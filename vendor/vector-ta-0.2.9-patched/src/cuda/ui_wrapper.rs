@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::ui::{UiBatchRange, UiParams};
@@ -8,8 +8,8 @@ use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, Function, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys;
@@ -95,11 +95,6 @@ impl CudaUi {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/ui_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("ui_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
@@ -1245,14 +1240,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "ui",
-            "one_series_many_params",
-            "ui_cuda_batch",
-            "1m",
-            prep_one_series,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series())]
+        vec![
+            CudaBenchScenario::new(
+                "ui",
+                "one_series_many_params",
+                "ui_cuda_batch",
+                "1m",
+                prep_one_series,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series()),
+        ]
     }
 }

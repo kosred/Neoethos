@@ -1,16 +1,16 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::supersmoother::{
-    expand_grid_supersmoother, SuperSmootherBatchRange, SuperSmootherParams,
+    SuperSmootherBatchRange, SuperSmootherParams, expand_grid_supersmoother,
 };
 use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
 use cust::memory::{
-    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info,
 };
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -65,18 +65,6 @@ impl CudaSuperSmoother {
         let device = Device::get_device(device_id as u32)?;
         let context = Context::new(device)?;
         let ctx = Arc::new(context);
-
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/supersmoother_kernel.ptx"));
-
-        let mut jit_opts: Vec<ModuleJitOption> = vec![
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
-        if let Ok(v) = std::env::var("SS_MAXREG") {
-            if let Ok(cap) = v.parse::<u32>() {
-                jit_opts.push(ModuleJitOption::MaxRegisters(cap));
-            }
-        }
 
         let module = crate::load_cuda_embedded_module!("supersmoother_kernel")?;
 

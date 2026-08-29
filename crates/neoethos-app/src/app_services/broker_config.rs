@@ -185,5 +185,4 @@ mod tests {
             "OAuth app credentials ready for Demo environment."
         );
     }
-
 }

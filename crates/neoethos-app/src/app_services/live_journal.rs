@@ -111,8 +111,7 @@ fn journal_path() -> Option<PathBuf> {
     // F-CORE3 closure (2026-05-25): routed through the canonical
     // `env_overrides::live_journal_path_override` typed getter so the
     // env var is grep-able from one place.
-    crate::app_services::env_overrides::live_journal_path_override()
-        .map(PathBuf::from)
+    crate::app_services::env_overrides::live_journal_path_override().map(PathBuf::from)
 }
 
 fn writer_lock() -> &'static Mutex<()> {
@@ -188,6 +187,8 @@ mod tests {
             lot_size: Some(0.10),
             requested_lot_size: Some(0.10),
             filled_lot_size: Some(0.10),
+            filled_volume_raw_centi_units: Some(10_000),
+            volume_scale_evidence: None,
             execution_price: Some(1.0987),
             gross_profit: Some(0.0),
             fee: Some(0.0),

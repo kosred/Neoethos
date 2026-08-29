@@ -28,8 +28,8 @@ use std::time::Duration;
 /// "fallback" variant without a cause attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndicatorLane {
-    /// Ran on the card. `arch` is the compute capability the PTX was built
-    /// for, as recorded by `build.rs`.
+    /// Ran on the card. `arch` is the exact native compute capability selected
+    /// from vector-ta's verified cubin registry.
     Gpu { arch: String },
     /// This binary has no CUDA indicator lane compiled in (`gpu-cuda` off).
     /// The normal, expected state for a card-less build.
@@ -129,29 +129,21 @@ pub const fn indicator_gpu_lane_compiled() -> bool {
     cfg!(feature = "gpu-cuda")
 }
 
-/// The arch of the PTX embedded in the vector-ta fatbin — the one the driver
-/// JITs on a card newer than anything we compiled SASS for.
-///
-/// RE-EXPORTED, not recomputed. This used to be `env!("NEOETHOS_VECTOR_TA_PTX_ARCH")`,
-/// resolved by `neoethos-data/build.rs` from `CUDA_ARCHS`/`CUDA_ARCH`/`nvidia-smi`
-/// — i.e. a fact about the BUILD HOST, printed in the diagnostic that exists to
-/// explain a mismatch on the RUN host. A portable binary built on a 4090
-/// reported `sm_89` in the message meant to explain why an sm_86 card failed.
-/// vector-ta records what it actually compiled; there is now one answer.
+/// Exact native SASS architectures in vector-ta's generated cubin registry.
+/// This is re-exported from the artifact producer, never recomputed from the
+/// build host.
 #[cfg(feature = "gpu-cuda")]
-pub const VECTOR_TA_PTX_ARCH: &str = vector_ta::cuda::module_loader::COMPILED_PTX_ARCH;
-/// `"none"` in a card-less build: there is no fatbin and no PTX.
+pub const VECTOR_TA_NATIVE_ARCHS: &[u32] = vector_ta::cuda::module_loader::COMPILED_ARCHS;
+/// Empty in a card-less build because no native CUDA artifact is compiled.
 #[cfg(not(feature = "gpu-cuda"))]
-pub const VECTOR_TA_PTX_ARCH: &str = "none";
+pub const VECTOR_TA_NATIVE_ARCHS: &[u32] = &[];
 
-/// The SASS architectures the vector-ta fatbin actually contains, e.g.
-/// `"sm_80,sm_86,sm_89,sm_90"`. Same single-source rule as
-/// [`VECTOR_TA_PTX_ARCH`].
+/// How the exact architecture set was selected (`CUDA_ARCHS` or visible-device
+/// detection), from the same generated registry provenance.
 #[cfg(feature = "gpu-cuda")]
-pub const VECTOR_TA_ARCHS: &str = vector_ta::cuda::module_loader::COMPILED_ARCHS;
-/// `"none"` in a card-less build.
+pub const VECTOR_TA_ARCH_SOURCE: &str = vector_ta::cuda::module_loader::COMPILED_ARCH_SOURCE;
 #[cfg(not(feature = "gpu-cuda"))]
-pub const VECTOR_TA_ARCHS: &str = "none";
+pub const VECTOR_TA_ARCH_SOURCE: &str = "none";
 
 /// Print the indicator-lane device split. Prints EVEN WHEN EMPTY, exactly like
 /// `eval_telemetry::device_summary`: a run that recorded no indicator frames
@@ -169,7 +161,8 @@ pub fn indicator_device_summary() {
         tracing::info!(
             target: "neoethos_data::indicator_telemetry",
             gpu_lane_compiled = lane_compiled,
-            ptx_arch = VECTOR_TA_PTX_ARCH,
+            native_archs = ?VECTOR_TA_NATIVE_ARCHS,
+            arch_source = VECTOR_TA_ARCH_SOURCE,
             frames = 0,
             "indicator-lane device split: no frames recorded"
         );
@@ -192,7 +185,8 @@ pub fn indicator_device_summary() {
     tracing::info!(
         target: "neoethos_data::indicator_telemetry",
         gpu_lane_compiled = lane_compiled,
-        ptx_arch = VECTOR_TA_PTX_ARCH,
+        native_archs = ?VECTOR_TA_NATIVE_ARCHS,
+        arch_source = VECTOR_TA_ARCH_SOURCE,
         frames,
         gpu_frames,
         gpu_pct = format!("{gpu_pct:.1}"),
@@ -283,13 +277,10 @@ mod tests {
     }
 
     #[test]
-    fn ptx_arch_is_none_without_the_gpu_feature() {
-        // A card-less build must still define the constant (so the cfg-gated
-        // module compiles) and must define it as the sentinel, never as a
-        // plausible-looking arch.
+    fn native_arch_registry_is_empty_without_the_gpu_feature() {
         if !indicator_gpu_lane_compiled() {
-            assert_eq!(VECTOR_TA_PTX_ARCH, "none");
-            assert_eq!(VECTOR_TA_ARCHS, "none");
+            assert!(VECTOR_TA_NATIVE_ARCHS.is_empty());
+            assert_eq!(VECTOR_TA_ARCH_SOURCE, "none");
         }
     }
 
@@ -298,16 +289,10 @@ mod tests {
     /// the only way to pin THAT card-lessly is to assert the sentinel is not
     /// something a host probe could have produced.
     #[test]
-    fn arch_strings_are_never_a_host_probe_result() {
+    fn cardless_arch_metadata_is_never_a_host_probe_result() {
         if !indicator_gpu_lane_compiled() {
-            for s in [VECTOR_TA_PTX_ARCH, VECTOR_TA_ARCHS] {
-                assert!(
-                    !s.contains("sm_") && !s.contains("compute_"),
-                    "a card-less build reported {s:?}, which reads like a resolved arch — \
-                     this constant must be re-exported from vector-ta, never recomputed \
-                     from CUDA_ARCH / nvidia-smi"
-                );
-            }
+            assert!(VECTOR_TA_NATIVE_ARCHS.is_empty());
+            assert!(!VECTOR_TA_ARCH_SOURCE.contains("sm_"));
         }
     }
 

@@ -1,13 +1,13 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::stochastic_adaptive_d::{
-    expand_grid_stochastic_adaptive_d, StochasticAdaptiveDBatchRange, StochasticAdaptiveDParams,
+    StochasticAdaptiveDBatchRange, StochasticAdaptiveDParams, expand_grid_stochastic_adaptive_d,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};

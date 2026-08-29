@@ -7,6 +7,7 @@ use neoethos_core::logging::{setup_logging, write_subsystem_record};
 use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod canonical_full_run;
 mod gpu_bench;
 mod gpu_bench_population;
 mod gpu_bench_prepare;
@@ -14,9 +15,14 @@ mod gpu_bench_snapshot;
 mod tui;
 
 fn main() -> Result<()> {
-    // Config-consolidation: search runtime overrides come from the single
-    // config (canonical user config.yaml), not the environment. (S2a:
-    // genetic search; rest staged.)
+    let mut startup_trace = StartupTrace::default();
+    // Must precede every possible thread/runtime/global-pool initialization;
+    // child threads inherit the blocked SourceSeal signal mask on Linux.
+    neoethos_data::initialize_source_seal_before_runtime()?;
+    startup_trace.record(StartupEvent::ImportSignalPreflightCompleted)?;
+    // Config-consolidation: ordinary discovery/model runtime overrides come
+    // from the canonical config, not the environment. Strict receipt-bound
+    // historical search branches below before that config surface exists.
     //
     // ⚠ AUDIT #125/#289, CLI HALF — this line read
     // `Settings::load().unwrap_or_default()` and its own comment admitted
@@ -37,6 +43,13 @@ fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     // Owned, so the `raw_args` vector can be moved into `args` further down.
     let subcommand: String = raw_args.get(1).cloned().unwrap_or_default();
+    if subcommand == "search" {
+        neoethos_search::historical_search_cli::install_historical_search_process_budget(
+            &raw_args,
+        )?;
+        setup_logging(false)?;
+        return neoethos_search::historical_search_cli::run(&raw_args[2..]);
+    }
     let startup_settings = match neoethos_core::Settings::load() {
         Ok(s) => s,
         Err(err) => {
@@ -91,7 +104,6 @@ fn main() -> Result<()> {
             neoethos_core::Settings::default()
         }
     };
-    let mut startup_trace = StartupTrace::default();
     startup_trace.record(StartupEvent::ConfigurationLoaded)?;
     // CPU budget for THIS process — an internal parent→child handoff, not an
     // operator knob.
@@ -134,14 +146,9 @@ fn main() -> Result<()> {
     neoethos_models::statistical::common::install_statistical_runtime_from_settings(
         &startup_settings,
     );
-    neoethos_models::genetic::install_genetic_runtime_from_settings(&startup_settings);
     neoethos_core::system::install_hardware_runtime_overrides_from_settings(&startup_settings);
     neoethos_data::install_data_runtime_overrides(
         startup_settings.models.data_runtime.normalize_features,
-        startup_settings
-            .models
-            .data_runtime
-            .rebuild_stale_higher_tfs,
     );
     startup_trace.record(StartupEvent::RuntimeSettingsInstalled)?;
     if startup_diagnostics_requested(&raw_args) {
@@ -208,15 +215,18 @@ fn main() -> Result<()> {
         ),
     )?;
 
+    let tail = &args[2..];
+    let settings = &startup_settings;
     let result = match args[1].as_str() {
         "symbols" => cmd_symbols(&args[2..]),
         "timeframes" => cmd_timeframes(&args[2..]),
         "load" => cmd_load(&args[2..]),
         "features" => cmd_features(&args[2..]),
         "prepare" => cmd_prepare(&args[2..]),
-        "resample" => cmd_resample(&args[2..]),
+        "canonical-cost-build" => canonical_full_run::build_cost_assumptions(tail, settings),
+        "canonical-train" => canonical_full_run::train_receipt_bound(tail, settings),
+        "canonical-full-run" => canonical_full_run::run(&args[2..], &startup_settings),
         "train" => cmd_train(&args[2..]),
-        "search" => cmd_search(&args[2..]),
         "discover" => cmd_discover(&args[2..]),
         "discovery-promote-weekly" => cmd_discovery_promote_weekly(&args[2..]),
         "trader-replay" => cmd_trader_replay(&args[2..]),
@@ -228,7 +238,6 @@ fn main() -> Result<()> {
         "bench-matrix" => gpu_bench_prepare::run_matrix(&args[2..]),
         "bench-collate" => gpu_bench_prepare::run_collate(&args[2..]),
         "bench-preflight-report" => gpu_bench_prepare::run_preflight_report(&args[2..]),
-        "migrate-data" => cmd_migrate_data(&args[2..]),
         "slice-dataset" => cmd_slice_dataset(&args[2..]),
         "import" => cmd_import(&args[2..]),
         "config" => cmd_config(&args[2..]),
@@ -301,33 +310,366 @@ fn cmd_load(args: &[String]) -> Result<()> {
 
     let symbol = symbol.unwrap_or_else(|| default_symbol(settings.as_ref()));
     let timeframe = timeframe.unwrap_or_else(|| default_base_tf(settings.as_ref()));
-
-    let ohlcv = neoethos_data::load_symbol_timeframe(&root, &symbol, &timeframe)?;
-    println!("Loaded {} {} rows: {}", symbol, timeframe, ohlcv.len());
+    let identities = inventory_canonical_identities(&root, &symbol)?;
+    let identity = select_exact_runtime_identity(&identities, args, &symbol, &timeframe)?;
+    let ohlcv = load_exact_runtime_timeframe(&root, &identity)?;
+    println!(
+        "Loaded {} {} identity={} rows: {}",
+        symbol,
+        timeframe,
+        identity.to_path_component(),
+        ohlcv.len()
+    );
     Ok(())
 }
 
 /// `slice-dataset --symbol EURUSD --base M1 --root <SRC> --out-root <DST>
 ///                --from-date 2018-01-01 --to-date 2021-01-01`
 ///
-/// Additive, NON-destructive: reads the source `(symbol, base)` Vortex
-/// dataset from `<SRC>`, keeps only the bars whose timestamp falls in the
-/// half-open range `[from-date, to-date)` (UTC), and writes the filtered
-/// subset to `<DST>/symbol=<SYM>/timeframe=<TF>/data.vortex` in the SAME
-/// canonical Vortex layout the loader reads — so a subsequent
-/// `discover --root <DST> --symbol <SYM> --base <TF>` runs on the slice.
+/// Additive, NON-destructive: resolves exactly one manifest-backed source
+/// identity for `(symbol, base)`, fully verifies and pins that immutable Vortex
+/// generation, keeps only bars in `[from-date, to-date)` (UTC), and atomically
+/// publishes the result under the same exact identity in a NEW configured
+/// root. The output manifest carries typed derivation provenance binding the
+/// source identity, manifest, generation, Vortex hash and selected row/range.
 ///
 /// Purpose: OOM-safe walk-forward. A multi-year M1 dataset that overflows
 /// RAM on a weak machine can be chopped into e.g. 3-year windows that each
 /// fit, discovered independently, and stitched by the operator.
 ///
-/// Reuses the exact discovery IO path:
-///   - reader: `neoethos_data::load_symbol_timeframe` (same as `discover`)
-///   - date→row mapping + filter: `neoethos_data::slice_ohlcv_by_date_range_ms`
-///   - writer: `neoethos_data::write_symbol_timeframe_vortex`
-///     (canonical `write_ohlcv_vortex` under the hood)
-///
-/// Fails loud when the source is missing/empty or the range yields 0 rows.
+/// Fails closed when source identity selection is missing/ambiguous, the
+/// source generation cannot be fully verified, an output generation already
+/// exists without an explicit CAS base, or the range yields zero rows.
+const SLICE_PROVENANCE_DOMAIN: &[u8] = b"neoethos.cli.slice-dataset-provenance.v1\0";
+const SLICE_PROVENANCE_VERSION: u16 = 1;
+const SLICE_SELECTION_HALF_OPEN: u8 = 1;
+const SLICE_VOLUME_ABSENT: u8 = 1;
+const SLICE_VOLUME_FLOAT64: u8 = 2;
+const SLICE_ROWS_PER_VORTEX_CHUNK: usize = 65_536;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SliceDatasetProvenanceV1 {
+    source_identity: neoethos_data::CanonicalDatasetIdentity,
+    source_manifest_schema_id: String,
+    source_manifest_hash: [u8; 32],
+    source_generation: String,
+    source_vortex_hash: [u8; 32],
+    source_row_count: u64,
+    source_timestamp_start_ms: i64,
+    source_timestamp_end_ms: i64,
+    selected_row_start: u64,
+    selected_row_end: u64,
+    requested_from_ms: i64,
+    requested_to_ms: i64,
+    selected_timestamp_start_ms: i64,
+    selected_timestamp_end_ms: i64,
+    volume_encoding: u8,
+}
+
+impl SliceDatasetProvenanceV1 {
+    const SCHEMA_ID: &'static str = "neoethos.cli.slice-dataset-provenance.v1";
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        source_identity: neoethos_data::CanonicalDatasetIdentity,
+        source_manifest_schema_id: impl Into<String>,
+        source_manifest_hash: [u8; 32],
+        source_generation: impl Into<String>,
+        source_vortex_hash: [u8; 32],
+        source_row_count: u64,
+        source_timestamp_start_ms: i64,
+        source_timestamp_end_ms: i64,
+        selected_row_start: u64,
+        selected_row_end: u64,
+        requested_from_ms: i64,
+        requested_to_ms: i64,
+        selected_timestamp_start_ms: i64,
+        selected_timestamp_end_ms: i64,
+        volume_encoding: u8,
+    ) -> Result<Self> {
+        let value = Self {
+            source_identity,
+            source_manifest_schema_id: source_manifest_schema_id.into(),
+            source_manifest_hash,
+            source_generation: source_generation.into(),
+            source_vortex_hash,
+            source_row_count,
+            source_timestamp_start_ms,
+            source_timestamp_end_ms,
+            selected_row_start,
+            selected_row_end,
+            requested_from_ms,
+            requested_to_ms,
+            selected_timestamp_start_ms,
+            selected_timestamp_end_ms,
+            volume_encoding,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn source_identity(&self) -> &neoethos_data::CanonicalDatasetIdentity {
+        &self.source_identity
+    }
+
+    #[cfg(test)]
+    const fn selected_row_range(&self) -> std::ops::Range<u64> {
+        self.selected_row_start..self.selected_row_end
+    }
+
+    #[cfg(test)]
+    const fn requested_range_ms(&self) -> (i64, i64) {
+        (self.requested_from_ms, self.requested_to_ms)
+    }
+
+    #[cfg(test)]
+    const fn selected_timestamp_range_ms(&self) -> (i64, i64) {
+        (
+            self.selected_timestamp_start_ms,
+            self.selected_timestamp_end_ms,
+        )
+    }
+
+    const fn output_row_count(&self) -> u64 {
+        self.selected_row_end - self.selected_row_start
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_slice_text("source manifest schema", &self.source_manifest_schema_id)?;
+        validate_slice_opaque_component("source generation", &self.source_generation)?;
+        if self.source_row_count == 0 {
+            anyhow::bail!("slice provenance cannot bind an empty source generation");
+        }
+        if self.source_timestamp_start_ms > self.source_timestamp_end_ms {
+            anyhow::bail!("slice provenance source timestamp range is descending");
+        }
+        if self.selected_row_start >= self.selected_row_end
+            || self.selected_row_end > self.source_row_count
+        {
+            anyhow::bail!("slice provenance selected row range is empty or outside the source");
+        }
+        if self.requested_from_ms >= self.requested_to_ms {
+            anyhow::bail!("slice provenance requested range is empty or descending");
+        }
+        if self.selected_timestamp_start_ms > self.selected_timestamp_end_ms
+            || self.selected_timestamp_start_ms < self.source_timestamp_start_ms
+            || self.selected_timestamp_end_ms > self.source_timestamp_end_ms
+            || self.selected_timestamp_start_ms < self.requested_from_ms
+            || self.selected_timestamp_end_ms >= self.requested_to_ms
+        {
+            anyhow::bail!(
+                "slice provenance selected timestamp range is outside the source or half-open request"
+            );
+        }
+        if !matches!(
+            self.volume_encoding,
+            SLICE_VOLUME_ABSENT | SLICE_VOLUME_FLOAT64
+        ) {
+            anyhow::bail!("unsupported slice provenance volume encoding");
+        }
+        Ok(())
+    }
+
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(384);
+        bytes.extend_from_slice(SLICE_PROVENANCE_DOMAIN);
+        bytes.extend_from_slice(&SLICE_PROVENANCE_VERSION.to_be_bytes());
+        push_slice_bytes(&mut bytes, &self.source_identity.canonical_bytes());
+        push_slice_bytes(&mut bytes, self.source_manifest_schema_id.as_bytes());
+        bytes.extend_from_slice(&self.source_manifest_hash);
+        push_slice_bytes(&mut bytes, self.source_generation.as_bytes());
+        bytes.extend_from_slice(&self.source_vortex_hash);
+        bytes.extend_from_slice(&self.source_row_count.to_be_bytes());
+        bytes.extend_from_slice(&self.source_timestamp_start_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.source_timestamp_end_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.selected_row_start.to_be_bytes());
+        bytes.extend_from_slice(&self.selected_row_end.to_be_bytes());
+        bytes.extend_from_slice(&self.requested_from_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.requested_to_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.selected_timestamp_start_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.selected_timestamp_end_ms.to_be_bytes());
+        bytes.push(SLICE_SELECTION_HALF_OPEN);
+        bytes.push(self.volume_encoding);
+        bytes
+    }
+
+    fn to_envelope(
+        &self,
+    ) -> Result<neoethos_data::core::dataset_manifest::ProducerProvenanceEnvelopeV1> {
+        self.validate()?;
+        neoethos_data::core::dataset_manifest::ProducerProvenanceEnvelopeV1::new(
+            Self::SCHEMA_ID,
+            self.canonical_bytes(),
+        )
+    }
+
+    fn from_envelope(
+        envelope: &neoethos_data::core::dataset_manifest::ProducerProvenanceEnvelopeV1,
+    ) -> Result<Self> {
+        envelope.validate()?;
+        if envelope.schema_id() != Self::SCHEMA_ID {
+            anyhow::bail!(
+                "slice provenance schema mismatch: expected {}, got {}",
+                Self::SCHEMA_ID,
+                envelope.schema_id()
+            );
+        }
+        let mut cursor = SliceProvenanceCursor::new(envelope.canonical_payload());
+        cursor.require_exact(SLICE_PROVENANCE_DOMAIN, "domain")?;
+        if cursor.read_u16("version")? != SLICE_PROVENANCE_VERSION {
+            anyhow::bail!("unsupported slice provenance version");
+        }
+        let source_identity = neoethos_data::CanonicalDatasetIdentity::from_canonical_bytes(
+            cursor.read_bytes("source identity")?,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let value = Self {
+            source_identity,
+            source_manifest_schema_id: cursor.read_text("source manifest schema")?,
+            source_manifest_hash: cursor.read_array("source manifest hash")?,
+            source_generation: cursor.read_text("source generation")?,
+            source_vortex_hash: cursor.read_array("source Vortex hash")?,
+            source_row_count: cursor.read_u64("source row count")?,
+            source_timestamp_start_ms: cursor.read_i64("source timestamp start")?,
+            source_timestamp_end_ms: cursor.read_i64("source timestamp end")?,
+            selected_row_start: cursor.read_u64("selected row start")?,
+            selected_row_end: cursor.read_u64("selected row end")?,
+            requested_from_ms: cursor.read_i64("requested from")?,
+            requested_to_ms: cursor.read_i64("requested to")?,
+            selected_timestamp_start_ms: cursor.read_i64("selected timestamp start")?,
+            selected_timestamp_end_ms: cursor.read_i64("selected timestamp end")?,
+            volume_encoding: 0,
+        };
+        cursor.require_tag(SLICE_SELECTION_HALF_OPEN, "selection semantics")?;
+        let volume_encoding = cursor.read_u8("volume encoding")?;
+        let value = Self {
+            volume_encoding,
+            ..value
+        };
+        if !cursor.is_empty() {
+            anyhow::bail!("slice provenance has trailing bytes");
+        }
+        value.validate()?;
+        if value.canonical_bytes() != envelope.canonical_payload() {
+            anyhow::bail!("slice provenance is not canonically encoded");
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalDatasetSliceOutcome {
+    publication: neoethos_data::core::dataset_manifest::PublishResult,
+    source_rows: usize,
+    kept_rows: usize,
+    first_ms: i64,
+    last_ms: i64,
+}
+
+fn publish_canonical_dataset_slice(
+    source_root: &std::path::Path,
+    output_root: &std::path::Path,
+    identity: &neoethos_data::CanonicalDatasetIdentity,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<CanonicalDatasetSliceOutcome> {
+    if from_ms >= to_ms {
+        anyhow::bail!("slice-dataset range is empty or descending");
+    }
+    let source =
+        neoethos_data::core::canonical_ohlcv::load_canonical_timeframe(source_root, identity)
+            .with_context(|| {
+                format!(
+                    "fully verify exact slice source {}",
+                    identity.to_path_component()
+                )
+            })?;
+    let source_rows = source.len();
+    let timestamps = source
+        .ohlcv()
+        .timestamp
+        .as_deref()
+        .context("verified canonical slice source has no timestamp_ms")?;
+    let selected_row_start = timestamps.partition_point(|timestamp| *timestamp < from_ms);
+    let selected_row_end = timestamps.partition_point(|timestamp| *timestamp < to_ms);
+    let (slice, span) = neoethos_data::slice_ohlcv_by_date_range_ms(source.ohlcv(), from_ms, to_ms)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let kept_rows = slice.len();
+    let (first_ms, last_ms) = span.context("slice-dataset selected zero source rows")?;
+    anyhow::ensure!(
+        kept_rows == selected_row_end.saturating_sub(selected_row_start),
+        "slice row selection disagrees with the shared date-range slicer"
+    );
+
+    let binding = source
+        .artifact()
+        .source_binding("slice-dataset-source")
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let volume_encoding = if slice.volume.is_some() {
+        SLICE_VOLUME_FLOAT64
+    } else {
+        SLICE_VOLUME_ABSENT
+    };
+    let provenance = SliceDatasetProvenanceV1::new(
+        binding.dataset_identity().clone(),
+        binding.manifest_schema_id(),
+        *binding.manifest_hash(),
+        binding.generation_id(),
+        *binding.vortex_hash(),
+        source.artifact().row_count(),
+        source.artifact().timestamp_start_ms(),
+        source.artifact().timestamp_end_ms(),
+        u64::try_from(selected_row_start).context("slice row start exceeds u64")?,
+        u64::try_from(selected_row_end).context("slice row end exceeds u64")?,
+        from_ms,
+        to_ms,
+        first_ms,
+        last_ms,
+        volume_encoding,
+    )?;
+    let envelope = provenance.to_envelope()?;
+    let volume = slice
+        .volume
+        .as_deref()
+        .map_or(neoethos_data::CanonicalVolumeRef::Absent, |values| {
+            neoethos_data::CanonicalVolumeRef::Float64(values)
+        });
+    let publication = neoethos_data::publish_canonical_ohlcv_generation(
+        neoethos_data::CanonicalOhlcvPublishRequest {
+            configured_root: output_root,
+            identity,
+            expected_generation: None,
+            provenance: &envelope,
+            ohlcv: &slice,
+            volume,
+            rows_per_chunk: SLICE_ROWS_PER_VORTEX_CHUNK,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "atomically publish canonical slice {} into {}",
+            identity.to_path_component(),
+            output_root.display()
+        )
+    })?;
+    let reopened = SliceDatasetProvenanceV1::from_envelope(publication.manifest().provenance())?;
+    anyhow::ensure!(
+        publication.manifest().identity() == identity
+            && reopened.source_identity() == identity
+            && reopened == provenance
+            && publication.row_count() == provenance.output_row_count(),
+        "reopened slice manifest/provenance disagrees with the exact publication request"
+    );
+
+    Ok(CanonicalDatasetSliceOutcome {
+        publication,
+        source_rows,
+        kept_rows,
+        first_ms,
+        last_ms,
+    })
+}
+
 fn cmd_slice_dataset(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
@@ -377,46 +719,519 @@ fn cmd_slice_dataset(args: &[String]) -> Result<()> {
         );
     }
 
-    // Reader — identical to the `discover` command's load path.
-    let source = neoethos_data::load_symbol_timeframe(&root, &symbol, &base).map_err(|err| {
-        anyhow::anyhow!("slice-dataset: failed to load source {symbol} {base} from {root}: {err}")
-    })?;
-    let source_rows = source.len();
-    if source_rows == 0 {
-        anyhow::bail!(
-            "slice-dataset: source {symbol} {base} at {root} is empty — nothing to slice"
-        );
-    }
+    let identities = inventory_canonical_identities(&root, &symbol)?;
+    let identity = select_exact_runtime_identity(&identities, args, &symbol, &base)
+        .context("slice-dataset exact source selection")?;
+    let outcome = publish_canonical_dataset_slice(
+        std::path::Path::new(&root),
+        std::path::Path::new(&out_root),
+        &identity,
+        from_ms,
+        to_ms,
+    )
+    .map_err(|error| anyhow::anyhow!("slice-dataset: {error:#}"))?;
 
-    // Date→row mapping + half-open filter (shared data-crate helper).
-    let (slice, span) = neoethos_data::slice_ohlcv_by_date_range_ms(&source, from_ms, to_ms)
-        .map_err(|err| anyhow::anyhow!("slice-dataset: {err}"))?;
-    let kept_rows = slice.len();
-    if kept_rows == 0 {
-        anyhow::bail!(
-            "slice-dataset: 0 rows of {symbol} {base} fall in [{from_date}, {to_date}) — \
-             the requested window does not overlap the source data \
-             (source has {source_rows} rows). Widen the date range or check the dataset."
-        );
-    }
-
-    // Writer — canonical Vortex layout, byte-compatible with the loader.
-    let written = neoethos_data::write_symbol_timeframe_vortex(&out_root, &symbol, &base, &slice)
-        .map_err(|err| {
-        anyhow::anyhow!("slice-dataset: failed to write slice to {out_root}: {err}")
-    })?;
-
-    let (first_ms, last_ms) = span.expect("span is Some when kept_rows > 0");
     println!(
-        "slice-dataset {symbol} {base}: [{from_date}, {to_date})  source rows={source_rows}  kept rows={kept_rows}"
+        "slice-dataset {symbol} {base}: [{from_date}, {to_date})  source rows={}  kept rows={}",
+        outcome.source_rows, outcome.kept_rows
     );
     println!(
         "  kept span: {} .. {}",
-        format_epoch_ms_date(first_ms),
-        format_epoch_ms_date(last_ms)
+        format_epoch_ms_date(outcome.first_ms),
+        format_epoch_ms_date(outcome.last_ms)
     );
-    println!("  written: {}", written.display());
+    println!("  dataset identity: {}", identity.to_path_component());
+    println!("  generation:       {}", outcome.publication.generation());
+    println!(
+        "  durable commit:   {}",
+        outcome.publication.durable_commit_id()
+    );
+    println!(
+        "  canonical Vortex: {}",
+        outcome.publication.manifest().generation_path().display()
+    );
     Ok(())
+}
+
+fn validate_slice_text(field: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() || value.len() > 4 * 1024 || value.chars().any(char::is_control) {
+        anyhow::bail!("slice provenance {field} is empty, too long, or contains control data");
+    }
+    Ok(())
+}
+
+fn validate_slice_opaque_component(field: &str, value: &str) -> Result<()> {
+    validate_slice_text(field, value)?;
+    if matches!(value, "." | "..")
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+    {
+        anyhow::bail!("slice provenance {field} is not one opaque path component");
+    }
+    Ok(())
+}
+
+fn push_slice_bytes(target: &mut Vec<u8>, value: &[u8]) {
+    target.extend_from_slice(
+        &u32::try_from(value.len())
+            .expect("validated slice provenance field length fits u32")
+            .to_be_bytes(),
+    );
+    target.extend_from_slice(value);
+}
+
+struct SliceProvenanceCursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> SliceProvenanceCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
+
+    fn take(&mut self, length: usize, field: &str) -> Result<&'a [u8]> {
+        if self.remaining.len() < length {
+            anyhow::bail!("slice provenance is truncated at {field}");
+        }
+        let (value, rest) = self.remaining.split_at(length);
+        self.remaining = rest;
+        Ok(value)
+    }
+
+    fn require_exact(&mut self, expected: &[u8], field: &str) -> Result<()> {
+        if self.take(expected.len(), field)? != expected {
+            anyhow::bail!("invalid slice provenance {field}");
+        }
+        Ok(())
+    }
+
+    fn require_tag(&mut self, expected: u8, field: &str) -> Result<()> {
+        let actual = self.read_u8(field)?;
+        if actual != expected {
+            anyhow::bail!("unsupported slice provenance {field} {actual}");
+        }
+        Ok(())
+    }
+
+    fn read_u8(&mut self, field: &str) -> Result<u8> {
+        Ok(self.take(1, field)?[0])
+    }
+
+    fn read_u16(&mut self, field: &str) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.read_array(field)?))
+    }
+
+    fn read_u64(&mut self, field: &str) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.read_array(field)?))
+    }
+
+    fn read_i64(&mut self, field: &str) -> Result<i64> {
+        Ok(i64::from_be_bytes(self.read_array(field)?))
+    }
+
+    fn read_bytes(&mut self, field: &str) -> Result<&'a [u8]> {
+        let length = usize::try_from(u32::from_be_bytes(self.read_array(field)?))
+            .context("slice provenance field length does not fit usize")?;
+        self.take(length, field)
+    }
+
+    fn read_text(&mut self, field: &str) -> Result<String> {
+        let bytes = self.read_bytes(field)?;
+        let value = std::str::from_utf8(bytes)
+            .with_context(|| format!("slice provenance {field} is not UTF-8"))?;
+        validate_slice_text(field, value)?;
+        Ok(value.to_owned())
+    }
+
+    fn read_array<const N: usize>(&mut self, field: &str) -> Result<[u8; N]> {
+        self.take(N, field)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid slice provenance {field}"))
+    }
+}
+
+fn inventory_canonical_identities(
+    root: impl AsRef<std::path::Path>,
+    symbol: &str,
+) -> Result<Vec<neoethos_data::CanonicalDatasetIdentity>> {
+    let inventory =
+        neoethos_data::DatasetDiscovery::scan_metadata(root.as_ref()).with_context(|| {
+            format!(
+                "inventory canonical manifests under {}",
+                root.as_ref().display()
+            )
+        })?;
+    for entry in inventory.entries.iter().filter(|entry| {
+        entry
+            .symbol
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(symbol))
+    }) {
+        print_dataset_inventory_entry(entry)?;
+    }
+    print_dataset_inventory_rejections(&inventory);
+    let mut identities = Vec::new();
+    for entry in inventory.entries.iter().filter(|entry| {
+        entry
+            .symbol
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(symbol))
+    }) {
+        anyhow::ensure!(
+            entry.verification == neoethos_data::DataVerificationStatus::ManifestOnly,
+            "metadata identity inventory unexpectedly authorized a generation as fully verified"
+        );
+        let identity =
+            neoethos_data::CanonicalDatasetIdentity::from_path_component(&entry.dataset_identity)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            identity.symbol_name().eq_ignore_ascii_case(symbol)
+                && entry.timeframe.as_deref() == Some(identity.timeframe().as_str()),
+            "canonical identity inventory metadata disagrees with its reversible identity"
+        );
+        identities.push(identity);
+    }
+    identities.sort_by(|left, right| {
+        left.timeframe()
+            .ctrader_protocol_code()
+            .cmp(&right.timeframe().ctrader_protocol_code())
+            .then_with(|| left.to_path_component().cmp(&right.to_path_component()))
+    });
+    Ok(identities)
+}
+
+fn verified_canonical_identities(
+    inventory: &neoethos_data::DatasetDiscovery,
+    symbol: &str,
+) -> Result<Vec<neoethos_data::CanonicalDatasetIdentity>> {
+    let mut identities = Vec::new();
+    for entry in inventory.entries.iter().filter(|entry| {
+        entry
+            .symbol
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(symbol))
+    }) {
+        anyhow::ensure!(
+            entry.verification == neoethos_data::DataVerificationStatus::GenerationVerified,
+            "schedule identity={} generation={} is not fully verified",
+            entry.dataset_identity,
+            entry.generation
+        );
+        let identity =
+            neoethos_data::CanonicalDatasetIdentity::from_path_component(&entry.dataset_identity)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            identity.symbol_name().eq_ignore_ascii_case(symbol)
+                && entry.timeframe.as_deref() == Some(identity.timeframe().as_str()),
+            "verified schedule inventory metadata disagrees with its reversible identity"
+        );
+        identities.push(identity);
+    }
+    identities.sort_by(|left, right| {
+        left.timeframe()
+            .ctrader_protocol_code()
+            .cmp(&right.timeframe().ctrader_protocol_code())
+            .then_with(|| left.to_path_component().cmp(&right.to_path_component()))
+    });
+    Ok(identities)
+}
+
+fn unique_canonical_identity(
+    identities: &[neoethos_data::CanonicalDatasetIdentity],
+    symbol: &str,
+    timeframe: neoethos_data::CanonicalTimeframe,
+) -> Result<Option<neoethos_data::CanonicalDatasetIdentity>> {
+    let matching = identities
+        .iter()
+        .filter(|identity| {
+            identity.symbol_name().eq_ignore_ascii_case(symbol) && identity.timeframe() == timeframe
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matching.len() <= 1,
+        "expected exactly one canonical dataset identity for {symbol} {timeframe}, found {}; select an exact source/account identity",
+        matching.len()
+    );
+    Ok(matching.first().map(|identity| (*identity).clone()))
+}
+
+fn select_exact_runtime_identity(
+    identities: &[neoethos_data::CanonicalDatasetIdentity],
+    args: &[String],
+    symbol: &str,
+    timeframe_label: &str,
+) -> Result<neoethos_data::CanonicalDatasetIdentity> {
+    let timeframe = timeframe_label
+        .parse::<neoethos_data::CanonicalTimeframe>()
+        .with_context(|| format!("unsupported canonical timeframe {timeframe_label}"))?;
+    if let Some(encoded) = parse_flag(args, "--dataset-identity") {
+        let identity = neoethos_data::CanonicalDatasetIdentity::from_path_component(&encoded)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .with_context(|| format!("decode --dataset-identity {encoded}"))?;
+        anyhow::ensure!(
+            identity.symbol_name().eq_ignore_ascii_case(symbol),
+            "--dataset-identity belongs to {}, but --symbol/config selected {symbol}",
+            identity.symbol_name()
+        );
+        anyhow::ensure!(
+            identity.timeframe() == timeframe,
+            "--dataset-identity is {}, but --timeframe/--base selected {timeframe}",
+            identity.timeframe()
+        );
+        anyhow::ensure!(
+            identities.contains(&identity),
+            "--dataset-identity {encoded} is not a current canonical manifest under the selected data root"
+        );
+        return Ok(identity);
+    }
+
+    unique_canonical_identity(identities, symbol, timeframe)?.with_context(|| {
+        format!(
+            "expected exactly one canonical dataset identity for {symbol} {timeframe}, found 0; pass --dataset-identity <d1-...>"
+        )
+    })
+}
+
+#[derive(Debug)]
+struct DirectTimeframeSelection {
+    base_identity: neoethos_data::CanonicalDatasetIdentity,
+    required: Vec<neoethos_data::CanonicalTimeframe>,
+    identities: Vec<neoethos_data::CanonicalDatasetIdentity>,
+}
+
+#[cfg(feature = "gpu-nvidia")]
+#[derive(Debug)]
+struct PinnedDirectTimeframeSelection {
+    series: neoethos_data::CanonicalDatasetSeriesReceiptV1,
+    base_row_count: usize,
+    pinned_series: Option<neoethos_data::PinnedCanonicalSeriesV1>,
+}
+
+#[cfg(feature = "gpu-nvidia")]
+impl PinnedDirectTimeframeSelection {
+    fn take_or_repin(
+        &mut self,
+        root: &std::path::Path,
+    ) -> Result<neoethos_data::PinnedCanonicalSeriesV1> {
+        if let Some(pinned) = self.pinned_series.take() {
+            return Ok(pinned);
+        }
+        neoethos_data::pin_exact_canonical_series_v1(root, self.series.clone())
+    }
+}
+
+#[cfg(feature = "gpu-nvidia")]
+fn pin_direct_timeframe_selection(
+    root: impl AsRef<std::path::Path>,
+    selection: &DirectTimeframeSelection,
+) -> Result<PinnedDirectTimeframeSelection> {
+    let root = root.as_ref();
+    let mut selected = Vec::with_capacity(selection.identities.len());
+    let mut base_row_count = None;
+    for identity in &selection.identities {
+        let manifest =
+            neoethos_data::core::dataset_manifest::read_current_manifest_metadata(root, identity)
+                .with_context(|| {
+                format!(
+                    "pin exact canonical generation metadata for {}",
+                    identity.to_path_component()
+                )
+            })?;
+        if identity == &selection.base_identity {
+            base_row_count = Some(
+                usize::try_from(manifest.row_count())
+                    .context("canonical base row count does not fit this process")?,
+            );
+        }
+        selected.push(neoethos_data::SelectedDatasetGenerationV1::from_manifest(
+            &manifest,
+        )?);
+    }
+    let anchor = selected
+        .iter()
+        .find(|receipt| receipt.identity() == &selection.base_identity)
+        .cloned()
+        .context("pinned direct timeframe selection lost its exact base generation")?;
+    let series = neoethos_data::CanonicalDatasetSeriesReceiptV1::new(anchor, selected)?;
+    let pinned_series = neoethos_data::pin_exact_canonical_series_v1(root, series.clone())?;
+    neoethos_search::fx_rates::set_store_selection(
+        root.to_path_buf(),
+        selection.base_identity.clone(),
+    )
+    .map_err(anyhow::Error::new)
+    .context("install exact FX source/account selection")?;
+    Ok(PinnedDirectTimeframeSelection {
+        series,
+        base_row_count: base_row_count.context("pinned selection has no base row count")?,
+        pinned_series: Some(pinned_series),
+    })
+}
+
+fn select_runtime_timeframe_identities(
+    identities: &[neoethos_data::CanonicalDatasetIdentity],
+    symbol: &str,
+    base: &str,
+    requested_higher: &[String],
+) -> Result<DirectTimeframeSelection> {
+    let base_timeframe = base
+        .parse::<neoethos_data::CanonicalTimeframe>()
+        .with_context(|| format!("unsupported canonical base timeframe {base}"))?;
+    let base_identity = unique_canonical_identity(identities, symbol, base_timeframe)?
+        .with_context(|| {
+            format!("expected exactly one canonical dataset identity for {symbol} {base}, found 0")
+        })?;
+    select_runtime_timeframe_identities_for_base(identities, &base_identity, requested_higher)
+}
+
+fn select_runtime_timeframe_identities_for_base(
+    identities: &[neoethos_data::CanonicalDatasetIdentity],
+    base_identity: &neoethos_data::CanonicalDatasetIdentity,
+    requested_higher: &[String],
+) -> Result<DirectTimeframeSelection> {
+    let symbol = base_identity.symbol_name();
+    let base_timeframe = base_identity.timeframe();
+    anyhow::ensure!(
+        identities.contains(base_identity),
+        "selected base identity {} is not present in the current canonical inventory",
+        base_identity.to_path_component()
+    );
+    let mut required = Vec::with_capacity(1 + requested_higher.len());
+    required.push(base_timeframe);
+    for label in requested_higher {
+        let label = label.trim();
+        if label.is_empty() {
+            continue;
+        }
+        let timeframe = label
+            .parse::<neoethos_data::CanonicalTimeframe>()
+            .with_context(|| format!("unsupported canonical higher timeframe {label}"))?;
+        if !required.contains(&timeframe) {
+            required.push(timeframe);
+        }
+    }
+    required.sort_by_key(|timeframe| timeframe.ctrader_protocol_code());
+
+    let mut selected = vec![base_identity.clone()];
+    for timeframe in &required {
+        if *timeframe == base_timeframe {
+            continue;
+        }
+        let matching = identities
+            .iter()
+            .filter(|identity| {
+                identity.symbol_name().eq_ignore_ascii_case(symbol)
+                    && identity.timeframe() == *timeframe
+                    && identity.scope() == base_identity.scope()
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            matching.len() <= 1,
+            "multiple canonical {symbol} {timeframe} identities match the exact base source/account scope"
+        );
+        let identity = matching.first().with_context(|| {
+            format!(
+                "missing direct canonical timeframe {symbol} {timeframe} in the exact base source/account scope; import/download required"
+            )
+        })?;
+        selected.push((**identity).clone());
+    }
+    Ok(DirectTimeframeSelection {
+        base_identity: base_identity.clone(),
+        required,
+        identities: selected,
+    })
+}
+
+fn load_exact_runtime_timeframe(
+    root: impl AsRef<std::path::Path>,
+    identity: &neoethos_data::CanonicalDatasetIdentity,
+) -> Result<neoethos_data::CanonicalOhlcvFrame> {
+    let loaded =
+        neoethos_data::core::canonical_ohlcv::load_canonical_timeframe(root.as_ref(), identity)
+            .with_context(|| {
+                format!(
+                    "fully verify exact canonical dataset {}",
+                    identity.to_path_component()
+                )
+            })?;
+    Ok(loaded)
+}
+
+fn load_exact_symbol_dataset(
+    root: impl AsRef<std::path::Path>,
+    symbol: &str,
+    identities: &[neoethos_data::CanonicalDatasetIdentity],
+) -> Result<neoethos_data::SymbolDataset> {
+    anyhow::ensure!(
+        !identities.is_empty(),
+        "no exact canonical dataset identities selected for {symbol}"
+    );
+    let mut frames = std::collections::HashMap::new();
+    let mut source_artifacts = std::collections::HashMap::new();
+    for identity in identities {
+        anyhow::ensure!(
+            identity.symbol_name().eq_ignore_ascii_case(symbol),
+            "selected canonical dataset identity belongs to {}, not {symbol}",
+            identity.symbol_name()
+        );
+        let timeframe = identity.timeframe().as_str().to_owned();
+        anyhow::ensure!(
+            !frames.contains_key(&timeframe),
+            "selected canonical runtime identities duplicate {symbol} {timeframe}"
+        );
+        let loaded =
+            neoethos_data::core::canonical_ohlcv::load_canonical_timeframe(root.as_ref(), identity)
+                .with_context(|| {
+                    format!(
+                        "fully verify selected canonical dataset {}",
+                        identity.to_path_component()
+                    )
+                })?;
+        frames.insert(timeframe.clone(), loaded.ohlcv().clone());
+        source_artifacts.insert(timeframe, loaded.artifact().clone());
+    }
+    Ok(neoethos_data::SymbolDataset {
+        symbol: symbol.to_owned(),
+        frames,
+        source_artifacts,
+    })
+}
+
+fn load_required_direct_symbol_dataset(
+    root: impl AsRef<std::path::Path>,
+    symbol: &str,
+    selection: &DirectTimeframeSelection,
+) -> Result<neoethos_data::SymbolDataset> {
+    let root = root.as_ref();
+    let dataset = load_exact_symbol_dataset(root, symbol, &selection.identities)?;
+    neoethos_data::require_direct_timeframes(
+        &dataset,
+        &selection.base_identity,
+        &selection.required,
+    )
+    .with_context(|| {
+        format!(
+            "direct canonical timeframe verification failed for {symbol} {}; import/download required",
+            selection.base_identity.timeframe()
+        )
+    })?;
+    neoethos_search::fx_rates::set_store_selection(
+        root.to_path_buf(),
+        selection.base_identity.clone(),
+    )
+    .map_err(anyhow::Error::new)
+    .with_context(|| {
+        format!(
+            "install exact FX source/account selection {}",
+            selection.base_identity.to_path_component()
+        )
+    })?;
+    Ok(dataset)
 }
 
 /// Parse a `YYYY-MM-DD` date as midnight UTC and return epoch milliseconds.
@@ -442,10 +1257,14 @@ fn format_epoch_ms_date(ms: i64) -> String {
 fn cmd_symbols(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
-    let symbols = neoethos_data::discover_symbols(root)?;
-    println!("Symbols ({}):", symbols.len());
-    for sym in symbols {
-        println!("  {}", sym);
+    let report = neoethos_data::DatasetDiscovery::scan_metadata(&root)?;
+    println!("Canonical dataset identities ({}):", report.entries.len());
+    for entry in &report.entries {
+        print_dataset_inventory_entry(entry)?;
+    }
+    print_dataset_inventory_rejections(&report);
+    if report.entries.is_empty() {
+        println!("  NO CANONICAL DATASET IDENTITIES FOUND");
     }
     Ok(())
 }
@@ -454,12 +1273,87 @@ fn cmd_timeframes(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
-    let tfs = neoethos_data::discover_timeframes(root, &symbol)?;
-    println!("Timeframes for {} ({}):", symbol, tfs.len());
-    for tf in tfs {
-        println!("  {}", tf);
+    let report = neoethos_data::DatasetDiscovery::scan_metadata(&root)?;
+    let entries = report
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .symbol
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&symbol))
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "Canonical dataset identities for {symbol} ({}):",
+        entries.len()
+    );
+    for entry in entries {
+        print_dataset_inventory_entry(entry)?;
+    }
+    print_dataset_inventory_rejections(&report);
+    if !report.entries.iter().any(|entry| {
+        entry
+            .symbol
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&symbol))
+    }) {
+        println!("  NO CANONICAL DATASET IDENTITIES FOUND FOR {symbol}");
     }
     Ok(())
+}
+
+fn print_dataset_inventory_entry(entry: &neoethos_data::DataFileEntry) -> Result<()> {
+    let symbol = entry
+        .symbol
+        .as_deref()
+        .context("canonical inventory entry has no symbol")?;
+    let timeframe = entry
+        .timeframe
+        .as_deref()
+        .context("canonical inventory entry has no timeframe")?;
+    println!(
+        "  {symbol} {timeframe} identity={} generation={} manifest_binding_sha256={} verification={:?} bytes={} path={}",
+        entry.dataset_identity,
+        entry.generation,
+        entry.manifest_binding_sha256,
+        entry.verification,
+        entry.size_bytes,
+        entry.path.display()
+    );
+    Ok(())
+}
+
+fn print_dataset_inventory_rejections(report: &neoethos_data::DatasetDiscovery) {
+    for skipped in &report.skipped {
+        println!(
+            "  REJECTED path={} category={} detail={:?}",
+            skipped.path.display(),
+            skipped.reason.category(),
+            skipped.reason
+        );
+    }
+}
+
+fn metadata_inventory_symbols(root: impl AsRef<std::path::Path>) -> Result<Vec<String>> {
+    let report =
+        neoethos_data::DatasetDiscovery::scan_metadata(root.as_ref()).with_context(|| {
+            format!(
+                "inventory canonical dataset identities under {}",
+                root.as_ref().display()
+            )
+        })?;
+    for entry in &report.entries {
+        print_dataset_inventory_entry(entry)?;
+    }
+    print_dataset_inventory_rejections(&report);
+    let symbols = report.symbols();
+    anyhow::ensure!(
+        !symbols.is_empty(),
+        "metadata inventory found no canonical dataset identities under {}",
+        root.as_ref().display()
+    );
+    Ok(symbols)
 }
 
 fn cmd_features(args: &[String]) -> Result<()> {
@@ -468,8 +1362,10 @@ fn cmd_features(args: &[String]) -> Result<()> {
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
     let timeframe =
         parse_flag(args, "--timeframe").unwrap_or_else(|| default_base_tf(settings.as_ref()));
-    let ohlcv = neoethos_data::load_symbol_timeframe(&root, &symbol, &timeframe)?;
-    let features = neoethos_data::compute_hpc_features(&ohlcv)?;
+    let identities = inventory_canonical_identities(&root, &symbol)?;
+    let identity = select_exact_runtime_identity(&identities, args, &symbol, &timeframe)?;
+    let canonical = load_exact_runtime_timeframe(&root, &identity)?;
+    let features = neoethos_data::compute_hpc_features(&canonical)?;
     println!(
         "Features {} {} -> rows={}, cols={}",
         symbol,
@@ -493,7 +1389,11 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
         .map(|s| s.trim().to_string())
         .collect();
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
-    let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
+    let identities = inventory_canonical_identities(&root, &symbol)?;
+    let base_identity = select_exact_runtime_identity(&identities, args, &symbol, &base)?;
+    let selection =
+        select_runtime_timeframe_identities_for_base(&identities, &base_identity, &higher_list)?;
+    let dataset = load_required_direct_symbol_dataset(&root, &symbol, &selection)?;
     let features = neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
     println!(
         "Prepared {} base={} rows={} cols={}",
@@ -505,15 +1405,12 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `discovery-promote-weekly [--symbol X --tf Y] [--cache-dir ...] [--portfolio ...]`
+/// `discovery-promote-weekly --portfolio PATH [--cache-dir ...]`
 /// — the weekly-refresh promotion step of the search-memory feature.
 ///
-/// Loads THIS run's discovery ledger (`<cache-dir>/{SYMBOL}_{TF}.discovery_ledger.json`,
-/// written by every discovery run) and merges its recorded genes into the live
-/// portfolio under the **additive** policy: a ledger gene is "new" when its
-/// canonical signature hash is not already present among the live portfolio's
-/// genes; existing genes are always carried. Prints a growth summary
-/// ("added N new, carried M, total K").
+/// The selected strict v3 live portfolio is the sole authority for receipt,
+/// search-config identity, symbol and timeframe. Loads that exact ledger and
+/// compares its recorded genes with the portfolio under the **additive** policy.
 ///
 /// SCOPE NOTE (deferred — see report): the ledger records gene *signatures*
 /// (hash + indicator names + SMC flags + fitness), not the full `Gene`
@@ -531,51 +1428,41 @@ fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
         .map(|s| s.models.discovery_ledger.clone())
         .unwrap_or_default();
 
-    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
-    let tf = parse_flag(args, "--tf")
-        .or_else(|| parse_flag(args, "--base"))
-        .unwrap_or_else(|| default_base_tf(settings.as_ref()));
+    let portfolio_path = parse_flag(args, "--portfolio").ok_or_else(|| {
+        anyhow::anyhow!(
+            "discovery-promote-weekly requires --portfolio PATH naming a strict v3 live portfolio"
+        )
+    })?;
+    let artifact = neoethos_search::load_live_portfolio_json(&portfolio_path)
+        .with_context(|| format!("load strict v3 live portfolio {portfolio_path}"))?;
+    let search_receipt = artifact.search_scope.receipt().clone();
+    let config_hash = artifact.search_config_hash.clone();
+    let anchor = search_receipt.validate()?;
+    let symbol = anchor.symbol_name().to_owned();
+    let tf = anchor.timeframe().as_str().to_owned();
     let cache_dir = parse_flag(args, "--cache-dir").unwrap_or(ledger_cfg.cache_dir);
 
-    let ledger = neoethos_search::load_prior_ledger(&cache_dir, &symbol, &tf).ok_or_else(|| {
+    let exact_ledger_path =
+        neoethos_search::ledger_path(&cache_dir, &search_receipt, &config_hash)?;
+    let ledger = neoethos_search::load_prior_ledger(
+        &cache_dir,
+        &symbol,
+        &tf,
+        &search_receipt,
+        &config_hash,
+    )?
+    .ok_or_else(|| {
         anyhow::anyhow!(
-            "no discovery ledger found at {} — run a discovery for {} {} first \
-             (the ledger is written automatically when models.discovery_ledger.enabled = true)",
-            neoethos_search::ledger_path(&cache_dir, &symbol, &tf).display(),
-            symbol,
-            tf
+            "no receipt-bound discovery ledger found at {} — run this exact dataset/feature/config search first",
+            exact_ledger_path.display()
         )
     })?;
 
-    // Ledger genes recorded this run (portfolio + archive), de-duplicated by hash.
-    let mut ledger_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for rec in ledger.portfolio.iter().chain(ledger.archive.iter()) {
-        ledger_hashes.insert(rec.hash.clone());
-    }
-
-    // The live portfolio whose full genes we carry. Default path mirrors the
-    // discover command's `{out}.live_portfolio.json`, keyed off the ledger's
-    // cache layout; override with --portfolio.
-    let portfolio_path = parse_flag(args, "--portfolio")
-        .unwrap_or_else(|| format!("{}/{}_{}.live_portfolio.json", cache_dir, symbol, tf));
-
     let mut existing_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let existing_count = match neoethos_search::load_live_portfolio_json(&portfolio_path) {
-        Ok(artifact) => {
-            for gene in &artifact.genes {
-                existing_hashes
-                    .insert(neoethos_search::genetic::gene_signature_hash(gene).to_string());
-            }
-            artifact.genes.len()
-        }
-        Err(_) => {
-            println!(
-                "(no existing live portfolio at {} — treating all ledger genes as new)",
-                portfolio_path
-            );
-            0
-        }
-    };
+    for gene in &artifact.genes {
+        existing_hashes.insert(neoethos_search::genetic::gene_signature_hash(gene).to_string());
+    }
+    let existing_count = artifact.genes.len();
 
     let new_genes: Vec<&neoethos_search::GeneRecord> = ledger
         .portfolio
@@ -596,40 +1483,42 @@ fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
     struct PromotionSummary<'a> {
         symbol: &'a str,
         tf: &'a str,
+        config_hash: &'a str,
         policy: &'a str,
         carried: usize,
         added: usize,
         total: usize,
         new_genes: Vec<&'a neoethos_search::GeneRecord>,
     }
-    let summary_path = format!("{}/{}_{}.weekly_promotion.json", cache_dir, symbol, tf);
+    let summary_path = exact_ledger_path
+        .parent()
+        .expect("receipt-bound ledger path has a parent")
+        .join("weekly_promotion.v2.json");
     let summary = PromotionSummary {
         symbol: &symbol,
         tf: &tf,
+        config_hash: &config_hash,
         policy: &ledger_cfg.promotion_policy,
         carried,
         added,
         total,
         new_genes: new_genes.clone(),
     };
-    if let Err(err) = neoethos_core::storage::json::write_json_atomic(&summary_path, &summary) {
-        tracing::warn!(
-            target: "neoethos_cli::discovery_promote_weekly",
-            error = %err,
-            path = %summary_path,
-            "failed to write weekly-promotion summary (non-fatal)"
-        );
-    }
+    let summary = neoethos_search::CanonicalSearchArtifactEnvelopeV2::new(
+        "neoethos.search-weekly-promotion.v2",
+        artifact.search_scope.clone(),
+        config_hash.clone(),
+        summary,
+    )?;
+    neoethos_core::storage::json::write_json_atomic(&summary_path, &summary)
+        .with_context(|| format!("write weekly-promotion summary {}", summary_path.display()))?;
 
     println!(
         "discovery-promote-weekly {} {} (policy={}): added {} new, carried {}, total {}",
         symbol, tf, ledger_cfg.promotion_policy, added, carried, total
     );
-    println!(
-        "  ledger: {}",
-        neoethos_search::ledger_path(&cache_dir, &symbol, &tf).display()
-    );
-    println!("  summary written: {}", summary_path);
+    println!("  ledger: {}", exact_ledger_path.display());
+    println!("  summary written: {}", summary_path.display());
     if added > 0 {
         println!("  new strategies this run:");
         for rec in new_genes.iter().take(20) {
@@ -976,28 +1865,6 @@ fn cmd_blend_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_resample(args: &[String]) -> Result<()> {
-    let settings = resolve_cli_settings(args)?;
-    let root = parse_root(args, settings.as_ref());
-    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
-    let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
-    let target = parse_flag(args, "--target").unwrap_or_else(|| "H1".to_string());
-    let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
-    let base_ohlcv = dataset
-        .frames
-        .get(&base)
-        .ok_or_else(|| anyhow::anyhow!("base timeframe missing: {}", base))?;
-    let resampled = neoethos_data::resample_ohlcv(base_ohlcv, &target)?;
-    println!(
-        "Resampled {} {} -> {} rows={}",
-        symbol,
-        base,
-        target,
-        resampled.len()
-    );
-    Ok(())
-}
-
 fn cmd_train(args: &[String]) -> Result<()> {
     let result = (|| -> Result<(String, String)> {
         let settings_opt = resolve_cli_settings(args)?;
@@ -1019,6 +1886,7 @@ fn cmd_train(args: &[String]) -> Result<()> {
         let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| settings.system.symbol.clone());
         let base =
             parse_flag(args, "--base").unwrap_or_else(|| settings.system.base_timeframe.clone());
+        let data_root = parse_root(args, Some(&settings));
         // Stage 4 leak-free OOS-locked retrain: `--oos-from YYYY-MM-DD` truncates
         // each symbol's training to rows strictly before the cutoff (minus the
         // triple-barrier purge), so the experts can be used in an OOS blend
@@ -1048,12 +1916,20 @@ fn cmd_train(args: &[String]) -> Result<()> {
         let mut orchestrator = neoethos_models::TrainingOrchestrator::new(
             settings,
             std::path::PathBuf::from(models_dir),
-        );
+        )
+        .with_data_root(data_root);
         if let Some(ms) = oos_ms {
             orchestrator = orchestrator.with_oos_lock_from_ms(ms);
         }
 
-        orchestrator.train_symbol(&symbol, &base)?;
+        let installed = neoethos_core::execution_budget::installed_process_budget()
+            .context("training unavailable before the process CPU budget is installed")?;
+        let lease = installed.broker().acquire(
+            neoethos_core::execution_budget::CpuPermitRequest::local(
+                installed.resolved().effective_worker_limit,
+            ),
+        )?;
+        orchestrator.train_symbol(&symbol, &base, &lease)?;
 
         println!("Pure Rust training complete for {}", symbol);
         Ok((symbol, base))
@@ -1087,65 +1963,6 @@ fn cmd_train(args: &[String]) -> Result<()> {
     result.map(|_| ())
 }
 
-fn cmd_search(args: &[String]) -> Result<()> {
-    let settings = resolve_cli_settings(args)?;
-    let defaults = settings
-        .as_ref()
-        .map(neoethos_search::DiscoveryConfig::try_from_settings)
-        .transpose()?
-        .unwrap_or_default();
-    let root = parse_root(args, settings.as_ref());
-    let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
-    let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
-    let higher = parse_flag(args, "--higher")
-        .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref(), &base));
-    let genes: usize = parse_flag(args, "--genes")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(defaults.population);
-    let max_indicators: usize = parse_flag(args, "--max-indicators")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(defaults.max_indicators);
-    let generations: usize = parse_flag(args, "--generations")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(defaults.generations);
-
-    let higher_list: Vec<String> = higher
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim().to_string())
-        .collect();
-    let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
-
-    let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
-    let dataset = neoethos_data::ensure_timeframes_with_resample(
-        &dataset,
-        &base,
-        neoethos_data::MANDATORY_TFS,
-    )?;
-    let features = neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
-    let base_ohlcv = dataset
-        .frames
-        .get(&base)
-        .ok_or_else(|| anyhow::anyhow!("base timeframe missing: {}", base))?;
-
-    let result =
-        neoethos_search::evolve_search(&features, base_ohlcv, genes, generations, max_indicators)?;
-    let mut best_idx = 0usize;
-    let mut best_profit = f64::MIN;
-    for (idx, metrics) in result.metrics.iter().enumerate() {
-        let net_profit = metrics[0];
-        if net_profit > best_profit {
-            best_profit = net_profit;
-            best_idx = idx;
-        }
-    }
-    println!(
-        "Search {} genes={} best_idx={} net_profit={:.2}",
-        symbol, genes, best_idx, best_profit
-    );
-    Ok(())
-}
-
 /// What a streaming sweep leaves behind, beyond the per-batch portfolios: the
 /// run-level canonical feature list, the survivors remapped onto it, and the
 /// census of every batch the sweep abandoned.
@@ -1156,6 +1973,7 @@ struct StreamingArtifactBundle {
     canonical: neoethos_search::orchestration::CanonicalFeatureIndex,
     survivors: Vec<neoethos_search::orchestration::CanonicalSurvivor>,
     ledger: neoethos_search::orchestration::StreamingRunLedger,
+    primary_cursor: usize,
     next_cursor: usize,
     space_len: usize,
     batch_columns: usize,
@@ -1171,24 +1989,33 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             .transpose()?
             .unwrap_or_default();
         let root = parse_root(args, settings.as_ref());
-        // Folder-browse support (2026-05-14): when `--data-path` or
-        // `--dry-run` are supplied, scan the folder and emit a
-        // dataset-layout summary before the GA pipeline starts.
-        if has_flag(args, "--data-path") || has_flag(args, "--dry-run") {
-            let _ = print_dataset_discovery_summary(&root)?;
-            if has_flag(args, "--dry-run") {
-                let dry_symbol = parse_flag(args, "--symbol")
-                    .unwrap_or_else(|| default_symbol(settings.as_ref()));
-                let dry_base = parse_flag(args, "--base")
-                    .unwrap_or_else(|| default_base_tf(settings.as_ref()));
-                return Ok((dry_symbol, dry_base, 0, 0));
-            }
-        }
         let symbol =
             parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
         let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
         let higher = parse_flag(args, "--higher")
             .unwrap_or_else(|| default_higher_tfs_csv(settings.as_ref(), &base));
+        let higher_list: Vec<String> = higher
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect();
+        // Folder-browse support (2026-05-14): when `--data-path` or
+        // `--dry-run` are supplied, scan the folder and emit a
+        // canonical manifest summary before the GA pipeline starts.
+        if has_flag(args, "--data-path") || has_flag(args, "--dry-run") {
+            let _ = print_dataset_discovery_summary(&root)?;
+        }
+        let identities = inventory_canonical_identities(&root, &symbol)?;
+        let base_identity = select_exact_runtime_identity(&identities, args, &symbol, &base)?;
+        let selection = select_runtime_timeframe_identities_for_base(
+            &identities,
+            &base_identity,
+            &higher_list,
+        )?;
+        if has_flag(args, "--dry-run") {
+            return Ok((symbol, base, 0, 0));
+        }
         // F-304 fix (2026-05-28): bind the account currency for the
         // cost model. Resolution order:
         //   1. `--account-currency` CLI flag (operator-explicit)
@@ -1232,44 +2059,21 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         let out = parse_flag(args, "--out")
             .unwrap_or_else(|| "cache/vector_ta_knowledge.json".to_string());
 
-        let higher_list: Vec<String> = higher
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.trim().to_string())
-            .collect();
+        #[cfg(not(feature = "gpu-nvidia"))]
         let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
-        // agent 2026-06-05 perf fix: load ONLY base + higher TFs, not every
-        // timeframe. `load_symbol_dataset` loaded EVERY canonical TF (incl M1's
-        // ~5.27M rows) for every combo, then `ensure_timeframes_with_resample`
-        // cloned the whole frame map — the dominant per-combo pre-GA cost
-        // (minutes, GPU idle). `ensure_timeframes_with_resample` skips TFs <= base
-        // and only resamples MISSING higher TFs from the base, so base + higher
-        // (filtered to what exists on disk) is sufficient. M1's 5.27M rows are now
-        // loaded only for the M1-base combo, not for every combo.
-        let mut want_tfs: Vec<String> = vec![base.clone()];
-        for h in &higher_list {
-            if !want_tfs.contains(h) {
-                want_tfs.push(h.clone());
-            }
-        }
-        want_tfs
-            .retain(|tf| neoethos_data::symbol_timeframe_vortex_path(&root, &symbol, tf).exists());
-        if !want_tfs.iter().any(|t| t == &base) {
-            want_tfs.push(base.clone());
-        }
-        let want_refs: Vec<&str> = want_tfs.iter().map(|s| s.as_str()).collect();
-        let dataset =
-            neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &want_refs)?;
-        let dataset = neoethos_data::ensure_timeframes_with_resample(
-            &dataset,
-            &base,
-            neoethos_data::MANDATORY_TFS,
-        )?;
-        let base_ohlcv = dataset
-            .frames
-            .get(&base)
-            .ok_or_else(|| anyhow::anyhow!("base timeframe missing: {}", base))?;
+        // Snapshot immutable generation metadata before any run. On a CUDA
+        // build, values are decoded only inside the selected prepared CPU
+        // factory, after one cross-vendor physical-device admission. The
+        // featureless CPU build retains its compatibility path below.
+        #[cfg(feature = "gpu-nvidia")]
+        let mut pinned_selection = pin_direct_timeframe_selection(&root, &selection)?;
+        #[cfg(not(feature = "gpu-nvidia"))]
+        let dataset = load_required_direct_symbol_dataset(&root, &symbol, &selection)?;
+        #[cfg(not(feature = "gpu-nvidia"))]
+        let base_frame = dataset.canonical_frame(&base)?;
+        #[cfg(not(feature = "gpu-nvidia"))]
+        let base_ohlcv = base_frame.ohlcv();
 
         let config = neoethos_search::DiscoveryConfig {
             timeframe_label: base.clone(),
@@ -1314,12 +2118,169 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         // FULL series — no held-out tail, so every "validation" window had
         // already been seen during selection. The holdout wrapper withholds
         // the last 20% and attaches honest forward-test/prop-firm evidence.
+        #[cfg(feature = "gpu-nvidia")]
+        let (result, streaming) = if !stream_sweep {
+            let feature_options = neoethos_data::FeatureBuildOptions {
+                higher_tfs: higher_list.clone(),
+                ..neoethos_data::FeatureBuildOptions::default()
+            };
+            let pinned_series = std::cell::RefCell::new(Some(
+                pinned_selection.take_or_repin(std::path::Path::new(root.as_str()))?,
+            ));
+            let prepared = neoethos_search::prepare_canonical_discovery_run_input_v3(
+                |no_physical_gpu_admission| {
+                    let pinned_series = pinned_series
+                        .borrow_mut()
+                        .take()
+                        .context("CLI Discovery pin was already consumed")?;
+                    let dataset = pinned_series
+                        .into_cpu_dataset_after_no_physical_gpu_v1(&no_physical_gpu_admission)?;
+                    let base_frame =
+                        dataset.canonical_frame(selection.base_identity.timeframe().as_str())?;
+                    let features = neoethos_data::prepare_multitimeframe_features_with_options(
+                        &dataset,
+                        selection.base_identity.timeframe().as_str(),
+                        &feature_options,
+                    )?;
+                    let input = neoethos_search::data_selection::CanonicalSearchInput::from_prepared_canonical_frame(
+                        selection.base_identity.clone(),
+                        base_frame,
+                        features,
+                    )?;
+                    Ok((input, no_physical_gpu_admission))
+                },
+                || {
+                    anyhow::bail!(
+                        "CLI Discovery cannot seal the complete native workspace yet; refusing host feature materialization on a physical GPU"
+                    )
+                },
+                |_admitted_native_run| {
+                    let _pinned_series = pinned_series
+                        .borrow_mut()
+                        .take()
+                        .context("CLI Discovery pin was already consumed")?;
+                    anyhow::bail!(
+                        "CLI native Data materialization is unreachable before workspace sealing"
+                    )
+                },
+            )?;
+            let result =
+                neoethos_search::run_prepared_canonical_discovery_with_holdout_and_progress_v3(
+                    prepared,
+                    &config,
+                    neoethos_search::PropFirmRiskRules::default(),
+                    |_| {},
+                )?;
+            (result, None)
+        } else {
+            let feature_options = neoethos_data::FeatureBuildOptions {
+                higher_tfs: higher_list.clone(),
+                ..neoethos_data::FeatureBuildOptions::default()
+            };
+            let mut outcome =
+                neoethos_search::orchestration::run_prepared_streaming_working_set_v3(
+                    &neoethos_search::orchestration::StreamingPlan::streaming(stream_max_batches),
+                    pinned_selection.base_row_count,
+                    |_batch| pinned_selection.take_or_repin(std::path::Path::new(root.as_str())),
+                    |batch, pinned_series, no_physical_gpu_admission| {
+                        let dataset = pinned_series.into_cpu_dataset_after_no_physical_gpu_v1(
+                            &no_physical_gpu_admission,
+                        )?;
+                        let base_frame = dataset
+                            .canonical_frame(selection.base_identity.timeframe().as_str())?;
+                        let input = neoethos_data::with_extended_sweep_working_set(batch, || {
+                            let features =
+                                neoethos_data::prepare_multitimeframe_features_with_options(
+                                    &dataset,
+                                    selection.base_identity.timeframe().as_str(),
+                                    &feature_options,
+                                )?;
+                            neoethos_search::data_selection::CanonicalSearchInput::from_prepared_canonical_frame(
+                                selection.base_identity.clone(),
+                                base_frame,
+                                features,
+                            )
+                            .map_err(anyhow::Error::new)
+                        })?;
+                        Ok((input, no_physical_gpu_admission))
+                    },
+                    |_batch| {
+                        anyhow::bail!(
+                            "CLI streaming Discovery cannot seal the complete native workspace yet; refusing host feature materialization on a physical GPU"
+                        )
+                    },
+                    |_batch, _pinned_series, _admitted_native_run| {
+                        anyhow::bail!(
+                            "CLI streaming native Data materialization is unreachable before workspace sealing"
+                        )
+                    },
+                    |prepared| {
+                        neoethos_search::run_prepared_canonical_discovery_with_holdout_and_progress_v3(
+                        prepared,
+                        &config,
+                        neoethos_search::PropFirmRiskRules::default(),
+                        |_| {},
+                    )
+                    },
+                )?;
+            if outcome.batches.is_empty() {
+                let rejected: Vec<(usize, &'static str)> = outcome
+                    .ledger
+                    .rejected_rows()
+                    .iter()
+                    .map(|row| (row.cursor, row.outcome.as_str()))
+                    .collect();
+                anyhow::bail!(
+                    "streaming sweep produced no portfolio: {} batches attempted, {} abandoned \
+                     (counts: {:?}; abandoned cursors: {:?}). The sweep covered pairs \
+                     [0, {}) of {} at {} columns per batch. Nothing was lost silently — every \
+                     cursor above has a reason in the run log \
+                     (target=neoethos_search::batch_ledger).",
+                    outcome.ledger.batches_seen(),
+                    outcome.ledger.batches_rejected(),
+                    outcome.ledger.counts_by_outcome(),
+                    rejected,
+                    outcome.next_cursor,
+                    outcome.space_len,
+                    outcome.batch_columns
+                );
+            }
+            let survivors = outcome.survivors();
+            let primary = outcome.batches.remove(0);
+            let bundle = StreamingArtifactBundle {
+                canonical: outcome.canonical.clone(),
+                survivors,
+                ledger: outcome.ledger.clone(),
+                primary_cursor: primary.cursor,
+                next_cursor: outcome.next_cursor,
+                space_len: outcome.space_len,
+                batch_columns: outcome.batch_columns,
+                streamed: outcome.streamed,
+            };
+            let extra: Vec<(usize, neoethos_search::DiscoveryResult)> = outcome
+                .batches
+                .into_iter()
+                .map(|batch| (batch.cursor, batch.result))
+                .collect();
+            (primary.result, Some((bundle, extra)))
+        };
+
+        #[cfg(not(feature = "gpu-nvidia"))]
         let (result, streaming) = if !stream_sweep {
             let features =
                 neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
-            let result = neoethos_search::run_discovery_cycle_with_holdout(
+            let receipt =
+                neoethos_search::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(
+                    &selection.base_identity,
+                    &features,
+                )?;
+            let run_input = neoethos_search::data_selection::CanonicalSearchRunInputV2::new(
+                receipt,
                 &features,
-                base_ohlcv,
+                &base_frame,
+            )?;
+            let result = neoethos_search::run_discovery_cycle_with_holdout(
+                &run_input,
                 &config,
                 neoethos_search::PropFirmRiskRules::default(),
             )?;
@@ -1341,9 +2302,18 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                     )
                 },
                 |features| {
-                    neoethos_search::run_discovery_cycle_with_holdout(
+                    let receipt = neoethos_search::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(
+                        &selection.base_identity,
                         features,
-                        base_ohlcv,
+                    )?;
+                    let run_input =
+                        neoethos_search::data_selection::CanonicalSearchRunInputV2::new(
+                            receipt,
+                            features,
+                            &base_frame,
+                        )?;
+                    neoethos_search::run_discovery_cycle_with_holdout(
+                        &run_input,
                         &config,
                         neoethos_search::PropFirmRiskRules::default(),
                     )
@@ -1377,19 +2347,20 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             // Provenance for the run-level artifact is collected BEFORE the
             // primary batch is moved out for the per-run artifacts below.
             let survivors = outcome.survivors();
+            // The FIRST surviving batch takes today's artifact paths, so a
+            // single-batch sweep writes exactly the file set a non-streaming
+            // run writes. Later batches are written beside it, keyed by cursor.
+            let primary = outcome.batches.remove(0);
             let bundle = StreamingArtifactBundle {
                 canonical: outcome.canonical.clone(),
                 survivors,
                 ledger: outcome.ledger.clone(),
+                primary_cursor: primary.cursor,
                 next_cursor: outcome.next_cursor,
                 space_len: outcome.space_len,
                 batch_columns: outcome.batch_columns,
                 streamed: outcome.streamed,
             };
-            // The FIRST surviving batch takes today's artifact paths, so a
-            // single-batch sweep writes exactly the file set a non-streaming
-            // run writes. Later batches are written beside it, keyed by cursor.
-            let primary = outcome.batches.remove(0);
             let extra: Vec<(usize, neoethos_search::DiscoveryResult)> = outcome
                 .batches
                 .into_iter()
@@ -1448,13 +2419,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         // strategies with backtest parity. Additive + non-fatal.
         {
             let live_path = format!("{out}.live_portfolio.json");
-            if let Err(err) = neoethos_search::save_live_portfolio_json(
-                &live_path,
-                &symbol,
-                &base,
-                &config.higher_timeframes,
-                &result,
-            ) {
+            if let Err(err) = neoethos_search::save_live_portfolio_json(&live_path, &result) {
                 tracing::warn!(
                     target: "neoethos_cli::discover",
                     error = %err,
@@ -1465,14 +2430,9 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         }
         let profile_path = format!("{out}.profile.json");
         neoethos_search::save_discovery_profile_json(&profile_path, &config, &result)?;
-        if !result.canonical_backtest_artifacts.is_empty() {
-            let backtest_dir = format!("{out}.canonical_backtests");
-            neoethos_search::save_canonical_backtest_artifacts(&backtest_dir, &result)?;
-        }
-        if !result.walkforward_validation_artifacts.is_empty() {
-            let validation_dir = format!("{out}.walkforward_validations");
-            neoethos_search::save_walkforward_validation_artifacts(&validation_dir, &result)?;
-        }
+        let primary_snapshot_root = format!("{out}.validation_snapshot");
+        let primary_snapshot =
+            neoethos_search::save_discovery_validation_snapshot(&primary_snapshot_root, &result)?;
         // ── The streaming run artifact ──────────────────────────────────────
         //
         // Written ONLY on a streaming run, and never instead of the per-batch
@@ -1482,6 +2442,14 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         // view — Option C's canonical name list, the survivors remapped onto
         // it with the cursor that produced each one, and the batch census.
         if let Some((bundle, extra)) = streaming {
+            let mut batch_snapshots = Vec::with_capacity(extra.len() + 1);
+            batch_snapshots.push(
+                neoethos_search::orchestration::StreamingBatchValidationSnapshotRefV1 {
+                    source_cursor: bundle.primary_cursor,
+                    snapshot_root: primary_snapshot_root,
+                    pointer: primary_snapshot,
+                },
+            );
             for (cursor, batch_result) in &extra {
                 let batch_out = format!("{out}.batch{cursor}.json");
                 // Non-fatal, deliberately: `save_portfolio_json` runs the
@@ -1496,10 +2464,29 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                         cursor = *cursor,
                         path = %batch_out,
                         "per-batch portfolio export failed (non-fatal — this batch's survivors \
-                         are still in the streaming run artifact)"
+                        are still in the streaming run artifact)"
                     );
                 }
+                let batch_snapshot_root = format!("{out}.batch{cursor}.validation_snapshot");
+                let pointer = neoethos_search::save_discovery_validation_snapshot(
+                    &batch_snapshot_root,
+                    batch_result,
+                )?;
+                batch_snapshots.push(
+                    neoethos_search::orchestration::StreamingBatchValidationSnapshotRefV1 {
+                        source_cursor: *cursor,
+                        snapshot_root: batch_snapshot_root,
+                        pointer,
+                    },
+                );
             }
+            batch_snapshots.sort_by_key(|snapshot| snapshot.source_cursor);
+            anyhow::ensure!(
+                batch_snapshots
+                    .windows(2)
+                    .all(|pair| pair[0].source_cursor < pair[1].source_cursor),
+                "streaming validation snapshots contain duplicate source cursors"
+            );
             let genes: Vec<neoethos_search::Gene> = bundle
                 .survivors
                 .iter()
@@ -1518,13 +2505,17 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                 higher_timeframes: config.higher_timeframes.clone(),
                 canonical_feature_names: bundle.canonical.names().to_vec(),
                 survivors: bundle.survivors,
+                promotion_authority:
+                    neoethos_search::orchestration::StreamingPromotionAuthorityV1::PerBatchLocalOnly {
+                        batch_snapshots,
+                    },
                 next_cursor: bundle.next_cursor,
                 space_len: bundle.space_len,
                 batch_columns: bundle.batch_columns,
                 ledger: bundle.ledger,
             };
             let streaming_path = format!("{out}.streaming.json");
-            std::fs::write(&streaming_path, serde_json::to_string_pretty(&artifact)?)?;
+            neoethos_core::storage::json::write_json_atomic(&streaming_path, &artifact)?;
             println!(
                 "Streaming sweep streamed={} batches={} kept={} abandoned={} survivors={} \
                  canonical_features={} cursor={}/{} batch_columns={} out={}",
@@ -1597,7 +2588,7 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
             parse_flag(args, "--out-dir").unwrap_or_else(|| "cache/discovery".to_string());
 
         let symbols: Vec<String> = if symbols_raw.is_empty() {
-            neoethos_data::discover_symbols(&root)?
+            metadata_inventory_symbols(&root)?
         } else {
             symbols_raw
                 .split(',')
@@ -1637,9 +2628,39 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
         {
             config.portfolio_size = ps;
         }
+        let inventory = neoethos_data::DatasetDiscovery::scan(&root)
+            .with_context(|| format!("fully verify canonical batch inventory under {root}"))?;
+        for entry in &inventory.entries {
+            print_dataset_inventory_entry(entry)?;
+        }
+        print_dataset_inventory_rejections(&inventory);
+        let mut anchors = Vec::with_capacity(symbols.len().saturating_mul(tfs.len()));
+        for symbol in &symbols {
+            let identities = verified_canonical_identities(&inventory, symbol)?;
+            for timeframe in &tfs {
+                let selection = select_runtime_timeframe_identities(
+                    &identities,
+                    symbol,
+                    timeframe,
+                    &config.higher_timeframes,
+                )
+                .with_context(|| {
+                    format!(
+                        "batch-discover direct-timeframe preflight failed for {symbol}/{timeframe}; import/download required"
+                    )
+                })?;
+                anchors.push(selection.base_identity);
+            }
+        }
+        anchors.sort_by_key(|identity| identity.to_path_component());
+        anchors.dedup();
+        anyhow::ensure!(
+            !anchors.is_empty(),
+            "batch-discover resolved zero exact canonical anchors"
+        );
         let orchestrator = neoethos_search::DiscoveryOrchestrator::new(&root, &out_dir, config);
 
-        let summary = orchestrator.run_batch(&symbols, &tfs)?;
+        let summary = orchestrator.run_batch(&anchors)?;
 
         println!(
             "Batch discovery complete. Results in {} (saved={} work_units={} skipped_symbols={} skipped_timeframes={} feature_failures={} empty_portfolios={})",
@@ -1685,12 +2706,6 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
     result.map(|_| ())
 }
 
-/// Recursive universal data importer — converts CSV/TSV/JSON/JSONL/
-/// Parquet/Vortex files anywhere under `--source` into the canonical
-/// `data/symbol={SYM}/timeframe={TF}/data.vortex` layout under
-/// `--root`. Symbol/timeframe are inferred from path components or the
-/// filename. Failed conversions are quarantined; the report is written
-/// to `<root>/import_report.json`.
 /// Print the resolved config: every setting with raw value, resolved
 /// value, source (config / sentinel-expanded / env / default), and
 /// notes. The TUI's Config page renders the same data.
@@ -1929,10 +2944,6 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
     let feature_count: usize = parse_flag(args, "--features")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1500);
-    // bytes-per-bar for the load-free row estimate (vortex-compressed OHLCV).
-    let bytes_per_bar: f64 = parse_flag(args, "--bytes-per-bar")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(12.0);
     let population = resolved.search.population;
 
     // Set the data root for any child orchestrator BEFORE any thread spawns.
@@ -1940,9 +2951,22 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
         std::env::set_var("NEOETHOS_BOT_DATA_ROOT", &root);
     }
 
+    // One full verification pass for the entire scheduling snapshot. The
+    // scheduler never materializes OHLCV, but it also never authorizes a row
+    // shape from compressed byte size or manifest-only inventory.
+    let inventory = neoethos_data::DatasetDiscovery::scan(&root)
+        .with_context(|| format!("fully verify canonical schedule inventory under {root}"))?;
+    for entry in &inventory.entries {
+        print_dataset_inventory_entry(entry)?;
+    }
+    print_dataset_inventory_rejections(&inventory);
+    anyhow::ensure!(
+        !inventory.entries.is_empty(),
+        "schedule found no fully verified canonical dataset identities under {root}"
+    );
     let symbols: Vec<String> = match parse_flag(args, "--symbols") {
         Some(s) if !s.trim().is_empty() => s.split(',').map(|x| x.trim().to_uppercase()).collect(),
-        _ => neoethos_data::discover_symbols(&root)?,
+        _ => inventory.symbols(),
     };
     let tfs: Vec<String> = parse_flag(args, "--timeframes")
         .unwrap_or_else(|| resolved.timeframes.canonical_default.join(","))
@@ -1965,13 +2989,27 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
         std::collections::HashMap::new();
     let mut schedulable: Vec<ComboItem> = Vec::new();
     for sym in &symbols {
+        let identities = verified_canonical_identities(&inventory, sym)?;
         for tf in &tfs {
             let id = format!("{sym}/{tf}");
-            let rows = estimate_series_rows(&root, sym, tf, bytes_per_bar);
-            if rows == 0 {
-                println!("  skip {id}: no vortex data found on disk");
-                continue;
-            }
+            let requested_direct = default_higher_tfs_csv(Some(&settings), tf)
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let selection = select_runtime_timeframe_identities(
+                &identities,
+                sym,
+                tf,
+                &requested_direct,
+            )
+            .with_context(|| {
+                format!(
+                    "schedule direct-timeframe preflight failed for {id}; import/download required"
+                )
+            })?;
+            let rows = schedule_series_rows(&inventory, &root, &selection.base_identity)?;
             let shape = ComboShape::new(rows, population, feature_count);
             let plan = plan_combo(shape, &hw, &policy);
             id_combo.insert(id.clone(), (sym.clone(), tf.clone()));
@@ -1992,7 +3030,7 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
             ""
         };
         println!(
-            "  [{:?}] {:<14} rows≈{:>9}  assigned_cards={} population/device={} cpu={} RAM≈{:.1}GB VRAM/device≈{:.1}GB{}",
+            "  [{:?}] {:<14} rows={:>9}  assigned_cards={} population/device={} cpu={} RAM≈{:.1}GB VRAM/device≈{:.1}GB{}",
             it.plan.class,
             it.id,
             it.shape.series_rows,
@@ -2121,18 +3159,45 @@ fn cmd_schedule(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Cheap, load-free estimate of the bar count for a symbol/timeframe from the
-/// on-disk vortex file size. The orchestrator must NOT materialise data (M1 is
-/// ~80GB expanded), so we estimate from bytes. Feeds the admission planner,
-/// whose conservative margins + the subprocess's exact load make the estimate
-/// non-critical to correctness.
-fn estimate_series_rows(root: &str, symbol: &str, tf: &str, bytes_per_bar: f64) -> usize {
-    let path = neoethos_data::symbol_timeframe_vortex_path(root, symbol, tf);
-    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64;
-    if bytes <= 0.0 {
-        return 0;
-    }
-    (bytes / bytes_per_bar.max(1.0)).ceil() as usize
+/// Exact, load-free row count for one entry from the already fully verified
+/// scheduling snapshot. Re-reading the small manifest is safe only if its
+/// generation and binding still equal that snapshot; publication races fail
+/// closed and the caller can rerun schedule against a fresh inventory.
+fn schedule_series_rows(
+    inventory: &neoethos_data::DatasetDiscovery,
+    root: impl AsRef<std::path::Path>,
+    identity: &neoethos_data::CanonicalDatasetIdentity,
+) -> Result<usize> {
+    let symbol = identity.symbol_name();
+    let timeframe = identity.timeframe();
+    let identity_path = identity.to_path_component();
+    let matching = inventory
+        .entries
+        .iter()
+        .filter(|entry| entry.dataset_identity == identity_path)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matching.len() == 1,
+        "schedule requires exactly one fully verified canonical dataset identity for {symbol} {timeframe}, found {}; import/download required",
+        matching.len()
+    );
+    let entry = matching[0];
+    anyhow::ensure!(
+        entry.verification == neoethos_data::DataVerificationStatus::GenerationVerified,
+        "schedule inventory entry for {symbol} {timeframe} is not generation-verified"
+    );
+    let manifest = neoethos_data::core::dataset_manifest::read_current_manifest_metadata(
+        root.as_ref(),
+        identity,
+    )?;
+    anyhow::ensure!(
+        manifest.generation_id() == entry.generation.as_str()
+            && manifest.manifest_binding_sha256() == entry.manifest_binding_sha256.as_str(),
+        "canonical generation changed after schedule verification for {symbol} {timeframe}; rerun schedule"
+    );
+    let rows = usize::try_from(manifest.row_count())
+        .with_context(|| format!("manifest row count for {symbol} {timeframe} exceeds usize"))?;
+    Ok(rows)
 }
 
 /// Spawn one `discover` subprocess pinned to its assigned card. The planner and
@@ -2252,19 +3317,6 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
     let resolved = neoethos_core::resolved_config::ResolvedConfig::from_settings(&settings);
     let root = parse_root(args, Some(&settings));
 
-    // Set NEOETHOS_BOT_DATA_ROOT for the in-process training orchestrator
-    // (cmd_train doesn't honor --root yet, see training_orchestrator.rs).
-    // SAFETY: called before any thread spawn — we are still in
-    // single-threaded init here (setup_logging and the search-runtime
-    // overrides installer above only mutate tracing/global config; rayon
-    // and tokio threads are not started until cmd_discover/cmd_train run,
-    // which happen below). Per std::env::set_var docs, on Linux/macOS the
-    // ONLY safe option is to mutate env before any other thread exists;
-    // doing this inside the per-symbol loop would race with rayon worker
-    // threads spawned by the prior cmd_discover call.
-    unsafe {
-        std::env::set_var("NEOETHOS_BOT_DATA_ROOT", &root);
-    }
     let symbols_raw = parse_flag(args, "--symbols").unwrap_or_default();
     let tfs_raw = parse_flag(args, "--timeframes")
         .unwrap_or_else(|| resolved.timeframes.canonical_default.join(","));
@@ -2278,7 +3330,7 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
     let checkpoint_path = std::path::PathBuf::from("cache").join("auto_loop_checkpoint.json");
 
     let symbols: Vec<String> = if symbols_raw.is_empty() {
-        neoethos_data::discover_symbols(&root)?
+        metadata_inventory_symbols(&root)?
     } else {
         symbols_raw
             .split(',')
@@ -2387,6 +3439,8 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
                 tf.clone(),
                 "--models-dir".to_string(),
                 "cache/auto_loop_models".to_string(),
+                "--root".to_string(),
+                root.clone(),
             ];
             match cmd_train(&train_args) {
                 Ok(()) => println!("  train OK"),
@@ -2471,108 +3525,221 @@ struct AutoLoopCheckpoint {
 }
 
 fn cmd_import(args: &[String]) -> Result<()> {
+    validate_import_arguments(args)?;
+    let source = required_import_flag(args, "--source")?;
+    let source = std::path::PathBuf::from(source);
+    let source = if source.is_absolute() {
+        source
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for relative import source")?
+            .join(source)
+    };
+
+    // Discovery is metadata-only. It may suggest labels from paths/extensions,
+    // but it never publishes, converts, or supplies implicit values to a real
+    // import request.
+    if has_flag(args, "--dry-run") {
+        return print_import_discovery_summary(&source);
+    }
+
+    let source_format = required_import_flag(args, "--format")?
+        .parse::<neoethos_data::core::import_provenance::ImportSourceFormat>()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let source_namespace = required_import_flag(args, "--source-namespace")?;
+    let symbol = required_import_flag(args, "--symbol")?;
+    let timeframe = required_import_flag(args, "--timeframe")?
+        .parse::<neoethos_data::CanonicalTimeframe>()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let bar_timestamp_convention = required_import_flag(args, "--bar-timestamps")?
+        .parse::<neoethos_data::BarTimestampConvention>()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if !bar_timestamp_convention.is_canonical_bar_open() {
+        anyhow::bail!(
+            "--bar-timestamps={} cannot become canonical; only explicitly evidenced bar_open timestamps are accepted",
+            bar_timestamp_convention
+        );
+    }
+    let expected_generation = unique_import_flag(args, "--expected-generation")?;
+
     let settings = resolve_cli_settings(args)?;
-    let root = parse_root(args, settings.as_ref());
-    let source = parse_flag(args, "--source").unwrap_or_else(|| root.clone());
-    let force = has_flag(args, "--force");
+    let root = unique_import_flag(args, "--root")?
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            settings
+                .as_ref()
+                .map(|settings| settings.system.data_dir.clone())
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("data"));
+    let identity = neoethos_data::CanonicalDatasetIdentity::external(
+        source_namespace.trim(),
+        symbol.trim(),
+        timeframe,
+        bar_timestamp_convention,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
-    // Folder-browse support (2026-05-14): when the operator points
-    // `--data-path` at a folder, scan it and print a summary so they
-    // can confirm the layout before any conversion runs. `--dry-run`
-    // exits after the summary.
-    if has_flag(args, "--data-path") || has_flag(args, "--dry-run") {
-        let _ = print_dataset_discovery_summary(&source)?;
-        if has_flag(args, "--dry-run") {
-            return Ok(());
-        }
-    }
-
-    let report =
-        neoethos_data::core::universal_importer::import_directory_recursive(&source, &root, force)?;
-
-    let report_path = std::path::PathBuf::from(&root).join("import_report.json");
-    if let Err(err) = report.save_to_disk(&report_path) {
-        tracing::warn!(
-            target: "neoethos_cli",
-            path = %report_path.display(),
-            error = %err,
-            "universal import: failed to save report"
-        );
-    }
-
-    println!(
-        "Universal import: source={} root={} files_seen={} imported={} skipped={} quarantined={} failed={}",
-        source,
-        root,
-        report.files_seen,
-        report.imported,
-        report.skipped,
-        report.quarantined,
-        report.failed
+    let installed = neoethos_core::execution_budget::installed_process_budget()
+        .context("import unavailable before the process CPU budget is installed")?;
+    let auxiliary_limit = neoethos_core::execution_budget::AuxiliarySlotLimit::new(
+        neoethos_data::source_seal_slot_limit(),
+    )?;
+    let admission = neoethos_core::execution_budget::CompositeAdmissionAuthority::new(
+        installed.broker().clone(),
+        auxiliary_limit,
     );
-    println!("  full report: {}", report_path.display());
-    for r in report.results.iter().take(20) {
-        println!(
-            "  [{:?}] {} -> {} rows ({})",
-            r.status, r.source, r.rows, r.message
-        );
+    let grant = admission.acquire(
+        neoethos_core::execution_budget::CompositeAdmissionRequest::new(
+            neoethos_core::execution_budget::CpuPermitRequest::local(
+                installed.resolved().effective_worker_limit,
+            ),
+            neoethos_core::execution_budget::AuxiliarySlotRequest::One,
+        ),
+    )?;
+    let (cpu_lease, auxiliary_slot) = grant.into_parts();
+    let auxiliary_slot = auxiliary_slot
+        .context("composite import admission returned no SourceSeal auxiliary slot")?;
+    let limits = neoethos_data::core::import_limits::ImportLimits::default();
+    let imported = cpu_lease.scope(|| -> Result<_> {
+        let imported = neoethos_data::core::import_service::import_path_to_vortex(
+            neoethos_data::core::import_service::ImportRequest {
+                source_path: &source,
+                configured_root: &root,
+                identity: &identity,
+                declared_format: source_format,
+                expected_generation: expected_generation.as_deref(),
+                limits: &limits,
+                auxiliary_slot: &auxiliary_slot,
+            },
+        )?;
+        let provenance = imported.provenance();
+        if provenance.dataset_identity() != &identity
+            || provenance.selected_format() != source_format
+            || provenance.detected_format() != source_format
+        {
+            anyhow::bail!("reopened canonical import provenance disagrees with the request");
+        }
+        Ok(imported)
+    })?;
+    let manifest = imported.manifest();
+    let provenance = imported.provenance();
+
+    println!("Canonical Vortex import committed and reopened successfully");
+    println!("  source:             {}", source.display());
+    println!("  declared format:    {}", source_format);
+    println!("  dataset identity:   {}", identity.to_path_component());
+    println!("  generation:         {}", imported.generation());
+    println!("  durable commit:     {}", imported.durable_commit_id());
+    println!("  rows:               {}", imported.row_count());
+    let source_sha256 = provenance
+        .source_sha256()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    println!("  source sha256:      {source_sha256}");
+    println!(
+        "  canonical Vortex:   {}",
+        manifest.generation_path().display()
+    );
+    println!("  vortex sha256:      {}", manifest.vortex_sha256());
+    Ok(())
+}
+
+fn validate_import_arguments(args: &[String]) -> Result<()> {
+    const VALUE_FLAGS: &[&str] = &[
+        "--source",
+        "--format",
+        "--source-namespace",
+        "--symbol",
+        "--timeframe",
+        "--bar-timestamps",
+        "--expected-generation",
+        "--root",
+        "--config",
+    ];
+    const BOOLEAN_FLAGS: &[&str] = &["--dry-run"];
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if BOOLEAN_FLAGS.contains(&argument) {
+            index += 1;
+            continue;
+        }
+        if VALUE_FLAGS.contains(&argument) {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow::anyhow!("import {argument} requires a non-empty value"))?;
+            if value.trim().is_empty() || value.starts_with("--") {
+                anyhow::bail!("import {argument} requires a non-empty value");
+            }
+            index += 2;
+            continue;
+        }
+        anyhow::bail!("unknown import argument `{argument}`; refusing to infer its meaning");
     }
-    if report.results.len() > 20 {
-        println!("  ... ({} more in report)", report.results.len() - 20);
+    for flag in VALUE_FLAGS {
+        let _ = unique_import_flag(args, flag)?;
     }
     Ok(())
 }
 
-fn cmd_migrate_data(args: &[String]) -> Result<()> {
-    let settings = resolve_cli_settings(args)?;
-    let root = parse_root(args, settings.as_ref());
-    let force = has_flag(args, "--force");
-    let delete_source = has_flag(args, "--delete-source");
-    let summary = neoethos_data::migrate_legacy_parquet_tree(&root, force, delete_source)?;
+fn unique_import_flag(args: &[String], name: &str) -> Result<Option<String>> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == name {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow::anyhow!("import {name} requires a value"))?;
+            values.push(value.trim().to_owned());
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    match values.len() {
+        0 => Ok(None),
+        1 => Ok(values.pop()),
+        count => anyhow::bail!("import {name} was supplied {count} times"),
+    }
+}
 
+fn required_import_flag(args: &[String], name: &str) -> Result<String> {
+    unique_import_flag(args, name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "import requires {name}; source identity and schema are never inferred for publication"
+        )
+    })
+}
+
+fn print_import_discovery_summary(source: &std::path::Path) -> Result<()> {
+    let report = neoethos_data::ImportDiscovery::scan(source)?;
+    println!("Import discovery only — no bytes were converted or published");
+    println!("  scanned: {}", report.root.display());
+    println!("  candidates: {}", report.entries.len());
+    for entry in &report.entries {
+        println!(
+            "  {}  suggested-format={}  suggested-symbol={}  suggested-timeframe={}  bytes={}",
+            entry.path.display(),
+            entry.format,
+            entry.symbol.as_deref().unwrap_or("<declare --symbol>"),
+            entry
+                .timeframe
+                .as_deref()
+                .unwrap_or("<declare --timeframe>"),
+            entry.size_bytes
+        );
+    }
+    for skipped in &report.skipped {
+        println!(
+            "  SKIPPED {} ({:?})",
+            skipped.path.display(),
+            skipped.reason
+        );
+    }
     println!(
-        "Vortex migration root={} converted={} skipped={} failed={}",
-        root,
-        summary.total_converted(),
-        summary.total_skipped(),
-        summary.total_failed()
+        "Run a real import with one file and explicit --format, --source-namespace, --symbol, --timeframe, and --bar-timestamps bar_open."
     );
-
-    for record in &summary.converted {
-        println!(
-            "  converted {} {} rows={} -> {}",
-            record.job.symbol,
-            record.job.timeframe,
-            record.rows,
-            record.job.vortex_path.display()
-        );
-    }
-    for record in &summary.skipped {
-        println!(
-            "  skipped {} {} rows={} -> {}",
-            record.job.symbol,
-            record.job.timeframe,
-            record.rows,
-            record.job.vortex_path.display()
-        );
-    }
-    for failure in &summary.failed {
-        println!(
-            "  failed {} {} -> {} ({})",
-            failure.job.symbol,
-            failure.job.timeframe,
-            failure.job.parquet_path.display(),
-            failure.error
-        );
-    }
-
-    if summary.total_failed() > 0 {
-        anyhow::bail!(
-            "vortex migration completed with {} failed datasets",
-            summary.total_failed()
-        );
-    }
-
     Ok(())
 }
 
@@ -2589,7 +3756,10 @@ fn cmd_stop_target(args: &[String]) -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let ohlcv = neoethos_data::load_symbol_timeframe(&root, &symbol, &timeframe)?;
+    let identities = inventory_canonical_identities(&root, &symbol)?;
+    let identity = select_exact_runtime_identity(&identities, args, &symbol, &timeframe)?;
+    let canonical = load_exact_runtime_timeframe(&root, &identity)?;
+    let ohlcv = canonical.ohlcv();
     let settings = neoethos_search::StopTargetSettings::default();
     let result = neoethos_search::infer_stop_target_pips(
         &ohlcv.open,
@@ -2681,7 +3851,10 @@ fn cmd_autoresearch(args: &[String]) -> Result<()> {
 
     // Refuse an unknown flag rather than ignore it.
     for arg in args {
-        if arg.starts_with("--") && !AUTORESEARCH_FLAGS.contains(&arg.as_str()) {
+        if arg.starts_with("--")
+            && !AUTORESEARCH_FLAGS.contains(&arg.as_str())
+            && arg != "--dataset-identity"
+        {
             anyhow::bail!(
                 "`autoresearch` does not accept {arg}. Accepted: {}.\n\n\
                  There is deliberately NO flag naming a goal constant, a cost field or a judge \
@@ -2690,7 +3863,7 @@ fn cmd_autoresearch(args: &[String]) -> Result<()> {
                  rule broken from the outside. Change the value in your config.yaml and start a \
                  NEW session — a session's goal_hash, judge_hash and cost_hash are frozen into \
                  its id at open and verified on every resume.",
-                AUTORESEARCH_FLAGS.join(" ")
+                format!("{} --dataset-identity", AUTORESEARCH_FLAGS.join(" "))
             );
         }
     }
@@ -2702,7 +3875,12 @@ fn cmd_autoresearch(args: &[String]) -> Result<()> {
     )?;
 
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(Some(&settings)));
-    let mut run_args = neoethos_autoresearch::RunArgs::new(symbol);
+    let base_timeframe = default_base_tf(Some(&settings));
+    let identities = inventory_canonical_identities(&settings.system.data_dir, &symbol)?;
+    let dataset_identity =
+        select_exact_runtime_identity(&identities, args, &symbol, &base_timeframe)
+            .context("selecting the exact canonical dataset for the autoresearch loop")?;
+    let mut run_args = neoethos_autoresearch::RunArgs::new(dataset_identity);
     run_args.dry_run = has_flag(args, "--dry-run");
     run_args.session = parse_flag(args, "--session");
     run_args.scenario = parse_flag(args, "--scenario");
@@ -2725,8 +3903,10 @@ fn cmd_autoresearch(args: &[String]) -> Result<()> {
     }
 
     println!(
-        "autoresearch: symbol {} | max_sweeps {} | max_hours {} | session {} | scenario {}{}",
-        run_args.symbol,
+        "autoresearch: identity {} | symbol {} | base {} | max_sweeps {} | max_hours {} | session {} | scenario {}{}",
+        run_args.dataset_identity.to_path_component(),
+        run_args.dataset_identity.symbol_name(),
+        run_args.dataset_identity.timeframe(),
         run_args.max_sweeps,
         if run_args.max_hours.is_finite() {
             format!("{:.2}", run_args.max_hours)
@@ -2946,19 +4126,13 @@ fn setup_ctrader_template() -> Result<()> {
 // restore a command that advertises a capability with no implementation.
 
 fn parse_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> String {
-    let root = resolve_root(args, settings);
-    // Point the FX resolver at whatever store this command decided on, so a
-    // `--root` run converts cross-pair pip values against that store rather
-    // than the one named in config.yaml.
-    neoethos_search::fx_rates::set_store_root(&root);
-    root
+    resolve_root(args, settings)
 }
 
 fn resolve_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> String {
-    // `--data-path` is the operator-facing flag added 2026-05-14 for
-    // folder-browsing workflows; `--root` remains for backwards
-    // compatibility with existing scripts. `--data-path` wins when
-    // both are supplied because it's the more explicit name.
+    // `--data-path` is the operator-facing canonical manifest-root flag;
+    // `--root` remains for existing scripts. `--data-path` wins when both are
+    // supplied because it is the explicit inventory root.
     if let Some(p) = parse_flag(args, "--data-path") {
         return p;
     }
@@ -2969,9 +4143,10 @@ fn resolve_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> 
     })
 }
 
-/// Run `DatasetDiscovery::scan` on the supplied root and print a
-/// human-readable summary table to stdout. Returns the report so the
-/// caller can react (e.g. honour `--dry-run`).
+/// Run bounded manifest-only inventory on the supplied root and print every
+/// exact identity/generation plus every rejected path. This is status output,
+/// never authorization to consume a generation; runtime readers still perform
+/// full hash/footer/timestamp verification.
 ///
 /// Shell-completion hint: when this codebase migrates to clap-derive,
 /// the `--data-path` argument should be annotated with
@@ -2979,16 +4154,13 @@ fn resolve_root(args: &[String], settings: Option<&neoethos_core::Settings>) -> 
 /// hint can complete directory paths. Today the CLI uses manual arg
 /// parsing, so the hint is documented here as a future-work marker.
 fn print_dataset_discovery_summary(root: &str) -> Result<neoethos_data::DatasetDiscovery> {
-    let report = neoethos_data::DatasetDiscovery::scan(root)?;
+    let report = neoethos_data::DatasetDiscovery::scan_metadata(root)?;
     println!("Scanned: {}", report.root.display());
     if report.is_empty() && report.skipped.is_empty() {
         // Real-data only: never silently fall back to a packaged demo
         // dataset. Surface the empty result so the operator can pick
         // a different folder.
-        println!(
-            "  (no data files found at depth ≤ {})",
-            neoethos_data::MAX_WALK_DEPTH
-        );
+        println!("  (no canonical manifest identities or rejected input paths found)");
         return Ok(report);
     }
 
@@ -2999,7 +4171,7 @@ fn print_dataset_discovery_summary(root: &str) -> Result<neoethos_data::DatasetD
         .map(|(fmt, n)| format!("{}: {}", fmt.as_str(), n))
         .collect();
     println!(
-        "Files found:        {} ({})",
+        "Canonical identities: {} ({})",
         total,
         format_breakdown.join(", ")
     );
@@ -3019,7 +4191,7 @@ fn print_dataset_discovery_summary(root: &str) -> Result<neoethos_data::DatasetD
         symbols.join(", ")
     };
     println!(
-        "Symbols detected:   {}  ({})",
+        "Exact symbols:      {}  ({})",
         symbols.len(),
         symbols_preview
     );
@@ -3027,9 +4199,13 @@ fn print_dataset_discovery_summary(root: &str) -> Result<neoethos_data::DatasetD
     let tfs = report.timeframes();
     println!("Timeframes:         {}", tfs.join(", "));
 
+    for entry in &report.entries {
+        print_dataset_inventory_entry(entry)?;
+    }
+
     if !report.skipped.is_empty() {
         let buckets = report.skip_counts_by_category();
-        // Per-bucket detail: e.g. "unsupported_timeframe: H2 (x4)".
+        // Per-bucket detail: e.g. "import_required: explicit import ... (x4)".
         let mut detail_parts: Vec<String> = Vec::new();
         for (cat, count) in &buckets {
             let example_labels: Vec<String> = report
@@ -3037,12 +4213,11 @@ fn print_dataset_discovery_summary(root: &str) -> Result<neoethos_data::DatasetD
                 .iter()
                 .filter(|s| s.reason.category() == cat)
                 .filter_map(|s| match &s.reason {
-                    neoethos_data::SkipReason::UnsupportedTimeframe(label) => Some(label.clone()),
-                    neoethos_data::SkipReason::UnknownExtension(ext) => Some(format!(".{ext}")),
-                    neoethos_data::SkipReason::TooLarge(bytes) => {
-                        Some(format!("{} MiB", bytes / (1024 * 1024)))
-                    }
-                    neoethos_data::SkipReason::Unreadable(_) => None,
+                    neoethos_data::SkipReason::ImportRequired(detail)
+                    | neoethos_data::SkipReason::RetiredLayout(detail)
+                    | neoethos_data::SkipReason::InvalidCanonicalIdentity(detail)
+                    | neoethos_data::SkipReason::UnverifiedGeneration(detail)
+                    | neoethos_data::SkipReason::Unreadable(detail) => Some(detail.clone()),
                 })
                 .collect();
             let mut uniq: Vec<String> = example_labels;
@@ -3060,6 +4235,7 @@ fn print_dataset_discovery_summary(root: &str) -> Result<neoethos_data::DatasetD
             report.skipped.len(),
             detail_parts.join("; ")
         );
+        print_dataset_inventory_rejections(&report);
     }
 
     Ok(report)
@@ -3448,25 +4624,41 @@ fn print_help() {
     println!("  [--cpu-threads N] [--startup-diagnostics]");
     println!("  symbols --root data");
     println!("  timeframes --symbol EURUSD --root data");
-    println!("  load --symbol EURUSD --timeframe M1 --root data");
-    println!("  features --symbol EURUSD --timeframe M1 --root data");
-    println!("  prepare --symbol EURUSD --base M1 --higher H1,H4 --root data");
-    println!("  resample --symbol EURUSD --base M1 --target H1 --root data");
+    println!("  load --symbol EURUSD --timeframe M1 [--dataset-identity d1-...] --root data");
+    println!("  features --symbol EURUSD --timeframe M1 [--dataset-identity d1-...] --root data");
+    println!(
+        "  prepare --symbol EURUSD --base M1 --higher H1,H4 [--dataset-identity d1-...] --root data"
+    );
     println!(
         "  bench --dry-run --fixture tiny --prototype a --backend cuda --out cache/gpu-bench/plan.json"
     );
     println!("  train --symbol EURUSD --base M1 --higher H1,H4 --horizon 1 --root data");
     println!(
-        "  search --symbol EURUSD --base M1 --higher H1,H4 --genes 64 --generations 5 --max-indicators 12 --root data"
+        "  canonical-cost-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --basis-timeframe D1 --broker-symbol-contract <json> --settings-source <yaml> --out <json>"
     );
     println!(
-        "  discover --symbol EURUSD --base M1 --higher H1,H4 --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/vector_ta_knowledge.json --root data"
+        "  canonical-full-run --authority-root <dir> --data-root <dir> --plan-sha256 <sha> \\\n         --matrix-sha256 <sha> --symbol EURUSD --base-timeframe M1 \\\n         --cost-assumptions <json> --broker-symbol-contract <json> \\\n         --settings-source <yaml> --models-dir <dir> --out <json> \\\n         --receipt-out <json>"
+    );
+    println!(
+        "  canonical-train --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --base-timeframe H4 --input-receipt <json> --cost-assumptions <json> --broker-symbol-contract <json> --settings-source <yaml> --models-dir <dir> --oos-from-ms <unix-ms> --out <json> --receipt-out <json>"
+    );
+    println!(
+        "  search --expected-input-receipt <receipt.json> --seed 42 --candidates 100 --max-indicators 12 --stop-multiple 1.0 --target-multiple 2.0 --out <artifact.json> --root data"
+    );
+    println!(
+        "                               CpuOnly gross-R research from exact direct generations; artifacts are ResearchOnly and NotPromotionEligible."
+    );
+    println!(
+        "  discover --symbol EURUSD --base M1 --higher H1,H4 [--dataset-identity d1-...] --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/vector_ta_knowledge.json --root data"
+    );
+    println!(
+        "                               Historical search requires every exact generation named by its receipt. Discovery/schedule require the direct base plus explicitly requested higher TFs. No timeframe is manufactured; missing data requires import/download."
     );
     println!(
         "  discover ... --stream-sweep [--stream-max-batches N]  Sweep the (indicator, period) space in BATCHES instead of building one cube: a batch is sized from FREE RAM (never a flag), a discovery cycle runs per batch, and a batch whose candidates cannot clear the CONFIGURED expectancy floor is abandoned before the quality screen. Survivors from different batches are remapped onto one run-level feature list; every abandoned batch is named by cursor in <out>.streaming.json."
     );
     println!(
-        "  discovery-promote-weekly [--symbol EURUSD --tf M1] [--cache-dir cache/search] [--portfolio <live_portfolio.json>]  Weekly-refresh: merge this run's discovery ledger into the live portfolio (additive by gene-signature hash) and print 'added N new, carried M, total K'."
+        "  discovery-promote-weekly --portfolio <live_portfolio.json> [--cache-dir cache/search]  Weekly-refresh using the strict v3 portfolio's embedded exact receipt/config authority; print 'added N new, carried M, total K'."
     );
     println!(
         "  trader-replay [--symbol EURUSD --base M1 | --portfolio <live_portfolio.json>] [--root data] [--blend off|confirm|scale] [--models-root models]  Offline dry-run of the autonomous trader (zero broker calls; same engine as /autonomous/replay). With --portfolio runs the REAL genes; --blend gates their size by the ML ensemble (gene-dominant)."
@@ -3477,17 +4669,33 @@ fn print_help() {
     println!(
         "  train --symbol EURUSD --base H1 [--models-dir models] [--oos-from 2023-01-01]  Train the ML ensemble. --oos-from trains LEAK-LOCKED experts (rows < cutoff, purged) to a SEPARATE root for OOS blend validation."
     );
-    println!("  migrate-data --root data [--force] [--delete-source]");
     println!(
-        "  slice-dataset --symbol EURUSD --base M1 --root <SRC> --out-root <DST> --from-date 2018-01-01 --to-date 2021-01-01"
+        "  import --source <FILE> --format <csv|tsv|json-array|json-lines|parquet|arrow-ipc-file|arrow-ipc-stream|vortex> --source-namespace <ID> --symbol <EXACT> --timeframe <TF> --bar-timestamps bar_open [--expected-generation <GEN>] [--root data]"
     );
     println!(
-        "                               Write the [from,to) UTC date-range subset of a Vortex dataset to a NEW root"
+        "                               Import exactly one declared source, atomically publish it as canonical Vortex, then reopen and verify the acknowledged generation."
     );
     println!(
-        "                               (discover --root <DST> runs on the slice). Enables OOM-safe walk-forward chunking."
+        "  import --source <FILE-OR-DIR> --dry-run   Metadata-only candidate discovery; never converts or publishes."
     );
-    println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
+    println!(
+        "  slice-dataset --symbol EURUSD --base M1 [--dataset-identity d1-...] --root <SRC> --out-root <DST> --from-date 2018-01-01 --to-date 2021-01-01"
+    );
+    println!(
+        "                               Resolve one exact source identity, fully verify it, and atomically publish"
+    );
+    println!(
+        "                               the [from,to) subset to a NEW root with typed source-generation provenance."
+    );
+    println!(
+        "                               Missing/ambiguous identities and an existing output generation fail closed."
+    );
+    println!(
+        "  bench-prepare --data-root data --symbol EURUSD --timeframe M1 --dataset-identity d1-... --out snapshots/M1.json"
+    );
+    println!(
+        "  stop-target --symbol EURUSD --timeframe M1 [--dataset-identity d1-...] --pip 0.0001 --signal 1 --root data"
+    );
     println!(
         "  autoresearch [--symbol EURUSD] [--max-sweeps 200] [--max-hours H] [--session <id>] [--scenario <label>] [--dry-run]"
     );
@@ -3515,10 +4723,11 @@ fn print_help() {
     println!("                               Merge-update broker_credentials.toml. Same writer");
     println!("                               as the GUI Settings screen — never drifts.");
     println!();
-    println!("  --data-path <folder>   Browse a folder and auto-discover dataset layout");
-    println!("                         (subfolders for symbol/timeframe, Hive-style or flat).");
-    println!("                         Supported on: train, discover, import.");
-    println!("  --dry-run              With --data-path, print the discovery summary and exit.");
+    println!("  --data-path <root>     Select a canonical manifest-backed data root.");
+    println!("                         Inventory support: train, discover.");
+    println!(
+        "  --dry-run              Print exact canonical identities/rejections and exit before execution."
+    );
 }
 
 fn cli_record(operation: &str, status: &str, message: impl Into<String>) -> SectionedRunRecord {
@@ -3572,8 +4781,216 @@ fn system_time_string() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cli_record, gpu_assignment_env, section_record};
+    use super::{
+        SliceDatasetProvenanceV1, cli_record, gpu_assignment_env, publish_canonical_dataset_slice,
+        schedule_series_rows, section_record, select_runtime_timeframe_identities,
+        select_runtime_timeframe_identities_for_base,
+    };
     use neoethos_core::sectioned_log::SubsystemSection;
+
+    fn external_identity(
+        namespace: &str,
+        timeframe: neoethos_data::CanonicalTimeframe,
+    ) -> neoethos_data::CanonicalDatasetIdentity {
+        neoethos_data::CanonicalDatasetIdentity::external(
+            namespace,
+            "EURUSD",
+            timeframe,
+            neoethos_data::BarTimestampConvention::BarOpen,
+        )
+        .expect("test identity")
+    }
+
+    fn unique_test_root(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "neoethos_cli_{label}_{}_{}",
+            std::process::id(),
+            nonce
+        ))
+    }
+
+    fn publish_fixture(root: &std::path::Path, identity: &neoethos_data::CanonicalDatasetIdentity) {
+        let ohlcv = neoethos_data::Ohlcv {
+            timestamp: Some(vec![
+                1_577_836_800_000,
+                1_577_923_200_000,
+                1_578_009_600_000,
+            ]),
+            open: vec![1.0, 2.0, 3.0],
+            high: vec![1.1, 2.1, 3.1],
+            low: vec![0.9, 1.9, 2.9],
+            close: vec![1.05, 2.05, 3.05],
+            volume: Some(vec![10.0, 20.0, 30.0]),
+        };
+        let provenance = neoethos_data::core::dataset_manifest::ProducerProvenanceEnvelopeV1::new(
+            "neoethos.cli-test-fixture.v1",
+            b"fixture".to_vec(),
+        )
+        .expect("fixture provenance");
+        neoethos_data::publish_canonical_ohlcv_generation(
+            neoethos_data::CanonicalOhlcvPublishRequest {
+                configured_root: root,
+                identity,
+                expected_generation: None,
+                provenance: &provenance,
+                ohlcv: &ohlcv,
+                volume: neoethos_data::CanonicalVolumeRef::Float64(
+                    ohlcv.volume.as_deref().expect("fixture volume"),
+                ),
+                rows_per_chunk: 2,
+            },
+        )
+        .expect("publish fixture");
+    }
+
+    #[test]
+    fn runtime_timeframes_stay_on_the_unique_base_source_scope() {
+        let source_a = [
+            neoethos_data::CanonicalTimeframe::M1,
+            neoethos_data::CanonicalTimeframe::H1,
+            neoethos_data::CanonicalTimeframe::H4,
+        ]
+        .into_iter()
+        .map(|timeframe| external_identity("source-a", timeframe))
+        .collect::<Vec<_>>();
+        let source_a_m1 = source_a
+            .iter()
+            .find(|identity| identity.timeframe() == neoethos_data::CanonicalTimeframe::M1)
+            .expect("M1 direct identity")
+            .clone();
+        let source_b_h1 = external_identity("source-b", neoethos_data::CanonicalTimeframe::H1);
+        let mut available = source_a.clone();
+        available.push(source_b_h1);
+        let selected = select_runtime_timeframe_identities(
+            &available,
+            "EURUSD",
+            "M1",
+            &["H1".to_owned(), "H4".to_owned()],
+        )
+        .expect("select exact runtime identities");
+
+        assert_eq!(selected.base_identity, source_a_m1);
+        assert_eq!(
+            selected.required.as_slice(),
+            &[
+                neoethos_data::CanonicalTimeframe::M1,
+                neoethos_data::CanonicalTimeframe::H1,
+                neoethos_data::CanonicalTimeframe::H4,
+            ]
+        );
+        assert_eq!(selected.identities.len(), source_a.len());
+        assert!(
+            selected
+                .identities
+                .iter()
+                .all(|identity| identity.scope() == selected.base_identity.scope())
+        );
+    }
+
+    #[test]
+    fn runtime_timeframes_require_every_direct_generation() {
+        let error = select_runtime_timeframe_identities(
+            &[external_identity(
+                "source-a",
+                neoethos_data::CanonicalTimeframe::M1,
+            )],
+            "EURUSD",
+            "M1",
+            &["H1".to_owned()],
+        )
+        .expect_err("missing direct generations must fail closed");
+
+        assert!(
+            error.to_string().contains("import/download required"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn runtime_timeframes_do_not_require_unconsumed_defaults() {
+        let h4 = external_identity("source-a", neoethos_data::CanonicalTimeframe::H4);
+        let selected = select_runtime_timeframe_identities_for_base(&[h4.clone()], &h4, &[])
+            .expect("base-only search consumes one direct timeframe");
+
+        assert_eq!(selected.base_identity, h4);
+        assert_eq!(
+            selected.required,
+            vec![neoethos_data::CanonicalTimeframe::H4]
+        );
+        assert_eq!(selected.identities, vec![selected.base_identity.clone()]);
+    }
+
+    #[test]
+    fn runtime_timeframes_reject_an_ambiguous_base_identity() {
+        let error = select_runtime_timeframe_identities(
+            &[
+                external_identity("source-a", neoethos_data::CanonicalTimeframe::M1),
+                external_identity("source-b", neoethos_data::CanonicalTimeframe::M1),
+            ],
+            "EURUSD",
+            "M1",
+            &[],
+        )
+        .expect_err("ambiguous base must fail closed");
+
+        assert!(
+            error.to_string().contains("exactly one"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn schedule_reads_the_verified_manifest_row_count() {
+        let root = unique_test_root("schedule_rows");
+        let identity = external_identity("source-a", neoethos_data::CanonicalTimeframe::D1);
+        publish_fixture(&root, &identity);
+        let inventory = neoethos_data::DatasetDiscovery::scan(&root).expect("verified inventory");
+
+        let rows = schedule_series_rows(&inventory, &root, &identity).expect("schedule row count");
+
+        assert_eq!(rows, 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn slice_publication_reopens_with_typed_source_provenance() {
+        let source_root = unique_test_root("slice_source");
+        let output_root = unique_test_root("slice_output");
+        let identity = external_identity("source-a", neoethos_data::CanonicalTimeframe::D1);
+        publish_fixture(&source_root, &identity);
+
+        let outcome = publish_canonical_dataset_slice(
+            &source_root,
+            &output_root,
+            &identity,
+            1_577_923_200_000,
+            1_578_096_000_000,
+        )
+        .expect("publish canonical slice");
+        let decoded =
+            SliceDatasetProvenanceV1::from_envelope(outcome.publication.manifest().provenance())
+                .expect("typed slice provenance");
+
+        assert_eq!(outcome.source_rows, 3);
+        assert_eq!(outcome.kept_rows, 2);
+        assert_eq!(decoded.source_identity(), &identity);
+        assert_eq!(decoded.selected_row_range(), 1..3);
+        assert_eq!(
+            decoded.requested_range_ms(),
+            (1_577_923_200_000, 1_578_096_000_000)
+        );
+        assert_eq!(
+            decoded.selected_timestamp_range_ms(),
+            (1_577_923_200_000, 1_578_009_600_000)
+        );
+
+        std::fs::remove_dir_all(source_root).ok();
+        std::fs::remove_dir_all(output_root).ok();
+    }
 
     #[test]
     fn integrated_wgpu_assignment_uses_typed_selector_without_cuda_pin() {

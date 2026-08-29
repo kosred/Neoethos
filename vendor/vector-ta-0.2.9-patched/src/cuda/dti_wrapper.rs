@@ -1,17 +1,17 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::dti::{DtiBatchRange, DtiParams};
 use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(thiserror::Error, Debug)]
 pub enum CudaDtiError {
@@ -112,11 +112,6 @@ impl CudaDti {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/dti_kernel.ptx"));
-        let jit = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("dti_kernel")?;
 
         let _ = cust::context::CurrentContext::set_cache_config(CacheConfig::PreferL1);

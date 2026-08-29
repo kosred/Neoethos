@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::mem::ManuallyDrop;
@@ -48,10 +30,6 @@ pub struct EhlersAdaptiveCyberCycleOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersAdaptiveCyberCycleParams {
     pub alpha: Option<f64>,
 }
@@ -209,11 +187,7 @@ struct ResolvedParams {
 
 #[inline(always)]
 fn nz(value: f64) -> f64 {
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
+    if value.is_finite() { value } else { 0.0 }
 }
 
 #[inline(always)]
@@ -510,7 +484,6 @@ pub fn ehlers_adaptive_cyber_cycle_with_kernel(
     Ok(EhlersAdaptiveCyberCycleOutput { cycle, trigger })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ehlers_adaptive_cyber_cycle_into(
     out_cycle: &mut [f64],
@@ -900,313 +873,6 @@ fn ehlers_adaptive_cyber_cycle_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_adaptive_cyber_cycle")]
-#[pyo3(signature = (data, alpha=0.07, kernel=None))]
-pub fn ehlers_adaptive_cyber_cycle_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    alpha: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let input = EhlersAdaptiveCyberCycleInput::from_slice(
-        slice,
-        EhlersAdaptiveCyberCycleParams { alpha: Some(alpha) },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| ehlers_adaptive_cyber_cycle_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("cycle", out.cycle.into_pyarray(py))?;
-    dict.set_item("trigger", out.trigger.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersAdaptiveCyberCycleStream")]
-pub struct EhlersAdaptiveCyberCycleStreamPy {
-    stream: EhlersAdaptiveCyberCycleStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersAdaptiveCyberCycleStreamPy {
-    #[new]
-    #[pyo3(signature = (alpha=0.07))]
-    fn new(alpha: f64) -> PyResult<Self> {
-        let stream = EhlersAdaptiveCyberCycleStream::try_new(EhlersAdaptiveCyberCycleParams {
-            alpha: Some(alpha),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> (f64, f64) {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_adaptive_cyber_cycle_batch")]
-#[pyo3(signature = (data, alpha_range=(0.07,0.07,0.0), kernel=None))]
-pub fn ehlers_adaptive_cyber_cycle_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    alpha_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let sweep = EhlersAdaptiveCyberCycleBatchRange { alpha: alpha_range };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_cycle = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_trigger = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let cycle_slice = unsafe { out_cycle.as_slice_mut()? };
-    let trigger_slice = unsafe { out_trigger.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        ehlers_adaptive_cyber_cycle_batch_inner_into(
-            slice,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            cycle_slice,
-            trigger_slice,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("cycle", out_cycle.reshape((rows, cols))?)?;
-    dict.set_item("trigger", out_trigger.reshape((rows, cols))?)?;
-    dict.set_item(
-        "alphas",
-        combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_ehlers_adaptive_cyber_cycle_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(ehlers_adaptive_cyber_cycle_py, m)?)?;
-    m.add_function(wrap_pyfunction!(ehlers_adaptive_cyber_cycle_batch_py, m)?)?;
-    m.add_class::<EhlersAdaptiveCyberCycleStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersAdaptiveCyberCycleJsOutput {
-    pub cycle: Vec<f64>,
-    pub trigger: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_adaptive_cyber_cycle_js")]
-pub fn ehlers_adaptive_cyber_cycle_js(data: &[f64], alpha: f64) -> Result<JsValue, JsValue> {
-    let input = EhlersAdaptiveCyberCycleInput::from_slice(
-        data,
-        EhlersAdaptiveCyberCycleParams { alpha: Some(alpha) },
-    );
-    let out = ehlers_adaptive_cyber_cycle_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersAdaptiveCyberCycleJsOutput {
-        cycle: out.cycle,
-        trigger: out.trigger,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersAdaptiveCyberCycleBatchConfig {
-    pub alpha_range: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersAdaptiveCyberCycleBatchJsOutput {
-    pub cycle: Vec<f64>,
-    pub trigger: Vec<f64>,
-    pub alphas: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_f64(name: &str, values: &[f64]) -> Result<(f64, f64, f64), JsValue> {
-    if values.len() != 3 {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 elements [start, end, step]"
-        )));
-    }
-    if values.iter().any(|value| !value.is_finite()) {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} values must be finite numbers"
-        )));
-    }
-    Ok((values[0], values[1], values[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_adaptive_cyber_cycle_batch_js")]
-pub fn ehlers_adaptive_cyber_cycle_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: EhlersAdaptiveCyberCycleBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = EhlersAdaptiveCyberCycleBatchRange {
-        alpha: js_vec3_to_f64("alpha_range", &config.alpha_range)?,
-    };
-    let out = ehlers_adaptive_cyber_cycle_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersAdaptiveCyberCycleBatchJsOutput {
-        cycle: out.cycle,
-        trigger: out.trigger,
-        alphas: out
-            .combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect(),
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_adaptive_cyber_cycle_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_adaptive_cyber_cycle_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_adaptive_cyber_cycle_into(
-    in_ptr: *const f64,
-    out_cycle_ptr: *mut f64,
-    out_trigger_ptr: *mut f64,
-    len: usize,
-    alpha: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_cycle_ptr.is_null() || out_trigger_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_adaptive_cyber_cycle_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out_cycle = std::slice::from_raw_parts_mut(out_cycle_ptr, len);
-        let out_trigger = std::slice::from_raw_parts_mut(out_trigger_ptr, len);
-        let input = EhlersAdaptiveCyberCycleInput::from_slice(
-            data,
-            EhlersAdaptiveCyberCycleParams { alpha: Some(alpha) },
-        );
-        ehlers_adaptive_cyber_cycle_into_slice(out_cycle, out_trigger, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_adaptive_cyber_cycle_batch_into(
-    in_ptr: *const f64,
-    out_cycle_ptr: *mut f64,
-    out_trigger_ptr: *mut f64,
-    len: usize,
-    alpha_start: f64,
-    alpha_end: f64,
-    alpha_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_cycle_ptr.is_null() || out_trigger_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_adaptive_cyber_cycle_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = EhlersAdaptiveCyberCycleBatchRange {
-            alpha: (alpha_start, alpha_end, alpha_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows.checked_mul(len).ok_or_else(|| {
-            JsValue::from_str("rows*cols overflow in ehlers_adaptive_cyber_cycle_batch_into")
-        })?;
-        let out_cycle = std::slice::from_raw_parts_mut(out_cycle_ptr, total);
-        let out_trigger = std::slice::from_raw_parts_mut(out_trigger_ptr, total);
-        ehlers_adaptive_cyber_cycle_batch_into_slice(
-            out_cycle,
-            out_trigger,
-            data,
-            &sweep,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_adaptive_cyber_cycle_output_into_js(
-    data: &[f64],
-    alpha: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_adaptive_cyber_cycle_js(data, alpha)?;
-    crate::write_wasm_object_f64_outputs("ehlers_adaptive_cyber_cycle_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_adaptive_cyber_cycle_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_adaptive_cyber_cycle_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_adaptive_cyber_cycle_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

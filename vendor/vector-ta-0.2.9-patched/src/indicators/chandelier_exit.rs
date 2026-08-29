@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -31,101 +13,9 @@ use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32 as DeviceArrayF32Cuda;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 use crate::cuda::{CudaCeError, CudaChandelierExit};
-use crate::indicators::atr::{atr_with_kernel, AtrInput, AtrParams};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context as CudaContext;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct CeDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32Cuda,
-    pub(crate) _ctx: Arc<CudaContext>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl CeDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner;
-        let d = PyDict::new(py);
-        let item = std::mem::size_of::<f32>();
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (inner.cols * item, item))?;
-        let size = inner.rows.saturating_mul(inner.cols);
-        let ptr_val: usize = if size == 0 {
-            0
-        } else {
-            inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        Ok((2, self.device_id as i32))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Cuda {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
+use crate::indicators::atr::{AtrInput, AtrParams, atr_with_kernel};
 
 impl<'a> AsRef<[f64]> for ChandelierExitInput<'a> {
     #[inline(always)]
@@ -156,10 +46,6 @@ pub struct ChandelierExitOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct ChandelierExitParams {
     pub period: Option<usize>,
     pub mult: Option<f64>,
@@ -302,14 +188,12 @@ impl ChandelierExitBuilder {
         chandelier_exit_with_kernel(&i, self.kernel)
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[inline(always)]
     pub fn into_stream(self) -> Result<ChandelierExitStream, ChandelierExitError> {
         ChandelierExitStream::try_new(self.build())
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[derive(Debug, Clone)]
 pub struct ChandelierExitStream {
     period: usize,
@@ -341,7 +225,6 @@ pub struct ChandelierExitStream {
     tmin: usize,
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 impl ChandelierExitStream {
     pub fn try_new(p: ChandelierExitParams) -> Result<Self, ChandelierExitError> {
         let period = p.period.unwrap_or(22);
@@ -570,7 +453,9 @@ pub enum ChandelierExitError {
     #[error("chandelier_exit: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
 
-    #[error("chandelier_exit: Inconsistent data lengths - high: {high_len}, low: {low_len}, close: {close_len}")]
+    #[error(
+        "chandelier_exit: Inconsistent data lengths - high: {high_len}, low: {low_len}, close: {close_len}"
+    )]
     InconsistentDataLengths {
         high_len: usize,
         low_len: usize,
@@ -1176,7 +1061,6 @@ pub fn chandelier_exit_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn chandelier_exit_into(
     input: &ChandelierExitInput,
@@ -1497,7 +1381,7 @@ fn expand_ce_checked(r: &CeBatchRange) -> Result<Vec<ChandelierExitParams>, Chan
                             start: start.to_string(),
                             end: end.to_string(),
                             step: step.to_string(),
-                        })
+                        });
                     }
                 }
             }
@@ -1535,11 +1419,7 @@ fn expand_ce_checked(r: &CeBatchRange) -> Result<Vec<ChandelierExitParams>, Chan
         let mut v = Vec::new();
 
         let s = if step > 0.0 {
-            if start <= end {
-                step
-            } else {
-                -step
-            }
+            if start <= end { step } else { -step }
         } else {
             step
         };
@@ -2016,837 +1896,11 @@ fn ce_batch_inner_into(
     Ok(())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "chandelier_exit")]
-#[pyo3(signature = (high, low, close, period=None, mult=None, use_close=None, kernel=None))]
-pub fn chandelier_exit_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: Option<usize>,
-    mult: Option<f64>,
-    use_close: Option<bool>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let params = ChandelierExitParams {
-        period,
-        mult,
-        use_close,
-    };
-    let input = ChandelierExitInput::from_slices(h, l, c, params);
-    let kern = validate_kernel(kernel, false)?;
-    let (long_vec, short_vec) = py
-        .allow_threads(|| {
-            chandelier_exit_with_kernel(&input, kern).map(|o| (o.long_stop, o.short_stop))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((long_vec.into_pyarray(py), short_vec.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "chandelier_exit_batch")]
-#[pyo3(signature = (high, low, close, period_range, mult_range, use_close=true, kernel=None))]
-pub fn chandelier_exit_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    use_close: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let sweep = CeBatchRange {
-        period: period_range,
-        mult: mult_range,
-        use_close: (use_close, use_close, false),
-    };
-
-    let combos = expand_ce_checked(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos
-        .len()
-        .checked_mul(2)
-        .ok_or_else(|| PyValueError::new_err("rows*2 overflow in chandelier_exit_batch_py"))?;
-    let cols = c.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in chandelier_exit_batch_py"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let simd = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            other => other,
-        };
-        ce_batch_inner_into(h, l, c, &combos, simd, slice_out)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("values", out_arr.reshape((rows, cols))?)?;
-    d.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "mults",
-        combos
-            .iter()
-            .map(|p| p.mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "use_close",
-        combos
-            .iter()
-            .map(|p| p.use_close.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(feature = "python")]
-#[pyclass]
-pub struct ChandelierExitStreamPy {
-    high_buffer: Vec<f64>,
-    low_buffer: Vec<f64>,
-    close_buffer: Vec<f64>,
-    period: usize,
-    mult: f64,
-    use_close: bool,
-    kernel: Kernel,
-
-    prev_close: Option<f64>,
-    atr_prev: Option<f64>,
-    long_stop_prev: Option<f64>,
-    short_stop_prev: Option<f64>,
-    dir_prev: i8,
-    warm_tr_sum: f64,
-    count: usize,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ChandelierExitStreamPy {
-    #[new]
-    #[pyo3(signature = (period=None, mult=None, use_close=None, kernel=None))]
-    fn new(
-        period: Option<usize>,
-        mult: Option<f64>,
-        use_close: Option<bool>,
-        kernel: Option<String>,
-    ) -> PyResult<Self> {
-        let kernel = validate_kernel(kernel.as_deref(), false)?;
-        Ok(Self {
-            high_buffer: Vec::new(),
-            low_buffer: Vec::new(),
-            close_buffer: Vec::new(),
-            period: period.unwrap_or(22),
-            mult: mult.unwrap_or(3.0),
-            use_close: use_close.unwrap_or(true),
-            kernel,
-            prev_close: None,
-            atr_prev: None,
-            long_stop_prev: None,
-            short_stop_prev: None,
-            dir_prev: 1,
-            warm_tr_sum: 0.0,
-            count: 0,
-        })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> PyResult<Option<(f64, f64)>> {
-        self.high_buffer.push(high);
-        self.low_buffer.push(low);
-        self.close_buffer.push(close);
-
-        let tr = if let Some(pc) = self.prev_close {
-            let hl = (high - low).abs();
-            let hc = (high - pc).abs();
-            let lc = (low - pc).abs();
-            hl.max(hc.max(lc))
-        } else {
-            (high - low).abs()
-        };
-
-        let atr = if self.atr_prev.is_none() {
-            self.warm_tr_sum += tr;
-            self.count += 1;
-            if self.count < self.period {
-                self.prev_close = Some(close);
-                return Ok(None);
-            }
-            let seed = self.warm_tr_sum / self.period as f64;
-            self.atr_prev = Some(seed);
-            seed
-        } else {
-            let prev = self.atr_prev.unwrap();
-            let n = self.period as f64;
-            let next = (prev * (n - 1.0) + tr) / n;
-            self.atr_prev = Some(next);
-            next
-        };
-
-        if self.high_buffer.len() > self.period {
-            self.high_buffer.remove(0);
-            self.low_buffer.remove(0);
-            self.close_buffer.remove(0);
-        }
-
-        let (highest, lowest) = if self.use_close {
-            (
-                window_max(&self.close_buffer),
-                window_min(&self.close_buffer),
-            )
-        } else {
-            (window_max(&self.high_buffer), window_min(&self.low_buffer))
-        };
-
-        let long_stop_val = highest - self.mult * atr;
-        let short_stop_val = lowest + self.mult * atr;
-
-        let lsp = self.long_stop_prev.unwrap_or(long_stop_val);
-        let ssp = self.short_stop_prev.unwrap_or(short_stop_val);
-
-        let ls = if let Some(pc) = self.prev_close {
-            if pc > lsp {
-                long_stop_val.max(lsp)
-            } else {
-                long_stop_val
-            }
-        } else {
-            long_stop_val
-        };
-        let ss = if let Some(pc) = self.prev_close {
-            if pc < ssp {
-                short_stop_val.min(ssp)
-            } else {
-                short_stop_val
-            }
-        } else {
-            short_stop_val
-        };
-
-        let d = if close > ssp {
-            1
-        } else if close < lsp {
-            -1
-        } else {
-            self.dir_prev
-        };
-
-        self.long_stop_prev = Some(ls);
-        self.short_stop_prev = Some(ss);
-        self.dir_prev = d;
-        self.prev_close = Some(close);
-
-        let out_long = if d == 1 { ls } else { f64::NAN };
-        let out_short = if d == -1 { ss } else { f64::NAN };
-        Ok(Some((out_long, out_short)))
-    }
-
-    fn reset(&mut self) {
-        self.high_buffer.clear();
-        self.low_buffer.clear();
-        self.close_buffer.clear();
-        self.prev_close = None;
-        self.atr_prev = None;
-        self.long_stop_prev = None;
-        self.short_stop_prev = None;
-        self.dir_prev = 1;
-        self.warm_tr_sum = 0.0;
-        self.count = 0;
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CeResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CeBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<ChandelierExitParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ce_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    mult: f64,
-    use_close: bool,
-) -> Result<JsValue, JsValue> {
-    let p = ChandelierExitParams {
-        period: Some(period),
-        mult: Some(mult),
-        use_close: Some(use_close),
-    };
-    let i = ChandelierExitInput::from_slices(high, low, close, p);
-    let out = chandelier_exit_with_kernel(&i, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = 2usize;
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow in ce_js"))?;
-    let mut values = vec![f64::NAN; total];
-    values[..cols].copy_from_slice(&out.long_stop);
-    values[cols..].copy_from_slice(&out.short_stop);
-    serde_wasm_bindgen::to_value(&CeResult { values, rows, cols })
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "chandelier_exit_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, period_range, mult_range=(3.0,3.0,0.0), use_close=true, device_id=0))]
-pub fn chandelier_exit_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: PyReadonlyArray1<'py, f32>,
-    low_f32: PyReadonlyArray1<'py, f32>,
-    close_f32: PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    use_close: bool,
-    device_id: usize,
-) -> PyResult<(CeDeviceArrayF32Py, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-
-    let sweep = CeBatchRange {
-        period: period_range,
-        mult: mult_range,
-        use_close: (use_close, use_close, false),
-    };
-    let (inner, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaChandelierExit::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.chandelier_exit_batch_dev(h, l, c, &sweep)
-            .map(|(a, b)| (a, b, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let d = PyDict::new(py);
-    d.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "mults",
-        combos
-            .iter()
-            .map(|p| p.mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "use_close",
-        combos
-            .iter()
-            .map(|p| p.use_close.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok((
-        CeDeviceArrayF32Py {
-            inner,
-            _ctx: ctx,
-            device_id: dev_id,
-        },
-        d,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "chandelier_exit_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, period, mult, use_close=true, device_id=0))]
-pub fn chandelier_exit_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: PyReadonlyArray1<'py, f32>,
-    low_tm_f32: PyReadonlyArray1<'py, f32>,
-    close_tm_f32: PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    mult: f64,
-    use_close: bool,
-    device_id: usize,
-) -> PyResult<CeDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaChandelierExit::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.chandelier_exit_many_series_one_param_time_major_dev(
-            h,
-            l,
-            c,
-            cols,
-            rows,
-            period,
-            mult as f32,
-            use_close,
-        )
-        .map(|a| (a, ctx, dev_id))
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(CeDeviceArrayF32Py {
-        inner,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ce_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ce_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ce_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    mult: f64,
-    use_close: bool,
-) -> Result<(), JsValue> {
-    if [
-        high_ptr as usize,
-        low_ptr as usize,
-        close_ptr as usize,
-        out_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer to ce_into"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let total = len
-            .checked_mul(2)
-            .ok_or_else(|| JsValue::from_str("2*len overflow in ce_into"))?;
-
-        let alias = out_ptr == high_ptr as *mut f64
-            || out_ptr == low_ptr as *mut f64
-            || out_ptr == close_ptr as *mut f64;
-        if alias {
-            let mut tmp = vec![f64::NAN; total];
-            let params = ChandelierExitParams {
-                period: Some(period),
-                mult: Some(mult),
-                use_close: Some(use_close),
-            };
-            let input = ChandelierExitInput::from_slices(h, l, c, params);
-            let result = chandelier_exit_with_kernel(&input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            tmp[..len].copy_from_slice(&result.long_stop);
-            tmp[len..].copy_from_slice(&result.short_stop);
-            std::ptr::copy_nonoverlapping(tmp.as_ptr(), out_ptr, total);
-            return Ok(());
-        }
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let params = ChandelierExitParams {
-            period: Some(period),
-            mult: Some(mult),
-            use_close: Some(use_close),
-        };
-        let input = ChandelierExitInput::from_slices(h, l, c, params);
-        let (long_stop, short_stop) = match chandelier_exit_with_kernel(&input, Kernel::Auto) {
-            Ok(o) => (o.long_stop, o.short_stop),
-            Err(e) => return Err(JsValue::from_str(&e.to_string())),
-        };
-        out[..len].copy_from_slice(&long_stop);
-        out[len..].copy_from_slice(&short_stop);
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ce_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    len: usize,
-    out_ptr: *mut f64,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-    use_close: bool,
-) -> Result<usize, JsValue> {
-    if [
-        high_ptr as usize,
-        low_ptr as usize,
-        close_ptr as usize,
-        out_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer to ce_batch_into"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let sweep = CeBatchRange {
-            period: (period_start, period_end, period_step),
-            mult: (mult_start, mult_end, mult_step),
-            use_close: (use_close, use_close, false),
-        };
-        let combos = expand_ce_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos
-            .len()
-            .checked_mul(2)
-            .ok_or_else(|| JsValue::from_str("rows*2 overflow in ce_batch_into"))?;
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in ce_batch_into"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        ce_batch_inner_into(h, l, c, &combos, detect_best_kernel(), out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ce_batch)]
-pub fn ce_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    #[derive(Deserialize)]
-    struct BatchConfig {
-        period_range: (usize, usize, usize),
-        mult_range: (f64, f64, f64),
-        use_close: bool,
-    }
-
-    let cfg: BatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = CeBatchRange {
-        period: cfg.period_range,
-        mult: cfg.mult_range,
-        use_close: (cfg.use_close, cfg.use_close, false),
-    };
-    let combos = expand_ce_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos
-        .len()
-        .checked_mul(2)
-        .ok_or_else(|| JsValue::from_str("rows*2 overflow in ce_batch_unified_js"))?;
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow in ce_batch_unified_js"))?;
-    let mut values = vec![f64::NAN; total];
-    ce_batch_inner_into(high, low, close, &combos, detect_best_kernel(), &mut values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&CeBatchJsOutput {
-        values,
-        combos,
-        rows,
-        cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chandelier_exit_wasm(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: Option<usize>,
-    mult: Option<f64>,
-    use_close: Option<bool>,
-) -> Result<JsValue, JsValue> {
-    let p = period.unwrap_or(22);
-    let m = mult.unwrap_or(3.0);
-    let u = use_close.unwrap_or(true);
-
-    let params = ChandelierExitParams {
-        period: Some(p),
-        mult: Some(m),
-        use_close: Some(u),
-    };
-    let input = ChandelierExitInput::from_slices(high, low, close, params);
-    let out = chandelier_exit_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    #[derive(Serialize)]
-    struct OldFormatResult {
-        long_stop: Vec<f64>,
-        short_stop: Vec<f64>,
-    }
-
-    serde_wasm_bindgen::to_value(&OldFormatResult {
-        long_stop: out.long_stop,
-        short_stop: out.short_stop,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct ChandelierExitStreamWasm {
-    high_buffer: Vec<f64>,
-    low_buffer: Vec<f64>,
-    close_buffer: Vec<f64>,
-    period: usize,
-    mult: f64,
-    use_close: bool,
-
-    prev_close: Option<f64>,
-    atr_prev: Option<f64>,
-    long_stop_prev: Option<f64>,
-    short_stop_prev: Option<f64>,
-    dir_prev: i8,
-    warm_tr_sum: f64,
-    count: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl ChandelierExitStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(period: Option<usize>, mult: Option<f64>, use_close: Option<bool>) -> Self {
-        Self {
-            high_buffer: Vec::new(),
-            low_buffer: Vec::new(),
-            close_buffer: Vec::new(),
-            period: period.unwrap_or(22),
-            mult: mult.unwrap_or(3.0),
-            use_close: use_close.unwrap_or(true),
-            prev_close: None,
-            atr_prev: None,
-            long_stop_prev: None,
-            short_stop_prev: None,
-            dir_prev: 1,
-            warm_tr_sum: 0.0,
-            count: 0,
-        }
-    }
-
-    pub fn update(&mut self, high: f64, low: f64, close: f64) -> Result<JsValue, JsValue> {
-        self.high_buffer.push(high);
-        self.low_buffer.push(low);
-        self.close_buffer.push(close);
-
-        let tr = if let Some(pc) = self.prev_close {
-            let hl = (high - low).abs();
-            let hc = (high - pc).abs();
-            let lc = (low - pc).abs();
-            hl.max(hc.max(lc))
-        } else {
-            (high - low).abs()
-        };
-
-        let atr = if self.atr_prev.is_none() {
-            self.warm_tr_sum += tr;
-            self.count += 1;
-            if self.count < self.period {
-                self.prev_close = Some(close);
-                return Ok(JsValue::NULL);
-            }
-            let seed = self.warm_tr_sum / self.period as f64;
-            self.atr_prev = Some(seed);
-            seed
-        } else {
-            let prev = self.atr_prev.unwrap();
-            let n = self.period as f64;
-            let next = (prev * (n - 1.0) + tr) / n;
-            self.atr_prev = Some(next);
-            next
-        };
-
-        if self.high_buffer.len() > self.period {
-            self.high_buffer.remove(0);
-            self.low_buffer.remove(0);
-            self.close_buffer.remove(0);
-        }
-
-        let (highest, lowest) = if self.use_close {
-            (
-                window_max(&self.close_buffer),
-                window_min(&self.close_buffer),
-            )
-        } else {
-            (window_max(&self.high_buffer), window_min(&self.low_buffer))
-        };
-
-        let long_stop_val = highest - self.mult * atr;
-        let short_stop_val = lowest + self.mult * atr;
-
-        let lsp = self.long_stop_prev.unwrap_or(long_stop_val);
-        let ssp = self.short_stop_prev.unwrap_or(short_stop_val);
-
-        let ls = if let Some(pc) = self.prev_close {
-            if pc > lsp {
-                long_stop_val.max(lsp)
-            } else {
-                long_stop_val
-            }
-        } else {
-            long_stop_val
-        };
-        let ss = if let Some(pc) = self.prev_close {
-            if pc < ssp {
-                short_stop_val.min(ssp)
-            } else {
-                short_stop_val
-            }
-        } else {
-            short_stop_val
-        };
-
-        let d = if close > ssp {
-            1
-        } else if close < lsp {
-            -1
-        } else {
-            self.dir_prev
-        };
-
-        self.long_stop_prev = Some(ls);
-        self.short_stop_prev = Some(ss);
-        self.dir_prev = d;
-        self.prev_close = Some(close);
-
-        let out_long = if d == 1 { ls } else { f64::NAN };
-        let out_short = if d == -1 { ss } else { f64::NAN };
-
-        let result = serde_json::json!({
-            "long_stop": out_long,
-            "short_stop": out_short,
-        });
-        serde_wasm_bindgen::to_value(&result)
-            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-    }
-
-    pub fn reset(&mut self) {
-        self.high_buffer.clear();
-        self.low_buffer.clear();
-        self.close_buffer.clear();
-        self.prev_close = None;
-        self.atr_prev = None;
-        self.long_stop_prev = None;
-        self.short_stop_prev = None;
-        self.dir_prev = 1;
-        self.warm_tr_sum = 0.0;
-        self.count = 0;
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ce_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    mult: f64,
-    use_close: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ce_js(high, low, close, period, mult, use_close)?;
-    crate::write_wasm_object_f64_outputs("ce_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ce_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ce_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("ce_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
@@ -2856,8 +1910,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = ChandelierExitParams {
             period: None,
@@ -2877,8 +1931,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ChandelierExitParams {
             period: Some(22),
@@ -2949,8 +2003,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = ChandelierExitInput::with_default_candles(&candles);
         let result = chandelier_exit_with_kernel(&input, kernel)?;
@@ -3083,8 +2137,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ChandelierExitParams {
             period: Some(14),
@@ -3154,8 +2208,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 22;
         let mult = 3.0;
@@ -3189,8 +2243,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             ChandelierExitParams::default(),
@@ -3266,10 +2320,9 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     fn check_ce_streaming_vs_batch(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let c = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let c = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let p = ChandelierExitParams::default();
         let batch =
             chandelier_exit_with_kernel(&ChandelierExitInput::from_candles(&c, p.clone()), kernel)?;
@@ -3339,14 +2392,9 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-    fn check_ce_streaming_vs_batch(_test: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
-
     fn check_ce_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let c = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let c = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let out = CeBatchBuilder::new()
             .period_range(10, 12, 1)
             .mult_range(2.0, 3.0, 0.5)
@@ -3491,8 +2539,9 @@ mod tests {
 
     #[test]
     fn ce_no_poison() {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let c = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let c =
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let out = ChandelierExitBuilder::new().apply_candles(&c).unwrap();
         for &v in out.long_stop.iter().chain(out.short_stop.iter()) {
             if v.is_nan() {
@@ -3507,8 +2556,9 @@ mod tests {
 
     #[test]
     fn ce_streaming_consistency() {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let c = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let c =
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let subset = 100;
         let high = &c.high[..subset];
         let low = &c.low[..subset];
@@ -3532,8 +2582,9 @@ mod tests {
 
     #[test]
     fn ce_batch_shapes() {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let c = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let c =
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let out = CeBatchBuilder::new()
             .period_range(10, 12, 1)
             .mult_range(2.5, 3.5, 0.5)

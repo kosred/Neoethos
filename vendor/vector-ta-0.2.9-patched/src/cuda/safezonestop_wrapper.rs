@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
 use crate::indicators::safezonestop::{SafeZoneStopBatchRange, SafeZoneStopParams};
@@ -6,8 +6,8 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -138,11 +138,6 @@ impl CudaSafeZoneStop {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/safezonestop_kernel.ptx"));
-        let jit = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("safezonestop_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -296,17 +291,9 @@ impl CudaSafeZoneStop {
             let up_pos = if up > 0.0 { up } else { 0.0 };
             let dn_pos = if dn > 0.0 { dn } else { 0.0 };
             let v = if dir_long {
-                if dn_pos > up_pos {
-                    dn_pos
-                } else {
-                    0.0
-                }
+                if dn_pos > up_pos { dn_pos } else { 0.0 }
             } else {
-                if up_pos > dn_pos {
-                    up_pos
-                } else {
-                    0.0
-                }
+                if up_pos > dn_pos { up_pos } else { 0.0 }
             };
             dm[i] = v;
             prev_h = h;

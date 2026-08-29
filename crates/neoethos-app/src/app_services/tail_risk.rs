@@ -126,7 +126,11 @@ pub fn run_tail_risk(
     let mut entries: Vec<(i64, f64, Option<f64>)> = Vec::new(); // (entry_time, r_multiple, pnl_pct)
     if let Some(arr) = logged.as_array() {
         for strat in arr {
-            for t in strat.get("trades").and_then(|v| v.as_array()).unwrap_or(&Vec::new()) {
+            for t in strat
+                .get("trades")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&Vec::new())
+            {
                 let entry_time = t.get("entry_time").and_then(|v| v.as_i64()).unwrap_or(0);
                 let r = t.get("r_multiple").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let pct = t.get("pnl_pct").and_then(|v| v.as_f64());
@@ -164,10 +168,7 @@ pub fn run_tail_risk(
     } else {
         (
             "pnlPct".into(),
-            entries
-                .iter()
-                .map(|e| e.2.unwrap_or(0.0) / 100.0)
-                .collect(),
+            entries.iter().map(|e| e.2.unwrap_or(0.0) / 100.0).collect(),
         )
     };
     // Clamp pathological single-trade returns (bad artifacts) to ±90%.

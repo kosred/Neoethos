@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::atr_wrapper::CudaAtr;
 use crate::cuda::di_wrapper::DeviceArrayF32Pair;
@@ -8,8 +8,8 @@ use crate::indicators::supertrend::{SuperTrendBatchRange, SuperTrendParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -89,11 +89,6 @@ impl CudaSupertrend {
         cust::init(CudaFlags::empty())?;
         let dev = Device::get_device(device_id as u32)?;
         let ctx = std::sync::Arc::new(Context::new(dev)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/supertrend_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("supertrend_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {
@@ -148,20 +143,12 @@ impl CudaSupertrend {
 
     #[inline]
     fn pick_block_x(rows_or_cols: usize) -> u32 {
-        if rows_or_cols >= (1 << 14) {
-            256
-        } else {
-            128
-        }
+        if rows_or_cols >= (1 << 14) { 256 } else { 128 }
     }
 
     #[inline]
     fn pick_batch_block_x(rows: usize) -> u32 {
-        if rows >= 128 {
-            256
-        } else {
-            128
-        }
+        if rows >= 128 { 256 } else { 128 }
     }
 
     fn first_valid_hlc(

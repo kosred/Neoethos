@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -12,24 +12,6 @@ use rayon::prelude::*;
 use std::convert::AsRef;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::{
-    exceptions::PyValueError,
-    pyclass, pyfunction, pymethods,
-    types::{PyDict, PyDictMethods},
-    Bound, PyErr, PyResult, Python,
-};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for FoscInput<'a> {
     #[inline(always)]
@@ -56,10 +38,6 @@ pub struct FoscOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct FoscParams {
     pub period: Option<usize>,
 }
@@ -299,7 +277,6 @@ pub fn fosc_into_slice(dst: &mut [f64], input: &FoscInput, kern: Kernel) -> Resu
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn fosc_into(input: &FoscInput, out: &mut [f64]) -> Result<(), FoscError> {
     fosc_into_slice(out, input, Kernel::Auto)
@@ -926,357 +903,19 @@ unsafe fn fosc_row_avx512_long(data: &[f64], first: usize, period: usize, out: &
     fosc_avx512_long(data, period, first, out)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "fosc")]
-#[pyo3(signature = (data, period=5, kernel=None))]
-pub fn fosc_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let data_slice = data.as_slice()?;
-    let kernel_enum = validate_kernel(kernel, false)?;
-
-    let params = FoscParams {
-        period: Some(period),
-    };
-    let input = FoscInput::from_slice(data_slice, params);
-
-    py.allow_threads(|| {
-        let output = fosc_with_kernel(&input, kernel_enum)
-            .map_err(|e| PyErr::new::<PyValueError, _>(format!("Rust computation error: {}", e)))?;
-        Ok(output)
-    })
-    .map(|result| result.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "fosc_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn fosc_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let sweep = FoscBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyErr::new::<PyValueError, _>("rows*cols overflow in fosc_batch_py"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match batch {
-                Kernel::ScalarBatch => Kernel::Scalar,
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx2Batch => Kernel::Avx2,
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx512Batch => Kernel::Avx512,
-                _ => unreachable!(),
-            };
-            fosc_batch_inner_into(slice_in, &sweep, simd, true, out_slice)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap_or(5) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "fosc_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn fosc_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::fosc_wrapper::CudaFosc;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = FoscBatchRange {
-        period: period_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaFosc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.fosc_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "fosc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn fosc_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::fosc_wrapper::CudaFosc;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let flat_in: &[f32] = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = FoscParams {
-        period: Some(period),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaFosc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.fosc_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "FoscStream")]
-pub struct FoscStreamPy {
-    inner: FoscStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl FoscStreamPy {
-    #[new]
-    #[pyo3(signature = (period=5))]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let params = FoscParams {
-            period: Some(period),
-        };
-        let inner = FoscStream::try_new(params).map_err(|e| {
-            PyErr::new::<PyValueError, _>(format!("Failed to create stream: {}", e))
-        })?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fosc_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = FoscParams {
-        period: Some(period),
-    };
-    let input = FoscInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    fosc_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fosc_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fosc_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fosc_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to fosc_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = FoscParams {
-            period: Some(period),
-        };
-        let input = FoscInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            fosc_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            fosc_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FoscBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FoscBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<FoscParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = fosc_batch)]
-pub fn fosc_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: FoscBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let range = FoscBatchRange {
-        period: config.period_range,
-    };
-
-    let output = fosc_batch_inner(data, &range, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = FoscBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fosc_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to fosc_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let range = FoscBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let output = fosc_batch_inner(data, &range, Kernel::Auto, false)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, output.values.len());
-        out.copy_from_slice(&output.values);
-
-        Ok(output.rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fosc_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = fosc_js(data, period)?;
-    crate::write_wasm_f64_output("fosc_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fosc_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fosc_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("fosc_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_fosc_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = FoscParams { period: None };
         let input = FoscInput::from_candles(&candles, "close", default_params);
         let output = fosc_with_kernel(&input, kernel)?;
@@ -1393,8 +1032,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let expected_last_five = [
             -0.8904444627923475,
             -0.4763353099245297,
@@ -1456,8 +1095,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             FoscParams::default(),
@@ -1878,8 +1517,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = FoscBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1927,8 +1566,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = FoscBatchBuilder::new()
             .kernel(kernel)
@@ -1947,8 +1586,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2039,7 +1678,6 @@ mod tests {
     gen_batch_tests!(check_batch_sweep);
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_fosc_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let n = 512usize;

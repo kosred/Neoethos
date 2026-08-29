@@ -1,7 +1,6 @@
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
-    dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
-    try_build_runtime_artifact_metadata,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata, validate_model_labels,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{
@@ -9,23 +8,18 @@ use crate::runtime::capabilities::{
 };
 use crate::runtime::prediction::RuntimePrediction;
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, TimeZone, Utc};
 use ndarray::Array2;
 use neoethos_core::storage::json::{
     JsonBackupWriteConfig, read_json as read_json_artifact,
     write_json_with_backup as write_json_artifact_with_backup,
 };
-use neoethos_data::{FeatureFrame, Ohlcv};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use neoethos_search::genetic::{
     Gene, ParentSelectionPolicy, SeenSignatureMemory, SmcSearchConfig, SurvivorSelectionPolicy,
     crossover, generate_random_genes, mutate, select_parent_index, select_survivor_indices,
     signals_for_gene, unique_candidate_or_retry,
 };
-use neoethos_search::{
-    DiscoveryConfig, FilteringConfig, PropFirmRiskRules, run_discovery_cycle,
-    run_discovery_cycle_with_holdout,
-};
-use polars::prelude::*;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -36,32 +30,9 @@ const ARTIFACT_FILE_NAME: &str = "genetic_portfolio.json";
 const METADATA_FILE_NAME: &str = "metadata.json";
 const MODEL_NAME: &str = "genetic";
 const DEFAULT_MAX_LABEL_EVALUATIONS: usize = 25_000;
-const DEFAULT_MAX_DISCOVERY_CANDIDATES: usize = 25_000;
-
-/// Whether `train_with_discovery` runs behind the 20% OOS holdout, installed
-/// once at startup from `models.discovery_runtime.genetic_expert_holdout`.
-///
-/// `false` (the default, and the value when never installed — e.g. unit
-/// tests) reproduces the behaviour this path has always had: the full series.
-static GENETIC_EXPERT_HOLDOUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-/// Install the genetic-expert holdout policy from `Settings`. Call once at
-/// startup, before any training; the first install wins. Called from
-/// `neoethos_app::install_runtime_overrides_from_settings` (app + desktop)
-/// and from the CLI's `main`.
-pub fn install_genetic_runtime_from_settings(settings: &neoethos_core::Settings) {
-    let _ = GENETIC_EXPERT_HOLDOUT.set(settings.models.discovery_runtime.genetic_expert_holdout);
-}
-
-/// Whether the genetic expert should hold out the tail. Defaults to `false`
-/// when never installed, which is what every run to date has done.
-pub fn genetic_expert_holdout_enabled() -> bool {
-    *GENETIC_EXPERT_HOLDOUT.get_or_init(|| false)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum GeneticBackendMode {
-    DiscoveryBacked,
     LabelSearch,
 }
 
@@ -72,8 +43,6 @@ struct GeneticArtifact {
     generations: usize,
     max_indicators: usize,
     portfolio_size: usize,
-    train_years: usize,
-    val_years: usize,
     symbol: Option<String>,
     feature_columns: Vec<String>,
     backend_mode: GeneticBackendMode,
@@ -96,8 +65,6 @@ impl Default for GeneticArtifact {
             generations: 10,
             max_indicators: 8,
             portfolio_size: 12,
-            train_years: 0,
-            val_years: 0,
             symbol: None,
             feature_columns: Vec::new(),
             backend_mode: GeneticBackendMode::LabelSearch,
@@ -120,8 +87,6 @@ pub struct GeneticStrategyExpert {
     generations: usize,
     max_indicators: usize,
     portfolio_size: usize,
-    train_years: usize,
-    val_years: usize,
     symbol: Option<String>,
     feature_columns: Vec<String>,
     backend_mode: GeneticBackendMode,
@@ -156,13 +121,6 @@ impl GeneticStrategyExpert {
         DEFAULT_MAX_LABEL_EVALUATIONS
     }
 
-    /// Compile-time cap on the candidate pool. Same reasoning as
-    /// [`Self::max_label_evaluations`]; `FOREX_GENETIC_MAX_DISCOVERY_CANDIDATES`
-    /// is deleted.
-    fn max_discovery_candidates() -> usize {
-        DEFAULT_MAX_DISCOVERY_CANDIDATES
-    }
-
     fn effective_generation_count_with_budget(
         population_size: usize,
         configured_generations: usize,
@@ -188,8 +146,6 @@ impl GeneticStrategyExpert {
             generations: generations.max(1),
             max_indicators: max_indicators.max(1),
             portfolio_size: population_size.clamp(4, 24),
-            train_years: 0,
-            val_years: 0,
             symbol: None,
             feature_columns: Vec::new(),
             backend_mode: GeneticBackendMode::LabelSearch,
@@ -228,30 +184,6 @@ impl GeneticStrategyExpert {
         self
     }
 
-    pub fn with_history_window(mut self, train_years: usize, val_years: usize) -> Self {
-        self.train_years = train_years;
-        self.val_years = val_years;
-        self
-    }
-
-    fn labels_from_series(y: &Series) -> Result<Vec<i32>> {
-        let labels = y
-            .cast(&DataType::Int32)
-            .context("cast genetic labels to Int32")?;
-        labels
-            .i32()
-            .context("access genetic labels as Int32")?
-            .into_iter()
-            .map(|value| match value {
-                Some(label @ -1..=1) => Ok(label),
-                Some(other) => {
-                    bail!("unsupported genetic-model label: {other}; expected one of -1, 0, 1")
-                }
-                None => bail!("genetic-model labels may not contain nulls"),
-            })
-            .collect()
-    }
-
     fn class_index_from_signal(signal: i8) -> usize {
         match signal {
             1 => 1,
@@ -265,172 +197,6 @@ impl GeneticStrategyExpert {
             1 => 1,
             -1 => 2,
             _ => 0,
-        }
-    }
-
-    fn timestamps_from_frame(df: &DataFrame) -> Vec<i64> {
-        for name in ["timestamp", "time", "date", "datetime"] {
-            if let Ok(column) = df.column(name)
-                && let Ok(series) = column.as_materialized_series().cast(&DataType::Int64)
-                && let Ok(values) = series.i64()
-            {
-                return values
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, value)| value.unwrap_or(idx as i64))
-                    .collect();
-            }
-        }
-        (0..df.height()).map(|idx| idx as i64).collect()
-    }
-
-    fn feature_frame_from_df(df: &DataFrame, timestamps: Option<Vec<i64>>) -> Result<FeatureFrame> {
-        Ok(FeatureFrame {
-            timestamps: timestamps.unwrap_or_else(|| Self::timestamps_from_frame(df)),
-            names: feature_columns_from_dataframe(df),
-            data: neoethos_data::FeatureData::InMemory(
-                dataframe_to_float32_array(df).context("build genetic feature frame matrix")?,
-            ),
-        })
-    }
-
-    fn numeric_column(df: &DataFrame, names: &[&str]) -> Result<Option<Vec<f64>>> {
-        for name in names {
-            if let Ok(column) = df.column(name) {
-                let series = column
-                    .as_materialized_series()
-                    .cast(&DataType::Float64)
-                    .with_context(|| format!("cast genetic OHLCV column {name} to Float64"))?;
-                let values = series
-                    .f64()
-                    .with_context(|| format!("access genetic OHLCV column {name} as Float64"))?
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, value)| {
-                        let value = value.with_context(|| {
-                            format!(
-                                "genetic OHLCV column {name} contains null at row {idx}; discovery-backed training requires fully materialized market data"
-                            )
-                        })?;
-                        if !value.is_finite() {
-                            bail!(
-                                "genetic OHLCV column {name} contains non-finite value {} at row {}",
-                                value,
-                                idx
-                            );
-                        }
-                        Ok(value)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                return Ok(Some(values));
-            }
-        }
-        Ok(None)
-    }
-
-    fn extract_ohlcv(df: &DataFrame) -> Result<Option<Ohlcv>> {
-        let open = Self::numeric_column(df, &["open", "o"])?;
-        let high = Self::numeric_column(df, &["high", "h"])?;
-        let low = Self::numeric_column(df, &["low", "l"])?;
-        let close = Self::numeric_column(df, &["close", "c"])?;
-        if open.is_none() && high.is_none() && low.is_none() && close.is_none() {
-            return Ok(None);
-        }
-
-        let open =
-            open.context("genetic OHLCV extraction found close-like data but no open column")?;
-        let high =
-            high.context("genetic OHLCV extraction found close-like data but no high column")?;
-        let low =
-            low.context("genetic OHLCV extraction found close-like data but no low column")?;
-        let close =
-            close.context("genetic OHLCV extraction found incomplete OHLCV market columns")?;
-        let len = close.len();
-        if open.len() != len || high.len() != len || low.len() != len {
-            bail!("genetic OHLCV columns have inconsistent lengths");
-        }
-        Ok(Some(Ohlcv {
-            timestamp: Some(Self::timestamps_from_frame(df)),
-            open,
-            high,
-            low,
-            close,
-            volume: Self::numeric_column(df, &["volume", "vol", "v"])?,
-        }))
-    }
-
-    fn discovery_config(&self) -> DiscoveryConfig {
-        let max_candidates = Self::max_discovery_candidates();
-        let candidate_count = self
-            .population_size
-            .saturating_mul(self.generations.max(1))
-            .max(self.population_size)
-            .min(max_candidates);
-        DiscoveryConfig {
-            population: self.population_size,
-            generations: self.generations,
-            max_indicators: self.max_indicators,
-            candidate_count,
-            portfolio_size: self.portfolio_size.clamp(1, self.population_size.max(1)),
-            corr_threshold: 0.90,
-            min_trades_per_day: 0.10,
-            filtering: FilteringConfig::default(),
-            ..DiscoveryConfig::default()
-        }
-    }
-
-    fn timestamp_to_utc(raw: i64) -> Option<chrono::DateTime<Utc>> {
-        let abs = raw.unsigned_abs();
-        let seconds = if abs > 10_000_000_000_000_000 {
-            raw / 1_000_000_000
-        } else if abs > 10_000_000_000_000 {
-            raw / 1_000_000
-        } else if abs > 10_000_000_000 {
-            raw / 1_000
-        } else {
-            raw
-        };
-        Utc.timestamp_opt(seconds, 0).single()
-    }
-
-    fn slice_rows_by_history_window(
-        &self,
-        timestamps: &[i64],
-        row_count: usize,
-    ) -> Option<Vec<usize>> {
-        if timestamps.len() != row_count || timestamps.is_empty() {
-            return None;
-        }
-
-        let latest = Self::timestamp_to_utc(*timestamps.last()?)?;
-        let val_cutoff = if self.val_years > 0 {
-            latest - Duration::days((365 * self.val_years.max(1)) as i64)
-        } else {
-            latest + Duration::seconds(1)
-        };
-        let train_start = if self.train_years > 0 {
-            val_cutoff - Duration::days((365 * self.train_years.max(1)) as i64)
-        } else {
-            Utc.timestamp_opt(0, 0).single()?
-        };
-
-        let selected = timestamps
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, raw)| {
-                let ts = Self::timestamp_to_utc(*raw)?;
-                if ts >= train_start && ts < val_cutoff {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if selected.len() >= row_count.clamp(64, 512).min(row_count) {
-            Some(selected)
-        } else {
-            None
         }
     }
 
@@ -448,135 +214,22 @@ impl GeneticStrategyExpert {
         (train, val)
     }
 
-    fn slice_feature_frame(features: &FeatureFrame, indices: &[usize]) -> FeatureFrame {
-        let timestamps = indices
-            .iter()
-            .filter_map(|idx| features.timestamps.get(*idx).copied())
-            .collect::<Vec<_>>();
-        let names = features.names.clone();
-        let mut data = Array2::<f32>::zeros((indices.len(), features.n_features()));
-        for (out_row, src_row) in indices.iter().copied().enumerate() {
-            for col in 0..features.n_features() {
-                data[(out_row, col)] = features.feature_at(src_row, col);
-            }
-        }
-
-        FeatureFrame {
-            timestamps,
-            names,
-            data: neoethos_data::FeatureData::InMemory(data),
-        }
+    fn slice_feature_frame(features: &FeatureFrame, indices: &[usize]) -> Result<FeatureFrame> {
+        features
+            .select_rows(indices)
+            .context("select exact genetic training rows from typed feature frame")
     }
 
-    fn slice_ohlcv(ohlcv: &Ohlcv, indices: &[usize]) -> Ohlcv {
-        let take = |values: &[f64]| {
-            indices
-                .iter()
-                .filter_map(|idx| values.get(*idx).copied())
-                .collect::<Vec<_>>()
-        };
-
-        Ohlcv {
-            timestamp: ohlcv.timestamp.as_ref().map(|timestamps| {
-                indices
-                    .iter()
-                    .filter_map(|idx| timestamps.get(*idx).copied())
-                    .collect::<Vec<_>>()
-            }),
-            open: take(&ohlcv.open),
-            high: take(&ohlcv.high),
-            low: take(&ohlcv.low),
-            close: take(&ohlcv.close),
-            volume: ohlcv.volume.as_ref().map(|values| {
-                indices
-                    .iter()
-                    .filter_map(|idx| values.get(*idx).copied())
-                    .collect::<Vec<_>>()
-            }),
-        }
-    }
-
-    fn slice_labels(labels: &[i32], indices: &[usize]) -> Vec<i32> {
+    fn slice_labels(labels: &[i32], indices: &[usize]) -> Result<Vec<i32>> {
         indices
             .iter()
-            .filter_map(|idx| labels.get(*idx).copied())
-            .collect::<Vec<_>>()
-    }
-
-    fn train_with_discovery(&self, features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<Vec<Gene>> {
-        let maybe_indices =
-            self.slice_rows_by_history_window(&features.timestamps, features.n_samples());
-        let scoped_features;
-        let scoped_ohlcv;
-        let (features, ohlcv) = if let Some(indices) = maybe_indices.as_ref() {
-            scoped_features = Self::slice_feature_frame(features, indices);
-            scoped_ohlcv = Self::slice_ohlcv(ohlcv, indices);
-            (&scoped_features, &scoped_ohlcv)
-        } else {
-            (features, ohlcv)
-        };
-
-        let resolved_config = self.discovery_config().apply_mode_overrides();
-        // Surface the resolved determinism policy so operators can
-        // correlate neoethos-models genetic-search runs with the typed
-        // policy persisted on the discovery profile (Phase 51).
-        // Reproducible runs require `Deterministic { seed }`; the two
-        // non-deterministic variants are still permitted but flagged
-        // here so they are visible in run logs.
-        let determinism_policy = neoethos_search::current_determinism_policy();
-        tracing::info!(
-            target: "neoethos_models::genetic",
-            ?determinism_policy,
-            "running Rust-native genetic discovery"
-        );
-        // THE HOLDOUT. `run_discovery_cycle_with_holdout` calls itself "the
-        // single source of truth for 'discovery never sees the tail'" and
-        // states that every production caller must go through it. Audit
-        // B02/B03 (2026-07-13) routed the desktop app, the CLI and the batch
-        // orchestrator through it — and missed this call site, which is the
-        // one the TRAINING orchestrator uses. So `GeneticStrategyExpert` has
-        // gone on searching the full series: its genes are selected on 100%
-        // of the rows and its reported fitness is entirely in-sample, while
-        // three other entry points hold back 20%.
-        //
-        // Fixing that outright would change which genes this expert produces,
-        // so it is behind `models.discovery_runtime.genetic_expert_holdout`,
-        // default false = the full series, exactly as before. See that field's
-        // docs for the second reason it is not simply flipped: the wrapper
-        // REFUSES a dataset whose in-sample half is under 64 rows, so short
-        // folds that quietly "succeed" today would start erroring — which is
-        // correct, but it is a change the operator should make deliberately.
-        let holdout = genetic_expert_holdout_enabled();
-        tracing::info!(
-            target: "neoethos_models::genetic",
-            oos_holdout = holdout,
-            "genetic expert discovery window: {}",
-            if holdout {
-                "first 80% (tail withheld)"
-            } else {
-                "FULL series — fitness is in-sample; set \
-                 models.discovery_runtime.genetic_expert_holdout=true to hold out the tail"
-            }
-        );
-        let result = if holdout {
-            run_discovery_cycle_with_holdout(
-                features,
-                ohlcv,
-                &resolved_config,
-                PropFirmRiskRules::default(),
-            )
-            .context("run Rust-native discovery-backed genetic search behind the OOS holdout")?
-        } else {
-            run_discovery_cycle(features, ohlcv, &resolved_config)
-                .context("run Rust-native discovery-backed genetic search")?
-        };
-        if !result.portfolio.is_empty() {
-            return Ok(result.portfolio);
-        }
-        if !result.candidates.is_empty() {
-            return Ok(result.candidates.into_iter().take(8).collect());
-        }
-        bail!("discovery-backed genetic search returned no candidate strategies")
+            .map(|idx| {
+                labels
+                    .get(*idx)
+                    .copied()
+                    .with_context(|| format!("genetic label row index {idx} is out of bounds"))
+            })
+            .collect()
     }
 
     fn evaluate_gene_against_labels(
@@ -584,8 +237,8 @@ impl GeneticStrategyExpert {
         labels: &[i32],
         gene: &mut Gene,
         generation: usize,
-    ) -> f64 {
-        let signals = signals_for_gene(features, gene);
+    ) -> Result<f64> {
+        let signals = signals_for_gene(features, gene)?;
         let mut confusion = [[0usize; 3]; 3];
         let mut non_neutral_predictions = 0usize;
         let mut directional_hits = 0usize;
@@ -651,24 +304,30 @@ impl GeneticStrategyExpert {
         gene.trades_count = non_neutral_predictions;
         gene.generation = generation;
         gene.consistency = consistency;
-        fitness
+        Ok(fitness)
     }
 
-    fn train_with_labels(&self, features: &FeatureFrame, y: &Series) -> Result<Vec<Gene>> {
-        let labels = Self::labels_from_series(y)?;
+    fn train_with_labels(&self, features: &FeatureFrame, labels: &[i32]) -> Result<Vec<Gene>> {
+        validate_model_labels(labels, features.n_samples())?;
         let n_indicators = features.n_features();
         if n_indicators == 0 {
             bail!("genetic label-search requires at least one feature column");
         }
         let (train_indices, val_indices) = Self::split_label_train_val_indices(labels.len());
-        let train_features = Self::slice_feature_frame(features, &train_indices);
-        let train_labels = Self::slice_labels(&labels, &train_indices);
-        let val_features =
-            (!val_indices.is_empty()).then(|| Self::slice_feature_frame(features, &val_indices));
-        let val_labels =
-            (!val_indices.is_empty()).then(|| Self::slice_labels(&labels, &val_indices));
+        let train_features = Self::slice_feature_frame(features, &train_indices)?;
+        let train_labels = Self::slice_labels(labels, &train_indices)?;
+        let val_features = if val_indices.is_empty() {
+            None
+        } else {
+            Some(Self::slice_feature_frame(features, &val_indices)?)
+        };
+        let val_labels = if val_indices.is_empty() {
+            None
+        } else {
+            Some(Self::slice_labels(labels, &val_indices)?)
+        };
 
-        let smc_cfg = SmcSearchConfig::from_env();
+        let smc_cfg = SmcSearchConfig::current();
         let population_size = self.population_size.max(16);
         let effective_generations =
             Self::effective_generation_count(population_size, self.generations);
@@ -726,13 +385,13 @@ impl GeneticStrategyExpert {
         for generation in 0..effective_generations {
             let mut scored = population
                 .into_iter()
-                .map(|mut gene| {
+                .map(|mut gene| -> Result<(f64, Gene)> {
                     let train_score = Self::evaluate_gene_against_labels(
                         &train_features,
                         &train_labels,
                         &mut gene,
                         generation,
-                    );
+                    )?;
                     let score = if let (Some(val_features), Some(val_labels)) =
                         (val_features.as_ref(), val_labels.as_ref())
                     {
@@ -742,7 +401,7 @@ impl GeneticStrategyExpert {
                             val_labels,
                             &mut val_gene,
                             generation,
-                        );
+                        )?;
                         gene.fitness = 0.65 * train_score + 0.35 * val_score;
                         gene.sharpe_ratio = 0.65 * gene.sharpe_ratio + 0.35 * val_gene.sharpe_ratio;
                         gene.win_rate = 0.65 * gene.win_rate + 0.35 * val_gene.win_rate;
@@ -758,9 +417,9 @@ impl GeneticStrategyExpert {
                     } else {
                         train_score
                     };
-                    (score, gene)
+                    Ok((score, gene))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
 
             let score_vector: Vec<f64> = scored.iter().map(|(score, _)| *score).collect();
@@ -890,13 +549,13 @@ impl GeneticStrategyExpert {
 
         let mut final_scored = population
             .into_iter()
-            .map(|mut gene| {
+            .map(|mut gene| -> Result<(f64, Gene)> {
                 let train_score = Self::evaluate_gene_against_labels(
                     &train_features,
                     &train_labels,
                     &mut gene,
                     effective_generations,
-                );
+                )?;
                 let score = if let (Some(val_features), Some(val_labels)) =
                     (val_features.as_ref(), val_labels.as_ref())
                 {
@@ -906,7 +565,7 @@ impl GeneticStrategyExpert {
                         val_labels,
                         &mut val_gene,
                         effective_generations,
-                    );
+                    )?;
                     gene.fitness = 0.65 * train_score + 0.35 * val_score;
                     gene.sharpe_ratio = 0.65 * gene.sharpe_ratio + 0.35 * val_gene.sharpe_ratio;
                     gene.win_rate = 0.65 * gene.win_rate + 0.35 * val_gene.win_rate;
@@ -921,9 +580,9 @@ impl GeneticStrategyExpert {
                 } else {
                     train_score
                 };
-                (score, gene)
+                Ok((score, gene))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         final_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
 
         let mut portfolio = final_scored
@@ -945,16 +604,16 @@ impl GeneticStrategyExpert {
         Ok(portfolio)
     }
 
-    fn feature_frame_for_prediction(&self, x: &DataFrame) -> Result<FeatureFrame> {
-        let actual_columns = feature_columns_from_dataframe(x);
-        if !self.feature_columns.is_empty() && self.feature_columns != actual_columns {
+    fn validate_prediction_frame(&self, x: &FeatureFrame) -> Result<()> {
+        if !self.feature_columns.is_empty() && self.feature_columns.as_slice() != x.names.as_slice()
+        {
             bail!(
                 "feature column mismatch for genetic model; expected {:?}, got {:?}",
                 self.feature_columns,
-                actual_columns
+                x.names
             );
         }
-        Self::feature_frame_from_df(x, None)
+        Ok(())
     }
 
     fn artifact_path(path: &Path) -> PathBuf {
@@ -1100,17 +759,8 @@ impl GeneticStrategyExpert {
 
     fn training_summary(&self, features: &FeatureFrame) -> TrainingSummaryMetadata {
         let dataset_rows = features.n_samples();
-        if matches!(self.backend_mode, GeneticBackendMode::DiscoveryBacked) {
-            let train_rows = self
-                .slice_rows_by_history_window(&features.timestamps, dataset_rows)
-                .map(|indices| indices.len())
-                .unwrap_or(dataset_rows);
-            let val_rows = dataset_rows.saturating_sub(train_rows);
-            TrainingSummaryMetadata::new(dataset_rows, train_rows, val_rows)
-        } else {
-            let (train_indices, val_indices) = Self::split_label_train_val_indices(dataset_rows);
-            TrainingSummaryMetadata::new(dataset_rows, train_indices.len(), val_indices.len())
-        }
+        let (train_indices, val_indices) = Self::split_label_train_val_indices(dataset_rows);
+        TrainingSummaryMetadata::new(dataset_rows, train_indices.len(), val_indices.len())
     }
 
     fn build_runtime_metadata(
@@ -1235,10 +885,7 @@ impl GeneticStrategyExpert {
     }
 
     fn runtime_backend(&self) -> String {
-        match self.backend_mode {
-            GeneticBackendMode::DiscoveryBacked => "genetic_discovery_backed_cpu".to_string(),
-            GeneticBackendMode::LabelSearch => "genetic_label_search_cpu".to_string(),
-        }
+        "genetic_label_search_cpu".to_string()
     }
 
     fn runtime_degraded_reason(&self) -> Option<String> {
@@ -1383,33 +1030,26 @@ impl GeneticStrategyExpert {
 
     pub fn fit(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        metadata: Option<&DataFrame>,
+        x: &FeatureFrame,
+        y: &[i32],
+        symbol: Option<&str>,
+        lease: &CpuLease,
+    ) -> Result<()> {
+        lease.scope(|| self.fit_scoped(x, y, symbol))
+    }
+
+    fn fit_scoped(
+        &mut self,
+        features: &FeatureFrame,
+        labels: &[i32],
         symbol: Option<&str>,
     ) -> Result<()> {
-        let timestamps = metadata.map(Self::timestamps_from_frame);
-        let features = Self::feature_frame_from_df(x, timestamps)?;
+        validate_model_labels(labels, features.n_samples())?;
         self.feature_columns = features.names.clone();
         self.symbol = symbol.map(|value| value.to_string());
 
-        let metadata_ohlcv = match metadata {
-            Some(frame) => Self::extract_ohlcv(frame)?,
-            None => None,
-        };
-        let feature_ohlcv = if metadata_ohlcv.is_none() {
-            Self::extract_ohlcv(x)?
-        } else {
-            None
-        };
-
-        let portfolio = if let Some(ohlcv) = metadata_ohlcv.or(feature_ohlcv) {
-            self.backend_mode = GeneticBackendMode::DiscoveryBacked;
-            self.train_with_discovery(&features, &ohlcv)?
-        } else {
-            self.backend_mode = GeneticBackendMode::LabelSearch;
-            self.train_with_labels(&features, y)?
-        };
+        self.backend_mode = GeneticBackendMode::LabelSearch;
+        let portfolio = self.train_with_labels(features, labels)?;
 
         self.best_fitness = portfolio
             .iter()
@@ -1418,7 +1058,7 @@ impl GeneticStrategyExpert {
             .ok_or_else(|| anyhow::anyhow!("genetic training produced an empty portfolio"))?;
         self.portfolio = portfolio;
         Self::validate_best_fitness(self.best_fitness, &self.portfolio, "genetic runtime state")?;
-        let training_summary = self.training_summary(&features);
+        let training_summary = self.training_summary(features);
         self.runtime_metadata = Some(Self::build_runtime_metadata(
             self.feature_columns.clone(),
             training_summary,
@@ -1434,23 +1074,22 @@ impl GeneticStrategyExpert {
         Ok(())
     }
 
-    pub fn predict_proba(
-        &self,
-        x: &DataFrame,
-        _metadata: Option<&DataFrame>,
-        _symbol: Option<&str>,
-    ) -> Result<Array2<f32>> {
+    pub fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| self.predict_proba_scoped(x))
+    }
+
+    fn predict_proba_scoped(&self, x: &FeatureFrame) -> Result<Array2<f64>> {
         if self.portfolio.is_empty() {
             bail!("genetic model has no trained portfolio")
         }
 
-        let features = self.feature_frame_for_prediction(x)?;
-        let n_samples = features.n_samples();
-        let mut probabilities = Array2::zeros((n_samples, 3));
+        self.validate_prediction_frame(x)?;
+        let n_samples = x.n_samples();
+        let mut probabilities = Array2::<f64>::zeros((n_samples, 3));
 
         for gene in &self.portfolio {
-            let signals = signals_for_gene(&features, gene);
-            let vote_weight = (gene.fitness.max(1.0) * (1.0 + gene.consistency.max(0.0))) as f32;
+            let signals = signals_for_gene(x, gene)?;
+            let vote_weight = gene.fitness.max(1.0) * (1.0 + gene.consistency.max(0.0));
             for (row_idx, signal) in signals.into_iter().enumerate() {
                 probabilities[(row_idx, Self::class_index_from_signal(signal))] += vote_weight;
             }
@@ -1460,7 +1099,7 @@ impl GeneticStrategyExpert {
             let row_sum = probabilities[(row_idx, 0)]
                 + probabilities[(row_idx, 1)]
                 + probabilities[(row_idx, 2)];
-            if row_sum <= f32::EPSILON {
+            if row_sum <= f64::EPSILON {
                 probabilities[(row_idx, 0)] = 1.0;
                 probabilities[(row_idx, 1)] = 0.0;
                 probabilities[(row_idx, 2)] = 0.0;
@@ -1474,9 +1113,17 @@ impl GeneticStrategyExpert {
         Ok(probabilities)
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        lease.scope(|| self.predict_runtime_scoped(x))
+    }
+
+    fn predict_runtime_scoped(&self, x: &FeatureFrame) -> Result<Vec<RuntimePrediction>> {
         self.ensure_runtime_state_ready()?;
-        let probabilities = self.predict_proba(x, None, None)?;
+        let probabilities = self.predict_proba_scoped(x)?;
         let (execution_backend, degraded_reason) = self.runtime_details();
         let mut predictions = Vec::with_capacity(probabilities.nrows());
         for row in probabilities.outer_iter() {
@@ -1503,8 +1150,6 @@ impl GeneticStrategyExpert {
             generations: self.generations,
             max_indicators: self.max_indicators,
             portfolio_size: self.portfolio_size,
-            train_years: self.train_years,
-            val_years: self.val_years,
             symbol: self.symbol.clone(),
             feature_columns: self.feature_columns.clone(),
             backend_mode: self.backend_mode,
@@ -1546,8 +1191,6 @@ impl GeneticStrategyExpert {
         self.generations = artifact.generations;
         self.max_indicators = artifact.max_indicators;
         self.portfolio_size = artifact.portfolio_size;
-        self.train_years = artifact.train_years;
-        self.val_years = artifact.val_years;
         self.symbol = artifact.symbol;
         self.feature_columns = artifact.feature_columns;
         self.backend_mode = artifact.backend_mode;
@@ -1574,12 +1217,12 @@ impl GeneticStrategyExpert {
 }
 
 impl ExpertModel for GeneticStrategyExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        GeneticStrategyExpert::fit(self, x, y, None, None)
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        GeneticStrategyExpert::fit(self, x, y, None, lease)
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        GeneticStrategyExpert::predict_proba(self, x, None, None)
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        GeneticStrategyExpert::predict_proba(self, x, lease)
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -1602,7 +1245,30 @@ mod tests {
     #![allow(clippy::field_reassign_with_default)]
 
     use super::*;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+    use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn typed_frame(columns: Vec<(&str, Vec<f64>)>) -> Result<FeatureFrame> {
+        let rows = columns.first().map_or(0, |(_, values)| values.len());
+        let columns = columns
+            .into_iter()
+            .map(|(name, values)| {
+                FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+    }
+
+    fn one_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker is valid");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("isolated genetic-model test lease")
+    }
 
     fn temp_model_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -1755,9 +1421,9 @@ mod tests {
         expert.portfolio = vec![sample_gene()];
         expert.best_fitness = 12.0;
 
-        let df = DataFrame::new(vec![Series::new("f1".into(), vec![0.8_f64, -0.4]).into()])?;
+        let features = typed_frame(vec![("f1", vec![0.8, -0.4])])?;
         let err = expert
-            .predict_runtime(&df)
+            .predict_runtime(&features, &one_worker_lease())
             .expect_err("missing runtime metadata should fail runtime predictions");
         assert!(err.to_string().contains("runtime metadata"));
         Ok(())
@@ -1772,8 +1438,8 @@ mod tests {
         expert.best_fitness = 12.0;
         expert.runtime_metadata = Some(sample_runtime_metadata(expert.feature_columns.clone()));
 
-        let df = DataFrame::new(vec![Series::new("f1".into(), vec![0.8_f64, -0.4]).into()])?;
-        let predictions = expert.predict_runtime(&df)?;
+        let features = typed_frame(vec![("f1", vec![0.8, -0.4])])?;
+        let predictions = expert.predict_runtime(&features, &one_worker_lease())?;
         assert_eq!(predictions.len(), 2);
         assert_eq!(
             predictions[0].metadata().execution_backend.as_deref(),
@@ -1785,50 +1451,46 @@ mod tests {
 
     #[test]
     fn genetic_trait_fit_and_predict_delegate_to_runtime_model() -> Result<()> {
-        let features = DataFrame::new(vec![
-            Series::new("f1".into(), vec![0.8_f64, -0.2, 1.1, -1.0, 0.3, -0.7]).into(),
-            Series::new("f2".into(), vec![0.1_f64, -0.4, 0.9, -0.8, 0.2, -0.5]).into(),
+        let features = typed_frame(vec![
+            ("f1", vec![0.8, -0.2, 1.1, -1.0, 0.3, -0.7]),
+            ("f2", vec![0.1, -0.4, 0.9, -0.8, 0.2, -0.5]),
         ])?;
-        let labels = Series::new("target".into(), vec![1_i32, -1, 1, -1, 0, 0]);
+        let labels = vec![1_i32, -1, 1, -1, 0, 0];
         let mut expert = GeneticStrategyExpert::new(8, 2, 2)?;
+        let lease = one_worker_lease();
 
-        ExpertModel::fit(&mut expert, &features, &labels)?;
-        let probabilities = ExpertModel::predict_proba(&expert, &features)?;
+        ExpertModel::fit(&mut expert, &features, &labels, &lease)?;
+        let probabilities = ExpertModel::predict_proba(&expert, &features, &lease)?;
 
-        assert_eq!(probabilities.nrows(), features.height());
+        assert_eq!(probabilities.nrows(), features.n_samples());
         assert_eq!(probabilities.ncols(), 3);
         Ok(())
     }
 
     #[test]
     fn genetic_label_search_runtime_metadata_tracks_train_val_split() -> Result<()> {
-        let features = DataFrame::new(vec![
-            Series::new(
-                "f1".into(),
+        let features = typed_frame(vec![
+            (
+                "f1",
                 (0..20).map(|idx| idx as f64 * 0.1).collect::<Vec<_>>(),
-            )
-            .into(),
-            Series::new(
-                "f2".into(),
+            ),
+            (
+                "f2",
                 (0..20)
                     .map(|idx| (idx as f64 * 0.1) - 0.5)
                     .collect::<Vec<_>>(),
-            )
-            .into(),
+            ),
         ])?;
-        let labels = Series::new(
-            "target".into(),
-            (0..20)
-                .map(|idx| match idx % 3 {
-                    0 => -1,
-                    1 => 0,
-                    _ => 1,
-                })
-                .collect::<Vec<_>>(),
-        );
+        let labels = (0..20)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
         let mut expert = GeneticStrategyExpert::new(12, 2, 2)?;
 
-        expert.fit(&features, &labels, None, None)?;
+        expert.fit(&features, &labels, None, &one_worker_lease())?;
         let metadata = expert
             .runtime_metadata
             .as_ref()
@@ -1836,21 +1498,6 @@ mod tests {
         assert_eq!(metadata.training_summary.dataset_rows, 20);
         assert_eq!(metadata.training_summary.train_rows, 16);
         assert_eq!(metadata.training_summary.val_rows, 4);
-        Ok(())
-    }
-
-    #[test]
-    fn genetic_extract_ohlcv_rejects_null_market_rows() -> Result<()> {
-        let df = DataFrame::new(vec![
-            Series::new("open".into(), vec![Some(1.0_f64), None]).into(),
-            Series::new("high".into(), vec![Some(1.1_f64), Some(1.2)]).into(),
-            Series::new("low".into(), vec![Some(0.9_f64), Some(1.0)]).into(),
-            Series::new("close".into(), vec![Some(1.05_f64), Some(1.1)]).into(),
-        ])?;
-
-        let err = GeneticStrategyExpert::extract_ohlcv(&df)
-            .expect_err("null OHLCV rows should fail strict extraction");
-        assert!(err.to_string().contains("contains null"));
         Ok(())
     }
 
@@ -1863,9 +1510,19 @@ mod tests {
     }
 
     #[test]
-    fn genetic_discovery_candidate_budget_caps_at_default_limit() {
-        let expert = GeneticStrategyExpert::new(2_000, 400, 4).expect("construct expert");
-        let config = expert.discovery_config();
-        assert_eq!(config.candidate_count, DEFAULT_MAX_DISCOVERY_CANDIDATES);
+    fn genetic_legacy_discovery_backed_artifact_fails_closed() -> Result<()> {
+        let artifact = GeneticArtifact {
+            portfolio: vec![sample_gene()],
+            feature_columns: vec!["f1".to_string()],
+            best_fitness: 12.0,
+            runtime_metadata: Some(sample_runtime_metadata(vec!["f1".to_string()])),
+            ..GeneticArtifact::default()
+        };
+        let retired_mode = ["Discovery", "Backed"].concat();
+        let payload = serde_json::to_string(&artifact)?.replace("LabelSearch", &retired_mode);
+        let err = serde_json::from_str::<GeneticArtifact>(&payload)
+            .expect_err("retired receiptless discovery artifacts must not load");
+        assert!(err.to_string().contains("unknown variant"));
+        Ok(())
     }
 }

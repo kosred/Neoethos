@@ -106,10 +106,6 @@ fn fnv1a_update(hash: u64, bytes: &[u8]) -> u64 {
     fnv1a64_update(hash, bytes)
 }
 
-fn quantize_f32(value: f32, scale: f32) -> i64 {
-    ((value as f64) * (scale as f64)).round() as i64
-}
-
 fn quantize_f64(value: f64, scale: f64) -> i64 {
     (value * scale).round() as i64
 }
@@ -270,15 +266,15 @@ pub fn gene_signature_hash(gene: &Gene) -> u64 {
     }
     h = fnv1a_update(h, &(gene.weights.len() as u64).to_le_bytes());
     for w in &gene.weights {
-        h = fnv1a_update(h, &quantize_f32(*w, 10_000.0).to_le_bytes());
+        h = fnv1a_update(h, &quantize_f64(*w, 10_000.0).to_le_bytes());
     }
     h = fnv1a_update(
         h,
-        &quantize_f32(gene.long_threshold, 1_000_000.0).to_le_bytes(),
+        &quantize_f64(gene.long_threshold, 1_000_000.0).to_le_bytes(),
     );
     h = fnv1a_update(
         h,
-        &quantize_f32(gene.short_threshold, 1_000_000.0).to_le_bytes(),
+        &quantize_f64(gene.short_threshold, 1_000_000.0).to_le_bytes(),
     );
     h = fnv1a_update(h, &[gene.use_ob as u8]);
     h = fnv1a_update(h, &[gene.use_fvg as u8]);
@@ -423,19 +419,6 @@ pub fn install_seen_signature_memory_runtime_overrides(
     SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES.set(overrides)
 }
 
-/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
-/// Kept only because `genetic/mod.rs` and `lib.rs` re-export it.
-pub fn install_seen_signature_memory_runtime_overrides_from_env() {
-    tracing::error!(
-        target: "neoethos_search::retired_env",
-        "install_seen_signature_memory_runtime_overrides_from_env() is RETIRED and installs \
-         typed DEFAULTS — the NEOETHOS_BOT_PROP_SEEN_* layer no longer exists. Call \
-         install_seen_signature_memory_runtime_overrides_from_settings(&settings)."
-    );
-    let _ = SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES
-        .set(SeenSignatureMemoryRuntimeOverrides::default());
-}
-
 /// Config-driven install — reads the seen-signature knobs from the single
 /// `Settings` instead of the environment. Idempotent.
 pub fn install_seen_signature_memory_runtime_overrides_from_settings(s: &neoethos_core::Settings) {
@@ -453,14 +436,6 @@ pub fn current_seen_signature_memory_runtime_overrides() -> SeenSignatureMemoryR
 }
 
 impl SeenSignatureMemory {
-    /// Deprecated spelling of [`Self::current`] — it has read no environment
-    /// since the typed boundary landed, and none at all since 2026-08-10.
-    /// Retained because `discovery.rs`, `genetic/search_engine.rs` and
-    /// `discovery_ledger.rs` call it.
-    pub fn from_env() -> Self {
-        Self::current()
-    }
-
     /// Build the dedup memory from the installed runtime overrides, seeding it
     /// from the persisted signature file when one is configured.
     pub fn current() -> Self {
@@ -597,7 +572,7 @@ impl SeenSignatureMemory {
     }
 }
 
-fn random_coarse_weight(rng: &mut impl Rng) -> f32 {
+fn random_coarse_weight(rng: &mut impl Rng) -> f64 {
     // 2026-07-02 (search-space expansion, SCORING_VERSION 5 changelog): weights
     // may now be NEGATIVE — "exit/veto when this indicator disagrees" is a real
     // strategy pattern the GA previously could not express (the seed templates
@@ -616,7 +591,7 @@ fn random_coarse_weight(rng: &mut impl Rng) -> f32 {
 /// Static fallback threshold ladder. Calibrated for z-score-normalised
 /// features per the 2026-05-26 narrow-ladder fix (F-273). Used when
 /// the adaptive ladder hasn't been installed for this process.
-const STATIC_THRESHOLD_LADDER: [f32; 6] = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
+const STATIC_THRESHOLD_LADDER: [f64; 6] = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
 
 /// F-277 (2026-05-28): process-wide adaptive threshold ladder derived
 /// from the actual feature-magnitude profile of the current discovery
@@ -643,14 +618,14 @@ const STATIC_THRESHOLD_LADDER: [f32; 6] = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
 /// is single-instance and runs sequentially, so a per-run replace is correct;
 /// the `RwLock` still allows the GA's many reader threads to read concurrently
 /// within a run.
-static ADAPTIVE_THRESHOLD_LADDER: std::sync::RwLock<Option<[f32; 6]>> =
+static ADAPTIVE_THRESHOLD_LADDER: std::sync::RwLock<Option<[f64; 6]>> =
     std::sync::RwLock::new(None);
 
 /// Install (REPLACE) the adaptive threshold ladder derived from the current
 /// run's feature cube. Unlike the old first-write-wins semantics, each call
 /// overwrites, so a later symbol's run gets its own ladder. Values should be
 /// sorted ascending and finite + non-negative (the derivation clamps/sorts).
-pub fn install_adaptive_threshold_ladder(ladder: [f32; 6]) {
+pub fn install_adaptive_threshold_ladder(ladder: [f64; 6]) {
     let mut guard = ADAPTIVE_THRESHOLD_LADDER
         .write()
         .unwrap_or_else(|e| e.into_inner());
@@ -669,7 +644,7 @@ pub fn clear_adaptive_threshold_ladder() {
 
 /// Read the currently-installed threshold ladder. Returns the adaptive ladder
 /// when installed, else the static fallback.
-pub fn current_threshold_ladder() -> [f32; 6] {
+pub fn current_threshold_ladder() -> [f64; 6] {
     ADAPTIVE_THRESHOLD_LADDER
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -694,7 +669,9 @@ static GENE_STOP_ATR_PIPS: std::sync::RwLock<Option<f64>> = std::sync::RwLock::n
 /// values clear the scale instead of installing a band that would collapse to a
 /// point — a zero ATR would otherwise produce `sl ∈ [0, 0]`.
 pub fn install_gene_stop_atr_scale(atr_pips: f64) {
-    let mut guard = GENE_STOP_ATR_PIPS.write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = GENE_STOP_ATR_PIPS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = if atr_pips.is_finite() && atr_pips > 0.0 {
         Some(atr_pips)
     } else {
@@ -705,7 +682,9 @@ pub fn install_gene_stop_atr_scale(atr_pips: f64) {
 /// Clear back to the absolute pip band. Called at the start of a run that does
 /// NOT scale by ATR, so the PREVIOUS combo's scale cannot leak into it.
 pub fn clear_gene_stop_atr_scale() {
-    let mut guard = GENE_STOP_ATR_PIPS.write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = GENE_STOP_ATR_PIPS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
 
@@ -788,7 +767,7 @@ pub fn current_gene_stop_bounds() -> ResolvedGeneStopBounds {
     }
 }
 
-fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
+fn random_coarse_threshold(rng: &mut impl Rng) -> f64 {
     // F-273 narrow ladder by default; F-277 adaptive ladder when the
     // operator opts in via `install_adaptive_threshold_ladder` from
     // `run_discovery_cycle_with_progress`.
@@ -815,7 +794,7 @@ fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
 /// Returns `None` when the cube is empty or has zero finite values.
 pub fn derive_adaptive_threshold_ladder_from_features(
     features: &neoethos_data::FeatureFrame,
-) -> Option<[f32; 6]> {
+) -> Option<[f64; 6]> {
     let n_cols = features.n_features();
     let n_rows = features.n_samples();
     if n_cols == 0 || n_rows == 0 {
@@ -825,14 +804,14 @@ pub fn derive_adaptive_threshold_ladder_from_features(
     // Per-column median |value|. `feature_column` yields one contiguous series
     // per call — for the mmap backing this is a single feature-major row read,
     // so the scan is sequential rather than strided across the whole matrix.
-    let mut per_col_median_abs: Vec<f32> = Vec::with_capacity(n_cols);
+    let mut per_col_median_abs: Vec<f64> = Vec::with_capacity(n_cols);
     for c in 0..n_cols {
-        let mut abs_vals: Vec<f32> = features
-            .feature_column(c)
+        let column = features.feature_column(c).ok()?;
+        let mut abs_vals: Vec<f64> = column
+            .values
             .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .map(|v| v.abs())
+            .zip(&column.validity)
+            .filter_map(|(value, validity)| validity.is_valid().then_some(value.abs()))
             .collect();
         if abs_vals.is_empty() {
             continue;
@@ -849,9 +828,8 @@ pub fn derive_adaptive_threshold_ladder_from_features(
     }
 
     // Pool: percentile points on the per-column-median sample.
-    per_col_median_abs
-        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let pct = |p: f64| -> f32 {
+    per_col_median_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |p: f64| -> f64 {
         let idx = ((p * (per_col_median_abs.len() as f64 - 1.0)).round() as usize)
             .min(per_col_median_abs.len() - 1);
         per_col_median_abs[idx].clamp(1e-4, 10.0)
@@ -902,7 +880,7 @@ pub fn new_random_gene(
     let count = rng.random_range(min_indicators..=max_indicators);
     let sample = sample(rng, n_indicators.max(1), count);
     let indices: Vec<usize> = sample.iter().collect();
-    let weights: Vec<f32> = (0..count).map(|_| random_coarse_weight(rng)).collect();
+    let weights: Vec<f64> = (0..count).map(|_| random_coarse_weight(rng)).collect();
     let long_threshold = random_coarse_threshold(rng);
     let short_threshold = -random_coarse_threshold(rng);
     // SL/TP in pips, drawn from the band resolved for THIS dataset.
@@ -1141,13 +1119,13 @@ pub fn mutate(
 
     // Adaptive mutation rate based on stagnation
     let (num_mutations, intensity) = if stagnant_generations > 10 {
-        (3, 1.5_f32) // Heavy exploration
+        (3, 1.5_f64) // Heavy exploration
     } else if stagnant_generations > 5 {
-        (2, 1.2_f32) // Moderate exploration
+        (2, 1.2_f64) // Moderate exploration
     } else if stagnant_generations == 0 {
-        (1, 0.5_f32) // Exploitation (improvement streak)
+        (1, 0.5_f64) // Exploitation (improvement streak)
     } else {
-        (1, 1.0_f32) // Normal
+        (1, 1.0_f64) // Normal
     };
 
     for _ in 0..num_mutations {
@@ -1282,7 +1260,10 @@ mod tests {
         let absolute = current_gene_stop_bounds();
         assert_eq!(absolute.atr_pips, None);
         assert_eq!(absolute.sl_min_pips, 6.0, "the pre-2026-08-09 stop floor");
-        assert_eq!(absolute.sl_max_pips, 20.0, "the pre-2026-08-09 stop ceiling");
+        assert_eq!(
+            absolute.sl_max_pips, 20.0,
+            "the pre-2026-08-09 stop ceiling"
+        );
         assert_eq!(absolute.tp_min_pips, 12.0);
         assert_eq!(absolute.tp_max_pips, 45.0);
 
@@ -1351,8 +1332,7 @@ mod tests {
         for _ in 0..200 {
             let gene = new_random_gene(8, 4, 0, &smc, &mut rng);
             assert!(
-                gene.sl_pips >= band.sl_min_pips - 1e-9
-                    && gene.sl_pips <= band.sl_max_pips + 1e-9,
+                gene.sl_pips >= band.sl_min_pips - 1e-9 && gene.sl_pips <= band.sl_max_pips + 1e-9,
                 "initialised sl {} outside [{}, {}]",
                 gene.sl_pips,
                 band.sl_min_pips,
@@ -1467,41 +1447,36 @@ mod tests {
 
     // ─── F-277 adaptive threshold ladder tests ────────────────────────
 
-    // The ladder fn moved from a raw `Array2` to the out-of-core-aware
-    // `FeatureFrame`; wrap each test cube (timestamps/names are irrelevant to
-    // the per-column magnitude math).
-    fn frame_of(a: ndarray::Array2<f32>) -> neoethos_data::FeatureFrame {
-        neoethos_data::FeatureFrame::from_array(Vec::new(), Vec::new(), a)
-    }
-
-    #[test]
-    fn derive_ladder_returns_none_for_empty_cube() {
-        let empty: ndarray::Array2<f32> = ndarray::Array2::zeros((0, 0));
-        assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(empty)).is_none());
-
-        let no_rows: ndarray::Array2<f32> = ndarray::Array2::zeros((0, 5));
-        assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(no_rows)).is_none());
-
-        let no_cols: ndarray::Array2<f32> = ndarray::Array2::zeros((100, 0));
-        assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(no_cols)).is_none());
+    // Empty feature frames are structurally invalid. Every ladder fixture now
+    // uses the same f64/validity/provenance contract as production.
+    fn frame_of(a: ndarray::Array2<f64>) -> neoethos_data::FeatureFrame {
+        let names = (0..a.ncols())
+            .map(|column| format!("test_feature_{column}"))
+            .collect();
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+            neoethos_data::test_fixtures::canonical_test_timestamps(a.nrows()),
+            names,
+            a,
+        )
+        .expect("valid f64 adaptive-threshold fixture")
     }
 
     #[test]
     fn derive_ladder_returns_none_for_all_nan_cube() {
-        let mut data: ndarray::Array2<f32> = ndarray::Array2::zeros((10, 3));
-        data.fill(f32::NAN);
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((10, 3));
+        data.fill(f64::NAN);
         assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(data)).is_none());
     }
 
     #[test]
     fn derive_ladder_produces_monotonic_ascending_values() {
         // Sample with varied magnitudes per column.
-        let mut data: ndarray::Array2<f32> = ndarray::Array2::zeros((100, 4));
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((100, 4));
         for r in 0..100 {
-            data[(r, 0)] = (r as f32) * 0.01; // 0..1.0 — small magnitudes
-            data[(r, 1)] = (r as f32) * 0.05; // 0..5.0 — medium
-            data[(r, 2)] = (r as f32) * 0.10; // 0..10.0 — large (will clamp)
-            data[(r, 3)] = -(r as f32) * 0.02; // negative side
+            data[(r, 0)] = (r as f64) * 0.01; // 0..1.0 — small magnitudes
+            data[(r, 1)] = (r as f64) * 0.05; // 0..5.0 — medium
+            data[(r, 2)] = (r as f64) * 0.10; // 0..10.0 — large (will clamp)
+            data[(r, 3)] = -(r as f64) * 0.02; // negative side
         }
         let ladder = derive_adaptive_threshold_ladder_from_features(&frame_of(data))
             .expect("non-degenerate cube must produce ladder");
@@ -1528,8 +1503,8 @@ mod tests {
         // Audit D06: a later run must REPLACE the ladder (not be blocked by a
         // first-write-wins OnceLock), and clearing must revert to the static
         // fallback so no symbol's ladder leaks into a later run.
-        let ladder_a = [0.01_f32, 0.02, 0.03, 0.04, 0.05, 0.06];
-        let ladder_b = [0.5_f32, 0.6, 0.7, 0.8, 0.9, 1.0];
+        let ladder_a = [0.01_f64, 0.02, 0.03, 0.04, 0.05, 0.06];
+        let ladder_b = [0.5_f64, 0.6, 0.7, 0.8, 0.9, 1.0];
 
         install_adaptive_threshold_ladder(ladder_a);
         assert_eq!(current_threshold_ladder(), ladder_a);

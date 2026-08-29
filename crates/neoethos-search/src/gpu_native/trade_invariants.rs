@@ -74,10 +74,20 @@ pub fn check_trade_invariants(
         // negative in either sense — the CPU floors both at zero and so does the
         // kernel, so a negative value means one of them stopped doing that.
         if !(outcome.mfe >= 0.0) {
-            push(index, candidate, "mfe_non_negative", format!("mfe={}", outcome.mfe));
+            push(
+                index,
+                candidate,
+                "mfe_non_negative",
+                format!("mfe={}", outcome.mfe),
+            );
         }
         if !(outcome.mae >= 0.0) {
-            push(index, candidate, "mae_non_negative", format!("mae={}", outcome.mae));
+            push(
+                index,
+                candidate,
+                "mae_non_negative",
+                format!("mae={}", outcome.mae),
+            );
         }
 
         // A trade cannot close better than the best price it ever saw. Compared
@@ -101,7 +111,10 @@ pub fn check_trade_invariants(
                 index,
                 candidate,
                 "exit_after_entry",
-                format!("entry_bar={} exit_bar={}", outcome.entry_bar, outcome.exit_bar),
+                format!(
+                    "entry_bar={} exit_bar={}",
+                    outcome.entry_bar, outcome.exit_bar
+                ),
             );
         }
 
@@ -135,13 +148,23 @@ pub fn check_trade_invariants(
         if first > last || last >= prices.high.len() || last >= prices.low.len() {
             continue;
         }
-        let pip = if pip_value.abs() < 1e-12 { 1e-12 } else { pip_value };
+        let pip = if pip_value.abs() < 1e-12 {
+            1e-12
+        } else {
+            pip_value
+        };
         let (mut max_fav, mut max_adv) = (0.0_f64, 0.0_f64);
         for bar in first..=last {
             let (fav, adv) = if event.direction == POPULATION_DIRECTION_LONG {
-                (prices.high[bar] - event.entry_price, event.entry_price - prices.low[bar])
+                (
+                    prices.high[bar] - event.entry_price,
+                    event.entry_price - prices.low[bar],
+                )
             } else {
-                (event.entry_price - prices.low[bar], prices.high[bar] - event.entry_price)
+                (
+                    event.entry_price - prices.low[bar],
+                    prices.high[bar] - event.entry_price,
+                )
             };
             max_fav = max_fav.max(fav / pip * pip_value_per_lot);
             max_adv = max_adv.max(adv / pip * pip_value_per_lot);
@@ -219,16 +242,11 @@ pub fn audit_device_outcomes(
     pip_value: f64,
     pip_value_per_lot: f64,
 ) -> Vec<String> {
-    let mut complaints: Vec<String> = check_trade_invariants(
-        events,
-        outcomes,
-        prices,
-        pip_value,
-        pip_value_per_lot,
-    )
-    .into_iter()
-    .map(|violation| violation.to_string())
-    .collect();
+    let mut complaints: Vec<String> =
+        check_trade_invariants(events, outcomes, prices, pip_value, pip_value_per_lot)
+            .into_iter()
+            .map(|violation| violation.to_string())
+            .collect();
     for (candidate_id, net_profit) in aggregates {
         if let Some(complaint) = check_pnl_reconciles(outcomes, *candidate_id, *net_profit) {
             complaints.push(complaint);
@@ -287,7 +305,10 @@ mod tests {
             check_trade_invariants(
                 &events,
                 &honest,
-                PriceSeries { high: &high, low: &low },
+                PriceSeries {
+                    high: &high,
+                    low: &low
+                },
                 0.01,
                 1.0,
             )
@@ -299,7 +320,10 @@ mod tests {
         let violations = check_trade_invariants(
             &events,
             &agreed_but_wrong,
-            PriceSeries { high: &high, low: &low },
+            PriceSeries {
+                high: &high,
+                low: &low,
+            },
             0.01,
             1.0,
         );
@@ -321,7 +345,10 @@ mod tests {
         let violations = check_trade_invariants(
             &events,
             &[bad],
-            PriceSeries { high: &high, low: &low },
+            PriceSeries {
+                high: &high,
+                low: &low,
+            },
             0.01,
             1.0,
         );
@@ -349,7 +376,10 @@ mod tests {
             check_trade_invariants(
                 &[event(POPULATION_DIRECTION_LONG, 100.0)],
                 &[open],
-                PriceSeries { high: &high, low: &low },
+                PriceSeries {
+                    high: &high,
+                    low: &low
+                },
                 0.01,
                 1.0,
             )
@@ -359,7 +389,10 @@ mod tests {
 
     #[test]
     fn per_trade_pnl_must_reconcile_with_the_reducer_aggregate() {
-        let trades = [outcome(10.0, 5.0, 30.0, 1.0), outcome(10.0, 5.0, -12.0, -0.4)];
+        let trades = [
+            outcome(10.0, 5.0, 30.0, 1.0),
+            outcome(10.0, 5.0, -12.0, -0.4),
+        ];
         assert!(check_pnl_reconciles(&trades, 1, 18.0).is_none());
         let complaint = check_pnl_reconciles(&trades, 1, 25.0).expect("mismatch must be reported");
         assert!(complaint.contains("18"), "{complaint}");
@@ -377,7 +410,10 @@ mod tests {
             &[],
             &[bad],
             &[(1, 999.0)],
-            PriceSeries { high: &high, low: &low },
+            PriceSeries {
+                high: &high,
+                low: &low,
+            },
             0.01,
             1.0,
         );
@@ -392,7 +428,9 @@ mod tests {
             "{complaints:?}"
         );
         assert!(
-            complaints.iter().any(|c| c.contains("reducer reported 999")),
+            complaints
+                .iter()
+                .any(|c| c.contains("reducer reported 999")),
             "{complaints:?}"
         );
     }
@@ -407,7 +445,10 @@ mod tests {
                 &[event(POPULATION_DIRECTION_LONG, 100.0)],
                 &honest,
                 &[(1, 50.0)],
-                PriceSeries { high: &high, low: &low },
+                PriceSeries {
+                    high: &high,
+                    low: &low
+                },
                 0.01,
                 1.0,
             )

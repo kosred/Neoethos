@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -56,10 +40,6 @@ pub enum DirectionalImbalanceIndexOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DirectionalImbalanceIndexParams {
     pub length: Option<usize>,
     pub period: Option<usize>,
@@ -748,7 +728,6 @@ pub fn directional_imbalance_index_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn directional_imbalance_index_into(
     out_up: &mut [f64],
@@ -1100,509 +1079,37 @@ fn directional_imbalance_index_batch_inner_into(
         }
         #[cfg(target_arch = "wasm32")]
         {
-            run_rows!(out_up
+            run_rows!(
+                out_up
+                    .chunks_mut(len)
+                    .zip(out_down.chunks_mut(len))
+                    .zip(out_bulls.chunks_mut(len))
+                    .zip(out_bears.chunks_mut(len))
+                    .zip(out_upper.chunks_mut(len))
+                    .zip(out_lower.chunks_mut(len))
+            );
+        }
+    } else {
+        run_rows!(
+            out_up
                 .chunks_mut(len)
                 .zip(out_down.chunks_mut(len))
                 .zip(out_bulls.chunks_mut(len))
                 .zip(out_bears.chunks_mut(len))
                 .zip(out_upper.chunks_mut(len))
-                .zip(out_lower.chunks_mut(len)));
-        }
-    } else {
-        run_rows!(out_up
-            .chunks_mut(len)
-            .zip(out_down.chunks_mut(len))
-            .zip(out_bulls.chunks_mut(len))
-            .zip(out_bears.chunks_mut(len))
-            .zip(out_upper.chunks_mut(len))
-            .zip(out_lower.chunks_mut(len)));
+                .zip(out_lower.chunks_mut(len))
+        );
     }
 
     Ok(())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(
-    name = "directional_imbalance_index",
-    signature = (high, low, length=DEFAULT_LENGTH, period=DEFAULT_PERIOD, kernel=None)
-)]
-pub fn directional_imbalance_index_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let input = DirectionalImbalanceIndexInput::from_slices(
-        high,
-        low,
-        DirectionalImbalanceIndexParams {
-            length: Some(length),
-            period: Some(period),
-        },
-    );
-    let out = py
-        .allow_threads(|| directional_imbalance_index_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.up.into_pyarray(py),
-        out.down.into_pyarray(py),
-        out.bulls.into_pyarray(py),
-        out.bears.into_pyarray(py),
-        out.upper.into_pyarray(py),
-        out.lower.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DirectionalImbalanceIndexStream")]
-pub struct DirectionalImbalanceIndexStreamPy {
-    inner: DirectionalImbalanceIndexStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DirectionalImbalanceIndexStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, period=DEFAULT_PERIOD))]
-    fn new(length: usize, period: usize) -> PyResult<Self> {
-        let inner = DirectionalImbalanceIndexStream::try_new(DirectionalImbalanceIndexParams {
-            length: Some(length),
-            period: Some(period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<(f64, f64, f64, f64, f64, f64)> {
-        self.inner.update(high, low).map(|point| {
-            (
-                point.up,
-                point.down,
-                point.bulls,
-                point.bears,
-                point.upper,
-                point.lower,
-            )
-        })
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(
-    name = "directional_imbalance_index_batch",
-    signature = (high, low, length_range=(DEFAULT_LENGTH, DEFAULT_LENGTH, 0), period_range=(DEFAULT_PERIOD, DEFAULT_PERIOD, 0), kernel=None)
-)]
-pub fn directional_imbalance_index_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let out = py
-        .allow_threads(|| {
-            directional_imbalance_index_batch_with_kernel(
-                high,
-                low,
-                &DirectionalImbalanceIndexBatchRange {
-                    length: length_range,
-                    period: period_range,
-                },
-                &DirectionalImbalanceIndexParams {
-                    length: None,
-                    period: None,
-                },
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("up", out.up.into_pyarray(py).reshape((out.rows, out.cols))?)?;
-    dict.set_item(
-        "down",
-        out.down.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "bulls",
-        out.bulls.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "bears",
-        out.bears.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "upper",
-        out.upper.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "lower",
-        out.lower.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        out.combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "periods",
-        out.combos
-            .iter()
-            .map(|combo| combo.period.unwrap_or(DEFAULT_PERIOD) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", out.rows)?;
-    dict.set_item("cols", out.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_directional_imbalance_index_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(directional_imbalance_index_py, m)?)?;
-    m.add_function(wrap_pyfunction!(directional_imbalance_index_batch_py, m)?)?;
-    m.add_class::<DirectionalImbalanceIndexStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectionalImbalanceIndexBatchConfig {
-    pub length_range: Vec<usize>,
-    pub period_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = directional_imbalance_index_js)]
-pub fn directional_imbalance_index_js(
-    high: &[f64],
-    low: &[f64],
-    length: usize,
-    period: usize,
-) -> Result<JsValue, JsValue> {
-    let out = directional_imbalance_index_with_kernel(
-        &DirectionalImbalanceIndexInput::from_slices(
-            high,
-            low,
-            DirectionalImbalanceIndexParams {
-                length: Some(length),
-                period: Some(period),
-            },
-        ),
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("up"),
-        &serde_wasm_bindgen::to_value(&out.up).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("down"),
-        &serde_wasm_bindgen::to_value(&out.down).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("bulls"),
-        &serde_wasm_bindgen::to_value(&out.bulls).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("bears"),
-        &serde_wasm_bindgen::to_value(&out.bears).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("upper"),
-        &serde_wasm_bindgen::to_value(&out.upper).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("lower"),
-        &serde_wasm_bindgen::to_value(&out.lower).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = directional_imbalance_index_batch_js)]
-pub fn directional_imbalance_index_batch_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: DirectionalImbalanceIndexBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 || config.period_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: every range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let out = directional_imbalance_index_batch_with_kernel(
-        high,
-        low,
-        &DirectionalImbalanceIndexBatchRange {
-            length: (
-                config.length_range[0],
-                config.length_range[1],
-                config.length_range[2],
-            ),
-            period: (
-                config.period_range[0],
-                config.period_range[1],
-                config.period_range[2],
-            ),
-        },
-        &DirectionalImbalanceIndexParams {
-            length: None,
-            period: None,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("up"),
-        &serde_wasm_bindgen::to_value(&out.up).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("down"),
-        &serde_wasm_bindgen::to_value(&out.down).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("bulls"),
-        &serde_wasm_bindgen::to_value(&out.bulls).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("bears"),
-        &serde_wasm_bindgen::to_value(&out.bears).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("upper"),
-        &serde_wasm_bindgen::to_value(&out.upper).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("lower"),
-        &serde_wasm_bindgen::to_value(&out.lower).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn directional_imbalance_index_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(6 * len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn directional_imbalance_index_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, 6 * len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn directional_imbalance_index_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to directional_imbalance_index_into",
-        ));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 6 * len);
-        let (dst_up, rest) = out.split_at_mut(len);
-        let (dst_down, rest) = rest.split_at_mut(len);
-        let (dst_bulls, rest) = rest.split_at_mut(len);
-        let (dst_bears, rest) = rest.split_at_mut(len);
-        let (dst_upper, dst_lower) = rest.split_at_mut(len);
-        directional_imbalance_index_into_slice(
-            dst_up,
-            dst_down,
-            dst_bulls,
-            dst_bears,
-            dst_upper,
-            dst_lower,
-            &DirectionalImbalanceIndexInput::from_slices(
-                high,
-                low,
-                DirectionalImbalanceIndexParams {
-                    length: Some(length),
-                    period: Some(period),
-                },
-            ),
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn directional_imbalance_index_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to directional_imbalance_index_batch_into",
-        ));
-    }
-
-    let sweep = DirectionalImbalanceIndexBatchRange {
-        length: (length_start, length_end, length_step),
-        period: (period_start, period_end, period_step),
-    };
-    let fixed = DirectionalImbalanceIndexParams {
-        length: None,
-        period: None,
-    };
-    let combos =
-        expand_grid_checked(&sweep, &fixed).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .and_then(|value| value.checked_mul(6))
-        .ok_or_else(|| {
-            JsValue::from_str("rows*cols overflow in directional_imbalance_index_batch_into")
-        })?;
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let split = rows * len;
-        let (dst_up, rest) = out.split_at_mut(split);
-        let (dst_down, rest) = rest.split_at_mut(split);
-        let (dst_bulls, rest) = rest.split_at_mut(split);
-        let (dst_bears, rest) = rest.split_at_mut(split);
-        let (dst_upper, dst_lower) = rest.split_at_mut(split);
-        directional_imbalance_index_batch_inner_into(
-            high,
-            low,
-            &combos,
-            Kernel::Auto,
-            false,
-            dst_up,
-            dst_down,
-            dst_bulls,
-            dst_bears,
-            dst_upper,
-            dst_lower,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn directional_imbalance_index_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    length: usize,
-    period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = directional_imbalance_index_js(high, low, length, period)?;
-    crate::write_wasm_object_f64_outputs("directional_imbalance_index_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn directional_imbalance_index_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = directional_imbalance_index_batch_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "directional_imbalance_index_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-        ParamValue,
+        IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+        compute_cpu_batch,
     };
 
     fn sample_high_low(len: usize) -> (Vec<f64>, Vec<f64>) {

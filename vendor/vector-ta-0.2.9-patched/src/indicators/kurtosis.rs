@@ -1,23 +1,4 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -30,8 +11,6 @@ use core::arch::x86_64::*;
 use rayon::prelude::*;
 use std::convert::AsRef;
 use std::error::Error;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 use thiserror::Error;
 
 impl<'a> AsRef<[f64]> for KurtosisInput<'a> {
@@ -72,10 +51,6 @@ pub struct KurtosisOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct KurtosisParams {
     pub period: Option<usize>,
 }
@@ -320,7 +295,6 @@ pub fn kurtosis_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn kurtosis_into(input: &KurtosisInput, out: &mut [f64]) -> Result<(), KurtosisError> {
     kurtosis_into_slice(out, input, Kernel::Auto)?;
@@ -1222,45 +1196,19 @@ impl KurtosisStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kurtosis_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = kurtosis_js(data, period)?;
-    crate::write_wasm_f64_output("kurtosis_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kurtosis_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kurtosis_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "kurtosis_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_kurtosis_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = KurtosisParams { period: None };
         let input = KurtosisInput::from_candles(&candles, "close", default_params);
@@ -1286,13 +1234,8 @@ mod tests {
         let baseline = kurtosis(&input)?.values;
 
         let mut out = vec![0.0f64; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             kurtosis_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            kurtosis_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1316,8 +1259,8 @@ mod tests {
 
     fn check_kurtosis_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = KurtosisInput::from_candles(&candles, "hl2", KurtosisParams::default());
         let result = kurtosis_with_kernel(&input, kernel)?;
@@ -1349,8 +1292,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = KurtosisInput::with_default_candles(&candles);
         match input.data {
@@ -1413,8 +1356,8 @@ mod tests {
 
     fn check_kurtosis_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = KurtosisParams { period: Some(5) };
         let first_input = KurtosisInput::from_candles(&candles, "close", first_params);
@@ -1430,8 +1373,8 @@ mod tests {
 
     fn check_kurtosis_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input =
             KurtosisInput::from_candles(&candles, "close", KurtosisParams { period: Some(5) });
@@ -1452,8 +1395,8 @@ mod tests {
 
     fn check_kurtosis_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 5;
 
@@ -1500,8 +1443,8 @@ mod tests {
     fn check_kurtosis_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             KurtosisParams::default(),
@@ -1837,8 +1780,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = KurtosisBatchBuilder::new()
             .kernel(kernel)
@@ -1870,8 +1813,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let data = source_type(&c, "close");
 
         let test_configs = vec![
@@ -1977,339 +1920,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kurtosis")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn kurtosis_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = KurtosisParams {
-        period: Some(period),
-    };
-    let input = KurtosisInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| kurtosis_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "KurtosisStream")]
-pub struct KurtosisStreamPy {
-    stream: KurtosisStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl KurtosisStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = KurtosisParams {
-            period: Some(period),
-        };
-        let stream =
-            KurtosisStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(KurtosisStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kurtosis_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn kurtosis_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = KurtosisBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("kurtosis: rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [expected], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            kurtosis_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kurtosis_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn kurtosis_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::kurtosis_wrapper::CudaKurtosis;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = KurtosisBatchRange {
-        period: period_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda =
-            CudaKurtosis::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (dev, _combos) = cuda
-            .kurtosis_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>(dev)
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kurtosis_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn kurtosis_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::kurtosis_wrapper::CudaKurtosis;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D time-major array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let slice_in = data_tm_f32.as_slice()?;
-    let inner = py.allow_threads(|| {
-        let cuda =
-            CudaKurtosis::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev = cuda
-            .kurtosis_many_series_one_param_time_major_dev(slice_in, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>(dev)
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kurtosis_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = KurtosisParams {
-        period: Some(period),
-    };
-    let input = KurtosisInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    kurtosis_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kurtosis_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kurtosis_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kurtosis_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to kurtosis_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = KurtosisParams {
-            period: Some(period),
-        };
-        let input = KurtosisInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            kurtosis_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            kurtosis_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KurtosisBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KurtosisBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<KurtosisParams>,
-    pub periods: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = kurtosis_batch)]
-pub fn kurtosis_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: KurtosisBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = KurtosisBatchRange {
-        period: config.period_range,
-    };
-
-    let output = kurtosis_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = KurtosisBatchJsOutput {
-        values: output.values,
-        periods: output.combos.iter().map(|c| c.period.unwrap()).collect(),
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kurtosis_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to kurtosis_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = KurtosisBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let expected = rows.checked_mul(cols).ok_or_else(|| {
-            JsValue::from_str(
-                &KurtosisError::InvalidRange {
-                    start: rows.to_string(),
-                    end: cols.to_string(),
-                    step: "rows*cols".into(),
-                }
-                .to_string(),
-            )
-        })?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, expected);
-
-        let kernel = detect_best_kernel();
-        kurtosis_batch_inner_into(data, &sweep, kernel, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

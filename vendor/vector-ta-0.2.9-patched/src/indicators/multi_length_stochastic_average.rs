@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -107,10 +89,6 @@ pub struct MultiLengthStochasticAverageOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MultiLengthStochasticAverageParams {
     pub length: Option<usize>,
     pub presmooth: Option<usize>,
@@ -909,7 +887,6 @@ pub fn multi_length_stochastic_average_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn multi_length_stochastic_average_into(
     input: &MultiLengthStochasticAverageInput,
@@ -919,10 +896,6 @@ pub fn multi_length_stochastic_average_into(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MultiLengthStochasticAverageBatchRange {
     pub length: (usize, usize, usize),
     pub presmooth: (usize, usize, usize),
@@ -1159,7 +1132,7 @@ pub fn multi_length_stochastic_average_batch_with_kernel(
         other => {
             return Err(MultiLengthStochasticAverageError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
     multi_length_stochastic_average_batch_par_slice(data, sweep, batch.to_non_batch())
@@ -1300,489 +1273,6 @@ pub fn multi_length_stochastic_average_batch_inner_into(
     }
     values_out.copy_from_slice(&out.values);
     Ok(out.combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "multi_length_stochastic_average")]
-#[pyo3(signature = (
-    data,
-    length=DEFAULT_LENGTH,
-    presmooth=DEFAULT_PRESMOOTH,
-    premethod=DEFAULT_SMOOTHING_METHOD,
-    postsmooth=DEFAULT_POSTSMOOTH,
-    postmethod=DEFAULT_SMOOTHING_METHOD,
-    kernel=None
-))]
-pub fn multi_length_stochastic_average_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    presmooth: usize,
-    premethod: &str,
-    postsmooth: usize,
-    postmethod: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = MultiLengthStochasticAverageInput::from_slice(
-        data,
-        MultiLengthStochasticAverageParams {
-            length: Some(length),
-            presmooth: Some(presmooth),
-            premethod: Some(premethod.to_string()),
-            postsmooth: Some(postsmooth),
-            postmethod: Some(postmethod.to_string()),
-        },
-    );
-    let out = py
-        .allow_threads(|| multi_length_stochastic_average_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MultiLengthStochasticAverageStream")]
-pub struct MultiLengthStochasticAverageStreamPy {
-    stream: MultiLengthStochasticAverageStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MultiLengthStochasticAverageStreamPy {
-    #[new]
-    #[pyo3(signature = (
-        length=DEFAULT_LENGTH,
-        presmooth=DEFAULT_PRESMOOTH,
-        premethod=DEFAULT_SMOOTHING_METHOD,
-        postsmooth=DEFAULT_POSTSMOOTH,
-        postmethod=DEFAULT_SMOOTHING_METHOD
-    ))]
-    fn new(
-        length: usize,
-        presmooth: usize,
-        premethod: &str,
-        postsmooth: usize,
-        postmethod: &str,
-    ) -> PyResult<Self> {
-        let stream =
-            MultiLengthStochasticAverageStream::try_new(MultiLengthStochasticAverageParams {
-                length: Some(length),
-                presmooth: Some(presmooth),
-                premethod: Some(premethod.to_string()),
-                postsmooth: Some(postsmooth),
-                postmethod: Some(postmethod.to_string()),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.stream.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "multi_length_stochastic_average_batch")]
-#[pyo3(signature = (
-    data,
-    length_range=(DEFAULT_LENGTH, DEFAULT_LENGTH, 0),
-    presmooth_range=(DEFAULT_PRESMOOTH, DEFAULT_PRESMOOTH, 0),
-    premethod=DEFAULT_SMOOTHING_METHOD,
-    postsmooth_range=(DEFAULT_POSTSMOOTH, DEFAULT_POSTSMOOTH, 0),
-    postmethod=DEFAULT_SMOOTHING_METHOD,
-    kernel=None
-))]
-pub fn multi_length_stochastic_average_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    presmooth_range: (usize, usize, usize),
-    premethod: &str,
-    postsmooth_range: (usize, usize, usize),
-    postmethod: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = MultiLengthStochasticAverageBatchRange {
-        length: length_range,
-        presmooth: presmooth_range,
-        postsmooth: postsmooth_range,
-        premethod: Some(premethod.to_string()),
-        postmethod: Some(postmethod.to_string()),
-    };
-    let combos = expand_grid_multi_length_stochastic_average(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let values_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let values_slice = unsafe { values_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            multi_length_stochastic_average_batch_inner_into(
-                data,
-                &sweep,
-                batch.to_non_batch(),
-                values_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", values_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "presmooths",
-        combos
-            .iter()
-            .map(|combo| combo.presmooth.unwrap_or(DEFAULT_PRESMOOTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "postsmooths",
-        combos
-            .iter()
-            .map(|combo| combo.postsmooth.unwrap_or(DEFAULT_POSTSMOOTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "premethods",
-        PyList::new(
-            py,
-            combos.iter().map(|combo| {
-                combo
-                    .premethod
-                    .as_deref()
-                    .unwrap_or(DEFAULT_SMOOTHING_METHOD)
-            }),
-        )?,
-    )?;
-    dict.set_item(
-        "postmethods",
-        PyList::new(
-            py,
-            combos.iter().map(|combo| {
-                combo
-                    .postmethod
-                    .as_deref()
-                    .unwrap_or(DEFAULT_SMOOTHING_METHOD)
-            }),
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_multi_length_stochastic_average_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(
-        multi_length_stochastic_average_py,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        multi_length_stochastic_average_batch_py,
-        module
-    )?)?;
-    module.add_class::<MultiLengthStochasticAverageStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MultiLengthStochasticAverageJsOutput {
-    pub values: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "multi_length_stochastic_average_js")]
-pub fn multi_length_stochastic_average_js(
-    data: &[f64],
-    length: usize,
-    presmooth: usize,
-    premethod: String,
-    postsmooth: usize,
-    postmethod: String,
-) -> Result<JsValue, JsValue> {
-    let input = MultiLengthStochasticAverageInput::from_slice(
-        data,
-        MultiLengthStochasticAverageParams {
-            length: Some(length),
-            presmooth: Some(presmooth),
-            premethod: Some(premethod),
-            postsmooth: Some(postsmooth),
-            postmethod: Some(postmethod),
-        },
-    );
-    let out =
-        multi_length_stochastic_average(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&MultiLengthStochasticAverageJsOutput { values: out.values })
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn multi_length_stochastic_average_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn multi_length_stochastic_average_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn multi_length_stochastic_average_into(
-    data_ptr: *const f64,
-    values_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    presmooth: usize,
-    premethod: String,
-    postsmooth: usize,
-    postmethod: String,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || values_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let input = MultiLengthStochasticAverageInput::from_slice(
-            data,
-            MultiLengthStochasticAverageParams {
-                length: Some(length),
-                presmooth: Some(presmooth),
-                premethod: Some(premethod),
-                postsmooth: Some(postsmooth),
-                postmethod: Some(postmethod),
-            },
-        );
-        if data_ptr == values_ptr {
-            let mut tmp = vec![0.0; len];
-            multi_length_stochastic_average_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(values_ptr, len).copy_from_slice(&tmp);
-        } else {
-            multi_length_stochastic_average_into_slice(
-                std::slice::from_raw_parts_mut(values_ptr, len),
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MultiLengthStochasticAverageBatchJsConfig {
-    pub length_range: (usize, usize, usize),
-    pub presmooth_range: Option<(usize, usize, usize)>,
-    pub premethod: Option<String>,
-    pub postsmooth_range: Option<(usize, usize, usize)>,
-    pub postmethod: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MultiLengthStochasticAverageBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<MultiLengthStochasticAverageParams>,
-    pub lengths: Vec<usize>,
-    pub presmooths: Vec<usize>,
-    pub postsmooths: Vec<usize>,
-    pub premethods: Vec<String>,
-    pub postmethods: Vec<String>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "multi_length_stochastic_average_batch_js")]
-pub fn multi_length_stochastic_average_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: MultiLengthStochasticAverageBatchJsConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = MultiLengthStochasticAverageBatchRange {
-        length: config.length_range,
-        presmooth: config
-            .presmooth_range
-            .unwrap_or((DEFAULT_PRESMOOTH, DEFAULT_PRESMOOTH, 0)),
-        premethod: config
-            .premethod
-            .or_else(|| Some(DEFAULT_SMOOTHING_METHOD.to_string())),
-        postsmooth: config
-            .postsmooth_range
-            .unwrap_or((DEFAULT_POSTSMOOTH, DEFAULT_POSTSMOOTH, 0)),
-        postmethod: config
-            .postmethod
-            .or_else(|| Some(DEFAULT_SMOOTHING_METHOD.to_string())),
-    };
-    let out = multi_length_stochastic_average_batch_inner(
-        data,
-        &sweep,
-        detect_best_batch_kernel().to_non_batch(),
-        false,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&MultiLengthStochasticAverageBatchJsOutput {
-        lengths: out
-            .combos
-            .iter()
-            .map(|p| p.length.unwrap_or(DEFAULT_LENGTH))
-            .collect(),
-        presmooths: out
-            .combos
-            .iter()
-            .map(|p| p.presmooth.unwrap_or(DEFAULT_PRESMOOTH))
-            .collect(),
-        postsmooths: out
-            .combos
-            .iter()
-            .map(|p| p.postsmooth.unwrap_or(DEFAULT_POSTSMOOTH))
-            .collect(),
-        premethods: out
-            .combos
-            .iter()
-            .map(|p| canonical_method_name(p.premethod.as_deref(), DEFAULT_SMOOTHING_METHOD))
-            .collect(),
-        postmethods: out
-            .combos
-            .iter()
-            .map(|p| canonical_method_name(p.postmethod.as_deref(), DEFAULT_SMOOTHING_METHOD))
-            .collect(),
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn multi_length_stochastic_average_batch_into(
-    data_ptr: *const f64,
-    values_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    presmooth_start: usize,
-    presmooth_end: usize,
-    presmooth_step: usize,
-    premethod: String,
-    postsmooth_start: usize,
-    postsmooth_end: usize,
-    postsmooth_step: usize,
-    postmethod: String,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || values_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = MultiLengthStochasticAverageBatchRange {
-        length: (length_start, length_end, length_step),
-        presmooth: (presmooth_start, presmooth_end, presmooth_step),
-        premethod: Some(premethod),
-        postsmooth: (postsmooth_start, postsmooth_end, postsmooth_step),
-        postmethod: Some(postmethod),
-    };
-    let combos = expand_grid_multi_length_stochastic_average(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let values_out = std::slice::from_raw_parts_mut(values_ptr, total);
-        multi_length_stochastic_average_batch_inner_into(
-            data,
-            &sweep,
-            detect_best_batch_kernel().to_non_batch(),
-            values_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn multi_length_stochastic_average_output_into_js(
-    data: &[f64],
-    length: usize,
-    presmooth: usize,
-    premethod: String,
-    postsmooth: usize,
-    postmethod: String,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = multi_length_stochastic_average_js(
-        data, length, presmooth, premethod, postsmooth, postmethod,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "multi_length_stochastic_average_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn multi_length_stochastic_average_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = multi_length_stochastic_average_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "multi_length_stochastic_average_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]
@@ -1926,8 +1416,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_length_stochastic_average_stream_matches_batch_with_reset(
-    ) -> Result<(), Box<dyn Error>> {
+    fn multi_length_stochastic_average_stream_matches_batch_with_reset()
+    -> Result<(), Box<dyn Error>> {
         let mut data = sample_source(220);
         data[110] = f64::NAN;
         let params = MultiLengthStochasticAverageParams {
@@ -1974,8 +1464,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_length_stochastic_average_batch_single_param_matches_single(
-    ) -> Result<(), Box<dyn Error>> {
+    fn multi_length_stochastic_average_batch_single_param_matches_single()
+    -> Result<(), Box<dyn Error>> {
         let data = sample_source(128);
         let sweep = MultiLengthStochasticAverageBatchRange {
             length: (12, 12, 0),

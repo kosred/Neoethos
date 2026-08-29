@@ -9,7 +9,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CodexError {
-    #[error("OAuth callback listener failed to bind 127.0.0.1:1455 — is another login already in progress? ({0})")]
+    #[error(
+        "OAuth callback listener failed to bind 127.0.0.1:1455 — is another login already in progress? ({0})"
+    )]
     CallbackBind(std::io::Error),
 
     #[error("OAuth callback timed out after {0}s. Try clicking Connect again.")]
@@ -18,7 +20,9 @@ pub enum CodexError {
     #[error("OAuth callback received an error from the sign-in provider: {0}")]
     CallbackError(String),
 
-    #[error("OAuth state mismatch — the callback did not match the request we sent. Aborting to defend against CSRF.")]
+    #[error(
+        "OAuth state mismatch — the callback did not match the request we sent. Aborting to defend against CSRF."
+    )]
     StateMismatch,
 
     #[error("Token endpoint returned {status}: {body}")]

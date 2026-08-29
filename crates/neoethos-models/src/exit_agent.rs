@@ -12,24 +12,59 @@ use burn::nn;
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::tensor::backend::BackendTypes;
 use burn::record::{DefaultFileRecorder, FullPrecisionSettings, Recorder};
+use burn::tensor::backend::BackendTypes;
 
-use polars::prelude::{DataFrame, DataType, Series};
+use ndarray::Array2;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::base::{
     build_runtime_prediction_with_details, canonical_three_class_label_mapping,
-    dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
-    try_build_runtime_artifact_metadata,
+    feature_columns_from_frame, feature_frame_to_f64_array, three_class_runtime_confidence,
+    try_build_runtime_artifact_metadata, validate_model_labels,
 };
+use crate::burn_models::validate_loaded_burn_device_identity;
 use crate::burn_models::{TrainBackend, resolve_train_device};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{METADATA_FILE_NAME, read_json, write_json};
+
+/// Burn's exit network is intrinsically f32. Narrow only at this backend-local
+/// boundary and reject every value that cannot survive the conversion exactly
+/// enough to remain finite and non-zero when the source was non-zero.
+fn exit_backend_f32_matrix(frame: &FeatureFrame) -> Result<Array2<f32>> {
+    let dense = feature_frame_to_f64_array(frame)?;
+    let mut values = Vec::with_capacity(dense.len());
+    for ((row, column), value) in dense.indexed_iter() {
+        if value.abs() > f64::from(f32::MAX) {
+            anyhow::bail!(
+                "exit-agent feature `{}` row {row} overflows f32: {value}",
+                frame.names[column]
+            );
+        }
+        let narrowed = *value as f32;
+        if !narrowed.is_finite() {
+            anyhow::bail!(
+                "exit-agent feature `{}` row {row} becomes non-finite in f32",
+                frame.names[column]
+            );
+        }
+        if *value != 0.0 && narrowed == 0.0 {
+            anyhow::bail!(
+                "exit-agent feature `{}` row {row} underflows to zero in f32",
+                frame.names[column]
+            );
+        }
+        values.push(narrowed);
+    }
+    Array2::from_shape_vec(dense.raw_dim(), values)
+        .context("rebuild checked exit-agent f32 backend matrix")
+}
 // ============================================================================
 // BURN Q-NETWORK
 // ============================================================================
@@ -575,7 +610,8 @@ impl ExitAgent {
     }
 
     pub fn with_hidden_dim(input_dim: usize, hidden_dim: usize) -> Self {
-        let (device, selection) = resolve_train_device("auto");
+        let (device, selection) =
+            resolve_train_device("auto").expect("canonical Burn auto training policy must resolve");
         let model = ExitAgentNetConfig::new()
             .with_input_dim(input_dim)
             .with_hidden_dim(hidden_dim)
@@ -614,9 +650,9 @@ impl ExitAgent {
         }
     }
 
-    pub fn with_device_policy(mut self, policy: impl Into<String>) -> Self {
+    pub fn with_device_policy(mut self, policy: impl Into<String>) -> Result<Self> {
         let requested = policy.into();
-        let (device, selection) = resolve_train_device(&requested);
+        let (device, selection) = resolve_train_device(&requested)?;
         // **2026-05-25 — gpu-vulkan build fix**: under the wgpu backend
         // `Device` is a non-Copy handle (vs. `NdArrayDevice` which is
         // a zero-sized Copy type). The previous code moved `device`
@@ -635,7 +671,7 @@ impl ExitAgent {
         self.requested_device_policy = selection.requested_policy;
         self.effective_device_policy = selection.effective_policy;
         self.execution_backend = selection.execution_backend;
-        self
+        Ok(self)
     }
 
     pub fn with_gamma(mut self, gamma: f32) -> Self {
@@ -1093,27 +1129,27 @@ impl ExitAgent {
         self.memory.push_back(experience);
     }
 
-    pub fn fit_from_frame(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        self.fit_from_frame_with_report(x, y).map(|_| ())
+    pub fn fit_from_frame(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        self.fit_from_frame_with_report(x, y, lease).map(|_| ())
     }
 
     pub fn fit_from_frame_with_report(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
+        x: &FeatureFrame,
+        y: &[i32],
+        lease: &CpuLease,
     ) -> Result<ExitAgentTrainingReport> {
-        let features = dataframe_to_float32_array(x)?;
-        let feature_columns = feature_columns_from_dataframe(x);
-        let labels = y
-            .cast(&DataType::Int32)
-            .context("cast exit-agent labels to Int32")?;
-        let labels = labels
-            .i32()
-            .context("access exit-agent labels as Int32")?
-            .into_iter()
-            .map(|value| value.context("exit-agent labels may not contain nulls"))
-            .collect::<Result<Vec<_>, _>>()
-            .context("collect exit-agent labels")?;
+        lease.scope(|| self.fit_from_frame_with_report_scoped(x, y))
+    }
+
+    fn fit_from_frame_with_report_scoped(
+        &mut self,
+        x: &FeatureFrame,
+        labels: &[i32],
+    ) -> Result<ExitAgentTrainingReport> {
+        let features = exit_backend_f32_matrix(x)?;
+        let feature_columns = feature_columns_from_frame(x);
+        validate_model_labels(labels, features.nrows())?;
 
         if features.nrows() != labels.len() {
             anyhow::bail!(
@@ -1257,10 +1293,18 @@ impl ExitAgent {
         Ok(training_report)
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        lease.scope(|| self.predict_runtime_scoped(x))
+    }
+
+    fn predict_runtime_scoped(&self, x: &FeatureFrame) -> Result<Vec<RuntimePrediction>> {
         self.ensure_inference_runtime_ready()?;
-        let features = dataframe_to_float32_array(x)?;
-        let actual_columns = feature_columns_from_dataframe(x);
+        let features = exit_backend_f32_matrix(x)?;
+        let actual_columns = feature_columns_from_frame(x);
         if features.ncols() != self.input_dim {
             anyhow::bail!(
                 "exit-agent prediction feature mismatch: configured input_dim {} vs dataframe {}",
@@ -1294,13 +1338,14 @@ impl ExitAgent {
                 Self::validated_runtime_probabilities(&probabilities)?;
             let runtime_probabilities =
                 Self::runtime_probabilities(hold_probability, close_probability);
+            let runtime_probabilities_f64 = runtime_probabilities.map(f64::from);
             let (confidence, abstain_recommended) =
-                three_class_runtime_confidence(runtime_probabilities)?;
+                three_class_runtime_confidence(runtime_probabilities_f64)?;
             predictions.push(build_runtime_prediction_with_details(
                 "exit_agent",
                 ModelFamily::Exit,
                 CapabilityState::Implemented,
-                runtime_probabilities,
+                runtime_probabilities_f64,
                 Some(confidence),
                 Some(abstain_recommended),
                 Some(self.execution_backend.clone()),
@@ -1477,7 +1522,14 @@ impl ExitAgent {
         let persisted_requested_device_policy = artifact.requested_device_policy.clone();
         let persisted_effective_device_policy = artifact.effective_device_policy.clone();
         let persisted_execution_backend = artifact.execution_backend.clone();
-        let (device, selection) = resolve_train_device(&requested_device_policy);
+        let (device, selection) = resolve_train_device(&requested_device_policy)?;
+        validate_loaded_burn_device_identity(
+            "exit-agent",
+            persisted_requested_device_policy.as_deref(),
+            persisted_effective_device_policy.as_deref(),
+            persisted_execution_backend.as_deref(),
+            &selection,
+        )?;
         if let Some(persisted_policy) = persisted_effective_device_policy.as_deref()
             && persisted_policy != selection.effective_policy
         {

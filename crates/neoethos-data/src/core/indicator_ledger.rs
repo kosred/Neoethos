@@ -3,10 +3,10 @@
 //!
 //! # Why this module exists
 //!
-//! `hpc_ta` used to iterate all 342 ids in [`crate::core::all_indicators`] and
+//! `hpc_ta` used to iterate every id in [`crate::core::all_indicators`] and
 //! keep whatever came back through an `if let Ok(output)` with no `else` and an
-//! `if v.len() == n` with no `else`. Exactly ONE of the 342 (`ttm_trend`)
-//! produced a column. The other 341 were discarded with no log line, no
+//! `if v.len() == n` with no `else`. Exactly ONE id (`ttm_trend`) produced a
+//! column. Every other declared id was discarded with no log line, no
 //! counter, and no way for any run to know. That state survived sixteen months
 //! because nothing in the system was capable of noticing it.
 //!
@@ -57,101 +57,178 @@ pub const EXPECTED_NON_PRODUCING: &[(&str, &str)] = &[
     // takes a `ma_type` enum; the concrete members (sma, ema, wma, hma, alma,
     // …) are already listed individually in ALL_INDICATORS, so these three are
     // pure duplication of a dispatch mechanism, not vocabulary.
-    ("ma", "moving-average family selector, not an indicator; members listed individually"),
-    ("ma_batch", "moving-average family batch selector, not an indicator"),
-    ("ma_stream", "moving-average family streaming selector, not an indicator"),
+    (
+        "ma",
+        "moving-average family selector, not an indicator; members listed individually",
+    ),
+    (
+        "ma_batch",
+        "moving-average family batch selector, not an indicator",
+    ),
+    (
+        "ma_stream",
+        "moving-average family streaming selector, not an indicator",
+    ),
     // ---- `UnknownIndicator`: present in ALL_INDICATORS, absent from
     // vector-ta 0.2.9's dispatch table entirely. Real gaps in the library.
-    ("cvi", "UnknownIndicator: no dispatch arm in vector-ta 0.2.9"),
-    ("insync_index", "UnknownIndicator: no dispatch arm in vector-ta 0.2.9"),
-    ("marketefi", "UnknownIndicator: no dispatch arm in vector-ta 0.2.9"),
-    ("sar", "UnknownIndicator: no dispatch arm in vector-ta 0.2.9"),
-    ("trend_follower", "UnknownIndicator: no dispatch arm in vector-ta 0.2.9"),
+    (
+        "insync_index",
+        "UnknownIndicator: no dispatch arm in vector-ta 0.2.9",
+    ),
+    (
+        "trend_follower",
+        "UnknownIndicator: no dispatch arm in vector-ta 0.2.9",
+    ),
     // ---- `UnsupportedCapability { capability: "cpu_batch" }`: these DO have
     // registry entries, but `cpu_single.rs` routes every non-pattern
     // request through `compute_cpu_batch`, and `dispatch_cpu_batch_by_indicator`
     // has no arm for them, so they fall to the catch-all. Reachable only by
     // calling their `*_with_kernel` functions directly, which is a separate,
     // larger change against the vendored crate.
-    ("dec_osc", "UnsupportedCapability 'cpu_batch': registered but no cpu_batch dispatch arm"),
-    ("decycler", "UnsupportedCapability 'cpu_batch': registered but no cpu_batch dispatch arm"),
-    ("ott", "UnsupportedCapability 'cpu_batch': registered but no cpu_batch dispatch arm"),
-    ("rsx", "UnsupportedCapability 'cpu_batch': registered but no cpu_batch dispatch arm"),
-    // ---- `UnknownOutput`: vector-ta CONTRADICTS ITSELF about this id. The
-    // registry declares eight named F64 outputs for it
-    // (`OUTPUTS_VDUBUS_DIVERGENCE_WAVE_PATTERN_GENERATOR`, registry.rs:1240 —
-    // fast_standard, fast_climax, fast_rounded, fast_predator, slow_*), but its
-    // dispatch arm (cpu_batch.rs:5095) opens with
-    // `expect_value_output(...)`, which accepts ONLY the literal "value"
-    // (cpu_batch.rs:17247). So every output_id the registry hands us is rejected
-    // with `UnknownOutput`, and "value" is not a name the registry offers.
-    // The id is unreachable through `compute_cpu` in either direction.
-    //
-    // NOT a silent absence: it is attempted every frame, counted under
-    // DropReason::UnknownOutput, and named here. If a future vector-ta
-    // reconciles the two, the id starts producing and `stale_exclusion` fires a
-    // WARN telling us to delete this line.
     (
-        "vdubus_divergence_wave_pattern_generator",
-        "UnknownOutput: registry declares 8 named outputs but the dispatch arm's \
-         expect_value_output() accepts only \"value\" — vector-ta 0.2.9 self-contradiction",
+        "dec_osc",
+        "UnsupportedCapability 'cpu_batch': registered but no cpu_batch dispatch arm",
+    ),
+    (
+        "decycler",
+        "UnsupportedCapability 'cpu_batch': registered but no cpu_batch dispatch arm",
+    ),
+    (
+        "ott",
+        "UnsupportedCapability 'cpu_batch': registered but no cpu_batch dispatch arm",
+    ),
+    (
+        "rsx",
+        "UnsupportedCapability 'cpu_batch': registered but no cpu_batch dispatch arm",
     ),
 ];
 
-/// Individual OUTPUTS that vector-ta 0.2.9 declares in its registry but cannot
-/// serve, on ids whose OTHER outputs work fine.
+/// Outputs deliberately absent from the production feature schema.
 ///
-/// The id-level table above cannot express this case, and the case is real: an
-/// indicator that drops from eight declared series to five still "produces", so
-/// every id-level check — including the vocabulary floor — is blind to it. That
-/// is the original 341-column defect at output granularity, and it is exactly
-/// the granularity the defect actually had (92 of the 342 failures were
-/// `output_id`-shaped).
+/// This is not a runtime quality filter and it is not an error allow-list.
+/// Every entry is a formula-level fact reviewed against vector-ta 0.2.9: the
+/// output is either an exact copy of another production feature, a fixed chart
+/// guide, or disabled by the indicator's own default parameters.  Resolving
+/// the set here keeps the schema independent of whichever market frame happens
+/// to be built.
 ///
-/// Same contract as [`EXPECTED_NON_PRODUCING`]: these are still ATTEMPTED on
-/// every frame, a failure is counted under its real `DropReason`, and a SUCCESS
-/// means this table is stale.
-pub const EXPECTED_NON_PRODUCING_OUTPUTS: &[(&str, &str, &str)] = &[
-    // vector-ta CONTRADICTS ITSELF on three of this id's eight declared
-    // outputs. `registry.rs:1504` (OUTPUTS_ADAPTIVE_BOUNDS_RSI) declares
-    // `lower`, `middle` and `upper` — the shared OUTPUT_LOWER / OUTPUT_MIDDLE /
-    // OUTPUT_UPPER constants at registry.rs:434-453 — but the dispatch arm's
-    // own name table, `adaptive_bounds_rsi_field` at cpu_batch.rs:12549, spells
-    // the same three series `lower_bound`, `mid` and `upper_bound` and rejects
-    // everything else with `UnknownOutput`. The other five (rsi, lower_mid,
-    // upper_mid, regime, regime_flip) agree between the two and DO produce.
-    //
-    // Reachable only by requesting a name the registry does not offer, which
-    // would mean this crate second-guessing the registry — a much worse
-    // precedent than three named, counted absences.
+/// `None` identifies the sole output of a single-output indicator. `Some(id)`
+/// identifies one declared output of a multi-output indicator.
+pub const PRODUCTION_OUTPUT_EXCLUSIONS: &[(&str, Option<&str>, &str)] = &[
     (
-        "adaptive_bounds_rsi",
-        "lower",
-        "UnknownOutput: registry declares `lower` (registry.rs:1504/449) but the dispatch arm's \
-         adaptive_bounds_rsi_field (cpu_batch.rs:12549) accepts only `lower_bound` — vector-ta \
-         0.2.9 self-contradiction",
+        "adjustable_ma_alternating_extremities",
+        Some("smoothed_close"),
+        "formula copies `ma` into `smoothed_close` with copy_from_slice, so the two outputs are structurally identical",
     ),
     (
         "adaptive_bounds_rsi",
-        "middle",
-        "UnknownOutput: registry declares `middle` (registry.rs:1504/439) but the dispatch arm's \
-         adaptive_bounds_rsi_field (cpu_batch.rs:12549) accepts only `mid` — vector-ta 0.2.9 \
-         self-contradiction",
+        Some("rsi"),
+        "auxiliary output is the same RSI series already emitted by the standalone RSI indicator at the same period",
     ),
     (
-        "adaptive_bounds_rsi",
-        "upper",
-        "UnknownOutput: registry declares `upper` (registry.rs:1504/434) but the dispatch arm's \
-         adaptive_bounds_rsi_field (cpu_batch.rs:12549) accepts only `upper_bound` — vector-ta \
-         0.2.9 self-contradiction",
+        "bulls_v_bears",
+        Some("ma"),
+        "default EMA moving-average auxiliary duplicates the standalone EMA feature and is not a distinct oscillator output",
+    ),
+    (
+        "bulls_v_bears",
+        Some("upper"),
+        "normalized-mode formula fills every valid row with the fixed positive threshold chart guide",
+    ),
+    (
+        "bulls_v_bears",
+        Some("lower"),
+        "normalized-mode formula fills every valid row with the fixed negative threshold chart guide",
+    ),
+    (
+        "daily_factor",
+        Some("ema"),
+        "formula exposes a fixed-period EMA(14) auxiliary already emitted by the standalone EMA feature",
+    ),
+    (
+        "ehlers_data_sampling_relative_strength_indicator",
+        Some("original_rsi"),
+        "original_rsi is the unmodified RSI auxiliary already emitted by the standalone RSI indicator",
+    ),
+    (
+        "fibonacci_entry_bands",
+        Some("tp_long_band"),
+        "default low take-profit aggressiveness assigns tp_long_band directly from lower_2618",
+    ),
+    (
+        "fibonacci_entry_bands",
+        Some("tp_short_band"),
+        "default low take-profit aggressiveness assigns tp_short_band directly from upper_2618",
+    ),
+    (
+        "half_causal_estimator",
+        Some("expected_value"),
+        "enable_expected_value defaults to false, so the declared output is deliberately all-NaN",
+    ),
+    (
+        "ichimoku_oscillator",
+        Some("max_level"),
+        "normalized oscillator max_level is a fixed visual guide rather than a market-derived feature",
+    ),
+    (
+        "ichimoku_oscillator",
+        Some("high_level"),
+        "normalized oscillator high_level is a fixed visual guide rather than a market-derived feature",
+    ),
+    (
+        "ichimoku_oscillator",
+        Some("low_level"),
+        "normalized oscillator low_level is a fixed visual guide rather than a market-derived feature",
+    ),
+    (
+        "ichimoku_oscillator",
+        Some("min_level"),
+        "normalized oscillator min_level is a fixed visual guide rather than a market-derived feature",
+    ),
+    (
+        "kase_peak_oscillator_with_divergences",
+        Some("hidden_bullish"),
+        "plot_hidden_bull defaults to false, so the hidden bullish output is deliberately all-NaN",
+    ),
+    (
+        "kase_peak_oscillator_with_divergences",
+        Some("hidden_bearish"),
+        "plot_hidden_bear defaults to false, so the hidden bearish output is deliberately all-NaN",
+    ),
+    (
+        "macd_wave_signal_pro",
+        Some("diff"),
+        "diff is the standard MACD line already emitted by the standalone MACD indicator at the same defaults",
+    ),
+    (
+        "macd_wave_signal_pro",
+        Some("dea"),
+        "dea is the standard MACD signal line already emitted by the standalone MACD indicator at the same defaults",
+    ),
+    (
+        "mwdx",
+        None,
+        "production batch dispatch maps its default factor to 2/(14+1), making the sole output exactly EMA(14)",
+    ),
+    (
+        "price_moving_average_ratio_percentile",
+        Some("plotline"),
+        "default line mode is PMAR and assigns plotline directly from the already emitted pmar output",
+    ),
+    (
+        "smooth_theil_sen",
+        Some("intercept"),
+        "default forecast offset is zero, so value and intercept both equal beta_0 on every row",
     ),
 ];
 
-/// Is this `(id, output_id)` pair one of the [`EXPECTED_NON_PRODUCING_OUTPUTS`]?
-pub fn expected_non_producing_output(id: &str, output_id: &str) -> Option<&'static str> {
-    EXPECTED_NON_PRODUCING_OUTPUTS
+/// Formula-level reason why a production output is deliberately absent.
+pub fn production_output_exclusion(id: &str, output_id: Option<&str>) -> Option<&'static str> {
+    PRODUCTION_OUTPUT_EXCLUSIONS
         .iter()
-        .find(|(i, o, _)| *i == id && *o == output_id)
+        .find(|(candidate_id, candidate_output, _)| {
+            *candidate_id == id && *candidate_output == output_id
+        })
         .map(|(_, _, why)| *why)
 }
 
@@ -171,7 +248,7 @@ pub fn expected_non_producing(id: &str) -> Option<&'static str> {
 /// `get_indicator` cannot enumerate their outputs.
 ///
 /// `compute_cpu_batch` falls through to a by-name match with `output_id`
-/// defaulted to the literal `"value"`, which these five reject with
+/// defaulted to the literal `"value"`, which these four reject with
 /// `UnknownOutput` because `"value"` is not one of their series. The names
 /// below are harvested from the dispatcher source itself
 /// (`vendor/vector-ta-0.2.9-patched/src/indicators/dispatch/cpu_batch.rs`), and
@@ -184,11 +261,6 @@ pub const UNREGISTERED_MULTI_OUTPUTS: &[(&str, &[&str])] = &[
     ("rolling_z_score_trend", &["zscore", "momentum"]),
     // cpu_batch.rs: `compute_historical_volatility_percentile_batch`
     ("historical_volatility_percentile", &["hvp", "hvp_sma"]),
-    // cpu_batch.rs: `compute_ehlers_data_sampling_relative_strength_indicator_batch`
-    (
-        "ehlers_data_sampling_relative_strength_indicator",
-        &["ds_rsi", "original_rsi", "signal"],
-    ),
     // cpu_batch.rs: `compute_ict_propulsion_block_batch` (twelve fields)
     (
         "ict_propulsion_block",
@@ -209,27 +281,47 @@ pub const UNREGISTERED_MULTI_OUTPUTS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Every `output_id` this indicator must be dispatched with, in a stable order.
+/// Every production `output_id` this indicator must be dispatched with, in a
+/// stable order. Formula-level exclusions are removed here before either the
+/// base pass or a sweep can allocate/compute them.
 ///
-/// * a registered SINGLE-output indicator gets `[None]` — the library default;
+/// * a registered SINGLE-output indicator gets `[None]` — the library default
+///   — unless its sole output is statically redundant, in which case it gets
+///   an empty plan;
 /// * a registered MULTI-output indicator gets one `Some(id)` per declared
 ///   output, because vector-ta answers `output_id: None` for those with
 ///   `InvalidParam { key: "output_id" }`. This is the single mechanism that
 ///   `compute_single_indicator` (the chart endpoint) has always used and the
-///   ALL_INDICATORS loop never did;
+///   ALL_INDICATORS loop never did. Removing redundant siblings may leave one
+///   `Some(id)`, which deliberately keeps its semantic suffix;
 /// * an UNREGISTERED id gets its entry from [`UNREGISTERED_MULTI_OUTPUTS`], or
 ///   `[None]` (which `compute_cpu_batch` turns into the literal `"value"`).
 pub fn output_ids_for(id: &str) -> Vec<Option<&'static str>> {
     if let Some(info) = get_indicator(id) {
         if info.outputs.len() <= 1 {
-            return vec![None];
+            return (production_output_exclusion(id, None).is_none())
+                .then_some(None)
+                .into_iter()
+                .collect();
         }
-        return info.outputs.iter().map(|o| Some(o.id)).collect();
+        return info
+            .outputs
+            .iter()
+            .map(|o| Some(o.id))
+            .filter(|output| production_output_exclusion(id, *output).is_none())
+            .collect();
     }
     if let Some((_, outs)) = UNREGISTERED_MULTI_OUTPUTS.iter().find(|(k, _)| *k == id) {
-        return outs.iter().map(|o| Some(*o)).collect();
+        return outs
+            .iter()
+            .map(|o| Some(*o))
+            .filter(|output| production_output_exclusion(id, *output).is_none())
+            .collect();
     }
-    vec![None]
+    (production_output_exclusion(id, None).is_none())
+        .then_some(None)
+        .into_iter()
+        .collect()
 }
 
 /// How many columns this id will attempt, used to plan the memory budget
@@ -374,9 +466,7 @@ impl DropReason {
         match e {
             IndicatorDispatchError::UnknownIndicator { .. } => DropReason::UnknownIndicator,
             IndicatorDispatchError::UnknownOutput { .. } => DropReason::UnknownOutput,
-            IndicatorDispatchError::MissingRequiredInput { .. } => {
-                DropReason::MissingRequiredInput
-            }
+            IndicatorDispatchError::MissingRequiredInput { .. } => DropReason::MissingRequiredInput,
             IndicatorDispatchError::InvalidParam { .. } => DropReason::InvalidParam,
             IndicatorDispatchError::UnsupportedCapability { .. } => {
                 DropReason::UnsupportedCapability
@@ -417,14 +507,18 @@ pub struct IndicatorLedger {
     produced: BTreeMap<String, usize>,
     /// reason -> bucket.
     drops: BTreeMap<DropReason, Bucket>,
+    /// Exact reasons by emitted column name.  Summary buckets retain only a
+    /// handful of examples for logs; the validity boundary needs every
+    /// frame-dependent placeholder's reason so an all-NaN warmup cannot be
+    /// confused with a compute failure.
+    column_drop_reasons: BTreeMap<String, Vec<DropReason>>,
     /// Ids in [`EXPECTED_NON_PRODUCING`] that nevertheless produced a column.
     /// A non-empty set means the exclusion table is stale.
     stale_exclusions: BTreeSet<String>,
-    /// Columns whose values are bit-identical to an earlier column in the same
-    /// pass. NOT removed — the column SET must stay a function of the id list
-    /// and the registry, never of the frame, or the cube width would vary by
-    /// timeframe. Reported so a period sweep that the indicator silently
-    /// ignores shows up as duplication instead of as vocabulary.
+    /// Columns whose values are bit-identical to an earlier column on this
+    /// frame. Never removed from runtime values: formula-proven aliases are
+    /// excluded statically, while a remaining match may be a corpus
+    /// coincidence and cannot be allowed to change schema width.
     duplicate_columns: Vec<String>,
     /// Columns with no finite variation on this frame (all-NaN or constant).
     /// Also not removed, for the same width-invariance reason.
@@ -442,7 +536,17 @@ impl IndicatorLedger {
     }
 
     /// Record one discard, with its reason and enough detail to act on.
-    pub fn dropped(&mut self, id: &str, column: &str, reason: DropReason, detail: impl Into<String>) {
+    pub fn dropped(
+        &mut self,
+        id: &str,
+        column: &str,
+        reason: DropReason,
+        detail: impl Into<String>,
+    ) {
+        self.column_drop_reasons
+            .entry(column.to_string())
+            .or_default()
+            .push(reason);
         let b = self.drops.entry(reason).or_default();
         b.columns += 1;
         b.ids.insert(id.to_string());
@@ -479,6 +583,12 @@ impl IndicatorLedger {
                 }
             }
         }
+        for (column, reasons) in other.column_drop_reasons {
+            self.column_drop_reasons
+                .entry(column)
+                .or_default()
+                .extend(reasons);
+        }
         self.stale_exclusions.extend(other.stale_exclusions);
         self.duplicate_columns.extend(other.duplicate_columns);
         self.degenerate_columns.extend(other.degenerate_columns);
@@ -507,6 +617,14 @@ impl IndicatorLedger {
         self.degenerate_columns.len()
     }
 
+    /// All counted discard reasons for one column in execution order.
+    pub fn drop_reasons_for_column(&self, column: &str) -> &[DropReason] {
+        self.column_drop_reasons
+            .get(column)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// One INFO line for the pass, then one INFO line per drop reason naming
     /// the bucket size, the ids involved and up to five real examples.
     ///
@@ -529,7 +647,13 @@ impl IndicatorLedger {
             let examples = b
                 .examples
                 .iter()
-                .map(|(c, d)| if d.is_empty() { c.clone() } else { format!("{c}: {d}") })
+                .map(|(c, d)| {
+                    if d.is_empty() {
+                        c.clone()
+                    } else {
+                        format!("{c}: {d}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" | ");
             tracing::info!(
@@ -557,10 +681,10 @@ impl IndicatorLedger {
                 stage,
                 count = self.duplicate_columns.len(),
                 names = %preview(&self.duplicate_columns),
-                "columns are bit-identical to an earlier column — usually an indicator that \
-                 IGNORES the swept parameter, so the sweep bought duplication rather than \
-                 vocabulary. They are KEPT (the column set must not depend on the frame) but \
-                 they carry no information."
+                "columns are bit-identical to an earlier column on this frame. Formula-proven \
+                 aliases and ignored/saturated sweep points belong in the static production \
+                 exclusions; remaining corpus coincidences are kept because schema width must \
+                 not depend on market values."
             );
         }
         if !self.degenerate_columns.is_empty() {
@@ -589,7 +713,7 @@ impl IndicatorLedger {
     /// change and were never exercised together, and they contradict each other
     /// on a real machine at real depth. Measured: 20.6 GB free, the M5 store's
     /// 1,054,320 bars, one f64 column = 8.43 MB, so `max_columns = 580` and
-    /// `admit_indicators` admits **269** of the 342 ids. The absolute floor
+    /// `admit_indicators` admits **269** ids from the declared inventory. The absolute floor
     /// demands 280 producing ids, so `compute_classic_ta_columns` returned Err
     /// and discovery could not start at all — two safety mechanisms
     /// deadlocking, on the operator's own box.
@@ -598,7 +722,7 @@ impl IndicatorLedger {
     /// cannot afford the vocabulary is a DIFFERENT INCIDENT from a dispatch
     /// regression, and the two must never share an error message: the first is
     /// a sizing fact already reported at WARN by
-    /// `feature_budget::VocabularyBudget::log`, the second is the 341-column
+    /// `feature_budget::VocabularyBudget::log`, the second is the all-but-one
     /// silent drop returning. `afforded_ids` / `afforded_columns` are what the
     /// budget admitted; pass `usize::MAX` for both when no budget applies.
     pub fn enforce_floor(
@@ -631,7 +755,12 @@ impl IndicatorLedger {
                     .map(|(c, d)| format!("{c} ({d})"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{} dropped {} columns across {} ids; e.g. {ex}", r.label(), b.columns, b.ids.len())
+                format!(
+                    "{} dropped {} columns across {} ids; e.g. {ex}",
+                    r.label(),
+                    b.columns,
+                    b.ids.len()
+                )
             })
             .unwrap_or_else(|| {
                 "no drops were recorded at all besides the budget's own, which is itself a defect"
@@ -651,7 +780,7 @@ impl IndicatorLedger {
         anyhow::bail!(
             "INDICATOR VOCABULARY COLLAPSE at stage '{stage}' ({rows} bars): {} indicator ids \
              produced {} columns, below the floor of {effective_ids} ids / {effective_columns} \
-             columns. This is the 341-silent-drop regression returning. Largest drop bucket: \
+             columns. This is the all-but-one silent-drop regression returning. Largest drop bucket: \
              {worst}.{sizing} Full per-reason census is on the INFO lines above \
              (target=neoethos_data::indicator_ledger).",
             self.producing_ids(),
@@ -720,34 +849,68 @@ mod tests {
             assert!(
                 why.len() > 20,
                 "'{id}' is excluded without a real reason — a name with no reason is how the \
-                 next 341-column drop starts"
+                 next all-but-one drop starts"
             );
         }
     }
 
     #[test]
-    fn every_expected_non_producing_output_names_a_real_declared_output_and_a_reason() {
-        for (id, output, why) in EXPECTED_NON_PRODUCING_OUTPUTS {
+    fn every_production_output_exclusion_is_static_real_unique_and_filtered() {
+        let mut keys = std::collections::BTreeSet::new();
+        for (id, output, why) in PRODUCTION_OUTPUT_EXCLUSIONS {
             assert!(
                 crate::core::all_indicators::ALL_INDICATORS.contains(id),
-                "'{id}' has an output exclusion but is not in ALL_INDICATORS"
+                "'{id}' has a production output exclusion but is not in ALL_INDICATORS"
             );
-            let info = get_indicator(id)
-                .unwrap_or_else(|| panic!("'{id}' has an output exclusion but is unregistered"));
             assert!(
-                info.outputs.iter().any(|o| o.id == *output),
-                "'{id}.{output}' is excluded but the registry does not declare that output — the \
-                 entry is dead and would hide a real absence"
+                keys.insert((*id, *output)),
+                "duplicate production output exclusion for {id}.{output:?}"
             );
             assert!(
                 why.len() > 20,
-                "'{id}.{output}' is excluded without a real reason"
+                "'{id}.{output:?}' is excluded without a formula-level reason"
+            );
+
+            match output {
+                None => {
+                    let registered_output_count =
+                        get_indicator(id).map_or(1, |info| info.outputs.len().max(1));
+                    assert_eq!(
+                        registered_output_count, 1,
+                        "'{id}' uses a whole-indicator exclusion but has multiple declared outputs"
+                    );
+                }
+                Some(output_id) => {
+                    let registered = get_indicator(id)
+                        .is_some_and(|info| info.outputs.iter().any(|o| o.id == *output_id));
+                    let overridden = UNREGISTERED_MULTI_OUTPUTS
+                        .iter()
+                        .any(|(candidate, outputs)| candidate == id && outputs.contains(output_id));
+                    assert!(
+                        registered || overridden,
+                        "'{id}.{output_id}' is excluded but neither the registry nor the audited \
+                         unregistered-output table declares it"
+                    );
+                }
+            }
+            assert!(
+                !output_ids_for(id).contains(output),
+                "'{id}.{output:?}' remains in the production resolver despite its exclusion"
             );
         }
+
+        assert!(
+            output_ids_for("mwdx").is_empty(),
+            "the whole structurally redundant MWDX feature must be absent"
+        );
         assert_eq!(
-            expected_non_producing_output("adaptive_bounds_rsi", "regime"),
-            None,
-            "an output that WORKS must never be on the exclusion list"
+            output_ids_for("half_causal_estimator"),
+            vec![Some("estimate")],
+            "excluding the disabled expected_value output must preserve the real estimate"
+        );
+        assert!(
+            output_ids_for("adaptive_bounds_rsi").contains(&Some("regime")),
+            "excluding the auxiliary RSI must preserve the indicator's distinct regime output"
         );
     }
 
@@ -766,7 +929,10 @@ mod tests {
     #[test]
     fn unregistered_output_tables_name_indicators_that_are_really_unregistered() {
         for (id, outs) in UNREGISTERED_MULTI_OUTPUTS {
-            assert!(!outs.is_empty(), "'{id}' override table has no output names");
+            assert!(
+                !outs.is_empty(),
+                "'{id}' override table has no output names"
+            );
             assert!(
                 crate::core::all_indicators::ALL_INDICATORS.contains(id),
                 "'{id}' has an output override but is not in ALL_INDICATORS"
@@ -776,7 +942,7 @@ mod tests {
 
     #[test]
     fn multi_output_indicators_get_one_request_per_declared_output() {
-        // The measured cause of 92 of the 342 failures: `output_id: None`
+        // The measured cause of 92 failures: `output_id: None`
         // against a multi-output indicator. bollinger_bands has three.
         let outs = output_ids_for("bollinger_bands");
         assert!(
@@ -799,7 +965,12 @@ mod tests {
         let mut a = IndicatorLedger::new();
         a.produced("rsi");
         a.produced("rsi");
-        a.dropped("sar", "sar", DropReason::UnknownIndicator, "unknown indicator: sar");
+        a.dropped(
+            "insync_index",
+            "insync_index",
+            DropReason::UnknownIndicator,
+            "unknown indicator: insync_index",
+        );
         let mut b = IndicatorLedger::new();
         b.produced("ema");
         b.dropped("rsx", "rsx", DropReason::UnsupportedCapability, "cpu_batch");
@@ -813,7 +984,10 @@ mod tests {
     fn floor_violation_is_a_hard_error_that_names_the_worst_bucket() {
         let mut l = IndicatorLedger::new();
         l.produced("ttm_trend");
-        for i in 0..341 {
+        let all_but_one = crate::core::all_indicators::ALL_INDICATORS
+            .len()
+            .saturating_sub(1);
+        for i in 0..all_but_one {
             l.dropped(
                 "x",
                 &format!("col{i}"),
@@ -898,7 +1072,10 @@ mod tests {
             .enforce_floor("base-vocabulary", 1_054_320, 280, 400, 269, 580)
             .expect_err("1 producing id of 269 afforded is a collapse at any clamp");
         let msg = format!("{err}");
-        assert!(msg.contains("clamped from 280/400 down to 269/400"), "{msg}");
+        assert!(
+            msg.contains("clamped from 280/400 down to 269/400"),
+            "{msg}"
+        );
         // The budget's own drops must NOT be blamed for the collapse.
         assert!(msg.contains("invalid_param"), "{msg}");
         assert!(!msg.contains("Largest drop bucket: over_budget"), "{msg}");
@@ -906,8 +1083,14 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_distinguishes_real_differences() {
-        assert_eq!(series_fingerprint(&[1.0, 2.0]), series_fingerprint(&[1.0, 2.0]));
-        assert_ne!(series_fingerprint(&[1.0, 2.0]), series_fingerprint(&[1.0, 2.5]));
+        assert_eq!(
+            series_fingerprint(&[1.0, 2.0]),
+            series_fingerprint(&[1.0, 2.0])
+        );
+        assert_ne!(
+            series_fingerprint(&[1.0, 2.0]),
+            series_fingerprint(&[1.0, 2.5])
+        );
         // NaN canonicalisation: two all-NaN series of the same length collide,
         // which is what makes duplicate detection catch dead sweeps.
         assert_eq!(
@@ -916,6 +1099,195 @@ mod tests {
         );
         // -0.0 must not read as a different column from 0.0.
         assert_eq!(series_fingerprint(&[-0.0]), series_fingerprint(&[0.0]));
+    }
+
+    #[test]
+    fn directional_imbalance_index_accounting_uses_six_canonical_registered_outputs() {
+        assert!(
+            get_indicator("directional_imbalance_index").is_some(),
+            "Directional Imbalance Index must not depend on an unregistered alias schema"
+        );
+        assert!(
+            !UNREGISTERED_MULTI_OUTPUTS
+                .iter()
+                .any(|(id, _)| *id == "directional_imbalance_index"),
+            "canonical registry and unregistered override schemas must never coexist"
+        );
+        assert_eq!(
+            output_ids_for("directional_imbalance_index"),
+            ["up", "down", "bulls", "bears", "upper", "lower"]
+                .map(Some)
+                .to_vec()
+        );
+        assert_eq!(planned_output_count("directional_imbalance_index"), 6);
+        let canonical_base_and_period_sweeps = planned_output_count("directional_imbalance_index")
+            * (1 + crate::core::hpc_ta::ALT_PERIODS.len());
+        assert_eq!(canonical_base_and_period_sweeps, 36);
+        assert_eq!(
+            canonical_base_and_period_sweeps - 1,
+            35,
+            "registering the six canonical outputs intentionally replaces the prior one-column \
+             alias with six base plus thirty swept columns"
+        );
+    }
+
+    #[test]
+    fn dual_ulcer_index_accounting_uses_three_canonical_registered_outputs() {
+        assert!(
+            get_indicator("dual_ulcer_index").is_some(),
+            "Dual Ulcer Index must not depend on an anonymous value-alias schema"
+        );
+        assert!(
+            !UNREGISTERED_MULTI_OUTPUTS
+                .iter()
+                .any(|(id, _)| *id == "dual_ulcer_index"),
+            "canonical registry and unregistered override schemas must never coexist"
+        );
+        assert_eq!(
+            output_ids_for("dual_ulcer_index"),
+            ["long_ulcer", "short_ulcer", "threshold"]
+                .map(Some)
+                .to_vec()
+        );
+        assert_eq!(planned_output_count("dual_ulcer_index"), 3);
+        let canonical_base_and_period_sweeps =
+            planned_output_count("dual_ulcer_index") * (1 + crate::core::hpc_ta::ALT_PERIODS.len());
+        assert_eq!(canonical_base_and_period_sweeps, 18);
+        assert_eq!(
+            canonical_base_and_period_sweeps - 1,
+            17,
+            "registering the three canonical outputs intentionally replaces the prior one-column \
+             alias with three base plus fifteen swept columns"
+        );
+    }
+
+    #[test]
+    fn dvdiqqe_accounting_preserves_four_canonical_outputs_across_period_sweeps() {
+        assert!(
+            get_indicator("dvdiqqe").is_some(),
+            "DVDIQQE must remain one canonical registered family"
+        );
+        assert!(
+            !UNREGISTERED_MULTI_OUTPUTS
+                .iter()
+                .any(|(id, _)| *id == "dvdiqqe"),
+            "canonical registry and unregistered override schemas must never coexist"
+        );
+        assert_eq!(
+            output_ids_for("dvdiqqe"),
+            ["dvdi", "fast_tl", "slow_tl", "center_line"]
+                .map(Some)
+                .to_vec()
+        );
+        assert_eq!(planned_output_count("dvdiqqe"), 4);
+        let canonical_base_and_period_sweeps =
+            planned_output_count("dvdiqqe") * (1 + crate::core::hpc_ta::ALT_PERIODS.len());
+        assert_eq!(
+            canonical_base_and_period_sweeps, 24,
+            "DVDIQQE must preserve four base plus twenty period-sweep receipts"
+        );
+    }
+
+    #[test]
+    fn ehlers_data_sampling_rsi_accounting_adds_ten_canonical_sweep_columns() {
+        let id = "ehlers_data_sampling_relative_strength_indicator";
+        let info = get_indicator(id).expect("Ehlers Data Sampling RSI must be registered");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["ds_rsi", "original_rsi", "signal"]
+        );
+        assert!(
+            !UNREGISTERED_MULTI_OUTPUTS
+                .iter()
+                .any(|(candidate, _)| *candidate == id),
+            "canonical registry and unregistered override schemas must never coexist"
+        );
+        assert_eq!(output_ids_for(id), [Some("ds_rsi"), Some("signal")]);
+        assert_eq!(planned_output_count(id), 2);
+        let canonical_base_and_length_sweeps =
+            planned_output_count(id) * (1 + crate::core::hpc_ta::ALT_PERIODS.len());
+        assert_eq!(canonical_base_and_length_sweeps, 12);
+        assert_eq!(
+            canonical_base_and_length_sweeps - 2,
+            10,
+            "registration intentionally expands the old two-column base-only identity with ten exact length-sweep columns"
+        );
+        assert_eq!(
+            production_output_exclusion(id, Some("original_rsi")),
+            Some(
+                "original_rsi is the unmodified RSI auxiliary already emitted by the standalone RSI indicator"
+            )
+        );
+    }
+
+    #[test]
+    fn emd_trend_accounting_adds_twenty_three_canonical_columns() {
+        let id = "emd_trend";
+        let info = get_indicator(id).expect("EMD Trend must have one canonical registry row");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["direction", "average", "upper", "lower"]
+        );
+        assert!(
+            !UNREGISTERED_MULTI_OUTPUTS
+                .iter()
+                .any(|(candidate, _)| *candidate == id),
+            "canonical registry and unregistered override schemas must never coexist"
+        );
+        assert_eq!(
+            output_ids_for(id),
+            ["direction", "average", "upper", "lower"]
+                .map(Some)
+                .to_vec()
+        );
+        assert_eq!(planned_output_count(id), 4);
+        let canonical_base_and_length_sweeps =
+            planned_output_count(id) * (1 + crate::core::hpc_ta::ALT_PERIODS.len());
+        assert_eq!(canonical_base_and_length_sweeps, 24);
+        assert_eq!(
+            canonical_base_and_length_sweeps - 1,
+            23,
+            "registration intentionally replaces the old anonymous average-only base with four canonical base and twenty exact length-sweep receipts"
+        );
+    }
+
+    #[test]
+    fn evasive_supertrend_accounting_adds_twenty_three_canonical_columns() {
+        let id = "evasive_supertrend";
+        let info =
+            get_indicator(id).expect("Evasive Supertrend must have one canonical registry row");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["band", "state", "noisy", "changed"]
+        );
+        assert!(
+            !UNREGISTERED_MULTI_OUTPUTS
+                .iter()
+                .any(|(candidate, _)| *candidate == id),
+            "canonical registry and unregistered override schemas must never coexist"
+        );
+        assert_eq!(
+            output_ids_for(id),
+            ["band", "state", "noisy", "changed"].map(Some).to_vec()
+        );
+        assert_eq!(planned_output_count(id), 4);
+        let canonical_base_and_atr_length_sweeps =
+            planned_output_count(id) * (1 + crate::core::hpc_ta::ALT_PERIODS.len());
+        assert_eq!(canonical_base_and_atr_length_sweeps, 24);
+        assert_eq!(
+            canonical_base_and_atr_length_sweeps - 1,
+            23,
+            "registration intentionally replaces the old anonymous band-only base with four canonical base and twenty exact atr_length-sweep receipts"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::highpass_2_pole::{HighPass2BatchRange, HighPass2Params};
@@ -6,15 +6,15 @@ use cust::context::{CacheConfig, Context};
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -143,19 +143,7 @@ impl CudaHighPass2 {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/highpass2_kernel.ptx"));
-        let jit_opts = &[ModuleJitOption::DetermineTargetFromContext];
-        let module = match Module::from_ptx(ptx, jit_opts) {
-            Ok(m) => m,
-            Err(_) => {
-                if let Ok(m) = Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext])
-                {
-                    m
-                } else {
-                    Module::from_ptx(ptx, &[])?
-                }
-            }
-        };
+        let module = crate::load_cuda_embedded_module!("highpass2_kernel")?;
 
         if let Ok(mut f) = module.get_function("highpass2_batch_f32") {
             let _ = f.set_cache_config(CacheConfig::PreferL1);

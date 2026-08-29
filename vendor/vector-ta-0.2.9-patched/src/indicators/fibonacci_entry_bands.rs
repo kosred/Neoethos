@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::mem::{ManuallyDrop, MaybeUninit};
@@ -220,10 +202,6 @@ impl FibonacciEntryBandsPoint {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct FibonacciEntryBandsParams {
     pub source: Option<String>,
     pub length: Option<usize>,
@@ -794,11 +772,7 @@ impl FibonacciEntryBandsStream {
 
 #[inline(always)]
 fn finite_option(value: f64) -> Option<f64> {
-    if value.is_finite() {
-        Some(value)
-    } else {
-        None
-    }
+    if value.is_finite() { Some(value) } else { None }
 }
 
 #[inline(always)]
@@ -1214,7 +1188,6 @@ pub fn fibonacci_entry_bands_into_slices(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn fibonacci_entry_bands_into(
@@ -1263,10 +1236,6 @@ pub fn fibonacci_entry_bands_into(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct FibonacciEntryBandsBatchRange {
     pub length: (usize, usize, usize),
     pub atr_length: (usize, usize, usize),
@@ -1443,6 +1412,89 @@ fn expand_grid(
         }
     }
     Ok(combos)
+}
+
+/// One authoritative host plan for the f64 CUDA batch ABI. Keeping this next
+/// to the scalar parser prevents the resident engine and the legacy wrapper
+/// from inventing different source/TP codes or parameter-grid ordering.
+#[cfg(feature = "cuda-build-native")]
+pub(crate) struct FibonacciEntryBandsCudaBatchPlan {
+    pub combos: Vec<FibonacciEntryBandsParams>,
+    pub lengths: Vec<i32>,
+    pub atr_lengths: Vec<i32>,
+    pub source_mode: i32,
+    pub source_needs_open: bool,
+    pub use_atr: bool,
+    pub tp_mode: i32,
+    pub max_length: usize,
+    pub minimum_valid_run: usize,
+}
+
+#[cfg(feature = "cuda-build-native")]
+pub(crate) fn fibonacci_entry_bands_cuda_batch_plan(
+    sweep: &FibonacciEntryBandsBatchRange,
+    data_len: usize,
+) -> Result<FibonacciEntryBandsCudaBatchPlan, FibonacciEntryBandsError> {
+    let combos = expand_grid(sweep)?;
+    if combos.is_empty() {
+        return Err(FibonacciEntryBandsError::OutputLengthMismatch { expected: 1 });
+    }
+
+    let source = parse_source(&sweep.source)?;
+    let tp_aggressiveness = parse_tp_aggressiveness(&sweep.tp_aggressiveness)?;
+    let source_mode = match source {
+        SourceKind::Open => 0,
+        SourceKind::High => 1,
+        SourceKind::Low => 2,
+        SourceKind::Close => 3,
+        SourceKind::Hl2 => 4,
+        SourceKind::Hlc3 => 5,
+        SourceKind::Ohlc4 => 6,
+        SourceKind::Hlcc4 => 7,
+    };
+    let tp_mode = match tp_aggressiveness {
+        TpAggressiveness::Low => 0,
+        TpAggressiveness::Medium => 1,
+        TpAggressiveness::High => 2,
+    };
+
+    let mut lengths = Vec::with_capacity(combos.len());
+    let mut atr_lengths = Vec::with_capacity(combos.len());
+    let mut max_length = 0usize;
+    let mut minimum_valid_run = 0usize;
+    for combo in &combos {
+        let resolved = resolve_params(combo, Some(data_len))?;
+        lengths.push(i32::try_from(resolved.length).map_err(|_| {
+            FibonacciEntryBandsError::InvalidLength {
+                length: resolved.length,
+                data_len,
+            }
+        })?);
+        atr_lengths.push(i32::try_from(resolved.atr_length).map_err(|_| {
+            FibonacciEntryBandsError::InvalidAtrLength {
+                atr_length: resolved.atr_length,
+                data_len,
+            }
+        })?);
+        max_length = max_length.max(resolved.length);
+        minimum_valid_run = minimum_valid_run.max(if resolved.use_atr {
+            resolved.atr_length
+        } else {
+            resolved.length
+        });
+    }
+
+    Ok(FibonacciEntryBandsCudaBatchPlan {
+        combos,
+        lengths,
+        atr_lengths,
+        source_mode,
+        source_needs_open: source.needs_open(),
+        use_atr: sweep.use_atr,
+        tp_mode,
+        max_length,
+        minimum_valid_run,
+    })
 }
 
 #[inline(always)]
@@ -1741,990 +1793,6 @@ pub fn fibonacci_entry_bands_batch_inner_into(
     long_bounce.copy_from_slice(&out.long_bounce);
     short_bounce.copy_from_slice(&out.short_bounce);
     Ok(out.combos)
-}
-
-#[cfg(feature = "python")]
-fn output_to_py_dict<'py>(
-    py: Python<'py>,
-    output: FibonacciEntryBandsOutput,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("basis", output.basis.into_pyarray(py))?;
-    dict.set_item("trend", output.trend.into_pyarray(py))?;
-    dict.set_item("upper_0618", output.upper_0618.into_pyarray(py))?;
-    dict.set_item("upper_1000", output.upper_1000.into_pyarray(py))?;
-    dict.set_item("upper_1618", output.upper_1618.into_pyarray(py))?;
-    dict.set_item("upper_2618", output.upper_2618.into_pyarray(py))?;
-    dict.set_item("lower_0618", output.lower_0618.into_pyarray(py))?;
-    dict.set_item("lower_1000", output.lower_1000.into_pyarray(py))?;
-    dict.set_item("lower_1618", output.lower_1618.into_pyarray(py))?;
-    dict.set_item("lower_2618", output.lower_2618.into_pyarray(py))?;
-    dict.set_item("tp_long_band", output.tp_long_band.into_pyarray(py))?;
-    dict.set_item("tp_short_band", output.tp_short_band.into_pyarray(py))?;
-    dict.set_item("long_entry", output.long_entry.into_pyarray(py))?;
-    dict.set_item("short_entry", output.short_entry.into_pyarray(py))?;
-    dict.set_item("rejection_long", output.rejection_long.into_pyarray(py))?;
-    dict.set_item("rejection_short", output.rejection_short.into_pyarray(py))?;
-    dict.set_item("long_bounce", output.long_bounce.into_pyarray(py))?;
-    dict.set_item("short_bounce", output.short_bounce.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-fn point_to_py_dict<'py>(
-    py: Python<'py>,
-    point: FibonacciEntryBandsPoint,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("basis", point.basis)?;
-    dict.set_item("trend", point.trend)?;
-    dict.set_item("upper_0618", point.upper_0618)?;
-    dict.set_item("upper_1000", point.upper_1000)?;
-    dict.set_item("upper_1618", point.upper_1618)?;
-    dict.set_item("upper_2618", point.upper_2618)?;
-    dict.set_item("lower_0618", point.lower_0618)?;
-    dict.set_item("lower_1000", point.lower_1000)?;
-    dict.set_item("lower_1618", point.lower_1618)?;
-    dict.set_item("lower_2618", point.lower_2618)?;
-    dict.set_item("tp_long_band", point.tp_long_band)?;
-    dict.set_item("tp_short_band", point.tp_short_band)?;
-    dict.set_item("long_entry", point.long_entry)?;
-    dict.set_item("short_entry", point.short_entry)?;
-    dict.set_item("rejection_long", point.rejection_long)?;
-    dict.set_item("rejection_short", point.rejection_short)?;
-    dict.set_item("long_bounce", point.long_bounce)?;
-    dict.set_item("short_bounce", point.short_bounce)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "FibonacciEntryBandsStream")]
-pub struct FibonacciEntryBandsStreamPy {
-    stream: FibonacciEntryBandsStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl FibonacciEntryBandsStreamPy {
-    #[new]
-    #[pyo3(signature = (source=DEFAULT_SOURCE, length=DEFAULT_LENGTH, atr_length=DEFAULT_ATR_LENGTH, use_atr=DEFAULT_USE_ATR, tp_aggressiveness=DEFAULT_TP_AGGRESSIVENESS))]
-    fn new(
-        source: &str,
-        length: usize,
-        atr_length: usize,
-        use_atr: bool,
-        tp_aggressiveness: &str,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            stream: FibonacciEntryBandsStream::try_new(FibonacciEntryBandsParams {
-                source: Some(source.to_string()),
-                length: Some(length),
-                atr_length: Some(atr_length),
-                use_atr: Some(use_atr),
-                tp_aggressiveness: Some(tp_aggressiveness.to_string()),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-
-    fn update<'py>(
-        &mut self,
-        py: Python<'py>,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.stream
-            .update(open, high, low, close)
-            .map(|point| point_to_py_dict(py, point))
-            .transpose()
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.stream.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "fibonacci_entry_bands")]
-#[pyo3(signature = (open, high, low, close, source=DEFAULT_SOURCE, length=DEFAULT_LENGTH, atr_length=DEFAULT_ATR_LENGTH, use_atr=DEFAULT_USE_ATR, tp_aggressiveness=DEFAULT_TP_AGGRESSIVENESS, kernel=None))]
-pub fn fibonacci_entry_bands_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    source: &str,
-    length: usize,
-    atr_length: usize,
-    use_atr: bool,
-    tp_aggressiveness: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let input = FibonacciEntryBandsInput::from_slices(
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        FibonacciEntryBandsParams {
-            source: Some(source.to_string()),
-            length: Some(length),
-            atr_length: Some(atr_length),
-            use_atr: Some(use_atr),
-            tp_aggressiveness: Some(tp_aggressiveness.to_string()),
-        },
-    );
-    let kern = validate_kernel(kernel, false)?;
-    let output = py
-        .allow_threads(|| fibonacci_entry_bands_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    output_to_py_dict(py, output)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "fibonacci_entry_bands_batch")]
-#[pyo3(signature = (open, high, low, close, length_range=(DEFAULT_LENGTH, DEFAULT_LENGTH, 0), atr_length_range=(DEFAULT_ATR_LENGTH, DEFAULT_ATR_LENGTH, 0), source=DEFAULT_SOURCE, use_atr=DEFAULT_USE_ATR, tp_aggressiveness=DEFAULT_TP_AGGRESSIVENESS, kernel=None))]
-pub fn fibonacci_entry_bands_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    atr_length_range: (usize, usize, usize),
-    source: &str,
-    use_atr: bool,
-    tp_aggressiveness: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = FibonacciEntryBandsBatchRange {
-        length: length_range,
-        atr_length: atr_length_range,
-        source: source.to_string(),
-        use_atr,
-        tp_aggressiveness: tp_aggressiveness.to_string(),
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    macro_rules! arr {
-        ($name:ident) => {
-            let $name = unsafe { PyArray1::<f64>::new(py, [total], false) };
-        };
-    }
-
-    arr!(basis_arr);
-    arr!(trend_arr);
-    arr!(upper_0618_arr);
-    arr!(upper_1000_arr);
-    arr!(upper_1618_arr);
-    arr!(upper_2618_arr);
-    arr!(lower_0618_arr);
-    arr!(lower_1000_arr);
-    arr!(lower_1618_arr);
-    arr!(lower_2618_arr);
-    arr!(tp_long_arr);
-    arr!(tp_short_arr);
-    arr!(long_entry_arr);
-    arr!(short_entry_arr);
-    arr!(rejection_long_arr);
-    arr!(rejection_short_arr);
-    arr!(long_bounce_arr);
-    arr!(short_bounce_arr);
-
-    let basis_slice = unsafe { basis_arr.as_slice_mut()? };
-    let trend_slice = unsafe { trend_arr.as_slice_mut()? };
-    let upper_0618_slice = unsafe { upper_0618_arr.as_slice_mut()? };
-    let upper_1000_slice = unsafe { upper_1000_arr.as_slice_mut()? };
-    let upper_1618_slice = unsafe { upper_1618_arr.as_slice_mut()? };
-    let upper_2618_slice = unsafe { upper_2618_arr.as_slice_mut()? };
-    let lower_0618_slice = unsafe { lower_0618_arr.as_slice_mut()? };
-    let lower_1000_slice = unsafe { lower_1000_arr.as_slice_mut()? };
-    let lower_1618_slice = unsafe { lower_1618_arr.as_slice_mut()? };
-    let lower_2618_slice = unsafe { lower_2618_arr.as_slice_mut()? };
-    let tp_long_slice = unsafe { tp_long_arr.as_slice_mut()? };
-    let tp_short_slice = unsafe { tp_short_arr.as_slice_mut()? };
-    let long_entry_slice = unsafe { long_entry_arr.as_slice_mut()? };
-    let short_entry_slice = unsafe { short_entry_arr.as_slice_mut()? };
-    let rejection_long_slice = unsafe { rejection_long_arr.as_slice_mut()? };
-    let rejection_short_slice = unsafe { rejection_short_arr.as_slice_mut()? };
-    let long_bounce_slice = unsafe { long_bounce_arr.as_slice_mut()? };
-    let short_bounce_slice = unsafe { short_bounce_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            fibonacci_entry_bands_batch_inner_into(
-                open,
-                high,
-                low,
-                close,
-                &sweep,
-                kern,
-                basis_slice,
-                trend_slice,
-                upper_0618_slice,
-                upper_1000_slice,
-                upper_1618_slice,
-                upper_2618_slice,
-                lower_0618_slice,
-                lower_1000_slice,
-                lower_1618_slice,
-                lower_2618_slice,
-                tp_long_slice,
-                tp_short_slice,
-                long_entry_slice,
-                short_entry_slice,
-                rejection_long_slice,
-                rejection_short_slice,
-                long_bounce_slice,
-                short_bounce_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("basis", basis_arr.reshape((rows, cols))?)?;
-    dict.set_item("trend", trend_arr.reshape((rows, cols))?)?;
-    dict.set_item("upper_0618", upper_0618_arr.reshape((rows, cols))?)?;
-    dict.set_item("upper_1000", upper_1000_arr.reshape((rows, cols))?)?;
-    dict.set_item("upper_1618", upper_1618_arr.reshape((rows, cols))?)?;
-    dict.set_item("upper_2618", upper_2618_arr.reshape((rows, cols))?)?;
-    dict.set_item("lower_0618", lower_0618_arr.reshape((rows, cols))?)?;
-    dict.set_item("lower_1000", lower_1000_arr.reshape((rows, cols))?)?;
-    dict.set_item("lower_1618", lower_1618_arr.reshape((rows, cols))?)?;
-    dict.set_item("lower_2618", lower_2618_arr.reshape((rows, cols))?)?;
-    dict.set_item("tp_long_band", tp_long_arr.reshape((rows, cols))?)?;
-    dict.set_item("tp_short_band", tp_short_arr.reshape((rows, cols))?)?;
-    dict.set_item("long_entry", long_entry_arr.reshape((rows, cols))?)?;
-    dict.set_item("short_entry", short_entry_arr.reshape((rows, cols))?)?;
-    dict.set_item("rejection_long", rejection_long_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "rejection_short",
-        rejection_short_arr.reshape((rows, cols))?,
-    )?;
-    dict.set_item("long_bounce", long_bounce_arr.reshape((rows, cols))?)?;
-    dict.set_item("short_bounce", short_bounce_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "atr_lengths",
-        combos
-            .iter()
-            .map(|combo| combo.atr_length.unwrap_or(DEFAULT_ATR_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "sources",
-        combos
-            .iter()
-            .map(|combo| combo.source.as_deref().unwrap_or(DEFAULT_SOURCE))
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "use_atr_flags",
-        combos
-            .iter()
-            .map(|combo| combo.use_atr.unwrap_or(DEFAULT_USE_ATR))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "tp_aggressiveness_values",
-        combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .tp_aggressiveness
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_TP_AGGRESSIVENESS.to_string())
-            })
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_fibonacci_entry_bands_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(fibonacci_entry_bands_py, module)?)?;
-    module.add_function(wrap_pyfunction!(fibonacci_entry_bands_batch_py, module)?)?;
-    module.add_class::<FibonacciEntryBandsStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FibonacciEntryBandsJsOutput {
-    pub basis: Vec<f64>,
-    pub trend: Vec<f64>,
-    pub upper_0618: Vec<f64>,
-    pub upper_1000: Vec<f64>,
-    pub upper_1618: Vec<f64>,
-    pub upper_2618: Vec<f64>,
-    pub lower_0618: Vec<f64>,
-    pub lower_1000: Vec<f64>,
-    pub lower_1618: Vec<f64>,
-    pub lower_2618: Vec<f64>,
-    pub tp_long_band: Vec<f64>,
-    pub tp_short_band: Vec<f64>,
-    pub long_entry: Vec<f64>,
-    pub short_entry: Vec<f64>,
-    pub rejection_long: Vec<f64>,
-    pub rejection_short: Vec<f64>,
-    pub long_bounce: Vec<f64>,
-    pub short_bounce: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "fibonacci_entry_bands_js")]
-pub fn fibonacci_entry_bands_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &str,
-    length: usize,
-    atr_length: usize,
-    use_atr: bool,
-    tp_aggressiveness: &str,
-) -> Result<JsValue, JsValue> {
-    let input = FibonacciEntryBandsInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        FibonacciEntryBandsParams {
-            source: Some(source.to_string()),
-            length: Some(length),
-            atr_length: Some(atr_length),
-            use_atr: Some(use_atr),
-            tp_aggressiveness: Some(tp_aggressiveness.to_string()),
-        },
-    );
-    let out = fibonacci_entry_bands(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&FibonacciEntryBandsJsOutput {
-        basis: out.basis,
-        trend: out.trend,
-        upper_0618: out.upper_0618,
-        upper_1000: out.upper_1000,
-        upper_1618: out.upper_1618,
-        upper_2618: out.upper_2618,
-        lower_0618: out.lower_0618,
-        lower_1000: out.lower_1000,
-        lower_1618: out.lower_1618,
-        lower_2618: out.lower_2618,
-        tp_long_band: out.tp_long_band,
-        tp_short_band: out.tp_short_band,
-        long_entry: out.long_entry,
-        short_entry: out.short_entry,
-        rejection_long: out.rejection_long,
-        rejection_short: out.rejection_short,
-        long_bounce: out.long_bounce,
-        short_bounce: out.short_bounce,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fibonacci_entry_bands_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fibonacci_entry_bands_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn has_duplicate_ptrs(ptrs: &[usize]) -> bool {
-    for i in 0..ptrs.len() {
-        for j in (i + 1)..ptrs.len() {
-            if ptrs[i] == ptrs[j] {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn fibonacci_entry_bands_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    basis_ptr: *mut f64,
-    trend_ptr: *mut f64,
-    upper_0618_ptr: *mut f64,
-    upper_1000_ptr: *mut f64,
-    upper_1618_ptr: *mut f64,
-    upper_2618_ptr: *mut f64,
-    lower_0618_ptr: *mut f64,
-    lower_1000_ptr: *mut f64,
-    lower_1618_ptr: *mut f64,
-    lower_2618_ptr: *mut f64,
-    tp_long_ptr: *mut f64,
-    tp_short_ptr: *mut f64,
-    long_entry_ptr: *mut f64,
-    short_entry_ptr: *mut f64,
-    rejection_long_ptr: *mut f64,
-    rejection_short_ptr: *mut f64,
-    long_bounce_ptr: *mut f64,
-    short_bounce_ptr: *mut f64,
-    len: usize,
-    source: &str,
-    length: usize,
-    atr_length: usize,
-    use_atr: bool,
-    tp_aggressiveness: &str,
-) -> Result<(), JsValue> {
-    let ptrs = [
-        open_ptr as usize,
-        high_ptr as usize,
-        low_ptr as usize,
-        close_ptr as usize,
-        basis_ptr as usize,
-        trend_ptr as usize,
-        upper_0618_ptr as usize,
-        upper_1000_ptr as usize,
-        upper_1618_ptr as usize,
-        upper_2618_ptr as usize,
-        lower_0618_ptr as usize,
-        lower_1000_ptr as usize,
-        lower_1618_ptr as usize,
-        lower_2618_ptr as usize,
-        tp_long_ptr as usize,
-        tp_short_ptr as usize,
-        long_entry_ptr as usize,
-        short_entry_ptr as usize,
-        rejection_long_ptr as usize,
-        rejection_short_ptr as usize,
-        long_bounce_ptr as usize,
-        short_bounce_ptr as usize,
-    ];
-    if ptrs.iter().any(|ptr| *ptr == 0) {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let input = FibonacciEntryBandsInput::from_slices(
-            open,
-            high,
-            low,
-            close,
-            FibonacciEntryBandsParams {
-                source: Some(source.to_string()),
-                length: Some(length),
-                atr_length: Some(atr_length),
-                use_atr: Some(use_atr),
-                tp_aggressiveness: Some(tp_aggressiveness.to_string()),
-            },
-        );
-        let output_ptrs = &ptrs[4..];
-        let need_temp = output_ptrs.iter().any(|ptr| {
-            *ptr == open_ptr as usize
-                || *ptr == high_ptr as usize
-                || *ptr == low_ptr as usize
-                || *ptr == close_ptr as usize
-        }) || has_duplicate_ptrs(output_ptrs);
-
-        if need_temp {
-            let mut basis = vec![0.0; len];
-            let mut trend = vec![0.0; len];
-            let mut upper_0618 = vec![0.0; len];
-            let mut upper_1000 = vec![0.0; len];
-            let mut upper_1618 = vec![0.0; len];
-            let mut upper_2618 = vec![0.0; len];
-            let mut lower_0618 = vec![0.0; len];
-            let mut lower_1000 = vec![0.0; len];
-            let mut lower_1618 = vec![0.0; len];
-            let mut lower_2618 = vec![0.0; len];
-            let mut tp_long = vec![0.0; len];
-            let mut tp_short = vec![0.0; len];
-            let mut long_entry = vec![0.0; len];
-            let mut short_entry = vec![0.0; len];
-            let mut rejection_long = vec![0.0; len];
-            let mut rejection_short = vec![0.0; len];
-            let mut long_bounce = vec![0.0; len];
-            let mut short_bounce = vec![0.0; len];
-            fibonacci_entry_bands_into_slices(
-                &mut basis,
-                &mut trend,
-                &mut upper_0618,
-                &mut upper_1000,
-                &mut upper_1618,
-                &mut upper_2618,
-                &mut lower_0618,
-                &mut lower_1000,
-                &mut lower_1618,
-                &mut lower_2618,
-                &mut tp_long,
-                &mut tp_short,
-                &mut long_entry,
-                &mut short_entry,
-                &mut rejection_long,
-                &mut rejection_short,
-                &mut long_bounce,
-                &mut short_bounce,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(basis_ptr, len).copy_from_slice(&basis);
-            std::slice::from_raw_parts_mut(trend_ptr, len).copy_from_slice(&trend);
-            std::slice::from_raw_parts_mut(upper_0618_ptr, len).copy_from_slice(&upper_0618);
-            std::slice::from_raw_parts_mut(upper_1000_ptr, len).copy_from_slice(&upper_1000);
-            std::slice::from_raw_parts_mut(upper_1618_ptr, len).copy_from_slice(&upper_1618);
-            std::slice::from_raw_parts_mut(upper_2618_ptr, len).copy_from_slice(&upper_2618);
-            std::slice::from_raw_parts_mut(lower_0618_ptr, len).copy_from_slice(&lower_0618);
-            std::slice::from_raw_parts_mut(lower_1000_ptr, len).copy_from_slice(&lower_1000);
-            std::slice::from_raw_parts_mut(lower_1618_ptr, len).copy_from_slice(&lower_1618);
-            std::slice::from_raw_parts_mut(lower_2618_ptr, len).copy_from_slice(&lower_2618);
-            std::slice::from_raw_parts_mut(tp_long_ptr, len).copy_from_slice(&tp_long);
-            std::slice::from_raw_parts_mut(tp_short_ptr, len).copy_from_slice(&tp_short);
-            std::slice::from_raw_parts_mut(long_entry_ptr, len).copy_from_slice(&long_entry);
-            std::slice::from_raw_parts_mut(short_entry_ptr, len).copy_from_slice(&short_entry);
-            std::slice::from_raw_parts_mut(rejection_long_ptr, len)
-                .copy_from_slice(&rejection_long);
-            std::slice::from_raw_parts_mut(rejection_short_ptr, len)
-                .copy_from_slice(&rejection_short);
-            std::slice::from_raw_parts_mut(long_bounce_ptr, len).copy_from_slice(&long_bounce);
-            std::slice::from_raw_parts_mut(short_bounce_ptr, len).copy_from_slice(&short_bounce);
-        } else {
-            fibonacci_entry_bands_into_slices(
-                std::slice::from_raw_parts_mut(basis_ptr, len),
-                std::slice::from_raw_parts_mut(trend_ptr, len),
-                std::slice::from_raw_parts_mut(upper_0618_ptr, len),
-                std::slice::from_raw_parts_mut(upper_1000_ptr, len),
-                std::slice::from_raw_parts_mut(upper_1618_ptr, len),
-                std::slice::from_raw_parts_mut(upper_2618_ptr, len),
-                std::slice::from_raw_parts_mut(lower_0618_ptr, len),
-                std::slice::from_raw_parts_mut(lower_1000_ptr, len),
-                std::slice::from_raw_parts_mut(lower_1618_ptr, len),
-                std::slice::from_raw_parts_mut(lower_2618_ptr, len),
-                std::slice::from_raw_parts_mut(tp_long_ptr, len),
-                std::slice::from_raw_parts_mut(tp_short_ptr, len),
-                std::slice::from_raw_parts_mut(long_entry_ptr, len),
-                std::slice::from_raw_parts_mut(short_entry_ptr, len),
-                std::slice::from_raw_parts_mut(rejection_long_ptr, len),
-                std::slice::from_raw_parts_mut(rejection_short_ptr, len),
-                std::slice::from_raw_parts_mut(long_bounce_ptr, len),
-                std::slice::from_raw_parts_mut(short_bounce_ptr, len),
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FibonacciEntryBandsBatchJsConfig {
-    pub length_range: Option<(usize, usize, usize)>,
-    pub atr_length_range: Option<(usize, usize, usize)>,
-    pub source: Option<String>,
-    pub use_atr: Option<bool>,
-    pub tp_aggressiveness: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FibonacciEntryBandsBatchJsOutput {
-    pub basis: Vec<f64>,
-    pub trend: Vec<f64>,
-    pub upper_0618: Vec<f64>,
-    pub upper_1000: Vec<f64>,
-    pub upper_1618: Vec<f64>,
-    pub upper_2618: Vec<f64>,
-    pub lower_0618: Vec<f64>,
-    pub lower_1000: Vec<f64>,
-    pub lower_1618: Vec<f64>,
-    pub lower_2618: Vec<f64>,
-    pub tp_long_band: Vec<f64>,
-    pub tp_short_band: Vec<f64>,
-    pub long_entry: Vec<f64>,
-    pub short_entry: Vec<f64>,
-    pub rejection_long: Vec<f64>,
-    pub rejection_short: Vec<f64>,
-    pub long_bounce: Vec<f64>,
-    pub short_bounce: Vec<f64>,
-    pub combos: Vec<FibonacciEntryBandsParams>,
-    pub lengths: Vec<usize>,
-    pub atr_lengths: Vec<usize>,
-    pub sources: Vec<String>,
-    pub use_atr_flags: Vec<bool>,
-    pub tp_aggressiveness_values: Vec<String>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "fibonacci_entry_bands_batch_js")]
-pub fn fibonacci_entry_bands_batch_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: FibonacciEntryBandsBatchJsConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = FibonacciEntryBandsBatchRange {
-        length: config
-            .length_range
-            .unwrap_or((DEFAULT_LENGTH, DEFAULT_LENGTH, 0)),
-        atr_length: config
-            .atr_length_range
-            .unwrap_or((DEFAULT_ATR_LENGTH, DEFAULT_ATR_LENGTH, 0)),
-        source: config.source.unwrap_or_else(|| DEFAULT_SOURCE.to_string()),
-        use_atr: config.use_atr.unwrap_or(DEFAULT_USE_ATR),
-        tp_aggressiveness: config
-            .tp_aggressiveness
-            .unwrap_or_else(|| DEFAULT_TP_AGGRESSIVENESS.to_string()),
-    };
-    let out = fibonacci_entry_bands_batch_with_kernel(open, high, low, close, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&FibonacciEntryBandsBatchJsOutput {
-        lengths: out
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH))
-            .collect(),
-        atr_lengths: out
-            .combos
-            .iter()
-            .map(|combo| combo.atr_length.unwrap_or(DEFAULT_ATR_LENGTH))
-            .collect(),
-        sources: out
-            .combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .source
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_SOURCE.to_string())
-            })
-            .collect(),
-        use_atr_flags: out
-            .combos
-            .iter()
-            .map(|combo| combo.use_atr.unwrap_or(DEFAULT_USE_ATR))
-            .collect(),
-        tp_aggressiveness_values: out
-            .combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .tp_aggressiveness
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_TP_AGGRESSIVENESS.to_string())
-            })
-            .collect(),
-        basis: out.basis,
-        trend: out.trend,
-        upper_0618: out.upper_0618,
-        upper_1000: out.upper_1000,
-        upper_1618: out.upper_1618,
-        upper_2618: out.upper_2618,
-        lower_0618: out.lower_0618,
-        lower_1000: out.lower_1000,
-        lower_1618: out.lower_1618,
-        lower_2618: out.lower_2618,
-        tp_long_band: out.tp_long_band,
-        tp_short_band: out.tp_short_band,
-        long_entry: out.long_entry,
-        short_entry: out.short_entry,
-        rejection_long: out.rejection_long,
-        rejection_short: out.rejection_short,
-        long_bounce: out.long_bounce,
-        short_bounce: out.short_bounce,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn fibonacci_entry_bands_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    basis_ptr: *mut f64,
-    trend_ptr: *mut f64,
-    upper_0618_ptr: *mut f64,
-    upper_1000_ptr: *mut f64,
-    upper_1618_ptr: *mut f64,
-    upper_2618_ptr: *mut f64,
-    lower_0618_ptr: *mut f64,
-    lower_1000_ptr: *mut f64,
-    lower_1618_ptr: *mut f64,
-    lower_2618_ptr: *mut f64,
-    tp_long_ptr: *mut f64,
-    tp_short_ptr: *mut f64,
-    long_entry_ptr: *mut f64,
-    short_entry_ptr: *mut f64,
-    rejection_long_ptr: *mut f64,
-    rejection_short_ptr: *mut f64,
-    long_bounce_ptr: *mut f64,
-    short_bounce_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    atr_length_start: usize,
-    atr_length_end: usize,
-    atr_length_step: usize,
-    source: &str,
-    use_atr: bool,
-    tp_aggressiveness: &str,
-) -> Result<usize, JsValue> {
-    let ptrs = [
-        open_ptr as usize,
-        high_ptr as usize,
-        low_ptr as usize,
-        close_ptr as usize,
-        basis_ptr as usize,
-        trend_ptr as usize,
-        upper_0618_ptr as usize,
-        upper_1000_ptr as usize,
-        upper_1618_ptr as usize,
-        upper_2618_ptr as usize,
-        lower_0618_ptr as usize,
-        lower_1000_ptr as usize,
-        lower_1618_ptr as usize,
-        lower_2618_ptr as usize,
-        tp_long_ptr as usize,
-        tp_short_ptr as usize,
-        long_entry_ptr as usize,
-        short_entry_ptr as usize,
-        rejection_long_ptr as usize,
-        rejection_short_ptr as usize,
-        long_bounce_ptr as usize,
-        short_bounce_ptr as usize,
-    ];
-    if ptrs.iter().any(|ptr| *ptr == 0) {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = FibonacciEntryBandsBatchRange {
-        length: (length_start, length_end, length_step),
-        atr_length: (atr_length_start, atr_length_end, atr_length_step),
-        source: source.to_string(),
-        use_atr,
-        tp_aggressiveness: tp_aggressiveness.to_string(),
-    };
-    let rows = expand_grid(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let output_ptrs = &ptrs[4..];
-        let need_temp = output_ptrs.iter().any(|ptr| {
-            *ptr == open_ptr as usize
-                || *ptr == high_ptr as usize
-                || *ptr == low_ptr as usize
-                || *ptr == close_ptr as usize
-        }) || has_duplicate_ptrs(output_ptrs);
-
-        if need_temp {
-            let mut basis = vec![0.0; total];
-            let mut trend = vec![0.0; total];
-            let mut upper_0618 = vec![0.0; total];
-            let mut upper_1000 = vec![0.0; total];
-            let mut upper_1618 = vec![0.0; total];
-            let mut upper_2618 = vec![0.0; total];
-            let mut lower_0618 = vec![0.0; total];
-            let mut lower_1000 = vec![0.0; total];
-            let mut lower_1618 = vec![0.0; total];
-            let mut lower_2618 = vec![0.0; total];
-            let mut tp_long = vec![0.0; total];
-            let mut tp_short = vec![0.0; total];
-            let mut long_entry = vec![0.0; total];
-            let mut short_entry = vec![0.0; total];
-            let mut rejection_long = vec![0.0; total];
-            let mut rejection_short = vec![0.0; total];
-            let mut long_bounce = vec![0.0; total];
-            let mut short_bounce = vec![0.0; total];
-            let rows = fibonacci_entry_bands_batch_inner_into(
-                open,
-                high,
-                low,
-                close,
-                &sweep,
-                Kernel::Auto,
-                &mut basis,
-                &mut trend,
-                &mut upper_0618,
-                &mut upper_1000,
-                &mut upper_1618,
-                &mut upper_2618,
-                &mut lower_0618,
-                &mut lower_1000,
-                &mut lower_1618,
-                &mut lower_2618,
-                &mut tp_long,
-                &mut tp_short,
-                &mut long_entry,
-                &mut short_entry,
-                &mut rejection_long,
-                &mut rejection_short,
-                &mut long_bounce,
-                &mut short_bounce,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?
-            .len();
-            std::slice::from_raw_parts_mut(basis_ptr, total).copy_from_slice(&basis);
-            std::slice::from_raw_parts_mut(trend_ptr, total).copy_from_slice(&trend);
-            std::slice::from_raw_parts_mut(upper_0618_ptr, total).copy_from_slice(&upper_0618);
-            std::slice::from_raw_parts_mut(upper_1000_ptr, total).copy_from_slice(&upper_1000);
-            std::slice::from_raw_parts_mut(upper_1618_ptr, total).copy_from_slice(&upper_1618);
-            std::slice::from_raw_parts_mut(upper_2618_ptr, total).copy_from_slice(&upper_2618);
-            std::slice::from_raw_parts_mut(lower_0618_ptr, total).copy_from_slice(&lower_0618);
-            std::slice::from_raw_parts_mut(lower_1000_ptr, total).copy_from_slice(&lower_1000);
-            std::slice::from_raw_parts_mut(lower_1618_ptr, total).copy_from_slice(&lower_1618);
-            std::slice::from_raw_parts_mut(lower_2618_ptr, total).copy_from_slice(&lower_2618);
-            std::slice::from_raw_parts_mut(tp_long_ptr, total).copy_from_slice(&tp_long);
-            std::slice::from_raw_parts_mut(tp_short_ptr, total).copy_from_slice(&tp_short);
-            std::slice::from_raw_parts_mut(long_entry_ptr, total).copy_from_slice(&long_entry);
-            std::slice::from_raw_parts_mut(short_entry_ptr, total).copy_from_slice(&short_entry);
-            std::slice::from_raw_parts_mut(rejection_long_ptr, total)
-                .copy_from_slice(&rejection_long);
-            std::slice::from_raw_parts_mut(rejection_short_ptr, total)
-                .copy_from_slice(&rejection_short);
-            std::slice::from_raw_parts_mut(long_bounce_ptr, total).copy_from_slice(&long_bounce);
-            std::slice::from_raw_parts_mut(short_bounce_ptr, total).copy_from_slice(&short_bounce);
-            Ok(rows)
-        } else {
-            let rows = fibonacci_entry_bands_batch_inner_into(
-                open,
-                high,
-                low,
-                close,
-                &sweep,
-                Kernel::Auto,
-                std::slice::from_raw_parts_mut(basis_ptr, total),
-                std::slice::from_raw_parts_mut(trend_ptr, total),
-                std::slice::from_raw_parts_mut(upper_0618_ptr, total),
-                std::slice::from_raw_parts_mut(upper_1000_ptr, total),
-                std::slice::from_raw_parts_mut(upper_1618_ptr, total),
-                std::slice::from_raw_parts_mut(upper_2618_ptr, total),
-                std::slice::from_raw_parts_mut(lower_0618_ptr, total),
-                std::slice::from_raw_parts_mut(lower_1000_ptr, total),
-                std::slice::from_raw_parts_mut(lower_1618_ptr, total),
-                std::slice::from_raw_parts_mut(lower_2618_ptr, total),
-                std::slice::from_raw_parts_mut(tp_long_ptr, total),
-                std::slice::from_raw_parts_mut(tp_short_ptr, total),
-                std::slice::from_raw_parts_mut(long_entry_ptr, total),
-                std::slice::from_raw_parts_mut(short_entry_ptr, total),
-                std::slice::from_raw_parts_mut(rejection_long_ptr, total),
-                std::slice::from_raw_parts_mut(rejection_short_ptr, total),
-                std::slice::from_raw_parts_mut(long_bounce_ptr, total),
-                std::slice::from_raw_parts_mut(short_bounce_ptr, total),
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?
-            .len();
-            Ok(rows)
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fibonacci_entry_bands_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &str,
-    length: usize,
-    atr_length: usize,
-    use_atr: bool,
-    tp_aggressiveness: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fibonacci_entry_bands_js(
-        open,
-        high,
-        low,
-        close,
-        source,
-        length,
-        atr_length,
-        use_atr,
-        tp_aggressiveness,
-    )?;
-    crate::write_wasm_object_f64_outputs("fibonacci_entry_bands_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fibonacci_entry_bands_batch_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fibonacci_entry_bands_batch_js(open, high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "fibonacci_entry_bands_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

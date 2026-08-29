@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 //! Host side of the NeoEthos f64 indicator lane.
 //!
@@ -8,10 +8,10 @@
 //!
 //! Every other CUDA wrapper in this crate loads its own module (309
 //! `load_cuda_embedded_module!` sites) and there is no module cache, so a
-//! dispatcher call constructs a wrapper and pays a full JIT per indicator —
-//! about fifty per frame in the NeoEthos feature build. This wrapper holds ONE
-//! module covering all ten indicators, so a frame pays one load and then only
-//! launches.
+//! dispatcher call constructs a wrapper and reloads an exact native cubin per
+//! indicator — about fifty per frame in the NeoEthos feature build. This
+//! wrapper holds ONE module covering all ten indicators, so a frame pays one
+//! load and then only launches.
 //!
 //! # The three properties that matter more than speed
 //!
@@ -31,29 +31,99 @@
 //!   larger period list makes the sweep slower, never fatter.
 
 use crate::cuda::device_types::CudaDeviceSliceI64Ref;
-use crate::cuda::device_types_f64::CudaDeviceSliceF64Ref;
-use cust::context::Context;
+use crate::cuda::device_types_f64::{
+    CudaDeviceHighLowF64Ref, CudaDeviceMatrixF64, CudaDeviceOhlcvF64Ref, CudaDeviceSliceF64Ref,
+};
+use crate::cuda::f64_launch::{checked_mul, plan_slots, scratch_elems};
+use crate::cuda::runtime::{CudaSession, CudaSessionIdentity};
+use crate::indicators::adaptive_bounds_rsi::AdaptiveBoundsRsiParams;
+use crate::indicators::adaptive_schaff_trend_cycle::AdaptiveSchaffTrendCycleParams;
+use crate::indicators::adjustable_ma_alternating_extremities::{
+    AdjustableMaAlternatingExtremitiesParams, adjustable_ma_alternating_extremities_exact_weights,
+};
+use crate::indicators::alligator::AlligatorParams;
+use crate::indicators::alphatrend::AlphaTrendParams;
+use crate::indicators::bulls_v_bears::{
+    BullsVBearsCalculationMethod, BullsVBearsMaType, BullsVBearsParams,
+};
+use crate::indicators::candle_strength_oscillator::CandleStrengthOscillatorParams;
+use crate::indicators::chandelier_exit::ChandelierExitParams;
+use crate::indicators::cksp::CkspParams;
+use crate::indicators::coppock::CoppockParams;
+use crate::indicators::cora_wave::{
+    CORA_WAVE_REDK_COMPOUND_RATIO_SEMANTICS_V1, cora_wave_exact_weight_row,
+};
+use crate::indicators::ehlers_autocorrelation_periodogram::{
+    EhlersAutocorrelationPeriodogramParams, ehlers_autocorrelation_periodogram_exact_coefficients,
+};
+use crate::indicators::ehlers_linear_extrapolation_predictor::{
+    EhlersLinearExtrapolationPredictorParams,
+    ehlers_linear_extrapolation_predictor_exact_coefficients,
+};
+use crate::indicators::emd::emd_exact_coefficients;
+use crate::indicators::fibonacci_entry_bands::{
+    FibonacciEntryBandsBatchRange, fibonacci_entry_bands_cuda_batch_plan,
+};
+use crate::indicators::hema_trend_levels::HemaTrendLevelsParams;
+use crate::indicators::ichimoku_oscillator::{
+    IchimokuOscillatorBatchRange, IchimokuOscillatorNormalizeMode,
+    expand_grid as expand_grid_ichimoku, ichimoku_chebyshev_coefficients,
+    ichimoku_gaussian_weights,
+};
+use crate::indicators::ict_propulsion_block::{
+    IctPropulsionBlockMitigationPrice, IctPropulsionBlockParams,
+};
+use crate::indicators::kase_peak_oscillator_with_divergences::KasePeakOscillatorWithDivergencesParams;
+use crate::indicators::market_structure_confluence::MarketStructureConfluenceParams;
+use crate::indicators::moving_averages::alma::{
+    ALMA_TRADINGVIEW_NONFLOORED_SEMANTICS_V1, alma_exact_weight_row,
+};
+use crate::indicators::moving_averages::ehlers_undersampled_double_moving_average::ehlers_undersampled_double_moving_average_exact_hann_payload;
+use crate::indicators::moving_averages::epma::{
+    EPMA_F64_MAX_CERTIFIED_PERIOD_V1, EPMA_F64_SEGMENT_OUTPUTS_V1,
+};
+use crate::indicators::pivot::PivotParams;
+use crate::indicators::range_filtered_trend_signals::RangeFilteredTrendSignalsParams;
+use crate::indicators::range_oscillator::RangeOscillatorParams;
+use crate::indicators::vdubus_divergence_wave_pattern_generator::VdubusDivergenceWavePatternGeneratorParams;
+use cust::context::{Context, CurrentContext};
 use cust::device::{Device, DeviceAttribute};
+use cust::error::CudaResult;
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, CopyDestination, DeviceBuffer};
+use cust::memory::{
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer, mem_get_info,
+};
 use cust::module::Module;
 use cust::prelude::*;
-use cust::stream::{Stream, StreamFlags};
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use thiserror::Error;
 
 const BLOCK_X: u32 = 64;
 /// Bars per block for the (combo, bar)-parallel kernels.
 const BAR_BLOCK_X: u32 = 256;
+/// Strict HCE-v2 reuses one RegistryRatio row's maximum D50 retained samples
+/// plus `(mean, M2)` for every possible minute-of-day slot. These constants are
+/// the host side of the explicit scratch ABI in the HCE CUDA source.
+const HCE_V2_MAX_SLOTS_PER_DAY: usize = 1440;
+const HCE_V2_MAX_DATA_PERIOD: usize = 50;
+const HCE_V2_MAX_ANCHOR: usize = 200;
+const HCE_V2_SCRATCH_F64_ELEMS: usize = HCE_V2_MAX_SLOTS_PER_DAY * (HCE_V2_MAX_DATA_PERIOD + 2);
+const HCE_V2_SCRATCH_I32_ELEMS: usize = HCE_V2_MAX_SLOTS_PER_DAY * 2;
 /// VRAM left untouched so a concurrent allocation does not fail because this
 /// sweep sized itself to the last free byte.
 const DEFAULT_HEADROOM: usize = 128 * 1024 * 1024;
+pub const F64_EXACT_MATH_AUTHORITY_V3: &str = "vector-ta.f64.native-sass.no-fast-math.no-fmad.v3";
 /// Must match `MFI_MAX_PERIOD` in `kernels/cuda/neoethos_f64_kernels.cu`.
 /// The mfi kernel keeps its money-flow ring in a per-thread local array of
 /// this fixed size, so the bound is a property of the kernel, not of the
 /// caller's request — and a request beyond it is REFUSED, never truncated.
 pub const MFI_MAX_PERIOD: usize = 512;
+/// Must match `CVI_MAX_PERIOD_F64` in `kernels/cuda/cvi_kernel.cu`.
+/// CVI keeps the lagged EMA values in a fixed per-thread ring, so a larger
+/// request must fail on the host rather than returning the kernel's NaN row.
+pub const CVI_MAX_PERIOD: usize = 512;
 /// Must match `ADXR_MAX_PERIOD` in `kernels/cuda/neoethos_f64_kernels.cu`.
 /// Same contract as [`MFI_MAX_PERIOD`]: adxr keeps `period` past ADX values in
 /// a per-thread ring, so the bound belongs to the kernel and a larger period is
@@ -88,9 +158,34 @@ pub const HMA_MAX_PERIOD: usize = 4095;
 pub const EDCF_MAX_PERIOD: usize = 512;
 /// Must match `NEO_S1_ALMA_MAX_PERIOD` in
 /// `kernels/cuda/moving_averages/alma_kernel.cu`. The Gaussian weights are
-/// built per row into a per-thread array.
+/// built once by the canonical CPU semantic authority, uploaded as exact f64
+/// bytes, and retained beside the asynchronous launch.
 pub const ALMA_MAX_PERIOD: usize = 1024;
+/// Must match `AMAE_MAX_LENGTH` in
+/// `kernels/cuda/adjustable_ma_alternating_extremities_kernel.cu`.
+/// Each parameter row materialises its normalized published kernel weights once
+/// and reuses them for all bars rather than recomputing `sin`/`pow` per cell.
+pub const ADJUSTABLE_MA_MAX_LENGTH: usize = 512;
 
+/// Must match `NEO_FRAMA_MAX_WINDOW` in
+/// `kernels/cuda/moving_averages/frama_kernel.cu`. The strict f64 kernel keeps
+/// four half-window monotonic deques in fixed per-thread storage, so the host
+/// refuses an oversized evenized window before allocation or launch.
+pub const FRAMA_MAX_WINDOW: usize = 1024;
+/// Must match `NEO_CCICYC_MAX_LENGTH` in
+/// `kernels/cuda/oscillators/cci_cycle_kernel.cu`. Both stochastic stages
+/// keep a `length`-wide per-thread ring, so oversized anchors are refused.
+pub const CCI_CYCLE_MAX_LENGTH: usize = 200;
+/// Must match `FWMA_MAX_PERIOD_F64` in
+/// `kernels/cuda/moving_averages/fwma_kernel.cu`. The strict f64 kernel builds
+/// the exact Fibonacci DD table in fixed per-block shared memory, so an
+/// oversized request is refused before allocation or launch.
+pub const FWMA_F64_MAX_PERIOD: usize = 254;
+/// Classic semantic-v9's production strict-f64 lane intentionally exposes the
+/// creator/default factor only. The CUDA ABI has no factor parameter: custom
+/// factors remain CPU-only rather than being silently rounded or ignored.
+pub const CCI_CYCLE_PRODUCTION_FACTOR_V9: f64 = 0.5;
+pub const CCI_CYCLE_CUSTOM_FACTOR_CUDA_SUPPORTED_V9: bool = false;
 
 /// The per-thread ring bound shared by every shard-2 kernel that keeps a
 /// window in local memory (`reflex`, `maaq`, `tradjema`, `pwma`, `nama`,
@@ -191,6 +286,17 @@ pub const LMA_MAX_PERIOD: usize = 512;
 /// Same reason as [`LMA_MAX_PERIOD`]: the weights are a sin/cos per slot
 /// (:268) and are built once per thread rather than per bar.
 pub const WS_MAX_PERIOD: usize = 512;
+/// Must match `NEO_FISHER_F64_MAX_PERIOD` in
+/// `kernels/cuda/oscillators/fisher_kernel.cu`. Strict Fisher f64 owns two
+/// monotone-deque index rings in dynamic shared memory. Periods above this
+/// certified bound are rejected by name before any device work.
+pub const FISHER_F64_MAX_PERIOD: usize = 1024;
+/// Must match `FVG_TS_NEO_MAX_SMOOTHING` in
+/// `kernels/cuda/fvg_trailing_stop_kernel.cu`. The preserved generic primary
+/// ABI owns fixed per-thread displacement rings; canonical production uses the
+/// dynamic all-output ABI and therefore is not constrained by this compatibility
+/// bound.
+pub const FVG_TRAILING_STOP_MAX_SMOOTHING: usize = 200;
 
 #[derive(Debug, Error)]
 pub enum CudaF64IndicatorError {
@@ -241,8 +347,9 @@ pub enum CudaF64IndicatorError {
         by: u32,
         bz: u32,
     },
+    #[error("resident f64 preallocation plan mismatched owner sizing for {indicator}")]
+    F64ResidentPreallocationPlanMismatchV4 { indicator: &'static str },
 }
-
 /// Which of the ten f64 kernels to launch, and what host series it needs.
 ///
 /// This enum IS the kernel-name resolution table: each variant maps to exactly
@@ -526,7 +633,7 @@ pub enum F64Kernel {
     TtmSqueeze,
     /// (high, low), with no close.
     Mass,
-    /// (high, low). PERIOD-INVARIANT and FIRST-VALID-IGNORED by construction.
+    /// (high, low). PERIOD-SWEPT and FIRST-VALID-IGNORED by construction.
     Aroon,
     Acosc,
     /// (close, volume). PERIOD-INVARIANT — short_range/long_range.
@@ -538,10 +645,9 @@ pub enum F64Kernel {
     /// reads a parameter literally named `period`, unlike the ten invariant
     /// variants above.
     Dvdiqqe,
-    /// Single price series, CPU source `close`. PERIOD-INVARIANT: cci_cycle's
-    /// CPU batch reads `length` (10) and `factor` (0.5), and `length` is
-    /// pinned at 10 because `cci_cycle_compute_from_parts:526` routes
-    /// `length > 16` to a DIFFERENT function.
+    /// Single price series, CPU source `close`. PERIOD-SWEPT: Classic
+    /// semantic-v9 consumes every requested `length` through the same
+    /// creator-aligned state machine; production `factor` remains 0.5.
     CciCycle,
 
     // ---------------------------------------------------------------- shard 3
@@ -564,11 +670,10 @@ pub enum F64Kernel {
     // all. A sweep of five periods gets five identical CPU columns, so the
     // kernel emits five identical rows.
     //
-    // SEVEN SERVE MULTI-OUTPUT INDICATORS, and each emits the column the CPU
-    // batch produces for `output_id == "value"`: di -> plus, kdj -> k,
-    // aso -> bulls, wto -> wavetrend1, range_filter -> filter,
-    // correlation_cycle -> real, mama -> mama. Never a different one
-    // silently.
+    // SEVEN SERVE MULTI-OUTPUT INDICATORS, and each primary ABI emits the
+    // registry's canonical first output: di -> plus, kdj -> k, aso -> bulls,
+    // wto -> wavetrend1, range_filter -> filter, correlation_cycle -> real,
+    // mama -> mama. Never a different one silently.
     Deviation,
     MeanAd,
     Ao,
@@ -608,13 +713,13 @@ pub enum F64Kernel {
     // of five periods gets five identical CPU columns and the kernel emits
     // five identical rows.
     //
-    // ALL THREE SERVE MULTI-OUTPUT INDICATORS, and each emits the column the
-    // CPU batch produces for `output_id == "value"`: emd -> upperband
-    // (cpu_batch.rs:14554), keltner -> upper_band (:6232), stoch -> k
-    // (:5603). Never a different one silently.
+    // ALL THREE SERVE MULTI-OUTPUT INDICATORS. Their compatibility primary
+    // symbols emit the registry-primary column: EMD -> upperband, Keltner ->
+    // upper_band, Stoch -> k. EMD production bypasses that primary symbol and
+    // uses the resident canonical triple route below.
     /// (high, low), with NO close. `emd_scalar_into` forms
-    /// `price = (h + l) * 0.5` itself; the hl2 path is unreachable from the
-    /// batch, which builds the input with `from_slices`.
+    /// `price = (h + l) * 0.5` itself; canonical batch dispatch builds the
+    /// input with `from_high_low_slices`.
     Emd,
     /// high / low / close, first-valid scanned on CLOSE ALONE.
     Keltner,
@@ -730,10 +835,9 @@ pub enum F64Kernel {
     // points the f32 wrappers still call, and against the CPU reference
     // named in that file's `NEOETHOS f64 LANE` header.
     //
-    // All fourteen are SEQUENTIAL. Every one carries state across bars: an
-    // Ehlers IIR, a Wilder or EMA recurrence, a rolling sum whose
-    // accumulation order is load-bearing, a monotone-deque extreme, or a
-    // prefix sum accumulated from index 0.
+    // Thirteen are one-thread-per-row sequential kernels. EPMA is the bounded
+    // exception: one thread owns each absolute 1024-output segment, initializes
+    // at the canonical checkpoint, then rolls in order within that segment.
     //
     // ELEVEN ARE PERIOD-INVARIANT and that is faithful, not lazy: their CPU
     // batch functions read named parameters -- `length` for
@@ -907,14 +1011,14 @@ pub enum F64Kernel {
     // selecting WHICH formula runs, which a period list cannot stand in for.
     //
     // THREE SERVE MULTI-OUTPUT INDICATORS whose CPU batch does not accept
-    // `output_id == "value"`, or accepts it only as an alias, so a parity run
-    // must ask for the right column by name:
+    // `output_id == "value"`, or historically accepted it only as an alias,
+    // so a parity run must ask for the right canonical column by name:
     // `HullButterflyOscillator` emits "oscillator" (cpu_batch.rs:8751-8762
     // accepts nothing else), `RangeOscillator` emits "oscillator" ("value" is
     // an alias, :16044-16049) and `MarketStructureTrailingStop` emits
-    // "trailing_stop" ("value" is an alias, :7197-7201). `DualUlcerIndex` emits
-    // "long_ulcer", of which "value" is also an alias (:6700-6706), and `Pivot`
-    // emits "pp" (:16743-16745).
+    // "trailing_stop" ("value" is an alias, :7197-7201). `DualUlcerIndex`
+    // emits canonical "long_ulcer"; its retired value/uulcer/dulcer spellings
+    // are rejected. `Pivot` emits "pp" (:16743-16745).
     /// Single price series, CPU source `close`. PERIOD-INVARIANT -- `factor`,
     /// not a period.
     Mwdx,
@@ -958,7 +1062,7 @@ pub enum F64Kernel {
     // can be made bar-parallel without changing the rounding, which is the
     // whole reason this lane exists.
     //
-    // TWENTY-TWO ARE PERIOD-INVARIANT and that is FAITHFUL, not lazy: their
+    // TWENTY ARE PERIOD-INVARIANT and that is FAITHFUL, not lazy: their
     // CPU batch functions read NAMED parameters -- `length`/`annual_length`
     // for historical_volatility_percentile, `hv_length`/`rank_length` for
     // historical_volatility_rank, `alpha` for the two Ehlers adaptive
@@ -967,10 +1071,11 @@ pub enum F64Kernel {
     // fibonacci_trailing_stop, and so on -- and NEVER `period`. A caller
     // sweeping `[7,21,50,100,200]` gets five identical CPU columns for each of
     // them, so the kernel emits five identical rows and `is_period_invariant`
-    // says so. The THREE that are genuinely period-swept read a parameter
-    // literally named `period`: `BullsVBears` (cpu_batch.rs:11153),
-    // `CandleStrengthOscillator` (:7514) and `DirectionalImbalanceIndex`
-    // (:7437).
+    // says so. Five are genuinely swept: `BullsVBears`,
+    // `CandleStrengthOscillator`, and `DirectionalImbalanceIndex` read a
+    // parameter literally named `period`, while Autocorrelation Indicator's
+    // repaired primary ABI consumes canonical `length`, as does Ehlers Data
+    // Sampling RSI's repaired primary ABI.
     //
     // EVERY ONE DECLARES `F64FirstValidRule::Ignored`, and that is a contract
     // the kernels honour rather than a shrug. Each of these CPU references
@@ -982,13 +1087,13 @@ pub enum F64Kernel {
     // halves of one rule in one place; the alternative is a rule that names a
     // different bar than the CPU and shifts the whole series.
     //
-    // MOST SERVE MULTI-OUTPUT INDICATORS, and each emits the column the CPU
-    // batch produces for `output_id == "value"`: adjustable_ma... -> ma,
-    // autocorrelation_indicator -> filtered, cycle_channel_oscillator -> fast,
-    // adaptive_schaff_trend_cycle -> stc, exponential_trend -> uptrend_base,
+    // MOST SERVE MULTI-OUTPUT INDICATORS, and each emits its registered
+    // canonical primary column (several older dispatchers also accepted a
+    // `value` alias): adjustable_ma... -> ma,
+    // cycle_channel_oscillator -> fast,
+    // exponential_trend -> uptrend_base,
     // fvg_positioning_average -> bull_average, hema_trend_levels -> fast_hema,
     // fibonacci_trailing_stop -> trailing_stop, demand_index -> demand_index,
-    // cyberpunk_value_trend_analyzer -> value_trend,
     // directional_imbalance_index -> up, intraday_momentum_index -> imi,
     // ehlers_adaptive_cg -> cg, ehlers_adaptive_cyber_cycle -> cycle,
     // ehlers_autocorrelation_periodogram -> dominant_cycle,
@@ -996,19 +1101,27 @@ pub enum F64Kernel {
     // grover_llorens_cycle_oscillator -> value, historical_volatility_rank ->
     // hvr. Never a different one silently.
     //
-    // TWO HAVE NO `value` ALIAS AT ALL and are named here for that reason: the
+    // FIVE HAVE NO `value` ALIAS AT ALL and are named here for that reason:
+    // autocorrelation_indicator accepts only `filtered` / `correlation`;
+    // adaptive_schaff_trend_cycle accepts only `stc` / `histogram`; the
+    // cyberpunk_value_trend_analyzer dispatcher accepts only its exact six
+    // registered outputs, with `value_trend` as the primary; the
     // `historical_volatility_percentile` batch accepts only `hvp` / `hvp_sma`
     // (cpu_batch.rs:9681-9690) and the
     // `ehlers_data_sampling_relative_strength_indicator` batch only `ds_rsi` /
     // `original_rsi` / `signal` (:8132-8144). A parity run must ask the CPU
-    // for `hvp` and `ds_rsi` explicitly; these kernels emit those columns.
+    // for `filtered`, `stc`, `value_trend`, `hvp` and `ds_rsi` explicitly;
+    // these primary kernels emit those first columns. Canonical ACI, ASTC and
+    // Cyberpunk and Ehlers Data Sampling RSI production use their full-output
+    // entry points and never these primary-only ABIs.
     /// Single price series, CPU source `close`. PERIOD-SWEPT -- the kernel
     /// already carried the lane ABI, so this row is registration only.
     VerticalHorizontalFilter,
     /// high / low / close, of which only CLOSE is convolved -- high and low
     /// are inputs to the validity scan that sets the warmup.
     AdjustableMaAlternatingExtremities,
-    /// Single price series, CPU source `close`. PERIOD-INVARIANT.
+    /// Single price series, CPU source `close`. PERIOD-SWEPT through canonical
+    /// `length`; production additionally emits selected `correlation`.
     AutocorrelationIndicator,
     HistoricalVolatilityRank,
     /// Emits `hvp`; the CPU batch has no `value` alias.
@@ -1023,7 +1136,7 @@ pub enum F64Kernel {
     EhlersAdaptiveCg,
     EhlersAdaptiveCyberCycle,
     /// (open, high, low, close), of which only OPEN and CLOSE are read.
-    /// Emits `ds_rsi`; the CPU batch has no `value` alias.
+    /// LENGTH-SWEPT; emits `ds_rsi` and the CPU batch has no `value` alias.
     EhlersDataSamplingRelativeStrengthIndicator,
     /// high / low / close. PERIOD-INVARIANT.
     ExponentialTrend,
@@ -1045,7 +1158,9 @@ pub enum F64Kernel {
     GroverLlorensCycleOscillator,
     /// (high, low, close, volume). PERIOD-INVARIANT.
     DemandIndex,
-    /// high / low / close. PERIOD-INVARIANT.
+    /// high / low / close. The legacy primary ABI is period-invariant; the
+    /// canonical typed all-output route consumes the exact five-parameter
+    /// point, including coupled window sweeps.
     AdaptiveSchaffTrendCycle,
     /// Single price series, CPU source `close`. PERIOD-INVARIANT.
     EhlersLinearExtrapolationPredictor,
@@ -1189,28 +1304,26 @@ pub enum F64Kernel {
     // (mod_god_mode). None can be made bar-parallel without changing the
     // rounding, which is the whole reason this lane exists.
     //
-    // FIVE ARE PERIOD-INVARIANT and that is FAITHFUL, not lazy. Their CPU
-    // batch functions read NAMED parameters and NEVER `period`:
-    // unmitigated_fvg_lookback / smoothing_length / reset_on_cross for
-    // fvg_trailing_stop (cpu_batch.rs:14862), amplitude / channel_deviation /
-    // atr_period for halftrend (:14960), n1 / n2 / n3 / mode / use_volume for
-    // mod_god_mode (:15516), ott_period / ott_percent / fast_vidya_length /
+    // THREE ARE PERIOD-INVARIANT and that is faithful, not lazy. Their CPU
+    // batch functions read named parameters outside today's sweep vocabulary:
+    // n1 / n2 / n3 / mode / use_volume for mod_god_mode (:15516),
+    // ott_period / ott_percent / fast_vidya_length /
     // slow_vidya_length / correcting_constant / ma_type for otto (:15657), and
     // smooth_data / smooth_period / regression_period / polynomial_order /
     // regression_offset / ndev / equ_from for prb (:15833). A caller sweeping
     // [7,21,50,100,200] gets five identical CPU columns for each, so the
     // kernel writes five identical rows.
     //
-    // THE FIVE THAT ARE SWEPT each map the swept int onto the window its own
+    // THE SEVEN THAT ARE SWEPT each map the swept int onto the window its own
     // CPU entry point reads, and the mapping is NOT always `period`:
     // `bandpass` and `ott` and `cora_wave` read a parameter literally named
-    // `period`, but `ma_batch.rs:593` sweeps buff_averages' SLOW period and
-    // `:1868` sweeps dma's HULL length. Mapping onto the other named window
-    // would compute a different indicator.
+    // `period`; typed FVG production maps onto smoothing_length, typed
+    // HalfTrend maps onto atr_period, `ma_batch.rs:593` maps buff_averages onto
+    // its SLOW period, and `:1868` maps dma onto its HULL length.
     //
-    // FIVE SERVE MULTI-OUTPUT INDICATORS, and each emits the column the CPU
-    // batch produces for `output_id == "value"`: bandpass -> bp,
-    // buff_averages -> fast (the `output` default in ma_batch.rs:629),
+    // FIVE SERVE MULTI-OUTPUT INDICATORS, and each emits the registered
+    // primary column: bandpass -> bp, buff_averages -> fast (the `output`
+    // default in ma_batch.rs:629),
     // fvg_trailing_stop -> upper, halftrend -> halftrend, mod_god_mode ->
     // wavetrend, otto -> hott, prb -> values. Never a different one silently.
     /// Single price series, CPU source `close`. PERIOD-SWEPT.
@@ -1224,9 +1337,11 @@ pub enum F64Kernel {
     /// is the HULL length. Keeps a difference ring of `round(sqrt(hull))`
     /// entries, hence a `max_period`.
     Dma,
-    /// high / low / close. PERIOD-INVARIANT. Emits the UPPER band.
+    /// high / low / close. PERIOD-SWEPT -- the swept int is smoothing_length.
+    /// The preserved primary ABI emits upper; typed production emits all four.
     FvgTrailingStop,
-    /// high / low / close. PERIOD-INVARIANT. Emits the HALFTREND series.
+    /// high / low / close. PERIOD-SWEPT via canonical atr_period. The preserved
+    /// primary ABI emits halftrend; typed production emits all six outputs.
     Halftrend,
     /// (high, low, close, volume). PERIOD-INVARIANT. Emits the WAVETREND
     /// series.
@@ -1331,11 +1446,11 @@ pub enum F64Kernel {
     // row here, so `resolve_f64_kernel` answered `CudaF64KernelMissing` for
     // every one of them. Each now has a from-scratch f64 kernel in its own
     // translation unit under `kernels/cuda/moving_averages/`.
-    /// (hlcc4, volume). Sequential per column. Its CPU default source is
-    /// `hlcc4` (elastic_volume_weighted_moving_average.rs:113) and it takes
-    /// the `use_volume_sum == true` branch, because that is the branch the
-    /// period-sweeping route selects (ma.rs:1105-1113, registry.rs:608) and
-    /// the other branch never reads `length` at all.
+    /// (close, volume). Sequential per column. Production/search uses rolling
+    /// volume-sum keyed by `length` (default 30), authority
+    /// `evwma_rolling_volume_close_length_key_default30_chronological_rn_f64_v1`.
+    /// The direct fixed-gamma-N API is a separate identity and never reaches
+    /// this period-sweeping ABI.
     ElasticVolumeWeightedMovingAverage,
     /// Single price series (close). Sequential per column: six T3 cascade
     /// stages, two deviation EMAs and the correction, nine carried scalars,
@@ -1369,9 +1484,10 @@ pub enum F64Kernel {
     // Every one is SEQUENTIAL: each carries at least one scalar across bars.
     // `Rsmk` and `CorrectedMovingAverage` are the only two that are genuinely
     // PERIOD-SWEPT -- their CPU batches read a parameter literally named
-    // `period` (cpu_batch.rs:16479, ma.rs:263). The other seven pin every
-    // window at a CPU default and are declared period-invariant for that
-    // reason, not for convenience.
+    // `period` (cpu_batch.rs:16479, ma.rs:263). Six others pin every window at
+    // a CPU default. EUDMA's preserved generic primary ABI is likewise fixed
+    // at defaults, while its canonical typed pair route carries the exact
+    // RegistryRatio tuple through a separate resident launch.
     Rsmk,
     SqueezeMomentum,
     Uma,
@@ -1395,7 +1511,7 @@ pub enum F64Kernel {
     // subtract-then-add. None can be made bar-parallel without changing the
     // rounding, which is the whole reason this lane exists.
     //
-    // EIGHT ARE PERIOD-INVARIANT and that is FAITHFUL, not lazy: their CPU
+    // SEVEN ARE PERIOD-INVARIANT and that is FAITHFUL, not lazy: their CPU
     // batch functions read NAMED parameters and NEVER `period` --
     // `lookback_period`/`confirmation_period`/`trend_ma_period`/
     // `ma_step_period` for reversal_signals (cpu_batch.rs:7286-7295),
@@ -1406,11 +1522,12 @@ pub enum F64Kernel {
     // volume_energy_reservoirs (:8984), `rsi_length`/`range_length`/
     // `ma_length` for volume_weighted_relative_strength_index (:16340),
     // `rsi_length`/`stoch_length`/`k_length`/`d_length` for
-    // volume_weighted_stochastic_rsi (:12413), `length`/`extend` for
-    // zig_zag_channels (:7365) and `fast_period`/`slow_period`/`multiplier`
-    // for avsl (:14126). A caller sweeping `[7,21,50,100,200]` gets five
-    // identical CPU columns for each of them, so the kernel emits five
-    // identical rows and `is_period_invariant` says so.
+    // volume_weighted_stochastic_rsi (:12413), and `length`/`extend` for
+    // zig_zag_channels (:7365). A caller sweeping `[7,21,50,100,200]` gets
+    // five identical CPU columns for each of those seven, so the kernel emits
+    // five identical rows and `is_period_invariant` says so. AVSL is excluded:
+    // its production plan scales the canonical named fast/slow tuple from the
+    // slow-period anchor and the primary ABI now consumes that anchor exactly.
     //
     // THE TWO THAT ARE GENUINELY PERIOD-SWEPT read a parameter literally named
     // `period`: `VolatilityRatioAdaptiveRsx` (cpu_batch.rs:9707) and
@@ -1427,13 +1544,16 @@ pub enum F64Kernel {
     // `close.iter().position(|x| !x.is_nan())` (alphatrend.rs:493), which is
     // exactly the existing `HlcCloseOnly` rule that `adxr` already declares.
     //
-    // EVERY ONE SERVES A MULTI-OUTPUT INDICATOR, and each emits the column its
+    // EVERY ONE SERVES A MULTI-OUTPUT INDICATOR. Eight emit the column their
     // CPU batch produces for `output_id == "value"`: reversal_signals ->
     // stepped_ma, trend_follower -> values, volatility_ratio_adaptive_rsx ->
     // line, volume_energy_reservoirs -> momentum,
     // volume_weighted_relative_strength_index -> rsi,
     // volume_weighted_stochastic_rsi -> k, zig_zag_channels -> middle,
-    // alphatrend -> k1, avsl -> values. Never a different one silently.
+    // avsl -> canonical `value` (the scalar struct field remains `values`).
+    // AlphaTrend emits the canonical registry primary `k1`;
+    // its CPU dispatcher accepts only `k1`/`k2`, never a retired `value`
+    // alias. Never a different column silently.
     //
     // ONE HAS NO REACHABLE `value` ALIAS AT ALL and is named here for that
     // reason: `compute_vdubus_divergence_wave_pattern_generator_batch`
@@ -1467,8 +1587,9 @@ pub enum F64Kernel {
     /// (high, low, close, volume). PERIOD-SWEPT -- the swept int is BOTH the
     /// true-range window AND the MFI period, hence a `max_period`. Emits `k1`.
     Alphatrend,
-    /// (high, low, close, volume) with HIGH bound and unread. PERIOD-INVARIANT.
-    /// Emits `values`.
+    /// (high, low, close, volume) with HIGH bound and unread. PERIOD-SWEPT:
+    /// the swept int is the slow anchor and the fast period keeps the exact
+    /// canonical 12:26 ratio. Emits `values`.
     Avsl,
 
     // ------------------------------------------------ closer 1, round 3
@@ -1481,8 +1602,8 @@ pub enum F64Kernel {
     // takes two host scratch pointers, `macd_wave_signal_pro_batch_f64` takes
     // no `periods` array at all. None of them is the lane ABI, so each file
     // received a `*_neo_batch_f64` entry point beside what it already had.
-    // Every one of the ten is PERIOD-INVARIANT: its CPU batch reads named
-    // windows and never `period`.
+    // Eight remain compatibility period-invariant. Fibonacci Entry Bands and
+    // HCE consume typed production anchors through their preserved period ABI.
     /// open / high / low / close. Emits `basis` -- the CPU batch has no
     /// `value` alias and every other column is derived from basis.
     FibonacciEntryBands,
@@ -1494,6 +1615,7 @@ pub enum F64Kernel {
     /// (timestamps, close, volume). Emits `estimate`. Timestamps are an
     /// INPUT -- the working CPU door infers `slots_per_day` from them and
     /// takes VOLUME as the source; close is passed by the shape and unread.
+    /// PERIOD-SWEPT through the checked RegistryRatio D/L resolver.
     HalfCausalEstimator,
     /// high / low / close. Emits `signal`, which the CPU batch also aliases
     /// as `value`.
@@ -1515,7 +1637,6 @@ pub enum F64Kernel {
     MultiLengthStochasticAverage,
 }
 
-
 impl F64Kernel {
     /// The exact `__global__` entry point this variant launches.
     pub fn entry_point(self) -> &'static str {
@@ -1531,9 +1652,13 @@ impl F64Kernel {
             F64Kernel::Macz => "macz_neo_batch_f64",
             F64Kernel::Vwmacd => "vwmacd_neo_batch_f64",
             F64Kernel::CorrectedMovingAverage => "corrected_moving_average_neo_batch_f64",
-            F64Kernel::EhlersUndersampledDoubleMovingAverage => "ehlers_undersampled_double_moving_average_neo_batch_f64",
+            F64Kernel::EhlersUndersampledDoubleMovingAverage => {
+                "ehlers_undersampled_double_moving_average_neo_batch_f64"
+            }
             // ------------------------------------------- closer 5, round 2
-            F64Kernel::SmoothedGaussianTrendFilter => "smoothed_gaussian_trend_filter_neo_batch_f64",
+            F64Kernel::SmoothedGaussianTrendFilter => {
+                "smoothed_gaussian_trend_filter_neo_batch_f64"
+            }
             F64Kernel::SpearmanCorrelation => "spearman_correlation_neo_batch_f64",
             F64Kernel::SqueezeIndex => "squeeze_index_neo_batch_f64",
             F64Kernel::StandardizedPsarOscillator => "standardized_psar_oscillator_neo_batch_f64",
@@ -1691,8 +1816,12 @@ impl F64Kernel {
             F64Kernel::Donchian => "donchian_batch_f64",
             // --------------------------------------------------- closer 5
             F64Kernel::Velocity => "velocity_neo_batch_f64",
-            F64Kernel::VelocityAccelerationIndicator => "velocity_acceleration_indicator_neo_batch_f64",
-            F64Kernel::VelocityAccelerationConvergenceDivergenceIndicator => "velocity_acceleration_convergence_divergence_indicator_neo_batch_f64",
+            F64Kernel::VelocityAccelerationIndicator => {
+                "velocity_acceleration_indicator_neo_batch_f64"
+            }
+            F64Kernel::VelocityAccelerationConvergenceDivergenceIndicator => {
+                "velocity_acceleration_convergence_divergence_indicator_neo_batch_f64"
+            }
             F64Kernel::TrendDirectionForceIndex => "trend_direction_force_index_neo_batch_f64",
             F64Kernel::TrendContinuationFactor => "trend_continuation_factor_neo_batch_f64",
             F64Kernel::Trima => "trima_neo_batch_f64",
@@ -1717,18 +1846,18 @@ impl F64Kernel {
             F64Kernel::MediumAd => "medium_ad_neo_batch_f64",
             F64Kernel::Marketefi => "marketefi_neo_batch_f64",
             F64Kernel::MomentumRatioOscillator => "momentum_ratio_oscillator_neo_batch_f64",
-            F64Kernel::OnBalanceVolumeOscillator => {
-                "on_balance_volume_oscillator_neo_batch_f64"
-            }
+            F64Kernel::OnBalanceVolumeOscillator => "on_balance_volume_oscillator_neo_batch_f64",
             // ------------------------------------------------------ closer 6
             F64Kernel::Emd => "emd_batch_f64",
             F64Kernel::Keltner => "keltner_batch_f64",
             F64Kernel::Stoch => "stoch_batch_f64",
             F64Kernel::NadarayaWatsonEnvelope => "nadaraya_watson_envelope_batch_f64",
-                    // ------------------------------------------------------------ closer 2
+            // ------------------------------------------------------------ closer 2
             F64Kernel::EhlersDetrendingFilter => "ehlers_detrending_filter_neo_batch_f64",
             F64Kernel::EhlersSimpleCycleIndicator => "ehlers_simple_cycle_indicator_neo_batch_f64",
-            F64Kernel::EhlersSmoothedAdaptiveMomentum => "ehlers_smoothed_adaptive_momentum_neo_batch_f64",
+            F64Kernel::EhlersSmoothedAdaptiveMomentum => {
+                "ehlers_smoothed_adaptive_momentum_neo_batch_f64"
+            }
             F64Kernel::EwmaVolatility => "ewma_volatility_neo_batch_f64",
             F64Kernel::FractalDimensionIndex => "fractal_dimension_index_neo_batch_f64",
             F64Kernel::GopalakrishnanRangeIndex => "gopalakrishnan_range_index_neo_batch_f64",
@@ -1742,7 +1871,9 @@ impl F64Kernel {
             F64Kernel::Eri => "eri_neo_batch_f64",
             // ---------------------------------------------------------- closer 2b
             F64Kernel::EhlersFmDemodulator => "ehlers_fm_demodulator_neo_batch_f64",
-            F64Kernel::ForwardBackwardExponentialOscillator => "forward_backward_exponential_oscillator_neo_batch_f64",
+            F64Kernel::ForwardBackwardExponentialOscillator => {
+                "forward_backward_exponential_oscillator_neo_batch_f64"
+            }
             F64Kernel::GmmaOscillator => "gmma_oscillator_neo_batch_f64",
             F64Kernel::EvasiveSupertrend => "evasive_supertrend_neo_batch_f64",
             // ------------------------------------------- closer 6, round 2
@@ -1846,10 +1977,16 @@ impl F64Kernel {
             }
             F64Kernel::IctPropulsionBlock => "ict_propulsion_block_neo_batch_f64",
             // ------------------------------------------ closer 4, round 2
-            F64Kernel::KasePeakOscillatorWithDivergences => "kase_peak_oscillator_with_divergences_neo_batch_f64",
-            F64Kernel::KeltnerChannelWidthOscillator => "keltner_channel_width_oscillator_neo_batch_f64",
+            F64Kernel::KasePeakOscillatorWithDivergences => {
+                "kase_peak_oscillator_with_divergences_neo_batch_f64"
+            }
+            F64Kernel::KeltnerChannelWidthOscillator => {
+                "keltner_channel_width_oscillator_neo_batch_f64"
+            }
             F64Kernel::Kst => "kst_neo_batch_f64",
-            F64Kernel::LeavittConvolutionAcceleration => "leavitt_convolution_acceleration_neo_batch_f64",
+            F64Kernel::LeavittConvolutionAcceleration => {
+                "leavitt_convolution_acceleration_neo_batch_f64"
+            }
             F64Kernel::MarketMeannessIndex => "market_meanness_index_neo_batch_f64",
             F64Kernel::MarketStructureConfluence => "market_structure_confluence_neo_batch_f64",
             F64Kernel::MonotonicityIndex => "monotonicity_index_neo_batch_f64",
@@ -1867,17 +2004,13 @@ impl F64Kernel {
                 "nonlinear_regression_zero_lag_moving_average_neo_batch_f64"
             }
             F64Kernel::NormalizedResonator => "normalized_resonator_neo_batch_f64",
-            F64Kernel::NormalizedVolumeTrueRange => {
-                "normalized_volume_true_range_neo_batch_f64"
-            }
+            F64Kernel::NormalizedVolumeTrueRange => "normalized_volume_true_range_neo_batch_f64",
             F64Kernel::PossibleRsi => "possible_rsi_neo_batch_f64",
             F64Kernel::PriceMovingAverageRatioPercentile => {
                 "price_moving_average_ratio_percentile_neo_batch_f64"
             }
             F64Kernel::RangeBreakoutSignals => "range_breakout_signals_neo_batch_f64",
-            F64Kernel::RangeFilteredTrendSignals => {
-                "range_filtered_trend_signals_neo_batch_f64"
-            }
+            F64Kernel::RangeFilteredTrendSignals => "range_filtered_trend_signals_neo_batch_f64",
             F64Kernel::RegressionSlopeOscillator => "regression_slope_oscillator_neo_batch_f64",
             F64Kernel::RelativeStrengthIndexWaveIndicator => {
                 "relative_strength_index_wave_indicator_neo_batch_f64"
@@ -1930,8 +2063,12 @@ impl F64Kernel {
             F64Kernel::LinearRegressionIntensity => "linear_regression_intensity_neo_batch_f64",
             F64Kernel::MacdWaveSignalPro => "macd_wave_signal_pro_neo_batch_f64",
             F64Kernel::MesaStochasticMultiLength => "mesa_stochastic_multi_length_neo_batch_f64",
-            F64Kernel::MovingAverageCrossProbability => "moving_average_cross_probability_neo_batch_f64",
-            F64Kernel::MultiLengthStochasticAverage => "multi_length_stochastic_average_neo_batch_f64",
+            F64Kernel::MovingAverageCrossProbability => {
+                "moving_average_cross_probability_neo_batch_f64"
+            }
+            F64Kernel::MultiLengthStochasticAverage => {
+                "multi_length_stochastic_average_neo_batch_f64"
+            }
         }
     }
 
@@ -1944,8 +2081,14 @@ impl F64Kernel {
     pub fn max_period(self) -> Option<usize> {
         match self {
             F64Kernel::Mfi => Some(MFI_MAX_PERIOD),
+            F64Kernel::Cvi => Some(CVI_MAX_PERIOD),
             F64Kernel::Adxr => Some(ADXR_MAX_PERIOD),
             F64Kernel::Ehma => Some(EHMA_MAX_PERIOD),
+            F64Kernel::Frama => Some(FRAMA_MAX_WINDOW),
+            F64Kernel::CciCycle => Some(CCI_CYCLE_MAX_LENGTH),
+            F64Kernel::Fwma => Some(FWMA_F64_MAX_PERIOD),
+            F64Kernel::Fisher => Some(FISHER_F64_MAX_PERIOD),
+            F64Kernel::HalfCausalEstimator => Some(HCE_V2_MAX_ANCHOR),
             F64Kernel::Devstop => Some(S2_RING_MAX_PERIOD),
             F64Kernel::ChandelierExit => Some(S2_RING_MAX_PERIOD),
             // ------------------------------------------------------------- shard 1 (S1)
@@ -2051,22 +2194,25 @@ impl F64Kernel {
             F64Kernel::WaveSmoother => Some(WS_MAX_PERIOD),
             // ---------------------------------------------- closer 4, round 3
             //
-            // Two of this round's ten. Both keep a per-thread ring whose depth
+            // Three of this round's ten. CoraWave and DMA keep a per-thread ring whose depth
             // is `round(sqrt(swept period))` -- cora_wave's smoothing WMA
             // (cora_wave.rs:378) and dma's difference ring (dma.rs:420) -- so
             // the bound belongs to the compiled kernel and an oversized period
             // is REFUSED BY NAME rather than truncated or moved to the host.
-            // The numbers match the `#define`s in the two `.cu` files.
+            // FVG Trailing Stop's preserved primary ABI keeps a direct
+            // smoothing_length ring and has its own exact bound; typed
+            // production uses dynamically sized resident scratch instead.
+            // The numbers match the `#define`s in the three `.cu` files.
             //
-            // The other eight hold no per-thread array whose length a caller
+            // The other seven hold no per-thread array whose length a caller
             // can move: bandpass, ott and otto carry scalars and a NINE-wide
             // CMO ring that is a constant of the indicator; buff_averages
             // reads its window straight out of global memory; and
-            // fvg_trailing_stop, halftrend, mod_god_mode and prb are
-            // PERIOD-INVARIANT, so every window they keep is a CPU default the
-            // sweep cannot move.
+            // mod_god_mode and prb are period-invariant. HalfTrend is not: its
+            // repaired primary and resident ABIs consume canonical atr_period.
             F64Kernel::CoraWave => Some(CORA_WAVE_MAX_PERIOD),
             F64Kernel::Dma => Some(DMA_MAX_PERIOD),
+            F64Kernel::FvgTrailingStop => Some(FVG_TRAILING_STOP_MAX_SMOOTHING),
             // ------------------------------------------------ closer 3, round 3
             // Only TWO of this closer's ten carry a bound, and that asymmetry
             // is the point: the other eight pin every window at a CPU DEFAULT,
@@ -2080,7 +2226,8 @@ impl F64Kernel {
     }
 
     /// `true` when the CPU reference this kernel mirrors does not read the
-    /// swept `period` at all, so every row of the sweep is byte-identical.
+    /// swept `period` at all, or when the preserved generic ABI is intentionally
+    /// fixed at defaults and canonical typed production bypasses that ABI.
     ///
     /// This is FAITHFUL, not a defect to be fixed here: `compute_obv_batch`
     /// (cpu_batch.rs:3897) takes `|_params|`, while
@@ -2091,18 +2238,19 @@ impl F64Kernel {
     pub fn is_period_invariant(self) -> bool {
         matches!(
             self,
-            F64Kernel::Adosc
-                // ------------------------------------ closer 5, round 3
-                // Seven of the nine. `Rsmk` reads a parameter literally named
-                // `period` (cpu_batch.rs:16479) and `CorrectedMovingAverage`
-                // reaches this crate through `ma(ma_type, period, ..)`
-                // (ma.rs:263); both are deliberately absent.
-                | F64Kernel::SqueezeMomentum
+            // ------------------------------------ closer 5, round 3
+            // Seven of the nine. `Rsmk` reads a parameter literally named
+            // `period` (cpu_batch.rs:16479) and `CorrectedMovingAverage`
+            // reaches this crate through `ma(ma_type, period, ..)`
+            // (ma.rs:263); both are deliberately absent.
+            F64Kernel::SqueezeMomentum
                 | F64Kernel::Uma
                 | F64Kernel::Lpc
                 | F64Kernel::Mab
                 | F64Kernel::Macz
                 | F64Kernel::Vwmacd
+                // EUDMA is compatibility-fixed only here; its canonical typed
+                // pair route carries all three RegistryRatio windows.
                 | F64Kernel::EhlersUndersampledDoubleMovingAverage
                 // -------------------------- closer 5, round 2 (invariant)
                 // Sixteen of the seventeen. `Supertrend` reads a parameter
@@ -2129,9 +2277,7 @@ impl F64Kernel {
                 | F64Kernel::Medprice
                 | F64Kernel::Wclprice
                 // ------------------------------------------------------------- shard 1 (S1)
-                | F64Kernel::Apo
                 | F64Kernel::Vidya
-                | F64Kernel::Gatorosc
                 | F64Kernel::Ppo
                 | F64Kernel::Pma
                 | F64Kernel::Alligator
@@ -2161,7 +2307,6 @@ impl F64Kernel {
                 // one repeated row. Removed rather than left as a latent trap.
                 | F64Kernel::Acosc
                 | F64Kernel::Ad
-                | F64Kernel::CciCycle
                 // ---------------------------------------------------- closer 6
                 // `compute_stoch_batch` (cpu_batch.rs:5580-5582) reads
                 // `fastk_period`, `slowk_period` and `slowd_period` and NEVER
@@ -2199,7 +2344,7 @@ impl F64Kernel {
                 | F64Kernel::VolumeZoneOscillator
                 | F64Kernel::Vosc
                 | F64Kernel::Ultosc
-        
+
                 // ------------------------------------------------------------ closer 2
                 | F64Kernel::EhlersDetrendingFilter
                 | F64Kernel::EhlersSimpleCycleIndicator
@@ -2207,7 +2352,6 @@ impl F64Kernel {
                 | F64Kernel::EwmaVolatility
                 | F64Kernel::FractalDimensionIndex
                 | F64Kernel::GopalakrishnanRangeIndex
-                | F64Kernel::GarmanKlassVolatility
                 | F64Kernel::ImpulseMacd
                 | F64Kernel::Hypertrend
                 | F64Kernel::EmdTrend
@@ -2221,18 +2365,16 @@ impl F64Kernel {
                 | F64Kernel::AdaptiveMomentumOscillator
                 | F64Kernel::AdvanceDeclineLine
                 | F64Kernel::AndeanOscillator
-                | F64Kernel::AtrPercentile
                 | F64Kernel::Bop
-                | F64Kernel::Coppock
                 | F64Kernel::DailyFactor
                 | F64Kernel::DecisionpointBreadthSwenlinTradingOscillator
                 | F64Kernel::DidiIndex
                 | F64Kernel::DisparityIndex
-        
+
                 // ---------------------------------------------------------- closer 2b
-                | F64Kernel::ForwardBackwardExponentialOscillator
+                // FBEO consumes its canonical length in both the typed full
+                // route and the preserved primary ABI. GMMA remains fixed.
                 | F64Kernel::GmmaOscillator
-                | F64Kernel::EvasiveSupertrend
                 // --------------------------------------- closer 6, round 2
                 // Five of the eight. `Msw`, `Rvi` and `NetMyrsi` are
                 // genuinely period-swept and are deliberately absent.
@@ -2267,7 +2409,6 @@ impl F64Kernel {
                 //
                 // The named parameters: `length`/`mult`/`alpha`/`beta`
                 // for adjustable_ma_alternating_extremities (:6417),
-                // `length`/`lag` for autocorrelation_indicator (:7798),
                 // `hv_length`/`rank_length` for historical_volatility_rank
                 // (:6664), `length`/`annual_length` for
                 // historical_volatility_percentile (:9660),
@@ -2276,7 +2417,6 @@ impl F64Kernel {
                 // `volatility_period` for dynamic_momentum_index (:6874),
                 // `alpha` for both Ehlers adaptive indicators (:15801,
                 // :10126), `length` for
-                // ehlers_data_sampling_relative_strength_indicator (:8114),
                 // `exp_rate`/`initial_distance` for exponential_trend (:4404),
                 // `length`/`multiplier`/`atr_length`/`smooth` for
                 // geometric_bias_oscillator (:5041), `length`/`length_ma` for
@@ -2297,20 +2437,19 @@ impl F64Kernel {
                 // THOSE `min_period` / `max_period` bound the SPECTRUM the
                 // indicator scans and are not the lane's swept period.
                 //
-                // The THREE that are genuinely period-swept -- BullsVBears,
-                // CandleStrengthOscillator and DirectionalImbalanceIndex --
-                // read a parameter literally named `period` and are
-                // deliberately absent, as is VerticalHorizontalFilter for the
-                // reason above.
+                // Five are genuinely swept and deliberately absent:
+                // BullsVBears, CandleStrengthOscillator and
+                // DirectionalImbalanceIndex read a parameter literally named
+                // `period`; Autocorrelation Indicator consumes canonical
+                // `length`, as does EhlersDataSamplingRelativeStrengthIndicator.
+                // VerticalHorizontalFilter is absent for the reason above.
                 | F64Kernel::AdjustableMaAlternatingExtremities
-                | F64Kernel::AutocorrelationIndicator
                 | F64Kernel::HistoricalVolatilityRank
                 | F64Kernel::HistoricalVolatilityPercentile
                 | F64Kernel::CycleChannelOscillator
                 | F64Kernel::DynamicMomentumIndex
                 | F64Kernel::EhlersAdaptiveCg
                 | F64Kernel::EhlersAdaptiveCyberCycle
-                | F64Kernel::EhlersDataSamplingRelativeStrengthIndicator
                 | F64Kernel::ExponentialTrend
                 | F64Kernel::GeometricBiasOscillator
                 | F64Kernel::IntradayMomentumIndex
@@ -2344,13 +2483,11 @@ impl F64Kernel {
                 | F64Kernel::SmoothTheilSen
                 // ------------------------------------ closer 4, round 3
                 //
-                // Five of this round's ten. Each CPU batch reads NAMED
+                // Three of this round's ten. Each CPU batch reads NAMED
                 // windows and never `period` -- see the enum note for the
-                // parameter list of each. The other five (Bandpass,
-                // BuffAverages, CoraWave, Dma, Ott) ARE swept and are
-                // deliberately absent.
-                | F64Kernel::FvgTrailingStop
-                | F64Kernel::Halftrend
+                // parameter list of each. The other six (Bandpass,
+                // BuffAverages, CoraWave, Dma, FvgTrailingStop, Ott) ARE
+                // swept and are deliberately absent.
                 | F64Kernel::ModGodMode
                 | F64Kernel::Otto
                 | F64Kernel::Prb
@@ -2388,13 +2525,14 @@ impl F64Kernel {
                 | F64Kernel::RegressionSlopeOscillator
                 | F64Kernel::RelativeStrengthIndexWaveIndicator
                 // ------------------------------- closer 3, round 3
-                // Eight of this closer's ten. Their CPU batch functions read
+                // Seven of this closer's ten. Their CPU batch functions read
                 // NAMED parameters and never `period`, AND their kernels pin
                 // every window at the CPU DEFAULT rather than reading
                 // `periods[combo]` -- the two halves have to agree or the
-                // claim is false. `VolatilityRatioAdaptiveRsx` and
-                // `Alphatrend` are deliberately absent: both read a parameter
-                // literally named `period` and both size a ring from it.
+                // claim is false. `VolatilityRatioAdaptiveRsx`, `Alphatrend`,
+                // and `Avsl` are deliberately absent: the first two read a
+                // parameter literally named `period`; AVSL's production plan
+                // maps its slow anchor to the exact named fast/slow tuple.
                 | F64Kernel::ReversalSignals
                 | F64Kernel::TrendFollower
                 | F64Kernel::VdubusDivergenceWavePatternGenerator
@@ -2402,14 +2540,13 @@ impl F64Kernel {
                 | F64Kernel::VolumeWeightedRelativeStrengthIndex
                 | F64Kernel::VolumeWeightedStochasticRsi
                 | F64Kernel::ZigZagChannels
-                | F64Kernel::Avsl
 
                 // ------------------------------------ closer 1, round 3
-                // All ten. Every CPU batch reads NAMED windows and never
-                // `period` -- see the enum note.
-                | F64Kernel::FibonacciEntryBands
+                // Eight of the ten. Fibonacci Entry Bands maps its anchor to
+                // registered `length`; HCE maps it to the checked RegistryRatio
+                // `(data_period, filter_length)` tuple. Both are absent because
+                // their preserved primary ABIs now consume typed sweep state.
                 | F64Kernel::GoertzelCycleCompositeWave
-                | F64Kernel::HalfCausalEstimator
                 | F64Kernel::IchimokuOscillator
                 | F64Kernel::InsyncIndex
                 | F64Kernel::LinearRegressionIntensity
@@ -2433,7 +2570,9 @@ impl F64Kernel {
             F64Kernel::Macz => "macz",
             F64Kernel::Vwmacd => "vwmacd",
             F64Kernel::CorrectedMovingAverage => "corrected_moving_average",
-            F64Kernel::EhlersUndersampledDoubleMovingAverage => "ehlers_undersampled_double_moving_average",
+            F64Kernel::EhlersUndersampledDoubleMovingAverage => {
+                "ehlers_undersampled_double_moving_average"
+            }
             // ---------------------------------- closer 5, round 2 (ids)
             F64Kernel::SmoothedGaussianTrendFilter => "smoothed_gaussian_trend_filter",
             F64Kernel::SpearmanCorrelation => "spearman_correlation",
@@ -2594,7 +2733,9 @@ impl F64Kernel {
             // --------------------------------------------------- closer 5
             F64Kernel::Velocity => "velocity",
             F64Kernel::VelocityAccelerationIndicator => "velocity_acceleration_indicator",
-            F64Kernel::VelocityAccelerationConvergenceDivergenceIndicator => "velocity_acceleration_convergence_divergence_indicator",
+            F64Kernel::VelocityAccelerationConvergenceDivergenceIndicator => {
+                "velocity_acceleration_convergence_divergence_indicator"
+            }
             F64Kernel::TrendDirectionForceIndex => "trend_direction_force_index",
             F64Kernel::TrendContinuationFactor => "trend_continuation_factor",
             F64Kernel::Trima => "trima",
@@ -2625,7 +2766,7 @@ impl F64Kernel {
             F64Kernel::Keltner => "keltner",
             F64Kernel::Stoch => "stoch",
             F64Kernel::NadarayaWatsonEnvelope => "nadaraya_watson_envelope",
-                    // ------------------------------------------------------------ closer 2
+            // ------------------------------------------------------------ closer 2
             F64Kernel::EhlersDetrendingFilter => "ehlers_detrending_filter",
             F64Kernel::EhlersSimpleCycleIndicator => "ehlers_simple_cycle_indicator",
             F64Kernel::EhlersSmoothedAdaptiveMomentum => "ehlers_smoothed_adaptive_momentum",
@@ -2642,7 +2783,9 @@ impl F64Kernel {
             F64Kernel::Eri => "eri",
             // ---------------------------------------------------------- closer 2b
             F64Kernel::EhlersFmDemodulator => "ehlers_fm_demodulator",
-            F64Kernel::ForwardBackwardExponentialOscillator => "forward_backward_exponential_oscillator",
+            F64Kernel::ForwardBackwardExponentialOscillator => {
+                "forward_backward_exponential_oscillator"
+            }
             F64Kernel::GmmaOscillator => "gmma_oscillator",
             F64Kernel::EvasiveSupertrend => "evasive_supertrend",
             // ------------------------------------------- closer 6, round 2
@@ -2683,9 +2826,7 @@ impl F64Kernel {
             F64Kernel::Pivot => "pivot",
             F64Kernel::Kaufmanstop => "kaufmanstop",
             F64Kernel::Sgf => "sgf",
-            F64Kernel::PolynomialRegressionExtrapolation => {
-                "polynomial_regression_extrapolation"
-            }
+            F64Kernel::PolynomialRegressionExtrapolation => "polynomial_regression_extrapolation",
             F64Kernel::DualUlcerIndex => "dual_ulcer_index",
             F64Kernel::HullButterflyOscillator => "hull_butterfly_oscillator",
             F64Kernel::RangeOscillator => "range_oscillator",
@@ -2748,9 +2889,7 @@ impl F64Kernel {
             F64Kernel::NormalizedResonator => "normalized_resonator",
             F64Kernel::NormalizedVolumeTrueRange => "normalized_volume_true_range",
             F64Kernel::PossibleRsi => "possible_rsi",
-            F64Kernel::PriceMovingAverageRatioPercentile => {
-                "price_moving_average_ratio_percentile"
-            }
+            F64Kernel::PriceMovingAverageRatioPercentile => "price_moving_average_ratio_percentile",
             F64Kernel::RangeBreakoutSignals => "range_breakout_signals",
             F64Kernel::RangeFilteredTrendSignals => "range_filtered_trend_signals",
             F64Kernel::RegressionSlopeOscillator => "regression_slope_oscillator",
@@ -3162,7 +3301,6 @@ impl F64Kernel {
         F64Kernel::ZigZagChannels,
         F64Kernel::Alphatrend,
         F64Kernel::Avsl,
-
         // ---------------------------------------------- closer 1, round 3
         F64Kernel::FibonacciEntryBands,
         F64Kernel::GoertzelCycleCompositeWave,
@@ -3184,6 +3322,9 @@ impl F64Kernel {
             self,
             F64Kernel::Sma
                 | F64Kernel::Adosc
+                // ACOSC owns three rolling rings and a previous-output state;
+                // one thread must walk each row in canonical scalar order.
+                | F64Kernel::Acosc
                 // ------------------------------------ closer 5, round 3
                 | F64Kernel::Rsmk
                 | F64Kernel::SqueezeMomentum
@@ -3294,7 +3435,6 @@ impl F64Kernel {
                 | F64Kernel::Jma
                 | F64Kernel::Reflex
                 | F64Kernel::Gaussian
-                | F64Kernel::Fwma
                 | F64Kernel::Hwma
                 | F64Kernel::Jsa
                 | F64Kernel::Nma
@@ -3343,7 +3483,6 @@ impl F64Kernel {
                 | F64Kernel::TtmSqueeze
                 | F64Kernel::Mass
                 | F64Kernel::Aroon
-                | F64Kernel::Acosc
                 | F64Kernel::Vpci
                 | F64Kernel::Ad
                 | F64Kernel::Dvdiqqe
@@ -3386,7 +3525,7 @@ impl F64Kernel {
                 | F64Kernel::VolumeZoneOscillator
                 | F64Kernel::Vosc
                 | F64Kernel::Ultosc
-        
+
                 // ------------------------------------------------------------ closer 2
                 | F64Kernel::EhlersDetrendingFilter
                 | F64Kernel::EhlersSimpleCycleIndicator
@@ -3398,7 +3537,6 @@ impl F64Kernel {
                 | F64Kernel::ImpulseMacd
                 | F64Kernel::Hypertrend
                 | F64Kernel::EmdTrend
-                | F64Kernel::Epma
                 | F64Kernel::Fosc
                 | F64Kernel::EhlersPma
                 | F64Kernel::Eri
@@ -3423,7 +3561,7 @@ impl F64Kernel {
                 | F64Kernel::Dm
                 | F64Kernel::DonchianChannelWidth
                 | F64Kernel::Dpo
-        
+
                 // ---------------------------------------------------------- closer 2b
                 | F64Kernel::EhlersFmDemodulator
                 | F64Kernel::ForwardBackwardExponentialOscillator
@@ -3447,14 +3585,11 @@ impl F64Kernel {
                 | F64Kernel::Vlma
                 | F64Kernel::Stc
                 // --------------------------------------- closer 2, round 2
-                // All ten. Six carry genuine state across bars; the other four
-                // rebuild their window every bar and are launched sequential
-                // because that is the shape this lane launches -- the bar loop
-                // is the thread body. See the enum block for the per-variant
-                // reason.
+                // Nine carry genuine state or rebuild a window per bar. Pivot
+                // is deliberately absent: the reviewed default formula is
+                // pointwise over period t-1 and its kernel is bar-parallel.
                 | F64Kernel::Mwdx
                 | F64Kernel::Lrsi
-                | F64Kernel::Pivot
                 | F64Kernel::Kaufmanstop
                 | F64Kernel::Sgf
                 | F64Kernel::PolynomialRegressionExtrapolation
@@ -3468,12 +3603,9 @@ impl F64Kernel {
                 // Wilder or EMA recurrence, an Ehlers IIR, a monotone deque, a
                 // sliding sum maintained with subtract-then-add, a ratchet, or
                 // a state machine whose reset points depend on where the holes
-                // in the series are. Even the three whose per-bar value would
-                // be window-parallel -- vertical_horizontal_filter,
-                // adjustable_ma_alternating_extremities and
-                // autocorrelation_indicator's convolution -- are launched one
-                // thread per combo, because that is the shape this lane
-                // launches and the bar loop is the thread body.
+                // in the series are. Autocorrelation Indicator now consumes
+                // its canonical length through a two-pole IIR; one thread owns
+                // that complete ordered state and its reset points.
                 | F64Kernel::VerticalHorizontalFilter
                 | F64Kernel::AdjustableMaAlternatingExtremities
                 | F64Kernel::AutocorrelationIndicator
@@ -3632,7 +3764,7 @@ impl F64Kernel {
     /// two implementations of one indicator — which is precisely the failure
     /// this lane exists to remove, just relocated.
     ///
-    /// So a variant names its module. [`CudaF64Indicators::new`] loads the
+    /// So a variant names its module. [`CudaF64Indicators::from_session`] loads the
     /// distinct set once at construction, so a frame still pays zero loads.
     pub fn module_stem(self) -> &'static str {
         match self {
@@ -3647,7 +3779,9 @@ impl F64Kernel {
             F64Kernel::Macz => "macz_kernel",
             F64Kernel::Vwmacd => "vwmacd_kernel",
             F64Kernel::CorrectedMovingAverage => "corrected_moving_average_kernel",
-            F64Kernel::EhlersUndersampledDoubleMovingAverage => "ehlers_undersampled_double_moving_average_kernel",
+            F64Kernel::EhlersUndersampledDoubleMovingAverage => {
+                "ehlers_undersampled_double_moving_average_kernel"
+            }
             // ------------------------------ closer 5, round 2 (modules)
             F64Kernel::SmoothedGaussianTrendFilter => "smoothed_gaussian_trend_filter_kernel",
             F64Kernel::SpearmanCorrelation => "spearman_correlation_kernel",
@@ -3779,7 +3913,9 @@ impl F64Kernel {
             // --------------------------------------------------- closer 5
             F64Kernel::Velocity => "velocity_kernel",
             F64Kernel::VelocityAccelerationIndicator => "velocity_acceleration_indicator_kernel",
-            F64Kernel::VelocityAccelerationConvergenceDivergenceIndicator => "velocity_acceleration_convergence_divergence_indicator_kernel",
+            F64Kernel::VelocityAccelerationConvergenceDivergenceIndicator => {
+                "velocity_acceleration_convergence_divergence_indicator_kernel"
+            }
             F64Kernel::TrendDirectionForceIndex => "trend_direction_force_index_kernel",
             F64Kernel::TrendContinuationFactor => "trend_continuation_factor_kernel",
             F64Kernel::Trima => "trima_kernel",
@@ -3804,9 +3940,7 @@ impl F64Kernel {
             F64Kernel::MediumAd => "medium_ad_kernel",
             F64Kernel::Marketefi => "marketefi_kernel",
             F64Kernel::MomentumRatioOscillator => "momentum_ratio_oscillator_kernel",
-            F64Kernel::OnBalanceVolumeOscillator => {
-                "on_balance_volume_oscillator_kernel"
-            }
+            F64Kernel::OnBalanceVolumeOscillator => "on_balance_volume_oscillator_kernel",
             // ------------------------------------------------------ closer 6
             F64Kernel::Emd => "emd_kernel",
             F64Kernel::Keltner => "keltner_kernel",
@@ -3829,7 +3963,9 @@ impl F64Kernel {
             F64Kernel::Eri => "eri_kernel",
             // ---------------------------------------------------------- closer 2b
             F64Kernel::EhlersFmDemodulator => "ehlers_fm_demodulator_kernel",
-            F64Kernel::ForwardBackwardExponentialOscillator => "forward_backward_exponential_oscillator_kernel",
+            F64Kernel::ForwardBackwardExponentialOscillator => {
+                "forward_backward_exponential_oscillator_kernel"
+            }
             F64Kernel::GmmaOscillator => "gmma_oscillator_kernel",
             F64Kernel::EvasiveSupertrend => "evasive_supertrend_kernel",
             // ------------------------------------------- closer 6, round 2
@@ -3838,7 +3974,8 @@ impl F64Kernel {
             // entry point was written into the `.cu` file its indicator
             // already ships in. Six live under a subdirectory
             // (`oscillators/`, `moving_averages/`), but `compile_kernel` names
-            // the PTX after the file STEM, so the module is `msw_kernel`, not
+            // the native artifact after the file STEM, so the module is
+            // `msw_kernel`, not
             // `oscillators_msw_kernel`.
             //
             // These arms MUST stay above the `_ => NEOETHOS_F64_MODULE`
@@ -3858,16 +3995,21 @@ impl F64Kernel {
             // already ships in. Three of them live under a subdirectory --
             // `oscillators/bop_kernel.cu`, `oscillators/cg_kernel.cu`,
             // `oscillators/coppock_kernel.cu`, `oscillators/dpo_kernel.cu` --
-            // but `compile_kernel` names the PTX after the file STEM, so the
+            // but `compile_kernel` names the native artifact after the file
+            // STEM, so the
             // module is still `bop_kernel` and not `oscillators_bop_kernel`.
             //
             // These arms MUST stay above the `_ => NEOETHOS_F64_MODULE`
             // catch-all below. Behind it they are dead, `module_stem` answers
             // `neoethos_f64_kernels`, and `get_function` then hunts for
             // `bop_neo_batch_f64` in a module that never contained it.
-            F64Kernel::AbsoluteStrengthIndexOscillator => "absolute_strength_index_oscillator_kernel",
+            F64Kernel::AbsoluteStrengthIndexOscillator => {
+                "absolute_strength_index_oscillator_kernel"
+            }
             F64Kernel::AccumulationSwingIndex => "accumulation_swing_index_kernel",
-            F64Kernel::AdaptiveBandpassTriggerOscillator => "adaptive_bandpass_trigger_oscillator_kernel",
+            F64Kernel::AdaptiveBandpassTriggerOscillator => {
+                "adaptive_bandpass_trigger_oscillator_kernel"
+            }
             F64Kernel::AdaptiveBoundsRsi => "adaptive_bounds_rsi_kernel",
             F64Kernel::AdaptiveMacd => "adaptive_macd_kernel",
             F64Kernel::AdaptiveMomentumOscillator => "adaptive_momentum_oscillator_kernel",
@@ -3879,7 +4021,9 @@ impl F64Kernel {
             F64Kernel::Cg => "cg_kernel",
             F64Kernel::Coppock => "coppock_kernel",
             F64Kernel::DailyFactor => "daily_factor_kernel",
-            F64Kernel::DecisionpointBreadthSwenlinTradingOscillator => "decisionpoint_breadth_swenlin_trading_oscillator_kernel",
+            F64Kernel::DecisionpointBreadthSwenlinTradingOscillator => {
+                "decisionpoint_breadth_swenlin_trading_oscillator_kernel"
+            }
             F64Kernel::DidiIndex => "didi_index_kernel",
             F64Kernel::DisparityIndex => "disparity_index_kernel",
             F64Kernel::Dm => "dm_kernel",
@@ -3897,9 +4041,7 @@ impl F64Kernel {
             F64Kernel::DualUlcerIndex => "dual_ulcer_index_kernel",
             F64Kernel::HullButterflyOscillator => "hull_butterfly_oscillator_kernel",
             F64Kernel::RangeOscillator => "range_oscillator_kernel",
-            F64Kernel::MarketStructureTrailingStop => {
-                "market_structure_trailing_stop_kernel"
-            }
+            F64Kernel::MarketStructureTrailingStop => "market_structure_trailing_stop_kernel",
             // ------------------------------------------ closer 3, round 2
             //
             // Every one of these lives in the .cu file its indicator already
@@ -3911,9 +4053,7 @@ impl F64Kernel {
             }
             F64Kernel::AutocorrelationIndicator => "autocorrelation_indicator_kernel",
             F64Kernel::HistoricalVolatilityRank => "historical_volatility_rank_kernel",
-            F64Kernel::HistoricalVolatilityPercentile => {
-                "historical_volatility_percentile_kernel"
-            }
+            F64Kernel::HistoricalVolatilityPercentile => "historical_volatility_percentile_kernel",
             F64Kernel::DirectionalImbalanceIndex => "directional_imbalance_index_kernel",
             F64Kernel::CycleChannelOscillator => "cycle_channel_oscillator_kernel",
             F64Kernel::DynamicMomentumIndex => "dynamic_momentum_index_kernel",
@@ -3931,9 +4071,7 @@ impl F64Kernel {
             F64Kernel::FvgPositioningAverage => "fvg_positioning_average_kernel",
             F64Kernel::HemaTrendLevels => "hema_trend_levels_kernel",
             F64Kernel::FibonacciTrailingStop => "fibonacci_trailing_stop_kernel",
-            F64Kernel::GroverLlorensCycleOscillator => {
-                "grover_llorens_cycle_oscillator_kernel"
-            }
+            F64Kernel::GroverLlorensCycleOscillator => "grover_llorens_cycle_oscillator_kernel",
             F64Kernel::DemandIndex => "demand_index_kernel",
             F64Kernel::AdaptiveSchaffTrendCycle => "adaptive_schaff_trend_cycle_kernel",
             F64Kernel::EhlersLinearExtrapolationPredictor => {
@@ -3944,7 +4082,9 @@ impl F64Kernel {
             }
             F64Kernel::IctPropulsionBlock => "ict_propulsion_block_kernel",
             // ------------------------------------------ closer 4, round 2
-            F64Kernel::KasePeakOscillatorWithDivergences => "kase_peak_oscillator_with_divergences_kernel",
+            F64Kernel::KasePeakOscillatorWithDivergences => {
+                "kase_peak_oscillator_with_divergences_kernel"
+            }
             F64Kernel::KeltnerChannelWidthOscillator => "keltner_channel_width_oscillator_kernel",
             F64Kernel::Kst => "kst_kernel",
             F64Kernel::LeavittConvolutionAcceleration => "leavitt_convolution_acceleration_kernel",
@@ -3964,7 +4104,8 @@ impl F64Kernel {
             // Each of the ten is compiled into its OWN module, because its
             // entry point was written into the `.cu` file its indicator
             // already ships in. Five live under `moving_averages/`, but
-            // `compile_kernel` names the PTX after the file STEM, so the
+            // `compile_kernel` names the native artifact after the file STEM,
+            // so the
             // module is `dma_kernel`, not `moving_averages_dma_kernel`.
             //
             // These arms MUST stay above the `_ => NEOETHOS_F64_MODULE`
@@ -4043,7 +4184,6 @@ impl F64Kernel {
                 "relative_strength_index_wave_indicator_kernel"
             }
             _ => NEOETHOS_F64_MODULE,
-
         }
     }
 }
@@ -4051,13 +4191,13 @@ impl F64Kernel {
 /// The module every kernel written into `neoethos_f64_kernels.cu` lives in.
 pub const NEOETHOS_F64_MODULE: &str = "neoethos_f64_kernels";
 
-/// Load the fatbin for one per-indicator f64 module.
+/// Load the exact native cubin for one per-indicator f64 module.
 ///
-/// `load_cuda_embedded_module!` takes a string LITERAL — it embeds the fatbin
-/// and the PTX at compile time — so this is a match on the stem and not a
-/// lookup. Every arm must correspond to a `compile_kernel` call in `build.rs`
-/// and to a `module_stem` arm above; a stem with no arm is a loud `Err` at
-/// construction rather than a missing symbol at launch.
+/// `load_cuda_embedded_module!` takes a string literal and resolves it through
+/// the generated exact-architecture registry. Every arm must correspond to a
+/// `compile_kernel` call in `build.rs` and to a `module_stem` arm above; a stem
+/// with no arm is a loud `Err` at construction rather than a missing symbol at
+/// launch.
 fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
     let m = match stem {
         NEOETHOS_F64_MODULE => crate::load_cuda_embedded_module!("neoethos_f64_kernels")?,
@@ -4082,9 +4222,13 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "aso_kernel" => crate::load_cuda_embedded_module!("aso_kernel")?,
         "wto_kernel" => crate::load_cuda_embedded_module!("wto_kernel")?,
         "range_filter_kernel" => crate::load_cuda_embedded_module!("range_filter_kernel")?,
-        "correlation_cycle_kernel" => crate::load_cuda_embedded_module!("correlation_cycle_kernel")?,
+        "correlation_cycle_kernel" => {
+            crate::load_cuda_embedded_module!("correlation_cycle_kernel")?
+        }
         "mama_kernel" => crate::load_cuda_embedded_module!("mama_kernel")?,
-        "volume_adjusted_ma_kernel" => crate::load_cuda_embedded_module!("volume_adjusted_ma_kernel")?,
+        "volume_adjusted_ma_kernel" => {
+            crate::load_cuda_embedded_module!("volume_adjusted_ma_kernel")?
+        }
         "reverse_rsi_kernel" => crate::load_cuda_embedded_module!("reverse_rsi_kernel")?,
         "ehlers_ecema_kernel" => crate::load_cuda_embedded_module!("ehlers_ecema_kernel")?,
         "devstop_kernel" => crate::load_cuda_embedded_module!("devstop_kernel")?,
@@ -4093,9 +4237,13 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         // ------------------------------------------------------------- shard 4 (S4)
         "er_kernel" => crate::load_cuda_embedded_module!("er_kernel")?,
         "linearreg_angle_kernel" => crate::load_cuda_embedded_module!("linearreg_angle_kernel")?,
-        "linearreg_intercept_kernel" => crate::load_cuda_embedded_module!("linearreg_intercept_kernel")?,
+        "linearreg_intercept_kernel" => {
+            crate::load_cuda_embedded_module!("linearreg_intercept_kernel")?
+        }
         "highpass2_kernel" => crate::load_cuda_embedded_module!("highpass2_kernel")?,
-        "supersmoother_3_pole_kernel" => crate::load_cuda_embedded_module!("supersmoother_3_pole_kernel")?,
+        "supersmoother_3_pole_kernel" => {
+            crate::load_cuda_embedded_module!("supersmoother_3_pole_kernel")?
+        }
         "cwma_kernel" => crate::load_cuda_embedded_module!("cwma_kernel")?,
         "cmo_kernel" => crate::load_cuda_embedded_module!("cmo_kernel")?,
         "stddev_kernel" => crate::load_cuda_embedded_module!("stddev_kernel")?,
@@ -4104,7 +4252,9 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "ehma_kernel" => crate::load_cuda_embedded_module!("ehma_kernel")?,
         "macd_kernel" => crate::load_cuda_embedded_module!("macd_kernel")?,
         "ift_rsi_kernel" => crate::load_cuda_embedded_module!("ift_rsi_kernel")?,
-        "damiani_volatmeter_kernel" => crate::load_cuda_embedded_module!("damiani_volatmeter_kernel")?,
+        "damiani_volatmeter_kernel" => {
+            crate::load_cuda_embedded_module!("damiani_volatmeter_kernel")?
+        }
         "wavetrend_kernel" => crate::load_cuda_embedded_module!("wavetrend_kernel")?,
         "dx_kernel" => crate::load_cuda_embedded_module!("dx_kernel")?,
         "frama_kernel" => crate::load_cuda_embedded_module!("frama_kernel")?,
@@ -4160,38 +4310,70 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "vpwma_kernel" => crate::load_cuda_embedded_module!("vpwma_kernel")?,
         "cfo_kernel" => crate::load_cuda_embedded_module!("cfo_kernel")?,
         "var_kernel" => crate::load_cuda_embedded_module!("var_kernel")?,
-        "bollinger_bands_width_kernel" => crate::load_cuda_embedded_module!("bollinger_bands_width_kernel")?,
+        "bollinger_bands_width_kernel" => {
+            crate::load_cuda_embedded_module!("bollinger_bands_width_kernel")?
+        }
         "dec_osc_kernel" => crate::load_cuda_embedded_module!("dec_osc_kernel")?,
         "voss_kernel" => crate::load_cuda_embedded_module!("voss_kernel")?,
-        "percentile_nearest_rank_kernel" => crate::load_cuda_embedded_module!("percentile_nearest_rank_kernel")?,
+        "percentile_nearest_rank_kernel" => {
+            crate::load_cuda_embedded_module!("percentile_nearest_rank_kernel")?
+        }
         "ttm_trend_kernel" => crate::load_cuda_embedded_module!("ttm_trend_kernel")?,
         "vi_kernel" => crate::load_cuda_embedded_module!("vi_kernel")?,
         "cvi_kernel" => crate::load_cuda_embedded_module!("cvi_kernel")?,
         "correl_hl_kernel" => crate::load_cuda_embedded_module!("correl_hl_kernel")?,
         "aroonosc_kernel" => crate::load_cuda_embedded_module!("aroonosc_kernel")?,
-        "parkinson_volatility_kernel" => crate::load_cuda_embedded_module!("parkinson_volatility_kernel")?,
-        "historical_volatility_kernel" => crate::load_cuda_embedded_module!("historical_volatility_kernel")?,
+        "parkinson_volatility_kernel" => {
+            crate::load_cuda_embedded_module!("parkinson_volatility_kernel")?
+        }
+        "historical_volatility_kernel" => {
+            crate::load_cuda_embedded_module!("historical_volatility_kernel")?
+        }
         "donchian_kernel" => crate::load_cuda_embedded_module!("donchian_kernel")?,
         // ------------------------------------------------------- closer 5
         "velocity_kernel" => crate::load_cuda_embedded_module!("velocity_kernel")?,
-        "velocity_acceleration_indicator_kernel" => crate::load_cuda_embedded_module!("velocity_acceleration_indicator_kernel")?,
-        "velocity_acceleration_convergence_divergence_indicator_kernel" => crate::load_cuda_embedded_module!("velocity_acceleration_convergence_divergence_indicator_kernel")?,
-        "trend_direction_force_index_kernel" => crate::load_cuda_embedded_module!("trend_direction_force_index_kernel")?,
-        "trend_continuation_factor_kernel" => crate::load_cuda_embedded_module!("trend_continuation_factor_kernel")?,
+        "velocity_acceleration_indicator_kernel" => {
+            crate::load_cuda_embedded_module!("velocity_acceleration_indicator_kernel")?
+        }
+        "velocity_acceleration_convergence_divergence_indicator_kernel" => {
+            crate::load_cuda_embedded_module!(
+                "velocity_acceleration_convergence_divergence_indicator_kernel"
+            )?
+        }
+        "trend_direction_force_index_kernel" => {
+            crate::load_cuda_embedded_module!("trend_direction_force_index_kernel")?
+        }
+        "trend_continuation_factor_kernel" => {
+            crate::load_cuda_embedded_module!("trend_continuation_factor_kernel")?
+        }
         "trima_kernel" => crate::load_cuda_embedded_module!("trima_kernel")?,
-        "trend_trigger_factor_kernel" => crate::load_cuda_embedded_module!("trend_trigger_factor_kernel")?,
-        "volume_weighted_rsi_kernel" => crate::load_cuda_embedded_module!("volume_weighted_rsi_kernel")?,
-        "volume_zone_oscillator_kernel" => crate::load_cuda_embedded_module!("volume_zone_oscillator_kernel")?,
+        "trend_trigger_factor_kernel" => {
+            crate::load_cuda_embedded_module!("trend_trigger_factor_kernel")?
+        }
+        "volume_weighted_rsi_kernel" => {
+            crate::load_cuda_embedded_module!("volume_weighted_rsi_kernel")?
+        }
+        "volume_zone_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("volume_zone_oscillator_kernel")?
+        }
         "vosc_kernel" => crate::load_cuda_embedded_module!("vosc_kernel")?,
         "ultosc_kernel" => crate::load_cuda_embedded_module!("ultosc_kernel")?,
         // ---------------------------------------------------------- closer 4
-        "psychological_line_kernel" => crate::load_cuda_embedded_module!("psychological_line_kernel")?,
-        "rank_correlation_index_kernel" => crate::load_cuda_embedded_module!("rank_correlation_index_kernel")?,
+        "psychological_line_kernel" => {
+            crate::load_cuda_embedded_module!("psychological_line_kernel")?
+        }
+        "rank_correlation_index_kernel" => {
+            crate::load_cuda_embedded_module!("rank_correlation_index_kernel")?
+        }
         "qstick_kernel" => crate::load_cuda_embedded_module!("qstick_kernel")?,
         "sinwma_kernel" => crate::load_cuda_embedded_module!("sinwma_kernel")?,
         "srwma_kernel" => crate::load_cuda_embedded_module!("srwma_kernel")?,
-        "rolling_z_score_trend_kernel" => crate::load_cuda_embedded_module!("rolling_z_score_trend_kernel")?,
-        "random_walk_index_kernel" => crate::load_cuda_embedded_module!("random_walk_index_kernel")?,
+        "rolling_z_score_trend_kernel" => {
+            crate::load_cuda_embedded_module!("rolling_z_score_trend_kernel")?
+        }
+        "random_walk_index_kernel" => {
+            crate::load_cuda_embedded_module!("random_walk_index_kernel")?
+        }
         // ------------------------------------------------------------- closer 3
         "l1_ehlers_phasor_kernel" => crate::load_cuda_embedded_module!("l1_ehlers_phasor_kernel")?,
         "l2_ehlers_signal_to_noise_kernel" => {
@@ -4219,13 +4401,25 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
             crate::load_cuda_embedded_module!("nadaraya_watson_envelope_kernel")?
         }
         // ------------------------------------------------------------ closer 2
-        "ehlers_detrending_filter_kernel" => crate::load_cuda_embedded_module!("ehlers_detrending_filter_kernel")?,
-        "ehlers_simple_cycle_indicator_kernel" => crate::load_cuda_embedded_module!("ehlers_simple_cycle_indicator_kernel")?,
-        "ehlers_smoothed_adaptive_momentum_kernel" => crate::load_cuda_embedded_module!("ehlers_smoothed_adaptive_momentum_kernel")?,
+        "ehlers_detrending_filter_kernel" => {
+            crate::load_cuda_embedded_module!("ehlers_detrending_filter_kernel")?
+        }
+        "ehlers_simple_cycle_indicator_kernel" => {
+            crate::load_cuda_embedded_module!("ehlers_simple_cycle_indicator_kernel")?
+        }
+        "ehlers_smoothed_adaptive_momentum_kernel" => {
+            crate::load_cuda_embedded_module!("ehlers_smoothed_adaptive_momentum_kernel")?
+        }
         "ewma_volatility_kernel" => crate::load_cuda_embedded_module!("ewma_volatility_kernel")?,
-        "fractal_dimension_index_kernel" => crate::load_cuda_embedded_module!("fractal_dimension_index_kernel")?,
-        "gopalakrishnan_range_index_kernel" => crate::load_cuda_embedded_module!("gopalakrishnan_range_index_kernel")?,
-        "garman_klass_volatility_kernel" => crate::load_cuda_embedded_module!("garman_klass_volatility_kernel")?,
+        "fractal_dimension_index_kernel" => {
+            crate::load_cuda_embedded_module!("fractal_dimension_index_kernel")?
+        }
+        "gopalakrishnan_range_index_kernel" => {
+            crate::load_cuda_embedded_module!("gopalakrishnan_range_index_kernel")?
+        }
+        "garman_klass_volatility_kernel" => {
+            crate::load_cuda_embedded_module!("garman_klass_volatility_kernel")?
+        }
         "impulse_macd_kernel" => crate::load_cuda_embedded_module!("impulse_macd_kernel")?,
         "hypertrend_kernel" => crate::load_cuda_embedded_module!("hypertrend_kernel")?,
         "emd_trend_kernel" => crate::load_cuda_embedded_module!("emd_trend_kernel")?,
@@ -4234,34 +4428,64 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "ehlers_pma_kernel" => crate::load_cuda_embedded_module!("ehlers_pma_kernel")?,
         "eri_kernel" => crate::load_cuda_embedded_module!("eri_kernel")?,
         // ---------------------------------------------------------- closer 1
-        "absolute_strength_index_oscillator_kernel" => crate::load_cuda_embedded_module!("absolute_strength_index_oscillator_kernel")?,
-        "accumulation_swing_index_kernel" => crate::load_cuda_embedded_module!("accumulation_swing_index_kernel")?,
-        "adaptive_bandpass_trigger_oscillator_kernel" => crate::load_cuda_embedded_module!("adaptive_bandpass_trigger_oscillator_kernel")?,
-        "adaptive_bounds_rsi_kernel" => crate::load_cuda_embedded_module!("adaptive_bounds_rsi_kernel")?,
+        "absolute_strength_index_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("absolute_strength_index_oscillator_kernel")?
+        }
+        "accumulation_swing_index_kernel" => {
+            crate::load_cuda_embedded_module!("accumulation_swing_index_kernel")?
+        }
+        "adaptive_bandpass_trigger_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("adaptive_bandpass_trigger_oscillator_kernel")?
+        }
+        "adaptive_bounds_rsi_kernel" => {
+            crate::load_cuda_embedded_module!("adaptive_bounds_rsi_kernel")?
+        }
         "adaptive_macd_kernel" => crate::load_cuda_embedded_module!("adaptive_macd_kernel")?,
-        "adaptive_momentum_oscillator_kernel" => crate::load_cuda_embedded_module!("adaptive_momentum_oscillator_kernel")?,
-        "advance_decline_line_kernel" => crate::load_cuda_embedded_module!("advance_decline_line_kernel")?,
-        "andean_oscillator_kernel" => crate::load_cuda_embedded_module!("andean_oscillator_kernel")?,
+        "adaptive_momentum_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("adaptive_momentum_oscillator_kernel")?
+        }
+        "advance_decline_line_kernel" => {
+            crate::load_cuda_embedded_module!("advance_decline_line_kernel")?
+        }
+        "andean_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("andean_oscillator_kernel")?
+        }
         "atr_percentile_kernel" => crate::load_cuda_embedded_module!("atr_percentile_kernel")?,
         "bop_kernel" => crate::load_cuda_embedded_module!("bop_kernel")?,
-        "bull_power_vs_bear_power_kernel" => crate::load_cuda_embedded_module!("bull_power_vs_bear_power_kernel")?,
+        "bull_power_vs_bear_power_kernel" => {
+            crate::load_cuda_embedded_module!("bull_power_vs_bear_power_kernel")?
+        }
         "cg_kernel" => crate::load_cuda_embedded_module!("cg_kernel")?,
         "coppock_kernel" => crate::load_cuda_embedded_module!("coppock_kernel")?,
         "daily_factor_kernel" => crate::load_cuda_embedded_module!("daily_factor_kernel")?,
-        "decisionpoint_breadth_swenlin_trading_oscillator_kernel" => crate::load_cuda_embedded_module!("decisionpoint_breadth_swenlin_trading_oscillator_kernel")?,
+        "decisionpoint_breadth_swenlin_trading_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!(
+                "decisionpoint_breadth_swenlin_trading_oscillator_kernel"
+            )?
+        }
         "didi_index_kernel" => crate::load_cuda_embedded_module!("didi_index_kernel")?,
         "disparity_index_kernel" => crate::load_cuda_embedded_module!("disparity_index_kernel")?,
         "dm_kernel" => crate::load_cuda_embedded_module!("dm_kernel")?,
-        "donchian_channel_width_kernel" => crate::load_cuda_embedded_module!("donchian_channel_width_kernel")?,
+        "donchian_channel_width_kernel" => {
+            crate::load_cuda_embedded_module!("donchian_channel_width_kernel")?
+        }
         "dpo_kernel" => crate::load_cuda_embedded_module!("dpo_kernel")?,
         // ---------------------------------------------------------- closer 2b
-        "ehlers_fm_demodulator_kernel" => crate::load_cuda_embedded_module!("ehlers_fm_demodulator_kernel")?,
-        "forward_backward_exponential_oscillator_kernel" => crate::load_cuda_embedded_module!("forward_backward_exponential_oscillator_kernel")?,
+        "ehlers_fm_demodulator_kernel" => {
+            crate::load_cuda_embedded_module!("ehlers_fm_demodulator_kernel")?
+        }
+        "forward_backward_exponential_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("forward_backward_exponential_oscillator_kernel")?
+        }
         "gmma_oscillator_kernel" => crate::load_cuda_embedded_module!("gmma_oscillator_kernel")?,
-        "evasive_supertrend_kernel" => crate::load_cuda_embedded_module!("evasive_supertrend_kernel")?,
+        "evasive_supertrend_kernel" => {
+            crate::load_cuda_embedded_module!("evasive_supertrend_kernel")?
+        }
         // ------------------------------------------------- closer 6, round 2
         "msw_kernel" => crate::load_cuda_embedded_module!("msw_kernel")?,
-        "yang_zhang_volatility_kernel" => crate::load_cuda_embedded_module!("yang_zhang_volatility_kernel")?,
+        "yang_zhang_volatility_kernel" => {
+            crate::load_cuda_embedded_module!("yang_zhang_volatility_kernel")?
+        }
         "qqe_kernel" => crate::load_cuda_embedded_module!("qqe_kernel")?,
         "srsi_kernel" => crate::load_cuda_embedded_module!("srsi_kernel")?,
         "rvi_kernel" => crate::load_cuda_embedded_module!("rvi_kernel")?,
@@ -4363,27 +4587,55 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
             crate::load_cuda_embedded_module!("ict_propulsion_block_kernel")?
         }
         // ---------------------------------------------- closer 4, round 2
-        "kase_peak_oscillator_with_divergences_kernel" => crate::load_cuda_embedded_module!("kase_peak_oscillator_with_divergences_kernel")?,
-        "keltner_channel_width_oscillator_kernel" => crate::load_cuda_embedded_module!("keltner_channel_width_oscillator_kernel")?,
+        "kase_peak_oscillator_with_divergences_kernel" => {
+            crate::load_cuda_embedded_module!("kase_peak_oscillator_with_divergences_kernel")?
+        }
+        "keltner_channel_width_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("keltner_channel_width_oscillator_kernel")?
+        }
         "kst_kernel" => crate::load_cuda_embedded_module!("kst_kernel")?,
-        "leavitt_convolution_acceleration_kernel" => crate::load_cuda_embedded_module!("leavitt_convolution_acceleration_kernel")?,
-        "market_meanness_index_kernel" => crate::load_cuda_embedded_module!("market_meanness_index_kernel")?,
-        "market_structure_confluence_kernel" => crate::load_cuda_embedded_module!("market_structure_confluence_kernel")?,
-        "monotonicity_index_kernel" => crate::load_cuda_embedded_module!("monotonicity_index_kernel")?,
-        "premier_rsi_oscillator_kernel" => crate::load_cuda_embedded_module!("premier_rsi_oscillator_kernel")?,
-        "pretty_good_oscillator_kernel" => crate::load_cuda_embedded_module!("pretty_good_oscillator_kernel")?,
-        "price_density_market_noise_kernel" => crate::load_cuda_embedded_module!("price_density_market_noise_kernel")?,
-        "projection_oscillator_kernel" => crate::load_cuda_embedded_module!("projection_oscillator_kernel")?,
-        "qqe_weighted_oscillator_kernel" => crate::load_cuda_embedded_module!("qqe_weighted_oscillator_kernel")?,
-        "rogers_satchell_volatility_kernel" => crate::load_cuda_embedded_module!("rogers_satchell_volatility_kernel")?,
-        "rolling_skewness_kurtosis_kernel" => crate::load_cuda_embedded_module!("rolling_skewness_kurtosis_kernel")?,
+        "leavitt_convolution_acceleration_kernel" => {
+            crate::load_cuda_embedded_module!("leavitt_convolution_acceleration_kernel")?
+        }
+        "market_meanness_index_kernel" => {
+            crate::load_cuda_embedded_module!("market_meanness_index_kernel")?
+        }
+        "market_structure_confluence_kernel" => {
+            crate::load_cuda_embedded_module!("market_structure_confluence_kernel")?
+        }
+        "monotonicity_index_kernel" => {
+            crate::load_cuda_embedded_module!("monotonicity_index_kernel")?
+        }
+        "premier_rsi_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("premier_rsi_oscillator_kernel")?
+        }
+        "pretty_good_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("pretty_good_oscillator_kernel")?
+        }
+        "price_density_market_noise_kernel" => {
+            crate::load_cuda_embedded_module!("price_density_market_noise_kernel")?
+        }
+        "projection_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("projection_oscillator_kernel")?
+        }
+        "qqe_weighted_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("qqe_weighted_oscillator_kernel")?
+        }
+        "rogers_satchell_volatility_kernel" => {
+            crate::load_cuda_embedded_module!("rogers_satchell_volatility_kernel")?
+        }
+        "rolling_skewness_kurtosis_kernel" => {
+            crate::load_cuda_embedded_module!("rolling_skewness_kurtosis_kernel")?
+        }
         "smooth_theil_sen_kernel" => crate::load_cuda_embedded_module!("smooth_theil_sen_kernel")?,
         // ------------------------------------------ closer 4, round 3
         "bandpass_kernel" => crate::load_cuda_embedded_module!("bandpass_kernel")?,
         "buff_averages_kernel" => crate::load_cuda_embedded_module!("buff_averages_kernel")?,
         "cora_wave_kernel" => crate::load_cuda_embedded_module!("cora_wave_kernel")?,
         "dma_kernel" => crate::load_cuda_embedded_module!("dma_kernel")?,
-        "fvg_trailing_stop_kernel" => crate::load_cuda_embedded_module!("fvg_trailing_stop_kernel")?,
+        "fvg_trailing_stop_kernel" => {
+            crate::load_cuda_embedded_module!("fvg_trailing_stop_kernel")?
+        }
         "halftrend_kernel" => crate::load_cuda_embedded_module!("halftrend_kernel")?,
         "mod_god_mode_kernel" => crate::load_cuda_embedded_module!("mod_god_mode_kernel")?,
         "ott_kernel" => crate::load_cuda_embedded_module!("ott_kernel")?,
@@ -4405,23 +4657,51 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         }
         "wave_smoother_kernel" => crate::load_cuda_embedded_module!("wave_smoother_kernel")?,
         // --------------------------------------------------- closer 5, round 2
-        "smoothed_gaussian_trend_filter_kernel" => crate::load_cuda_embedded_module!("smoothed_gaussian_trend_filter_kernel")?,
-        "spearman_correlation_kernel" => crate::load_cuda_embedded_module!("spearman_correlation_kernel")?,
+        "smoothed_gaussian_trend_filter_kernel" => {
+            crate::load_cuda_embedded_module!("smoothed_gaussian_trend_filter_kernel")?
+        }
+        "spearman_correlation_kernel" => {
+            crate::load_cuda_embedded_module!("spearman_correlation_kernel")?
+        }
         "squeeze_index_kernel" => crate::load_cuda_embedded_module!("squeeze_index_kernel")?,
-        "standardized_psar_oscillator_kernel" => crate::load_cuda_embedded_module!("standardized_psar_oscillator_kernel")?,
-        "statistical_trailing_stop_kernel" => crate::load_cuda_embedded_module!("statistical_trailing_stop_kernel")?,
-        "stochastic_adaptive_d_kernel" => crate::load_cuda_embedded_module!("stochastic_adaptive_d_kernel")?,
-        "stochastic_connors_rsi_kernel" => crate::load_cuda_embedded_module!("stochastic_connors_rsi_kernel")?,
-        "stochastic_distance_kernel" => crate::load_cuda_embedded_module!("stochastic_distance_kernel")?,
-        "stochastic_money_flow_index_kernel" => crate::load_cuda_embedded_module!("stochastic_money_flow_index_kernel")?,
+        "standardized_psar_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("standardized_psar_oscillator_kernel")?
+        }
+        "statistical_trailing_stop_kernel" => {
+            crate::load_cuda_embedded_module!("statistical_trailing_stop_kernel")?
+        }
+        "stochastic_adaptive_d_kernel" => {
+            crate::load_cuda_embedded_module!("stochastic_adaptive_d_kernel")?
+        }
+        "stochastic_connors_rsi_kernel" => {
+            crate::load_cuda_embedded_module!("stochastic_connors_rsi_kernel")?
+        }
+        "stochastic_distance_kernel" => {
+            crate::load_cuda_embedded_module!("stochastic_distance_kernel")?
+        }
+        "stochastic_money_flow_index_kernel" => {
+            crate::load_cuda_embedded_module!("stochastic_money_flow_index_kernel")?
+        }
         "supertrend_kernel" => crate::load_cuda_embedded_module!("supertrend_kernel")?,
-        "supertrend_oscillator_kernel" => crate::load_cuda_embedded_module!("supertrend_oscillator_kernel")?,
-        "supertrend_recovery_kernel" => crate::load_cuda_embedded_module!("supertrend_recovery_kernel")?,
+        "supertrend_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("supertrend_oscillator_kernel")?
+        }
+        "supertrend_recovery_kernel" => {
+            crate::load_cuda_embedded_module!("supertrend_recovery_kernel")?
+        }
         "trend_flow_trail_kernel" => crate::load_cuda_embedded_module!("trend_flow_trail_kernel")?,
-        "twiggs_money_flow_kernel" => crate::load_cuda_embedded_module!("twiggs_money_flow_kernel")?,
-        "volatility_quality_index_kernel" => crate::load_cuda_embedded_module!("volatility_quality_index_kernel")?,
-        "vwap_deviation_oscillator_kernel" => crate::load_cuda_embedded_module!("vwap_deviation_oscillator_kernel")?,
-        "vwap_zscore_with_signals_kernel" => crate::load_cuda_embedded_module!("vwap_zscore_with_signals_kernel")?,
+        "twiggs_money_flow_kernel" => {
+            crate::load_cuda_embedded_module!("twiggs_money_flow_kernel")?
+        }
+        "volatility_quality_index_kernel" => {
+            crate::load_cuda_embedded_module!("volatility_quality_index_kernel")?
+        }
+        "vwap_deviation_oscillator_kernel" => {
+            crate::load_cuda_embedded_module!("vwap_deviation_oscillator_kernel")?
+        }
+        "vwap_zscore_with_signals_kernel" => {
+            crate::load_cuda_embedded_module!("vwap_zscore_with_signals_kernel")?
+        }
         "adosc_kernel" => crate::load_cuda_embedded_module!("adosc_kernel")?,
         // ---------------------------------------------- closer 5, round 3
         "rsmk_kernel" => crate::load_cuda_embedded_module!("rsmk_kernel")?,
@@ -4431,15 +4711,15 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "mab_kernel" => crate::load_cuda_embedded_module!("mab_kernel")?,
         "macz_kernel" => crate::load_cuda_embedded_module!("macz_kernel")?,
         "vwmacd_kernel" => crate::load_cuda_embedded_module!("vwmacd_kernel")?,
-        "corrected_moving_average_kernel" => crate::load_cuda_embedded_module!("corrected_moving_average_kernel")?,
-        "ehlers_undersampled_double_moving_average_kernel" => crate::load_cuda_embedded_module!("ehlers_undersampled_double_moving_average_kernel")?,
+        "corrected_moving_average_kernel" => {
+            crate::load_cuda_embedded_module!("corrected_moving_average_kernel")?
+        }
+        "ehlers_undersampled_double_moving_average_kernel" => {
+            crate::load_cuda_embedded_module!("ehlers_undersampled_double_moving_average_kernel")?
+        }
         // ---------------------------------------------- closer 3, round 3
-        "reversal_signals_kernel" => {
-            crate::load_cuda_embedded_module!("reversal_signals_kernel")?
-        }
-        "trend_follower_kernel" => {
-            crate::load_cuda_embedded_module!("trend_follower_kernel")?
-        }
+        "reversal_signals_kernel" => crate::load_cuda_embedded_module!("reversal_signals_kernel")?,
+        "trend_follower_kernel" => crate::load_cuda_embedded_module!("trend_follower_kernel")?,
         "vdubus_divergence_wave_pattern_generator_kernel" => {
             crate::load_cuda_embedded_module!("vdubus_divergence_wave_pattern_generator_kernel")?
         }
@@ -4455,31 +4735,23 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "volume_weighted_stochastic_rsi_kernel" => {
             crate::load_cuda_embedded_module!("volume_weighted_stochastic_rsi_kernel")?
         }
-        "zig_zag_channels_kernel" => {
-            crate::load_cuda_embedded_module!("zig_zag_channels_kernel")?
-        }
-        "alphatrend_kernel" => {
-            crate::load_cuda_embedded_module!("alphatrend_kernel")?
-        }
-        "avsl_kernel" => {
-            crate::load_cuda_embedded_module!("avsl_kernel")?
-        }
+        "zig_zag_channels_kernel" => crate::load_cuda_embedded_module!("zig_zag_channels_kernel")?,
+        "alphatrend_kernel" => crate::load_cuda_embedded_module!("alphatrend_kernel")?,
+        "avsl_kernel" => crate::load_cuda_embedded_module!("avsl_kernel")?,
         // ---------------------------------------------------- closer 2, round 3
         "neighboring_trailing_stop_kernel" => {
             crate::load_cuda_embedded_module!("neighboring_trailing_stop_kernel")?
         }
-        "nonlinear_regression_zero_lag_moving_average_kernel" => {
-            crate::load_cuda_embedded_module!("nonlinear_regression_zero_lag_moving_average_kernel")?
-        }
+        "nonlinear_regression_zero_lag_moving_average_kernel" => crate::load_cuda_embedded_module!(
+            "nonlinear_regression_zero_lag_moving_average_kernel"
+        )?,
         "normalized_resonator_kernel" => {
             crate::load_cuda_embedded_module!("normalized_resonator_kernel")?
         }
         "normalized_volume_true_range_kernel" => {
             crate::load_cuda_embedded_module!("normalized_volume_true_range_kernel")?
         }
-        "possible_rsi_kernel" => {
-            crate::load_cuda_embedded_module!("possible_rsi_kernel")?
-        }
+        "possible_rsi_kernel" => crate::load_cuda_embedded_module!("possible_rsi_kernel")?,
         "price_moving_average_ratio_percentile_kernel" => {
             crate::load_cuda_embedded_module!("price_moving_average_ratio_percentile_kernel")?
         }
@@ -4508,9 +4780,7 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
         "ichimoku_oscillator_kernel" => {
             crate::load_cuda_embedded_module!("ichimoku_oscillator_kernel")?
         }
-        "insync_index_kernel" => {
-            crate::load_cuda_embedded_module!("insync_index_kernel")?
-        }
+        "insync_index_kernel" => crate::load_cuda_embedded_module!("insync_index_kernel")?,
         "linear_regression_intensity_kernel" => {
             crate::load_cuda_embedded_module!("linear_regression_intensity_kernel")?
         }
@@ -4530,9 +4800,11 @@ fn load_f64_module(stem: &str) -> Result<Module, CudaF64IndicatorError> {
             return Err(CudaF64IndicatorError::InvalidInput {
                 indicator: "<module>",
                 reason: format!(
-                    "no embedded fatbin arm for f64 module '{other}'. Add it to                      `load_f64_module` and to `build.rs`; this lane will not guess a module                      name or fall back to another one."
+                    "no exact native cubin arm for f64 module '{other}'. Add it to \
+                     `load_f64_module` and to `build.rs`; this lane will not guess a module \
+                     name or fall back to another one."
                 ),
-            })
+            });
         }
     };
     Ok(m)
@@ -4665,6 +4937,14 @@ impl F64Inputs {
     }
 }
 
+/// Typed state retained for the one authoritative serial RegistryRatio HCE-v2
+/// launch. Keeping counts/ring cursors in `i32` prevents an undocumented
+/// integer-through-f64 ABI and keeps sync/resident ownership identical.
+struct HceStableScratchV2 {
+    scratch_f64: DeviceBuffer<f64>,
+    scratch_i32: DeviceBuffer<i32>,
+}
+
 /// A completed sweep: `rows` period-series of `cols` bars, row-major, resident
 /// on the device.
 pub struct F64SweepResult {
@@ -4695,6 +4975,679 @@ impl F64SweepResult {
     }
 }
 
+/// One primary f64 sweep whose output and every asynchronous parameter/scratch
+/// allocation remain resident until an outer event owner retires them.
+#[must_use = "resident sweep outputs must be event-retired on their exact CUDA stream"]
+pub struct F64ResidentSweepResultV3 {
+    indicator_id: &'static str,
+    entry_point: &'static str,
+    output_id: &'static str,
+    output: Option<DeviceBuffer<f64>>,
+    rows: usize,
+    cols: usize,
+    device_id: u32,
+    parameter_i32_host: Vec<LockedBuffer<i32>>,
+    parameter_i32: Vec<DeviceBuffer<i32>>,
+    parameter_f64_host: Vec<LockedBuffer<f64>>,
+    parameter_f64: Vec<DeviceBuffer<f64>>,
+    scratch_f64: Vec<DeviceBuffer<f64>>,
+    scratch_i32: Vec<DeviceBuffer<i32>>,
+    session: Arc<CudaSession>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct F64ResidentObservedRouteManifestV3 {
+    pub indicator_id: &'static str,
+    pub entry_point: &'static str,
+    pub output_ids: Vec<&'static str>,
+    pub rows: usize,
+    pub cols: usize,
+    pub device_id: u32,
+    pub compiled_architectures: &'static [u32],
+    pub compiled_arch_source: &'static str,
+    pub compiled_nvcc_version: &'static str,
+    pub exact_math_authority: &'static str,
+}
+
+/// Pure, move-only VectorTA sizing authority for one resident primary sweep
+/// row. Classic TA uses one canonical parameter tuple per primary launch, so
+/// the complete device allocation set is knowable without a CUDA context or a
+/// live memory probe. Named multi-output launches require their own owner plan.
+#[derive(Debug, PartialEq, Eq)]
+pub struct F64ResidentSingleSweepAllocationPlanV4 {
+    kernel: F64Kernel,
+    period: i32,
+    columns: usize,
+    output_bytes: usize,
+    parameter_i32_bytes: usize,
+    parameter_f64_bytes: usize,
+    scratch_f64_bytes: usize,
+    scratch_i32_bytes: usize,
+    chunk_rows: usize,
+}
+
+impl F64ResidentSingleSweepAllocationPlanV4 {
+    pub const fn kernel(&self) -> F64Kernel {
+        self.kernel
+    }
+
+    pub const fn period(&self) -> i32 {
+        self.period
+    }
+
+    pub const fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub const fn output_bytes(&self) -> usize {
+        self.output_bytes
+    }
+
+    pub const fn parameter_i32_bytes(&self) -> usize {
+        self.parameter_i32_bytes
+    }
+
+    pub const fn parameter_f64_bytes(&self) -> usize {
+        self.parameter_f64_bytes
+    }
+
+    pub const fn scratch_f64_bytes(&self) -> usize {
+        self.scratch_f64_bytes
+    }
+
+    pub const fn scratch_i32_bytes(&self) -> usize {
+        self.scratch_i32_bytes
+    }
+
+    pub const fn chunk_rows(&self) -> usize {
+        self.chunk_rows
+    }
+
+    pub fn retained_parameter_bytes(&self) -> Result<usize, CudaF64IndicatorError> {
+        self.parameter_i32_bytes
+            .checked_add(self.parameter_f64_bytes)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: self.kernel.indicator_id(),
+                reason: "resident single-sweep parameter byte count overflow".into(),
+            })
+    }
+
+    pub fn retained_scratch_bytes(&self) -> Result<usize, CudaF64IndicatorError> {
+        self.scratch_f64_bytes
+            .checked_add(self.scratch_i32_bytes)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: self.kernel.indicator_id(),
+                reason: "resident single-sweep scratch byte count overflow".into(),
+            })
+    }
+}
+
+/// Derive the exact primary-output, parameter and scratch allocations used by
+/// the strict one-row resident sweep. This function is context-free and never
+/// queries CUDA memory or creates a host/device allocation.
+pub fn preflight_resident_single_sweep_allocation_v4(
+    kernel: F64Kernel,
+    periods: &[i32],
+    columns: usize,
+) -> Result<F64ResidentSingleSweepAllocationPlanV4, CudaF64IndicatorError> {
+    let indicator = kernel.indicator_id();
+    let [period] = periods else {
+        return Err(CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: format!(
+                "resident single-sweep preflight needs exactly one period row, got {}",
+                periods.len()
+            ),
+        });
+    };
+    if *period <= 0 || columns == 0 {
+        return Err(CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: format!(
+                "resident single-sweep preflight needs a positive period and nonzero columns, got period={period} columns={columns}"
+            ),
+        });
+    }
+    if let Some(maximum) = kernel.max_period() {
+        if usize::try_from(*period).map_or(true, |period| period > maximum) {
+            return Err(CudaF64IndicatorError::PeriodTooLarge {
+                indicator,
+                period: usize::try_from(*period).unwrap_or(usize::MAX),
+                max: maximum,
+            });
+        }
+    }
+    let output_bytes = columns
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: "resident single-sweep output byte count overflow".into(),
+        })?;
+    let parameter_i32_bytes = std::mem::size_of::<i32>();
+    let parameter_f64_bytes = exact_coefficient_stride_v3(kernel, periods)?
+        .unwrap_or(0)
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: "resident single-sweep coefficient byte count overflow".into(),
+        })?;
+    let scratch_f64_elements = if kernel == F64Kernel::HalfCausalEstimator {
+        HCE_V2_SCRATCH_F64_ELEMS
+    } else if kernel == F64Kernel::Cci {
+        columns
+    } else {
+        0
+    };
+    let scratch_f64_bytes = scratch_f64_elements
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: "resident single-sweep f64 scratch byte count overflow".into(),
+        })?;
+    let scratch_i32_elements = if kernel == F64Kernel::HalfCausalEstimator {
+        HCE_V2_SCRATCH_I32_ELEMS
+    } else {
+        0
+    };
+    let scratch_i32_bytes = scratch_i32_elements
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: "resident single-sweep i32 scratch byte count overflow".into(),
+        })?;
+    Ok(F64ResidentSingleSweepAllocationPlanV4 {
+        kernel,
+        period: *period,
+        columns,
+        output_bytes,
+        parameter_i32_bytes,
+        parameter_f64_bytes,
+        scratch_f64_bytes,
+        scratch_i32_bytes,
+        chunk_rows: 1,
+    })
+}
+
+impl std::fmt::Debug for F64ResidentSweepResultV3 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("F64ResidentSweepResultV3")
+            .field("indicator_id", &self.indicator_id)
+            .field("entry_point", &self.entry_point)
+            .field("output_id", &self.output_id)
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("device_id", &self.device_id)
+            .finish()
+    }
+}
+
+impl F64ResidentSweepResultV3 {
+    pub const fn indicator_id(&self) -> &'static str {
+        self.indicator_id
+    }
+
+    pub const fn entry_point(&self) -> &'static str {
+        self.entry_point
+    }
+
+    pub const fn output_id(&self) -> &'static str {
+        self.output_id
+    }
+
+    pub fn output_buffer(&self) -> &DeviceBuffer<f64> {
+        self.output
+            .as_ref()
+            .expect("live resident sweep retains its output buffer")
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub const fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub const fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    pub fn session_identity(&self) -> CudaSessionIdentity {
+        self.session.identity()
+    }
+
+    pub fn route_manifest_v3(&self) -> F64ResidentObservedRouteManifestV3 {
+        F64ResidentObservedRouteManifestV3 {
+            indicator_id: self.indicator_id,
+            entry_point: self.entry_point,
+            output_ids: vec![self.output_id],
+            rows: self.rows,
+            cols: self.cols,
+            device_id: self.device_id,
+            compiled_architectures: crate::cuda::module_loader::COMPILED_ARCHS,
+            compiled_arch_source: crate::cuda::module_loader::COMPILED_ARCH_SOURCE,
+            compiled_nvcc_version: crate::cuda::module_loader::COMPILED_NVCC_VERSION,
+            exact_math_authority: F64_EXACT_MATH_AUTHORITY_V3,
+        }
+    }
+
+    pub fn retained_parameter_bytes(&self) -> usize {
+        let i32_bytes = self
+            .parameter_i32
+            .iter()
+            .map(|buffer| buffer.len().saturating_mul(std::mem::size_of::<i32>()))
+            .sum::<usize>();
+        let f64_bytes = self
+            .parameter_f64
+            .iter()
+            .map(|buffer| buffer.len().saturating_mul(std::mem::size_of::<f64>()))
+            .sum::<usize>();
+        i32_bytes.saturating_add(f64_bytes)
+    }
+
+    pub fn retained_scratch_bytes(&self) -> usize {
+        self.scratch_f64
+            .iter()
+            .map(|buffer| buffer.len().saturating_mul(std::mem::size_of::<f64>()))
+            .chain(
+                self.scratch_i32
+                    .iter()
+                    .map(|buffer| buffer.len().saturating_mul(std::mem::size_of::<i32>())),
+            )
+            .sum()
+    }
+
+    pub fn enqueue_release_v3(self, release_stream: &Stream) -> Result<(), CudaF64IndicatorError> {
+        if release_stream.as_inner().is_null()
+            || release_stream.as_inner() != self.session.stream().as_inner()
+        {
+            let indicator = self.indicator_id;
+            std::mem::forget(self);
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: "resident primary output release stream does not match its launch stream"
+                    .into(),
+            });
+        }
+        let mut this = ManuallyDrop::new(self);
+        let output = this
+            .output
+            .take()
+            .expect("live resident sweep retains its output buffer");
+        // SAFETY: `this` cannot run Drop, and all vectors/session are moved
+        // exactly once into the explicit stream-ordered release path.
+        let (
+            parameter_i32_host,
+            parameter_i32,
+            parameter_f64_host,
+            parameter_f64,
+            scratch_f64,
+            scratch_i32,
+            session,
+        ) = unsafe {
+            (
+                std::ptr::read(&this.parameter_i32_host),
+                std::ptr::read(&this.parameter_i32),
+                std::ptr::read(&this.parameter_f64_host),
+                std::ptr::read(&this.parameter_f64),
+                std::ptr::read(&this.scratch_f64),
+                std::ptr::read(&this.scratch_i32),
+                std::ptr::read(&this.session),
+            )
+        };
+        let mut all_f64 = vec![output];
+        all_f64.extend(scratch_f64);
+        all_f64.extend(parameter_f64);
+        if let Err(error) = enqueue_buffer_vec_release_v3(all_f64, release_stream) {
+            std::mem::forget(parameter_i32_host);
+            std::mem::forget(parameter_i32);
+            std::mem::forget(parameter_f64_host);
+            std::mem::forget(scratch_i32);
+            std::mem::forget(session);
+            return Err(error.into());
+        }
+        let mut all_i32 = parameter_i32;
+        all_i32.extend(scratch_i32);
+        if let Err(error) = enqueue_buffer_vec_release_v3(all_i32, release_stream) {
+            std::mem::forget(parameter_i32_host);
+            std::mem::forget(parameter_f64_host);
+            std::mem::forget(session);
+            return Err(error.into());
+        }
+        drop(parameter_i32_host);
+        drop(parameter_f64_host);
+        drop(session);
+        Ok(())
+    }
+}
+
+impl Drop for F64ResidentSweepResultV3 {
+    fn drop(&mut self) {
+        if let Some(output) = self.output.take() {
+            std::mem::forget(output);
+        }
+        std::mem::forget(std::mem::take(&mut self.parameter_i32_host));
+        std::mem::forget(std::mem::take(&mut self.parameter_i32));
+        std::mem::forget(std::mem::take(&mut self.parameter_f64_host));
+        std::mem::forget(std::mem::take(&mut self.parameter_f64));
+        std::mem::forget(std::mem::take(&mut self.scratch_f64));
+        std::mem::forget(std::mem::take(&mut self.scratch_i32));
+    }
+}
+
+/// One exact named f64 feature matrix produced by a multi-output launch.
+pub struct F64NamedDeviceOutput {
+    pub output_id: &'static str,
+    pub matrix: CudaDeviceMatrixF64,
+}
+
+/// A whole multi-output indicator launch kept resident as one lifetime unit.
+///
+/// The parameter buffers are intentionally owned beside the outputs: CUDA
+/// launches are asynchronous, so dropping those buffers at method return
+/// would create a device use-after-free. `Drop` waits on the same shared
+/// session before any owned buffer can be released when a caller forgot the
+/// normal frame-level synchronization.
+pub struct F64NamedOutputsResult {
+    pub indicator_id: &'static str,
+    pub entry_point: &'static str,
+    pub outputs: Vec<F64NamedDeviceOutput>,
+    pub rows: usize,
+    pub cols: usize,
+    _parameter_i32: Vec<DeviceBuffer<i32>>,
+    _parameter_f64: Vec<DeviceBuffer<f64>>,
+    _scratch_f64: Vec<DeviceBuffer<f64>>,
+    _scratch_i32: Vec<DeviceBuffer<i32>>,
+    session: Arc<CudaSession>,
+}
+
+/// Move-only ownership of one named resident f64 launch.
+///
+/// This is deliberately not a route or device-admission authority. It merely
+/// keeps every allocation read by the already-enqueued launch alive so an
+/// outer, opaque runtime can record a ready event and retire the allocations
+/// on the exact borrowed stream without invoking [`F64NamedOutputsResult`]'s
+/// compatibility `Drop` synchronization.
+#[must_use = "resident named outputs must be event-retired on their exact CUDA stream"]
+pub struct F64ResidentNamedPartsV3 {
+    indicator_id: &'static str,
+    entry_point: &'static str,
+    outputs: Vec<F64NamedDeviceOutput>,
+    rows: usize,
+    cols: usize,
+    parameter_i32: Vec<DeviceBuffer<i32>>,
+    parameter_f64: Vec<DeviceBuffer<f64>>,
+    scratch_f64: Vec<DeviceBuffer<f64>>,
+    scratch_i32: Vec<DeviceBuffer<i32>>,
+    session: Arc<CudaSession>,
+}
+
+impl std::fmt::Debug for F64ResidentNamedPartsV3 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("F64ResidentNamedPartsV3")
+            .field("indicator_id", &self.indicator_id)
+            .field("entry_point", &self.entry_point)
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("outputs", &self.outputs.len())
+            .field("device_id", &self.session.device_id())
+            .finish()
+    }
+}
+
+impl F64NamedOutputsResult {
+    /// Consume the compatibility result without running its synchronizing
+    /// destructor and transfer every output/parameter/scratch/session lifetime
+    /// into one resident owner.
+    pub fn into_resident_parts_v3(self) -> F64ResidentNamedPartsV3 {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `this` will never be dropped. Each field is moved exactly
+        // once into the successor owner, which preserves the complete launch
+        // lifetime set.
+        unsafe {
+            F64ResidentNamedPartsV3 {
+                indicator_id: this.indicator_id,
+                entry_point: this.entry_point,
+                outputs: std::ptr::read(&this.outputs),
+                rows: this.rows,
+                cols: this.cols,
+                parameter_i32: std::ptr::read(&this._parameter_i32),
+                parameter_f64: std::ptr::read(&this._parameter_f64),
+                scratch_f64: std::ptr::read(&this._scratch_f64),
+                scratch_i32: std::ptr::read(&this._scratch_i32),
+                session: std::ptr::read(&this.session),
+            }
+        }
+    }
+}
+
+impl F64ResidentNamedPartsV3 {
+    pub const fn indicator_id(&self) -> &'static str {
+        self.indicator_id
+    }
+
+    pub const fn entry_point(&self) -> &'static str {
+        self.entry_point
+    }
+
+    pub fn outputs(&self) -> &[F64NamedDeviceOutput] {
+        &self.outputs
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub const fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn device_id(&self) -> u32 {
+        self.session.device_id()
+    }
+
+    pub fn session_identity(&self) -> CudaSessionIdentity {
+        self.session.identity()
+    }
+
+    pub fn route_manifest_v3(&self) -> F64ResidentObservedRouteManifestV3 {
+        F64ResidentObservedRouteManifestV3 {
+            indicator_id: self.indicator_id,
+            entry_point: self.entry_point,
+            output_ids: self.outputs.iter().map(|output| output.output_id).collect(),
+            rows: self.rows,
+            cols: self.cols,
+            device_id: self.session.device_id(),
+            compiled_architectures: crate::cuda::module_loader::COMPILED_ARCHS,
+            compiled_arch_source: crate::cuda::module_loader::COMPILED_ARCH_SOURCE,
+            compiled_nvcc_version: crate::cuda::module_loader::COMPILED_NVCC_VERSION,
+            exact_math_authority: F64_EXACT_MATH_AUTHORITY_V3,
+        }
+    }
+
+    pub fn retained_parameter_bytes(&self) -> usize {
+        self.parameter_i32
+            .iter()
+            .map(|buffer| buffer.len().saturating_mul(std::mem::size_of::<i32>()))
+            .chain(
+                self.parameter_f64
+                    .iter()
+                    .map(|buffer| buffer.len().saturating_mul(std::mem::size_of::<f64>())),
+            )
+            .sum()
+    }
+
+    pub fn retained_scratch_bytes(&self) -> usize {
+        self.scratch_f64
+            .iter()
+            .map(|buffer| buffer.len().saturating_mul(std::mem::size_of::<f64>()))
+            .chain(
+                self.scratch_i32
+                    .iter()
+                    .map(|buffer| buffer.len().saturating_mul(std::mem::size_of::<i32>())),
+            )
+            .sum()
+    }
+
+    /// Retire every owned allocation on the exact launch stream. A stream
+    /// mismatch or CUDA retirement failure leaks the still-live ownership set
+    /// rather than synchronizing or invoking a legacy free while work may be
+    /// queued.
+    pub fn enqueue_release_v3(self, release_stream: &Stream) -> Result<(), CudaF64IndicatorError> {
+        if release_stream.as_inner().is_null()
+            || release_stream.as_inner() != self.session.stream().as_inner()
+        {
+            let indicator = self.indicator_id;
+            std::mem::forget(self);
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: "resident named output release stream does not match its launch stream"
+                    .into(),
+            });
+        }
+
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `this` cannot run the synchronizing Drop implementation.
+        // Every field is moved exactly once into the explicit retirement path.
+        let (outputs, parameter_i32, parameter_f64, scratch_f64, scratch_i32, session) = unsafe {
+            (
+                std::ptr::read(&this.outputs),
+                std::ptr::read(&this.parameter_i32),
+                std::ptr::read(&this.parameter_f64),
+                std::ptr::read(&this.scratch_f64),
+                std::ptr::read(&this.scratch_i32),
+                std::ptr::read(&this.session),
+            )
+        };
+        let output_f64 = outputs
+            .into_iter()
+            .map(|output| output.matrix.into_buffer())
+            .collect::<Vec<_>>();
+        let mut all_f64 = output_f64;
+        all_f64.extend(parameter_f64);
+        all_f64.extend(scratch_f64);
+        if let Err(error) = enqueue_buffer_vec_release_v3(all_f64, release_stream) {
+            std::mem::forget(parameter_i32);
+            std::mem::forget(scratch_i32);
+            std::mem::forget(session);
+            return Err(error.into());
+        }
+        let mut all_i32 = parameter_i32;
+        all_i32.extend(scratch_i32);
+        if let Err(error) = enqueue_buffer_vec_release_v3(all_i32, release_stream) {
+            std::mem::forget(session);
+            return Err(error.into());
+        }
+        drop(session);
+        Ok(())
+    }
+}
+
+impl Drop for F64ResidentNamedPartsV3 {
+    fn drop(&mut self) {
+        // Never host-synchronize or invoke a legacy free from an accidental
+        // early drop. The strict producer consumes through
+        // `enqueue_release_v3`; every other path leaks the queued allocation
+        // set fail-closed so no device work can observe freed memory.
+        for output in std::mem::take(&mut self.outputs) {
+            std::mem::forget(output.matrix);
+        }
+        std::mem::forget(std::mem::take(&mut self.parameter_i32));
+        std::mem::forget(std::mem::take(&mut self.parameter_f64));
+        std::mem::forget(std::mem::take(&mut self.scratch_f64));
+        std::mem::forget(std::mem::take(&mut self.scratch_i32));
+    }
+}
+
+fn enqueue_buffer_vec_release_v3<T: DeviceCopy>(
+    mut buffers: Vec<DeviceBuffer<T>>,
+    stream: &Stream,
+) -> CudaResult<()> {
+    while let Some(buffer) = buffers.pop() {
+        if let Err(error) = buffer.drop_async(stream) {
+            std::mem::forget(buffers);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Runtime launch-capacity evidence for one exact CUDA entry point.
+///
+/// This is deliberately separate from sampled utilization: the CUDA driver
+/// can always report the real launch geometry and theoretical resident-block
+/// limit, even on rented hosts that deny Nsight hardware counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct F64CudaLaunchCapacity {
+    pub entry_point: &'static str,
+    pub logical_work_items: usize,
+    pub grid_blocks: u32,
+    pub threads_per_block: u32,
+    pub multiprocessors: u32,
+    pub max_active_blocks_per_multiprocessor: u32,
+    pub max_threads_per_multiprocessor: u32,
+}
+
+impl Drop for F64NamedOutputsResult {
+    fn drop(&mut self) {
+        let _ = self.session.synchronize();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct F64ScalarParameterDomain {
+    minimum: f64,
+    maximum: f64,
+    minimum_inclusive: bool,
+    maximum_inclusive: bool,
+}
+
+impl F64ScalarParameterDomain {
+    fn contains(self, value: f64) -> bool {
+        let minimum_matches = if self.minimum_inclusive {
+            value >= self.minimum
+        } else {
+            value > self.minimum
+        };
+        let maximum_matches = if self.maximum_inclusive {
+            value <= self.maximum
+        } else {
+            value < self.maximum
+        };
+        value.is_finite() && minimum_matches && maximum_matches
+    }
+
+    fn notation(self) -> String {
+        format!(
+            "{}{}, {}{}",
+            if self.minimum_inclusive { "[" } else { "(" },
+            self.minimum,
+            self.maximum,
+            if self.maximum_inclusive { "]" } else { ")" }
+        )
+    }
+}
+
+/// Verified ABI for a narrow class of kernels:
+/// `(data, len, scalar_parameters, rows, output_0, output_1)`.
+///
+/// A row enters this descriptor only after its CUDA signature has been read;
+/// sharing the launcher never permits one indicator to borrow another one's
+/// kernel, source, validation domain, output identities or formula.
+#[derive(Clone, Copy)]
+struct F64OneScalarTwoOutputSpec {
+    indicator: &'static str,
+    entry_point: &'static str,
+    kernel: F64Kernel,
+    source_name: &'static str,
+    parameter_name: &'static str,
+    parameter_domain: F64ScalarParameterDomain,
+    minimum_valid_samples: usize,
+    output_ids: [&'static str; 2],
+}
+
 /// How many rows fit alongside the scratch this kernel needs.
 ///
 /// NEVER-OOM: this is derived from `mem_get_info`, never from the caller's
@@ -4704,6 +5657,7 @@ fn rows_per_chunk(
     indicator: &'static str,
     cols: usize,
     scratch_matrices: usize,
+    parameter_bytes_per_row: usize,
     headroom: usize,
 ) -> Result<usize, CudaF64IndicatorError> {
     let (free, _total) = mem_get_info()?;
@@ -4712,6 +5666,7 @@ fn rows_per_chunk(
     let per_row = cols
         .checked_mul(std::mem::size_of::<f64>())
         .and_then(|b| b.checked_mul(1 + scratch_matrices))
+        .and_then(|b| b.checked_add(parameter_bytes_per_row))
         .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
             indicator,
             reason: "row byte count overflow".into(),
@@ -4731,6 +5686,162 @@ fn rows_per_chunk(
     Ok(rows)
 }
 
+fn alma_coefficient_stride_v3(periods: &[i32]) -> Result<usize, CudaF64IndicatorError> {
+    let maximum =
+        periods
+            .iter()
+            .copied()
+            .max()
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: "alma",
+                reason: "empty period chunk cannot define an exact coefficient stride".into(),
+            })?;
+    let maximum = usize::try_from(maximum).map_err(|_| CudaF64IndicatorError::InvalidInput {
+        indicator: "alma",
+        reason: format!("period {maximum} is not positive"),
+    })?;
+    if maximum == 0 || maximum > ALMA_MAX_PERIOD {
+        return Err(CudaF64IndicatorError::PeriodTooLarge {
+            indicator: "alma",
+            period: maximum,
+            max: ALMA_MAX_PERIOD,
+        });
+    }
+    maximum
+        .checked_add(1)
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: "alma",
+            reason: "exact coefficient stride overflow".into(),
+        })
+}
+
+fn prepare_alma_exact_coefficient_rows_v3(
+    periods: &[i32],
+) -> Result<(Vec<f64>, usize), CudaF64IndicatorError> {
+    let _semantics = ALMA_TRADINGVIEW_NONFLOORED_SEMANTICS_V1;
+    let stride = alma_coefficient_stride_v3(periods)?;
+    let elements =
+        periods
+            .len()
+            .checked_mul(stride)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: "alma",
+                reason: "exact coefficient matrix extent overflow".into(),
+            })?;
+    let mut coefficients = vec![0.0; elements];
+    for (row, raw_period) in periods.iter().copied().enumerate() {
+        let period =
+            usize::try_from(raw_period).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: "alma",
+                reason: format!("period {raw_period} is not positive"),
+            })?;
+        let (weights, inv_norm) = alma_exact_weight_row(period, 0.85, 6.0).map_err(|error| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: "alma",
+                reason: format!("exact coefficient row {row} failed: {error}"),
+            }
+        })?;
+        let start = row
+            .checked_mul(stride)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: "alma",
+                reason: "exact coefficient row offset overflow".into(),
+            })?;
+        coefficients[start..start + weights.len()].copy_from_slice(&weights);
+        coefficients[start + stride - 1] = inv_norm;
+    }
+    Ok((coefficients, stride))
+}
+
+fn cora_wave_coefficient_stride_v3(periods: &[i32]) -> Result<usize, CudaF64IndicatorError> {
+    let maximum =
+        periods
+            .iter()
+            .copied()
+            .max()
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: "cora_wave",
+                reason: "empty period chunk cannot define an exact coefficient stride".into(),
+            })?;
+    let maximum = usize::try_from(maximum).map_err(|_| CudaF64IndicatorError::InvalidInput {
+        indicator: "cora_wave",
+        reason: format!("period {maximum} is not positive"),
+    })?;
+    if maximum == 0 || maximum > CORA_WAVE_MAX_PERIOD {
+        return Err(CudaF64IndicatorError::PeriodTooLarge {
+            indicator: "cora_wave",
+            period: maximum,
+            max: CORA_WAVE_MAX_PERIOD,
+        });
+    }
+    maximum
+        .checked_add(1)
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: "cora_wave",
+            reason: "exact coefficient stride overflow".into(),
+        })
+}
+
+fn prepare_cora_wave_exact_coefficient_rows_v3(
+    periods: &[i32],
+) -> Result<(Vec<f64>, usize), CudaF64IndicatorError> {
+    let _semantics = CORA_WAVE_REDK_COMPOUND_RATIO_SEMANTICS_V1;
+    let stride = cora_wave_coefficient_stride_v3(periods)?;
+    let elements =
+        periods
+            .len()
+            .checked_mul(stride)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: "cora_wave",
+                reason: "exact coefficient matrix extent overflow".into(),
+            })?;
+    let mut coefficients = vec![0.0; elements];
+    for (row, raw_period) in periods.iter().copied().enumerate() {
+        let period =
+            usize::try_from(raw_period).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: "cora_wave",
+                reason: format!("period {raw_period} is not positive"),
+            })?;
+        let (weights, inv_norm) = cora_wave_exact_weight_row(period, 2.0).map_err(|error| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: "cora_wave",
+                reason: format!("exact coefficient row {row} failed: {error}"),
+            }
+        })?;
+        let start = row
+            .checked_mul(stride)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: "cora_wave",
+                reason: "exact coefficient row offset overflow".into(),
+            })?;
+        coefficients[start..start + weights.len()].copy_from_slice(&weights);
+        coefficients[start + stride - 1] = inv_norm;
+    }
+    Ok((coefficients, stride))
+}
+
+fn exact_coefficient_stride_v3(
+    kernel: F64Kernel,
+    periods: &[i32],
+) -> Result<Option<usize>, CudaF64IndicatorError> {
+    match kernel {
+        F64Kernel::Alma => alma_coefficient_stride_v3(periods).map(Some),
+        F64Kernel::CoraWave => cora_wave_coefficient_stride_v3(periods).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn prepare_exact_coefficient_rows_v3(
+    kernel: F64Kernel,
+    periods: &[i32],
+) -> Result<Option<(Vec<f64>, usize)>, CudaF64IndicatorError> {
+    match kernel {
+        F64Kernel::Alma => prepare_alma_exact_coefficient_rows_v3(periods).map(Some),
+        F64Kernel::CoraWave => prepare_cora_wave_exact_coefficient_rows_v3(periods).map(Some),
+        _ => Ok(None),
+    }
+}
+
 /// The f64 indicator engine.
 pub struct CudaF64Indicators {
     /// `neoethos_f64_kernels`, the module most variants live in.
@@ -4741,19 +5852,20 @@ pub struct CudaF64Indicators {
     /// pays zero module loads. Never populated lazily: a missing module is a
     /// construction-time error, not a surprise on the hot path.
     extra_modules: Vec<(&'static str, Module)>,
-    stream: Stream,
-    context: Arc<Context>,
-    device_id: u32,
+    /// The exact uploader-owned session. Keeping one Arc here makes the
+    /// context/stream ownership executable instead of merely checking that
+    /// both objects happen to name the same device ordinal.
+    session: Arc<CudaSession>,
 }
 
 impl CudaF64Indicators {
-    pub fn new(device_id: usize) -> Result<Self, CudaF64IndicatorError> {
+    pub fn from_session(session: Arc<CudaSession>) -> Result<Self, CudaF64IndicatorError> {
         cust::init(CudaFlags::empty())?;
-        let device = Device::get_device(device_id as u32)?;
-        let context = Arc::new(Context::new(device)?);
-        // Architecture-agnostic: `load_cuda_embedded_module!` reaches for the
-        // multi-arch fatbin first and the lowest-arch PTX second. No card is
-        // named here or in the macro.
+        let device_id = session.device_id();
+        Device::get_device(device_id)?;
+        CurrentContext::set_current(session.context_arc().as_ref())?;
+        // The central loader reads the current device architecture and requires
+        // this exact stem/architecture pair in the generated native registry.
         let module = crate::load_cuda_embedded_module!("neoethos_f64_kernels")?;
 
         // Every OTHER module some variant names, loaded once, deduplicated.
@@ -4772,29 +5884,16083 @@ impl CudaF64Indicators {
             extra_modules.push((stem, load_f64_module(stem)?));
         }
 
-        let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {
             module,
             extra_modules,
-            stream,
-            context,
-            device_id: device_id as u32,
+            session,
         })
     }
 
     #[inline]
     pub fn context_arc(&self) -> Arc<Context> {
-        self.context.clone()
+        self.session.context_arc()
     }
 
     #[inline]
     pub fn device_id(&self) -> u32 {
-        self.device_id
+        self.session.device_id()
+    }
+
+    #[inline]
+    pub fn session_identity(&self) -> CudaSessionIdentity {
+        self.session.identity()
     }
 
     pub fn synchronize(&self) -> Result<(), CudaF64IndicatorError> {
-        self.stream.synchronize()?;
+        self.session.stream().synchronize()?;
         Ok(())
+    }
+
+    fn launch_one_f64_scalar_two_outputs(
+        &self,
+        spec: F64OneScalarTwoOutputSpec,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameters: &[f64],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        let cols = prices.len();
+        let rows = parameters.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: spec.indicator,
+                reason: format!("empty resident {} series", spec.source_name),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: spec.indicator,
+                reason: format!(
+                    "{} is resident on device {} but this session is bound to device {}",
+                    spec.source_name,
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: spec.indicator,
+                reason: format!(
+                    "first valid {} index {first_valid} is outside {cols} bars",
+                    spec.source_name
+                ),
+            });
+        }
+        let valid = cols - first_valid;
+        if valid < spec.minimum_valid_samples {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: spec.indicator,
+                reason: format!(
+                    "not enough data after the first valid {} value: needed={}, valid={valid}",
+                    spec.source_name, spec.minimum_valid_samples
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: spec.indicator,
+                reason: format!("empty {} list", spec.parameter_name),
+            });
+        }
+        for &value in parameters {
+            if !spec.parameter_domain.contains(value) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: spec.indicator,
+                    reason: format!(
+                        "{} must be finite and inside {}, got {value}",
+                        spec.parameter_name,
+                        spec.parameter_domain.notation()
+                    ),
+                });
+            }
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: spec.indicator,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: spec.indicator,
+                reason: "two-output byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: spec.indicator,
+                reason: format!("{} byte count overflow", spec.parameter_name),
+            })?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: spec.indicator,
+                reason: "total device byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: spec.indicator,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: spec.indicator,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: spec.indicator,
+            reason: format!(
+                "{} count {rows} exceeds the CUDA i32 ABI",
+                spec.parameter_name
+            ),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: spec.indicator,
+            reason: format!(
+                "{} count {rows} exceeds the CUDA grid ABI",
+                spec.parameter_name
+            ),
+        })?;
+
+        let d_parameters = DeviceBuffer::from_slice(parameters)?;
+        let d_output_0 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_output_1 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(spec.kernel)?;
+        let function = module.get_function(spec.entry_point).map_err(|_| {
+            CudaF64IndicatorError::MissingKernelSymbol {
+                name: spec.entry_point,
+            }
+        })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_parameters.as_device_ptr(),
+                rows_i32,
+                d_output_0.as_device_ptr(),
+                d_output_1.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: spec.indicator,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+        let [output_0_id, output_1_id] = spec.output_ids;
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: spec.indicator,
+            entry_point: spec.entry_point,
+            outputs: vec![
+                matrix(d_output_0, output_0_id)?,
+                matrix(d_output_1, output_1_id)?,
+            ],
+            rows,
+            cols,
+            _parameter_i32: Vec::new(),
+            _parameter_f64: vec![d_parameters],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch every f64 output of Absolute Strength Index Oscillator against
+    /// one already-resident close series and this engine's shared session.
+    ///
+    /// The tuples are the indicator's real `(ema_length, signal_length)`
+    /// parameters. They are not collapsed into a synthetic `period`, which
+    /// would silently produce duplicate columns under different names.
+    pub fn absolute_strength_index_oscillator_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        parameter_tuples: &[(usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "absolute_strength_index_oscillator";
+        const ENTRY_POINT: &str = "absolute_strength_index_oscillator_batch_f64";
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident price series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "prices are resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut ema_lengths = Vec::with_capacity(rows);
+        let mut signal_lengths = Vec::with_capacity(rows);
+        for &(ema_length, signal_length) in parameter_tuples {
+            if ema_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "ema_length must be >= 1".into(),
+                });
+            }
+            if signal_length <= 1 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "signal_length must be >= 2".into(),
+                });
+            }
+            ema_lengths.push(i32::try_from(ema_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("ema_length {ema_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            signal_lengths.push(i32::try_from(signal_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("signal_length {signal_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(3))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "three-output byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total device byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_ema_lengths = DeviceBuffer::from_slice(&ema_lengths)?;
+        let d_signal_lengths = DeviceBuffer::from_slice(&signal_lengths)?;
+        let d_oscillator = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_histogram = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::AbsoluteStrengthIndexOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_ema_lengths.as_device_ptr(),
+                d_signal_lengths.as_device_ptr(),
+                rows_i32,
+                d_oscillator.as_device_ptr(),
+                d_signal.as_device_ptr(),
+                d_histogram.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![
+                matrix(d_oscillator, "oscillator")?,
+                matrix(d_signal, "signal")?,
+                matrix(d_histogram, "histogram")?,
+            ],
+            rows,
+            cols,
+            _parameter_i32: vec![d_ema_lengths, d_signal_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all three Andean Oscillator outputs against one already-resident
+    /// OHLCV frame and this engine's shared CUDA session. The kernel consumes
+    /// only open and close; the full frame view keeps the input ABI explicit
+    /// without constructing the standalone wrapper's second context or upload.
+    pub fn andean_oscillator_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid_open_close_finite: usize,
+        parameter_tuples: &[(usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "andean_oscillator";
+        const ENTRY_POINT: &str = "andean_oscillator_batch_f64";
+        const OUTPUT_IDS: [&str; 3] = ["bull", "bear", "signal"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLCV frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLCV is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_open_close_finite >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first jointly finite open/close index {first_valid_open_close_finite} is \
+                     outside {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut lengths = Vec::with_capacity(rows);
+        let mut signal_lengths = Vec::with_capacity(rows);
+        for &(length, signal_length) in parameter_tuples {
+            if length == 0 || signal_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "length and signal_length must both be >= 1, got ({length}, \
+                         {signal_length})"
+                    ),
+                });
+            }
+            lengths.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            signal_lengths.push(i32::try_from(signal_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("signal_length {signal_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(OUTPUT_IDS.len()))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "three-output byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total device byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_signal_lengths = DeviceBuffer::from_slice(&signal_lengths)?;
+        let d_bull = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_bear = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::AndeanOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                close,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_signal_lengths.as_device_ptr(),
+                rows_i32,
+                d_bull.as_device_ptr(),
+                d_bear.as_device_ptr(),
+                d_signal.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![
+                matrix(d_bull, OUTPUT_IDS[0])?,
+                matrix(d_bear, OUTPUT_IDS[1])?,
+                matrix(d_signal, OUTPUT_IDS[2])?,
+            ],
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths, d_signal_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Autocorrelation Indicator's canonical filtered and selected-
+    /// correlation matrices from one resident close series. Each sequential
+    /// thread owns one exact `(length, lag, use_test_signal)` tuple plus its
+    /// prefix scratch; no standalone context, upload, synchronization, or
+    /// all-lag matrix is entered by this production path.
+    pub fn autocorrelation_indicator_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        max_consecutive_finite_close: usize,
+        parameter_tuples: &[(usize, usize, bool)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "autocorrelation_indicator";
+        const ENTRY_POINT: &str = "autocorrelation_indicator_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["filtered", "correlation"];
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_consecutive_finite_close > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "finite close run {max_consecutive_finite_close} exceeds the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut lengths = Vec::with_capacity(rows);
+        let mut lags = Vec::with_capacity(rows);
+        let mut use_test_signals = Vec::with_capacity(rows);
+        for &(length, lag, use_test_signal) in parameter_tuples {
+            if length == 0 || length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} is not inside 1..={cols}"),
+                });
+            }
+            if lag == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "lag must be positive".into(),
+                });
+            }
+            if !use_test_signal && max_consecutive_finite_close < length {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "length {length} needs a finite close run of at least {length}, found \
+                         {max_consecutive_finite_close}"
+                    ),
+                });
+            }
+            lengths.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            lags.push(
+                i32::try_from(lag).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("lag {lag} exceeds the CUDA i32 ABI"),
+                })?,
+            );
+            use_test_signals.push(i32::from(use_test_signal));
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let scratch_cols =
+            cols.checked_add(1)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "bar count plus prefix sentinel overflow".into(),
+                })?;
+        let scratch_elems =
+            checked_mul(INDICATOR, "rows*(bars+1)", rows, scratch_cols).map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "two prefix scratch byte arrays",
+            scratch_elems,
+            2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_elems =
+            checked_mul(INDICATOR, "three parameter arrays", rows, 3).map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            parameter_elems,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_lags = DeviceBuffer::from_slice(&lags)?;
+        let d_use_test_signals = DeviceBuffer::from_slice(&use_test_signals)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+        let scratch_prefix = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_elems)? };
+        let scratch_prefix_sq = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_elems)? };
+
+        let module = self.module_for(F64Kernel::AutocorrelationIndicator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (filtered_buffers, correlation_buffers) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_lags.as_device_ptr(),
+                d_use_test_signals.as_device_ptr(),
+                rows_i32,
+                filtered_buffers[0].as_device_ptr(),
+                correlation_buffers[0].as_device_ptr(),
+                scratch_prefix.as_device_ptr(),
+                scratch_prefix_sq.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths, d_lags, d_use_test_signals],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![scratch_prefix, scratch_prefix_sq],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch AVSL's canonical value matrix from one already-resident
+    /// close/low/volume frame. Each sequential thread owns one exact
+    /// `(fast_period, slow_period, multiplier)` tuple and a runtime-sized final
+    /// SMA ring; neither the standalone f32 wrapper nor a second CUDA session
+    /// is part of this production route.
+    pub fn avsl_production_output(
+        &self,
+        close: CudaDeviceSliceF64Ref,
+        low: CudaDeviceSliceF64Ref,
+        volume: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, usize, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "avsl";
+        const ENTRY_POINT: &str = "avsl_production_f64";
+        const OUTPUT_IDS: [&str; 1] = ["value"];
+
+        let cols = close.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if low.len() != cols || volume.len() != cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "resident length mismatch: close={cols}, low={}, volume={}",
+                    low.len(),
+                    volume.len()
+                ),
+            });
+        }
+        for (name, input) in [("close", close), ("low", low), ("volume", volume)] {
+            if input.device_id() != self.device_id() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "{name} is resident on device {} but this session is bound to device {}",
+                        input.device_id(),
+                        self.device_id()
+                    ),
+                });
+            }
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first-valid index {first_valid} is outside the {cols}-bar resident frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut fast_periods = Vec::with_capacity(rows);
+        let mut slow_periods = Vec::with_capacity(rows);
+        let mut multipliers = Vec::with_capacity(rows);
+        let mut max_slow_period = 0usize;
+        for &(fast_period, slow_period, multiplier) in parameter_tuples {
+            if fast_period == 0 || fast_period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("fast_period {fast_period} is not inside 1..={cols}"),
+                });
+            }
+            if slow_period == 0 || slow_period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("slow_period {slow_period} is not inside 1..={cols}"),
+                });
+            }
+            let expected_fast_period = slow_period
+                .checked_mul(12)
+                .and_then(|scaled| scaled.checked_add(13))
+                .map(|scaled| scaled / 26)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "fast/slow ratio scaling overflow".into(),
+                })?
+                .max(1);
+            if fast_period != expected_fast_period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "slow_period {slow_period} requires exact half-up 12:26 fast_period \
+                         {expected_fast_period}, got {fast_period}"
+                    ),
+                });
+            }
+            if cols - first_valid < slow_period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "slow_period {slow_period} needs at least {slow_period} bars from \
+                         first-valid {first_valid}, found {}",
+                        cols - first_valid
+                    ),
+                });
+            }
+            if !multiplier.is_finite() || multiplier <= 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("multiplier must be positive and finite, got {multiplier}"),
+                });
+            }
+            if multiplier.to_bits() != 2.0_f64.to_bits() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "production multiplier must keep the exact canonical default 2.0, got \
+                         {multiplier}"
+                    ),
+                });
+            }
+            fast_periods.push(i32::try_from(fast_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("fast_period {fast_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            slow_periods.push(i32::try_from(slow_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("slow_period {slow_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            multipliers.push(multiplier);
+            max_slow_period = max_slow_period.max(slow_period);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "output bytes",
+            output_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let scratch_elems =
+            checked_mul(INDICATOR, "rows*maximum slow period", rows, max_slow_period)
+                .map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "final SMA scratch bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let i32_parameter_bytes = checked_mul(
+            INDICATOR,
+            "two integer parameter arrays",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let f64_parameter_bytes = checked_mul(
+            INDICATOR,
+            "multiplier parameter bytes",
+            rows,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(i32_parameter_bytes))
+            .and_then(|bytes| bytes.checked_add(f64_parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let scratch_stride_i32 =
+            i32::try_from(max_slow_period).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "maximum slow period {max_slow_period} exceeds the CUDA scratch-stride ABI"
+                ),
+            })?;
+
+        let d_fast_periods = DeviceBuffer::from_slice(&fast_periods)?;
+        let d_slow_periods = DeviceBuffer::from_slice(&slow_periods)?;
+        let d_multipliers = DeviceBuffer::from_slice(&multipliers)?;
+        let scratch_final_sma = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_elems)? };
+        let output_buffer = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::Avsl)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let close = cust::memory::DevicePointer::<f64>::from_raw(close.device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(low.device_ptr());
+            let volume = cust::memory::DevicePointer::<f64>::from_raw(volume.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                close,
+                low,
+                volume,
+                cols_i32,
+                first_valid_i32,
+                d_fast_periods.as_device_ptr(),
+                d_slow_periods.as_device_ptr(),
+                d_multipliers.as_device_ptr(),
+                rows_i32,
+                scratch_final_sma.as_device_ptr(),
+                scratch_stride_i32,
+                output_buffer.as_device_ptr()
+            ))?;
+        }
+
+        let matrix = CudaDeviceMatrixF64::from_buffer(
+            output_buffer,
+            rows,
+            cols,
+            self.context_arc(),
+            self.device_id(),
+        )
+        .map_err(|error| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("value device matrix ownership failed: {error}"),
+        })?;
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![F64NamedDeviceOutput {
+                output_id: OUTPUT_IDS[0],
+                matrix,
+            }],
+            rows,
+            cols,
+            _parameter_i32: vec![d_fast_periods, d_slow_periods],
+            _parameter_f64: vec![d_multipliers],
+            _scratch_f64: vec![scratch_final_sma],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch CVI's canonical value matrix from one already-resident high/low
+    /// pair. Every admitted period is retained in one device buffer beside
+    /// the result, so the existing exact f64 kernel can run asynchronously in
+    /// the shared session without a per-launch synchronization or a second
+    /// input upload.
+    pub fn cvi_production_output(
+        &self,
+        high_low: CudaDeviceHighLowF64Ref,
+        first_valid: usize,
+        periods: &[usize],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "cvi";
+        const ENTRY_POINT: &str = "cvi_batch_f64";
+        const OUTPUT_IDS: [&str; 1] = ["value"];
+
+        let cols = high_low.len();
+        let rows = periods.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident high/low series".into(),
+            });
+        }
+        if high_low.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "high/low are resident on device {} but this session is bound to device {}",
+                    high_low.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first-valid index {first_valid} is outside the {cols}-bar resident frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty period row list".into(),
+            });
+        }
+
+        let valid_bars = cols - first_valid;
+        let mut period_rows = Vec::with_capacity(rows);
+        for &period in periods {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if period > CVI_MAX_PERIOD {
+                return Err(CudaF64IndicatorError::PeriodTooLarge {
+                    indicator: INDICATOR,
+                    period,
+                    max: CVI_MAX_PERIOD,
+                });
+            }
+            let needed = period
+                .checked_mul(2)
+                .and_then(|twice| twice.checked_sub(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} warmup length overflow"),
+                })?;
+            if valid_bars < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs at least {needed} bars from first-valid \
+                         {first_valid}, found {valid_bars}"
+                    ),
+                });
+            }
+            period_rows.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "output bytes",
+            output_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "integer period bytes",
+            rows,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&period_rows)?;
+        let output_buffer = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::Cvi)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(high_low.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(high_low.low().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                output_buffer.as_device_ptr()
+            ))?;
+        }
+
+        let matrix = CudaDeviceMatrixF64::from_buffer(
+            output_buffer,
+            rows,
+            cols,
+            self.context_arc(),
+            self.device_id(),
+        )
+        .map_err(|error| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("value device matrix ownership failed: {error}"),
+        })?;
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![F64NamedDeviceOutput {
+                output_id: OUTPUT_IDS[0],
+                matrix,
+            }],
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Coppock's canonical value matrix from one already-resident
+    /// close series. Each sequential thread owns one exact
+    /// `(short_roc_period, long_roc_period, ma_period)` tuple and performs the
+    /// ROC-plus-WMA state in one launch. The default primary ABI remains
+    /// separate; no standalone f32 wrapper, second context, input re-upload,
+    /// host replay, or intermediate synchronization enters this route.
+    pub fn coppock_production_output(
+        &self,
+        close: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_rows: &[CoppockParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "coppock";
+        const ENTRY_POINT: &str = "coppock_production_f64";
+        const OUTPUT_IDS: [&str; 1] = ["value"];
+
+        let cols = close.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if close.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    close.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first-valid index {first_valid} is outside the {cols}-bar resident frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut short_roc_periods = Vec::with_capacity(rows);
+        let mut long_roc_periods = Vec::with_capacity(rows);
+        let mut ma_periods = Vec::with_capacity(rows);
+        for parameters in parameter_rows {
+            let short_roc_period = parameters.short_roc_period.unwrap_or(11);
+            let long_roc_period = parameters.long_roc_period.unwrap_or(14);
+            let ma_period = parameters.ma_period.unwrap_or(10);
+            let ma_type = parameters.ma_type.as_deref().unwrap_or("wma");
+            if ma_type != "wma" {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "production ma_type must keep the exact canonical `wma`, got `{ma_type}`"
+                    ),
+                });
+            }
+            for (name, period) in [
+                ("short_roc_period", short_roc_period),
+                ("long_roc_period", long_roc_period),
+                ("ma_period", ma_period),
+            ] {
+                if period == 0 || period > cols {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{name} {period} is not inside 1..={cols}"),
+                    });
+                }
+            }
+            let largest_roc = short_roc_period.max(long_roc_period);
+            let needed = largest_roc.checked_add(ma_period).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "ROC plus WMA warmup length overflow".into(),
+                }
+            })?;
+            if cols - first_valid < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "tuple ({short_roc_period}, {long_roc_period}, {ma_period}) needs at least \
+                         {needed} bars from first-valid {first_valid}, found {}",
+                        cols - first_valid
+                    ),
+                });
+            }
+            short_roc_periods.push(i32::try_from(short_roc_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("short_roc_period {short_roc_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            long_roc_periods.push(i32::try_from(long_roc_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("long_roc_period {long_roc_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            ma_periods.push(i32::try_from(ma_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("ma_period {ma_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "output bytes",
+            output_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "three integer parameter arrays",
+            rows,
+            3 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_short_roc_periods = DeviceBuffer::from_slice(&short_roc_periods)?;
+        let d_long_roc_periods = DeviceBuffer::from_slice(&long_roc_periods)?;
+        let d_ma_periods = DeviceBuffer::from_slice(&ma_periods)?;
+        let output_buffer = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::Coppock)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let close = cust::memory::DevicePointer::<f64>::from_raw(close.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                close,
+                cols_i32,
+                d_short_roc_periods.as_device_ptr(),
+                d_long_roc_periods.as_device_ptr(),
+                d_ma_periods.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                output_buffer.as_device_ptr()
+            ))?;
+        }
+
+        let matrix = CudaDeviceMatrixF64::from_buffer(
+            output_buffer,
+            rows,
+            cols,
+            self.context_arc(),
+            self.device_id(),
+        )
+        .map_err(|error| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("value device matrix ownership failed: {error}"),
+        })?;
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![F64NamedDeviceOutput {
+                output_id: OUTPUT_IDS[0],
+                matrix,
+            }],
+            rows,
+            cols,
+            _parameter_i32: vec![d_short_roc_periods, d_long_roc_periods, d_ma_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Correlation Cycle's canonical real/imag/angle/state matrices
+    /// from one already-resident close series. One sequential thread owns the
+    /// exact state for each `(period, threshold)` tuple; the default primary
+    /// ABI remains intact and no standalone f32 context, input re-upload, host
+    /// replay, or intermediate synchronization enters this route.
+    pub fn correlation_cycle_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "correlation_cycle";
+        const ENTRY_POINT: &str = "correlation_cycle_outputs_f64";
+        const OUTPUT_IDS: [&str; 4] = ["real", "imag", "angle", "state"];
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first-valid close index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut thresholds = Vec::with_capacity(rows);
+        for &(period, threshold) in parameter_tuples {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if cols - first_valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs at least {period} bars from first-valid \
+                         {first_valid}, found {}",
+                        cols - first_valid
+                    ),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            thresholds.push(threshold);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let i32_parameter_bytes = checked_mul(
+            INDICATOR,
+            "period parameter bytes",
+            rows,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let f64_parameter_bytes = checked_mul(
+            INDICATOR,
+            "threshold parameter bytes",
+            rows,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(i32_parameter_bytes)
+            .and_then(|bytes| bytes.checked_add(f64_parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_thresholds = DeviceBuffer::from_slice(&thresholds)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::CorrelationCycle)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (real, rest) = output_buffers.split_at_mut(1);
+            let (imag, rest) = rest.split_at_mut(1);
+            let (angle, state) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_thresholds.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                real[0].as_device_ptr(),
+                imag[0].as_device_ptr(),
+                angle[0].as_device_ptr(),
+                state[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: vec![d_thresholds],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Bandpass's canonical bp/bp_normalized/signal/trigger matrices
+    /// from one already-resident close series. One sequential thread owns the
+    /// two exact IIR passes for each `(period, bandwidth)` tuple; no standalone
+    /// f32 context, input re-upload, host replay, or intermediate sync enters
+    /// this production path.
+    pub fn bandpass_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "bandpass";
+        const ENTRY_POINT: &str = "bandpass_production_f64";
+        const OUTPUT_IDS: [&str; 4] = ["bp", "bp_normalized", "signal", "trigger"];
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first finite close index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut bandwidths = Vec::with_capacity(rows);
+        for &(period, bandwidth) in parameter_tuples {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if cols - first_valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs at least {period} bars from first-finite \
+                         {first_valid}, found {}",
+                        cols - first_valid
+                    ),
+                });
+            }
+            if !bandwidth.is_finite() || bandwidth <= 0.0 || bandwidth > 1.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("bandwidth must be finite and inside (0, 1], got {bandwidth}"),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            bandwidths.push(bandwidth);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let i32_parameter_bytes = checked_mul(
+            INDICATOR,
+            "period parameter bytes",
+            rows,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let f64_parameter_bytes = checked_mul(
+            INDICATOR,
+            "bandwidth parameter bytes",
+            rows,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(i32_parameter_bytes)
+            .and_then(|bytes| bytes.checked_add(f64_parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-finite index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_bandwidths = DeviceBuffer::from_slice(&bandwidths)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Bandpass)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (bp, rest) = output_buffers.split_at_mut(1);
+            let (bp_normalized, rest) = rest.split_at_mut(1);
+            let (signal, trigger) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_bandwidths.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                bp[0].as_device_ptr(),
+                bp_normalized[0].as_device_ptr(),
+                signal[0].as_device_ptr(),
+                trigger[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: vec![d_bandwidths],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Bollinger Bands' canonical upper/middle/lower matrices from one
+    /// already-resident close series. One sequential thread owns the scalar
+    /// rolling `(sum, sum_sq)` state for each exact `(period, devup, devdn)`
+    /// tuple; the public standalone f32 wrapper is never entered.
+    pub fn bollinger_bands_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, f64, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "bollinger_bands";
+        const ENTRY_POINT: &str = "bollinger_bands_production_f64";
+        const OUTPUT_IDS: [&str; 3] = ["upper", "middle", "lower"];
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first non-NaN close index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut devups = Vec::with_capacity(rows);
+        let mut devdns = Vec::with_capacity(rows);
+        for &(period, devup, devdn) in parameter_tuples {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if cols - first_valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs at least {period} bars from first non-NaN close \
+                         {first_valid}, found {}",
+                        cols - first_valid
+                    ),
+                });
+            }
+            if !devup.is_finite() || !devdn.is_finite() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "production devup/devdn must be finite, got ({devup}, {devdn})"
+                    ),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            devups.push(devup);
+            devdns.push(devdn);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "three output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let i32_parameter_bytes = checked_mul(
+            INDICATOR,
+            "period parameter bytes",
+            rows,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let f64_parameter_bytes = checked_mul(
+            INDICATOR,
+            "deviation parameter bytes",
+            rows,
+            2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(i32_parameter_bytes)
+            .and_then(|bytes| bytes.checked_add(f64_parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first non-NaN index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_devups = DeviceBuffer::from_slice(&devups)?;
+        let d_devdns = DeviceBuffer::from_slice(&devdns)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::BollingerBands)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (upper, rest) = output_buffers.split_at_mut(1);
+            let (middle, lower) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_devups.as_device_ptr(),
+                d_devdns.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                upper[0].as_device_ptr(),
+                middle[0].as_device_ptr(),
+                lower[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: vec![d_devups, d_devdns],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Buff Averages' canonical fast/slow matrices from the one
+    /// already-resident close/volume frame. One sequential thread owns both
+    /// rolling volume-weighted states for each exact `(fast_period,
+    /// slow_period)` tuple; the public standalone f32 wrapper is never entered.
+    pub fn buff_averages_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        volumes: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "buff_averages";
+        const ENTRY_POINT: &str = "buff_averages_production_f64";
+        const OUTPUT_IDS: [&str; 2] = ["fast", "slow"];
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 || volumes.len() != cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "resident close/volume lengths must be equal and nonzero, got {cols}/{}",
+                    volumes.len()
+                ),
+            });
+        }
+        if prices.device_id() != self.device_id() || volumes.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close/volume are resident on devices {}/{} but this session is bound to \
+                     device {}",
+                    prices.device_id(),
+                    volumes.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first non-NaN close index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut fast_periods = Vec::with_capacity(rows);
+        let mut slow_periods = Vec::with_capacity(rows);
+        for &(fast_period, slow_period) in parameter_tuples {
+            if fast_period == 0 || slow_period == 0 || fast_period > slow_period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "expected 1 <= fast_period <= slow_period, got \
+                         ({fast_period}, {slow_period})"
+                    ),
+                });
+            }
+            if slow_period > cols || cols - first_valid < slow_period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "slow period {slow_period} needs {slow_period} bars from first non-NaN \
+                         close {first_valid}, found {} in a {cols}-bar frame",
+                        cols - first_valid
+                    ),
+                });
+            }
+            fast_periods.push(i32::try_from(fast_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("fast period {fast_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            slow_periods.push(i32::try_from(slow_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("slow period {slow_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "two period parameter bytes",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first non-NaN index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_fast_periods = DeviceBuffer::from_slice(&fast_periods)?;
+        let d_slow_periods = DeviceBuffer::from_slice(&slow_periods)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::BuffAverages)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let volumes = cust::memory::DevicePointer::<f64>::from_raw(volumes.device_ptr());
+            let (fast, slow) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                volumes,
+                cols_i32,
+                d_fast_periods.as_device_ptr(),
+                d_slow_periods.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                fast[0].as_device_ptr(),
+                slow[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_fast_periods, d_slow_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Candle Strength Oscillator's canonical strength/highs/lows/mid/
+    /// long_signal/short_signal matrices from one already-resident OHLC frame.
+    /// One sequential thread owns the complete nested-HMA and level state for
+    /// each exact tuple; the standalone wrapper's context, uploads, and sync
+    /// boundary are never entered.
+    pub fn candle_strength_oscillator_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_ohlc_run: usize,
+        parameter_rows: &[CandleStrengthOscillatorParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "candle_strength_oscillator";
+        const ENTRY_POINT: &str = "candle_strength_oscillator_batch_f64";
+        const OUTPUT_IDS: [&str; 6] = [
+            "strength",
+            "highs",
+            "lows",
+            "mid",
+            "long_signal",
+            "short_signal",
+        ];
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_ohlc_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "finite-OHLC run metadata {max_finite_ohlc_run} exceeds frame length {cols}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut atr_lengths = Vec::with_capacity(rows);
+        let mut shared_atr_enabled = None;
+        let mut shared_mode = None;
+        let mut max_period = 1usize;
+        let mut max_half = 1usize;
+        let mut max_sqrt = 1usize;
+        let mut max_level = 1usize;
+        for params in parameter_rows {
+            let period = params.period.unwrap_or(50);
+            if period == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "period must be at least 1".into(),
+                });
+            }
+            let atr_length = params.atr_length.unwrap_or(50);
+            if atr_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "atr_length must be at least 1".into(),
+                });
+            }
+            let atr_enabled = params.atr_enabled.unwrap_or(false);
+            if shared_atr_enabled.is_some_and(|shared| shared != atr_enabled) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "one production launch requires one shared atr_enabled value".into(),
+                });
+            }
+            shared_atr_enabled = Some(atr_enabled);
+
+            let mode = params.mode.as_deref().unwrap_or("bollinger");
+            let mode = if mode.eq_ignore_ascii_case("bollinger") {
+                0_i32
+            } else if mode.eq_ignore_ascii_case("donchian") {
+                1_i32
+            } else {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "mode must be canonical 'bollinger' or 'donchian', got '{mode}'"
+                    ),
+                });
+            };
+            if shared_mode.is_some_and(|shared| shared != mode) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "one production launch requires one shared canonical mode".into(),
+                });
+            }
+            shared_mode = Some(mode);
+
+            let sqrt_period = (period as f64).sqrt().floor() as usize;
+            let hma_prefix = period
+                .checked_add(sqrt_period)
+                .and_then(|value| value.checked_sub(2))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} HMA warmup overflow"),
+                })?;
+            let atr_prefix = if atr_enabled { atr_length - 1 } else { 0 };
+            let levels_needed = atr_prefix
+                .checked_add(hma_prefix)
+                .and_then(|value| value.checked_add(period - 1))
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "tuple ({period}, {atr_enabled}, {atr_length}) warmup overflow"
+                    ),
+                })?;
+            if max_finite_ohlc_run < levels_needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "not enough consecutive finite OHLC data for ({period}, {atr_enabled}, \
+                         {atr_length}): needed={levels_needed}, valid={max_finite_ohlc_run}"
+                    ),
+                });
+            }
+
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            atr_lengths.push(i32::try_from(atr_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("atr_length {atr_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            max_period = max_period.max(period);
+            max_half = max_half.max((period / 2).max(1));
+            max_sqrt = max_sqrt.max(sqrt_period.max(1));
+            max_level = max_level.max(period);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "six output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "two i32 parameter arrays",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let full_elems =
+            checked_mul(INDICATOR, "full scratch", rows, max_period).map_err(plan_failure)?;
+        let half_elems =
+            checked_mul(INDICATOR, "half scratch", rows, max_half).map_err(plan_failure)?;
+        let sqrt_elems =
+            checked_mul(INDICATOR, "sqrt scratch", rows, max_sqrt).map_err(plan_failure)?;
+        let level_elems =
+            checked_mul(INDICATOR, "level scratch", rows, max_level).map_err(plan_failure)?;
+        let scratch_elems = full_elems
+            .checked_add(half_elems)
+            .and_then(|value| value.checked_add(sqrt_elems))
+            .and_then(|value| value.checked_add(level_elems))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total scratch element count overflow".into(),
+            })?;
+        let scratch_bytes = scratch_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total scratch byte count overflow".into(),
+            })?;
+        let required = output_bytes
+            .checked_add(parameter_bytes)
+            .and_then(|value| value.checked_add(scratch_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let full_cap_i32 =
+            i32::try_from(max_period).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("full scratch cap {max_period} exceeds the CUDA i32 ABI"),
+            })?;
+        let half_cap_i32 =
+            i32::try_from(max_half).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("half scratch cap {max_half} exceeds the CUDA i32 ABI"),
+            })?;
+        let sqrt_cap_i32 =
+            i32::try_from(max_sqrt).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("sqrt scratch cap {max_sqrt} exceeds the CUDA i32 ABI"),
+            })?;
+        let level_cap_i32 =
+            i32::try_from(max_level).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("level scratch cap {max_level} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_atr_lengths = DeviceBuffer::from_slice(&atr_lengths)?;
+        let d_full = unsafe { DeviceBuffer::<f64>::uninitialized(full_elems)? };
+        let d_half = unsafe { DeviceBuffer::<f64>::uninitialized(half_elems)? };
+        let d_sqrt = unsafe { DeviceBuffer::<f64>::uninitialized(sqrt_elems)? };
+        let d_level = unsafe { DeviceBuffer::<f64>::uninitialized(level_elems)? };
+        let d_strength = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_highs = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_lows = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_mid = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_long_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_short_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let atr_enabled_i32 =
+            if shared_atr_enabled.ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "missing shared atr_enabled value".into(),
+            })? {
+                1_i32
+            } else {
+                0_i32
+            };
+        let mode_i32 = shared_mode.ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: "missing shared mode value".into(),
+        })?;
+
+        let module = self.module_for(F64Kernel::CandleStrengthOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_atr_lengths.as_device_ptr(),
+                atr_enabled_i32,
+                mode_i32,
+                rows_i32,
+                full_cap_i32,
+                half_cap_i32,
+                sqrt_cap_i32,
+                level_cap_i32,
+                d_full.as_device_ptr(),
+                d_half.as_device_ptr(),
+                d_sqrt.as_device_ptr(),
+                d_level.as_device_ptr(),
+                d_strength.as_device_ptr(),
+                d_highs.as_device_ptr(),
+                d_lows.as_device_ptr(),
+                d_mid.as_device_ptr(),
+                d_long_signal.as_device_ptr(),
+                d_short_signal.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let output_buffers = [
+            d_strength,
+            d_highs,
+            d_lows,
+            d_mid,
+            d_long_signal,
+            d_short_signal,
+        ];
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods, d_atr_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_full, d_half, d_sqrt, d_level],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Cyberpunk Value Trend Analyzer's canonical value_trend/
+    /// value_trend_lag/deviation_index/overbought_signal/buy_signal/
+    /// sell_signal matrices from one already-resident OHLC frame. One
+    /// sequential thread owns the exact rolling sums, monotone queues, filter
+    /// state, and threshold tuple; the preserved primary ABI remains separate.
+    pub fn cyberpunk_value_trend_analyzer_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_ohlc_run: usize,
+        parameter_tuples: &[(usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "cyberpunk_value_trend_analyzer";
+        const ENTRY_POINT: &str = "cyberpunk_value_trend_analyzer_batch_f64";
+        const OUTPUT_IDS: [&str; 6] = [
+            "value_trend",
+            "value_trend_lag",
+            "deviation_index",
+            "overbought_signal",
+            "buy_signal",
+            "sell_signal",
+        ];
+        const REQUIRED_FINITE_RUN: usize = 75;
+
+        let cols = ohlcv.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_ohlc_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "finite-OHLC run metadata {max_finite_ohlc_run} exceeds frame length {cols}"
+                ),
+            });
+        }
+        if max_finite_ohlc_run < REQUIRED_FINITE_RUN {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "not enough consecutive finite OHLC data: needed={REQUIRED_FINITE_RUN}, \
+                     valid={max_finite_ohlc_run}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut entry_levels = Vec::with_capacity(rows);
+        let mut exit_levels = Vec::with_capacity(rows);
+        for &(entry_level, exit_level) in parameter_tuples {
+            if !(1..=100).contains(&entry_level) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("entry_level {entry_level} is outside 1..=100"),
+                });
+            }
+            if !(1..=100).contains(&exit_level) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("exit_level {exit_level} is outside 1..=100"),
+                });
+            }
+            entry_levels.push(i32::try_from(entry_level).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("entry_level {entry_level} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            exit_levels.push(i32::try_from(exit_level).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("exit_level {exit_level} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "six output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "two i32 parameter arrays",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_entry_levels = DeviceBuffer::from_slice(&entry_levels)?;
+        let d_exit_levels = DeviceBuffer::from_slice(&exit_levels)?;
+        let d_value_trend = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_value_trend_lag = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_deviation_index = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_overbought_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_buy_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_sell_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::CyberpunkValueTrendAnalyzer)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_entry_levels.as_device_ptr(),
+                d_exit_levels.as_device_ptr(),
+                rows_i32,
+                d_value_trend.as_device_ptr(),
+                d_value_trend_lag.as_device_ptr(),
+                d_deviation_index.as_device_ptr(),
+                d_overbought_signal.as_device_ptr(),
+                d_buy_signal.as_device_ptr(),
+                d_sell_signal.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let output_buffers = [
+            d_value_trend,
+            d_value_trend_lag,
+            d_deviation_index,
+            d_overbought_signal,
+            d_buy_signal,
+            d_sell_signal,
+        ];
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_entry_levels, d_exit_levels],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Cycle Channel Oscillator's canonical fast/slow matrices from an
+    /// already-resident default-close HLC frame. One sequential thread owns
+    /// each exact coupled parameter tuple and its two history rows; this path
+    /// creates no standalone CUDA context, input upload, synchronization, or
+    /// host output.
+    pub fn cycle_channel_oscillator_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid_hlc_finite: usize,
+        parameter_tuples: &[(usize, usize, f64, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "cycle_channel_oscillator";
+        const ENTRY_POINT: &str = "cycle_channel_oscillator_batch_f64";
+        const OUTPUT_IDS: [&str; 2] = ["fast", "slow"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident default-close HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_hlc_finite >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first jointly finite default-close HLC index {first_valid_hlc_finite} is \
+                     outside {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let valid = cols - first_valid_hlc_finite;
+        let mut short_cycle_lengths = Vec::with_capacity(rows);
+        let mut medium_cycle_lengths = Vec::with_capacity(rows);
+        let mut short_multipliers = Vec::with_capacity(rows);
+        let mut medium_multipliers = Vec::with_capacity(rows);
+        for &(short_cycle_length, medium_cycle_length, short_multiplier, medium_multiplier) in
+            parameter_tuples
+        {
+            if short_cycle_length < 2 || medium_cycle_length < 2 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "cycle lengths must both be >= 2, got ({short_cycle_length}, \
+                         {medium_cycle_length})"
+                    ),
+                });
+            }
+            if !short_multiplier.is_finite() || short_multiplier < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "short_multiplier must be finite and >= 0, got {short_multiplier}"
+                    ),
+                });
+            }
+            if !medium_multiplier.is_finite() || medium_multiplier < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "medium_multiplier must be finite and >= 0, got {medium_multiplier}"
+                    ),
+                });
+            }
+            let needed = medium_cycle_length / 2;
+            if valid < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "medium cycle {medium_cycle_length} needs {needed} bars after the first \
+                         jointly finite default-close HLC value, found {valid}"
+                    ),
+                });
+            }
+            short_cycle_lengths.push(i32::try_from(short_cycle_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "short_cycle_length {short_cycle_length} exceeds the CUDA i32 ABI"
+                    ),
+                }
+            })?);
+            medium_cycle_lengths.push(i32::try_from(medium_cycle_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "medium_cycle_length {medium_cycle_length} exceeds the CUDA i32 ABI"
+                    ),
+                }
+            })?);
+            short_multipliers.push(short_multiplier);
+            medium_multipliers.push(medium_multiplier);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let matrix_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            matrix_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "two history scratch bytes",
+            matrix_elems,
+            2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "two i32 plus two f64 parameter arrays",
+            rows,
+            2 * std::mem::size_of::<i32>() + 2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/scratch/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_short_cycle_lengths = DeviceBuffer::from_slice(&short_cycle_lengths)?;
+        let d_medium_cycle_lengths = DeviceBuffer::from_slice(&medium_cycle_lengths)?;
+        let d_short_multipliers = DeviceBuffer::from_slice(&short_multipliers)?;
+        let d_medium_multipliers = DeviceBuffer::from_slice(&medium_multipliers)?;
+        let d_out_fast = unsafe { DeviceBuffer::<f64>::uninitialized(matrix_elems)? };
+        let d_out_slow = unsafe { DeviceBuffer::<f64>::uninitialized(matrix_elems)? };
+        let d_short_history = unsafe { DeviceBuffer::<f64>::uninitialized(matrix_elems)? };
+        let d_medium_history = unsafe { DeviceBuffer::<f64>::uninitialized(matrix_elems)? };
+
+        let module = self.module_for(F64Kernel::CycleChannelOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let source = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                source,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_short_cycle_lengths.as_device_ptr(),
+                d_medium_cycle_lengths.as_device_ptr(),
+                d_short_multipliers.as_device_ptr(),
+                d_medium_multipliers.as_device_ptr(),
+                rows_i32,
+                d_out_fast.as_device_ptr(),
+                d_out_slow.as_device_ptr(),
+                d_short_history.as_device_ptr(),
+                d_medium_history.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![
+                matrix(d_out_fast, OUTPUT_IDS[0])?,
+                matrix(d_out_slow, OUTPUT_IDS[1])?,
+            ],
+            rows,
+            cols,
+            _parameter_i32: vec![d_short_cycle_lengths, d_medium_cycle_lengths],
+            _parameter_f64: vec![d_short_multipliers, d_medium_multipliers],
+            _scratch_f64: vec![d_short_history, d_medium_history],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Daily Factor's canonical value/ema/signal matrices from the
+    /// already-resident OHLC frame. One sequential thread owns the exact
+    /// threshold tuple and recurrence; this path creates no standalone CUDA
+    /// context, input upload, synchronization, or host output.
+    pub fn daily_factor_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid_ohlc4_finite: usize,
+        threshold_levels: &[f64],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "daily_factor";
+        const ENTRY_POINT: &str = "daily_factor_batch_f64";
+        const OUTPUT_IDS: [&str; 3] = ["value", "ema", "signal"];
+
+        let cols = ohlcv.len();
+        let rows = threshold_levels.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_ohlc4_finite >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first jointly finite OHLC index {first_valid_ohlc4_finite} is outside \
+                     {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty threshold tuple list".into(),
+            });
+        }
+        for &threshold_level in threshold_levels {
+            if !threshold_level.is_finite() || !(0.0..=1.0).contains(&threshold_level) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "threshold_level must be finite and inside 0..=1, got {threshold_level}"
+                    ),
+                });
+            }
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "three output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "threshold parameter bytes",
+            rows,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_threshold_levels = DeviceBuffer::from_slice(threshold_levels)?;
+        let d_value = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_ema = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::DailyFactor)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_threshold_levels.as_device_ptr(),
+                rows_i32,
+                d_value.as_device_ptr(),
+                d_ema.as_device_ptr(),
+                d_signal.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let output_buffers = [d_value, d_ema, d_signal];
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: Vec::new(),
+            _parameter_f64: vec![d_threshold_levels],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Ehlers Data Sampling RSI's complete canonical triple from the
+    /// already-resident OHLC frame. Only the exact length tuples are uploaded;
+    /// one sequential CUDA thread owns both RSI recurrences and the signal.
+    pub fn ehlers_data_sampling_relative_strength_indicator_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        lengths: &[usize],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_data_sampling_relative_strength_indicator";
+        const ENTRY_POINT: &str = "ehlers_data_sampling_relative_strength_indicator_batch_f64";
+        const OUTPUT_IDS: [&str; 3] = ["ds_rsi", "original_rsi", "signal"];
+
+        let cols = ohlcv.len();
+        let rows = lengths.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty length tuple list".into(),
+            });
+        }
+        let mut length_values = Vec::with_capacity(rows);
+        for &length in lengths {
+            if length == 0 || length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} is not inside 1..={cols}"),
+                });
+            }
+            length_values.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "three output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes =
+            checked_mul(INDICATOR, "length bytes", rows, std::mem::size_of::<i32>())
+                .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("length tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("length tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&length_values)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+        let module = self.module_for(F64Kernel::EhlersDataSamplingRelativeStrengthIndicator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let (ds_rsi, rest) = output_buffers.split_at_mut(1);
+            let (original_rsi, signal) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                close,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                rows_i32,
+                ds_rsi[0].as_device_ptr(),
+                original_rsi[0].as_device_ptr(),
+                signal[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Damiani Volatmeter's canonical vol/anti matrices from one
+    /// already-resident close series. One sequential thread owns each exact
+    /// four-window/threshold tuple plus its runtime-strided variance rings;
+    /// this path creates no standalone context, upload, synchronization, or
+    /// host output.
+    pub fn damiani_volatmeter_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, usize, usize, usize, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "damiani_volatmeter";
+        const ENTRY_POINT: &str = "damiani_volatmeter_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["vol", "anti"];
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first valid close index {first_valid} is outside {cols} bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let valid = cols - first_valid;
+        let mut vis_atrs = Vec::with_capacity(rows);
+        let mut vis_stds = Vec::with_capacity(rows);
+        let mut sed_atrs = Vec::with_capacity(rows);
+        let mut sed_stds = Vec::with_capacity(rows);
+        let mut thresholds = Vec::with_capacity(rows);
+        let mut vis_stride = 0_usize;
+        let mut sed_stride = 0_usize;
+        for &(vis_atr, vis_std, sed_atr, sed_std, threshold) in parameter_tuples {
+            for (key, value) in [
+                ("vis_atr", vis_atr),
+                ("vis_std", vis_std),
+                ("sed_atr", sed_atr),
+                ("sed_std", sed_std),
+            ] {
+                if value == 0 || value > cols {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{key} {value} is not inside 1..={cols}"),
+                    });
+                }
+            }
+            if !threshold.is_finite() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("threshold must be finite, got {threshold}"),
+                });
+            }
+            let needed = vis_atr.max(vis_std).max(sed_atr).max(sed_std).max(3);
+            if valid < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "tuple ({vis_atr}, {vis_std}, {sed_atr}, {sed_std}) needs {needed} bars \
+                         after first valid close {first_valid}, found {valid}"
+                    ),
+                });
+            }
+            vis_atrs.push(i32::try_from(vis_atr).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("vis_atr {vis_atr} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            vis_stds.push(i32::try_from(vis_std).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("vis_std {vis_std} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            sed_atrs.push(i32::try_from(sed_atr).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("sed_atr {sed_atr} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            sed_stds.push(i32::try_from(sed_std).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("sed_std {sed_std} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            thresholds.push(threshold);
+            vis_stride = vis_stride.max(vis_std);
+            sed_stride = sed_stride.max(sed_std);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let vis_scratch_elems =
+            checked_mul(INDICATOR, "rows*max vis_std", rows, vis_stride).map_err(plan_failure)?;
+        let sed_scratch_elems =
+            checked_mul(INDICATOR, "rows*max sed_std", rows, sed_stride).map_err(plan_failure)?;
+        let scratch_elems = vis_scratch_elems
+            .checked_add(sed_scratch_elems)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "variance ring element count overflow".into(),
+            })?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "variance ring bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "four i32 plus one f64 parameter arrays",
+            rows,
+            4 * std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/scratch/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let vis_stride_i32 =
+            i32::try_from(vis_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("vis ring stride {vis_stride} exceeds the CUDA i32 ABI"),
+            })?;
+        let sed_stride_i32 =
+            i32::try_from(sed_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("sed ring stride {sed_stride} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_vis_atrs = DeviceBuffer::from_slice(&vis_atrs)?;
+        let d_vis_stds = DeviceBuffer::from_slice(&vis_stds)?;
+        let d_sed_atrs = DeviceBuffer::from_slice(&sed_atrs)?;
+        let d_sed_stds = DeviceBuffer::from_slice(&sed_stds)?;
+        let d_thresholds = DeviceBuffer::from_slice(&thresholds)?;
+        let d_vol = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_anti = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_ring_vis = unsafe { DeviceBuffer::<f64>::uninitialized(vis_scratch_elems)? };
+        let d_ring_sed = unsafe { DeviceBuffer::<f64>::uninitialized(sed_scratch_elems)? };
+
+        let module = self.module_for(F64Kernel::DamianiVolatmeter)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_vis_atrs.as_device_ptr(),
+                d_vis_stds.as_device_ptr(),
+                d_sed_atrs.as_device_ptr(),
+                d_sed_stds.as_device_ptr(),
+                d_thresholds.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                d_ring_vis.as_device_ptr(),
+                vis_stride_i32,
+                d_ring_sed.as_device_ptr(),
+                sed_stride_i32,
+                d_vol.as_device_ptr(),
+                d_anti.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let output_buffers = [d_vol, d_anti];
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_vis_atrs, d_vis_stds, d_sed_atrs, d_sed_stds],
+            _parameter_f64: vec![d_thresholds],
+            _scratch_f64: vec![d_ring_vis, d_ring_sed],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch DI's canonical plus/minus pair from the already-resident HLC
+    /// frame. One sequential thread owns each exact period tuple so the two
+    /// Wilder accumulators and their shared true-range state follow the scalar
+    /// selected-output arithmetic without replaying either output.
+    pub fn di_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid: usize,
+        periods: &[usize],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "di";
+        const ENTRY_POINT: &str = "di_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["plus", "minus"];
+
+        let cols = ohlcv.len();
+        let rows = periods.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first simultaneous non-NaN HLC index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty period tuple list".into(),
+            });
+        }
+
+        let valid = cols - first_valid;
+        let mut period_values = Vec::with_capacity(rows);
+        for &period in periods {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs {period} bars from first-valid {first_valid}, found {valid}"
+                    ),
+                });
+            }
+            period_values.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes =
+            checked_mul(INDICATOR, "period bytes", rows, std::mem::size_of::<i32>())
+                .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&period_values)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Di)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let (plus, minus) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                plus[0].as_device_ptr(),
+                minus[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch DM's canonical plus/minus pair from the already-resident high/low
+    /// frame. One sequential thread owns each exact period tuple and both
+    /// Wilder accumulators are emitted by the shared exact f64 row authority.
+    pub fn dm_all_outputs(
+        &self,
+        high_low: CudaDeviceHighLowF64Ref,
+        first_valid: usize,
+        periods: &[usize],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "dm";
+        const ENTRY_POINT: &str = "dm_batch_f64";
+        const OUTPUT_IDS: [&str; 2] = ["plus", "minus"];
+
+        let cols = high_low.len();
+        let rows = periods.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident high/low frame".into(),
+            });
+        }
+        if high_low.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "high/low frame is resident on device {} but this session is bound to device {}",
+                    high_low.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first simultaneous non-NaN high/low index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty period tuple list".into(),
+            });
+        }
+
+        let valid = cols - first_valid;
+        let mut period_values = Vec::with_capacity(rows);
+        for &period in periods {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs {period} bars from first-valid {first_valid}, found {valid}"
+                    ),
+                });
+            }
+            period_values.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes =
+            checked_mul(INDICATOR, "period bytes", rows, std::mem::size_of::<i32>())
+                .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&period_values)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Dm)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(high_low.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(high_low.low().device_ptr());
+            let (plus, minus) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                d_periods.as_device_ptr(),
+                cols_i32,
+                rows_i32,
+                first_valid_i32,
+                plus[0].as_device_ptr(),
+                minus[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Fisher's canonical fisher/signal pair from the already-resident
+    /// high/low frame. One sequential thread owns each period's complete
+    /// recurrence and writes both outputs without replaying the state.
+    pub fn fisher_all_outputs(
+        &self,
+        high_low: CudaDeviceHighLowF64Ref,
+        first_valid: usize,
+        periods: &[usize],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "fisher";
+        const ENTRY_POINT: &str = "fisher_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["fisher", "signal"];
+
+        let cols = high_low.len();
+        let rows = periods.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident high/low frame".into(),
+            });
+        }
+        if high_low.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "high/low frame is resident on device {} but this session is bound to device {}",
+                    high_low.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first simultaneous non-NaN high/low index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty period tuple list".into(),
+            });
+        }
+
+        // Fisher-v2 admission is complete before period/output allocation.
+        let valid = cols - first_valid;
+        let mut max_period = 0usize;
+        for &period in periods {
+            if period == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "period 0 is not >= 1".into(),
+                });
+            }
+            if period > FISHER_F64_MAX_PERIOD {
+                return Err(CudaF64IndicatorError::PeriodTooLarge {
+                    indicator: INDICATOR,
+                    period,
+                    max: FISHER_F64_MAX_PERIOD,
+                });
+            }
+            if period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the {cols}-bar frame"),
+                });
+            }
+            if valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs {period} bars from first-valid {first_valid}, found {valid}"
+                    ),
+                });
+            }
+            max_period = max_period.max(period);
+        }
+        let fisher_shared_bytes = Self::fisher_shared_bytes_for_max_period_v2(max_period)?;
+        let mut period_values = Vec::with_capacity(rows);
+        for &period in periods {
+            period_values.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes =
+            checked_mul(INDICATOR, "period bytes", rows, std::mem::size_of::<i32>())
+                .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&period_values)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Fisher)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32);
+        let block = BlockSize::x(32);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(high_low.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(high_low.low().device_ptr());
+            let (fisher, signal) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, fisher_shared_bytes, stream>>>(
+                high,
+                low,
+                d_periods.as_device_ptr(),
+                cols_i32,
+                rows_i32,
+                first_valid_i32,
+                fisher[0].as_device_ptr(),
+                signal[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch the canonical FBEO forward_backward/backward/histogram matrices
+    /// from one already-resident close series. Each tuple owns its exact
+    /// sequential EMA and rolling-difference state in one shared-session
+    /// launch; prices and outputs never cross the host boundary here.
+    pub fn forward_backward_exponential_oscillator_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        finite_count: usize,
+        parameter_rows: &[(usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "forward_backward_exponential_oscillator";
+        const ENTRY_POINT: &str = "forward_backward_exponential_oscillator_batch_f64";
+        const OUTPUT_IDS: [&str; 3] = ["forward_backward", "backward", "histogram"];
+
+        let cols = prices.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if finite_count == 0 || finite_count > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("finite close count {finite_count} is invalid for {cols} bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty length/smooth tuple list".into(),
+            });
+        }
+
+        let mut lengths = Vec::with_capacity(rows);
+        let mut smooths = Vec::with_capacity(rows);
+        let mut max_length = 0usize;
+        for &(length, smooth) in parameter_rows {
+            if length == 0 || length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} is not inside 1..={cols}"),
+                });
+            }
+            if finite_count < length.max(2) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "length {length} needs {} finite closes, found {finite_count}",
+                        length.max(2)
+                    ),
+                });
+            }
+            if smooth == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "smooth must be positive".into(),
+                });
+            }
+            lengths.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            smooths.push(i32::try_from(smooth).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("smooth {smooth} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            max_length = max_length.max(length);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "three output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let one_scratch_elems =
+            checked_mul(INDICATOR, "rows*max length", rows, max_length).map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "two scratch ring bytes",
+            one_scratch_elems,
+            2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "two i32 parameter arrays",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/scratch/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let max_length_i32 =
+            i32::try_from(max_length).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("max length {max_length} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_smooths = DeviceBuffer::from_slice(&smooths)?;
+        let d_ema1_buffer =
+            unsafe { DeviceBuffer::<f64>::uninitialized(one_scratch_elems.max(1))? };
+        let d_diff_buffer =
+            unsafe { DeviceBuffer::<f64>::uninitialized(one_scratch_elems.max(1))? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::ForwardBackwardExponentialOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (forward_backward, rest) = output_buffers.split_at_mut(1);
+            let (backward, histogram) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_smooths.as_device_ptr(),
+                rows_i32,
+                max_length_i32,
+                d_ema1_buffer.as_device_ptr(),
+                d_diff_buffer.as_device_ptr(),
+                forward_backward[0].as_device_ptr(),
+                backward[0].as_device_ptr(),
+                histogram[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths, d_smooths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_ema1_buffer, d_diff_buffer],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch the canonical FVG Trailing Stop upper/lower/upper_ts/lower_ts
+    /// matrices from one already-resident HLC frame. Every exact parameter
+    /// tuple owns its gap queues, displacement rings and trailing-stop state in
+    /// one sequential thread; prices and outputs never cross the host boundary.
+    pub fn fvg_trailing_stop_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid_hlc: usize,
+        parameter_rows: &[(usize, usize, bool)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "fvg_trailing_stop";
+        const ENTRY_POINT: &str = "fvg_trailing_stop_outputs_f64";
+        const OUTPUT_IDS: [&str; 4] = ["upper", "lower", "upper_ts", "lower_ts"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_hlc >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first jointly non-NaN HLC bar {first_valid_hlc} is outside {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty lookback/smoothing/reset tuple list".into(),
+            });
+        }
+
+        let mut lookbacks = Vec::with_capacity(rows);
+        let mut smoothing_lengths = Vec::with_capacity(rows);
+        let mut reset_on_cross = Vec::with_capacity(rows);
+        let mut max_lookback = 0usize;
+        let mut max_smoothing = 0usize;
+        for &(lookback, smoothing_length, reset) in parameter_rows {
+            if lookback == 0 || lookback > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("unmitigated_fvg_lookback {lookback} is not inside 1..={cols}"),
+                });
+            }
+            if smoothing_length == 0 || smoothing_length >= cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "smoothing_length {smoothing_length} must leave at least one bar after its CPU warmup in {cols} bars"
+                    ),
+                });
+            }
+            let needed = smoothing_length.checked_add(1).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("smoothing_length {smoothing_length} overflows CPU warmup"),
+                }
+            })?;
+            if cols - first_valid_hlc < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "not enough valid HLC data after bar {first_valid_hlc}: needed={needed}, valid={}",
+                        cols - first_valid_hlc
+                    ),
+                });
+            }
+            lookbacks.push(i32::try_from(lookback).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("unmitigated_fvg_lookback {lookback} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            smoothing_lengths.push(i32::try_from(smoothing_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("smoothing_length {smoothing_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            reset_on_cross.push(if reset { 1 } else { 0 });
+            max_lookback = max_lookback.max(lookback);
+            max_smoothing = max_smoothing.max(smoothing_length);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let one_gap_elems = checked_mul(INDICATOR, "rows*max lookback", rows, max_lookback)
+            .map_err(plan_failure)?;
+        let one_ring_elems = checked_mul(INDICATOR, "rows*max smoothing", rows, max_smoothing)
+            .map_err(plan_failure)?;
+        let gap_bytes = checked_mul(
+            INDICATOR,
+            "two gap-queue bytes",
+            one_gap_elems,
+            2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let ring_value_bytes = checked_mul(
+            INDICATOR,
+            "two displacement-ring bytes",
+            one_ring_elems,
+            2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let ring_nan_bytes = checked_mul(
+            INDICATOR,
+            "two displacement-ring NaN-flag bytes",
+            one_ring_elems,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "three i32 parameter arrays",
+            rows,
+            3 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(gap_bytes)
+            .and_then(|bytes| bytes.checked_add(ring_value_bytes))
+            .and_then(|bytes| bytes.checked_add(ring_nan_bytes))
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/scratch/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let max_lookback_i32 =
+            i32::try_from(max_lookback).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("max lookback {max_lookback} exceeds the CUDA i32 ABI"),
+            })?;
+        let max_smoothing_i32 =
+            i32::try_from(max_smoothing).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("max smoothing {max_smoothing} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_lookbacks = DeviceBuffer::from_slice(&lookbacks)?;
+        let d_smoothing_lengths = DeviceBuffer::from_slice(&smoothing_lengths)?;
+        let d_reset_on_cross = DeviceBuffer::from_slice(&reset_on_cross)?;
+        let d_bull_gaps = unsafe { DeviceBuffer::<f64>::uninitialized(one_gap_elems.max(1))? };
+        let d_bear_gaps = unsafe { DeviceBuffer::<f64>::uninitialized(one_gap_elems.max(1))? };
+        let d_bull_rings = unsafe { DeviceBuffer::<f64>::uninitialized(one_ring_elems.max(1))? };
+        let d_bear_rings = unsafe { DeviceBuffer::<f64>::uninitialized(one_ring_elems.max(1))? };
+        let d_bull_ring_nan = unsafe { DeviceBuffer::<i32>::uninitialized(one_ring_elems.max(1))? };
+        let d_bear_ring_nan = unsafe { DeviceBuffer::<i32>::uninitialized(one_ring_elems.max(1))? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::FvgTrailingStop)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let (upper, rest) = output_buffers.split_at_mut(1);
+            let (lower, rest) = rest.split_at_mut(1);
+            let (upper_ts, lower_ts) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_lookbacks.as_device_ptr(),
+                d_smoothing_lengths.as_device_ptr(),
+                d_reset_on_cross.as_device_ptr(),
+                rows_i32,
+                max_lookback_i32,
+                max_smoothing_i32,
+                d_bull_gaps.as_device_ptr(),
+                d_bear_gaps.as_device_ptr(),
+                d_bull_rings.as_device_ptr(),
+                d_bear_rings.as_device_ptr(),
+                d_bull_ring_nan.as_device_ptr(),
+                d_bear_ring_nan.as_device_ptr(),
+                upper[0].as_device_ptr(),
+                lower[0].as_device_ptr(),
+                upper_ts[0].as_device_ptr(),
+                lower_ts[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lookbacks, d_smoothing_lengths, d_reset_on_cross],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_bull_gaps, d_bear_gaps, d_bull_rings, d_bear_rings],
+            _scratch_i32: vec![d_bull_ring_nan, d_bear_ring_nan],
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Donchian's canonical upper/middle/lower matrices from the
+    /// already-resident high/low frame. Every `(period, bar)` thread evaluates
+    /// the one shared exact f64 row authority and all three outputs remain in
+    /// this CUDA session until the FeatureFrame boundary.
+    pub fn donchian_all_outputs(
+        &self,
+        high_low: CudaDeviceHighLowF64Ref,
+        first_valid: usize,
+        periods: &[usize],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "donchian";
+        const ENTRY_POINT: &str = "donchian_all_outputs_batch_f64";
+        const OUTPUT_IDS: [&str; 3] = ["upper", "middle", "lower"];
+
+        let cols = high_low.len();
+        let rows = periods.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident high/low frame".into(),
+            });
+        }
+        if high_low.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "high/low frame is resident on device {} but this session is bound to device {}",
+                    high_low.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first independent high/low index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty period tuple list".into(),
+            });
+        }
+
+        let valid = cols - first_valid;
+        let mut period_values = Vec::with_capacity(rows);
+        for &period in periods {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs {period} bars from first-valid {first_valid}, found {valid}"
+                    ),
+                });
+            }
+            period_values.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "three output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes =
+            checked_mul(INDICATOR, "period bytes", rows, std::mem::size_of::<i32>())
+                .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let cols_u32 = u32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA grid ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&period_values)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Donchian)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::xy(cols_u32.div_ceil(BAR_BLOCK_X), rows_u32);
+        let block = BlockSize::x(BAR_BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(high_low.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(high_low.low().device_ptr());
+            let (upper, remaining) = output_buffers.split_at_mut(1);
+            let (middle, lower) = remaining.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                upper[0].as_device_ptr(),
+                middle[0].as_device_ptr(),
+                lower[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Directional Imbalance Index's canonical six matrices from the
+    /// already-resident high/low frame. One sequential thread owns each exact
+    /// `(length, period)` tuple plus its four runtime-sized rings. Inputs,
+    /// parameters, scratch, and outputs remain in this shared CUDA session.
+    pub fn directional_imbalance_index_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid_high_low_finite: usize,
+        parameter_tuples: &[(usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "directional_imbalance_index";
+        const ENTRY_POINT: &str = "directional_imbalance_index_batch_f64";
+        const OUTPUT_IDS: [&str; 6] = ["up", "down", "bulls", "bears", "upper", "lower"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident high/low frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "high/low frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_high_low_finite >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "no simultaneous finite high/low pair exists inside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty (length, period) tuple list".into(),
+            });
+        }
+
+        let mut lengths = Vec::with_capacity(rows);
+        let mut periods = Vec::with_capacity(rows);
+        let mut window_stride = 0usize;
+        let mut period_stride = 0usize;
+        for &(length, period) in parameter_tuples {
+            if length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "length must be positive".into(),
+                });
+            }
+            if period == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "period must be positive".into(),
+                });
+            }
+            let window =
+                length
+                    .checked_add(1)
+                    .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("length {length} overflows the inclusive window"),
+                    })?;
+            lengths.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            window_stride = window_stride.max(window);
+            period_stride = period_stride.max(period);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "six output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let window_scratch_elems = checked_mul(
+            INDICATOR,
+            "two rows*window scratch rings",
+            rows,
+            window_stride
+                .checked_mul(2)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "two-window scratch element count overflow".into(),
+                })?,
+        )
+        .map_err(plan_failure)?;
+        let hit_scratch_elems = checked_mul(
+            INDICATOR,
+            "two rows*period scratch rings",
+            rows,
+            period_stride
+                .checked_mul(2)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "two-hit scratch element count overflow".into(),
+                })?,
+        )
+        .map_err(plan_failure)?;
+        let scratch_elems = window_scratch_elems
+            .checked_add(hit_scratch_elems)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "four-ring scratch element count overflow".into(),
+            })?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "four-ring scratch bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "two i32 parameter arrays",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/scratch/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let window_stride_i32 =
+            i32::try_from(window_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("window stride {window_stride} exceeds the CUDA i32 ABI"),
+            })?;
+        let period_stride_i32 =
+            i32::try_from(period_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("period stride {period_stride} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_high_ring = unsafe {
+            DeviceBuffer::<f64>::uninitialized(rows.checked_mul(window_stride).ok_or_else(
+                || CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "high-ring element count overflow".into(),
+                },
+            )?)?
+        };
+        let d_low_ring = unsafe {
+            DeviceBuffer::<f64>::uninitialized(rows.checked_mul(window_stride).ok_or_else(
+                || CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "low-ring element count overflow".into(),
+                },
+            )?)?
+        };
+        let d_up_hits = unsafe {
+            DeviceBuffer::<f64>::uninitialized(rows.checked_mul(period_stride).ok_or_else(
+                || CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "up-hit-ring element count overflow".into(),
+                },
+            )?)?
+        };
+        let d_down_hits = unsafe {
+            DeviceBuffer::<f64>::uninitialized(rows.checked_mul(period_stride).ok_or_else(
+                || CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "down-hit-ring element count overflow".into(),
+                },
+            )?)?
+        };
+        let d_up = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_down = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_bulls = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_bears = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_upper = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_lower = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::DirectionalImbalanceIndex)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_periods.as_device_ptr(),
+                rows_i32,
+                window_stride_i32,
+                period_stride_i32,
+                d_high_ring.as_device_ptr(),
+                d_low_ring.as_device_ptr(),
+                d_up_hits.as_device_ptr(),
+                d_down_hits.as_device_ptr(),
+                d_up.as_device_ptr(),
+                d_down.as_device_ptr(),
+                d_bulls.as_device_ptr(),
+                d_bears.as_device_ptr(),
+                d_upper.as_device_ptr(),
+                d_lower.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let output_buffers = [d_up, d_down, d_bulls, d_bears, d_upper, d_lower];
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths, d_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_high_ring, d_low_ring, d_up_hits, d_down_hits],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Disparity Index's sole canonical value matrix from one
+    /// already-resident close series. Each sequential thread owns the exact
+    /// EMA, lookback, smoothing, and smoothing-kind tuple plus its two
+    /// runtime-sized rings. The retained default primary and this dynamic
+    /// production ABI delegate to one shared CUDA row authority.
+    pub fn disparity_index_production_output(
+        &self,
+        close: CudaDeviceSliceF64Ref,
+        max_consecutive_finite_close: usize,
+        parameter_rows: &[(usize, usize, usize, bool)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "disparity_index";
+        const ENTRY_POINT: &str = "disparity_index_batch_f64";
+        const OUTPUT_IDS: [&str; 1] = ["value"];
+
+        let cols = close.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if close.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    close.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_consecutive_finite_close == 0 || max_consecutive_finite_close > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "maximum consecutive finite close count {max_consecutive_finite_close} is \
+                     invalid for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut ema_periods = Vec::with_capacity(rows);
+        let mut lookback_periods = Vec::with_capacity(rows);
+        let mut smoothing_periods = Vec::with_capacity(rows);
+        let mut smoothing_flags = Vec::with_capacity(rows);
+        let mut max_lookback = 0usize;
+        let mut max_smoothing = 0usize;
+        for &(ema_period, lookback_period, smoothing_period, smoothing_is_sma) in parameter_rows {
+            for (key, value) in [
+                ("ema_period", ema_period),
+                ("lookback_period", lookback_period),
+                ("smoothing_period", smoothing_period),
+            ] {
+                if value == 0 || value > cols {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{key} {value} is not inside 1..={cols}"),
+                    });
+                }
+            }
+            let needed = ema_period
+                .checked_add(lookback_period)
+                .and_then(|value| value.checked_add(smoothing_period))
+                .and_then(|value| value.checked_sub(2))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "tuple ({ema_period}, {lookback_period}, {smoothing_period}) warmup \
+                         length overflow"
+                    ),
+                })?;
+            if max_consecutive_finite_close < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "tuple ({ema_period}, {lookback_period}, {smoothing_period}) needs \
+                         {needed} consecutive finite closes, found \
+                         {max_consecutive_finite_close}"
+                    ),
+                });
+            }
+            ema_periods.push(i32::try_from(ema_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("ema_period {ema_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            lookback_periods.push(i32::try_from(lookback_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("lookback_period {lookback_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            smoothing_periods.push(i32::try_from(smoothing_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("smoothing_period {smoothing_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            smoothing_flags.push(if smoothing_is_sma { 1_i32 } else { 0_i32 });
+            max_lookback = max_lookback.max(lookback_period);
+            max_smoothing = max_smoothing.max(smoothing_period);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "output bytes",
+            output_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let disparity_scratch_elems =
+            checked_mul(INDICATOR, "rows*lookback stride", rows, max_lookback)
+                .map_err(plan_failure)?;
+        let sma_scratch_elems =
+            checked_mul(INDICATOR, "rows*smoothing stride", rows, max_smoothing)
+                .map_err(plan_failure)?;
+        let scratch_elems = disparity_scratch_elems
+            .checked_add(sma_scratch_elems)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "two-ring scratch element count overflow".into(),
+            })?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "two-ring scratch bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "four i32 parameter arrays",
+            rows,
+            4 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/scratch/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let max_lookback_i32 =
+            i32::try_from(max_lookback).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("lookback stride {max_lookback} exceeds the CUDA i32 ABI"),
+            })?;
+        let max_smoothing_i32 =
+            i32::try_from(max_smoothing).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("smoothing stride {max_smoothing} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_ema_periods = DeviceBuffer::from_slice(&ema_periods)?;
+        let d_lookback_periods = DeviceBuffer::from_slice(&lookback_periods)?;
+        let d_smoothing_periods = DeviceBuffer::from_slice(&smoothing_periods)?;
+        let d_smoothing_flags = DeviceBuffer::from_slice(&smoothing_flags)?;
+        let d_disparity_buffer =
+            unsafe { DeviceBuffer::<f64>::uninitialized(disparity_scratch_elems)? };
+        let d_sma_buffer = unsafe { DeviceBuffer::<f64>::uninitialized(sma_scratch_elems)? };
+        let output_buffer = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::DisparityIndex)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let close = cust::memory::DevicePointer::<f64>::from_raw(close.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                close,
+                cols_i32,
+                d_ema_periods.as_device_ptr(),
+                d_lookback_periods.as_device_ptr(),
+                d_smoothing_periods.as_device_ptr(),
+                d_smoothing_flags.as_device_ptr(),
+                rows_i32,
+                max_lookback_i32,
+                max_smoothing_i32,
+                d_disparity_buffer.as_device_ptr(),
+                d_sma_buffer.as_device_ptr(),
+                output_buffer.as_device_ptr()
+            ))?;
+        }
+
+        let matrix = CudaDeviceMatrixF64::from_buffer(
+            output_buffer,
+            rows,
+            cols,
+            self.context_arc(),
+            self.device_id(),
+        )
+        .map_err(|error| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("value device matrix ownership failed: {error}"),
+        })?;
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![F64NamedDeviceOutput {
+                output_id: OUTPUT_IDS[0],
+                matrix,
+            }],
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_ema_periods,
+                d_lookback_periods,
+                d_smoothing_periods,
+                d_smoothing_flags,
+            ],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_disparity_buffer, d_sma_buffer],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Dual Ulcer Index's canonical long/short/threshold matrices from
+    /// one already-resident close series. One sequential thread owns the exact
+    /// extrema, sliding square sums and cumulative auto-threshold state for
+    /// each admitted tuple; no standalone two-pass wrapper enters production.
+    pub fn dual_ulcer_index_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        max_consecutive_valid: usize,
+        parameter_rows: &[(usize, bool, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "dual_ulcer_index";
+        const ENTRY_POINT: &str = "dual_ulcer_index_all_outputs_f64";
+        const OUTPUT_IDS: [&str; 3] = ["long_ulcer", "short_ulcer", "threshold"];
+
+        let cols = prices.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_consecutive_valid == 0 || max_consecutive_valid > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "finite positive close run {max_consecutive_valid} is invalid for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut auto_thresholds = Vec::with_capacity(rows);
+        let mut thresholds = Vec::with_capacity(rows);
+        for &(period, auto_threshold, threshold) in parameter_rows {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            let needed = period
+                .checked_mul(2)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} warmup length overflow"),
+                })?;
+            if max_consecutive_valid < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs {needed} consecutive finite positive closes, \
+                         found {max_consecutive_valid}"
+                    ),
+                });
+            }
+            if !threshold.is_finite() || threshold < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("threshold must be finite and at least 0, got {threshold}"),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            auto_thresholds.push(if auto_threshold { 1 } else { 0 });
+            thresholds.push(threshold);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "three output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let i32_parameter_bytes = checked_mul(
+            INDICATOR,
+            "two i32 parameter arrays",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let f64_parameter_bytes = checked_mul(
+            INDICATOR,
+            "one f64 parameter array",
+            rows,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(i32_parameter_bytes)
+            .and_then(|value| value.checked_add(f64_parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_auto_thresholds = DeviceBuffer::from_slice(&auto_thresholds)?;
+        let d_thresholds = DeviceBuffer::from_slice(&thresholds)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::DualUlcerIndex)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (long_ulcer, rest) = output_buffers.split_at_mut(1);
+            let (short_ulcer, threshold) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_auto_thresholds.as_device_ptr(),
+                d_thresholds.as_device_ptr(),
+                rows_i32,
+                long_ulcer[0].as_device_ptr(),
+                short_ulcer[0].as_device_ptr(),
+                threshold[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods, d_auto_thresholds],
+            _parameter_f64: vec![d_thresholds],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch DVDIQQE's canonical dvdi/fast/slow/center matrices from one
+    /// already-resident OHLCV frame. The explicit dynamic seven-parameter ABI
+    /// keeps every admitted tuple auditable while one sequential thread owns
+    /// the complete PVI/NVI, six-EMA, ratchet and cumulative-center state.
+    pub fn dvdiqqe_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid_close_finite: usize,
+        parameter_rows: &[(usize, usize, f64, f64, bool, bool, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "dvdiqqe";
+        const ENTRY_POINT: &str = "dvdiqqe_all_outputs_f64";
+        const OUTPUT_IDS: [&str; 4] = ["dvdi", "fast_tl", "slow_tl", "center_line"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLCV frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLCV is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_close_finite >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first finite close {first_valid_close_finite} is outside {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut smoothing_periods = Vec::with_capacity(rows);
+        let mut fast_multipliers = Vec::with_capacity(rows);
+        let mut slow_multipliers = Vec::with_capacity(rows);
+        let mut use_tick_only_flags = Vec::with_capacity(rows);
+        let mut dynamic_center_flags = Vec::with_capacity(rows);
+        let mut tick_sizes = Vec::with_capacity(rows);
+        for &(
+            period,
+            smoothing_period,
+            fast_multiplier,
+            slow_multiplier,
+            use_tick_only,
+            dynamic_center,
+            tick_size,
+        ) in parameter_rows
+        {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if cols - first_valid_close_finite < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} needs {period} bars from first finite close \
+                         {first_valid_close_finite}, found {}",
+                        cols - first_valid_close_finite
+                    ),
+                });
+            }
+            let double_period = period
+                .checked_mul(2)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} double-period overflow"),
+                })?;
+            i32::try_from(double_period).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("double period {double_period} exceeds the CUDA i32 ABI"),
+            })?;
+            if double_period > cols.saturating_sub(1) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "double period {double_period} needs {double_period} finite range bars after the initial NaN, found {}",
+                        cols.saturating_sub(1)
+                    ),
+                });
+            }
+            if smoothing_period == 0 || smoothing_period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("smoothing period {smoothing_period} is not inside 1..={cols}"),
+                });
+            }
+            if !fast_multiplier.is_finite() || fast_multiplier <= 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "fast multiplier must be finite and positive, got {fast_multiplier}"
+                    ),
+                });
+            }
+            if !slow_multiplier.is_finite() || slow_multiplier <= 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "slow multiplier must be finite and positive, got {slow_multiplier}"
+                    ),
+                });
+            }
+            if !tick_size.is_finite() || tick_size <= 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("tick size must be finite and positive, got {tick_size}"),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            smoothing_periods.push(i32::try_from(smoothing_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("smoothing period {smoothing_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            fast_multipliers.push(fast_multiplier);
+            slow_multipliers.push(slow_multiplier);
+            use_tick_only_flags.push(if use_tick_only { 1_i32 } else { 0_i32 });
+            dynamic_center_flags.push(if dynamic_center { 1_i32 } else { 0_i32 });
+            tick_sizes.push(tick_size);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let i32_parameter_bytes = checked_mul(
+            INDICATOR,
+            "four i32 parameter arrays",
+            rows,
+            4 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let f64_parameter_bytes = checked_mul(
+            INDICATOR,
+            "three f64 parameter arrays",
+            rows,
+            3 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(i32_parameter_bytes)
+            .and_then(|value| value.checked_add(f64_parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 = i32::try_from(first_valid_close_finite).map_err(|_| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first finite close {first_valid_close_finite} exceeds the CUDA i32 ABI"
+                ),
+            }
+        })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_smoothing_periods = DeviceBuffer::from_slice(&smoothing_periods)?;
+        let d_fast_multipliers = DeviceBuffer::from_slice(&fast_multipliers)?;
+        let d_slow_multipliers = DeviceBuffer::from_slice(&slow_multipliers)?;
+        let d_use_tick_only = DeviceBuffer::from_slice(&use_tick_only_flags)?;
+        let d_dynamic_center = DeviceBuffer::from_slice(&dynamic_center_flags)?;
+        let d_tick_sizes = DeviceBuffer::from_slice(&tick_sizes)?;
+        let mut d_dvdi = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let mut d_fast_tl = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let mut d_slow_tl = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let mut d_center_line = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::Dvdiqqe)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let volume = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.volume().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                close,
+                volume,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_smoothing_periods.as_device_ptr(),
+                d_fast_multipliers.as_device_ptr(),
+                d_slow_multipliers.as_device_ptr(),
+                d_use_tick_only.as_device_ptr(),
+                d_dynamic_center.as_device_ptr(),
+                d_tick_sizes.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                d_dvdi.as_device_ptr(),
+                d_fast_tl.as_device_ptr(),
+                d_slow_tl.as_device_ptr(),
+                d_center_line.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let output_buffers = [d_dvdi, d_fast_tl, d_slow_tl, d_center_line];
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_periods,
+                d_smoothing_periods,
+                d_use_tick_only,
+                d_dynamic_center,
+            ],
+            _parameter_f64: vec![d_fast_multipliers, d_slow_multipliers, d_tick_sizes],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch the canonical Ehlers Autocorrelation Periodogram pair from the
+    /// already-resident close series.
+    ///
+    /// The only host-to-device payload is immutable parameter arithmetic:
+    /// exact scalar-CPU coefficient bits and trig tables for each tuple. The
+    /// complete filter, correlation, spectrum, dominant-cycle and normalized
+    /// power state stays in one sequential CUDA launch. Input prices are never
+    /// uploaded again and neither output is reconstructed on the host.
+    pub fn ehlers_autocorrelation_periodogram_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        parameter_rows: &[(usize, usize, usize, bool)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_autocorrelation_periodogram";
+        const ENTRY_POINT: &str = "ehlers_autocorrelation_periodogram_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["dominant_cycle", "normalized_power"];
+        const INTS_PER_ROW: usize = 4;
+        const COEFFICIENTS_PER_ROW: usize = 7;
+
+        let cols = prices.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let mut packed_parameters = Vec::with_capacity(
+            checked_mul(INDICATOR, "four integers per row", rows, INTS_PER_ROW)
+                .map_err(plan_failure)?,
+        );
+        let mut packed_coefficients = Vec::with_capacity(
+            checked_mul(
+                INDICATOR,
+                "seven coefficients per row",
+                rows,
+                COEFFICIENTS_PER_ROW,
+            )
+            .map_err(plan_failure)?,
+        );
+        let mut trig_offsets = Vec::with_capacity(rows);
+        let mut cos_tables = Vec::new();
+        let mut sin_tables = Vec::new();
+        let mut scratch_stride = 0usize;
+
+        for &(min_period, max_period, avg_length, enhance) in parameter_rows {
+            if min_period < 3 || max_period <= min_period || max_period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "invalid tuple min_period={min_period}, max_period={max_period}, bars={cols}"
+                    ),
+                });
+            }
+            let expected_trig_stride =
+                max_period
+                    .checked_add(1)
+                    .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: "trig table stride overflow".into(),
+                    })?;
+            let expected_trig_len = checked_mul(
+                INDICATOR,
+                "(max_period+1)^2 trig table",
+                expected_trig_stride,
+                expected_trig_stride,
+            )
+            .map_err(plan_failure)?;
+            let exact = ehlers_autocorrelation_periodogram_exact_coefficients(
+                &EhlersAutocorrelationPeriodogramParams {
+                    min_period: Some(min_period),
+                    max_period: Some(max_period),
+                    avg_length: Some(avg_length),
+                    enhance: Some(enhance),
+                },
+            )
+            .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("CPU coefficient authority rejected the exact tuple: {error}"),
+            })?;
+            if (
+                exact.min_period,
+                exact.max_period,
+                exact.avg_length,
+                exact.enhance,
+            ) != (min_period, max_period, avg_length, enhance)
+            {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "CPU coefficient authority changed the resolved parameter tuple".into(),
+                });
+            }
+
+            if exact.trig_stride != expected_trig_stride
+                || exact.cos_table.len() != expected_trig_len
+                || exact.sin_table.len() != expected_trig_len
+            {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "CPU trig table shape stride={}, lens=({}, {}) != stride={expected_trig_stride}, lens=({expected_trig_len}, {expected_trig_len})",
+                        exact.trig_stride,
+                        exact.cos_table.len(),
+                        exact.sin_table.len()
+                    ),
+                });
+            }
+            let trig_offset = i32::try_from(cos_tables.len()).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "flattened trig table offset exceeds the CUDA i32 ABI".into(),
+                }
+            })?;
+            trig_offsets.push(trig_offset);
+            cos_tables.extend_from_slice(&exact.cos_table);
+            sin_tables.extend_from_slice(&exact.sin_table);
+
+            for (key, value) in [
+                ("min_period", min_period),
+                ("max_period", max_period),
+                ("avg_length", avg_length),
+            ] {
+                packed_parameters.push(i32::try_from(value).map_err(|_| {
+                    CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{key} {value} exceeds the CUDA i32 ABI"),
+                    }
+                })?);
+            }
+            packed_parameters.push(i32::from(enhance));
+            packed_coefficients.extend_from_slice(&[
+                exact.hp_coef,
+                exact.hp_prev1_coef,
+                exact.hp_prev2_coef,
+                exact.filt_c1,
+                exact.filt_c2,
+                exact.filt_c3,
+                exact.decay,
+            ]);
+
+            let corr_window = if avg_length == 0 {
+                max_period.max(2)
+            } else {
+                avg_length.max(2)
+            };
+            let history_cap = max_period.checked_add(corr_window).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "history capacity overflow".into(),
+                }
+            })?;
+            let spectral_scratch = max_period
+                .checked_add(1)
+                .and_then(|value| value.checked_mul(3))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "spectral scratch capacity overflow".into(),
+                })?;
+            let row_scratch = history_cap.checked_add(spectral_scratch).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "row scratch capacity overflow".into(),
+                }
+            })?;
+            scratch_stride = scratch_stride.max(row_scratch);
+        }
+
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "packed integer parameter bytes",
+            packed_parameters
+                .len()
+                .checked_add(trig_offsets.len())
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "integer parameter element count overflow".into(),
+                })?,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let coefficient_bytes = checked_mul(
+            INDICATOR,
+            "exact coefficient bytes",
+            packed_coefficients.len(),
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let trig_elements = cos_tables
+            .len()
+            .checked_add(sin_tables.len())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "trig table element count overflow".into(),
+            })?;
+        let trig_table_bytes = checked_mul(
+            INDICATOR,
+            "CPU-owned trig table bytes",
+            trig_elements,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let scratch_elems = checked_mul(INDICATOR, "rows*scratch_stride", rows, scratch_stride)
+            .map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "dynamic scratch bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = [
+            output_bytes,
+            parameter_bytes,
+            coefficient_bytes,
+            trig_table_bytes,
+            scratch_bytes,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: "resident output/parameter/coefficient/trig/scratch byte count overflow".into(),
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let scratch_stride_i32 =
+            i32::try_from(scratch_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("scratch stride {scratch_stride} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_parameter_rows = DeviceBuffer::from_slice(&packed_parameters)?;
+        let d_coefficients = DeviceBuffer::from_slice(&packed_coefficients)?;
+        let d_trig_offsets = DeviceBuffer::from_slice(&trig_offsets)?;
+        let d_cos_tables = DeviceBuffer::from_slice(&cos_tables)?;
+        let d_sin_tables = DeviceBuffer::from_slice(&sin_tables)?;
+        let d_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_elems)? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::EhlersAutocorrelationPeriodogram)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32);
+        let block = BlockSize::x(BAR_BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let input = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (dominant_cycle, normalized_power) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                input,
+                cols_i32,
+                d_parameter_rows.as_device_ptr(),
+                d_coefficients.as_device_ptr(),
+                d_trig_offsets.as_device_ptr(),
+                d_cos_tables.as_device_ptr(),
+                d_sin_tables.as_device_ptr(),
+                rows_i32,
+                scratch_stride_i32,
+                d_scratch.as_device_ptr(),
+                dominant_cycle[0].as_device_ptr(),
+                normalized_power[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_parameter_rows, d_trig_offsets],
+            _parameter_f64: vec![d_coefficients, d_cos_tables, d_sin_tables],
+            _scratch_f64: vec![d_scratch],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch the canonical five-output Ehlers Linear Extrapolation Predictor
+    /// from the already-resident close series. The only host-to-device data is
+    /// the exact parameter/coefficient/Hann payload produced by the scalar CPU
+    /// authority; prices and outputs never cross the production host boundary.
+    pub fn ehlers_linear_extrapolation_predictor_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        finite_count: usize,
+        parameter_rows: &[(usize, usize, f64, usize, i32)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_linear_extrapolation_predictor";
+        const ENTRY_POINT: &str = "ehlers_linear_extrapolation_predictor_outputs_f64";
+        const OUTPUT_IDS: [&str; 5] = ["prediction", "filter", "state", "go_long", "go_short"];
+        const INTS_PER_ROW: usize = 4;
+        const COEFFICIENTS_PER_ROW: usize = 5;
+
+        let cols = prices.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if finite_count == 0 || finite_count > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("finite close count {finite_count} is invalid for {cols} bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty exact parameter tuple list".into(),
+            });
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let mut packed_parameters = Vec::with_capacity(
+            checked_mul(INDICATOR, "four integers per row", rows, INTS_PER_ROW)
+                .map_err(plan_failure)?,
+        );
+        let mut packed_coefficients = Vec::with_capacity(
+            checked_mul(
+                INDICATOR,
+                "five coefficients per row",
+                rows,
+                COEFFICIENTS_PER_ROW,
+            )
+            .map_err(plan_failure)?,
+        );
+        let mut hann_offsets = Vec::with_capacity(rows);
+        let mut hann_weights = Vec::new();
+        let mut max_low_pass_length = 0usize;
+
+        for &(high_pass_length, low_pass_length, gain, bars_forward, signal_mode) in parameter_rows
+        {
+            let signal_mode_name = match signal_mode {
+                0 => "predict_filter_crosses",
+                1 => "predict_middle_crosses",
+                2 => "filter_middle_crosses",
+                other => {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("signal mode code {other} is outside the exact CUDA ABI"),
+                    });
+                }
+            };
+            let needed = low_pass_length.checked_add(12).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "low-pass warmup length overflow".into(),
+                }
+            })?;
+            if finite_count < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "tuple ({high_pass_length}, {low_pass_length}) needs {needed} finite closes, found {finite_count}"
+                    ),
+                });
+            }
+            let exact = ehlers_linear_extrapolation_predictor_exact_coefficients(
+                &EhlersLinearExtrapolationPredictorParams {
+                    high_pass_length: Some(high_pass_length),
+                    low_pass_length: Some(low_pass_length),
+                    gain: Some(gain),
+                    bars_forward: Some(bars_forward),
+                    signal_mode: Some(signal_mode_name.to_string()),
+                },
+            )
+            .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("CPU coefficient authority rejected the exact tuple: {error}"),
+            })?;
+            if exact.high_pass_length != high_pass_length
+                || exact.low_pass_length != low_pass_length
+                || exact.gain.to_bits() != gain.to_bits()
+                || exact.bars_forward != bars_forward
+                || exact.signal_mode != signal_mode
+                || exact.hann_weights.len() != low_pass_length
+                || !exact.hann_weight_sum.is_finite()
+                || exact.hann_weight_sum == 0.0
+            {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "CPU coefficient authority changed the exact tuple/payload shape"
+                        .into(),
+                });
+            }
+
+            for (key, value) in [
+                ("high_pass_length", high_pass_length),
+                ("low_pass_length", low_pass_length),
+                ("bars_forward", bars_forward),
+            ] {
+                packed_parameters.push(i32::try_from(value).map_err(|_| {
+                    CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{key} {value} exceeds the CUDA i32 ABI"),
+                    }
+                })?);
+            }
+            packed_parameters.push(signal_mode);
+            packed_coefficients.extend_from_slice(&[
+                exact.gain,
+                exact.hp_c1,
+                exact.hp_c2,
+                exact.hp_c3,
+                exact.hann_weight_sum,
+            ]);
+            hann_offsets.push(i32::try_from(hann_weights.len()).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "flattened Hann-weight offset exceeds the CUDA i32 ABI".into(),
+                }
+            })?);
+            hann_weights.extend_from_slice(&exact.hann_weights);
+            max_low_pass_length = max_low_pass_length.max(low_pass_length);
+        }
+
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "five output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_elements = packed_parameters
+            .len()
+            .checked_add(hann_offsets.len())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "integer parameter element count overflow".into(),
+            })?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "integer parameter bytes",
+            parameter_elements,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let coefficient_bytes = checked_mul(
+            INDICATOR,
+            "exact coefficient bytes",
+            packed_coefficients.len(),
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let hann_weight_bytes = checked_mul(
+            INDICATOR,
+            "CPU-owned Hann-weight bytes",
+            hann_weights.len(),
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let scratch_elems = checked_mul(
+            INDICATOR,
+            "rows*max_low_pass_length",
+            rows,
+            max_low_pass_length,
+        )
+        .map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "high-pass history scratch bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = [
+            output_bytes,
+            parameter_bytes,
+            coefficient_bytes,
+            hann_weight_bytes,
+            scratch_bytes,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: "resident ELEP byte count overflow".into(),
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let max_low_pass_i32 = i32::try_from(max_low_pass_length).map_err(|_| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "low-pass scratch stride {max_low_pass_length} exceeds the CUDA i32 ABI"
+                ),
+            }
+        })?;
+
+        let d_parameter_rows = DeviceBuffer::from_slice(&packed_parameters)?;
+        let d_coefficients = DeviceBuffer::from_slice(&packed_coefficients)?;
+        let d_hann_offsets = DeviceBuffer::from_slice(&hann_offsets)?;
+        let d_hann_weights = DeviceBuffer::from_slice(&hann_weights)?;
+        let d_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_elems)? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::EhlersLinearExtrapolationPredictor)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let input = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (prediction, remaining) = output_buffers.split_at_mut(1);
+            let (filter, remaining) = remaining.split_at_mut(1);
+            let (state, remaining) = remaining.split_at_mut(1);
+            let (go_long, go_short) = remaining.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                input,
+                cols_i32,
+                d_parameter_rows.as_device_ptr(),
+                d_coefficients.as_device_ptr(),
+                d_hann_offsets.as_device_ptr(),
+                d_hann_weights.as_device_ptr(),
+                rows_i32,
+                max_low_pass_i32,
+                d_scratch.as_device_ptr(),
+                prediction[0].as_device_ptr(),
+                filter[0].as_device_ptr(),
+                state[0].as_device_ptr(),
+                go_long[0].as_device_ptr(),
+                go_short[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_parameter_rows, d_hann_offsets],
+            _parameter_f64: vec![d_coefficients, d_hann_weights],
+            _scratch_f64: vec![d_scratch],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch the canonical fast/slow Ehlers Undersampled Double Moving
+    /// Average pair from one already-resident price series. The host uploads
+    /// only the exact scalar-CPU Hann coefficients and bounded tuple metadata;
+    /// both price-dependent rows remain in one shared-session CUDA launch.
+    pub fn ehlers_undersampled_double_moving_average_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_rows: &[(usize, usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_undersampled_double_moving_average";
+        const ENTRY_POINT: &str = "ehlers_undersampled_double_moving_average_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["fast", "slow"];
+        const INTS_PER_ROW: usize = 3;
+
+        let cols = prices.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident price series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "prices are resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first non-NaN price index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty exact parameter tuple list".into(),
+            });
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let mut packed_parameters = Vec::with_capacity(
+            checked_mul(INDICATOR, "three integers per row", rows, INTS_PER_ROW)
+                .map_err(plan_failure)?,
+        );
+        let mut weight_offsets = Vec::with_capacity(
+            checked_mul(INDICATOR, "two weight offsets per row", rows, 2).map_err(plan_failure)?,
+        );
+        let mut norms = Vec::with_capacity(
+            checked_mul(INDICATOR, "two Hann norms per row", rows, 2).map_err(plan_failure)?,
+        );
+        let mut hann_weights = Vec::new();
+        let mut max_fast_length = 0usize;
+        let mut max_slow_length = 0usize;
+
+        for &(fast_length, slow_length, sample_length) in parameter_rows {
+            for (key, value) in [
+                ("fast_length", fast_length),
+                ("slow_length", slow_length),
+                ("sample_length", sample_length),
+            ] {
+                if value == 0 || value > 4096 {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{key} {value} is outside the canonical 1..=4096 bound"),
+                    });
+                }
+                packed_parameters.push(i32::try_from(value).map_err(|_| {
+                    CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{key} {value} exceeds the CUDA i32 ABI"),
+                    }
+                })?);
+            }
+
+            let exact = ehlers_undersampled_double_moving_average_exact_hann_payload(
+                fast_length,
+                slow_length,
+            )
+            .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("CPU Hann authority rejected the exact tuple: {error}"),
+            })?;
+            if exact.fast_weights.len() != fast_length
+                || exact.slow_weights.len() != slow_length
+                || !exact.fast_norm.is_finite()
+                || exact.fast_norm == 0.0
+                || !exact.slow_norm.is_finite()
+                || exact.slow_norm == 0.0
+            {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "CPU Hann authority changed the exact tuple/payload shape".into(),
+                });
+            }
+
+            weight_offsets.push(i32::try_from(hann_weights.len()).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "flattened fast Hann offset exceeds the CUDA i32 ABI".into(),
+                }
+            })?);
+            hann_weights.extend_from_slice(&exact.fast_weights);
+            weight_offsets.push(i32::try_from(hann_weights.len()).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "flattened slow Hann offset exceeds the CUDA i32 ABI".into(),
+                }
+            })?);
+            hann_weights.extend_from_slice(&exact.slow_weights);
+            norms.extend_from_slice(&[exact.fast_norm, exact.slow_norm]);
+            max_fast_length = max_fast_length.max(fast_length);
+            max_slow_length = max_slow_length.max(slow_length);
+        }
+
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let integer_parameter_elems = packed_parameters
+            .len()
+            .checked_add(weight_offsets.len())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "integer parameter element count overflow".into(),
+            })?;
+        let integer_parameter_bytes = checked_mul(
+            INDICATOR,
+            "integer parameter bytes",
+            integer_parameter_elems,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let norm_bytes = checked_mul(
+            INDICATOR,
+            "Hann norm bytes",
+            norms.len(),
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = integer_parameter_bytes
+            .checked_add(norm_bytes)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let hann_weight_bytes = checked_mul(
+            INDICATOR,
+            "CPU-owned Hann-weight bytes",
+            hann_weights.len(),
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let fast_scratch_elems =
+            checked_mul(INDICATOR, "rows*max_fast_length", rows, max_fast_length)
+                .map_err(plan_failure)?;
+        let slow_scratch_elems =
+            checked_mul(INDICATOR, "rows*max_slow_length", rows, max_slow_length)
+                .map_err(plan_failure)?;
+        let scratch_elems = fast_scratch_elems
+            .checked_add(slow_scratch_elems)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "combined ring scratch element count overflow".into(),
+            })?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "fast/slow ring scratch bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = [
+            output_bytes,
+            parameter_bytes,
+            hann_weight_bytes,
+            scratch_bytes,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: "resident EUDMA byte count overflow".into(),
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first non-NaN index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let max_fast_i32 =
+            i32::try_from(max_fast_length).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("fast scratch stride {max_fast_length} exceeds the CUDA i32 ABI"),
+            })?;
+        let max_slow_i32 =
+            i32::try_from(max_slow_length).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("slow scratch stride {max_slow_length} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_parameter_rows = DeviceBuffer::from_slice(&packed_parameters)?;
+        let d_weight_offsets = DeviceBuffer::from_slice(&weight_offsets)?;
+        let d_norms = DeviceBuffer::from_slice(&norms)?;
+        let d_hann_weights = DeviceBuffer::from_slice(&hann_weights)?;
+        let d_fast_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(fast_scratch_elems)? };
+        let d_slow_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(slow_scratch_elems)? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::EhlersUndersampledDoubleMovingAverage)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let input = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (fast, slow) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                input,
+                cols_i32,
+                d_parameter_rows.as_device_ptr(),
+                d_norms.as_device_ptr(),
+                d_weight_offsets.as_device_ptr(),
+                d_hann_weights.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                max_fast_i32,
+                max_slow_i32,
+                d_fast_scratch.as_device_ptr(),
+                d_slow_scratch.as_device_ptr(),
+                fast[0].as_device_ptr(),
+                slow[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_parameter_rows, d_weight_offsets],
+            _parameter_f64: vec![d_norms, d_hann_weights],
+            _scratch_f64: vec![d_fast_scratch, d_slow_scratch],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch EMA-Deviation-Corrected T3's canonical corrected/T3 pair from
+    /// one already-resident close series. The only new device payload is the
+    /// bounded exact `(period, hot, t3_mode)` tuple list; both output matrices
+    /// are produced by one sequential shared-session launch.
+    pub fn ema_deviation_corrected_t3_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        parameter_rows: &[(usize, f64, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ema_deviation_corrected_t3";
+        const ENTRY_POINT: &str = "ema_deviation_corrected_t3_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["corrected", "t3"];
+
+        let cols = prices.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty exact parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut hots = Vec::with_capacity(rows);
+        let mut t3_modes = Vec::with_capacity(rows);
+        for &(period, hot, t3_mode) in parameter_rows {
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} is not inside 1..={cols}"),
+                });
+            }
+            if !hot.is_finite() || !(-16.0..=16.0).contains(&hot) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "hot {hot:?} is not finite inside the canonical -16..=16 bound"
+                    ),
+                });
+            }
+            if t3_mode > 1 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("t3_mode {t3_mode} is outside the canonical 0..=1 bound"),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            hots.push(hot);
+            t3_modes.push(i32::try_from(t3_mode).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("t3_mode {t3_mode} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes_per_row = (2 * std::mem::size_of::<i32>())
+            .checked_add(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter bytes per row overflow".into(),
+            })?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "period/hot/t3_mode bytes",
+            rows,
+            parameter_bytes_per_row,
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_hots = DeviceBuffer::from_slice(&hots)?;
+        let d_t3_modes = DeviceBuffer::from_slice(&t3_modes)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::EmaDeviationCorrectedT3)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let input = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (corrected, t3) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                input,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_hots.as_device_ptr(),
+                d_t3_modes.as_device_ptr(),
+                rows_i32,
+                corrected[0].as_device_ptr(),
+                t3[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods, d_t3_modes],
+            _parameter_f64: vec![d_hots],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch EMD's canonical upper/middle/lower triple from the already-
+    /// resident high/low frame. The host uploads only exact scalar-CPU
+    /// coefficient bits and bounded tuple metadata; all price-dependent state
+    /// and all three matrices remain in one shared-session CUDA launch.
+    pub fn emd_all_outputs(
+        &self,
+        high_low: CudaDeviceHighLowF64Ref,
+        first_valid: usize,
+        parameter_rows: &[(usize, f64, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "emd";
+        const ENTRY_POINT: &str = "emd_outputs_f64";
+        const OUTPUT_IDS: [&str; 3] = ["upperband", "middleband", "lowerband"];
+        const COEFFICIENTS_PER_ROW: usize = 6;
+        const UP_LOW_RING: usize = 50;
+
+        let cols = high_low.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident high/low frame".into(),
+            });
+        }
+        if high_low.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "high/low frame is resident on device {} but this session is bound to device {}",
+                    high_low.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first valid high/low index {first_valid} is outside {cols} bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty exact parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut coefficients =
+            Vec::with_capacity(rows.checked_mul(COEFFICIENTS_PER_ROW).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "coefficient element count overflow".into(),
+                }
+            })?);
+        let mut bp_stride = 0usize;
+        for (row, &(period, delta, fraction)) in parameter_rows.iter().enumerate() {
+            if period == 0 || period > S2_RING_MAX_PERIOD || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} period {period} is outside 1..={} and the {cols}-bar frame",
+                        S2_RING_MAX_PERIOD
+                    ),
+                });
+            }
+            if !delta.is_finite() || delta < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} delta {delta:?} violates the canonical min 0"),
+                });
+            }
+            if !fraction.is_finite() || fraction < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} fraction {fraction:?} violates the canonical min 0"),
+                });
+            }
+            let per_mid =
+                period
+                    .checked_mul(2)
+                    .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("row {row} period {period} overflows the middle-band ring"),
+                    })?;
+            let needed = per_mid.max(UP_LOW_RING);
+            if cols - first_valid < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {needed} bars after first_valid {first_valid}, got {}",
+                        cols - first_valid
+                    ),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            let exact = emd_exact_coefficients(period, delta, fraction);
+            coefficients.extend_from_slice(&[
+                exact.inv_up_low,
+                exact.inv_mid,
+                exact.alpha,
+                exact.half_one_minus_alpha,
+                exact.beta_times_one_plus_alpha,
+                exact.fraction,
+            ]);
+            bp_stride = bp_stride.max(per_mid);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "three output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes_per_row = std::mem::size_of::<i32>()
+            .checked_add(COEFFICIENTS_PER_ROW * std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter bytes per row overflow".into(),
+            })?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "period/coefficient bytes",
+            rows,
+            parameter_bytes_per_row,
+        )
+        .map_err(plan_failure)?;
+        let up_low_ring_elems = checked_mul(INDICATOR, "rows*50 ring elements", rows, UP_LOW_RING)
+            .map_err(plan_failure)?;
+        let bp_ring_elems =
+            checked_mul(INDICATOR, "rows*bp stride", rows, bp_stride).map_err(plan_failure)?;
+        let scratch_elems = up_low_ring_elems
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(bp_ring_elems))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "three-ring scratch element count overflow".into(),
+            })?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "three-ring scratch bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(parameter_bytes)
+            .and_then(|value| value.checked_add(scratch_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter/scratch byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let bp_stride_i32 =
+            i32::try_from(bp_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("bandpass ring stride {bp_stride} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_coefficients = DeviceBuffer::from_slice(&coefficients)?;
+        let d_sp_rings = unsafe { DeviceBuffer::<f64>::uninitialized(up_low_ring_elems)? };
+        let d_sv_rings = unsafe { DeviceBuffer::<f64>::uninitialized(up_low_ring_elems)? };
+        let d_bp_rings = unsafe { DeviceBuffer::<f64>::uninitialized(bp_ring_elems)? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Emd)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(high_low.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(high_low.low().device_ptr());
+            let (upper, rest) = output_buffers.split_at_mut(1);
+            let (middle, lower) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_coefficients.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                bp_stride_i32,
+                d_sp_rings.as_device_ptr(),
+                d_sv_rings.as_device_ptr(),
+                d_bp_rings.as_device_ptr(),
+                upper[0].as_device_ptr(),
+                middle[0].as_device_ptr(),
+                lower[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: vec![d_coefficients],
+            _scratch_f64: vec![d_sp_rings, d_sv_rings, d_bp_rings],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch EMD Trend's canonical direction/average/upper/lower matrices
+    /// from one already-resident close series. Only the bounded exact
+    /// `(length, mult)` tuples cross the PCIe boundary; one sequential thread
+    /// owns each tuple's runtime-sized SMA ring and complete crossing state.
+    pub fn emd_trend_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_rows: &[(usize, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "emd_trend";
+        const ENTRY_POINT: &str = "emd_trend_outputs_f64";
+        const OUTPUT_IDS: [&str; 4] = ["direction", "average", "upper", "lower"];
+
+        let cols = prices.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first non-NaN close index {first_valid} is outside the {cols}-bar frame"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty exact parameter tuple list".into(),
+            });
+        }
+
+        let mut lengths = Vec::with_capacity(rows);
+        let mut mults = Vec::with_capacity(rows);
+        let mut sma_stride = 0usize;
+        for (row, &(length, mult)) in parameter_rows.iter().enumerate() {
+            if length == 0 || length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} length {length} is outside the canonical 1..={cols} frame bound"
+                    ),
+                });
+            }
+            if cols - first_valid < length {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {length} bars after first_valid {first_valid}, got {}",
+                        cols - first_valid
+                    ),
+                });
+            }
+            if !mult.is_finite() || mult < 0.05 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} multiplier {mult:?} violates the canonical finite min 0.05"
+                    ),
+                });
+            }
+            lengths.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            mults.push(mult);
+            sma_stride = sma_stride.max(length);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let length_bytes = checked_mul(
+            INDICATOR,
+            "length parameter bytes",
+            rows,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let mult_bytes = checked_mul(
+            INDICATOR,
+            "multiplier parameter bytes",
+            rows,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = length_bytes.checked_add(mult_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            }
+        })?;
+        let scratch_elems =
+            checked_mul(INDICATOR, "rows*SMA stride", rows, sma_stride).map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "SMA ring scratch bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(parameter_bytes)
+            .and_then(|value| value.checked_add(scratch_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter/scratch byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first non-NaN index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let sma_stride_i32 =
+            i32::try_from(sma_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("SMA scratch stride {sma_stride} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_mults = DeviceBuffer::from_slice(&mults)?;
+        let d_sma_rings = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_elems)? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::EmdTrend)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let input = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (direction, rest) = output_buffers.split_at_mut(1);
+            let (average, rest) = rest.split_at_mut(1);
+            let (upper, lower) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                input,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_mults.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                sma_stride_i32,
+                d_sma_rings.as_device_ptr(),
+                direction[0].as_device_ptr(),
+                average[0].as_device_ptr(),
+                upper[0].as_device_ptr(),
+                lower[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths],
+            _parameter_f64: vec![d_mults],
+            _scratch_f64: vec![d_sma_rings],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch ERI's canonical bull/bear pair from the already-resident OHLCV
+    /// frame. Production admits only the registry's EMA default and uploads
+    /// the bounded period vector; no host-computed moving-average row crosses
+    /// the device boundary.
+    pub fn eri_all_outputs(
+        &self,
+        input: CudaDeviceOhlcvF64Ref,
+        first_valid: usize,
+        periods: &[usize],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "eri";
+        const ENTRY_POINT: &str = "eri_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["bull", "bear"];
+
+        let cols = input.len();
+        let rows = periods.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLCV frame".into(),
+            });
+        }
+        if input.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLCV frame is resident on device {} but this session is bound to device {}",
+                    input.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first simultaneous high/low/close index {first_valid} is outside {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty exact period list".into(),
+            });
+        }
+
+        let mut periods_i32 = Vec::with_capacity(rows);
+        for (row, &period) in periods.iter().enumerate() {
+            if period == 0 || period > cols || cols - first_valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} period {period} is outside the canonical 1..={} valid-bar bound",
+                        cols - first_valid
+                    ),
+                });
+            }
+            periods_i32.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "period parameter bytes",
+            rows,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("period count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first non-NaN index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods_i32)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+        let module = self.module_for(F64Kernel::Eri)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(input.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(input.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(input.close().device_ptr());
+            let (bull, bear) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                bull[0].as_device_ptr(),
+                bear[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Evasive Supertrend's canonical band/state/noisy/changed matrices
+    /// from the already-resident OHLCV frame. Only the exact bounded parameter
+    /// tuples cross PCIe; one sequential thread owns each ATR/trend recurrence.
+    pub fn evasive_supertrend_all_outputs(
+        &self,
+        input: CudaDeviceOhlcvF64Ref,
+        max_consecutive_finite_ohlc: usize,
+        parameter_rows: &[(usize, f64, f64, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "evasive_supertrend";
+        const ENTRY_POINT: &str = "evasive_supertrend_batch_f64";
+        const OUTPUT_IDS: [&str; 4] = ["band", "state", "noisy", "changed"];
+
+        let cols = input.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLCV frame".into(),
+            });
+        }
+        if input.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLCV frame is resident on device {} but this session is bound to device {}",
+                    input.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_consecutive_finite_ohlc == 0 || max_consecutive_finite_ohlc > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "longest finite OHLC run {max_consecutive_finite_ohlc} is invalid for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty exact parameter tuple list".into(),
+            });
+        }
+
+        let mut atr_lengths = Vec::with_capacity(rows);
+        let mut base_multipliers = Vec::with_capacity(rows);
+        let mut noise_thresholds = Vec::with_capacity(rows);
+        let mut expansion_alphas = Vec::with_capacity(rows);
+        for (row, &(atr_length, base_multiplier, noise_threshold, expansion_alpha)) in
+            parameter_rows.iter().enumerate()
+        {
+            if atr_length == 0 || atr_length > max_consecutive_finite_ohlc {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} atr_length {atr_length} exceeds the canonical finite-run bound {max_consecutive_finite_ohlc}"
+                    ),
+                });
+            }
+            if !base_multiplier.is_finite() || base_multiplier < 0.1 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} base_multiplier {base_multiplier:?} violates the canonical finite min 0.1"
+                    ),
+                });
+            }
+            if !noise_threshold.is_finite() || noise_threshold < 0.1 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} noise_threshold {noise_threshold:?} violates the canonical finite min 0.1"
+                    ),
+                });
+            }
+            if !expansion_alpha.is_finite() || expansion_alpha < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} expansion_alpha {expansion_alpha:?} violates the canonical finite min 0.0"
+                    ),
+                });
+            }
+            atr_lengths.push(i32::try_from(atr_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} atr_length {atr_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            base_multipliers.push(base_multiplier);
+            noise_thresholds.push(noise_threshold);
+            expansion_alphas.push(expansion_alpha);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let atr_length_bytes = checked_mul(
+            INDICATOR,
+            "atr_length parameter bytes",
+            rows,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let float_parameter_bytes = checked_mul(
+            INDICATOR,
+            "three f64 parameter bytes",
+            rows,
+            3 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = atr_length_bytes
+            .checked_add(float_parameter_bytes)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_atr_lengths = DeviceBuffer::from_slice(&atr_lengths)?;
+        let d_base_multipliers = DeviceBuffer::from_slice(&base_multipliers)?;
+        let d_noise_thresholds = DeviceBuffer::from_slice(&noise_thresholds)?;
+        let d_expansion_alphas = DeviceBuffer::from_slice(&expansion_alphas)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+        let module = self.module_for(F64Kernel::EvasiveSupertrend)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(input.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(input.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(input.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(input.close().device_ptr());
+            let (band, rest) = output_buffers.split_at_mut(1);
+            let (state, rest) = rest.split_at_mut(1);
+            let (noisy, changed) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_atr_lengths.as_device_ptr(),
+                d_base_multipliers.as_device_ptr(),
+                d_noise_thresholds.as_device_ptr(),
+                d_expansion_alphas.as_device_ptr(),
+                rows_i32,
+                band[0].as_device_ptr(),
+                state[0].as_device_ptr(),
+                noisy[0].as_device_ptr(),
+                changed[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_atr_lengths],
+            _parameter_f64: vec![d_base_multipliers, d_noise_thresholds, d_expansion_alphas],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Didi Index's canonical short/long/crossover/crossunder matrices
+    /// from one already-resident close series. One sequential thread owns the
+    /// three runtime-sized SMA rings for each exact RegistryRatio tuple; the
+    /// full and preserved primary kernels share one operation authority.
+    pub fn didi_index_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        finite_count: usize,
+        parameter_tuples: &[(usize, usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "didi_index";
+        const ENTRY_POINT: &str = "didi_index_batch_f64";
+        const OUTPUT_IDS: [&str; 4] = ["short", "long", "crossover", "crossunder"];
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if finite_count == 0 || finite_count > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("finite close count {finite_count} is invalid for {cols} bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty RegistryRatio tuple list".into(),
+            });
+        }
+
+        let mut short_lengths = Vec::with_capacity(rows);
+        let mut medium_lengths = Vec::with_capacity(rows);
+        let mut long_lengths = Vec::with_capacity(rows);
+        let mut short_stride = 0usize;
+        let mut medium_stride = 0usize;
+        let mut long_stride = 0usize;
+        for &(short_length, medium_length, long_length) in parameter_tuples {
+            for (key, value) in [
+                ("short_length", short_length),
+                ("medium_length", medium_length),
+                ("long_length", long_length),
+            ] {
+                if value == 0 || value > cols {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{key} {value} is not inside 1..={cols}"),
+                    });
+                }
+            }
+            let needed = short_length.max(medium_length).max(long_length);
+            if finite_count < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "tuple ({short_length}, {medium_length}, {long_length}) needs {needed} \
+                         finite closes, found {finite_count}"
+                    ),
+                });
+            }
+            short_lengths.push(i32::try_from(short_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("short_length {short_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            medium_lengths.push(i32::try_from(medium_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("medium_length {medium_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            long_lengths.push(i32::try_from(long_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("long_length {long_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            short_stride = short_stride.max(short_length);
+            medium_stride = medium_stride.max(medium_length);
+            long_stride = long_stride.max(long_length);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let short_ring_elems = checked_mul(INDICATOR, "rows*short stride", rows, short_stride)
+            .map_err(plan_failure)?;
+        let medium_ring_elems = checked_mul(INDICATOR, "rows*medium stride", rows, medium_stride)
+            .map_err(plan_failure)?;
+        let long_ring_elems =
+            checked_mul(INDICATOR, "rows*long stride", rows, long_stride).map_err(plan_failure)?;
+        let scratch_elems = short_ring_elems
+            .checked_add(medium_ring_elems)
+            .and_then(|value| value.checked_add(long_ring_elems))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "three-ring element count overflow".into(),
+            })?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "three-ring bytes",
+            scratch_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "three i32 parameter arrays",
+            rows,
+            3 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|value| value.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/scratch/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let short_stride_i32 =
+            i32::try_from(short_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("short ring stride {short_stride} exceeds the CUDA i32 ABI"),
+            })?;
+        let medium_stride_i32 =
+            i32::try_from(medium_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("medium ring stride {medium_stride} exceeds the CUDA i32 ABI"),
+            })?;
+        let long_stride_i32 =
+            i32::try_from(long_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("long ring stride {long_stride} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_short_lengths = DeviceBuffer::from_slice(&short_lengths)?;
+        let d_medium_lengths = DeviceBuffer::from_slice(&medium_lengths)?;
+        let d_long_lengths = DeviceBuffer::from_slice(&long_lengths)?;
+        let d_short_rings = unsafe { DeviceBuffer::<f64>::uninitialized(short_ring_elems)? };
+        let d_medium_rings = unsafe { DeviceBuffer::<f64>::uninitialized(medium_ring_elems)? };
+        let d_long_rings = unsafe { DeviceBuffer::<f64>::uninitialized(long_ring_elems)? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::DidiIndex)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            let (short, rest) = output_buffers.split_at_mut(1);
+            let (long, rest) = rest.split_at_mut(1);
+            let (crossover, crossunder) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_short_lengths.as_device_ptr(),
+                d_medium_lengths.as_device_ptr(),
+                d_long_lengths.as_device_ptr(),
+                rows_i32,
+                d_short_rings.as_device_ptr(),
+                short_stride_i32,
+                d_medium_rings.as_device_ptr(),
+                medium_stride_i32,
+                d_long_rings.as_device_ptr(),
+                long_stride_i32,
+                short[0].as_device_ptr(),
+                long[0].as_device_ptr(),
+                crossover[0].as_device_ptr(),
+                crossunder[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_short_lengths, d_medium_lengths, d_long_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_short_rings, d_medium_rings, d_long_rings],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Chandelier Exit's canonical long_stop/short_stop pair from the
+    /// already-resident HLC frame. Every exact tuple owns its ATR, monotone
+    /// deques, and directional stop recurrence in one sequential thread.
+    pub fn chandelier_exit_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid_close: usize,
+        first_valid_hlc: usize,
+        parameter_rows: &[ChandelierExitParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "chandelier_exit";
+        const ENTRY_POINT: &str = "chandelier_exit_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["long_stop", "short_stop"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_close >= cols || first_valid_hlc >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first-valid metadata exceeds frame length {cols}: close={first_valid_close}, \
+                     hlc={first_valid_hlc}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        let mut mults = Vec::with_capacity(rows);
+        let mut shared_use_close = None;
+        let mut max_deque_cap = 1usize;
+        for params in parameter_rows {
+            let period = params.period.unwrap_or(22);
+            if period == 0 || period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} must be within 1..={cols}"),
+                });
+            }
+            if cols - first_valid_close < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} exceeds close-valid suffix {}",
+                        cols - first_valid_close
+                    ),
+                });
+            }
+            if cols - first_valid_hlc < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} exceeds ATR HLC-valid suffix {}",
+                        cols - first_valid_hlc
+                    ),
+                });
+            }
+
+            let mult = params.mult.unwrap_or(3.0);
+            if !mult.is_finite() || mult < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("mult must be finite and at least 0, got {mult}"),
+                });
+            }
+            let use_close = params.use_close.unwrap_or(true);
+            if !use_close {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "the canonical production route admits use_close=true only".into(),
+                });
+            }
+            if shared_use_close.is_some_and(|shared| shared != use_close) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "one production launch requires one shared use_close value".into(),
+                });
+            }
+            shared_use_close = Some(use_close);
+
+            let deque_cap = period.checked_next_power_of_two().ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} deque capacity overflow"),
+                }
+            })?;
+            max_deque_cap = max_deque_cap.max(deque_cap);
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            mults.push(mult);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "period and multiplier bytes",
+            rows,
+            std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let one_deque_elems =
+            checked_mul(INDICATOR, "rows*deque-cap", rows, max_deque_cap).map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "two deque scratch bytes",
+            one_deque_elems,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(parameter_bytes)
+            .and_then(|value| value.checked_add(scratch_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid_close).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first valid close {first_valid_close} exceeds the CUDA i32 ABI"),
+            })?;
+        let deque_cap_i32 =
+            i32::try_from(max_deque_cap).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("deque scratch cap {max_deque_cap} exceeds the CUDA i32 ABI"),
+            })?;
+        let use_close_i32 =
+            if shared_use_close.ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "missing shared use_close value".into(),
+            })? {
+                1_i32
+            } else {
+                0_i32
+            };
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_mults = DeviceBuffer::from_slice(&mults)?;
+        let d_max_deque = unsafe { DeviceBuffer::<i32>::uninitialized(one_deque_elems)? };
+        let d_min_deque = unsafe { DeviceBuffer::<i32>::uninitialized(one_deque_elems)? };
+        let d_long_stop = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_short_stop = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::ChandelierExit)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_mults.as_device_ptr(),
+                use_close_i32,
+                rows_i32,
+                first_valid_i32,
+                deque_cap_i32,
+                d_max_deque.as_device_ptr(),
+                d_min_deque.as_device_ptr(),
+                d_long_stop.as_device_ptr(),
+                d_short_stop.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let output_buffers = [d_long_stop, d_short_stop];
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: vec![d_mults],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: vec![d_max_deque, d_min_deque],
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch CKSP's canonical long_values/short_values pair from the
+    /// already-resident HLC frame. Each row carries its exact p/x/q tuple and
+    /// owns all four monotone deques in runtime-sized resident scratch.
+    pub fn cksp_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid_close: usize,
+        parameter_rows: &[CkspParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "cksp";
+        const ENTRY_POINT: &str = "cksp_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["long_values", "short_values"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_close >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first valid close {first_valid_close} exceeds frame length {cols}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let valid = cols - first_valid_close;
+        let mut p_values = Vec::with_capacity(rows);
+        let mut x_values = Vec::with_capacity(rows);
+        let mut q_values = Vec::with_capacity(rows);
+        let mut max_deque_cap = 1usize;
+        for params in parameter_rows {
+            let p = params.p.unwrap_or(10);
+            let x = params.x.unwrap_or(1.0);
+            let q = params.q.unwrap_or(9);
+            if p == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "p must be positive".into(),
+                });
+            }
+            if q == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "q must be positive".into(),
+                });
+            }
+            if !x.is_finite() || x < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("x must be finite and at least 0, got {x}"),
+                });
+            }
+            let warm_span = p
+                .checked_add(q)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("p+q-1 overflow for ({p},{q})"),
+                })?;
+            if valid <= warm_span {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "p={p}, q={q} need more than {warm_span} valid bars, found {valid}"
+                    ),
+                });
+            }
+            let deque_cap =
+                q.checked_add(1)
+                    .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("q={q} deque capacity overflow"),
+                    })?;
+            max_deque_cap = max_deque_cap.max(deque_cap);
+            p_values.push(
+                i32::try_from(p).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("p={p} exceeds the CUDA i32 ABI"),
+                })?,
+            );
+            x_values.push(x);
+            q_values.push(
+                i32::try_from(q).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("q={q} exceeds the CUDA i32 ABI"),
+                })?,
+            );
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "p/x/q parameter bytes",
+            rows,
+            2 * std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let one_scratch_elems =
+            checked_mul(INDICATOR, "rows*deque-cap", rows, max_deque_cap).map_err(plan_failure)?;
+        let scratch_i32_bytes = checked_mul(
+            INDICATOR,
+            "four index scratch buffers",
+            one_scratch_elems,
+            4 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let scratch_f64_bytes = checked_mul(
+            INDICATOR,
+            "two value scratch buffers",
+            one_scratch_elems,
+            2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(parameter_bytes)
+            .and_then(|value| value.checked_add(scratch_i32_bytes))
+            .and_then(|value| value.checked_add(scratch_f64_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid_close).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first valid close {first_valid_close} exceeds the CUDA i32 ABI"),
+            })?;
+        let deque_cap_i32 =
+            i32::try_from(max_deque_cap).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("deque scratch cap {max_deque_cap} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_p_values = DeviceBuffer::from_slice(&p_values)?;
+        let d_x_values = DeviceBuffer::from_slice(&x_values)?;
+        let d_q_values = DeviceBuffer::from_slice(&q_values)?;
+        let d_h_index = unsafe { DeviceBuffer::<i32>::uninitialized(one_scratch_elems)? };
+        let d_l_index = unsafe { DeviceBuffer::<i32>::uninitialized(one_scratch_elems)? };
+        let d_long_index = unsafe { DeviceBuffer::<i32>::uninitialized(one_scratch_elems)? };
+        let d_short_index = unsafe { DeviceBuffer::<i32>::uninitialized(one_scratch_elems)? };
+        let d_long_value = unsafe { DeviceBuffer::<f64>::uninitialized(one_scratch_elems)? };
+        let d_short_value = unsafe { DeviceBuffer::<f64>::uninitialized(one_scratch_elems)? };
+        let d_long_values = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_short_values = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::Cksp)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_p_values.as_device_ptr(),
+                d_x_values.as_device_ptr(),
+                d_q_values.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                deque_cap_i32,
+                d_h_index.as_device_ptr(),
+                d_l_index.as_device_ptr(),
+                d_long_index.as_device_ptr(),
+                d_short_index.as_device_ptr(),
+                d_long_value.as_device_ptr(),
+                d_short_value.as_device_ptr(),
+                d_long_values.as_device_ptr(),
+                d_short_values.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let output_buffers = [d_long_values, d_short_values];
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_p_values, d_q_values],
+            _parameter_f64: vec![d_x_values],
+            _scratch_f64: vec![d_long_value, d_short_value],
+            _scratch_i32: vec![d_h_index, d_l_index, d_long_index, d_short_index],
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Aroon's canonical up/down pair from the already-resident high/low
+    /// frame. One thread owns each length tuple so both rolling extrema follow
+    /// the scalar comparison, tie, invalid-window, and rescan order exactly.
+    pub fn aroon_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        lengths: &[usize],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "aroon";
+        const ENTRY_POINT: &str = "aroon_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["up", "down"];
+
+        let cols = ohlcv.len();
+        let rows = lengths.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident high/low frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "high/low frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty length tuple list".into(),
+            });
+        }
+
+        let mut length_values = Vec::with_capacity(rows);
+        for &length in lengths {
+            if length == 0 || length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} is not inside 1..={cols}"),
+                });
+            }
+            length_values.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes =
+            checked_mul(INDICATOR, "length bytes", rows, std::mem::size_of::<i32>())
+                .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("length tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("length tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&length_values)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Aroon)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let (up_buffers, down_buffers) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                rows_i32,
+                0_i32,
+                up_buffers[0].as_device_ptr(),
+                down_buffers[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch ASO's canonical bulls/bears pair from the already-resident OHLC
+    /// frame. One sequential thread owns each exact `(period, mode)` tuple so
+    /// the window sentinels and running-mean update order match the scalar
+    /// selected-output dispatcher without replaying either output.
+    pub fn aso_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "aso";
+        const ENTRY_POINT: &str = "neoethos_aso_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["bulls", "bears"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first non-NaN close index {first_valid} is outside {cols} bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let valid = cols - first_valid;
+        let mut periods = Vec::with_capacity(rows);
+        let mut modes = Vec::with_capacity(rows);
+        for &(period, mode) in parameter_tuples {
+            if period == 0 || period > cols || valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "period {period} is not supported by {valid} bars from first_valid={first_valid}"
+                    ),
+                });
+            }
+            if mode > 2 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("mode {mode} is outside the exact 0..=2 contract"),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            modes.push(
+                i32::try_from(mode).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("mode {mode} exceeds the CUDA i32 ABI"),
+                })?,
+            );
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_elems =
+            checked_mul(INDICATOR, "two parameter rows", rows, 2).map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            parameter_elems,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_modes = DeviceBuffer::from_slice(&modes)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Aso)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let (bulls_buffers, bears_buffers) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_modes.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                bulls_buffers[0].as_device_ptr(),
+                bears_buffers[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods, d_modes],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all three Adaptive MACD outputs from one resident close series.
+    ///
+    /// Each row is one real `(length, fast_period, slow_period,
+    /// signal_period)` tuple. The rolling-correlation ring is device scratch
+    /// owned by the returned result, and the same kernel state machine emits
+    /// `macd`, `signal`, and `hist` without a host reconstruction step.
+    pub fn adaptive_macd_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, usize, usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "adaptive_macd";
+        const ENTRY_POINT: &str = "adaptive_macd_neo_all_outputs_f64";
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid={first_valid} is not inside a {cols}-bar series"),
+            });
+        }
+
+        let valid = cols - first_valid;
+        let mut lengths = Vec::with_capacity(rows);
+        let mut fast_periods = Vec::with_capacity(rows);
+        let mut slow_periods = Vec::with_capacity(rows);
+        let mut signal_periods = Vec::with_capacity(rows);
+        let mut max_length = 0usize;
+        for &(length, fast_period, slow_period, signal_period) in parameter_tuples {
+            if [length, fast_period, slow_period, signal_period]
+                .iter()
+                .any(|&period| period < 2 || period > cols)
+            {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "periods must each be inside [2, {cols}], got length={length}, \
+                         fast={fast_period}, slow={slow_period}, signal={signal_period}"
+                    ),
+                });
+            }
+            if valid < length {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("not enough valid data: needed={length}, valid={valid}"),
+                });
+            }
+            let two_length_minus_one = length
+                .checked_mul(2)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} overflows correlation arithmetic"),
+                })?;
+            length
+                .checked_sub(1)
+                .and_then(|value| value.checked_mul(length))
+                .and_then(|value| value.checked_mul(two_length_minus_one))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} overflows correlation arithmetic"),
+                })?;
+
+            max_length = max_length.max(length);
+            let to_i32 = |name, value| {
+                i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{name} {value} exceeds the CUDA i32 ABI"),
+                })
+            };
+            lengths.push(to_i32("length", length)?);
+            fast_periods.push(to_i32("fast_period", fast_period)?);
+            slow_periods.push(to_i32("slow_period", slow_period)?);
+            signal_periods.push(to_i32("signal_period", signal_period)?);
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        let ring_elems =
+            rows.checked_mul(max_length)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rolling-ring size overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(3))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "three-output byte count overflow".into(),
+            })?;
+        let scratch_bytes = ring_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "rolling-ring byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|bytes| bytes.checked_mul(4))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total device byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let max_length_i32 =
+            i32::try_from(max_length).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("max length {max_length} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_fast_periods = DeviceBuffer::from_slice(&fast_periods)?;
+        let d_slow_periods = DeviceBuffer::from_slice(&slow_periods)?;
+        let d_signal_periods = DeviceBuffer::from_slice(&signal_periods)?;
+        let d_ring = unsafe { DeviceBuffer::<f64>::uninitialized(ring_elems)? };
+        let d_macd = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_signal = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_hist = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::AdaptiveMacd)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_fast_periods.as_device_ptr(),
+                d_slow_periods.as_device_ptr(),
+                d_signal_periods.as_device_ptr(),
+                rows_i32,
+                max_length_i32,
+                d_ring.as_device_ptr(),
+                d_macd.as_device_ptr(),
+                d_signal.as_device_ptr(),
+                d_hist.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![
+                matrix(d_macd, "macd")?,
+                matrix(d_signal, "signal")?,
+                matrix(d_hist, "hist")?,
+            ],
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths, d_fast_periods, d_slow_periods, d_signal_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_ring],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch both f64 outputs of Adaptive Momentum Oscillator against one
+    /// already-resident close series and this engine's shared session.
+    ///
+    /// The tuples are the real `(length, smoothing_length)` parameters. The
+    /// ring buffers remain device-resident and are owned by the result until
+    /// the shared stream retires; no output or intermediate is recomputed on
+    /// the host.
+    pub fn adaptive_momentum_oscillator_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_tuples: &[(usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "adaptive_momentum_oscillator";
+        const ENTRY_POINT: &str = "adaptive_momentum_oscillator_batch_f64";
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident price series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "prices are resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid={first_valid} is not inside a {cols}-bar series"),
+            });
+        }
+
+        let mut lengths = Vec::with_capacity(rows);
+        let mut smoothing_lengths = Vec::with_capacity(rows);
+        let mut max_length = 0usize;
+        let mut max_smoothing_length = 0usize;
+        for &(length, smoothing_length) in parameter_tuples {
+            if length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "length must be >= 1".into(),
+                });
+            }
+            if smoothing_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "smoothing_length must be >= 1".into(),
+                });
+            }
+            max_length = max_length.max(length);
+            max_smoothing_length = max_smoothing_length.max(smoothing_length);
+            lengths.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            smoothing_lengths.push(i32::try_from(smoothing_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("smoothing_length {smoothing_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let valid = cols - first_valid;
+        if valid < max_smoothing_length {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "not enough valid data: needed={max_smoothing_length}, valid={valid}"
+                ),
+            });
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        let raw_ring_elems =
+            rows.checked_mul(max_length)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "raw ring size overflow".into(),
+                })?;
+        let change_ring_elems = raw_ring_elems;
+        let linreg_ring_elems = rows.checked_mul(max_smoothing_length).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "linear-regression ring size overflow".into(),
+            }
+        })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "two-output byte count overflow".into(),
+            })?;
+        let scratch_bytes = raw_ring_elems
+            .checked_add(change_ring_elems)
+            .and_then(|elems| elems.checked_add(linreg_ring_elems))
+            .and_then(|elems| elems.checked_mul(std::mem::size_of::<f64>()))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "scratch byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total device byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let max_length_i32 =
+            i32::try_from(max_length).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("max length {max_length} exceeds the CUDA i32 ABI"),
+            })?;
+        let max_smoothing_length_i32 = i32::try_from(max_smoothing_length).map_err(|_| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "max smoothing length {max_smoothing_length} exceeds the CUDA i32 ABI"
+                ),
+            }
+        })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_smoothing_lengths = DeviceBuffer::from_slice(&smoothing_lengths)?;
+        let d_raw_ring = unsafe { DeviceBuffer::<f64>::uninitialized(raw_ring_elems)? };
+        let d_change_ring = unsafe { DeviceBuffer::<f64>::uninitialized(change_ring_elems)? };
+        let d_linreg_ring = unsafe { DeviceBuffer::<f64>::uninitialized(linreg_ring_elems)? };
+        let d_amo = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_ama = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::AdaptiveMomentumOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_smoothing_lengths.as_device_ptr(),
+                rows_i32,
+                max_length_i32,
+                max_smoothing_length_i32,
+                d_raw_ring.as_device_ptr(),
+                d_change_ring.as_device_ptr(),
+                d_linreg_ring.as_device_ptr(),
+                d_amo.as_device_ptr(),
+                d_ama.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![matrix(d_amo, "amo")?, matrix(d_ama, "ama")?],
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths, d_smoothing_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_raw_ring, d_change_ring, d_linreg_ring],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch both Adaptive Schaff Trend Cycle outputs from one resident HLC
+    /// frame through this engine's shared CUDA session.
+    ///
+    /// The public CPU contract admits a parameter row from the suffix length
+    /// beginning at the first finite `high >= low` bar; later invalid bars
+    /// reset the recurrence. The caller supplies that once-computed suffix
+    /// length, while this method owns every parameter, scratch and output
+    /// buffer until the shared stream retires.
+    pub fn adaptive_schaff_trend_cycle_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        valid_suffix_len: usize,
+        parameter_rows: &[AdaptiveSchaffTrendCycleParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "adaptive_schaff_trend_cycle";
+        const ENTRY_POINT: &str = "adaptive_schaff_trend_cycle_batch_f64";
+        const DEFAULT_ADAPTIVE_LENGTH: usize = 55;
+        const DEFAULT_STC_LENGTH: usize = 12;
+        const DEFAULT_SMOOTHING_FACTOR: f64 = 0.45;
+        const DEFAULT_FAST_LENGTH: usize = 26;
+        const DEFAULT_SLOW_LENGTH: usize = 50;
+        const QUEUE_FAMILIES: usize = 4;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if valid_suffix_len == 0 || valid_suffix_len > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid finite high>=low suffix metadata {valid_suffix_len} for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut adaptive_lengths = Vec::with_capacity(rows);
+        let mut stc_lengths = Vec::with_capacity(rows);
+        let mut smoothing_factors = Vec::with_capacity(rows);
+        let mut fast_lengths = Vec::with_capacity(rows);
+        let mut slow_lengths = Vec::with_capacity(rows);
+        let mut adaptive_cap = 0usize;
+        let mut stc_cap = 0usize;
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let adaptive_length = params.adaptive_length.unwrap_or(DEFAULT_ADAPTIVE_LENGTH);
+            let stc_length = params.stc_length.unwrap_or(DEFAULT_STC_LENGTH);
+            let smoothing_factor = params.smoothing_factor.unwrap_or(DEFAULT_SMOOTHING_FACTOR);
+            let fast_length = params.fast_length.unwrap_or(DEFAULT_FAST_LENGTH);
+            let slow_length = params.slow_length.unwrap_or(DEFAULT_SLOW_LENGTH);
+            if adaptive_length == 0 || adaptive_length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid adaptive_length {adaptive_length} for {cols} bars"
+                    ),
+                });
+            }
+            if stc_length == 0 || stc_length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid stc_length {stc_length} for {cols} bars"
+                    ),
+                });
+            }
+            if !smoothing_factor.is_finite() || smoothing_factor <= 0.0 || smoothing_factor > 1.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid smoothing_factor {smoothing_factor}; expected (0, 1]"
+                    ),
+                });
+            }
+            if fast_length == 0 || slow_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid EMA lengths fast={fast_length}, slow={slow_length}"
+                    ),
+                });
+            }
+            let needed = adaptive_length.max(stc_length);
+            if valid_suffix_len < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs a valid suffix of {needed} bars, got {valid_suffix_len}"
+                    ),
+                });
+            }
+            let to_i32 = |name, value| {
+                i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} {name} {value} exceeds the CUDA i32 ABI"),
+                })
+            };
+            adaptive_lengths.push(to_i32("adaptive_length", adaptive_length)?);
+            stc_lengths.push(to_i32("stc_length", stc_length)?);
+            smoothing_factors.push(smoothing_factor);
+            fast_lengths.push(to_i32("fast_length", fast_length)?);
+            slow_lengths.push(to_i32("slow_length", slow_length)?);
+            adaptive_cap = adaptive_cap.max(adaptive_length);
+            stc_cap = stc_cap.max(stc_length);
+        }
+        let queue_cap =
+            stc_cap
+                .checked_add(1)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "stc scratch queue capacity overflow".into(),
+                })?;
+        let queue_stride = queue_cap.checked_mul(QUEUE_FAMILIES).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "four-family queue scratch stride overflow".into(),
+            }
+        })?;
+        if queue_stride > i32::MAX as usize {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "four-family queue scratch stride {queue_stride} exceeds the CUDA i32 ABI"
+                ),
+            });
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            4 * std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let correlation_elems = checked_mul(INDICATOR, "correlation scratch", rows, adaptive_cap)
+            .map_err(plan_failure)?;
+        let correlation_bytes = checked_mul(
+            INDICATOR,
+            "correlation scratch bytes",
+            correlation_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let queue_elems =
+            checked_mul(INDICATOR, "queue scratch", rows, queue_stride).map_err(plan_failure)?;
+        let queue_index_bytes = checked_mul(
+            INDICATOR,
+            "queue index scratch bytes",
+            queue_elems,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let queue_value_bytes = checked_mul(
+            INDICATOR,
+            "queue value scratch bytes",
+            queue_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(parameter_bytes)
+            .and_then(|bytes| bytes.checked_add(correlation_bytes))
+            .and_then(|bytes| bytes.checked_add(queue_index_bytes))
+            .and_then(|bytes| bytes.checked_add(queue_value_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let adaptive_cap_i32 =
+            i32::try_from(adaptive_cap).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("adaptive scratch cap {adaptive_cap} exceeds the CUDA i32 ABI"),
+            })?;
+        let stc_cap_i32 =
+            i32::try_from(stc_cap).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("STC scratch cap {stc_cap} exceeds the CUDA i32 ABI"),
+            })?;
+        let queue_cap_i32 =
+            i32::try_from(queue_cap).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("queue scratch cap {queue_cap} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_adaptive_lengths = DeviceBuffer::from_slice(&adaptive_lengths)?;
+        let d_stc_lengths = DeviceBuffer::from_slice(&stc_lengths)?;
+        let d_smoothing_factors = DeviceBuffer::from_slice(&smoothing_factors)?;
+        let d_fast_lengths = DeviceBuffer::from_slice(&fast_lengths)?;
+        let d_slow_lengths = DeviceBuffer::from_slice(&slow_lengths)?;
+        let d_correlation = unsafe { DeviceBuffer::<f64>::uninitialized(correlation_elems)? };
+        let d_queue_indices = unsafe { DeviceBuffer::<i32>::uninitialized(queue_elems)? };
+        let d_queue_values = unsafe { DeviceBuffer::<f64>::uninitialized(queue_elems)? };
+        let d_stc = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_histogram = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::AdaptiveSchaffTrendCycle)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_adaptive_lengths.as_device_ptr(),
+                d_stc_lengths.as_device_ptr(),
+                d_smoothing_factors.as_device_ptr(),
+                d_fast_lengths.as_device_ptr(),
+                d_slow_lengths.as_device_ptr(),
+                rows_i32,
+                adaptive_cap_i32,
+                stc_cap_i32,
+                queue_cap_i32,
+                d_correlation.as_device_ptr(),
+                d_queue_indices.as_device_ptr(),
+                d_queue_values.as_device_ptr(),
+                d_stc.as_device_ptr(),
+                d_histogram.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![matrix(d_stc, "stc")?, matrix(d_histogram, "histogram")?],
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_adaptive_lengths,
+                d_stc_lengths,
+                d_fast_lengths,
+                d_slow_lengths,
+            ],
+            _parameter_f64: vec![d_smoothing_factors],
+            _scratch_f64: vec![d_correlation, d_queue_values],
+            _scratch_i32: vec![d_queue_indices],
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch both f64 Ehlers Adaptive CG outputs from one resident `hl2`
+    /// series through this engine's shared CUDA session.
+    ///
+    /// `alpha` is the indicator's real parameter. Both `cg` and `trigger`
+    /// remain device-resident; the host neither re-uploads prices nor
+    /// reconstructs the secondary output.
+    pub fn ehlers_adaptive_cg_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        alphas: &[f64],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_adaptive_cg";
+        const ENTRY_POINT: &str = "ehlers_adaptive_cg_batch_f64";
+
+        let cols = prices.len();
+        let rows = alphas.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident hl2 series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "hl2 is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty alpha list".into(),
+            });
+        }
+        for &alpha in alphas {
+            if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) || alpha == 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("alpha must be finite and strictly inside (0, 1), got {alpha}"),
+                });
+            }
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "two-output byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "alpha byte count overflow".into(),
+            })?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total device byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("alpha count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("alpha count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_alphas = DeviceBuffer::from_slice(alphas)?;
+        let d_cg = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_trigger = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::EhlersAdaptiveCg)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_alphas.as_device_ptr(),
+                rows_i32,
+                d_cg.as_device_ptr(),
+                d_trigger.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![matrix(d_cg, "cg")?, matrix(d_trigger, "trigger")?],
+            rows,
+            cols,
+            _parameter_i32: Vec::new(),
+            _parameter_f64: vec![d_alphas],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch both f64 Ehlers Adaptive Cyber Cycle outputs from one resident
+    /// `hl2` series through this engine's shared CUDA session.
+    ///
+    /// The production kernel carries the adaptive-cycle state once and writes
+    /// both `cycle` and its previous-cycle `trigger`; rebuilding `trigger` on
+    /// the host would violate the GpuOnly contract.
+    pub fn ehlers_adaptive_cyber_cycle_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        alphas: &[f64],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_adaptive_cyber_cycle";
+        const ENTRY_POINT: &str = "ehlers_adaptive_cyber_cycle_batch_f64";
+        const MIN_VALID_SAMPLES: usize = 3;
+
+        let cols = prices.len();
+        let rows = alphas.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident hl2 series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "hl2 is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first finite hl2 index {first_valid} is outside {cols} bars"),
+            });
+        }
+        let valid = cols - first_valid;
+        if valid < MIN_VALID_SAMPLES {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "not enough data after the first finite hl2 value: needed={MIN_VALID_SAMPLES}, valid={valid}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty alpha list".into(),
+            });
+        }
+        for &alpha in alphas {
+            if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("alpha must be finite and inside [0, 1], got {alpha}"),
+                });
+            }
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "two-output byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "alpha byte count overflow".into(),
+            })?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total device byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("alpha count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("alpha count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_alphas = DeviceBuffer::from_slice(alphas)?;
+        let d_cycle = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_trigger = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::EhlersAdaptiveCyberCycle)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_alphas.as_device_ptr(),
+                rows_i32,
+                d_cycle.as_device_ptr(),
+                d_trigger.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![matrix(d_cycle, "cycle")?, matrix(d_trigger, "trigger")?],
+            rows,
+            cols,
+            _parameter_i32: Vec::new(),
+            _parameter_f64: vec![d_alphas],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch both f64 Ehlers Simple Cycle Indicator outputs from the
+    /// resident `hl2` series. This uses the verified two-output scalar ABI but
+    /// retains its own kernel, parameter domain and output identities.
+    pub fn ehlers_simple_cycle_indicator_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        alphas: &[f64],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        self.launch_one_f64_scalar_two_outputs(
+            F64OneScalarTwoOutputSpec {
+                indicator: "ehlers_simple_cycle_indicator",
+                entry_point: "ehlers_simple_cycle_indicator_batch_f64",
+                kernel: F64Kernel::EhlersSimpleCycleIndicator,
+                source_name: "hl2",
+                parameter_name: "alpha",
+                parameter_domain: F64ScalarParameterDomain {
+                    minimum: 0.0,
+                    maximum: 1.0,
+                    minimum_inclusive: true,
+                    maximum_inclusive: true,
+                },
+                minimum_valid_samples: 3,
+                output_ids: ["cycle", "trigger"],
+            },
+            prices,
+            first_valid,
+            alphas,
+        )
+    }
+
+    /// Launch the parameter-free f64 Ehlers PMA once and keep its distinct
+    /// `predict` and `trigger` matrices resident. The historical benchmark's
+    /// arbitrary combo count is not a production parameter and is therefore
+    /// never allowed to create duplicate feature rows here.
+    fn ehlers_pma_bars_parallel_grid(cols: usize) -> Result<(u32, u32), CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_pma";
+        let work_items = u32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA grid work-item ABI"),
+        })?;
+        Ok((work_items, work_items.div_ceil(BAR_BLOCK_X)))
+    }
+
+    /// Exact launch geometry plus CUDA-driver occupancy capacity for the
+    /// parameter-free PMA bar-parallel kernel. This does not claim sampled SM
+    /// utilization; it records the strongest truthful evidence available when
+    /// a rented host disables NVIDIA performance counters.
+    pub fn ehlers_pma_bars_parallel_launch_capacity(
+        &self,
+        cols: usize,
+    ) -> Result<F64CudaLaunchCapacity, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_pma";
+        const ENTRY_POINT: &str = "ehlers_pma_bars_parallel_f64";
+        let (work_items, grid_blocks) = Self::ehlers_pma_bars_parallel_grid(cols)?;
+        if work_items == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+
+        let module = self.module_for(F64Kernel::EhlersPma)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let block = BlockSize::x(BAR_BLOCK_X);
+        let max_active_blocks_per_multiprocessor =
+            function.max_active_blocks_per_multiprocessor(block, 0)?;
+        let device = Device::get_device(self.device_id())?;
+        let positive_attribute = |attribute, name| {
+            let value = device.get_attribute(attribute)?;
+            u32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("CUDA device reported invalid {name}={value}"),
+            })
+        };
+
+        Ok(F64CudaLaunchCapacity {
+            entry_point: ENTRY_POINT,
+            logical_work_items: work_items as usize,
+            grid_blocks,
+            threads_per_block: BAR_BLOCK_X,
+            multiprocessors: positive_attribute(
+                DeviceAttribute::MultiprocessorCount,
+                "multiprocessor count",
+            )?,
+            max_active_blocks_per_multiprocessor,
+            max_threads_per_multiprocessor: positive_attribute(
+                DeviceAttribute::MaxThreadsPerMultiprocessor,
+                "max threads per multiprocessor",
+            )?,
+        })
+    }
+
+    pub fn ehlers_pma_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ehlers_pma";
+        const ENTRY_POINT: &str = "ehlers_pma_bars_parallel_f64";
+        const MIN_VALID_SAMPLES: usize = 14;
+        const ROWS: usize = 1;
+
+        let cols = prices.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first non-NaN close index {first_valid} is outside {cols} bars"),
+            });
+        }
+        let valid = cols - first_valid;
+        if valid < MIN_VALID_SAMPLES {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "not enough data after the first non-NaN close: needed={MIN_VALID_SAMPLES}, valid={valid}"
+                ),
+            });
+        }
+
+        let output_bytes = cols
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "two-output byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if output_bytes.checked_add(DEFAULT_HEADROOM).is_none()
+            || output_bytes + DEFAULT_HEADROOM > free
+        {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required: output_bytes,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first-valid index {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let rows_i32 = i32::try_from(ROWS).expect("one output row fits the CUDA i32 ABI");
+
+        let d_predict = unsafe { DeviceBuffer::<f64>::uninitialized(cols)? };
+        let d_trigger = unsafe { DeviceBuffer::<f64>::uninitialized(cols)? };
+        let module = self.module_for(F64Kernel::EhlersPma)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let (_, grid_blocks) = Self::ehlers_pma_bars_parallel_grid(cols)?;
+        let grid = GridSize::x(grid_blocks);
+        let block = BlockSize::x(BAR_BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                rows_i32,
+                first_valid_i32,
+                d_predict.as_device_ptr(),
+                d_trigger.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, ROWS, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![matrix(d_predict, "predict")?, matrix(d_trigger, "trigger")?],
+            rows: ROWS,
+            cols,
+            _parameter_i32: Vec::new(),
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch Fibonacci Trailing Stop's canonical four matrices from the
+    /// already-resident HLC buffers. Only the exact default parameter tuple is
+    /// uploaded; price data and outputs remain owned by this shared session.
+    pub fn fibonacci_trailing_stop_all_outputs(
+        &self,
+        input: CudaDeviceOhlcvF64Ref,
+        max_consecutive_finite_hlc: usize,
+        parameter_rows: &[(usize, usize, f64, i32)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "fibonacci_trailing_stop";
+        const ENTRY_POINT: &str = "fibonacci_trailing_stop_batch_f64";
+        const OUTPUT_IDS: [&str; 4] = ["trailing_stop", "long_stop", "short_stop", "direction"];
+
+        let cols = input.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLCV frame".into(),
+            });
+        }
+        if input.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLCV frame is resident on device {} but this session is bound to device {}",
+                    input.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_consecutive_finite_hlc == 0 || max_consecutive_finite_hlc > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "longest finite HLC run {max_consecutive_finite_hlc} is invalid for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty exact parameter tuple list".into(),
+            });
+        }
+
+        let mut left_bars = Vec::with_capacity(rows);
+        let mut right_bars = Vec::with_capacity(rows);
+        let mut levels = Vec::with_capacity(rows);
+        let mut trigger_modes = Vec::with_capacity(rows);
+        for (row, &(left, right, level, trigger_mode)) in parameter_rows.iter().enumerate() {
+            if left == 0 || right == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} requires positive left/right bars, found {left}/{right}"
+                    ),
+                });
+            }
+            let needed = left
+                .checked_add(right)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} left/right valid-run requirement overflow"),
+                })?;
+            if needed > max_consecutive_finite_hlc {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {needed} consecutive finite HLC bars, available {max_consecutive_finite_hlc}"
+                    ),
+                });
+            }
+            if !level.is_finite() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} level must be finite, found {level:?}"),
+                });
+            }
+            if !matches!(trigger_mode, 0 | 1) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} trigger mode must be close=0 or wick=1, found {trigger_mode}"
+                    ),
+                });
+            }
+            left_bars.push(i32::try_from(left).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} left_bars {left} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            right_bars.push(i32::try_from(right).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} right_bars {right} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            levels.push(level);
+            trigger_modes.push(trigger_mode);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "four parameter arrays",
+            rows,
+            3 * std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_left_bars = DeviceBuffer::from_slice(&left_bars)?;
+        let d_right_bars = DeviceBuffer::from_slice(&right_bars)?;
+        let d_levels = DeviceBuffer::from_slice(&levels)?;
+        let d_trigger_modes = DeviceBuffer::from_slice(&trigger_modes)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+        let module = self.module_for(F64Kernel::FibonacciTrailingStop)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(input.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(input.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(input.close().device_ptr());
+            let (trailing_stop, rest) = output_buffers.split_at_mut(1);
+            let (long_stop, rest) = rest.split_at_mut(1);
+            let (short_stop, direction) = rest.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_left_bars.as_device_ptr(),
+                d_right_bars.as_device_ptr(),
+                d_levels.as_device_ptr(),
+                d_trigger_modes.as_device_ptr(),
+                rows_i32,
+                trailing_stop[0].as_device_ptr(),
+                long_stop[0].as_device_ptr(),
+                short_stop[0].as_device_ptr(),
+                direction[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_left_bars, d_right_bars, d_trigger_modes],
+            _parameter_f64: vec![d_levels],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all eighteen Fibonacci Entry Bands outputs from the frame's
+    /// already-resident OHLC buffers. The legacy wrapper creates another CUDA
+    /// context, stream and four host uploads; none of those are part of an
+    /// admissible GpuOnly graph.
+    pub fn fibonacci_entry_bands_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_hlc_run: usize,
+        max_finite_ohlc_run: usize,
+        sweep: &FibonacciEntryBandsBatchRange,
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "fibonacci_entry_bands";
+        const ENTRY_POINT: &str = "fibonacci_entry_bands_batch_f64";
+        const OUTPUT_IDS: [&str; 18] = [
+            "middle",
+            "trend",
+            "upper_0618",
+            "upper_1000",
+            "upper_1618",
+            "upper_2618",
+            "lower_0618",
+            "lower_1000",
+            "lower_1618",
+            "lower_2618",
+            "tp_long_band",
+            "tp_short_band",
+            "go_long",
+            "go_short",
+            "rejection_long",
+            "rejection_short",
+            "long_bounce",
+            "short_bounce",
+        ];
+
+        let cols = ohlcv.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+
+        let plan = fibonacci_entry_bands_cuda_batch_plan(sweep, cols).map_err(|error| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            }
+        })?;
+        let valid_run = if plan.source_needs_open {
+            max_finite_ohlc_run
+        } else {
+            max_finite_hlc_run
+        };
+        if valid_run < plan.minimum_valid_run {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "not enough consecutive finite source data: needed={}, valid={valid_run}",
+                    plan.minimum_valid_run
+                ),
+            });
+        }
+
+        let rows = plan.combos.len();
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*bars overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(OUTPUT_IDS.len()))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "eighteen-output byte count overflow".into(),
+            })?;
+        let scratch_elems = rows.checked_mul(plan.max_length).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "standard-deviation scratch length overflow".into(),
+            }
+        })?;
+        let scratch_bytes = scratch_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "standard-deviation scratch byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(2 * std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident allocation byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let max_length_i32 =
+            i32::try_from(plan.max_length).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "maximum standard-deviation length {} exceeds the CUDA i32 ABI",
+                    plan.max_length
+                ),
+            })?;
+
+        let d_lengths = DeviceBuffer::from_slice(&plan.lengths)?;
+        let d_atr_lengths = DeviceBuffer::from_slice(&plan.atr_lengths)?;
+        let d_stdev_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_elems)? };
+        let d_basis = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_trend = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_upper_0618 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_upper_1000 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_upper_1618 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_upper_2618 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_lower_0618 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_lower_1000 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_lower_1618 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_lower_2618 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_tp_long_band = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_tp_short_band = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_long_entry = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_short_entry = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_rejection_long = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_rejection_short = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_long_bounce = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_short_bounce = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::FibonacciEntryBands)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_atr_lengths.as_device_ptr(),
+                plan.source_mode,
+                if plan.use_atr { 1_i32 } else { 0_i32 },
+                plan.tp_mode,
+                rows_i32,
+                max_length_i32,
+                d_stdev_scratch.as_device_ptr(),
+                d_basis.as_device_ptr(),
+                d_trend.as_device_ptr(),
+                d_upper_0618.as_device_ptr(),
+                d_upper_1000.as_device_ptr(),
+                d_upper_1618.as_device_ptr(),
+                d_upper_2618.as_device_ptr(),
+                d_lower_0618.as_device_ptr(),
+                d_lower_1000.as_device_ptr(),
+                d_lower_1618.as_device_ptr(),
+                d_lower_2618.as_device_ptr(),
+                d_tp_long_band.as_device_ptr(),
+                d_tp_short_band.as_device_ptr(),
+                d_long_entry.as_device_ptr(),
+                d_short_entry.as_device_ptr(),
+                d_rejection_long.as_device_ptr(),
+                d_rejection_short.as_device_ptr(),
+                d_long_bounce.as_device_ptr(),
+                d_short_bounce.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+        let outputs = vec![
+            matrix(d_basis, OUTPUT_IDS[0])?,
+            matrix(d_trend, OUTPUT_IDS[1])?,
+            matrix(d_upper_0618, OUTPUT_IDS[2])?,
+            matrix(d_upper_1000, OUTPUT_IDS[3])?,
+            matrix(d_upper_1618, OUTPUT_IDS[4])?,
+            matrix(d_upper_2618, OUTPUT_IDS[5])?,
+            matrix(d_lower_0618, OUTPUT_IDS[6])?,
+            matrix(d_lower_1000, OUTPUT_IDS[7])?,
+            matrix(d_lower_1618, OUTPUT_IDS[8])?,
+            matrix(d_lower_2618, OUTPUT_IDS[9])?,
+            matrix(d_tp_long_band, OUTPUT_IDS[10])?,
+            matrix(d_tp_short_band, OUTPUT_IDS[11])?,
+            matrix(d_long_entry, OUTPUT_IDS[12])?,
+            matrix(d_short_entry, OUTPUT_IDS[13])?,
+            matrix(d_rejection_long, OUTPUT_IDS[14])?,
+            matrix(d_rejection_short, OUTPUT_IDS[15])?,
+            matrix(d_long_bounce, OUTPUT_IDS[16])?,
+            matrix(d_short_bounce, OUTPUT_IDS[17])?,
+        ];
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths, d_atr_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_stdev_scratch],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch both f64 Adaptive Bandpass Trigger Oscillator outputs from one
+    /// resident close series through this engine's shared CUDA session.
+    pub fn adaptive_bandpass_trigger_oscillator_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        finite_value_count: usize,
+        parameter_tuples: &[(f64, f64)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "adaptive_bandpass_trigger_oscillator";
+        const ENTRY_POINT: &str = "adaptive_bandpass_trigger_oscillator_batch_f64";
+        const MIN_VALID_SAMPLES: usize = 12;
+
+        let cols = prices.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if finite_value_count > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "finite-value metadata {finite_value_count} exceeds series length {cols}"
+                ),
+            });
+        }
+        if finite_value_count < MIN_VALID_SAMPLES {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "not enough finite data: needed={MIN_VALID_SAMPLES}, \
+                     valid={finite_value_count}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut deltas = Vec::with_capacity(rows);
+        let mut alphas = Vec::with_capacity(rows);
+        for &(delta, alpha) in parameter_tuples {
+            if !delta.is_finite() || delta <= 0.0 || delta >= 1.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("delta must be finite and strictly inside (0, 1), got {delta}"),
+                });
+            }
+            if !alpha.is_finite() || alpha <= 0.0 || alpha >= 1.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("alpha must be finite and strictly inside (0, 1), got {alpha}"),
+                });
+            }
+            deltas.push(delta);
+            alphas.push(alpha);
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "two-output byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "total device byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("tuple count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_deltas = DeviceBuffer::from_slice(&deltas)?;
+        let d_alphas = DeviceBuffer::from_slice(&alphas)?;
+        let d_in_phase = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_lead = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::AdaptiveBandpassTriggerOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_deltas.as_device_ptr(),
+                d_alphas.as_device_ptr(),
+                rows_i32,
+                d_in_phase.as_device_ptr(),
+                d_lead.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs: vec![matrix(d_in_phase, "in_phase")?, matrix(d_lead, "lead")?],
+            rows,
+            cols,
+            _parameter_i32: Vec::new(),
+            _parameter_f64: vec![d_deltas, d_alphas],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all seventeen Trend Flow Trail outputs from one already-
+    /// resident OHLCV frame through this engine's shared CUDA session.
+    /// Parameter and scratch buffers remain owned by the returned lifetime
+    /// unit until the asynchronous launch has completed.
+    pub fn trend_flow_trail_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_ohlcv_run: usize,
+        parameter_tuples: &[(usize, f64, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "trend_flow_trail";
+        const ENTRY_POINT: &str = "trend_flow_trail_batch_f64";
+        const MFI_HMA_LENGTH: usize = 7;
+        const MFI_HMA_HALF: usize = 3;
+        const MFI_HMA_SQRT: usize = 2;
+        const OUTPUT_IDS: [&str; 17] = [
+            "alpha_trail",
+            "alpha_trail_bullish",
+            "alpha_trail_bearish",
+            "alpha_dir",
+            "mfi",
+            "tp_upper",
+            "tp_lower",
+            "alpha_trail_bullish_switch",
+            "alpha_trail_bearish_switch",
+            "mfi_overbought",
+            "mfi_oversold",
+            "mfi_cross_up_mid",
+            "mfi_cross_down_mid",
+            "price_cross_alpha_trail_up",
+            "price_cross_alpha_trail_down",
+            "mfi_above_90",
+            "mfi_below_10",
+        ];
+
+        let cols = ohlcv.len();
+        let rows = parameter_tuples.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLCV frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLCV is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_ohlcv_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "finite-OHLCV run metadata {max_finite_ohlcv_run} exceeds frame length {cols}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter tuple list".into(),
+            });
+        }
+
+        let mut alpha_lengths = Vec::with_capacity(rows);
+        let mut alpha_multipliers = Vec::with_capacity(rows);
+        let mut mfi_lengths = Vec::with_capacity(rows);
+        let mut max_alpha_length = 1usize;
+        let mut max_alpha_half = 1usize;
+        let mut max_alpha_sqrt = 1usize;
+        let mut max_mfi_length = 1usize;
+        for &(alpha_length, alpha_multiplier, mfi_length) in parameter_tuples {
+            if alpha_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "alpha_length must be at least 1".into(),
+                });
+            }
+            if !alpha_multiplier.is_finite() || alpha_multiplier < 0.1 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "alpha_multiplier must be finite and at least 0.1, got {alpha_multiplier}"
+                    ),
+                });
+            }
+            if mfi_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "mfi_length must be at least 1".into(),
+                });
+            }
+
+            let alpha_required = if alpha_length == 1 {
+                1
+            } else {
+                alpha_length
+                    .checked_add((alpha_length as f64).sqrt().floor() as usize)
+                    .and_then(|value| value.checked_sub(1))
+                    .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("alpha_length {alpha_length} warmup overflow"),
+                    })?
+            };
+            let mfi_required = mfi_length
+                .checked_add(MFI_HMA_LENGTH + MFI_HMA_SQRT - 1)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("mfi_length {mfi_length} warmup overflow"),
+                })?;
+            let required_run = alpha_required.max(mfi_required);
+            if max_finite_ohlcv_run < required_run {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "not enough consecutive finite OHLCV data for ({alpha_length}, \
+                         {alpha_multiplier}, {mfi_length}): needed={required_run}, \
+                         valid={max_finite_ohlcv_run}"
+                    ),
+                });
+            }
+
+            alpha_lengths.push(i32::try_from(alpha_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("alpha_length {alpha_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            alpha_multipliers.push(alpha_multiplier);
+            mfi_lengths.push(i32::try_from(mfi_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("mfi_length {mfi_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            max_alpha_length = max_alpha_length.max(alpha_length);
+            max_alpha_half = max_alpha_half.max((alpha_length / 2).max(1));
+            max_alpha_sqrt = max_alpha_sqrt
+                .max((alpha_length as f64).sqrt().floor() as usize)
+                .max(1);
+            max_mfi_length = max_mfi_length.max(mfi_length);
+        }
+
+        let checked_rows = |per_row: usize, label: &'static str| {
+            rows.checked_mul(per_row)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{label} scratch element count overflow"),
+                })
+        };
+        let alpha_full_elems = checked_rows(max_alpha_length, "alpha-full")?;
+        let alpha_half_elems = checked_rows(max_alpha_half, "alpha-half")?;
+        let alpha_sqrt_elems = checked_rows(max_alpha_sqrt, "alpha-sqrt")?;
+        let mfi_pos_elems = checked_rows(max_mfi_length, "MFI-positive")?;
+        let mfi_neg_elems = checked_rows(max_mfi_length, "MFI-negative")?;
+        let mfi_full_elems = checked_rows(MFI_HMA_LENGTH, "MFI-HMA-full")?;
+        let mfi_half_elems = checked_rows(MFI_HMA_HALF, "MFI-HMA-half")?;
+        let mfi_sqrt_elems = checked_rows(MFI_HMA_SQRT, "MFI-HMA-sqrt")?;
+        let scratch_elems = [
+            alpha_full_elems,
+            alpha_half_elems,
+            alpha_sqrt_elems,
+            mfi_pos_elems,
+            mfi_neg_elems,
+            mfi_full_elems,
+            mfi_half_elems,
+            mfi_sqrt_elems,
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, count| sum.checked_add(count))
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: "total scratch element count overflow".into(),
+        })?;
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*bars overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(OUTPUT_IDS.len()))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "seventeen-output byte count overflow".into(),
+            })?;
+        let scratch_bytes = scratch_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "scratch byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(2 * std::mem::size_of::<i32>() + std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident allocation byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let max_alpha_length_i32 =
+            i32::try_from(max_alpha_length).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("maximum alpha length {max_alpha_length} exceeds the CUDA ABI"),
+            })?;
+        let max_alpha_half_i32 =
+            i32::try_from(max_alpha_half).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("maximum alpha half {max_alpha_half} exceeds the CUDA ABI"),
+            })?;
+        let max_alpha_sqrt_i32 =
+            i32::try_from(max_alpha_sqrt).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("maximum alpha sqrt {max_alpha_sqrt} exceeds the CUDA ABI"),
+            })?;
+        let max_mfi_length_i32 =
+            i32::try_from(max_mfi_length).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("maximum MFI length {max_mfi_length} exceeds the CUDA ABI"),
+            })?;
+
+        let d_alpha_lengths = DeviceBuffer::from_slice(&alpha_lengths)?;
+        let d_alpha_multipliers = DeviceBuffer::from_slice(&alpha_multipliers)?;
+        let d_mfi_lengths = DeviceBuffer::from_slice(&mfi_lengths)?;
+        let d_alpha_full = unsafe { DeviceBuffer::<f64>::uninitialized(alpha_full_elems)? };
+        let d_alpha_half = unsafe { DeviceBuffer::<f64>::uninitialized(alpha_half_elems)? };
+        let d_alpha_sqrt = unsafe { DeviceBuffer::<f64>::uninitialized(alpha_sqrt_elems)? };
+        let d_mfi_pos = unsafe { DeviceBuffer::<f64>::uninitialized(mfi_pos_elems)? };
+        let d_mfi_neg = unsafe { DeviceBuffer::<f64>::uninitialized(mfi_neg_elems)? };
+        let d_mfi_full = unsafe { DeviceBuffer::<f64>::uninitialized(mfi_full_elems)? };
+        let d_mfi_half = unsafe { DeviceBuffer::<f64>::uninitialized(mfi_half_elems)? };
+        let d_mfi_sqrt = unsafe { DeviceBuffer::<f64>::uninitialized(mfi_sqrt_elems)? };
+
+        let d_alpha_trail = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_alpha_trail_bullish = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_alpha_trail_bearish = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_alpha_dir = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_mfi = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_tp_upper = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_tp_lower = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_alpha_trail_bullish_switch =
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_alpha_trail_bearish_switch =
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_mfi_overbought = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_mfi_oversold = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_mfi_cross_up_mid = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_mfi_cross_down_mid = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_price_cross_alpha_trail_up =
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_price_cross_alpha_trail_down =
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_mfi_above_90 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_mfi_below_10 = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::TrendFlowTrail)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let volume = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.volume().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                volume,
+                cols_i32,
+                d_alpha_lengths.as_device_ptr(),
+                d_alpha_multipliers.as_device_ptr(),
+                d_mfi_lengths.as_device_ptr(),
+                rows_i32,
+                max_alpha_length_i32,
+                max_alpha_half_i32,
+                max_alpha_sqrt_i32,
+                max_mfi_length_i32,
+                d_alpha_full.as_device_ptr(),
+                d_alpha_half.as_device_ptr(),
+                d_alpha_sqrt.as_device_ptr(),
+                d_mfi_pos.as_device_ptr(),
+                d_mfi_neg.as_device_ptr(),
+                d_mfi_full.as_device_ptr(),
+                d_mfi_half.as_device_ptr(),
+                d_mfi_sqrt.as_device_ptr(),
+                d_alpha_trail.as_device_ptr(),
+                d_alpha_trail_bullish.as_device_ptr(),
+                d_alpha_trail_bearish.as_device_ptr(),
+                d_alpha_dir.as_device_ptr(),
+                d_mfi.as_device_ptr(),
+                d_tp_upper.as_device_ptr(),
+                d_tp_lower.as_device_ptr(),
+                d_alpha_trail_bullish_switch.as_device_ptr(),
+                d_alpha_trail_bearish_switch.as_device_ptr(),
+                d_mfi_overbought.as_device_ptr(),
+                d_mfi_oversold.as_device_ptr(),
+                d_mfi_cross_up_mid.as_device_ptr(),
+                d_mfi_cross_down_mid.as_device_ptr(),
+                d_price_cross_alpha_trail_up.as_device_ptr(),
+                d_price_cross_alpha_trail_down.as_device_ptr(),
+                d_mfi_above_90.as_device_ptr(),
+                d_mfi_below_10.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+        let outputs = vec![
+            matrix(d_alpha_trail, OUTPUT_IDS[0])?,
+            matrix(d_alpha_trail_bullish, OUTPUT_IDS[1])?,
+            matrix(d_alpha_trail_bearish, OUTPUT_IDS[2])?,
+            matrix(d_alpha_dir, OUTPUT_IDS[3])?,
+            matrix(d_mfi, OUTPUT_IDS[4])?,
+            matrix(d_tp_upper, OUTPUT_IDS[5])?,
+            matrix(d_tp_lower, OUTPUT_IDS[6])?,
+            matrix(d_alpha_trail_bullish_switch, OUTPUT_IDS[7])?,
+            matrix(d_alpha_trail_bearish_switch, OUTPUT_IDS[8])?,
+            matrix(d_mfi_overbought, OUTPUT_IDS[9])?,
+            matrix(d_mfi_oversold, OUTPUT_IDS[10])?,
+            matrix(d_mfi_cross_up_mid, OUTPUT_IDS[11])?,
+            matrix(d_mfi_cross_down_mid, OUTPUT_IDS[12])?,
+            matrix(d_price_cross_alpha_trail_up, OUTPUT_IDS[13])?,
+            matrix(d_price_cross_alpha_trail_down, OUTPUT_IDS[14])?,
+            matrix(d_mfi_above_90, OUTPUT_IDS[15])?,
+            matrix(d_mfi_below_10, OUTPUT_IDS[16])?,
+        ];
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_alpha_lengths, d_mfi_lengths],
+            _parameter_f64: vec![d_alpha_multipliers],
+            _scratch_f64: vec![
+                d_alpha_full,
+                d_alpha_half,
+                d_alpha_sqrt,
+                d_mfi_pos,
+                d_mfi_neg,
+                d_mfi_full,
+                d_mfi_half,
+                d_mfi_sqrt,
+            ],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all fifteen HEMA Trend Levels outputs from one already-resident
+    /// OHLC frame through this engine's shared CUDA session.
+    ///
+    /// The superseded wrapper created a second CUDA context, uploaded all four
+    /// price series again and synchronized inside the call. This route owns
+    /// only the parameter/output buffers; input residency and stream ordering
+    /// remain those of the frame-level session.
+    pub fn hema_trend_levels_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_consecutive_finite_ohlc: usize,
+        parameter_rows: &[HemaTrendLevelsParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "hema_trend_levels";
+        const ENTRY_POINT: &str = "hema_trend_levels_batch_f64";
+        const OUTPUT_IDS: [&str; 15] = [
+            "fast_hema",
+            "slow_hema",
+            "trend_direction",
+            "bar_state",
+            "bullish_crossover",
+            "bearish_crossunder",
+            "box_offset",
+            "bull_box_top",
+            "bull_box_bottom",
+            "bear_box_top",
+            "bear_box_bottom",
+            "bullish_test",
+            "bearish_test",
+            "bullish_test_level",
+            "bearish_test_level",
+        ];
+        const DEFAULT_FAST_LENGTH: usize = 20;
+        const DEFAULT_SLOW_LENGTH: usize = 40;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_consecutive_finite_ohlc == 0 || max_consecutive_finite_ohlc > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid finite-OHLC run metadata {max_consecutive_finite_ohlc} for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut fast_lengths = Vec::with_capacity(rows);
+        let mut slow_lengths = Vec::with_capacity(rows);
+        for params in parameter_rows {
+            let fast_length = params.fast_length.unwrap_or(DEFAULT_FAST_LENGTH);
+            let slow_length = params.slow_length.unwrap_or(DEFAULT_SLOW_LENGTH);
+            if fast_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "fast_length must be at least 1".into(),
+                });
+            }
+            if slow_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "slow_length must be at least 1".into(),
+                });
+            }
+            fast_lengths.push(i32::try_from(fast_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("fast_length {fast_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            slow_lengths.push(i32::try_from(slow_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("slow_length {slow_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "fifteen output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+
+        let d_fast_lengths = DeviceBuffer::from_slice(&fast_lengths)?;
+        let d_slow_lengths = DeviceBuffer::from_slice(&slow_lengths)?;
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::HemaTrendLevels)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X).max(1));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_fast_lengths.as_device_ptr(),
+                d_slow_lengths.as_device_ptr(),
+                rows_i32,
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr(),
+                output_buffers[10].as_device_ptr(),
+                output_buffers[11].as_device_ptr(),
+                output_buffers[12].as_device_ptr(),
+                output_buffers[13].as_device_ptr(),
+                output_buffers[14].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_fast_lengths, d_slow_lengths],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all thirteen Range Filtered Trend Signals outputs from one
+    /// already-resident HLC frame through this engine's shared CUDA session.
+    /// No input or feature matrix crosses the host boundary.
+    pub fn range_filtered_trend_signals_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_hlc_run: usize,
+        parameter_rows: &[RangeFilteredTrendSignalsParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "range_filtered_trend_signals";
+        const ENTRY_POINT: &str = "range_filtered_trend_signals_batch_f64";
+        const WMA_PERIOD: usize = 200;
+        const OUTPUT_IDS: [&str; 13] = [
+            "kalman",
+            "supertrend",
+            "upper_band",
+            "lower_band",
+            "trend",
+            "kalman_trend",
+            "state",
+            "market_trending",
+            "market_ranging",
+            "short_term_bullish",
+            "short_term_bearish",
+            "long_term_bullish",
+            "long_term_bearish",
+        ];
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_hlc_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "finite-HLC run metadata {max_finite_hlc_run} exceeds frame length {cols}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut kalman_alphas = Vec::with_capacity(rows);
+        let mut kalman_betas = Vec::with_capacity(rows);
+        let mut kalman_periods = Vec::with_capacity(rows);
+        let mut devs = Vec::with_capacity(rows);
+        let mut supertrend_factors = Vec::with_capacity(rows);
+        let mut supertrend_atr_periods = Vec::with_capacity(rows);
+        for params in parameter_rows {
+            let kalman_alpha = params.kalman_alpha.unwrap_or(0.01);
+            let kalman_beta = params.kalman_beta.unwrap_or(0.1);
+            let kalman_period = params.kalman_period.unwrap_or(77);
+            let dev = params.dev.unwrap_or(1.2);
+            let supertrend_factor = params.supertrend_factor.unwrap_or(0.7);
+            let supertrend_atr_period = params.supertrend_atr_period.unwrap_or(7);
+            if !kalman_alpha.is_finite() || kalman_alpha <= 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("kalman_alpha must be finite and positive, got {kalman_alpha}"),
+                });
+            }
+            if !kalman_beta.is_finite() || kalman_beta < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "kalman_beta must be finite and non-negative, got {kalman_beta}"
+                    ),
+                });
+            }
+            if kalman_period == 0 || kalman_period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("kalman_period must be inside 1..={cols}, got {kalman_period}"),
+                });
+            }
+            if !dev.is_finite() || dev < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("dev must be finite and non-negative, got {dev}"),
+                });
+            }
+            if !supertrend_factor.is_finite() || supertrend_factor < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "supertrend_factor must be finite and non-negative, got {supertrend_factor}"
+                    ),
+                });
+            }
+            if supertrend_atr_period == 0 || supertrend_atr_period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "supertrend_atr_period must be inside 1..={cols}, got \
+                         {supertrend_atr_period}"
+                    ),
+                });
+            }
+            let required_run = WMA_PERIOD.max(supertrend_atr_period);
+            if max_finite_hlc_run < required_run {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "not enough consecutive finite HLC data: needed={required_run}, \
+                         valid={max_finite_hlc_run}"
+                    ),
+                });
+            }
+
+            kalman_alphas.push(kalman_alpha);
+            kalman_betas.push(kalman_beta);
+            kalman_periods.push(i32::try_from(kalman_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("kalman_period {kalman_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            devs.push(dev);
+            supertrend_factors.push(supertrend_factor);
+            supertrend_atr_periods.push(i32::try_from(supertrend_atr_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "supertrend_atr_period {supertrend_atr_period} exceeds the CUDA i32 ABI"
+                    ),
+                }
+            })?);
+        }
+
+        let output_elems =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "rows*bars overflow".into(),
+                })?;
+        let output_bytes = output_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| bytes.checked_mul(OUTPUT_IDS.len()))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "thirteen-output byte count overflow".into(),
+            })?;
+        let scratch_elems =
+            rows.checked_mul(WMA_PERIOD)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "WMA scratch element count overflow".into(),
+                })?;
+        let scratch_bytes = scratch_elems
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "WMA scratch byte count overflow".into(),
+            })?;
+        let parameter_bytes = rows
+            .checked_mul(4 * std::mem::size_of::<f64>() + 2 * std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident allocation byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_kalman_alphas = DeviceBuffer::from_slice(&kalman_alphas)?;
+        let d_kalman_betas = DeviceBuffer::from_slice(&kalman_betas)?;
+        let d_kalman_periods = DeviceBuffer::from_slice(&kalman_periods)?;
+        let d_devs = DeviceBuffer::from_slice(&devs)?;
+        let d_supertrend_factors = DeviceBuffer::from_slice(&supertrend_factors)?;
+        let d_supertrend_atr_periods = DeviceBuffer::from_slice(&supertrend_atr_periods)?;
+        let d_wma_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_elems)? };
+        let d_kalman = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_supertrend = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_upper_band = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_lower_band = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_trend = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_kalman_trend = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_state = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_market_trending = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_market_ranging = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_short_term_bullish = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_short_term_bearish = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_long_term_bullish = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_long_term_bearish = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+
+        let module = self.module_for(F64Kernel::RangeFilteredTrendSignals)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_kalman_alphas.as_device_ptr(),
+                d_kalman_betas.as_device_ptr(),
+                d_kalman_periods.as_device_ptr(),
+                d_devs.as_device_ptr(),
+                d_supertrend_factors.as_device_ptr(),
+                d_supertrend_atr_periods.as_device_ptr(),
+                rows_i32,
+                d_wma_scratch.as_device_ptr(),
+                d_kalman.as_device_ptr(),
+                d_supertrend.as_device_ptr(),
+                d_upper_band.as_device_ptr(),
+                d_lower_band.as_device_ptr(),
+                d_trend.as_device_ptr(),
+                d_kalman_trend.as_device_ptr(),
+                d_state.as_device_ptr(),
+                d_market_trending.as_device_ptr(),
+                d_market_ranging.as_device_ptr(),
+                d_short_term_bullish.as_device_ptr(),
+                d_short_term_bearish.as_device_ptr(),
+                d_long_term_bullish.as_device_ptr(),
+                d_long_term_bearish.as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let matrix = |buffer, output_id| {
+            CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                .map(|matrix| F64NamedDeviceOutput { output_id, matrix })
+                .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("{output_id} device matrix ownership failed: {error}"),
+                })
+        };
+        let outputs = vec![
+            matrix(d_kalman, OUTPUT_IDS[0])?,
+            matrix(d_supertrend, OUTPUT_IDS[1])?,
+            matrix(d_upper_band, OUTPUT_IDS[2])?,
+            matrix(d_lower_band, OUTPUT_IDS[3])?,
+            matrix(d_trend, OUTPUT_IDS[4])?,
+            matrix(d_kalman_trend, OUTPUT_IDS[5])?,
+            matrix(d_state, OUTPUT_IDS[6])?,
+            matrix(d_market_trending, OUTPUT_IDS[7])?,
+            matrix(d_market_ranging, OUTPUT_IDS[8])?,
+            matrix(d_short_term_bullish, OUTPUT_IDS[9])?,
+            matrix(d_short_term_bearish, OUTPUT_IDS[10])?,
+            matrix(d_long_term_bullish, OUTPUT_IDS[11])?,
+            matrix(d_long_term_bearish, OUTPUT_IDS[12])?,
+        ];
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_kalman_periods, d_supertrend_atr_periods],
+            _parameter_f64: vec![
+                d_kalman_alphas,
+                d_kalman_betas,
+                d_devs,
+                d_supertrend_factors,
+            ],
+            _scratch_f64: vec![d_wma_scratch],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all twelve ICT Propulsion Block outputs from one already-resident
+    /// OHLC frame through this engine's shared CUDA session.
+    ///
+    /// Parameter rows preserve caller order and mitigation mode. Inputs are
+    /// borrowed from the frame upload; outputs, parameters and deque scratch
+    /// remain owned together until the asynchronous shared stream retires.
+    pub fn ict_propulsion_block_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        finite_ohlc_run: usize,
+        parameter_rows: &[IctPropulsionBlockParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ict_propulsion_block";
+        const ENTRY_POINT: &str = "ict_propulsion_block_batch_f64";
+        const OUTPUT_IDS: [&str; 12] = [
+            "bullish_high",
+            "bullish_low",
+            "bullish_kind",
+            "bullish_active",
+            "bullish_mitigated",
+            "bullish_new",
+            "bearish_high",
+            "bearish_low",
+            "bearish_kind",
+            "bearish_active",
+            "bearish_mitigated",
+            "bearish_new",
+        ];
+        const DEFAULT_SWING_LENGTH: usize = 3;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if finite_ohlc_run == 0 || finite_ohlc_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid finite-OHLC run metadata {finite_ohlc_run} for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let as_i32 = |name: &'static str, value: usize| -> Result<i32, CudaF64IndicatorError> {
+            i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("{name} {value} exceeds the CUDA i32 ABI"),
+            })
+        };
+        let mut swing_lengths = Vec::with_capacity(rows);
+        let mut mitigation_modes = Vec::with_capacity(rows);
+        let mut deque_cap = 2usize;
+        for params in parameter_rows {
+            let swing_length = params.swing_length.unwrap_or(DEFAULT_SWING_LENGTH);
+            if swing_length == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "swing_length must be at least 1".into(),
+                });
+            }
+            deque_cap = deque_cap.max(swing_length.checked_add(1).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("swing_length {swing_length} overflows deque capacity"),
+                }
+            })?);
+            swing_lengths.push(as_i32("swing_length", swing_length)?);
+            mitigation_modes.push(match params.mitigation_price.unwrap_or_default() {
+                IctPropulsionBlockMitigationPrice::Close => 0_i32,
+                IctPropulsionBlockMitigationPrice::Wick => 1_i32,
+            });
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "twelve output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let fixed_bytes = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "fixed resident byte count overflow".into(),
+            }
+        })?;
+        let ints_per_slot =
+            checked_mul(INDICATOR, "deque elements/slot", 2, deque_cap).map_err(plan_failure)?;
+        let bytes_per_slot = checked_mul(
+            INDICATOR,
+            "deque bytes/slot",
+            ints_per_slot,
+            std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )
+        .map_err(plan_failure)?;
+        let scratch_i32_elems =
+            scratch_elems(INDICATOR, "deque scratch", plan.slots, ints_per_slot)
+                .map_err(plan_failure)?;
+
+        let cols_i32 = as_i32("bar count", cols)?;
+        let rows_i32 = as_i32("parameter row count", rows)?;
+        let slots_i32 = as_i32("scratch slot count", plan.slots)?;
+        let deque_cap_i32 = as_i32("deque capacity", deque_cap)?;
+        let d_swing_lengths = DeviceBuffer::from_slice(&swing_lengths)?;
+        let d_mitigation_modes = DeviceBuffer::from_slice(&mitigation_modes)?;
+        let d_scratch_i32 =
+            unsafe { DeviceBuffer::<i32>::uninitialized(scratch_i32_elems.max(1))? };
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::IctPropulsionBlock)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        self.validate_launch(plan.grid, plan.block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<plan.grid, plan.block, 0, stream>>>(
+                open,
+                high,
+                low,
+                close,
+                cols_i32,
+                d_swing_lengths.as_device_ptr(),
+                d_mitigation_modes.as_device_ptr(),
+                rows_i32,
+                slots_i32,
+                deque_cap_i32,
+                d_scratch_i32.as_device_ptr(),
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr(),
+                output_buffers[10].as_device_ptr(),
+                output_buffers[11].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_swing_lengths, d_mitigation_modes],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: vec![d_scratch_i32],
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all ten Adaptive Bounds RSI outputs from one already-resident
+    /// close series through the shared CUDA session.
+    ///
+    /// The superseded wrapper uploaded the same close series into a private
+    /// context and synchronized before returning. This route borrows the
+    /// frame upload and keeps parameter/output buffers alive with the shared
+    /// asynchronous session.
+    pub fn adaptive_bounds_rsi_all_outputs(
+        &self,
+        prices: CudaDeviceSliceF64Ref,
+        max_finite_close_run: usize,
+        parameter_rows: &[AdaptiveBoundsRsiParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "adaptive_bounds_rsi";
+        const ENTRY_POINT: &str = "adaptive_bounds_rsi_batch_f64";
+        const OUTPUT_IDS: [&str; 10] = [
+            "rsi",
+            "lower",
+            "lower_mid",
+            "middle",
+            "upper_mid",
+            "upper",
+            "regime",
+            "regime_flip",
+            "lower_signal",
+            "upper_signal",
+        ];
+        const DEFAULT_RSI_LENGTH: usize = 14;
+        const DEFAULT_ALPHA: f64 = 0.1;
+        const MIN_ALPHA: f64 = 0.001;
+        const MAX_ALPHA: f64 = 1.0;
+
+        let cols = prices.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if prices.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    prices.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_close_run == 0 || max_finite_close_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid finite-close run metadata {max_finite_close_run} for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut rsi_lengths = Vec::with_capacity(rows);
+        let mut alphas = Vec::with_capacity(rows);
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let rsi_length = params.rsi_length.unwrap_or(DEFAULT_RSI_LENGTH);
+            let alpha = params.alpha.unwrap_or(DEFAULT_ALPHA);
+            if rsi_length == 0 || rsi_length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid rsi_length {rsi_length} for {cols} bars"
+                    ),
+                });
+            }
+            if !alpha.is_finite() || !(MIN_ALPHA..=MAX_ALPHA).contains(&alpha) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid alpha {alpha}"),
+                });
+            }
+            let needed =
+                rsi_length
+                    .checked_add(1)
+                    .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("row {row} rsi_length {rsi_length} overflows warmup"),
+                    })?;
+            if max_finite_close_run < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {needed} consecutive finite close bars, got \
+                         {max_finite_close_run}"
+                    ),
+                });
+            }
+            rsi_lengths.push(i32::try_from(rsi_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} rsi_length {rsi_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            alphas.push(alpha);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "ten output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_rsi_lengths = DeviceBuffer::from_slice(&rsi_lengths)?;
+        let d_alphas = DeviceBuffer::from_slice(&alphas)?;
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::AdaptiveBoundsRsi)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                prices,
+                cols_i32,
+                d_rsi_lengths.as_device_ptr(),
+                d_alphas.as_device_ptr(),
+                rows_i32,
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_rsi_lengths],
+            _parameter_f64: vec![d_alphas],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch every Adjustable MA & Alternating Extremities output from one
+    /// already-resident OHLC frame. The kernel resets all rolling/stateful
+    /// values at every non-finite HLC gap and borrows each row's exact
+    /// CPU-owned normalized weight vector while scanning bars.
+    pub fn adjustable_ma_alternating_extremities_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_hlc_run: usize,
+        parameter_rows: &[AdjustableMaAlternatingExtremitiesParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "adjustable_ma_alternating_extremities";
+        const ENTRY_POINT: &str = "adjustable_ma_alternating_extremities_batch_f64";
+        const OUTPUT_IDS: [&str; 10] = [
+            "ma",
+            "upper",
+            "lower",
+            "extremity",
+            "state",
+            "changed",
+            "smoothed_open",
+            "smoothed_high",
+            "smoothed_low",
+            "smoothed_close",
+        ];
+        const DEFAULT_LENGTH: usize = 50;
+        const DEFAULT_MULT: f64 = 2.0;
+        const DEFAULT_ALPHA: f64 = 1.0;
+        const DEFAULT_BETA: f64 = 0.5;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_hlc_run == 0 || max_finite_hlc_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid finite-HLC run metadata {max_finite_hlc_run} for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let as_i32 = |name: &'static str, value: usize| -> Result<i32, CudaF64IndicatorError> {
+            i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("{name} {value} exceeds the CUDA i32 ABI"),
+            })
+        };
+        let mut lengths = Vec::with_capacity(rows);
+        let mut mults = Vec::with_capacity(rows);
+        let mut exact_weight_rows = Vec::with_capacity(rows);
+        let mut weight_stride = 0usize;
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let length = params.length.unwrap_or(DEFAULT_LENGTH);
+            let mult = params.mult.unwrap_or(DEFAULT_MULT);
+            let alpha = params.alpha.unwrap_or(DEFAULT_ALPHA);
+            let beta = params.beta.unwrap_or(DEFAULT_BETA);
+            if length < 2 || length > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid length {length} for {cols} bars"),
+                });
+            }
+            if length > ADJUSTABLE_MA_MAX_LENGTH {
+                return Err(CudaF64IndicatorError::PeriodTooLarge {
+                    indicator: INDICATOR,
+                    period: length,
+                    max: ADJUSTABLE_MA_MAX_LENGTH,
+                });
+            }
+            if !mult.is_finite() || mult < 1.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid mult {mult}"),
+                });
+            }
+            if !alpha.is_finite() || alpha < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid alpha {alpha}"),
+                });
+            }
+            if !beta.is_finite() || beta < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid beta {beta}"),
+                });
+            }
+            let needed = length
+                .checked_mul(2)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} length {length} overflows warmup"),
+                })?;
+            if max_finite_hlc_run < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {needed} consecutive finite HLC bars, got \
+                         {max_finite_hlc_run}"
+                    ),
+                });
+            }
+
+            let exact_weights = adjustable_ma_alternating_extremities_exact_weights(
+                length, alpha, beta,
+            )
+            .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("row {row} exact weight authority failed: {error}"),
+            })?;
+            weight_stride = weight_stride.max(exact_weights.len());
+            lengths.push(as_i32("length", length)?);
+            mults.push(mult);
+            exact_weight_rows.push(exact_weights);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let coefficient_elems = checked_mul(INDICATOR, "rows*weight_stride", rows, weight_stride)
+            .map_err(plan_failure)?;
+        let mut exact_weights = vec![0.0; coefficient_elems];
+        for (row, weights) in exact_weight_rows.iter().enumerate() {
+            let start = row.checked_mul(weight_stride).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "exact weight row offset overflow".into(),
+                }
+            })?;
+            let end = start.checked_add(weights.len()).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "exact weight row extent overflow".into(),
+                }
+            })?;
+            exact_weights[start..end].copy_from_slice(weights);
+        }
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "ten output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let scalar_parameter_bytes = checked_mul(
+            INDICATOR,
+            "scalar parameter bytes",
+            rows,
+            std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let coefficient_bytes = checked_mul(
+            INDICATOR,
+            "exact coefficient bytes",
+            coefficient_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = scalar_parameter_bytes
+            .checked_add(coefficient_bytes)
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident parameter byte count overflow".into(),
+            })?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = as_i32("bar count", cols)?;
+        let rows_i32 = as_i32("parameter row count", rows)?;
+        let weight_stride_i32 = as_i32("exact weight stride", weight_stride)?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_mults = DeviceBuffer::from_slice(&mults)?;
+        let d_exact_weights = DeviceBuffer::from_slice(&exact_weights)?;
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::AdjustableMaAlternatingExtremities)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_mults.as_device_ptr(),
+                d_exact_weights.as_device_ptr(),
+                weight_stride_i32,
+                rows_i32,
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths],
+            _parameter_f64: vec![d_mults, d_exact_weights],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch every Bulls v Bears output from the already-resident HLC frame.
+    /// Each parameter row carries its own moving-average type and calculation
+    /// mode; no row is collapsed to the historical EMA/normalized defaults.
+    /// All rolling extrema and crossing state restart after an undefined bar.
+    pub fn bulls_v_bears_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_hlc_run: usize,
+        parameter_rows: &[BullsVBearsParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "bulls_v_bears";
+        const ENTRY_POINT: &str = "bulls_v_bears_batch_f64";
+        const OUTPUT_IDS: [&str; 10] = [
+            "value",
+            "bull",
+            "bear",
+            "ma",
+            "upper",
+            "lower",
+            "bullish_signal",
+            "bearish_signal",
+            "zero_cross_up",
+            "zero_cross_down",
+        ];
+        const DEFAULT_PERIOD: usize = 14;
+        const DEFAULT_NORMALIZED_BARS_BACK: usize = 120;
+        const DEFAULT_RAW_ROLLING_PERIOD: usize = 50;
+        const DEFAULT_RAW_THRESHOLD_PERCENTILE: f64 = 95.0;
+        const DEFAULT_THRESHOLD_LEVEL: f64 = 80.0;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_hlc_run == 0 || max_finite_hlc_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid finite-HLC run metadata {max_finite_hlc_run} for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let as_i32 =
+            |row: usize, name: &'static str, value: usize| -> Result<i32, CudaF64IndicatorError> {
+                i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} {name} {value} exceeds the CUDA i32 ABI"),
+                })
+            };
+        let mut periods = Vec::with_capacity(rows);
+        let mut normalized_bars_backs = Vec::with_capacity(rows);
+        let mut raw_rolling_periods = Vec::with_capacity(rows);
+        let mut raw_threshold_percentiles = Vec::with_capacity(rows);
+        let mut threshold_levels = Vec::with_capacity(rows);
+        let mut ma_types = Vec::with_capacity(rows);
+        let mut calculation_methods = Vec::with_capacity(rows);
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let period = params.period.unwrap_or(DEFAULT_PERIOD);
+            let normalized_bars_back = params
+                .normalized_bars_back
+                .unwrap_or(DEFAULT_NORMALIZED_BARS_BACK);
+            let raw_rolling_period = params
+                .raw_rolling_period
+                .unwrap_or(DEFAULT_RAW_ROLLING_PERIOD);
+            let raw_threshold_percentile = params
+                .raw_threshold_percentile
+                .unwrap_or(DEFAULT_RAW_THRESHOLD_PERCENTILE);
+            let threshold_level = params.threshold_level.unwrap_or(DEFAULT_THRESHOLD_LEVEL);
+            if period == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid period {period}"),
+                });
+            }
+            if normalized_bars_back == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid normalized_bars_back {normalized_bars_back}"
+                    ),
+                });
+            }
+            if raw_rolling_period == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid raw_rolling_period {raw_rolling_period}"
+                    ),
+                });
+            }
+            if !raw_threshold_percentile.is_finite()
+                || !(80.0..=99.0).contains(&raw_threshold_percentile)
+            {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid raw_threshold_percentile \
+                         {raw_threshold_percentile}"
+                    ),
+                });
+            }
+            if !threshold_level.is_finite() || !(0.0..=100.0).contains(&threshold_level) {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid threshold_level {threshold_level}"),
+                });
+            }
+
+            periods.push(as_i32(row, "period", period)?);
+            normalized_bars_backs.push(as_i32(row, "normalized_bars_back", normalized_bars_back)?);
+            raw_rolling_periods.push(as_i32(row, "raw_rolling_period", raw_rolling_period)?);
+            raw_threshold_percentiles.push(raw_threshold_percentile);
+            threshold_levels.push(threshold_level);
+            ma_types.push(match params.ma_type.unwrap_or_default() {
+                BullsVBearsMaType::Ema => 0,
+                BullsVBearsMaType::Sma => 1,
+                BullsVBearsMaType::Wma => 2,
+            });
+            calculation_methods.push(match params.calculation_method.unwrap_or_default() {
+                BullsVBearsCalculationMethod::Normalized => 0,
+                BullsVBearsCalculationMethod::Raw => 1,
+            });
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "ten output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            5 * std::mem::size_of::<i32>() + 2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let d_normalized_bars_backs = DeviceBuffer::from_slice(&normalized_bars_backs)?;
+        let d_raw_rolling_periods = DeviceBuffer::from_slice(&raw_rolling_periods)?;
+        let d_raw_threshold_percentiles = DeviceBuffer::from_slice(&raw_threshold_percentiles)?;
+        let d_threshold_levels = DeviceBuffer::from_slice(&threshold_levels)?;
+        let d_ma_types = DeviceBuffer::from_slice(&ma_types)?;
+        let d_calculation_methods = DeviceBuffer::from_slice(&calculation_methods)?;
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::BullsVBears)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                d_normalized_bars_backs.as_device_ptr(),
+                d_raw_rolling_periods.as_device_ptr(),
+                d_raw_threshold_percentiles.as_device_ptr(),
+                d_threshold_levels.as_device_ptr(),
+                d_ma_types.as_device_ptr(),
+                d_calculation_methods.as_device_ptr(),
+                rows_i32,
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_periods,
+                d_normalized_bars_backs,
+                d_raw_rolling_periods,
+                d_ma_types,
+                d_calculation_methods,
+            ],
+            _parameter_f64: vec![d_raw_threshold_percentiles, d_threshold_levels],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    fn pivot_outputs_bar_parallel_grid(
+        rows: usize,
+        cols: usize,
+    ) -> Result<(u32, u32), CudaF64IndicatorError> {
+        const INDICATOR: &str = "pivot";
+        let work_items =
+            checked_mul(INDICATOR, "formula rows*bars", rows, cols).map_err(|error| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: error.to_string(),
+                }
+            })?;
+        let work_items =
+            u32::try_from(work_items).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "formula rows {rows} * bar count {cols} exceeds the CUDA grid work-item ABI"
+                ),
+            })?;
+        Ok((work_items, work_items.div_ceil(BAR_BLOCK_X)))
+    }
+
+    /// Exact launch geometry and CUDA-driver occupancy for Pivot's flattened
+    /// `(formula row, bar)` grid.
+    pub fn pivot_outputs_launch_capacity(
+        &self,
+        rows: usize,
+        cols: usize,
+    ) -> Result<F64CudaLaunchCapacity, CudaF64IndicatorError> {
+        const INDICATOR: &str = "pivot";
+        const ENTRY_POINT: &str = "pivot_outputs_f64";
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty formula row list".into(),
+            });
+        }
+        if cols < 2 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("Pivot requires at least two resident bars, got {cols}"),
+            });
+        }
+        let (work_items, grid_blocks) = Self::pivot_outputs_bar_parallel_grid(rows, cols)?;
+        let module = self.module_for(F64Kernel::Pivot)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let block = BlockSize::x(BAR_BLOCK_X);
+        let max_active_blocks_per_multiprocessor =
+            function.max_active_blocks_per_multiprocessor(block, 0)?;
+        let device = Device::get_device(self.device_id())?;
+        let positive_attribute = |attribute, name| {
+            let value = device.get_attribute(attribute)?;
+            u32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("CUDA device reported invalid {name}={value}"),
+            })
+        };
+        Ok(F64CudaLaunchCapacity {
+            entry_point: ENTRY_POINT,
+            logical_work_items: work_items as usize,
+            grid_blocks,
+            threads_per_block: BAR_BLOCK_X,
+            multiprocessors: positive_attribute(
+                DeviceAttribute::MultiprocessorCount,
+                "multiprocessor count",
+            )?,
+            max_active_blocks_per_multiprocessor,
+            max_threads_per_multiprocessor: positive_attribute(
+                DeviceAttribute::MaxThreadsPerMultiprocessor,
+                "max threads per multiprocessor",
+            )?,
+        })
+    }
+
+    /// Launch every published Pivot formula/output from one resident OHLC
+    /// frame. Row `t` reads the previous period; Woodie alone also reads the
+    /// current open. No output crosses the PCIe boundary here.
+    pub fn pivot_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        parameter_rows: &[PivotParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "pivot";
+        const ENTRY_POINT: &str = "pivot_outputs_f64";
+        const OUTPUT_IDS: [&str; 9] = ["r4", "r3", "r2", "r1", "pp", "s1", "s2", "s3", "s4"];
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols < 2 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("Pivot requires at least two resident bars, got {cols}"),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty formula row list".into(),
+            });
+        }
+
+        let mut modes = Vec::with_capacity(rows);
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let mode = params.mode.unwrap_or(3);
+            if mode > 4 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid formula mode {mode}; expected 0..=4"),
+                });
+            }
+            modes.push(mode as i32);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "nine output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes =
+            checked_mul(INDICATOR, "mode bytes", rows, std::mem::size_of::<i32>())
+                .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("formula row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let (_, grid_blocks) = Self::pivot_outputs_bar_parallel_grid(rows, cols)?;
+        let d_modes = DeviceBuffer::from_slice(&modes)?;
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::Pivot)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(grid_blocks);
+        let block = BlockSize::x(BAR_BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let open = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.open().device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                open,
+                cols_i32,
+                d_modes.as_device_ptr(),
+                rows_i32,
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_modes],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch the exact canonical jaw/teeth/lips tuple from one resident hl2
+    /// upload. Each parameter row is one CUDA thread and all three independent
+    /// shifted SMMAs are emitted by that one launch.
+    pub fn alligator_all_outputs(
+        &self,
+        hl2: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_rows: &[AlligatorParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "alligator";
+        const ENTRY_POINT: &str = "alligator_outputs_f64";
+        const OUTPUT_IDS: [&str; 3] = ["jaw", "teeth", "lips"];
+        const DEFAULT_JAW_PERIOD: usize = 13;
+        const DEFAULT_JAW_OFFSET: usize = 8;
+        const DEFAULT_TEETH_PERIOD: usize = 8;
+        const DEFAULT_TEETH_OFFSET: usize = 5;
+        const DEFAULT_LIPS_PERIOD: usize = 5;
+        const DEFAULT_LIPS_OFFSET: usize = 3;
+
+        let cols = hl2.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident hl2 series".into(),
+            });
+        }
+        if hl2.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "hl2 is resident on device {} but this session is bound to device {}",
+                    hl2.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid {first_valid} is outside {cols} resident bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let as_i32 =
+            |row: usize, name: &'static str, value: usize| -> Result<i32, CudaF64IndicatorError> {
+                i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} {name} {value} exceeds the CUDA i32 ABI"),
+                })
+            };
+        let mut jaw_periods = Vec::with_capacity(rows);
+        let mut jaw_offsets = Vec::with_capacity(rows);
+        let mut teeth_periods = Vec::with_capacity(rows);
+        let mut teeth_offsets = Vec::with_capacity(rows);
+        let mut lips_periods = Vec::with_capacity(rows);
+        let mut lips_offsets = Vec::with_capacity(rows);
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let jaw_period = params.jaw_period.unwrap_or(DEFAULT_JAW_PERIOD);
+            let jaw_offset = params.jaw_offset.unwrap_or(DEFAULT_JAW_OFFSET);
+            let teeth_period = params.teeth_period.unwrap_or(DEFAULT_TEETH_PERIOD);
+            let teeth_offset = params.teeth_offset.unwrap_or(DEFAULT_TEETH_OFFSET);
+            let lips_period = params.lips_period.unwrap_or(DEFAULT_LIPS_PERIOD);
+            let lips_offset = params.lips_offset.unwrap_or(DEFAULT_LIPS_OFFSET);
+            for (name, period) in [
+                ("jaw_period", jaw_period),
+                ("teeth_period", teeth_period),
+                ("lips_period", lips_period),
+            ] {
+                if period == 0 || period > cols {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("row {row} has invalid {name} {period} for {cols} bars"),
+                    });
+                }
+            }
+            for (name, offset) in [
+                ("jaw_offset", jaw_offset),
+                ("teeth_offset", teeth_offset),
+                ("lips_offset", lips_offset),
+            ] {
+                if offset > cols {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("row {row} has invalid {name} {offset} for {cols} bars"),
+                    });
+                }
+            }
+            let needed = jaw_period.max(teeth_period).max(lips_period);
+            let valid = cols - first_valid;
+            if valid < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {needed} values from first_valid {first_valid}, got {valid}"
+                    ),
+                });
+            }
+
+            jaw_periods.push(as_i32(row, "jaw_period", jaw_period)?);
+            jaw_offsets.push(as_i32(row, "jaw_offset", jaw_offset)?);
+            teeth_periods.push(as_i32(row, "teeth_period", teeth_period)?);
+            teeth_offsets.push(as_i32(row, "teeth_offset", teeth_offset)?);
+            lips_periods.push(as_i32(row, "lips_period", lips_period)?);
+            lips_offsets.push(as_i32(row, "lips_offset", lips_offset)?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "three output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "six-parameter bytes",
+            rows,
+            6 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_jaw_periods = DeviceBuffer::from_slice(&jaw_periods)?;
+        let d_jaw_offsets = DeviceBuffer::from_slice(&jaw_offsets)?;
+        let d_teeth_periods = DeviceBuffer::from_slice(&teeth_periods)?;
+        let d_teeth_offsets = DeviceBuffer::from_slice(&teeth_offsets)?;
+        let d_lips_periods = DeviceBuffer::from_slice(&lips_periods)?;
+        let d_lips_offsets = DeviceBuffer::from_slice(&lips_offsets)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Alligator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let hl2 = cust::memory::DevicePointer::<f64>::from_raw(hl2.device_ptr());
+            let (jaw_buffers, remaining) = output_buffers.split_at_mut(1);
+            let (teeth_buffers, lips_buffers) = remaining.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                hl2,
+                cols_i32,
+                d_jaw_periods.as_device_ptr(),
+                d_jaw_offsets.as_device_ptr(),
+                d_teeth_periods.as_device_ptr(),
+                d_teeth_offsets.as_device_ptr(),
+                d_lips_periods.as_device_ptr(),
+                d_lips_offsets.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                jaw_buffers[0].as_device_ptr(),
+                teeth_buffers[0].as_device_ptr(),
+                lips_buffers[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_jaw_periods,
+                d_jaw_offsets,
+                d_teeth_periods,
+                d_teeth_offsets,
+                d_lips_periods,
+                d_lips_offsets,
+            ],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch the canonical Gator Oscillator upper/lower/change quartet from
+    /// one already-resident close series. Every six-integer parameter row owns
+    /// its three EMA recurrences and shift rings in one sequential CUDA thread.
+    pub fn gatorosc_all_outputs(
+        &self,
+        close: CudaDeviceSliceF64Ref,
+        first_valid: usize,
+        parameter_rows: &[(usize, usize, usize, usize, usize, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "gatorosc";
+        const ENTRY_POINT: &str = "gatorosc_outputs_f64";
+        const OUTPUT_IDS: [&str; 4] = ["upper", "lower", "upper_change", "lower_change"];
+
+        let cols = close.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident close series".into(),
+            });
+        }
+        if close.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "close is resident on device {} but this session is bound to device {}",
+                    close.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid {first_valid} is outside {cols} resident bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty six-parameter row list".into(),
+            });
+        }
+
+        let mut jaws_lengths = Vec::with_capacity(rows);
+        let mut jaws_shifts = Vec::with_capacity(rows);
+        let mut teeth_lengths = Vec::with_capacity(rows);
+        let mut teeth_shifts = Vec::with_capacity(rows);
+        let mut lips_lengths = Vec::with_capacity(rows);
+        let mut lips_shifts = Vec::with_capacity(rows);
+        let mut ring_stride = 0usize;
+        for (row, &(jl, js, tl, ts, ll, ls)) in parameter_rows.iter().enumerate() {
+            for (name, value) in [
+                ("jaws_length", jl),
+                ("teeth_length", tl),
+                ("lips_length", ll),
+            ] {
+                if value == 0 || value > cols {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("row {row} has invalid {name} {value} for {cols} bars"),
+                    });
+                }
+            }
+            let max_shift = js.max(ts).max(ls);
+            let needed = jl.max(tl).max(ll).checked_add(max_shift).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} warmup length overflow"),
+                }
+            })?;
+            if cols - first_valid < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {needed} values from first_valid {first_valid}, got {}",
+                        cols - first_valid
+                    ),
+                });
+            }
+            let as_i32 = |name: &'static str, value: usize| {
+                i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} {name} {value} exceeds the CUDA i32 ABI"),
+                })
+            };
+            jaws_lengths.push(as_i32("jaws_length", jl)?);
+            jaws_shifts.push(as_i32("jaws_shift", js)?);
+            teeth_lengths.push(as_i32("teeth_length", tl)?);
+            teeth_shifts.push(as_i32("teeth_shift", ts)?);
+            lips_lengths.push(as_i32("lips_length", ll)?);
+            lips_shifts.push(as_i32("lips_shift", ls)?);
+            ring_stride = ring_stride.max(max_shift.checked_add(1).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} shift-ring length overflow"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "four output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let one_ring_elems =
+            checked_mul(INDICATOR, "rows*ring stride", rows, ring_stride).map_err(plan_failure)?;
+        let ring_elems = checked_mul(INDICATOR, "three ring scratch", one_ring_elems, 3)
+            .map_err(plan_failure)?;
+        let ring_bytes = checked_mul(
+            INDICATOR,
+            "ring scratch bytes",
+            ring_elems,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "six-parameter bytes",
+            rows,
+            6 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(ring_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/scratch/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let ring_stride_i32 =
+            i32::try_from(ring_stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("ring stride {ring_stride} exceeds the CUDA i32 ABI"),
+            })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_jaws_lengths = DeviceBuffer::from_slice(&jaws_lengths)?;
+        let d_jaws_shifts = DeviceBuffer::from_slice(&jaws_shifts)?;
+        let d_teeth_lengths = DeviceBuffer::from_slice(&teeth_lengths)?;
+        let d_teeth_shifts = DeviceBuffer::from_slice(&teeth_shifts)?;
+        let d_lips_lengths = DeviceBuffer::from_slice(&lips_lengths)?;
+        let d_lips_shifts = DeviceBuffer::from_slice(&lips_shifts)?;
+        let mut d_ring_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(ring_elems)? };
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Gatorosc)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let close = cust::memory::DevicePointer::<f64>::from_raw(close.device_ptr());
+            let (upper, remaining) = output_buffers.split_at_mut(1);
+            let (lower, remaining) = remaining.split_at_mut(1);
+            let (upper_change, lower_change) = remaining.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                close,
+                cols_i32,
+                first_valid_i32,
+                d_jaws_lengths.as_device_ptr(),
+                d_jaws_shifts.as_device_ptr(),
+                d_teeth_lengths.as_device_ptr(),
+                d_teeth_shifts.as_device_ptr(),
+                d_lips_lengths.as_device_ptr(),
+                d_lips_shifts.as_device_ptr(),
+                rows_i32,
+                ring_stride_i32,
+                d_ring_scratch.as_device_ptr(),
+                upper[0].as_device_ptr(),
+                lower[0].as_device_ptr(),
+                upper_change[0].as_device_ptr(),
+                lower_change[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_jaws_lengths,
+                d_jaws_shifts,
+                d_teeth_lengths,
+                d_teeth_shifts,
+                d_lips_lengths,
+                d_lips_shifts,
+            ],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: vec![d_ring_scratch],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch HalfTrend's canonical six-output state machine from three
+    /// already-resident price series. Each parameter row owns one sequential
+    /// exact-f64 recurrence and emits the complete canonical schema once.
+    pub fn halftrend_all_outputs(
+        &self,
+        high: CudaDeviceSliceF64Ref,
+        low: CudaDeviceSliceF64Ref,
+        close: CudaDeviceSliceF64Ref,
+        parameter_rows: &[(usize, f64, usize)],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "halftrend";
+        const ENTRY_POINT: &str = "halftrend_outputs_f64";
+        const OUTPUT_IDS: [&str; 6] = [
+            "halftrend",
+            "trend",
+            "atr_high",
+            "atr_low",
+            "buy_signal",
+            "sell_signal",
+        ];
+
+        let cols = high.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident high/low/close frame".into(),
+            });
+        }
+        if low.len() != cols || close.len() != cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "resident high/low/close lengths differ: {cols}/{}/{}",
+                    low.len(),
+                    close.len()
+                ),
+            });
+        }
+        for (name, input) in [("high", high), ("low", low), ("close", close)] {
+            if input.device_id() != self.device_id() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "{name} is resident on device {} but this session is bound to device {}",
+                        input.device_id(),
+                        self.device_id()
+                    ),
+                });
+            }
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty HalfTrend parameter-row list".into(),
+            });
+        }
+
+        let mut amplitudes = Vec::with_capacity(rows);
+        let mut channel_deviations = Vec::with_capacity(rows);
+        let mut atr_periods = Vec::with_capacity(rows);
+        for (row, &(amplitude, channel_deviation, atr_period)) in parameter_rows.iter().enumerate()
+        {
+            if amplitude == 0 || amplitude > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} amplitude {amplitude} is not inside 1..={cols}"),
+                });
+            }
+            if !channel_deviation.is_finite() || channel_deviation <= 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} channel_deviation {channel_deviation} is not finite and positive"
+                    ),
+                });
+            }
+            if atr_period == 0 || atr_period > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} atr_period {atr_period} is not inside 1..={cols}"),
+                });
+            }
+            amplitudes.push(i32::try_from(amplitude).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} amplitude {amplitude} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            channel_deviations.push(channel_deviation);
+            atr_periods.push(i32::try_from(atr_period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} atr_period {atr_period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "six output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let i32_parameter_bytes = checked_mul(
+            INDICATOR,
+            "two integer parameter arrays",
+            rows,
+            2 * std::mem::size_of::<i32>(),
+        )
+        .map_err(plan_failure)?;
+        let f64_parameter_bytes = checked_mul(
+            INDICATOR,
+            "channel-deviation parameter array",
+            rows,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(i32_parameter_bytes)
+            .and_then(|bytes| bytes.checked_add(f64_parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_amplitudes = DeviceBuffer::from_slice(&amplitudes)?;
+        let d_channel_deviations = DeviceBuffer::from_slice(&channel_deviations)?;
+        let d_atr_periods = DeviceBuffer::from_slice(&atr_periods)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Halftrend)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(high.device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(low.device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(close.device_ptr());
+            let (halftrend, remaining) = output_buffers.split_at_mut(1);
+            let (trend, remaining) = remaining.split_at_mut(1);
+            let (atr_high, remaining) = remaining.split_at_mut(1);
+            let (atr_low, remaining) = remaining.split_at_mut(1);
+            let (buy_signal, sell_signal) = remaining.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_amplitudes.as_device_ptr(),
+                d_channel_deviations.as_device_ptr(),
+                d_atr_periods.as_device_ptr(),
+                rows_i32,
+                halftrend[0].as_device_ptr(),
+                trend[0].as_device_ptr(),
+                atr_high[0].as_device_ptr(),
+                atr_low[0].as_device_ptr(),
+                buy_signal[0].as_device_ptr(),
+                sell_signal[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_amplitudes, d_atr_periods],
+            _parameter_f64: vec![d_channel_deviations],
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch AlphaTrend's canonical k1/k2 pair from one resident OHLCV
+    /// upload. The full kernel deliberately admits only the production tuple:
+    /// coeff=1.0, no_volume=false, and the canonical period-only sweep.
+    pub fn alphatrend_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        first_valid: usize,
+        parameter_rows: &[AlphaTrendParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "alphatrend";
+        const ENTRY_POINT: &str = "alphatrend_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["k1", "k2"];
+        const DEFAULT_COEFF: f64 = 1.0;
+        const DEFAULT_PERIOD: usize = 14;
+        const DEFAULT_NO_VOLUME: bool = false;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLCV series".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLCV is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid {first_valid} is outside {cols} resident bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut periods = Vec::with_capacity(rows);
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let coeff = params.coeff.unwrap_or(DEFAULT_COEFF);
+            if coeff.to_bits() != DEFAULT_COEFF.to_bits() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} coeff {coeff:?} is not the canonical exact default {DEFAULT_COEFF:?}"
+                    ),
+                });
+            }
+            let no_volume = params.no_volume.unwrap_or(DEFAULT_NO_VOLUME);
+            if no_volume != DEFAULT_NO_VOLUME {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} no_volume={no_volume} is not the canonical MFI branch"
+                    ),
+                });
+            }
+            let period = params.period.unwrap_or(DEFAULT_PERIOD);
+            if period == 0 || period > cols || period > ALPHATREND_MAX_PERIOD {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid period {period} for {cols} bars and compiled max {ALPHATREND_MAX_PERIOD}"
+                    ),
+                });
+            }
+            let valid = cols - first_valid;
+            if valid < period {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {period} close values from first_valid {first_valid}, got {valid}"
+                    ),
+                });
+            }
+            periods.push(i32::try_from(period).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} period {period} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes =
+            checked_mul(INDICATOR, "period bytes", rows, std::mem::size_of::<i32>())
+                .map_err(plan_failure)?;
+        let required = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            }
+        })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let first_valid_i32 =
+            i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("first_valid {first_valid} exceeds the CUDA i32 ABI"),
+            })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+
+        let d_periods = DeviceBuffer::from_slice(&periods)?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Alphatrend)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let block = BlockSize::x(BLOCK_X);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let volume = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.volume().device_ptr());
+            let (k1_buffers, k2_buffers) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                close,
+                volume,
+                cols_i32,
+                d_periods.as_device_ptr(),
+                rows_i32,
+                first_valid_i32,
+                k1_buffers[0].as_device_ptr(),
+                k2_buffers[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_periods],
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch both published ACOSC outputs from the already-resident high/low
+    /// frame. One CUDA thread preserves the canonical rolling-state operation
+    /// order. Neither output crosses PCIe and no host formula fills a gap.
+    pub fn acosc_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "acosc";
+        const ENTRY_POINT: &str = "acosc_outputs_f64";
+        const OUTPUT_IDS: [&str; 2] = ["osc", "change"];
+
+        let cols = ohlcv.len();
+        if cols < 38 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("ACOSC requires at least 38 resident bars, got {cols}"),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "high/low frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "two output bytes",
+            cols,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let (free, _) = mem_get_info()?;
+        if output_bytes.checked_add(DEFAULT_HEADROOM).is_none()
+            || output_bytes + DEFAULT_HEADROOM > free
+        {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required: output_bytes,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let mut output_buffers = [
+            unsafe { DeviceBuffer::<f64>::uninitialized(cols)? },
+            unsafe { DeviceBuffer::<f64>::uninitialized(cols)? },
+        ];
+
+        let module = self.module_for(F64Kernel::Acosc)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let grid = GridSize::x(1);
+        let block = BlockSize::x(1);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let (osc_buffers, change_buffers) = output_buffers.split_at_mut(1);
+            launch!(function<<<grid, block, 0, stream>>>(
+                high,
+                low,
+                cols_i32,
+                osc_buffers[0].as_device_ptr(),
+                change_buffers[0].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, 1, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows: 1,
+            cols,
+            _parameter_i32: Vec::new(),
+            _parameter_f64: Vec::new(),
+            _scratch_f64: Vec::new(),
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    fn range_oscillator_outputs_bar_parallel_grid(
+        rows: usize,
+        cols: usize,
+    ) -> Result<(u32, u32), CudaF64IndicatorError> {
+        const INDICATOR: &str = "range_oscillator";
+        let work_items =
+            checked_mul(INDICATOR, "parameter rows*bars", rows, cols).map_err(|error| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: error.to_string(),
+                }
+            })?;
+        let work_items =
+            u32::try_from(work_items).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "parameter rows {rows} * bar count {cols} exceeds the CUDA grid work-item ABI"
+                ),
+            })?;
+        Ok((work_items, work_items.div_ceil(BAR_BLOCK_X)))
+    }
+
+    /// Exact launch geometry and CUDA-driver occupancy capacity for the
+    /// expensive `(parameter row, bar)` Range Oscillator stage. The shared ATR
+    /// recurrence and sticky-trend pass are deliberately excluded from the
+    /// logical work count: they are the two small serial state machines around
+    /// this bar-parallel value-producing kernel.
+    pub fn range_oscillator_outputs_launch_capacity(
+        &self,
+        rows: usize,
+        cols: usize,
+    ) -> Result<F64CudaLaunchCapacity, CudaF64IndicatorError> {
+        const INDICATOR: &str = "range_oscillator";
+        const ENTRY_POINT: &str = "range_oscillator_outputs_f64";
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        let (work_items, grid_blocks) =
+            Self::range_oscillator_outputs_bar_parallel_grid(rows, cols)?;
+        let module = self.module_for(F64Kernel::RangeOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let block = BlockSize::x(BAR_BLOCK_X);
+        let max_active_blocks_per_multiprocessor =
+            function.max_active_blocks_per_multiprocessor(block, 0)?;
+        let device = Device::get_device(self.device_id())?;
+        let positive_attribute = |attribute, name| {
+            let value = device.get_attribute(attribute)?;
+            u32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("CUDA device reported invalid {name}={value}"),
+            })
+        };
+
+        Ok(F64CudaLaunchCapacity {
+            entry_point: ENTRY_POINT,
+            logical_work_items: work_items as usize,
+            grid_blocks,
+            threads_per_block: BAR_BLOCK_X,
+            multiprocessors: positive_attribute(
+                DeviceAttribute::MultiprocessorCount,
+                "multiprocessor count",
+            )?,
+            max_active_blocks_per_multiprocessor,
+            max_threads_per_multiprocessor: positive_attribute(
+                DeviceAttribute::MaxThreadsPerMultiprocessor,
+                "max threads per multiprocessor",
+            )?,
+        })
+    }
+
+    /// Launch all nine Range Oscillator outputs from one already-resident HLC
+    /// frame. The common 200/2000-bar ATR recurrence runs once, the expensive
+    /// weighted-window work runs over a flattened `(row, bar)` grid, and only
+    /// the unavoidable sticky-trend recurrence stays one thread per row. All
+    /// three stages share this session's stream, so neither inputs nor outputs
+    /// cross the PCIe boundary between stages.
+    pub fn range_oscillator_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        finite_hlc_count: usize,
+        parameter_rows: &[RangeOscillatorParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "range_oscillator";
+        const ENTRY_POINT: &str = "range_oscillator_outputs_f64";
+        const ATR_ENTRY_POINT: &str = "range_oscillator_atr_f64";
+        const TREND_ENTRY_POINT: &str = "range_oscillator_trend_f64";
+        const OUTPUT_IDS: [&str; 9] = [
+            "oscillator",
+            "ma",
+            "upper_band",
+            "lower_band",
+            "range_width",
+            "in_range",
+            "trend",
+            "break_up",
+            "break_down",
+        ];
+        const DEFAULT_LENGTH: usize = 50;
+        const DEFAULT_MULT: f64 = 2.0;
+        const ATR_FALLBACK_PERIOD: usize = 200;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC frame is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if finite_hlc_count == 0 || finite_hlc_count > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("invalid finite-HLC count {finite_hlc_count} for {cols} bars"),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut lengths = Vec::with_capacity(rows);
+        let mut mults = Vec::with_capacity(rows);
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let length = params.length.unwrap_or(DEFAULT_LENGTH);
+            let mult = params.mult.unwrap_or(DEFAULT_MULT);
+            if length == 0 || length >= cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid length {length} for {cols} bars"),
+                });
+            }
+            if !mult.is_finite() || mult < 0.1 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid mult {mult}"),
+                });
+            }
+            let needed = (length + 1).max(ATR_FALLBACK_PERIOD);
+            if finite_hlc_count < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {needed} finite HLC bars but the frame has {finite_hlc_count}"
+                    ),
+                });
+            }
+            lengths.push(i32::try_from(length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} length {length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            mults.push(mult);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems =
+            checked_mul(INDICATOR, "parameter rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "nine output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let scratch_bytes = checked_mul(
+            INDICATOR,
+            "ATR scratch bytes",
+            cols,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let required = output_bytes
+            .checked_add(scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(parameter_bytes))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident byte count overflow".into(),
+            })?;
+        let (free, _) = mem_get_info()?;
+        if required.checked_add(DEFAULT_HEADROOM).is_none() || required + DEFAULT_HEADROOM > free {
+            return Err(CudaF64IndicatorError::OutOfMemory {
+                indicator: INDICATOR,
+                required,
+                free,
+                headroom: DEFAULT_HEADROOM,
+            });
+        }
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_u32 = u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA grid ABI"),
+        })?;
+        let (_, output_grid_blocks) = Self::range_oscillator_outputs_bar_parallel_grid(rows, cols)?;
+
+        let d_lengths = DeviceBuffer::from_slice(&lengths)?;
+        let d_mults = DeviceBuffer::from_slice(&mults)?;
+        let mut d_atr = unsafe { DeviceBuffer::<f64>::uninitialized(cols)? };
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::RangeOscillator)?;
+        let atr_function = module.get_function(ATR_ENTRY_POINT).map_err(|_| {
+            CudaF64IndicatorError::MissingKernelSymbol {
+                name: ATR_ENTRY_POINT,
+            }
+        })?;
+        let output_function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        let trend_function = module.get_function(TREND_ENTRY_POINT).map_err(|_| {
+            CudaF64IndicatorError::MissingKernelSymbol {
+                name: TREND_ENTRY_POINT,
+            }
+        })?;
+        let single_grid = GridSize::x(1);
+        let single_block = BlockSize::x(1);
+        let output_grid = GridSize::x(output_grid_blocks);
+        let output_block = BlockSize::x(BAR_BLOCK_X);
+        let trend_grid = GridSize::x(rows_u32.div_ceil(BLOCK_X));
+        let trend_block = BlockSize::x(BLOCK_X);
+        self.validate_launch(single_grid, single_block)?;
+        self.validate_launch(output_grid, output_block)?;
+        self.validate_launch(trend_grid, trend_block)?;
+
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(atr_function<<<single_grid, single_block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_atr.as_device_ptr()
+            ))?;
+            launch!(output_function<<<output_grid, output_block, 0, stream>>>(
+                high,
+                low,
+                close,
+                d_atr.as_device_ptr(),
+                cols_i32,
+                d_lengths.as_device_ptr(),
+                d_mults.as_device_ptr(),
+                rows_i32,
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr()
+            ))?;
+            launch!(trend_function<<<trend_grid, trend_block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                rows_i32,
+                output_buffers[1].as_device_ptr(),
+                output_buffers[6].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_lengths],
+            _parameter_f64: vec![d_mults],
+            _scratch_f64: vec![d_atr],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch the ten mathematically distinct Kase Peak Oscillator outputs
+    /// from one already-resident HLC frame through the shared CUDA session.
+    ///
+    /// The public vector-ta scalar result retains `histogram` as the original
+    /// chart-display alias of `oscillator`. NeoEthos does not allocate,
+    /// transfer or score that duplicate column.
+    pub fn kase_peak_oscillator_with_divergences_unique_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_hlc_run: usize,
+        parameter_rows: &[KasePeakOscillatorWithDivergencesParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "kase_peak_oscillator_with_divergences";
+        const ENTRY_POINT: &str = "kase_peak_oscillator_with_divergences_batch_f64";
+        const OUTPUT_IDS: [&str; 10] = [
+            "oscillator",
+            "max_peak_value",
+            "min_peak_value",
+            "market_extreme",
+            "regular_bullish",
+            "hidden_bullish",
+            "regular_bearish",
+            "hidden_bearish",
+            "go_long",
+            "go_short",
+        ];
+        const DEFAULT_DEVIATIONS: f64 = 2.0;
+        const DEFAULT_SHORT_CYCLE: usize = 8;
+        const DEFAULT_LONG_CYCLE: usize = 65;
+        const DEFAULT_SENSITIVITY: f64 = 40.0;
+        const DEFAULT_ALL_PEAKS_MODE: bool = true;
+        const DEFAULT_LB_R: usize = 5;
+        const DEFAULT_LB_L: usize = 5;
+        const DEFAULT_RANGE_UPPER: usize = 60;
+        const DEFAULT_RANGE_LOWER: usize = 5;
+        const DEFAULT_PLOT_BULL: bool = true;
+        const DEFAULT_PLOT_HIDDEN_BULL: bool = false;
+        const DEFAULT_PLOT_BEAR: bool = true;
+        const DEFAULT_PLOT_HIDDEN_BEAR: bool = false;
+        const ROLLING_RING_DOUBLES: usize = 9 + 30 + 3 + 3 + 50 + 50;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_hlc_run == 0 || max_finite_hlc_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid finite-HLC run metadata {max_finite_hlc_run} for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let as_i32 = |name: &'static str, value: usize| -> Result<i32, CudaF64IndicatorError> {
+            i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("{name} {value} exceeds the CUDA i32 ABI"),
+            })
+        };
+        let shared_shape = |params: &KasePeakOscillatorWithDivergencesParams| {
+            (
+                params.all_peaks_mode.unwrap_or(DEFAULT_ALL_PEAKS_MODE),
+                params.lb_r.unwrap_or(DEFAULT_LB_R),
+                params.lb_l.unwrap_or(DEFAULT_LB_L),
+                params.range_upper.unwrap_or(DEFAULT_RANGE_UPPER),
+                params.range_lower.unwrap_or(DEFAULT_RANGE_LOWER),
+                params.plot_bull.unwrap_or(DEFAULT_PLOT_BULL),
+                params.plot_hidden_bull.unwrap_or(DEFAULT_PLOT_HIDDEN_BULL),
+                params.plot_bear.unwrap_or(DEFAULT_PLOT_BEAR),
+                params.plot_hidden_bear.unwrap_or(DEFAULT_PLOT_HIDDEN_BEAR),
+            )
+        };
+        let batch_shape = shared_shape(&parameter_rows[0]);
+        let (_, lb_r, lb_l, range_upper, range_lower, _, _, _, _) = batch_shape;
+        if lb_r == 0 || lb_l == 0 || range_upper == 0 || range_lower == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid shared divergence windows: lb_r={lb_r} lb_l={lb_l} \
+                     range_upper={range_upper} range_lower={range_lower}"
+                ),
+            });
+        }
+        if range_lower > range_upper {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("range_lower {range_lower} exceeds range_upper {range_upper}"),
+            });
+        }
+
+        let mut deviations = Vec::with_capacity(rows);
+        let mut short_cycles = Vec::with_capacity(rows);
+        let mut long_cycles = Vec::with_capacity(rows);
+        let mut sensitivities = Vec::with_capacity(rows);
+        let mut long_cycle_cap = 0usize;
+        for (row, params) in parameter_rows.iter().enumerate() {
+            if shared_shape(params) != batch_shape {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} changes divergence/plot flags inside one kernel batch; group \
+                         rows by the exact shared flag tuple instead of applying row zero"
+                    ),
+                });
+            }
+            let deviation = params.deviations.unwrap_or(DEFAULT_DEVIATIONS);
+            let short_cycle = params.short_cycle.unwrap_or(DEFAULT_SHORT_CYCLE);
+            let long_cycle = params.long_cycle.unwrap_or(DEFAULT_LONG_CYCLE);
+            let sensitivity = params.sensitivity.unwrap_or(DEFAULT_SENSITIVITY);
+            if !deviation.is_finite() || deviation < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid deviations {deviation}"),
+                });
+            }
+            if short_cycle == 0 || long_cycle == 0 || short_cycle >= long_cycle || long_cycle > cols
+            {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid cycles for {cols} bars: short={short_cycle} \
+                         long={long_cycle}"
+                    ),
+                });
+            }
+            if !sensitivity.is_finite() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid sensitivity {sensitivity}"),
+                });
+            }
+            let required_run =
+                long_cycle
+                    .checked_add(2)
+                    .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("row {row} long_cycle {long_cycle} overflows warmup"),
+                    })?;
+            if max_finite_hlc_run < required_run {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {required_run} consecutive finite HLC bars, got \
+                         {max_finite_hlc_run}"
+                    ),
+                });
+            }
+            deviations.push(deviation);
+            short_cycles.push(as_i32("short_cycle", short_cycle)?);
+            long_cycles.push(as_i32("long_cycle", long_cycle)?);
+            sensitivities.push(sensitivity);
+            long_cycle_cap = long_cycle_cap.max(long_cycle);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "ten unique output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            2 * std::mem::size_of::<i32>() + 2 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let fixed_bytes = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "fixed resident byte count overflow".into(),
+            }
+        })?;
+        let history_doubles =
+            checked_mul(INDICATOR, "three histories/slot", 3, cols).map_err(plan_failure)?;
+        let doubles_per_slot = history_doubles
+            .checked_add(long_cycle_cap)
+            .and_then(|value| value.checked_add(ROLLING_RING_DOUBLES))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "scratch doubles per slot overflow".into(),
+            })?;
+        let bytes_per_slot = checked_mul(
+            INDICATOR,
+            "scratch bytes/slot",
+            doubles_per_slot,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )
+        .map_err(plan_failure)?;
+        let scratch_len = scratch_elems(
+            INDICATOR,
+            "Kase history/rolling scratch",
+            plan.slots,
+            doubles_per_slot,
+        )
+        .map_err(plan_failure)?;
+
+        let cols_i32 = as_i32("bar count", cols)?;
+        let rows_i32 = as_i32("parameter row count", rows)?;
+        let slots_i32 = as_i32("scratch slot count", plan.slots)?;
+        let long_cycle_cap_i32 = as_i32("long-cycle capacity", long_cycle_cap)?;
+        let lb_r_i32 = as_i32("lb_r", lb_r)?;
+        let lb_l_i32 = as_i32("lb_l", lb_l)?;
+        let range_upper_i32 = as_i32("range_upper", range_upper)?;
+        let range_lower_i32 = as_i32("range_lower", range_lower)?;
+        let d_deviations = DeviceBuffer::from_slice(&deviations)?;
+        let d_short_cycles = DeviceBuffer::from_slice(&short_cycles)?;
+        let d_long_cycles = DeviceBuffer::from_slice(&long_cycles)?;
+        let d_sensitivities = DeviceBuffer::from_slice(&sensitivities)?;
+        let d_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_len.max(1))? };
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::KasePeakOscillatorWithDivergences)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        self.validate_launch(plan.grid, plan.block)?;
+        let stream = self.session.stream();
+        let (all_peaks_mode, _, _, _, _, plot_bull, plot_hidden_bull, plot_bear, plot_hidden_bear) =
+            batch_shape;
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<plan.grid, plan.block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_deviations.as_device_ptr(),
+                d_short_cycles.as_device_ptr(),
+                d_long_cycles.as_device_ptr(),
+                d_sensitivities.as_device_ptr(),
+                i32::from(all_peaks_mode),
+                lb_r_i32,
+                lb_l_i32,
+                range_upper_i32,
+                range_lower_i32,
+                i32::from(plot_bull),
+                i32::from(plot_hidden_bull),
+                i32::from(plot_bear),
+                i32::from(plot_hidden_bear),
+                rows_i32,
+                slots_i32,
+                long_cycle_cap_i32,
+                d_scratch.as_device_ptr(),
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![d_short_cycles, d_long_cycles],
+            _parameter_f64: vec![d_deviations, d_sensitivities],
+            _scratch_f64: vec![d_scratch],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all twelve Vdubus Divergence Wave Pattern Generator outputs
+    /// from one already-resident HLC frame through the shared CUDA session.
+    ///
+    /// The superseded wrapper created its own context, uploaded high/low/close
+    /// again, synchronized inside the call and returned a private output type.
+    /// This route borrows the frame upload and keeps parameters, scratch and
+    /// every named output alive until the shared stream retires.
+    pub fn vdubus_divergence_wave_pattern_generator_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        max_finite_hlc_run: usize,
+        parameter_rows: &[VdubusDivergenceWavePatternGeneratorParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "vdubus_divergence_wave_pattern_generator";
+        const ENTRY_POINT: &str = "vdubus_divergence_wave_pattern_generator_batch_f64";
+        const OUTPUT_IDS: [&str; 12] = [
+            "fast_standard",
+            "fast_climax",
+            "fast_rounded",
+            "fast_predator",
+            "slow_standard",
+            "slow_climax",
+            "slow_rounded",
+            "slow_predator",
+            "opposing_force",
+            "macd",
+            "signal",
+            "hist",
+        ];
+        const DEFAULT_FAST_DEPTH: usize = 9;
+        const DEFAULT_SLOW_DEPTH: usize = 24;
+        const DEFAULT_FAST_LENGTH: usize = 21;
+        const DEFAULT_SLOW_LENGTH: usize = 34;
+        const DEFAULT_SIGNAL_LENGTH: usize = 5;
+        const DEFAULT_LOOKBACK: usize = 3;
+        const DEFAULT_ERR_TOL: f64 = 0.15;
+        const DEFAULT_SHOW_STANDARD: bool = true;
+        const DEFAULT_SHOW_CLIMAX: bool = true;
+        const DEFAULT_SHOW_ROUNDED: bool = true;
+        const DEFAULT_SHOW_PREDATOR: bool = true;
+        const DEFAULT_SHOW_GARTLEY: bool = false;
+        const DEFAULT_SHOW_BAT: bool = false;
+        const DEFAULT_SHOW_BUTTERFLY: bool = false;
+        const DEFAULT_SHOW_CRAB: bool = false;
+        const DEFAULT_SHOW_DEEP: bool = false;
+        const DEFAULT_SHOW_HS: bool = true;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if max_finite_hlc_run == 0 || max_finite_hlc_run > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "invalid finite-HLC run metadata {max_finite_hlc_run} for {cols} bars"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let as_i32 = |name: &'static str, value: usize| -> Result<i32, CudaF64IndicatorError> {
+            i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("{name} {value} exceeds the CUDA i32 ABI"),
+            })
+        };
+        let show_flags = |params: &VdubusDivergenceWavePatternGeneratorParams| {
+            (
+                params.show_standard.unwrap_or(DEFAULT_SHOW_STANDARD),
+                params.show_climax.unwrap_or(DEFAULT_SHOW_CLIMAX),
+                params.show_rounded.unwrap_or(DEFAULT_SHOW_ROUNDED),
+                params.show_predator.unwrap_or(DEFAULT_SHOW_PREDATOR),
+                params.show_gartley.unwrap_or(DEFAULT_SHOW_GARTLEY),
+                params.show_bat.unwrap_or(DEFAULT_SHOW_BAT),
+                params.show_butterfly.unwrap_or(DEFAULT_SHOW_BUTTERFLY),
+                params.show_crab.unwrap_or(DEFAULT_SHOW_CRAB),
+                params.show_deep.unwrap_or(DEFAULT_SHOW_DEEP),
+                params.show_hs.unwrap_or(DEFAULT_SHOW_HS),
+            )
+        };
+        let batch_show_flags = show_flags(&parameter_rows[0]);
+        let mut fast_depths = Vec::with_capacity(rows);
+        let mut slow_depths = Vec::with_capacity(rows);
+        let mut fast_lengths = Vec::with_capacity(rows);
+        let mut slow_lengths = Vec::with_capacity(rows);
+        let mut signal_lengths = Vec::with_capacity(rows);
+        let mut lookbacks = Vec::with_capacity(rows);
+        let mut err_tols = Vec::with_capacity(rows);
+        let mut window_cap = 3usize;
+        for (row, params) in parameter_rows.iter().enumerate() {
+            let fast_depth = params.fast_depth.unwrap_or(DEFAULT_FAST_DEPTH);
+            let slow_depth = params.slow_depth.unwrap_or(DEFAULT_SLOW_DEPTH);
+            let fast_length = params.fast_length.unwrap_or(DEFAULT_FAST_LENGTH);
+            let slow_length = params.slow_length.unwrap_or(DEFAULT_SLOW_LENGTH);
+            let signal_length = params.signal_length.unwrap_or(DEFAULT_SIGNAL_LENGTH);
+            let lookback = params.lookback.unwrap_or(DEFAULT_LOOKBACK);
+            let err_tol = params.err_tol.unwrap_or(DEFAULT_ERR_TOL);
+            if fast_depth == 0 || slow_depth == 0 || lookback == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid depth/lookback: fast_depth={fast_depth} \
+                         slow_depth={slow_depth} lookback={lookback}"
+                    ),
+                });
+            }
+            if fast_length == 0
+                || slow_length == 0
+                || signal_length == 0
+                || fast_length > cols
+                || slow_length > cols
+                || signal_length > cols
+            {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} has invalid periods for {cols} bars: fast={fast_length} \
+                         slow={slow_length} signal={signal_length}"
+                    ),
+                });
+            }
+            if !err_tol.is_finite() || err_tol <= 0.0 || err_tol > 0.5 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("row {row} has invalid err_tol {err_tol}"),
+                });
+            }
+            if show_flags(params) != batch_show_flags {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} changes show flags inside one kernel batch; group rows by the \
+                         exact show-flag tuple instead of applying row zero to every row"
+                    ),
+                });
+            }
+            let required_run = slow_length
+                .checked_add(signal_length)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} slow_length+signal_length-1 overflows: \
+                         {slow_length}+{signal_length}-1"
+                    ),
+                })?;
+            if max_finite_hlc_run < required_run {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "row {row} needs {required_run} consecutive finite HLC bars, got \
+                         {max_finite_hlc_run}"
+                    ),
+                });
+            }
+            for (name, span) in [
+                ("fast_depth", fast_depth),
+                ("slow_depth", slow_depth),
+                ("lookback", lookback),
+            ] {
+                let width = span
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("row {row} {name} {span} overflows pivot-window width"),
+                    })?;
+                window_cap = window_cap.max(width);
+            }
+            fast_depths.push(as_i32("fast_depth", fast_depth)?);
+            slow_depths.push(as_i32("slow_depth", slow_depth)?);
+            fast_lengths.push(as_i32("fast_length", fast_length)?);
+            slow_lengths.push(as_i32("slow_length", slow_length)?);
+            signal_lengths.push(as_i32("signal_length", signal_length)?);
+            lookbacks.push(as_i32("lookback", lookback)?);
+            err_tols.push(err_tol);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "twelve output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            6 * std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let fixed_bytes = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "fixed resident byte count overflow".into(),
+            }
+        })?;
+        let doubles_per_slot =
+            checked_mul(INDICATOR, "pivot windows/slot", 6, window_cap).map_err(plan_failure)?;
+        let bytes_per_slot = checked_mul(
+            INDICATOR,
+            "pivot-window bytes/slot",
+            doubles_per_slot,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )
+        .map_err(plan_failure)?;
+        let scratch_len = scratch_elems(
+            INDICATOR,
+            "pivot-window scratch",
+            plan.slots,
+            doubles_per_slot,
+        )
+        .map_err(plan_failure)?;
+
+        let cols_i32 = as_i32("bar count", cols)?;
+        let rows_i32 = as_i32("parameter row count", rows)?;
+        let slots_i32 = as_i32("scratch slot count", plan.slots)?;
+        let window_cap_i32 = as_i32("pivot-window capacity", window_cap)?;
+        let d_fast_depths = DeviceBuffer::from_slice(&fast_depths)?;
+        let d_slow_depths = DeviceBuffer::from_slice(&slow_depths)?;
+        let d_fast_lengths = DeviceBuffer::from_slice(&fast_lengths)?;
+        let d_slow_lengths = DeviceBuffer::from_slice(&slow_lengths)?;
+        let d_signal_lengths = DeviceBuffer::from_slice(&signal_lengths)?;
+        let d_lookbacks = DeviceBuffer::from_slice(&lookbacks)?;
+        let d_err_tols = DeviceBuffer::from_slice(&err_tols)?;
+        let d_scratch = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_len.max(1))? };
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::VdubusDivergenceWavePatternGenerator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        self.validate_launch(plan.grid, plan.block)?;
+        let stream = self.session.stream();
+        let (
+            show_standard,
+            show_climax,
+            show_rounded,
+            show_predator,
+            show_gartley,
+            show_bat,
+            show_butterfly,
+            show_crab,
+            show_deep,
+            show_hs,
+        ) = batch_show_flags;
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<plan.grid, plan.block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_fast_depths.as_device_ptr(),
+                d_slow_depths.as_device_ptr(),
+                d_fast_lengths.as_device_ptr(),
+                d_slow_lengths.as_device_ptr(),
+                d_signal_lengths.as_device_ptr(),
+                d_lookbacks.as_device_ptr(),
+                d_err_tols.as_device_ptr(),
+                i32::from(show_standard),
+                i32::from(show_climax),
+                i32::from(show_rounded),
+                i32::from(show_predator),
+                i32::from(show_gartley),
+                i32::from(show_bat),
+                i32::from(show_butterfly),
+                i32::from(show_crab),
+                i32::from(show_deep),
+                i32::from(show_hs),
+                rows_i32,
+                slots_i32,
+                window_cap_i32,
+                d_scratch.as_device_ptr(),
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr(),
+                output_buffers[10].as_device_ptr(),
+                output_buffers[11].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_fast_depths,
+                d_slow_depths,
+                d_fast_lengths,
+                d_slow_lengths,
+                d_signal_lengths,
+                d_lookbacks,
+            ],
+            _parameter_f64: vec![d_err_tols],
+            _scratch_f64: vec![d_scratch],
+            _scratch_i32: Vec::new(),
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all thirteen Ichimoku Oscillator outputs from one already-
+    /// resident HLC/source frame through this engine's shared CUDA session.
+    ///
+    /// The superseded wrapper created a second context, uploaded four input
+    /// vectors, synchronized inside the call and returned a private output
+    /// type. This route borrows the frame upload and keeps every output,
+    /// parameter and scratch allocation alive until the shared stream retires.
+    pub fn ichimoku_oscillator_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        source: CudaDeviceSliceF64Ref,
+        first_valid_hlcs: usize,
+        sweep: &IchimokuOscillatorBatchRange,
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "ichimoku_oscillator";
+        const ENTRY_POINT: &str = "ichimoku_oscillator_batch_f64";
+        const SCRATCH_ARRAYS: usize = 14;
+        const OUTPUT_IDS: [&str; 13] = [
+            "signal",
+            "ma",
+            "conversion",
+            "base",
+            "chikou",
+            "current_kumo_a",
+            "current_kumo_b",
+            "future_kumo_a",
+            "future_kumo_b",
+            "max_level",
+            "high_level",
+            "low_level",
+            "min_level",
+        ];
+        const DEFAULT_CONVERSION_PERIODS: usize = 9;
+        const DEFAULT_BASE_PERIODS: usize = 26;
+        const DEFAULT_LAGGING_SPAN_PERIODS: usize = 52;
+        const DEFAULT_DISPLACEMENT: usize = 26;
+        const DEFAULT_MA_LENGTH: usize = 12;
+        const DEFAULT_SMOOTHING_LENGTH: usize = 3;
+        const DEFAULT_WINDOW_SIZE: usize = 20;
+        const DEFAULT_TOP_BAND: f64 = 2.0;
+        const DEFAULT_MID_BAND: f64 = 1.5;
+
+        let cols = ohlcv.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident HLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "HLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if source.len() != cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "resident source length {} differs from HLC length {cols}",
+                    source.len()
+                ),
+            });
+        }
+        if source.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "source is resident on device {} but this session is bound to device {}",
+                    source.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid_hlcs >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "first finite HLC/source index {first_valid_hlcs} is outside {cols} bars"
+                ),
+            });
+        }
+
+        let combos =
+            expand_grid_ichimoku(sweep).map_err(|error| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            })?;
+        let rows = combos.len();
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter grid".into(),
+            });
+        }
+
+        let mut conversion_periods = Vec::with_capacity(rows);
+        let mut base_periods = Vec::with_capacity(rows);
+        let mut lagging_span_periods = Vec::with_capacity(rows);
+        let mut displacements = Vec::with_capacity(rows);
+        let mut ma_lengths = Vec::with_capacity(rows);
+        let mut window_sizes = Vec::with_capacity(rows);
+        let mut top_bands = Vec::with_capacity(rows);
+        let mut mid_bands = Vec::with_capacity(rows);
+        let mut chebyshev_c = Vec::with_capacity(rows);
+        let mut chebyshev_one_minus_c = Vec::with_capacity(rows);
+        let mut deque_cap = 2usize;
+        let valid = cols - first_valid_hlcs;
+
+        let as_i32 = |name: &'static str, value: usize| -> Result<i32, CudaF64IndicatorError> {
+            i32::try_from(value).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("{name} {value} exceeds the CUDA i32 ABI"),
+            })
+        };
+
+        for combo in &combos {
+            let conversion = combo
+                .conversion_periods
+                .unwrap_or(DEFAULT_CONVERSION_PERIODS);
+            let base = combo.base_periods.unwrap_or(DEFAULT_BASE_PERIODS);
+            let lagging = combo
+                .lagging_span_periods
+                .unwrap_or(DEFAULT_LAGGING_SPAN_PERIODS);
+            let displacement = combo.displacement.unwrap_or(DEFAULT_DISPLACEMENT);
+            let ma_length = combo.ma_length.unwrap_or(DEFAULT_MA_LENGTH);
+            let smoothing = combo.smoothing_length.unwrap_or(DEFAULT_SMOOTHING_LENGTH);
+            let window = combo.window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
+            let top_band = combo.top_band.unwrap_or(DEFAULT_TOP_BAND);
+            let mid_band = combo.mid_band.unwrap_or(DEFAULT_MID_BAND);
+
+            for (name, value) in [
+                ("conversion_periods", conversion),
+                ("base_periods", base),
+                ("lagging_span_periods", lagging),
+                ("displacement", displacement),
+                ("ma_length", ma_length),
+                ("smoothing_length", smoothing),
+            ] {
+                if value == 0 {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{name} must be at least 1"),
+                    });
+                }
+            }
+            if matches!(sweep.normalize, IchimokuOscillatorNormalizeMode::Window) && window < 5 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("window_size {window} must be at least 5 in window mode"),
+                });
+            }
+            for (name, value) in [("top_band", top_band), ("mid_band", mid_band)] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{name} must be finite and non-negative, got {value}"),
+                    });
+                }
+            }
+
+            let needed = lagging
+                .saturating_add(displacement)
+                .saturating_sub(1)
+                .max(base)
+                .max(conversion)
+                .max(ma_length);
+            if valid < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("not enough valid data: needed={needed}, valid={valid}"),
+                });
+            }
+
+            let row_deque_cap = conversion
+                .max(base)
+                .max(lagging)
+                .checked_add(1)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "deque capacity overflow".into(),
+                })?;
+            deque_cap = deque_cap.max(row_deque_cap);
+
+            conversion_periods.push(as_i32("conversion_periods", conversion)?);
+            base_periods.push(as_i32("base_periods", base)?);
+            lagging_span_periods.push(as_i32("lagging_span_periods", lagging)?);
+            displacements.push(as_i32("displacement", displacement)?);
+            ma_lengths.push(as_i32("ma_length", ma_length)?);
+            window_sizes.push(as_i32("window_size", window)?);
+            top_bands.push(top_band);
+            mid_bands.push(mid_band);
+            let (c, one_minus_c) = ichimoku_chebyshev_coefficients(smoothing, 0.5);
+            chebyshev_c.push(c);
+            chebyshev_one_minus_c.push(one_minus_c);
+        }
+        let gaussian_weights = ichimoku_gaussian_weights(4, 2.0, 1.0);
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "thirteen output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            6 * std::mem::size_of::<i32>() + 4 * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?
+        .checked_add(gaussian_weights.len() * std::mem::size_of::<f64>())
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: "resident parameter byte count overflow".into(),
+        })?;
+        let fixed_bytes = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "resident output/parameter byte count overflow".into(),
+            }
+        })?;
+        let doubles_per_slot = checked_mul(INDICATOR, "double scratch/slot", SCRATCH_ARRAYS, cols)
+            .map_err(plan_failure)?;
+        let ints_per_slot =
+            checked_mul(INDICATOR, "integer scratch/slot", 2, deque_cap).map_err(plan_failure)?;
+        let bytes_per_slot = checked_mul(
+            INDICATOR,
+            "double scratch bytes/slot",
+            doubles_per_slot,
+            std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?
+        .checked_add(
+            checked_mul(
+                INDICATOR,
+                "integer scratch bytes/slot",
+                ints_per_slot,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(plan_failure)?,
+        )
+        .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: "scratch byte count per slot overflow".into(),
+        })?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )
+        .map_err(plan_failure)?;
+        let scratch_doubles =
+            scratch_elems(INDICATOR, "double scratch", plan.slots, doubles_per_slot)
+                .map_err(plan_failure)?;
+        let scratch_ints = scratch_elems(INDICATOR, "integer scratch", plan.slots, ints_per_slot)
+            .map_err(plan_failure)?;
+
+        let cols_i32 = as_i32("bar count", cols)?;
+        let first_i32 = as_i32("first finite HLC/source index", first_valid_hlcs)?;
+        let rows_i32 = as_i32("parameter row count", rows)?;
+        let slots_i32 = as_i32("scratch slot count", plan.slots)?;
+        let deque_cap_i32 = as_i32("deque capacity", deque_cap)?;
+        let normalize_code = match sweep.normalize {
+            IchimokuOscillatorNormalizeMode::All => 0_i32,
+            IchimokuOscillatorNormalizeMode::Window => 1_i32,
+            IchimokuOscillatorNormalizeMode::Disabled => 2_i32,
+        };
+
+        let d_conversion = DeviceBuffer::from_slice(&conversion_periods)?;
+        let d_base = DeviceBuffer::from_slice(&base_periods)?;
+        let d_lagging = DeviceBuffer::from_slice(&lagging_span_periods)?;
+        let d_displacement = DeviceBuffer::from_slice(&displacements)?;
+        let d_ma_length = DeviceBuffer::from_slice(&ma_lengths)?;
+        let d_window = DeviceBuffer::from_slice(&window_sizes)?;
+        let d_top_band = DeviceBuffer::from_slice(&top_bands)?;
+        let d_mid_band = DeviceBuffer::from_slice(&mid_bands)?;
+        let d_chebyshev_c = DeviceBuffer::from_slice(&chebyshev_c)?;
+        let d_chebyshev_one_minus_c = DeviceBuffer::from_slice(&chebyshev_one_minus_c)?;
+        let d_gaussian_weights = DeviceBuffer::from_slice(&gaussian_weights)?;
+        let d_scratch_f64 = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_doubles.max(1))? };
+        let d_scratch_i32 = unsafe { DeviceBuffer::<i32>::uninitialized(scratch_ints.max(1))? };
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::IchimokuOscillator)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        self.validate_launch(plan.grid, plan.block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            let source = cust::memory::DevicePointer::<f64>::from_raw(source.device_ptr());
+            launch!(function<<<plan.grid, plan.block, 0, stream>>>(
+                high,
+                low,
+                close,
+                source,
+                cols_i32,
+                first_i32,
+                d_conversion.as_device_ptr(),
+                d_base.as_device_ptr(),
+                d_lagging.as_device_ptr(),
+                d_displacement.as_device_ptr(),
+                d_ma_length.as_device_ptr(),
+                d_window.as_device_ptr(),
+                d_top_band.as_device_ptr(),
+                d_mid_band.as_device_ptr(),
+                d_chebyshev_c.as_device_ptr(),
+                d_chebyshev_one_minus_c.as_device_ptr(),
+                d_gaussian_weights.as_device_ptr(),
+                i32::from(sweep.extra_smoothing),
+                normalize_code,
+                i32::from(sweep.clamp),
+                rows_i32,
+                slots_i32,
+                deque_cap_i32,
+                d_scratch_f64.as_device_ptr(),
+                d_scratch_i32.as_device_ptr(),
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr(),
+                output_buffers[10].as_device_ptr(),
+                output_buffers[11].as_device_ptr(),
+                output_buffers[12].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_conversion,
+                d_base,
+                d_lagging,
+                d_displacement,
+                d_ma_length,
+                d_window,
+            ],
+            _parameter_f64: vec![
+                d_top_band,
+                d_mid_band,
+                d_chebyshev_c,
+                d_chebyshev_one_minus_c,
+                d_gaussian_weights,
+            ],
+            _scratch_f64: vec![d_scratch_f64],
+            _scratch_i32: vec![d_scratch_i32],
+            session: self.session.clone(),
+        })
+    }
+
+    /// Launch all sixteen Market Structure Confluence outputs from one
+    /// already-resident OHLC frame through this engine's shared CUDA session.
+    ///
+    /// The legacy wrapper constructs another context, uploads high/low/close,
+    /// synchronizes inside the call and returns a private output type. This is
+    /// the GpuOnly route: inputs remain resident, all output matrices remain
+    /// resident, and the returned lifetime unit owns every asynchronous
+    /// parameter/scratch allocation until the shared stream retires.
+    pub fn market_structure_confluence_all_outputs(
+        &self,
+        ohlcv: CudaDeviceOhlcvF64Ref,
+        finite_hlc_count: usize,
+        parameter_rows: &[MarketStructureConfluenceParams],
+    ) -> Result<F64NamedOutputsResult, CudaF64IndicatorError> {
+        const INDICATOR: &str = "market_structure_confluence";
+        const ENTRY_POINT: &str = "market_structure_confluence_batch_f64";
+        const OUTPUT_IDS: [&str; 16] = [
+            "basis",
+            "upper_band",
+            "lower_band",
+            "structure_direction",
+            "bullish_arrow",
+            "bearish_arrow",
+            "bullish_change",
+            "bearish_change",
+            "hh",
+            "lh",
+            "hl",
+            "ll",
+            "bullish_bos",
+            "bullish_choch",
+            "bearish_bos",
+            "bearish_choch",
+        ];
+        const DEFAULT_SWING_SIZE: usize = 10;
+        const DEFAULT_BASIS_LENGTH: usize = 100;
+        const DEFAULT_ATR_LENGTH: usize = 14;
+        const DEFAULT_ATR_SMOOTH: usize = 21;
+        const DEFAULT_VOL_MULT: f64 = 2.0;
+
+        let cols = ohlcv.len();
+        let rows = parameter_rows.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty resident OHLC frame".into(),
+            });
+        }
+        if ohlcv.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "OHLC is resident on device {} but this session is bound to device {}",
+                    ohlcv.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if finite_hlc_count > cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!(
+                    "finite-HLC metadata {finite_hlc_count} exceeds frame length {cols}"
+                ),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "empty parameter row list".into(),
+            });
+        }
+
+        let mut swing_sizes = Vec::with_capacity(rows);
+        let mut bos_confirmations = Vec::with_capacity(rows);
+        let mut basis_lengths = Vec::with_capacity(rows);
+        let mut atr_lengths = Vec::with_capacity(rows);
+        let mut atr_smooths = Vec::with_capacity(rows);
+        let mut vol_mults = Vec::with_capacity(rows);
+        let mut basis_cap = 1usize;
+        let mut smooth_cap = 1usize;
+        let mut pivot_cap = 3usize;
+
+        for params in parameter_rows {
+            let swing_size = params.swing_size.unwrap_or(DEFAULT_SWING_SIZE);
+            let pivot_window = swing_size
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("swing_size {swing_size} overflows the pivot window"),
+                })?;
+            if swing_size < 2 || pivot_window > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "invalid swing_size {swing_size}: pivot window {pivot_window}, bars={cols}"
+                    ),
+                });
+            }
+            let bos = match params.bos_confirmation.as_deref().unwrap_or("Candle Close") {
+                "Candle Close" | "candle_close" | "candle close" => 0,
+                "Wicks" | "wicks" => 1,
+                other => {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("invalid bos_confirmation: {other}"),
+                    });
+                }
+            };
+            let basis_length = params.basis_length.unwrap_or(DEFAULT_BASIS_LENGTH);
+            let atr_length = params.atr_length.unwrap_or(DEFAULT_ATR_LENGTH);
+            let atr_smooth = params.atr_smooth.unwrap_or(DEFAULT_ATR_SMOOTH);
+            let vol_mult = params.vol_mult.unwrap_or(DEFAULT_VOL_MULT);
+            for (name, value) in [
+                ("basis_length", basis_length),
+                ("atr_length", atr_length),
+                ("atr_smooth", atr_smooth),
+            ] {
+                if value == 0 || value > cols {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("invalid {name} {value}: bars={cols}"),
+                    });
+                }
+            }
+            if !vol_mult.is_finite() || vol_mult < 0.0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("vol_mult must be finite and non-negative, got {vol_mult}"),
+                });
+            }
+            let atr_ready = atr_length
+                .checked_add(atr_smooth)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "atr_length {atr_length} + atr_smooth {atr_smooth} readiness overflow"
+                    ),
+                })?;
+            let needed = pivot_window.max(basis_length).max(atr_ready);
+            if finite_hlc_count < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!(
+                        "not enough finite HLC bars for parameter row: needed={needed}, \
+                         valid={finite_hlc_count}"
+                    ),
+                });
+            }
+
+            swing_sizes.push(i32::try_from(swing_size).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("swing_size {swing_size} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            bos_confirmations.push(bos);
+            basis_lengths.push(i32::try_from(basis_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("basis_length {basis_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            atr_lengths.push(i32::try_from(atr_length).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("atr_length {atr_length} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            atr_smooths.push(i32::try_from(atr_smooth).map_err(|_| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("atr_smooth {atr_smooth} exceeds the CUDA i32 ABI"),
+                }
+            })?);
+            vol_mults.push(vol_mult);
+            basis_cap = basis_cap.max(basis_length);
+            smooth_cap = smooth_cap.max(atr_smooth);
+            pivot_cap = pivot_cap.max(pivot_window.checked_add(1).ok_or_else(|| {
+                CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: format!("pivot capacity overflow for swing_size {swing_size}"),
+                }
+            })?);
+        }
+
+        let plan_failure =
+            |error: crate::cuda::f64_launch::LaunchPlanError| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: error.to_string(),
+            };
+        let output_elems = checked_mul(INDICATOR, "rows*bars", rows, cols).map_err(plan_failure)?;
+        let output_bytes = checked_mul(
+            INDICATOR,
+            "sixteen output bytes",
+            output_elems,
+            OUTPUT_IDS.len() * std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let parameter_bytes = checked_mul(
+            INDICATOR,
+            "parameter bytes",
+            rows,
+            5 * std::mem::size_of::<i32>() + std::mem::size_of::<f64>(),
+        )
+        .map_err(plan_failure)?;
+        let fixed_bytes = output_bytes.checked_add(parameter_bytes).ok_or_else(|| {
+            CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "fixed resident byte count overflow".into(),
+            }
+        })?;
+        let doubles_per_slot = basis_cap
+            .checked_add(smooth_cap)
+            .and_then(|value| pivot_cap.checked_mul(2).and_then(|p| value.checked_add(p)))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "f64 scratch elements per slot overflow".into(),
+            })?;
+        let ints_per_slot =
+            pivot_cap
+                .checked_mul(2)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: INDICATOR,
+                    reason: "i32 scratch elements per slot overflow".into(),
+                })?;
+        let bytes_per_slot = doubles_per_slot
+            .checked_mul(std::mem::size_of::<f64>())
+            .and_then(|bytes| {
+                ints_per_slot
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .and_then(|int_bytes| bytes.checked_add(int_bytes))
+            })
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: "scratch bytes per slot overflow".into(),
+            })?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )
+        .map_err(plan_failure)?;
+        let scratch_f64_elems =
+            scratch_elems(INDICATOR, "f64 scratch", plan.slots, doubles_per_slot)
+                .map_err(plan_failure)?;
+        let scratch_i32_elems = scratch_elems(INDICATOR, "i32 scratch", plan.slots, ints_per_slot)
+            .map_err(plan_failure)?;
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("bar count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: INDICATOR,
+            reason: format!("parameter row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let slots_i32 =
+            i32::try_from(plan.slots).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("scratch slot count {} exceeds the CUDA i32 ABI", plan.slots),
+            })?;
+        let basis_cap_i32 =
+            i32::try_from(basis_cap).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("basis capacity {basis_cap} exceeds the CUDA i32 ABI"),
+            })?;
+        let smooth_cap_i32 =
+            i32::try_from(smooth_cap).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("smooth capacity {smooth_cap} exceeds the CUDA i32 ABI"),
+            })?;
+        let pivot_cap_i32 =
+            i32::try_from(pivot_cap).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: INDICATOR,
+                reason: format!("pivot capacity {pivot_cap} exceeds the CUDA i32 ABI"),
+            })?;
+
+        let d_swing = DeviceBuffer::from_slice(&swing_sizes)?;
+        let d_bos = DeviceBuffer::from_slice(&bos_confirmations)?;
+        let d_basis_lengths = DeviceBuffer::from_slice(&basis_lengths)?;
+        let d_atr_lengths = DeviceBuffer::from_slice(&atr_lengths)?;
+        let d_atr_smooths = DeviceBuffer::from_slice(&atr_smooths)?;
+        let d_vol_mults = DeviceBuffer::from_slice(&vol_mults)?;
+        let d_scratch_f64 = unsafe { DeviceBuffer::<f64>::uninitialized(scratch_f64_elems)? };
+        let d_scratch_i32 = unsafe { DeviceBuffer::<i32>::uninitialized(scratch_i32_elems)? };
+        let mut output_buffers = Vec::with_capacity(OUTPUT_IDS.len());
+        for _ in OUTPUT_IDS {
+            output_buffers.push(unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? });
+        }
+
+        let module = self.module_for(F64Kernel::MarketStructureConfluence)?;
+        let function = module
+            .get_function(ENTRY_POINT)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name: ENTRY_POINT })?;
+        self.validate_launch(plan.grid, plan.block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let high = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.high().device_ptr());
+            let low = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.low().device_ptr());
+            let close = cust::memory::DevicePointer::<f64>::from_raw(ohlcv.close().device_ptr());
+            launch!(function<<<plan.grid, plan.block, 0, stream>>>(
+                high,
+                low,
+                close,
+                cols_i32,
+                d_swing.as_device_ptr(),
+                d_bos.as_device_ptr(),
+                d_basis_lengths.as_device_ptr(),
+                d_atr_lengths.as_device_ptr(),
+                d_atr_smooths.as_device_ptr(),
+                d_vol_mults.as_device_ptr(),
+                rows_i32,
+                slots_i32,
+                basis_cap_i32,
+                smooth_cap_i32,
+                pivot_cap_i32,
+                d_scratch_f64.as_device_ptr(),
+                d_scratch_i32.as_device_ptr(),
+                output_buffers[0].as_device_ptr(),
+                output_buffers[1].as_device_ptr(),
+                output_buffers[2].as_device_ptr(),
+                output_buffers[3].as_device_ptr(),
+                output_buffers[4].as_device_ptr(),
+                output_buffers[5].as_device_ptr(),
+                output_buffers[6].as_device_ptr(),
+                output_buffers[7].as_device_ptr(),
+                output_buffers[8].as_device_ptr(),
+                output_buffers[9].as_device_ptr(),
+                output_buffers[10].as_device_ptr(),
+                output_buffers[11].as_device_ptr(),
+                output_buffers[12].as_device_ptr(),
+                output_buffers[13].as_device_ptr(),
+                output_buffers[14].as_device_ptr(),
+                output_buffers[15].as_device_ptr()
+            ))?;
+        }
+
+        let context = self.context_arc();
+        let device_id = self.device_id();
+        let mut outputs = Vec::with_capacity(OUTPUT_IDS.len());
+        for (buffer, output_id) in output_buffers.into_iter().zip(OUTPUT_IDS) {
+            let matrix =
+                CudaDeviceMatrixF64::from_buffer(buffer, rows, cols, context.clone(), device_id)
+                    .map_err(|error| CudaF64IndicatorError::InvalidInput {
+                        indicator: INDICATOR,
+                        reason: format!("{output_id} device matrix ownership failed: {error}"),
+                    })?;
+            outputs.push(F64NamedDeviceOutput { output_id, matrix });
+        }
+
+        Ok(F64NamedOutputsResult {
+            indicator_id: INDICATOR,
+            entry_point: ENTRY_POINT,
+            outputs,
+            rows,
+            cols,
+            _parameter_i32: vec![
+                d_swing,
+                d_bos,
+                d_basis_lengths,
+                d_atr_lengths,
+                d_atr_smooths,
+            ],
+            _parameter_f64: vec![d_vol_mults],
+            _scratch_f64: vec![d_scratch_f64],
+            _scratch_i32: vec![d_scratch_i32],
+            session: self.session.clone(),
+        })
     }
 
     /// The module holding `kernel`'s entry point.
@@ -4817,8 +21983,270 @@ impl CudaF64Indicators {
             })
     }
 
-    fn validate_launch(&self, grid: GridSize, block: BlockSize) -> Result<(), CudaF64IndicatorError> {
-        let device = Device::get_device(self.device_id)?;
+    fn fisher_shared_bytes_for_max_period_v2(
+        max_period: usize,
+    ) -> Result<u32, CudaF64IndicatorError> {
+        if max_period == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator: "fisher",
+                reason: "period 0 is not >= 1".into(),
+            });
+        }
+        if max_period > FISHER_F64_MAX_PERIOD {
+            return Err(CudaF64IndicatorError::PeriodTooLarge {
+                indicator: "fisher",
+                period: max_period,
+                max: FISHER_F64_MAX_PERIOD,
+            });
+        }
+        let slots = max_period
+            .checked_add(1)
+            .and_then(|capacity| capacity.checked_mul(2))
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: "fisher",
+                reason: "dynamic shared deque slot count overflow".into(),
+            })?;
+        let bytes = slots
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator: "fisher",
+                reason: "dynamic shared deque byte count overflow".into(),
+            })?;
+        u32::try_from(bytes).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator: "fisher",
+            reason: format!("dynamic shared deque byte count {bytes} exceeds the CUDA ABI"),
+        })
+    }
+
+    fn fisher_shared_bytes_for_periods_v2(
+        kernel: F64Kernel,
+        periods: &[i32],
+    ) -> Result<u32, CudaF64IndicatorError> {
+        if kernel != F64Kernel::Fisher {
+            return Ok(0);
+        }
+        let max_period =
+            periods
+                .iter()
+                .copied()
+                .max()
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator: "fisher",
+                    reason: "empty period list cannot size dynamic shared deques".into(),
+                })?;
+        let max_period =
+            usize::try_from(max_period).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                indicator: "fisher",
+                reason: format!("period {max_period} is not >= 1"),
+            })?;
+        Self::fisher_shared_bytes_for_max_period_v2(max_period)
+    }
+
+    fn validate_epma_periods_v1(
+        kernel: F64Kernel,
+        periods: &[i32],
+        cols: usize,
+        first_valid: usize,
+    ) -> Result<(), CudaF64IndicatorError> {
+        if kernel != F64Kernel::Epma {
+            return Ok(());
+        }
+        for &period in periods {
+            if period < 2 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: "epma",
+                    reason: format!("period {period} is not >= 2"),
+                });
+            }
+            if period as usize > EPMA_F64_MAX_CERTIFIED_PERIOD_V1 {
+                return Err(CudaF64IndicatorError::PeriodTooLarge {
+                    indicator: "epma",
+                    period: period as usize,
+                    max: EPMA_F64_MAX_CERTIFIED_PERIOD_V1,
+                });
+            }
+            let width = i64::from(period - 1);
+            let c0 = 2_i64 - 4_i64;
+            let twice_sum = width * (2_i64 * c0 + width - 1_i64);
+            if twice_sum & 1_i64 != 0 || twice_sum / 2_i64 == 0 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: "epma",
+                    reason: format!(
+                        "period {period} with offset 4 has a singular integer weight sum"
+                    ),
+                });
+            }
+            let needed = period as usize + 4_usize + 1_usize;
+            let available = cols - first_valid;
+            if available < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: "epma",
+                    reason: format!(
+                        "not enough finite-tail data for period {period}: needed={needed}, available={available}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_fwma_periods_v2(
+        kernel: F64Kernel,
+        periods: &[i32],
+        cols: usize,
+        first_valid: usize,
+    ) -> Result<(), CudaF64IndicatorError> {
+        if kernel != F64Kernel::Fwma {
+            return Ok(());
+        }
+        let available = cols.checked_sub(first_valid).unwrap_or(0);
+        for &period in periods {
+            if period < 1 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: "fwma",
+                    reason: format!("period {period} is not >= 1"),
+                });
+            }
+            let needed = period as usize;
+            if available < needed {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: "fwma",
+                    reason: format!(
+                        "not enough finite-tail data for period {period}: needed={needed}, available={available}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_cci_cycle_periods_v9(
+        kernel: F64Kernel,
+        periods: &[i32],
+        cols: usize,
+    ) -> Result<(), CudaF64IndicatorError> {
+        if kernel != F64Kernel::CciCycle {
+            return Ok(());
+        }
+        for &period in periods {
+            if period < 2 {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: "cci_cycle",
+                    reason: format!("period {period} is not >= 2 for Classic semantic-v9"),
+                });
+            }
+            if period as usize > cols {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator: "cci_cycle",
+                    reason: format!("period {period} exceeds the {cols}-bar input length"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_hce_registry_ratio_v2(anchor: i32) -> Option<(usize, usize)> {
+        match anchor {
+            7 => Some((2, 7)),
+            20 => Some((5, 20)),
+            21 => Some((5, 21)),
+            50 => Some((13, 50)),
+            100 => Some((25, 100)),
+            200 => Some((50, 200)),
+            _ => None,
+        }
+    }
+
+    fn validate_hce_v2_preallocation(
+        &self,
+        kernel: F64Kernel,
+        inputs: F64Inputs,
+        periods: &[i32],
+        rows: usize,
+        cols: usize,
+        first_valid: usize,
+    ) -> Result<(), CudaF64IndicatorError> {
+        if kernel != F64Kernel::HalfCausalEstimator {
+            return Ok(());
+        }
+        let indicator = kernel.indicator_id();
+        let F64Inputs::TimestampPriceVolume {
+            timestamps,
+            price,
+            volume,
+        } = inputs
+        else {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: "HCE-v2 needs resident timestamps, close, and volume".into(),
+            });
+        };
+        if timestamps.len() != cols || price.len() != cols || volume.len() != cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: format!(
+                    "HCE-v2 input lengths differ: timestamps={} close={} volume={} expected={cols}",
+                    timestamps.len(),
+                    price.len(),
+                    volume.len()
+                ),
+            });
+        }
+        if timestamps.device_id() != self.device_id()
+            || price.device_id() != self.device_id()
+            || volume.device_id() != self.device_id()
+        {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: format!(
+                    "HCE-v2 input devices differ: timestamps={} close={} volume={} engine={}",
+                    timestamps.device_id(),
+                    price.device_id(),
+                    volume.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if periods.len() != rows {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: format!(
+                    "HCE-v2 period row count differs: periods={} rows={rows}",
+                    periods.len()
+                ),
+            });
+        }
+        i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: format!("HCE-v2 column count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: format!("HCE-v2 row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: format!("HCE-v2 first_valid {first_valid} exceeds the CUDA i32 ABI"),
+        })?;
+        for &anchor in periods {
+            if Self::resolve_hce_registry_ratio_v2(anchor).is_none() {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: format!(
+                        "HCE-v2 unsupported RegistryRatio anchor {anchor}; expected one of 7,20,21,50,100,200"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_launch(
+        &self,
+        grid: GridSize,
+        block: BlockSize,
+    ) -> Result<(), CudaF64IndicatorError> {
+        let device = Device::get_device(self.device_id())?;
         let max_grid_x = device.get_attribute(DeviceAttribute::MaxGridDimX)? as u32;
         let max_grid_y = device.get_attribute(DeviceAttribute::MaxGridDimY)? as u32;
         let max_block_x = device.get_attribute(DeviceAttribute::MaxBlockDimX)? as u32;
@@ -4831,6 +22259,82 @@ impl CudaF64Indicators {
                 by: block.y,
                 bz: block.z,
             });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_hce_stable_v2(
+        &self,
+        inputs: F64Inputs,
+        d_periods: &DeviceBuffer<i32>,
+        rows: usize,
+        cols: usize,
+        first_valid: usize,
+        scratch: &HceStableScratchV2,
+        output: cust::memory::DevicePointer<f64>,
+    ) -> Result<(), CudaF64IndicatorError> {
+        let indicator = F64Kernel::HalfCausalEstimator.indicator_id();
+        let F64Inputs::TimestampPriceVolume {
+            timestamps,
+            price,
+            volume,
+        } = inputs
+        else {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: "HCE-v2 needs resident timestamps, close, and volume".into(),
+            });
+        };
+        if timestamps.len() != cols || price.len() != cols || volume.len() != cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: format!(
+                    "HCE-v2 input lengths differ: timestamps={} close={} volume={} expected={cols}",
+                    timestamps.len(),
+                    price.len(),
+                    volume.len()
+                ),
+            });
+        }
+
+        let n = i32::try_from(cols).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: format!("HCE-v2 column count {cols} exceeds the CUDA i32 ABI"),
+        })?;
+        let n_combos = i32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: format!("HCE-v2 row count {rows} exceeds the CUDA i32 ABI"),
+        })?;
+        let fv = i32::try_from(first_valid).map_err(|_| CudaF64IndicatorError::InvalidInput {
+            indicator,
+            reason: format!("HCE-v2 first_valid {first_valid} exceeds the CUDA i32 ABI"),
+        })?;
+        let module = self.module_for(F64Kernel::HalfCausalEstimator)?;
+        let name = F64Kernel::HalfCausalEstimator.entry_point();
+        let function = module
+            .get_function(name)
+            .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name })?;
+        let grid = GridSize::x(1);
+        let block = BlockSize::x(1);
+        self.validate_launch(grid, block)?;
+        let stream = self.session.stream();
+        unsafe {
+            let timestamps = cust::memory::DevicePointer::<i64>::from_raw(timestamps.device_ptr());
+            let price = cust::memory::DevicePointer::<f64>::from_raw(price.device_ptr());
+            let volume = cust::memory::DevicePointer::<f64>::from_raw(volume.device_ptr());
+            launch!(function<<<grid, block, 0, stream>>>(
+                timestamps,
+                price,
+                volume,
+                n,
+                d_periods.as_device_ptr(),
+                n_combos,
+                fv,
+                scratch.scratch_f64.as_device_ptr(),
+                scratch.scratch_i32.as_device_ptr(),
+                output
+            ))?;
         }
         Ok(())
     }
@@ -4865,13 +22369,13 @@ impl CudaF64Indicators {
                 reason: "empty period list".into(),
             });
         }
-        if inputs.device_id() != self.device_id {
+        if inputs.device_id() != self.device_id() {
             return Err(CudaF64IndicatorError::InvalidInput {
                 indicator,
                 reason: format!(
                     "inputs are resident on device {} but this engine is bound to device {}",
                     inputs.device_id(),
-                    self.device_id
+                    self.device_id()
                 ),
             });
         }
@@ -4887,6 +22391,7 @@ impl CudaF64Indicators {
                 reason: format!("period {bad} is not >= 1"),
             });
         }
+        Self::validate_epma_periods_v1(kernel, periods, cols, first_valid)?;
         // Kernels that keep a fixed per-thread ring refuse an oversized period
         // BY NAME. Truncating the window would compute a different indicator
         // and moving the sweep to the host would be the silent fallback this
@@ -4900,10 +22405,23 @@ impl CudaF64Indicators {
                 });
             }
         }
+        Self::validate_fwma_periods_v2(kernel, periods, cols, first_valid)?;
+        Self::validate_cci_cycle_periods_v9(kernel, periods, cols)?;
+        self.validate_hce_v2_preallocation(kernel, inputs, periods, rows, cols, first_valid)?;
+        let fisher_shared_bytes = Self::fisher_shared_bytes_for_periods_v2(kernel, periods)?;
 
         // cci needs one extra matrix of the same shape for the sequential
         // running-mean pass; everything else needs none.
         let scratch = usize::from(kernel == F64Kernel::Cci);
+        let coefficient_bytes_per_row = match exact_coefficient_stride_v3(kernel, periods)? {
+            Some(stride) => stride
+                .checked_mul(std::mem::size_of::<f64>())
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: "exact coefficient byte count overflow".into(),
+                })?,
+            None => 0,
+        };
 
         let output_elems =
             rows.checked_mul(cols)
@@ -4913,23 +22431,79 @@ impl CudaF64Indicators {
                 })?;
         let out = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
 
+        if kernel == F64Kernel::HalfCausalEstimator {
+            // The preserved ABI carries one RegistryRatio anchor per row; the
+            // serial kernel resets state and resolves the exact D/L tuple.
+            let d_periods = DeviceBuffer::from_slice(periods)?;
+            let scratch = HceStableScratchV2 {
+                scratch_f64: unsafe {
+                    DeviceBuffer::<f64>::uninitialized(HCE_V2_SCRATCH_F64_ELEMS)?
+                },
+                scratch_i32: unsafe {
+                    DeviceBuffer::<i32>::uninitialized(HCE_V2_SCRATCH_I32_ELEMS)?
+                },
+            };
+            self.launch_hce_stable_v2(
+                inputs,
+                &d_periods,
+                rows,
+                cols,
+                first_valid,
+                &scratch,
+                out.as_device_ptr(),
+            )?;
+            // Compatibility ownership ends here; keep both typed state buffers
+            // live until the single HCE-v2 launch has completed.
+            self.session.stream().synchronize()?;
+            return Ok(F64SweepResult {
+                buf: out,
+                rows,
+                cols,
+                device_id: self.device_id(),
+            });
+        }
+
         // Chunk over ROWS so peak transient memory tracks the card, not the
         // period list. The output itself is the caller's contract and is
         // allocated whole; the scratch is what gets chunked.
-        let chunk = rows_per_chunk(indicator, cols, scratch, DEFAULT_HEADROOM)?.min(rows);
+        let chunk = rows_per_chunk(
+            indicator,
+            cols,
+            scratch,
+            coefficient_bytes_per_row,
+            DEFAULT_HEADROOM,
+        )?
+        .min(rows);
 
         let mut row0 = 0usize;
         while row0 < rows {
             let nrows = (rows - row0).min(chunk);
-            let d_periods = DeviceBuffer::from_slice(&periods[row0..row0 + nrows])?;
+            let chunk_periods = &periods[row0..row0 + nrows];
+            let d_periods = DeviceBuffer::from_slice(chunk_periods)?;
+            let exact_coefficients = if let Some((coefficients, stride)) =
+                prepare_exact_coefficient_rows_v3(kernel, chunk_periods)?
+            {
+                let stride =
+                    i32::try_from(stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                        indicator,
+                        reason: "exact coefficient stride exceeds the CUDA i32 ABI".into(),
+                    })?;
+                Some((DeviceBuffer::from_slice(&coefficients)?, stride))
+            } else {
+                None
+            };
             // Row-offset view into the whole output buffer. `as_device_ptr()`
             // plus an element offset avoids a second allocation and a copy.
             let out_ptr = unsafe { out.as_device_ptr().offset((row0 * cols) as isize) };
 
-            self.launch_chunk(
+            let _retained_scratch = self.launch_chunk(
                 kernel,
                 inputs,
                 &d_periods,
+                exact_coefficients
+                    .as_ref()
+                    .map(|(coefficients, stride)| (coefficients, *stride)),
+                fisher_shared_bytes,
                 nrows,
                 cols,
                 first_valid,
@@ -4937,24 +22511,307 @@ impl CudaF64Indicators {
                 indicator,
             )?;
 
-            // MUST synchronize before `d_periods` drops at the end of this
-            // iteration. Launches are asynchronous on the stream, so freeing
-            // the period buffer while a kernel may still be reading it is a
-            // use-after-free on the device — the kind that corrupts a
-            // neighbouring allocation and surfaces as a wrong number three
-            // indicators later rather than as a crash here.
-            self.stream.synchronize()?;
+            // Compatibility sweep ownership ends at this iteration, so it
+            // still synchronizes before its period/scratch buffers drop. The
+            // strict resident path uses `sweep_resident_v3` below and retains
+            // these allocations behind a device event with no host wait.
+            self.session.stream().synchronize()?;
 
             row0 += nrows;
         }
-
 
         Ok(F64SweepResult {
             buf: out,
             rows,
             cols,
-            device_id: self.device_id,
+            device_id: self.device_id(),
         })
+    }
+
+    /// Launch the same authoritative primary f64 sweep while retaining every
+    /// chunk parameter/scratch allocation. Unlike [`Self::sweep`], this path
+    /// performs no per-chunk or destructor host synchronization; an opaque
+    /// same-session owner must record a ready event and consume the result via
+    /// [`F64ResidentSweepResultV3::enqueue_release_v3`].
+    pub fn sweep_resident_v3(
+        &self,
+        kernel: F64Kernel,
+        inputs: F64Inputs,
+        periods: &[i32],
+        first_valid: usize,
+    ) -> Result<F64ResidentSweepResultV3, CudaF64IndicatorError> {
+        self.sweep_resident_with_preallocation_v4(kernel, inputs, periods, first_valid, None)
+    }
+
+    /// Execute a strict one-row resident primary sweep only after the caller's
+    /// move-only pre-device plan matches VectorTA's current owner sizing. The
+    /// equality guard runs before the shared implementation creates its first
+    /// device allocation, and the admitted chunk count bypasses a live probe.
+    pub fn sweep_resident_preplanned_v4(
+        &self,
+        kernel: F64Kernel,
+        inputs: F64Inputs,
+        periods: &[i32],
+        first_valid: usize,
+        preallocation_plan: &F64ResidentSingleSweepAllocationPlanV4,
+    ) -> Result<F64ResidentSweepResultV3, CudaF64IndicatorError> {
+        let expected_preallocation_plan =
+            preflight_resident_single_sweep_allocation_v4(kernel, periods, inputs.len())?;
+        if expected_preallocation_plan != *preallocation_plan {
+            return Err(
+                CudaF64IndicatorError::F64ResidentPreallocationPlanMismatchV4 {
+                    indicator: kernel.indicator_id(),
+                },
+            );
+        }
+        self.sweep_resident_with_preallocation_v4(
+            kernel,
+            inputs,
+            periods,
+            first_valid,
+            Some(preallocation_plan),
+        )
+    }
+
+    fn sweep_resident_with_preallocation_v4(
+        &self,
+        kernel: F64Kernel,
+        inputs: F64Inputs,
+        periods: &[i32],
+        first_valid: usize,
+        preallocation_plan: Option<&F64ResidentSingleSweepAllocationPlanV4>,
+    ) -> Result<F64ResidentSweepResultV3, CudaF64IndicatorError> {
+        let indicator = kernel.indicator_id();
+        let cols = inputs.len();
+        let rows = periods.len();
+        if cols == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: "empty input series".into(),
+            });
+        }
+        if rows == 0 {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: "empty period list".into(),
+            });
+        }
+        if inputs.device_id() != self.device_id() {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: format!(
+                    "inputs are resident on device {} but this engine is bound to device {}",
+                    inputs.device_id(),
+                    self.device_id()
+                ),
+            });
+        }
+        if first_valid >= cols {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: format!("first_valid={first_valid} is not inside a {cols}-bar series"),
+            });
+        }
+        if let Some(bad) = periods.iter().find(|period| **period <= 0) {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: format!("period {bad} is not >= 1"),
+            });
+        }
+        Self::validate_epma_periods_v1(kernel, periods, cols, first_valid)?;
+        if let Some(maximum) = kernel.max_period() {
+            if let Some(too_large) = periods.iter().find(|period| **period as usize > maximum) {
+                return Err(CudaF64IndicatorError::PeriodTooLarge {
+                    indicator,
+                    period: *too_large as usize,
+                    max: maximum,
+                });
+            }
+        }
+        Self::validate_fwma_periods_v2(kernel, periods, cols, first_valid)?;
+        Self::validate_cci_cycle_periods_v9(kernel, periods, cols)?;
+        self.validate_hce_v2_preallocation(kernel, inputs, periods, rows, cols, first_valid)?;
+        let fisher_shared_bytes = Self::fisher_shared_bytes_for_periods_v2(kernel, periods)?;
+        let output_id = crate::indicators::dispatch::f64_kernel_for(indicator)
+            .and_then(|spec| spec.primary_output_id())
+            .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: "resident primary route has no authoritative output id".into(),
+            })?;
+        let output_elements =
+            rows.checked_mul(cols)
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: "rows*cols overflow".into(),
+                })?;
+        // SAFETY: the owner below retains the allocation and exact session;
+        // every cell is initialized by the complete chunk partition before the
+        // result can be returned.
+        let output = unsafe {
+            DeviceBuffer::<f64>::uninitialized_async(output_elements, self.session.stream())?
+        };
+        let mut resident = F64ResidentSweepResultV3 {
+            indicator_id: indicator,
+            entry_point: kernel.entry_point(),
+            output_id,
+            output: Some(output),
+            rows,
+            cols,
+            device_id: self.device_id(),
+            parameter_i32_host: Vec::new(),
+            parameter_i32: Vec::new(),
+            parameter_f64_host: Vec::new(),
+            parameter_f64: Vec::new(),
+            scratch_f64: Vec::new(),
+            scratch_i32: Vec::new(),
+            session: Arc::clone(&self.session),
+        };
+        if kernel == F64Kernel::HalfCausalEstimator {
+            let host_periods = LockedBuffer::from_slice(periods)?;
+            let mut device_periods =
+                unsafe { DeviceBuffer::<i32>::uninitialized_async(rows, self.session.stream())? };
+            if let Err(error) =
+                unsafe { device_periods.async_copy_from(&host_periods, self.session.stream()) }
+            {
+                std::mem::forget(host_periods);
+                std::mem::forget(device_periods);
+                return Err(error.into());
+            }
+            resident.parameter_i32_host.push(host_periods);
+            resident.parameter_i32.push(device_periods);
+            let scratch = HceStableScratchV2 {
+                scratch_f64: unsafe {
+                    DeviceBuffer::<f64>::uninitialized_async(
+                        HCE_V2_SCRATCH_F64_ELEMS,
+                        self.session.stream(),
+                    )?
+                },
+                scratch_i32: unsafe {
+                    DeviceBuffer::<i32>::uninitialized_async(
+                        HCE_V2_SCRATCH_I32_ELEMS,
+                        self.session.stream(),
+                    )?
+                },
+            };
+            self.launch_hce_stable_v2(
+                inputs,
+                resident
+                    .parameter_i32
+                    .last()
+                    .expect("resident HCE-v2 retains every RegistryRatio anchor"),
+                rows,
+                cols,
+                first_valid,
+                &scratch,
+                resident.output_buffer().as_device_ptr(),
+            )?;
+            resident.scratch_f64.push(scratch.scratch_f64);
+            resident.scratch_i32.push(scratch.scratch_i32);
+            return Ok(resident);
+        }
+        let scratch_matrices = usize::from(kernel == F64Kernel::Cci);
+        let coefficient_bytes_per_row = match exact_coefficient_stride_v3(kernel, periods)? {
+            Some(stride) => stride
+                .checked_mul(std::mem::size_of::<f64>())
+                .ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: "exact coefficient byte count overflow".into(),
+                })?,
+            None => 0,
+        };
+        let chunk = match preallocation_plan {
+            Some(plan) => plan.chunk_rows().min(rows),
+            None => rows_per_chunk(
+                indicator,
+                cols,
+                scratch_matrices,
+                coefficient_bytes_per_row,
+                DEFAULT_HEADROOM,
+            )?
+            .min(rows),
+        };
+        let mut row_start = 0_usize;
+        while row_start < rows {
+            let chunk_rows = (rows - row_start).min(chunk);
+            let chunk_periods = &periods[row_start..row_start.saturating_add(chunk_rows)];
+            let host_periods = LockedBuffer::from_slice(chunk_periods)?;
+            let mut device_periods = unsafe {
+                DeviceBuffer::<i32>::uninitialized_async(host_periods.len(), self.session.stream())?
+            };
+            if let Err(error) =
+                unsafe { device_periods.async_copy_from(&host_periods, self.session.stream()) }
+            {
+                std::mem::forget(host_periods);
+                std::mem::forget(device_periods);
+                return Err(error.into());
+            }
+            resident.parameter_i32_host.push(host_periods);
+            resident.parameter_i32.push(device_periods);
+            let exact_coefficient_stride = if let Some((coefficients, stride)) =
+                prepare_exact_coefficient_rows_v3(kernel, chunk_periods)?
+            {
+                let stride =
+                    i32::try_from(stride).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                        indicator,
+                        reason: "exact coefficient stride exceeds the CUDA i32 ABI".into(),
+                    })?;
+                let host_coefficients = LockedBuffer::from_slice(&coefficients)?;
+                let mut device_coefficients = unsafe {
+                    DeviceBuffer::<f64>::uninitialized_async(
+                        host_coefficients.len(),
+                        self.session.stream(),
+                    )?
+                };
+                if let Err(error) = unsafe {
+                    device_coefficients.async_copy_from(&host_coefficients, self.session.stream())
+                } {
+                    std::mem::forget(host_coefficients);
+                    std::mem::forget(device_coefficients);
+                    return Err(error.into());
+                }
+                resident.parameter_f64_host.push(host_coefficients);
+                resident.parameter_f64.push(device_coefficients);
+                Some(stride)
+            } else {
+                None
+            };
+            let output_pointer = unsafe {
+                resident
+                    .output_buffer()
+                    .as_device_ptr()
+                    .offset((row_start * cols) as isize)
+            };
+            let scratch = self.launch_chunk(
+                kernel,
+                inputs,
+                resident
+                    .parameter_i32
+                    .last()
+                    .expect("resident chunk retains its period buffer"),
+                exact_coefficient_stride.map(|stride| {
+                    let retention_message = if kernel == F64Kernel::CoraWave {
+                        "resident CoRa Wave chunk retains its exact coefficient buffer"
+                    } else {
+                        "resident ALMA chunk retains its exact coefficient buffer"
+                    };
+                    (
+                        resident.parameter_f64.last().expect(retention_message),
+                        stride,
+                    )
+                }),
+                fisher_shared_bytes,
+                chunk_rows,
+                cols,
+                first_valid,
+                output_pointer,
+                indicator,
+            )?;
+            if let Some(scratch) = scratch {
+                resident.scratch_f64.push(scratch);
+            }
+            row_start += chunk_rows;
+        }
+        Ok(resident)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4963,12 +22820,20 @@ impl CudaF64Indicators {
         kernel: F64Kernel,
         inputs: F64Inputs,
         d_periods: &DeviceBuffer<i32>,
+        exact_coefficients: Option<(&DeviceBuffer<f64>, i32)>,
+        fisher_shared_bytes: u32,
         rows: usize,
         cols: usize,
         first_valid: usize,
         out_ptr: cust::memory::DevicePointer<f64>,
         indicator: &'static str,
-    ) -> Result<(), CudaF64IndicatorError> {
+    ) -> Result<Option<DeviceBuffer<f64>>, CudaF64IndicatorError> {
+        if kernel == F64Kernel::HalfCausalEstimator {
+            return Err(CudaF64IndicatorError::InvalidInput {
+                indicator,
+                reason: "HCE-v2 must use launch_hce_stable_v2 with typed TOD scratch".into(),
+            });
+        }
         let name = kernel.entry_point();
         // The module this VARIANT declares, not "the" module — see
         // `F64Kernel::module_stem`.
@@ -4976,10 +22841,145 @@ impl CudaF64Indicators {
         let func = kmod
             .get_function(name)
             .map_err(|_| CudaF64IndicatorError::MissingKernelSymbol { name })?;
-        let stream = &self.stream;
+        let stream = self.session.stream();
         let n = cols as i32;
         let n_combos = rows as i32;
         let fv = first_valid as i32;
+
+        if matches!(kernel, F64Kernel::Alma | F64Kernel::CoraWave) {
+            let prices = match inputs {
+                F64Inputs::Prices(prices) => prices,
+                _ => {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator,
+                        reason: format!("{indicator} needs one canonical price series"),
+                    });
+                }
+            };
+            let (exact_coefficients, coefficient_stride) =
+                exact_coefficients.ok_or_else(|| CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: format!(
+                        "{indicator} launch omitted its exact CPU-owned coefficient rows"
+                    ),
+                })?;
+            let grid = GridSize::x(((rows as u32) + BLOCK_X - 1) / BLOCK_X);
+            let block = BlockSize::x(BLOCK_X);
+            self.validate_launch(grid, block)?;
+            unsafe {
+                let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+                launch!(func<<<grid, block, 0, stream>>>(
+                    prices,
+                    n,
+                    d_periods.as_device_ptr(),
+                    n_combos,
+                    fv,
+                    exact_coefficients.as_device_ptr(),
+                    coefficient_stride,
+                    out_ptr
+                ))?;
+            }
+            return Ok(None);
+        }
+
+        if kernel == F64Kernel::Epma {
+            let prices = match inputs {
+                F64Inputs::Prices(prices) => prices,
+                _ => {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator,
+                        reason: "epma needs the canonical finite close series".into(),
+                    });
+                }
+            };
+            let segments = cols.div_ceil(EPMA_F64_SEGMENT_OUTPUTS_V1);
+            let segments_u32 =
+                u32::try_from(segments).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: format!("EPMA segment count {segments} exceeds the CUDA grid ABI"),
+                })?;
+            let rows_u32 =
+                u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: format!("EPMA row count {rows} exceeds the CUDA grid ABI"),
+                })?;
+            let grid = GridSize::xy(segments_u32.div_ceil(BLOCK_X), rows_u32);
+            let block = BlockSize::x(BLOCK_X);
+            self.validate_launch(grid, block)?;
+            unsafe {
+                let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+                launch!(func<<<grid, block, 0, stream>>>(
+                    prices,
+                    n,
+                    d_periods.as_device_ptr(),
+                    n_combos,
+                    fv,
+                    out_ptr
+                ))?;
+            }
+            return Ok(None);
+        }
+
+        if kernel == F64Kernel::Deviation {
+            // Stable Authority V2 makes every (combo, output bar) window
+            // independent, so launch one thread per output instead of the
+            // generic sequential lane's one thread per parameter row.
+            let prices = match inputs {
+                F64Inputs::Prices(prices) => prices,
+                _ => {
+                    return Err(CudaF64IndicatorError::InvalidInput {
+                        indicator,
+                        reason: "deviation needs one canonical price series".into(),
+                    });
+                }
+            };
+            let grid = GridSize::xy(((cols as u32) + BLOCK_X - 1) / BLOCK_X, rows as u32);
+            let block = BlockSize::x(BLOCK_X);
+            self.validate_launch(grid, block)?;
+            unsafe {
+                let prices = cust::memory::DevicePointer::<f64>::from_raw(prices.device_ptr());
+                launch!(func<<<grid, block, 0, stream>>>(
+                    prices,
+                    n,
+                    d_periods.as_device_ptr(),
+                    n_combos,
+                    fv,
+                    out_ptr
+                ))?;
+            }
+            return Ok(None);
+        }
+
+        if kernel == F64Kernel::Fisher {
+            let F64Inputs::HighLow { high, low } = inputs else {
+                return Err(CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: "fisher needs resident high and low series".into(),
+                });
+            };
+            let rows_u32 =
+                u32::try_from(rows).map_err(|_| CudaF64IndicatorError::InvalidInput {
+                    indicator,
+                    reason: format!("Fisher row count {rows} exceeds the CUDA grid ABI"),
+                })?;
+            let grid = GridSize::x(rows_u32);
+            let block = BlockSize::x(32);
+            self.validate_launch(grid, block)?;
+            unsafe {
+                let high = cust::memory::DevicePointer::<f64>::from_raw(high.device_ptr());
+                let low = cust::memory::DevicePointer::<f64>::from_raw(low.device_ptr());
+                launch!(func<<<grid, block, fisher_shared_bytes, stream>>>(
+                    high,
+                    low,
+                    n,
+                    d_periods.as_device_ptr(),
+                    n_combos,
+                    fv,
+                    out_ptr
+                ))?;
+            }
+            return Ok(None);
+        }
 
         if kernel.is_sequential() && kernel != F64Kernel::Cci {
             // One thread per column, walking bars in CPU order.
@@ -5175,7 +23175,7 @@ impl CudaF64Indicators {
                     ))?;
                 },
             }
-            return Ok(());
+            return Ok(None);
         }
 
         if kernel == F64Kernel::Cci {
@@ -5189,7 +23189,7 @@ impl CudaF64Indicators {
                         indicator,
                         reason: "cci needs a single price series (the CPU source, hlc3 by default)"
                             .into(),
-                    })
+                    });
                 }
             };
             let scratch = unsafe { DeviceBuffer::<f64>::uninitialized(rows * cols)? };
@@ -5214,10 +23214,7 @@ impl CudaF64Indicators {
                 ))?;
             }
 
-            let grid2 = GridSize::xy(
-                ((cols as u32) + BAR_BLOCK_X - 1) / BAR_BLOCK_X,
-                rows as u32,
-            );
+            let grid2 = GridSize::xy(((cols as u32) + BAR_BLOCK_X - 1) / BAR_BLOCK_X, rows as u32);
             let block2 = BlockSize::x(BAR_BLOCK_X);
             self.validate_launch(grid2, block2)?;
             unsafe {
@@ -5232,17 +23229,11 @@ impl CudaF64Indicators {
                     out_ptr
                 ))?;
             }
-            // The scratch must outlive the launch; synchronising here is the
-            // simple, obviously-correct way to guarantee that.
-            self.stream.synchronize()?;
-            return Ok(());
+            return Ok(Some(scratch));
         }
 
         // Parallel over (combo, bar): roc, mom, willr.
-        let grid = GridSize::xy(
-            ((cols as u32) + BAR_BLOCK_X - 1) / BAR_BLOCK_X,
-            rows as u32,
-        );
+        let grid = GridSize::xy(((cols as u32) + BAR_BLOCK_X - 1) / BAR_BLOCK_X, rows as u32);
         let block = BlockSize::x(BAR_BLOCK_X);
         self.validate_launch(grid, block)?;
 
@@ -5298,7 +23289,7 @@ impl CudaF64Indicators {
                 return Err(CudaF64IndicatorError::InvalidInput {
                     indicator,
                     reason: "timestamped inputs are only accepted by the sequential lane".into(),
-                })
+                });
             }
             // shard 1: every indicator that asks for these two shapes carries
             // state across bars, so none of them has a bar-parallel kernel.
@@ -5311,7 +23302,7 @@ impl CudaF64Indicators {
                     indicator,
                     reason: "(open, close, volume) inputs are only accepted by the sequential lane"
                         .into(),
-                })
+                });
             }
             // closer 5, round 2: every indicator that asks for the full bar
             // carries state across bars, so none of them has a bar-parallel
@@ -5323,7 +23314,7 @@ impl CudaF64Indicators {
                     reason: "(open, high, low, close, volume) inputs are only accepted by the \
                              sequential lane"
                         .into(),
-                })
+                });
             }
             F64Inputs::HighLowVolume { .. } | F64Inputs::Hlcv { .. } => {
                 return Err(CudaF64IndicatorError::InvalidInput {
@@ -5331,24 +23322,265 @@ impl CudaF64Indicators {
                     reason: "(high, low, volume) and (high, low, close, volume) inputs are only \
                              accepted by the sequential lane"
                         .into(),
-                })
+                });
             }
             // shard 3: same reason. `aso` carries a running mean across bars.
             F64Inputs::Ohlc4 { .. } => {
                 return Err(CudaF64IndicatorError::InvalidInput {
                     indicator,
-                    reason: "(open, high, low, close) inputs are only accepted by the sequential lane"
-                        .into(),
-                })
+                    reason:
+                        "(open, high, low, close) inputs are only accepted by the sequential lane"
+                            .into(),
+                });
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fwma_v2_admission_bound_and_bar_parallel_launch_are_closed() {
+        const FWMA_CUDA_SOURCE: &str =
+            include_str!("../../kernels/cuda/moving_averages/fwma_kernel.cu");
+        const WRAPPER_SOURCE: &str = include_str!("neoethos_f64_wrapper.rs");
+        assert_eq!(FWMA_F64_MAX_PERIOD, 254);
+        assert_eq!(F64Kernel::Fwma.max_period(), Some(FWMA_F64_MAX_PERIOD));
+        assert!(!F64Kernel::Fwma.is_sequential());
+        assert!(
+            CudaF64Indicators::validate_fwma_periods_v2(F64Kernel::Fwma, &[1, 2, 254], 254, 0,)
+                .is_ok()
+        );
+        let leading_infinity = [f64::INFINITY, 1.0, 2.0, 3.0];
+        let cpu_first = leading_infinity
+            .iter()
+            .position(|value| value.is_finite())
+            .unwrap();
+        assert_eq!(cpu_first, 1);
+        assert!(
+            CudaF64Indicators::validate_fwma_periods_v2(
+                F64Kernel::Fwma,
+                &[leading_infinity.len() as i32 - 1],
+                leading_infinity.len(),
+                cpu_first,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            CudaF64Indicators::validate_fwma_periods_v2(
+                F64Kernel::Fwma,
+                &[leading_infinity.len() as i32],
+                leading_infinity.len(),
+                cpu_first,
+            ),
+            Err(CudaF64IndicatorError::InvalidInput {
+                indicator: "fwma",
+                ..
+            })
+        ));
+        assert!(matches!(
+            CudaF64Indicators::validate_fwma_periods_v2(F64Kernel::Fwma, &[5], 9, 5),
+            Err(CudaF64IndicatorError::InvalidInput {
+                indicator: "fwma",
+                ..
+            })
+        ));
+        assert!(matches!(
+            CudaF64Indicators::validate_fwma_periods_v2(F64Kernel::Fwma, &[0], 9, 0),
+            Err(CudaF64IndicatorError::InvalidInput {
+                indicator: "fwma",
+                ..
+            })
+        ));
+        assert!(
+            CudaF64Indicators::validate_fwma_periods_v2(F64Kernel::Sma, &[255], 255, 0).is_ok()
+        );
+        assert!(FWMA_CUDA_SOURCE.contains("#define FWMA_MAX_PERIOD_F64 254"));
+        assert!(FWMA_CUDA_SOURCE.contains("const int combo = blockIdx.y;"));
+        assert!(
+            FWMA_CUDA_SOURCE.contains("const int index = blockIdx.x * blockDim.x + threadIdx.x;")
+        );
+        assert!(FWMA_CUDA_SOURCE.contains("__shared__ fwma_dd_f64_v2 weights"));
+        assert!(FWMA_CUDA_SOURCE.contains("__syncthreads();"));
+
+        let production = WRAPPER_SOURCE
+            .split("#[cfg(test)]")
+            .next()
+            .expect("wrapper retains production source");
+        let sweep = production
+            .split("pub fn sweep(")
+            .nth(1)
+            .expect("compatibility sweep source")
+            .split("pub fn sweep_resident_v3(")
+            .next()
+            .unwrap();
+        let resident = production
+            .split("pub fn sweep_resident_v3(")
+            .nth(1)
+            .expect("resident sweep source")
+            .split("fn launch_chunk(")
+            .next()
+            .unwrap();
+        for (name, source, max_token, allocation_token) in [
+            (
+                "compatibility",
+                sweep,
+                "if let Some(max) = kernel.max_period()",
+                "DeviceBuffer::<f64>::uninitialized(output_elems)",
+            ),
+            (
+                "resident",
+                resident,
+                "if let Some(maximum) = kernel.max_period()",
+                "DeviceBuffer::<f64>::uninitialized_async(output_elements",
+            ),
+        ] {
+            let generic = source.find("period {bad} is not >= 1").unwrap();
+            let maximum = source.find(max_token).unwrap();
+            let fwma = source
+                .find("Self::validate_fwma_periods_v2(kernel, periods, cols, first_valid)?")
+                .unwrap();
+            let allocation = source.find(allocation_token).unwrap();
+            assert!(
+                generic < maximum && maximum < fwma && fwma < allocation,
+                "{name} FWMA admission must close before allocation"
+            );
+        }
+    }
+
+    #[test]
+    fn fisher_v2_bound_shared_extent_and_one_block_launch_are_closed() {
+        const WRAPPER_SOURCE: &str = include_str!("neoethos_f64_wrapper.rs");
+        assert_eq!(FISHER_F64_MAX_PERIOD, 1024);
+        assert_eq!(F64Kernel::Fisher.max_period(), Some(FISHER_F64_MAX_PERIOD));
+        assert!(F64Kernel::Fisher.is_sequential());
+        assert_eq!(
+            CudaF64Indicators::fisher_shared_bytes_for_max_period_v2(1024).unwrap(),
+            2 * (1024 + 1) * std::mem::size_of::<i32>() as u32
+        );
+        assert!(matches!(
+            CudaF64Indicators::fisher_shared_bytes_for_max_period_v2(1025),
+            Err(CudaF64IndicatorError::PeriodTooLarge {
+                indicator: "fisher",
+                period: 1025,
+                max: 1024,
+            })
+        ));
+        assert_eq!(
+            CudaF64Indicators::fisher_shared_bytes_for_periods_v2(
+                F64Kernel::Fisher,
+                &[9, 50, 1024],
+            )
+            .unwrap(),
+            8200
+        );
+        assert_eq!(
+            CudaF64Indicators::fisher_shared_bytes_for_periods_v2(F64Kernel::Sma, &[1025]).unwrap(),
+            0
+        );
+
+        let all_outputs = WRAPPER_SOURCE
+            .split("pub fn fisher_all_outputs(")
+            .nth(1)
+            .expect("Fisher full-pair source remains present")
+            .split("/// Launch the canonical FBEO")
+            .next()
+            .unwrap();
+        let too_large = all_outputs
+            .find("if period > FISHER_F64_MAX_PERIOD")
+            .unwrap();
+        let period_allocation = all_outputs
+            .find("let mut period_values = Vec::with_capacity(rows);")
+            .unwrap();
+        let device_allocation = all_outputs
+            .find("let d_periods = DeviceBuffer::from_slice(&period_values)?;")
+            .unwrap();
+        let module_lookup = all_outputs
+            .find("let module = self.module_for(F64Kernel::Fisher)?;")
+            .unwrap();
+        assert!(
+            too_large < period_allocation
+                && period_allocation < device_allocation
+                && device_allocation < module_lookup
+        );
+        assert!(all_outputs.contains("let grid = GridSize::x(rows_u32);"));
+        assert!(all_outputs.contains("let block = BlockSize::x(32);"));
+        assert!(
+            all_outputs.contains("launch!(function<<<grid, block, fisher_shared_bytes, stream>>>")
+        );
+
+        let launch_chunk = WRAPPER_SOURCE
+            .split("fn launch_chunk(")
+            .nth(1)
+            .expect("generic primary launch source remains present")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(launch_chunk.contains("if kernel == F64Kernel::Fisher"));
+        assert!(launch_chunk.contains("let grid = GridSize::x(rows_u32);"));
+        assert!(launch_chunk.contains("let block = BlockSize::x(32);"));
+        assert!(
+            launch_chunk.contains("launch!(func<<<grid, block, fisher_shared_bytes, stream>>>")
+        );
+    }
+
+    #[test]
+    fn cci_cycle_v9_period_validation_matches_cpu_prepare() {
+        assert!(matches!(
+            CudaF64Indicators::validate_cci_cycle_periods_v9(F64Kernel::CciCycle, &[1], 64),
+            Err(CudaF64IndicatorError::InvalidInput {
+                indicator: "cci_cycle",
+                ..
+            })
+        ));
+        assert!(matches!(
+            CudaF64Indicators::validate_cci_cycle_periods_v9(F64Kernel::CciCycle, &[65], 64),
+            Err(CudaF64IndicatorError::InvalidInput {
+                indicator: "cci_cycle",
+                ..
+            })
+        ));
+        assert!(
+            CudaF64Indicators::validate_cci_cycle_periods_v9(F64Kernel::CciCycle, &[2, 64], 64,)
+                .is_ok()
+        );
+        assert!(CudaF64Indicators::validate_cci_cycle_periods_v9(F64Kernel::Sma, &[1], 64).is_ok());
+        assert_eq!(CCI_CYCLE_PRODUCTION_FACTOR_V9, 0.5);
+        assert!(!CCI_CYCLE_CUSTOM_FACTOR_CUDA_SUPPORTED_V9);
+    }
+
+    #[test]
+    fn epma_v1_rejects_singular_uncertified_and_short_requests_before_launch() {
+        assert!(
+            CudaF64Indicators::validate_epma_periods_v1(F64Kernel::Epma, &[14, 30, 260], 265, 0,)
+                .is_ok()
+        );
+        assert!(matches!(
+            CudaF64Indicators::validate_epma_periods_v1(F64Kernel::Epma, &[6], 64, 0),
+            Err(CudaF64IndicatorError::InvalidInput {
+                indicator: "epma",
+                ..
+            })
+        ));
+        assert!(matches!(
+            CudaF64Indicators::validate_epma_periods_v1(F64Kernel::Epma, &[261], 400, 0),
+            Err(CudaF64IndicatorError::PeriodTooLarge {
+                indicator: "epma",
+                period: 261,
+                max: 260,
+            })
+        ));
+        assert!(matches!(
+            CudaF64Indicators::validate_epma_periods_v1(F64Kernel::Epma, &[30], 34, 0),
+            Err(CudaF64IndicatorError::InvalidInput {
+                indicator: "epma",
+                ..
+            })
+        ));
+    }
 
     /// Every variant resolves to a distinct `*_f64` entry point, and none of
     /// them can be mistaken for an f32 symbol. Runs without a card.
@@ -5413,6 +23645,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn census_window_kernels_consume_requested_anchor() {
+        assert!(!F64Kernel::Adosc.is_period_invariant());
+        assert!(!F64Kernel::Ao.is_period_invariant());
+        assert!(!F64Kernel::Apo.is_period_invariant());
+        assert!(!F64Kernel::AtrPercentile.is_period_invariant());
+        assert!(!F64Kernel::CciCycle.is_period_invariant());
+        assert!(!F64Kernel::GarmanKlassVolatility.is_period_invariant());
+        assert!(!F64Kernel::HalfCausalEstimator.is_period_invariant());
+    }
+
+    #[test]
+    fn hce_v2_registry_ratio_resolver_and_scratch_are_frozen() {
+        assert_eq!(
+            [7, 20, 21, 50, 100, 200].map(CudaF64Indicators::resolve_hce_registry_ratio_v2),
+            [
+                Some((2, 7)),
+                Some((5, 20)),
+                Some((5, 21)),
+                Some((13, 50)),
+                Some((25, 100)),
+                Some((50, 200)),
+            ]
+        );
+        assert_eq!(CudaF64Indicators::resolve_hce_registry_ratio_v2(22), None);
+        assert_eq!(HCE_V2_SCRATCH_F64_ELEMS, 74_880);
+        assert_eq!(HCE_V2_SCRATCH_I32_ELEMS, 2_880);
+        assert_eq!(
+            F64Kernel::HalfCausalEstimator.max_period(),
+            Some(HCE_V2_MAX_ANCHOR)
+        );
+    }
+
     /// Each kernel that carries a fixed per-thread ring must state its bound,
     /// and the host bound must equal the `#define` in the .cu. A period between
     /// the two would overrun a per-thread array on the device.
@@ -5420,8 +23685,15 @@ mod tests {
     fn ring_bounds_are_stated_once() {
         assert_eq!(MFI_MAX_PERIOD, 512);
         assert_eq!(ADXR_MAX_PERIOD, 512);
+        assert_eq!(CCI_CYCLE_MAX_LENGTH, 200);
         assert_eq!(F64Kernel::Mfi.max_period(), Some(MFI_MAX_PERIOD));
         assert_eq!(F64Kernel::Adxr.max_period(), Some(ADXR_MAX_PERIOD));
+        assert_eq!(F64Kernel::CciCycle.max_period(), Some(CCI_CYCLE_MAX_LENGTH));
+        assert_eq!(HCE_V2_MAX_ANCHOR, 200);
+        assert_eq!(
+            F64Kernel::HalfCausalEstimator.max_period(),
+            Some(HCE_V2_MAX_ANCHOR)
+        );
         assert_eq!(S2_RING_MAX_PERIOD, 512);
         // shard 1's four rings. Each is the length of a fixed per-thread array
         // in the indicator's own .cu, so the host constant and the `#define`
@@ -5439,6 +23711,10 @@ mod tests {
         // backwards.
         assert_eq!(EHMA_MAX_PERIOD, 512);
         assert_eq!(F64Kernel::Ehma.max_period(), Some(EHMA_MAX_PERIOD));
+        // FRAMA's four 513-slot half deques represent every index in an
+        // evenized 1024-row window without a full/empty ring alias.
+        assert_eq!(FRAMA_MAX_WINDOW, 1024);
+        assert_eq!(F64Kernel::Frama.max_period(), Some(FRAMA_MAX_WINDOW));
         // closer 6, round 3: two weight vectors built once per thread rather
         // than per bar -- `logarithmic_moving_average`'s logarithmic weights
         // and `wave_smoother`'s sin/cos wave weights. The .cu `#define` and the
@@ -5460,7 +23736,21 @@ mod tests {
         assert_eq!(DMA_MAX_PERIOD, 4160);
         assert_eq!(F64Kernel::CoraWave.max_period(), Some(CORA_WAVE_MAX_PERIOD));
         assert_eq!(F64Kernel::Dma.max_period(), Some(DMA_MAX_PERIOD));
-        // Every declared bound must be one of the three constants above. A
+        assert_eq!(FVG_TRAILING_STOP_MAX_SMOOTHING, 200);
+        assert_eq!(
+            F64Kernel::FvgTrailingStop.max_period(),
+            Some(FVG_TRAILING_STOP_MAX_SMOOTHING)
+        );
+        // NWE uses its own 500-sample Gaussian/residual storage.  It is not a
+        // rounded member of the shared 512-sized ring family, so keep the
+        // compiled-kernel contract visible here instead of silently accepting
+        // an otherwise unexplained literal from `max_period`.
+        assert_eq!(NWE_MAX_LOOKBACK, 500);
+        assert_eq!(
+            F64Kernel::NadarayaWatsonEnvelope.max_period(),
+            Some(NWE_MAX_LOOKBACK)
+        );
+        // Every declared bound must be one of the stated constants above. A
         // kernel that invents its own number would compile and then overrun a
         // local array for periods between the two values.
         for &k in F64Kernel::ALL {
@@ -5468,16 +23758,20 @@ mod tests {
                 assert!(
                     m == MFI_MAX_PERIOD
                         || m == ADXR_MAX_PERIOD
+                        || m == CCI_CYCLE_MAX_LENGTH
                         || m == S2_RING_MAX_PERIOD
                         || m == CHOP_MAX_PERIOD
                         || m == HMA_MAX_PERIOD
                         || m == EDCF_MAX_PERIOD
                         || m == ALMA_MAX_PERIOD
                         || m == EHMA_MAX_PERIOD
+                        || m == FRAMA_MAX_WINDOW
                         || m == LMA_MAX_PERIOD
                         || m == WS_MAX_PERIOD
                         || m == CORA_WAVE_MAX_PERIOD
-                        || m == DMA_MAX_PERIOD,
+                        || m == DMA_MAX_PERIOD
+                        || m == FVG_TRAILING_STOP_MAX_SMOOTHING
+                        || m == NWE_MAX_LOOKBACK,
                     "{}: period bound {m} is not one of the stated ring constants",
                     k.indicator_id()
                 );

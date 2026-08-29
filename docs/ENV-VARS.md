@@ -1,6 +1,6 @@
 # NeoEthos environment variables — `NEOETHOS_BOT_*` reference
 
-**Owner**: Κωνσταντίνος · **Status**: living document · **Last update**: 2026-05-29 (F-313)
+**Owner**: Κωνσταντίνος · **Status**: living document · **Last update**: 2026-08-25
 
 This file documents every `NEOETHOS_BOT_*` environment variable the backend
 consults at startup or while wiring runtime overrides. The list was
@@ -32,7 +32,6 @@ path regardless of what config.yaml says.
 
 | Variable | Type | Default | Purpose |
 |---|---|---|---|
-| `NEOETHOS_BOT_AUTO_ENABLE_RLLIB` | bool (`1`/`true`) | unset | Force-enable RLLib agent path even when `models.use_rllib_agent` is `false` in config.yaml. |
 | `NEOETHOS_BOT_BASE_TIMEFRAME` | string (`M5`, `H1`, `D1`, ...) | inherited from config | Override base timeframe for the next Discovery/Training run. |
 | `NEOETHOS_BOT_CALIBRATION_METHOD` | `"platt"` / `"isotonic"` / `"none"` | inherited | Override probability-calibration method used by the meta layer. |
 | `NEOETHOS_BOT_CALIBRATION_MIN_ROWS` | usize | inherited | Minimum row count before calibration kicks in. Lower it for tiny-dataset smoke tests. |
@@ -59,11 +58,15 @@ path regardless of what config.yaml says.
 | `NEOETHOS_BOT_REGIME_ROUTER_ENABLED` | bool | inherited | Force-enable / disable the regime router. |
 | `NEOETHOS_BOT_REGIME_ROUTER_MIN_MODELS` | usize | inherited | Minimum loaded models the regime router requires before routing. |
 | `NEOETHOS_BOT_REGIME_TREND_MODELS` | comma-list | inherited | Override `models.regime_trend_models`. |
-| `NEOETHOS_BOT_RLLIB_NUM_WORKERS` | usize | inherited | Worker count for the RLLib trainer. |
 | `NEOETHOS_BOT_SYMBOL` | string (`EURUSD`, `EUR/USD`, ...) | inherited | Override the symbol the next Discovery/Training run targets. |
 | `NEOETHOS_BOT_TRAIN_HOLDOUT_PCT` | f64 (`0.0`–`1.0`) | inherited | Hold-out fraction the training orchestrator carves off for the WFA val set. |
 | `NEOETHOS_BOT_TREE_DEVICE` | `"cpu"` / `"cuda"` / `"vulkan"` | inherited | Compute device used by the tree models (LightGBM / XGBoost / CatBoost). Independent of `NEOETHOS_BOT_DEVICE` so the operator can keep deep models on GPU while pinning tree models to CPU (or vice versa). |
-| `NEOETHOS_BOT_USE_RLLIB_AGENT` | bool | inherited | Override `models.use_rllib_agent`. |
+
+RLlib/Ray is not a NeoEthos runtime backend. The former RLlib environment
+variables have no runtime reader and are not compatibility aliases for rlkit.
+Legacy YAML keys remain readable only to produce the versioned, fail-closed
+migration error; set `use_rllib_agent: false`, `auto_enable_rllib: false`, and
+`rllib_num_workers: 0`, then use `use_rl_agent: true` for native rlkit DQN.
 
 ## Deprecation candidates
 
@@ -73,7 +76,6 @@ editor surface:
 
 | Variable | Replacement |
 |---|---|
-| `NEOETHOS_BOT_AUTO_ENABLE_RLLIB` | `models.use_rllib_agent` |
 | `NEOETHOS_BOT_PROP_SEARCH_*` | `search.prop_firm.*` |
 
 Operators should migrate scripts away from these variables; the env-var

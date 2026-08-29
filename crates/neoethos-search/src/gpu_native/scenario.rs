@@ -258,14 +258,13 @@ pub fn perturb_factor(counter: u64, draw: u64, amplitude: f64) -> f64 {
 /// never computed from any perturbation at all — the worst kind of wrong, since
 /// every downstream number stays plausible.
 ///
-/// The f32 narrowing is deliberate and matches the device exactly: thresholds
-/// and weights are `f32` in both lanes, the factor is `f64` in both, and the
-/// product is formed in `f64` and narrowed once. Stops stay `f64` throughout.
+/// Thresholds, weights and stops remain f64 in both host and device contracts.
+/// No host perturbation may narrow a shared strategy parameter before launch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerturbedGene {
-    pub long_threshold: f32,
-    pub short_threshold: f32,
-    pub weights: Vec<f32>,
+    pub long_threshold: f64,
+    pub short_threshold: f64,
+    pub weights: Vec<f64>,
     pub sl_pips: f64,
     pub tp_pips: f64,
 }
@@ -275,29 +274,22 @@ pub struct PerturbedGene {
 /// `weights` is the gene's own CSR term window, not the whole population array.
 pub fn perturbed_gene(
     counter: u64,
-    long_threshold: f32,
-    short_threshold: f32,
-    weights: &[f32],
+    long_threshold: f64,
+    short_threshold: f64,
+    weights: &[f64],
     sl_pips: f64,
     tp_pips: f64,
 ) -> PerturbedGene {
     let term_count = weights.len() as u64;
-    let long = (f64::from(long_threshold)
-        * perturb_factor(counter, DRAW_LONG_THRESHOLD, MC_THRESHOLD_AMPLITUDE))
-        as f32;
-    let short = (f64::from(short_threshold)
-        * perturb_factor(counter, DRAW_SHORT_THRESHOLD, MC_THRESHOLD_AMPLITUDE))
-        as f32;
+    let long =
+        long_threshold * perturb_factor(counter, DRAW_LONG_THRESHOLD, MC_THRESHOLD_AMPLITUDE);
+    let short =
+        short_threshold * perturb_factor(counter, DRAW_SHORT_THRESHOLD, MC_THRESHOLD_AMPLITUDE);
     let perturbed_weights = weights
         .iter()
         .enumerate()
         .map(|(term, weight)| {
-            (f64::from(*weight)
-                * perturb_factor(
-                    counter,
-                    DRAW_WEIGHT_BASE + term as u64,
-                    MC_WEIGHT_AMPLITUDE,
-                )) as f32
+            *weight * perturb_factor(counter, DRAW_WEIGHT_BASE + term as u64, MC_WEIGHT_AMPLITUDE)
         })
         .collect();
     // The finite-and-positive guard mirrors the host screen's, and the device's:
@@ -521,9 +513,8 @@ pub fn cpu_mirror_unsupported(scenario: &ScenarioDescriptor, bars: usize) -> Opt
 mod tests {
     use super::*;
 
-    const KERNEL: &str = include_str!(
-        "../../../neoethos-gpu-cuda/native/prototype_b_population.cu"
-    );
+    const KERNEL: &str =
+        include_str!("../../../neoethos-gpu-cuda/native/prototype_b_population.cu");
 
     fn kernel_constant(name: &str) -> String {
         let line = KERNEL
@@ -565,7 +556,10 @@ mod tests {
     fn the_fixed_point_scales_match_the_kernel() {
         assert_eq!(kernel_constant("kTicksPerPip"), "1000.0");
         assert_eq!(kernel_constant("kMicrosPerUnit"), "1000000.0");
-        assert_eq!(kernel_constant("kNoTickOverride"), NO_TICK_OVERRIDE.to_string());
+        assert_eq!(
+            kernel_constant("kNoTickOverride"),
+            NO_TICK_OVERRIDE.to_string()
+        );
         assert_eq!(
             kernel_constant("kNoMicroOverride"),
             NO_MICRO_OVERRIDE.to_string()
@@ -583,7 +577,10 @@ mod tests {
         assert_eq!(commission_micros_exact(3.5), Some(3_500_000));
 
         // And the round trip is the SAME division the device performs.
-        assert_eq!(f64::from(spread_ticks_exact(1.4).unwrap()) / TICKS_PER_PIP, 1.4);
+        assert_eq!(
+            f64::from(spread_ticks_exact(1.4).unwrap()) / TICKS_PER_PIP,
+            1.4
+        );
         assert_eq!(
             commission_micros_exact(3.5).unwrap() as f64 / MICROS_PER_UNIT,
             3.5
@@ -695,7 +692,12 @@ mod tests {
         // No index may be reused, or two parameters would move together.
         let used: Vec<u64> = (0..3)
             .map(|t| DRAW_WEIGHT_BASE + t)
-            .chain([DRAW_LONG_THRESHOLD, DRAW_SHORT_THRESHOLD, draw_stop(3), draw_target(3)])
+            .chain([
+                DRAW_LONG_THRESHOLD,
+                DRAW_SHORT_THRESHOLD,
+                draw_stop(3),
+                draw_target(3),
+            ])
             .collect();
         let mut sorted = used.clone();
         sorted.sort_unstable();
@@ -743,7 +745,11 @@ mod tests {
         // Past the end of the gene array: an out-of-bounds read of thresholds
         // and CSR offsets that would still produce a metric row.
         let bad_gene = vec![base_scenario(5, 0, bars)];
-        assert!(validate_scenarios(&bad_gene, 2, bars).unwrap_err().contains("gene 5"));
+        assert!(
+            validate_scenarios(&bad_gene, 2, bars)
+                .unwrap_err()
+                .contains("gene 5")
+        );
 
         // Past the end of the series.
         let mut long_window = base_scenario(0, 0, bars);
@@ -752,7 +758,11 @@ mod tests {
 
         let mut unknown = base_scenario(0, 0, bars);
         unknown.scenario_type = 9;
-        assert!(validate_scenarios(&[unknown], 1, bars).unwrap_err().contains("type 9"));
+        assert!(
+            validate_scenarios(&[unknown], 1, bars)
+                .unwrap_err()
+                .contains("type 9")
+        );
 
         assert!(validate_scenarios(&[], 1, bars).is_err());
     }
@@ -762,7 +772,13 @@ mod tests {
     fn the_cpu_mirror_refuses_only_what_it_cannot_reproduce() {
         let bars = 1_000;
         // Cost and device-perturbation scenarios ARE reproducible on the CPU.
-        assert!(cpu_mirror_unsupported(&cost_scenario(0, 0, bars, Some(2_000), Some(7_000_000)), bars).is_none());
+        assert!(
+            cpu_mirror_unsupported(
+                &cost_scenario(0, 0, bars, Some(2_000), Some(7_000_000)),
+                bars
+            )
+            .is_none()
+        );
         assert!(cpu_mirror_unsupported(&perturb_scenario(0, 0, bars, 99), bars).is_none());
 
         // A sub-window is not, and it says so instead of walking the whole
@@ -774,7 +790,11 @@ mod tests {
 
         let mut slipped = base_scenario(0, 0, bars);
         slipped.slippage_ticks = 5;
-        assert!(cpu_mirror_unsupported(&slipped, bars).unwrap().contains("slippage"));
+        assert!(
+            cpu_mirror_unsupported(&slipped, bars)
+                .unwrap()
+                .contains("slippage")
+        );
     }
 
     /// The default must be the shipped behaviour, whatever else is true.

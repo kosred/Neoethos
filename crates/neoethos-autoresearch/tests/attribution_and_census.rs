@@ -102,7 +102,9 @@ fn two_slot_sweep(survivor_row_hash: &str) -> (SweepEvidence, Vec<f64>, Vec<f64>
     let sweep = SweepId(1);
     let (outlier_bytes, outlier_series) = matrix_for(11);
     let (survivor_bytes, survivor_series) = matrix_for(22);
-    let period_keys: Vec<i64> = (0..survivor_series.len() as i64).map(|i| 24_300 + i).collect();
+    let period_keys: Vec<i64> = (0..survivor_series.len() as i64)
+        .map(|i| 24_300 + i)
+        .collect();
 
     let evidence = SweepEvidence {
         sweep,

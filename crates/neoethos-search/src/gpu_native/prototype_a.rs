@@ -12,7 +12,7 @@ use std::ops::Range;
 #[cfg(feature = "gpu")]
 pub use crate::gpu_native::prototype_a_engine::create_prototype_a_engine;
 
-pub const PROTOTYPE_A_UPLOAD_SCHEMA_VERSION: u32 = 1;
+pub const PROTOTYPE_A_UPLOAD_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PrototypeAUploadEnvelope<T> {
@@ -26,7 +26,7 @@ pub struct PrototypeADatasetUpload {
     pub high: Vec<f64>,
     pub low: Vec<f64>,
     /// Feature-major contiguous `[feature][bar]` values.
-    pub indicators: Vec<f32>,
+    pub indicators: Vec<f64>,
     pub feature_count: usize,
     pub months: Vec<i64>,
     pub days: Vec<i64>,
@@ -91,15 +91,15 @@ pub struct PrototypeAGeneUpload {
     pub candidate_ids: Vec<u64>,
     pub offsets: Vec<i32>,
     pub indices: Vec<i32>,
-    pub weights: Vec<f32>,
-    pub long_thresholds: Vec<f32>,
-    pub short_thresholds: Vec<f32>,
+    pub weights: Vec<f64>,
+    pub long_thresholds: Vec<f64>,
+    pub short_thresholds: Vec<f64>,
     pub stop_pips: Vec<f64>,
     pub target_pips: Vec<f64>,
     pub stop_vol_multipliers: Vec<f64>,
     pub smc_flags: Vec<[i8; 11]>,
-    pub smc_weights: [f32; 11],
-    pub gate_threshold: f32,
+    pub smc_weights: [f64; 11],
+    pub gate_threshold: f64,
 }
 
 impl PrototypeAGeneUpload {
@@ -696,23 +696,25 @@ mod tests {
         use crate::gpu_native::engine::{BacktestEngine, DeviceFilterPolicy};
         use crate::gpu_native::population_fixture::TinyPopulationFixture;
 
+        if std::env::var("NEOETHOS_RUN_CUDA_SEARCH_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIPPED direct_prototype_a_engine_is_resident_and_matches_cpu_fixture — set \
+                 NEOETHOS_RUN_CUDA_SEARCH_TESTS=1 on a real GPU host"
+            );
+            return;
+        }
+
         let fixture = TinyPopulationFixture::new(4, 128, 4);
         let reference = fixture
-            .evaluate(
+            .evaluate_test_oracle(
                 EvaluationBackend::CPU_CANONICAL,
                 &CpuStrategyAuditContext::validation_reference(91),
             )
             .unwrap();
         let (dataset, genes, scenarios) = fixture.prototype_a_uploads();
 
-        let mut engine = match create_prototype_a_engine(None, 9001, 2) {
-            Ok(engine) => engine,
-            Err(error) if is_known_no_adapter_error(&error.to_string()) => {
-                eprintln!("Prototype A direct GPU test skipped: {error}");
-                return;
-            }
-            Err(error) => panic!("Prototype A engine creation failed: {error}"),
-        };
+        let mut engine = create_prototype_a_engine(None, 9001, 2)
+            .unwrap_or_else(|error| panic!("Prototype A engine creation failed: {error}"));
         let dataset_handle = engine.upload_dataset(&dataset.encode().unwrap()).unwrap();
         assert!(matches!(
             engine.upload_dataset(&dataset.encode().unwrap()),

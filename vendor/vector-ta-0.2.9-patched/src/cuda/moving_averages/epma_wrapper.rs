@@ -1,6 +1,4 @@
-#![cfg(feature = "cuda")]
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::types::PyDictMethods;
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::epma::{EpmaBatchRange, EpmaParams};
@@ -8,16 +6,16 @@ use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
 use cust::memory::{
-    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info,
 };
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 const EPMA_TILE: u32 = 8;
@@ -112,12 +110,6 @@ impl CudaEpma {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/epma_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("epma_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -277,6 +269,31 @@ impl CudaEpma {
         combos
     }
 
+    fn validate_weight_sum(period: usize, offset: usize) -> Result<(), CudaEpmaError> {
+        let width = i128::try_from(period.saturating_sub(1)).map_err(|_| {
+            CudaEpmaError::InvalidInput(format!(
+                "period {period}, offset {offset} exceeds the exact weight-sum domain"
+            ))
+        })?;
+        let offset = i128::try_from(offset).map_err(|_| {
+            CudaEpmaError::InvalidInput("offset exceeds the exact weight-sum domain".into())
+        })?;
+        let c0 = 2_i128 - offset;
+        let twice_sum = width
+            .checked_mul(2_i128 * c0 + width - 1_i128)
+            .ok_or_else(|| {
+                CudaEpmaError::InvalidInput(
+                    "EPMA integer weight sum overflowed before launch".into(),
+                )
+            })?;
+        if twice_sum & 1_i128 != 0 || twice_sum / 2_i128 == 0 {
+            return Err(CudaEpmaError::InvalidInput(format!(
+                "period {period} with offset {offset} has a singular integer weight sum"
+            )));
+        }
+        Ok(())
+    }
+
     fn prepare_batch_inputs(
         data_f32: &[f32],
         sweep: &EpmaBatchRange,
@@ -313,6 +330,7 @@ impl CudaEpma {
                     offset, period
                 )));
             }
+            Self::validate_weight_sum(period, offset)?;
             if period > series_len {
                 return Err(CudaEpmaError::InvalidInput(format!(
                     "period {} exceeds data length {}",
@@ -619,6 +637,7 @@ impl CudaEpma {
                 offset, period
             )));
         }
+        Self::validate_weight_sum(period, offset)?;
 
         let mut first_valids = vec![0i32; cols];
         let needed = period + offset + 1;
@@ -666,6 +685,7 @@ impl CudaEpma {
                 offset, period
             )));
         }
+        Self::validate_weight_sum(period, offset)?;
 
         let block_x = match self.policy.many_series {
             ManySeriesKernelPolicy::Auto => 256,
@@ -825,25 +845,30 @@ impl CudaEpma {
     }
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl super::alma_wrapper::DeviceArrayF32 {
-    pub fn cai_v3_dict<'py>(
-        &self,
-        py: pyo3::Python<'py>,
-    ) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
-        let d = pyo3::types::PyDict::new(py);
-        let ptr = self.buf.as_device_ptr().as_raw() as usize;
-        let row_stride = self
-            .cols
-            .checked_mul(std::mem::size_of::<f32>())
-            .unwrap_or(0);
-        let col_stride = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("strides", (row_stride as isize, col_stride as isize))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("data", (ptr, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn singular_weight_sum_is_rejected_before_epma_cuda_allocation() {
+        let data = vec![1.0_f32; 64];
+        let sweep = EpmaBatchRange {
+            period: (6, 6, 0),
+            offset: (4, 4, 0),
+        };
+        assert!(matches!(
+            CudaEpma::prepare_batch_inputs(&data, &sweep),
+            Err(CudaEpmaError::InvalidInput(reason)) if reason.contains("singular integer weight sum")
+        ));
+
+        let params = EpmaParams {
+            period: Some(6),
+            offset: Some(4),
+        };
+        assert!(matches!(
+            CudaEpma::prepare_many_series_inputs(&data, 1, data.len(), &params),
+            Err(CudaEpmaError::InvalidInput(reason)) if reason.contains("singular integer weight sum")
+        ));
     }
 }
 

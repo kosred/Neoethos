@@ -40,7 +40,9 @@ mod tests {
             symbol: symbol.to_string(),
             base_tf: base_tf.to_string(),
             higher_tfs: vec!["H1".to_string()],
-            source: StrategySource::Gene { id: "stub".to_string() },
+            source: StrategySource::Gene {
+                id: "stub".to_string(),
+            },
             mode: TradeMode::PropFirm,
         }
     }
@@ -68,14 +70,30 @@ mod tests {
         let mut price = 1.0000;
         for _ in 0..20 {
             let next = price + 0.0005;
-            bars.push(bar(symbol, tf, ts, price, next + 0.0002, price - 0.0002, next));
+            bars.push(bar(
+                symbol,
+                tf,
+                ts,
+                price,
+                next + 0.0002,
+                price - 0.0002,
+                next,
+            ));
             price = next;
             ts += 60_000;
         }
         // Falling leg: back down past the entry to force a reversal/stop.
         for _ in 0..20 {
             let next = price - 0.0005;
-            bars.push(bar(symbol, tf, ts, price, price + 0.0002, next - 0.0002, next));
+            bars.push(bar(
+                symbol,
+                tf,
+                ts,
+                price,
+                price + 0.0002,
+                next - 0.0002,
+                next,
+            ));
             price = next;
             ts += 60_000;
         }
@@ -99,7 +117,10 @@ mod tests {
 
         // Every bar processed; the momentum stub fired on base-TF bars.
         assert_eq!(stats.bars_processed, bars.len());
-        assert!(stats.signals_evaluated > 0, "stub signal should evaluate on base-TF bars");
+        assert!(
+            stats.signals_evaluated > 0,
+            "stub signal should evaluate on base-TF bars"
+        );
         // The up-then-down ramp must have opened at least one position and then
         // closed it (reversal or SL/TP) — proving the full open→manage→close path.
         assert!(stats.positions_opened > 0, "expected at least one open");
@@ -129,7 +150,10 @@ mod tests {
         let stats = replay(&mut engine, &bars);
 
         assert_eq!(stats.bars_processed, 10);
-        assert_eq!(stats.signals_evaluated, 0, "H4 is not the base TF → no signal");
+        assert_eq!(
+            stats.signals_evaluated, 0,
+            "H4 is not the base TF → no signal"
+        );
         assert_eq!(stats.positions_opened, 0);
     }
 
@@ -137,10 +161,8 @@ mod tests {
     fn risk_gate_blocks_opens_over_the_cap() {
         // Two symbols, both base M1, both ramping up so each wants to open. With
         // a 1-position cap, the second symbol's open must be blocked.
-        let registry = PortfolioRegistry::from_entries(vec![
-            entry("EURUSD", "M1"),
-            entry("GBPUSD", "M1"),
-        ]);
+        let registry =
+            PortfolioRegistry::from_entries(vec![entry("EURUSD", "M1"), entry("GBPUSD", "M1")]);
         let mut engine = AutonomousEngine::new(
             registry,
             MomentumStubSignal::new(2),
@@ -155,13 +177,35 @@ mod tests {
         let mut price = 1.0;
         for i in 0..12i64 {
             let next = price + 0.001;
-            bars.push(bar("EURUSD", "M1", i * 60_000, price, next + 0.0002, price, next));
-            bars.push(bar("GBPUSD", "M1", i * 60_000, price, next + 0.0002, price, next));
+            bars.push(bar(
+                "EURUSD",
+                "M1",
+                i * 60_000,
+                price,
+                next + 0.0002,
+                price,
+                next,
+            ));
+            bars.push(bar(
+                "GBPUSD",
+                "M1",
+                i * 60_000,
+                price,
+                next + 0.0002,
+                price,
+                next,
+            ));
             price = next;
         }
         let stats = replay(&mut engine, &bars);
 
-        assert!(stats.intents_blocked > 0, "the 1-position cap must block the 2nd symbol's open");
-        assert!(stats.open_positions <= 1, "cap must hold open positions at 1");
+        assert!(
+            stats.intents_blocked > 0,
+            "the 1-position cap must block the 2nd symbol's open"
+        );
+        assert!(
+            stats.open_positions <= 1,
+            "cap must hold open positions at 1"
+        );
     }
 }

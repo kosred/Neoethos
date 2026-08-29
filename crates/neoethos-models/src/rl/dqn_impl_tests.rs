@@ -9,8 +9,33 @@
 use super::*;
 
 use ndarray::{Array1, Array2};
-use polars::prelude::NamedFrom;
+use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame};
+use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
 use std::path::PathBuf;
+
+#[cfg(feature = "reinforcement-learning-cuda")]
+use candle_core::Tensor;
+
+fn typed_frame(columns: Vec<(&str, Vec<f64>)>) -> Result<FeatureFrame> {
+    let rows = columns.first().map_or(0, |(_, values)| values.len());
+    let columns = columns
+        .into_iter()
+        .map(|(name, values)| {
+            FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+        neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+        columns,
+    )
+}
+
+fn one_worker_lease() -> CpuLease {
+    let width = WorkerLimit::new(1).expect("one worker");
+    CpuPermitBroker::new(width)
+        .acquire(CpuPermitRequest::local(width))
+        .expect("isolated DQN test lease")
+}
 
 /// Serializes the tests that read or mutate the process-global
 /// `NEOETHOS_BOT_DQN_TRAIN_PRECISION` env var. Rust runs tests in parallel
@@ -198,28 +223,70 @@ fn runtime_hints_are_normalized() {
 
 #[cfg(feature = "reinforcement-learning")]
 #[test]
-fn auto_policy_uses_cpu_when_cuda_backend_is_unavailable() {
-    let (device, effective_policy, effective_backend) =
-        resolve_rl_training_device("auto").expect("auto policy should resolve");
+fn native_dqn_training_prefers_requested_cuda_over_fallback_runtime_state() {
+    let mut artifact = TradingRlArtifact::default();
+    artifact.requested_device_policy = Some("gpu:0".to_string());
+    artifact.effective_device_policy = Some("cpu".to_string());
+    artifact.device_policy = "cpu".to_string();
 
-    #[cfg(not(feature = "reinforcement-learning-cuda"))]
-    {
+    assert_eq!(artifact_requested_device_policy(&artifact), "gpu:0");
+}
+
+#[cfg(feature = "reinforcement-learning")]
+#[test]
+fn auto_policy_uses_cpu_only_when_no_nvidia_device_is_visible() {
+    let visible_nvidia_devices = crate::tree_models::config::nvidia_gpu_count();
+    let resolved = resolve_rl_training_device("auto");
+    if visible_nvidia_devices == 0 {
+        let (device, effective_policy, effective_backend) =
+            resolved.expect("Auto without NVIDIA must preserve normal CPU operation");
         assert!(matches!(device, Device::Cpu));
         assert_eq!(effective_policy, "cpu");
         assert_eq!(effective_backend, "rlkit_cpu");
+        return;
     }
 
     #[cfg(feature = "reinforcement-learning-cuda")]
     {
+        let (device, effective_policy, effective_backend) =
+            resolved.expect("Auto with NVIDIA must initialize CUDA or fail the test");
         let _ = device;
-        assert!(
-            matches!(effective_policy.as_str(), "cpu") || effective_policy.starts_with("cuda:")
-        );
-        assert!(matches!(
-            effective_backend.as_str(),
-            "rlkit_cpu" | "rlkit_cuda"
-        ));
+        assert_eq!(effective_policy, "cuda:0");
+        assert_eq!(effective_backend, "rlkit_cuda");
     }
+    #[cfg(not(feature = "reinforcement-learning-cuda"))]
+    {
+        let error = resolved.expect_err("Auto with NVIDIA cannot use a CUDA-less build");
+        assert!(error.to_string().contains("no usable CUDA backend"));
+    }
+}
+
+#[cfg(feature = "reinforcement-learning-cuda")]
+#[test]
+fn rl_cuda_tensor_launch_real_kernel() {
+    let (device, effective_policy, effective_backend) =
+        resolve_rl_training_device("gpu:0").expect("mandatory RL CUDA device creation");
+    assert_eq!(effective_policy, "cuda:0");
+    assert_eq!(effective_backend, "rlkit_cuda");
+
+    let input = Tensor::new(&[[1.0_f32, 2.0], [3.0, 4.0]], &device).expect("upload RL CUDA tensor");
+    let sum_of_squares = input
+        .sqr()
+        .and_then(|squared| squared.sum_all())
+        .and_then(|sum| sum.to_scalar::<f32>())
+        .expect("launch and read back RL CUDA tensor kernel");
+    assert_eq!(sum_of_squares, 30.0);
+}
+
+#[cfg(feature = "reinforcement-learning-cuda")]
+#[test]
+fn explicit_rl_cuda_inference_device_is_fail_loud() {
+    let err = resolve_rl_inference_device("gpu:9999")
+        .expect_err("missing explicit CUDA ordinal must fail instead of selecting CPU");
+    assert!(
+        err.to_string().contains("requested ordinal 9999")
+            || err.to_string().contains("initialize RL CUDA device 9999")
+    );
 }
 
 #[cfg(all(
@@ -227,20 +294,21 @@ fn auto_policy_uses_cpu_when_cuda_backend_is_unavailable() {
     not(feature = "reinforcement-learning-cuda")
 ))]
 #[test]
-fn explicit_gpu_policy_falls_back_to_cpu_without_cuda_support() {
-    let (device, policy, backend) =
-        resolve_rl_training_device("rocm:0").expect("gpu policy should degrade to cpu");
-    assert!(matches!(device, Device::Cpu));
-    assert_eq!(policy, "cpu");
-    assert_eq!(backend, "rlkit_cpu");
+fn explicit_gpu_policy_fails_without_cuda_support() {
+    let err = resolve_rl_training_device("gpu:0")
+        .expect_err("explicit GPU policy must not degrade to CPU");
+    assert!(
+        err.to_string().contains("no usable CUDA backend")
+            || err.to_string().contains("no NVIDIA device is visible")
+    );
 }
 
 #[test]
-fn normalize_rl_device_policy_accepts_vendor_neutral_gpu_tokens() {
+fn normalize_rl_device_policy_accepts_only_cuda_vendor_tokens() {
     assert_eq!(normalize_rl_device_policy("CUDA:1"), "gpu:1");
-    assert_eq!(normalize_rl_device_policy("rocm:2"), "gpu:2");
-    assert_eq!(normalize_rl_device_policy("metal:0"), "gpu:0");
-    assert_eq!(normalize_rl_device_policy("vulkan:3"), "gpu:3");
+    assert_eq!(normalize_rl_device_policy("rocm:2"), "rocm:2");
+    assert_eq!(normalize_rl_device_policy("metal:0"), "metal:0");
+    assert_eq!(normalize_rl_device_policy("vulkan:3"), "vulkan:3");
     assert_eq!(normalize_rl_device_policy("nvidia"), "gpu");
 }
 
@@ -254,10 +322,9 @@ fn normalize_rl_device_policy_edge_cases() {
     assert_eq!(normalize_rl_device_policy("CUDA:0"), "gpu:0");
     assert_eq!(normalize_rl_device_policy("CuDa:0"), "gpu:0");
 
-    // Bare lower-case vendor name (no colon, no index) — vendor is in
-    // the recognised set, so it collapses to the canonical "gpu" token
-    // meaning "pick a default GPU device".
-    assert_eq!(normalize_rl_device_policy("rocm"), "gpu");
+    // Other GPU vendors remain intact so the fallible CUDA resolver can reject
+    // them instead of silently binding an NVIDIA ordinal.
+    assert_eq!(normalize_rl_device_policy("rocm"), "rocm");
 
     // CPU pass-through: the literal "cpu" token is canonical and must
     // survive all of: lowercase, uppercase, surrounding whitespace.
@@ -273,9 +340,8 @@ fn normalize_rl_device_policy_edge_cases() {
     // Contract: an internal space inside the vendor token ("cuda :0")
     // is NOT a recognised form — `trim()` only removes leading/trailing
     // whitespace, the literal "cuda :0" does not match any of the
-    // vendor prefixes, and the RL whitelist then rewrites it to "auto"
-    // (strict whitelist semantics specific to the RL normaliser).
-    assert_eq!(normalize_rl_device_policy("cuda :0"), "auto");
+    // vendor prefixes, and remains invalid for the fallible resolver.
+    assert_eq!(normalize_rl_device_policy("cuda :0"), "cuda :0");
 
     // Empty input defaults to "auto" — let the runtime pick a device.
     assert_eq!(normalize_rl_device_policy(""), "auto");
@@ -285,23 +351,17 @@ fn normalize_rl_device_policy_edge_cases() {
     // Observation (NOT a bug): the normaliser performs NO bounds-check
     // on the index suffix. "cuda:99" yields "gpu:99" even if the host
     // has fewer GPUs, and "cuda:" (empty index) yields the syntactically
-    // odd "gpu:". The downstream GPU dispatch layer is responsible for
-    // rejecting indices that don't map to a physical device; this
-    // normaliser only handles vendor-alias collapsing.
+    // odd raw "cuda:". The downstream fallible resolver rejects it.
     assert_eq!(normalize_rl_device_policy("cuda:99"), "gpu:99");
-    assert_eq!(normalize_rl_device_policy("cuda:"), "gpu:");
+    assert_eq!(normalize_rl_device_policy("cuda:"), "cuda:");
 
-    // RL-specific extension: `wgpu` (with or without index) is in the
-    // extra-prefix list passed to the shared helper, so it normalises
-    // to the canonical "gpu" / "gpu:N" form.
-    assert_eq!(normalize_rl_device_policy("wgpu"), "gpu");
-    assert_eq!(normalize_rl_device_policy("wgpu:2"), "gpu:2");
+    // WGPU is not CUDA and must remain rejectable.
+    assert_eq!(normalize_rl_device_policy("wgpu"), "wgpu");
+    assert_eq!(normalize_rl_device_policy("wgpu:2"), "wgpu:2");
 
-    // Unknown vendor tokens are forced to "auto" by the RL whitelist
-    // (the shared helper would return them lowercased-but-unchanged,
-    // but the RL wrapper layers strict validation on top).
-    assert_eq!(normalize_rl_device_policy("tpu"), "auto");
-    assert_eq!(normalize_rl_device_policy("nonsense"), "auto");
+    // Unknown input is preserved so validation fails loudly.
+    assert_eq!(normalize_rl_device_policy("tpu"), "tpu");
+    assert_eq!(normalize_rl_device_policy("nonsense"), "nonsense");
 }
 
 #[test]
@@ -1627,8 +1687,9 @@ fn preprocess_runtime_state_applies_persisted_feature_scaler() {
     // other transform, this test will catch it because the formula
     // is checked, not the result.
     let mut learner = TradingReinforcementLearner::new();
-    let means = vec![1.0_f32, 2.0];
-    let stds = vec![2.0_f32, 4.0];
+    learner.train_args.state_dim = 2;
+    let means = vec![1.0_f64, 2.0];
+    let stds = vec![2.0_f64, 4.0];
     learner.feature_scaler = Some(FeatureScaler {
         means: means.clone(),
         stds: stds.clone(),
@@ -1641,7 +1702,7 @@ fn preprocess_runtime_state_applies_persisted_feature_scaler() {
     let expected: Vec<f32> = inputs
         .iter()
         .zip(means.iter().zip(stds.iter()))
-        .map(|(x, (mean, std))| (*x - *mean) / *std)
+        .map(|(x, (mean, std))| ((f64::from(*x) - *mean) / *std) as f32)
         .collect();
     assert_eq!(scaled.len(), expected.len());
     for (i, (s, e)) in scaled.iter().zip(expected.iter()).enumerate() {
@@ -1659,8 +1720,8 @@ fn preprocess_runtime_state_applies_persisted_feature_scaler() {
     // Second case with non-trivial mean/std to prove the formula isn't
     // numerically coincidental with the first case (both inputs were
     // chosen to land on z=2.0 above; here z varies per feature).
-    let means2 = vec![0.5_f32, -1.0];
-    let stds2 = vec![0.25_f32, 3.0];
+    let means2 = vec![0.5_f64, -1.0];
+    let stds2 = vec![0.25_f64, 3.0];
     learner.feature_scaler = Some(FeatureScaler {
         means: means2.clone(),
         stds: stds2.clone(),
@@ -1672,7 +1733,7 @@ fn preprocess_runtime_state_applies_persisted_feature_scaler() {
     let expected2: Vec<f32> = inputs2
         .iter()
         .zip(means2.iter().zip(stds2.iter()))
-        .map(|(x, (mean, std))| (*x - *mean) / *std)
+        .map(|(x, (mean, std))| ((f64::from(*x) - *mean) / *std) as f32)
         .collect();
     for (i, (s, e)) in scaled2.iter().zip(expected2.iter()).enumerate() {
         assert!((s - e).abs() < 1e-6, "case 2, feature {i}");
@@ -1712,10 +1773,10 @@ fn predict_runtime_rejects_missing_bounds_before_inference() -> Result<()> {
     learner.fallback_weights = Some(Array2::zeros((3, 1)));
     learner.fallback_bias = Some(Array1::zeros(3));
     learner.training_report = learner.train_args.training_report.clone();
-    let df = DataFrame::new(vec![Series::new("f1".into(), vec![0.0_f64]).into()])?;
+    let frame = typed_frame(vec![("f1", vec![0.0])])?;
 
     let err = learner
-        .predict_runtime(&df)
+        .predict_runtime(&frame, &one_worker_lease())
         .expect_err("missing bounds should fail early");
     assert!(err.to_string().contains("feature bounds"));
     Ok(())

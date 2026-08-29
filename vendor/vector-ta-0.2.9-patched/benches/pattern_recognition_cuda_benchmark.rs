@@ -1,8 +1,8 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 extern crate vector_ta;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use cust::memory::DeviceBuffer;
 use std::time::Duration;
 use vector_ta::cuda::pattern_recognition_wrapper::CudaPatternRecognition;
@@ -70,8 +70,6 @@ fn bench_pattern_recognition_cuda(c: &mut Criterion) {
     let row_map = native_row_map();
     let rows = list_patterns().len();
     let cols = len;
-    let words_per_row = cols.div_ceil(64);
-
     let cuda = CudaPatternRecognition::new(0).expect("cuda runtime");
     let d_open = DeviceBuffer::from_slice(open.as_slice()).expect("d_open");
     let d_high = DeviceBuffer::from_slice(high.as_slice()).expect("d_high");
@@ -119,20 +117,6 @@ fn bench_pattern_recognition_cuda(c: &mut Criterion) {
                     .compute_native_matrix_host(&features, rows, cols, row_map.as_slice())
                     .expect("matrix host");
                 black_box(out.len());
-            })
-        },
-    );
-
-    group.bench_function(
-        BenchmarkId::new("pack_u8_to_u64_device", format!("{rows}x{cols}")),
-        |b| {
-            b.iter(|| {
-                let mut words = unsafe { DeviceBuffer::<u64>::uninitialized(rows * words_per_row) }
-                    .expect("pack alloc");
-                cuda.pack_matrix_u8_device_into(&matrix, rows, cols, &mut words)
-                    .expect("pack");
-                cuda.synchronize().expect("pack sync");
-                black_box(words.len());
             })
         },
     );
@@ -191,24 +175,6 @@ fn bench_pattern_recognition_cuda(c: &mut Criterion) {
                     .expect("device inputs f32");
                 cuda.synchronize().expect("device inputs f32 sync");
                 black_box((out.rows, out.cols, out.buf.len()));
-            })
-        },
-    );
-
-    group.bench_function(
-        BenchmarkId::new(
-            "end_to_end_device_inputs_packed_u64",
-            format!("{rows}x{cols}"),
-        ),
-        |b| {
-            b.iter(|| {
-                let out = cuda
-                    .compute_native_matrix_bitmask_u64_device_from_device_inputs(
-                        &d_open, &d_high, &d_low, &d_close, len,
-                    )
-                    .expect("device inputs packed u64");
-                cuda.synchronize().expect("device inputs packed u64 sync");
-                black_box((out.rows, out.cols, out.words_per_row, out.buf.len()));
             })
         },
     );

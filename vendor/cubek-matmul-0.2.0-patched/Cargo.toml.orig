@@ -1,0 +1,41 @@
+[package]
+authors = ["louisfd <louisfd94@gmail.com>"]
+categories = ["science", "mathematics", "algorithms"]
+description = "CubeK: Matrix Multiplication Kernels"
+edition.workspace = true
+keywords = []
+license.workspace = true
+name = "cubek-matmul"
+readme.workspace = true
+repository = "https://github.com/tracel-ai/cubek/tree/main/crates/cubek-matmul"
+version.workspace = true
+
+[features]
+default = ["std", "cubecl/default"]
+std = ["cubecl/std"]
+
+heavy = []
+extended = ["heavy"]
+full = ["extended"]
+
+cpu-reference = ["dep:cubek-test-utils"]
+
+[dependencies]
+cubek-std = { path = "../cubek-std", version = "0.2.0", default-features = false }
+cubek-test-utils = { path = "../cubek-test-utils", version = "0.2.0", default-features = false, optional = true }
+
+bytemuck = { workspace = true }
+cubecl = { workspace = true, features = ["stdlib"] }
+cubecl-common = { workspace = true }
+half = { workspace = true, features = ["bytemuck"] }
+serde = { workspace = true }
+
+[dev-dependencies]
+cubecl = { workspace = true, features = ["test-runtime"] }
+cubek-matmul = { path = ".", features = ["cpu-reference"] }
+cubek-test-utils = { path = "../cubek-test-utils", version = "0.2.0", default-features = false }
+cubek-quant = { path = "../cubek-quant", version = "0.2.0", features = [
+    "kernels",
+] }
+pretty_assertions = { workspace = true }
+trybuild = "1"

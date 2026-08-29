@@ -1,10 +1,4 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::maaq_wrapper::DeviceArrayF32Maaq;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaMaaq;
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -61,10 +55,6 @@ pub struct MaaqOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MaaqParams {
     pub period: Option<usize>,
     pub fast_period: Option<usize>,
@@ -1135,51 +1125,16 @@ unsafe fn maaq_row_avx512_long(
     maaq_row_scalar(data, first, period, fast_p, slow_p, out)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_output_into_js(
-    data: &[f64],
-    period: usize,
-    fast_period: usize,
-    slow_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = maaq_js(data, period, fast_period, slow_period)?;
-    crate::write_wasm_f64_output("maaq_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = maaq_batch_js(data, config)?;
-    crate::write_wasm_f64_output("maaq_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = maaq_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("maaq_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_maaq_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = MaaqParams {
             period: None,
             fast_period: None,
@@ -1193,8 +1148,8 @@ mod tests {
 
     fn check_maaq_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MaaqInput::from_candles(&candles, "close", MaaqParams::default());
         let result = maaq_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -1222,8 +1177,8 @@ mod tests {
 
     fn check_maaq_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MaaqInput::with_default_candles(&candles);
         match input.data {
             MaaqData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1296,8 +1251,8 @@ mod tests {
 
     fn check_maaq_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = MaaqParams {
             period: Some(11),
             fast_period: Some(2),
@@ -1318,8 +1273,8 @@ mod tests {
 
     fn check_maaq_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MaaqInput::from_candles(
             &candles,
             "close",
@@ -1346,8 +1301,8 @@ mod tests {
 
     fn check_maaq_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 11;
         let fast_p = 2;
         let slow_p = 30;
@@ -1423,8 +1378,8 @@ mod tests {
     fn check_maaq_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_cases = vec![
             MaaqParams::default(),
@@ -1484,21 +1439,39 @@ mod tests {
                 if bits == 0x11111111_11111111 {
                     panic!(
                         "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with params period={:?}, fast_period={:?}, slow_period={:?}",
-                        test_name, val, bits, i, params.period, params.fast_period, params.slow_period
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period,
+                        params.fast_period,
+                        params.slow_period
                     );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
                         "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with params period={:?}, fast_period={:?}, slow_period={:?}",
-                        test_name, val, bits, i, params.period, params.fast_period, params.slow_period
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period,
+                        params.fast_period,
+                        params.slow_period
                     );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
                         "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with params period={:?}, fast_period={:?}, slow_period={:?}",
-                        test_name, val, bits, i, params.period, params.fast_period, params.slow_period
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period,
+                        params.fast_period,
+                        params.slow_period
                     );
                 }
             }
@@ -1527,8 +1500,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = MaaqBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1563,8 +1536,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             ((5, 10, 2), (2, 4, 1), (10, 30, 5)),
@@ -1595,21 +1568,42 @@ mod tests {
                 if bits == 0x11111111_11111111 {
                     panic!(
                         "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (params: period={:?}, fast_period={:?}, slow_period={:?})",
-                        test, val, bits, row, col, params.period, params.fast_period, params.slow_period
+                        test,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        params.period,
+                        params.fast_period,
+                        params.slow_period
                     );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
                         "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (params: period={:?}, fast_period={:?}, slow_period={:?})",
-                        test, val, bits, row, col, params.period, params.fast_period, params.slow_period
+                        test,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        params.period,
+                        params.fast_period,
+                        params.slow_period
                     );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
                         "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (params: period={:?}, fast_period={:?}, slow_period={:?})",
-                        test, val, bits, row, col, params.period, params.fast_period, params.slow_period
+                        test,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        params.period,
+                        params.fast_period,
+                        params.slow_period
                     );
                 }
             }
@@ -1920,7 +1914,6 @@ mod tests {
     #[cfg(feature = "proptest")]
     generate_all_maaq_tests!(check_maaq_property);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_maaq_into_matches_api() -> Result<(), Box<dyn Error>> {
         let mut data: Vec<f64> = vec![f64::NAN, f64::NAN, f64::NAN];
@@ -1947,491 +1940,6 @@ mod tests {
     }
 }
 
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub struct PrimaryCtxGuard {
-    dev: i32,
-    ctx: cust::sys::CUcontext,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl PrimaryCtxGuard {
-    fn new(device_id: u32) -> Result<Self, cust::error::CudaError> {
-        unsafe {
-            let mut ctx: cust::sys::CUcontext = core::ptr::null_mut();
-            let dev = device_id as i32;
-            let rc = cust::sys::cuDevicePrimaryCtxRetain(&mut ctx as *mut _, dev);
-            if rc != cust::sys::CUresult::CUDA_SUCCESS {
-                return Err(cust::error::CudaError::UnknownError);
-            }
-            Ok(PrimaryCtxGuard { dev, ctx })
-        }
-    }
-    #[inline]
-    unsafe fn push_current(&self) {
-        let _ = cust::sys::cuCtxSetCurrent(self.ctx);
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl Drop for PrimaryCtxGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = cust::sys::cuDevicePrimaryCtxRelease_v2(self.dev);
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Maaq", unsendable)]
-pub struct DeviceArrayF32MaaqPy {
-    pub(crate) inner: Option<DeviceArrayF32Maaq>,
-    device_id: u32,
-    pc_guard: Option<PrimaryCtxGuard>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32MaaqPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = pyo3::types::PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr_val: usize = if inner.rows == 0 || inner.cols == 0 {
-            0
-        } else {
-            inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        Ok((2, self.device_id as i32))
-    }
-
-    #[pyo3(signature=(_stream=None, max_version=None, _dl_device=None, _copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        _stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        _dl_device: Option<pyo3::PyObject>,
-        _copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = _dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = _copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = _stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl Drop for DeviceArrayF32MaaqPy {
-    fn drop(&mut self) {
-        if let Some(ref pc) = self.pc_guard {
-            unsafe {
-                pc.push_current();
-            }
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "maaq")]
-#[pyo3(signature = (data, period, fast_period, slow_period, kernel=None))]
-pub fn maaq_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    fast_period: usize,
-    slow_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = MaaqParams {
-        period: Some(period),
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-    };
-
-    let result_vec: Vec<f64> = if let Ok(slice_in) = data.as_slice() {
-        let input = MaaqInput::from_slice(slice_in, params);
-        py.allow_threads(|| maaq_with_kernel(&input, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    } else {
-        let owned = data.as_array().to_owned();
-        let slice_in = owned.as_slice().expect("owned array should be contiguous");
-        let input = MaaqInput::from_slice(slice_in, params);
-        py.allow_threads(|| maaq_with_kernel(&input, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    };
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "maaq_batch")]
-#[pyo3(signature = (data, period_range, fast_period_range, slow_period_range, kernel=None))]
-pub fn maaq_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = MaaqBatchRange {
-        period: period_range,
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-            maaq_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "maaq_cuda_batch_dev")]
-#[pyo3(signature = (data, period_range, fast_period_range, slow_period_range, device_id=0))]
-pub fn maaq_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: numpy::PyReadonlyArray1<'_, f64>,
-    period_range: (usize, usize, usize),
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32MaaqPy> {
-    use numpy::PyArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data.as_slice()?;
-    let sweep = MaaqBatchRange {
-        period: period_range,
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-    };
-    let data_f32: Vec<f32> = slice_in.iter().map(|&v| v as f32).collect();
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaMaaq::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.maaq_batch_dev_ex(&data_f32, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let pc =
-        PrimaryCtxGuard::new(device_id as u32).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(DeviceArrayF32MaaqPy {
-        inner: Some(inner),
-        device_id: device_id as u32,
-        pc_guard: Some(pc),
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "maaq_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, fast_period, slow_period, device_id=0))]
-pub fn maaq_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    fast_period: usize,
-    slow_period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32MaaqPy> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = MaaqParams {
-        period: Some(period),
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaMaaq::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.maaq_multi_series_one_param_time_major_dev_ex(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let pc =
-        PrimaryCtxGuard::new(device_id as u32).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(DeviceArrayF32MaaqPy {
-        inner: Some(inner),
-        device_id: device_id as u32,
-        pc_guard: Some(pc),
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MaaqStream")]
-pub struct MaaqStreamPy {
-    stream: MaaqStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MaaqStreamPy {
-    #[new]
-    pub fn new(period: usize, fast_period: usize, slow_period: usize) -> PyResult<Self> {
-        let params = MaaqParams {
-            period: Some(period),
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-        };
-        let stream =
-            MaaqStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MaaqBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub fast_period_range: (usize, usize, usize),
-    pub slow_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MaaqBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<MaaqParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_js(
-    data: &[f64],
-    period: usize,
-    fast_period: usize,
-    slow_period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = MaaqParams {
-        period: Some(period),
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-    };
-    let input = MaaqInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    maaq_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_batch_js(data: &[f64], config: JsValue) -> Result<Vec<f64>, JsValue> {
-    let config: MaaqBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let range = MaaqBatchRange {
-        period: config.period_range,
-        fast_period: config.fast_period_range,
-        slow_period: config.slow_period_range,
-    };
-
-    match maaq_batch_with_kernel(data, &range, Kernel::Auto) {
-        Ok(output) => Ok(output.values),
-        Err(e) => Err(JsValue::from_str(&e.to_string())),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = maaq_batch)]
-pub fn maaq_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: MaaqBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let range = MaaqBatchRange {
-        period: config.period_range,
-        fast_period: config.fast_period_range,
-        slow_period: config.slow_period_range,
-    };
-
-    let output = maaq_batch_with_kernel(data, &range, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = MaaqBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    fast_period_start: usize,
-    fast_period_end: usize,
-    fast_period_step: usize,
-    slow_period_start: usize,
-    slow_period_end: usize,
-    slow_period_step: usize,
-) -> Vec<f64> {
-    let range = MaaqBatchRange {
-        period: (period_start, period_end, period_step),
-        fast_period: (fast_period_start, fast_period_end, fast_period_step),
-        slow_period: (slow_period_start, slow_period_end, slow_period_step),
-    };
-
-    let combos = expand_grid(&range);
-    let mut metadata = Vec::with_capacity(combos.len() * 3);
-
-    for params in combos {
-        metadata.push(params.period.unwrap_or(11) as f64);
-        metadata.push(params.fast_period.unwrap_or(2) as f64);
-        metadata.push(params.slow_period.unwrap_or(30) as f64);
-    }
-
-    metadata
-}
-
 #[inline]
 pub fn maaq_into_slice(dst: &mut [f64], input: &MaaqInput, kern: Kernel) -> Result<(), MaaqError> {
     let (data, period, fast_p, slow_p, first, chosen) = maaq_prepare(input, kern)?;
@@ -2453,122 +1961,7 @@ pub fn maaq_into_slice(dst: &mut [f64], input: &MaaqInput, kern: Kernel) -> Resu
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn maaq_into(input: &MaaqInput, out: &mut [f64]) -> Result<(), MaaqError> {
     maaq_into_slice(out, input, Kernel::Auto)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    fast_period: usize,
-    slow_period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to maaq_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-        if fast_period == 0 {
-            return Err(JsValue::from_str("Invalid fast_period"));
-        }
-        if slow_period == 0 {
-            return Err(JsValue::from_str("Invalid slow_period"));
-        }
-
-        let params = MaaqParams {
-            period: Some(period),
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-        };
-        let input = MaaqInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            maaq_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            maaq_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn maaq_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    config: JsValue,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to maaq_batch_into"));
-    }
-
-    let config: MaaqBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let range = MaaqBatchRange {
-            period: config.period_range,
-            fast_period: config.fast_period_range,
-            slow_period: config.slow_period_range,
-        };
-
-        let combos = expand_grid(&range);
-        let total_size = combos.len() * len;
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; total_size];
-            maaq_batch_inner_into(data, &range, Kernel::Auto, false, &mut temp)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
-            maaq_batch_inner_into(data, &range, Kernel::Auto, false, out)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
 }

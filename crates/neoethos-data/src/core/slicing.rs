@@ -151,16 +151,18 @@ mod tests {
         assert!(err.contains("timestamp"), "unexpected error: {err}");
     }
 
-    /// Format-compatibility gate: build a tiny dataset with known
-    /// timestamps, write it to a temp `<root>/symbol=/timeframe=/data.vortex`,
-    /// slice it by a DATE range, write the slice to a second temp root via
-    /// the SAME Vortex writer discover uses, then RELOAD the slice via the
-    /// SAME reader discover uses (`load_symbol_timeframe`) and assert the
-    /// kept rows + span survive the round-trip. This is the gate that
-    /// proves `slice-dataset` output is byte-compatible with discovery.
+    /// Format-compatibility gate: publish a tiny immutable canonical
+    /// generation, slice it by a DATE range, publish the slice as another
+    /// immutable canonical generation, then reopen both through the exact
+    /// identity loader used by discovery.
     #[test]
     fn slice_dataset_round_trips_through_vortex_io() {
-        use crate::{Ohlcv, load_symbol_timeframe, write_symbol_timeframe_vortex};
+        use crate::core::dataset_manifest::ProducerProvenanceEnvelopeV1;
+        use crate::{
+            BarTimestampConvention, CanonicalDatasetIdentity, CanonicalOhlcvPublishRequest,
+            CanonicalTimeframe, CanonicalVolumeRef, Ohlcv, load_dataset_for_identity,
+            publish_canonical_ohlcv_generation,
+        };
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // 10 daily bars, 2020-01-01 00:00 UTC onward (1 day = 86_400_000 ms).
@@ -199,13 +201,34 @@ mod tests {
         ));
         let src_root = tmp.join("src");
         let dst_root = tmp.join("dst");
+        let identity = CanonicalDatasetIdentity::external(
+            "slice-roundtrip-test",
+            "EURUSD",
+            CanonicalTimeframe::D1,
+            BarTimestampConvention::BarOpen,
+        )
+        .expect("canonical D1 identity");
+        let source_provenance = ProducerProvenanceEnvelopeV1::new(
+            "neoethos.data.slice-source-test.v1",
+            b"deterministic-source".to_vec(),
+        )
+        .expect("source provenance");
 
-        // Write the full source through the canonical writer, then reload it
-        // the way the CLI command will (so the slicer sees ms-normalised ts).
-        write_symbol_timeframe_vortex(&src_root, "EURUSD", "D1", &full)
-            .expect("write source vortex");
-        let reloaded_src =
-            load_symbol_timeframe(&src_root, "EURUSD", "D1").expect("reload source vortex");
+        publish_canonical_ohlcv_generation(CanonicalOhlcvPublishRequest {
+            configured_root: &src_root,
+            identity: &identity,
+            expected_generation: None,
+            provenance: &source_provenance,
+            ohlcv: &full,
+            volume: CanonicalVolumeRef::Float64(full.volume.as_deref().expect("source volume")),
+            rows_per_chunk: 4,
+        })
+        .expect("publish source generation");
+        let reloaded_src = load_dataset_for_identity(&src_root, &identity)
+            .expect("reload exact source generation")
+            .frames
+            .remove("D1")
+            .expect("source D1 frame");
         assert_eq!(reloaded_src.len(), n, "source round-trip row count");
 
         // Keep [2020-01-03, 2020-01-07) → bars at day index 2,3,4,5 (4 rows).
@@ -216,11 +239,26 @@ mod tests {
         assert_eq!(slice.len(), 4, "expected 4 kept rows");
         assert_eq!(span, Some((base + 2 * day_ms, base + 5 * day_ms)));
 
-        // Persist the slice and reload it via the SAME discover-facing reader.
-        write_symbol_timeframe_vortex(&dst_root, "EURUSD", "D1", &slice)
-            .expect("write sliced vortex");
-        let reloaded_slice =
-            load_symbol_timeframe(&dst_root, "EURUSD", "D1").expect("reload sliced vortex");
+        let slice_provenance = ProducerProvenanceEnvelopeV1::new(
+            "neoethos.data.slice-output-test.v1",
+            b"source-generation-and-half-open-range-bound".to_vec(),
+        )
+        .expect("slice provenance");
+        publish_canonical_ohlcv_generation(CanonicalOhlcvPublishRequest {
+            configured_root: &dst_root,
+            identity: &identity,
+            expected_generation: None,
+            provenance: &slice_provenance,
+            ohlcv: &slice,
+            volume: CanonicalVolumeRef::Float64(slice.volume.as_deref().expect("slice volume")),
+            rows_per_chunk: 2,
+        })
+        .expect("publish sliced generation");
+        let reloaded_slice = load_dataset_for_identity(&dst_root, &identity)
+            .expect("reload exact sliced generation")
+            .frames
+            .remove("D1")
+            .expect("slice D1 frame");
 
         assert_eq!(reloaded_slice.len(), 4, "reloaded slice row count");
         let ts = reloaded_slice

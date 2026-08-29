@@ -1,27 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -54,10 +36,6 @@ pub struct DiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DiParams {
     pub period: Option<usize>,
 }
@@ -370,7 +348,6 @@ pub fn di_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn di_into(
     input: &DiInput,
     out_plus: &mut [f64],
@@ -583,11 +560,7 @@ unsafe fn di_selected_into<const PLUS: bool>(
         let dp = ch - prev_h;
         let dm = prev_l - cl;
         let inc = if PLUS {
-            if dp > dm && dp > 0.0 {
-                dp
-            } else {
-                0.0
-            }
+            if dp > dm && dp > 0.0 { dp } else { 0.0 }
         } else if dm > dp && dm > 0.0 {
             dm
         } else {
@@ -1538,42 +1511,16 @@ fn true_range(current_high: f64, current_low: f64, prev_close: f64) -> f64 {
     tr1
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn di_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = di_js(high, low, close, period)?;
-    crate::write_wasm_object_f64_outputs("di_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn di_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = di_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("di_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_di_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = DiParams { period: None };
         let input_default = DiInput::from_candles(&candles, default_params);
         let output_default = di_with_kernel(&input_default, kernel)?;
@@ -1588,8 +1535,8 @@ mod tests {
     }
     fn check_di_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = DiParams { period: Some(14) };
         let input = DiInput::from_candles(&candles, params);
         let di_result = di_with_kernel(&input, kernel)?;
@@ -1672,8 +1619,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = DiParams { period: Some(14) };
         let first_input = DiInput::from_candles(&candles, first_params);
         let first_result = di_with_kernel(&first_input, kernel)?;
@@ -1693,8 +1640,8 @@ mod tests {
     }
     fn check_di_accuracy_nan_check(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = DiParams { period: Some(14) };
         let input = DiInput::from_candles(&candles, params);
         let di_result = di_with_kernel(&input, kernel)?;
@@ -1712,8 +1659,8 @@ mod tests {
     fn check_di_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DiParams::default(),
@@ -2082,8 +2029,8 @@ mod tests {
 
     #[test]
     fn test_di_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = DiParams::default();
         let input = DiInput::from_candles(&candles, params);
@@ -2123,8 +2070,8 @@ mod tests {
 
     #[test]
     fn test_di_selected_outputs_match_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DiInput::from_candles(&candles, DiParams::default());
         let baseline = di(&input)?;
         let plus = di_plus_with_kernel(&input, Kernel::Scalar)?;
@@ -2193,8 +2140,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = DiBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -2219,8 +2166,8 @@ mod tests {
     fn check_batch_period_range(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = DiBatchBuilder::new()
             .kernel(kernel)
@@ -2245,8 +2192,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2410,585 +2357,4 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_period_range);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "di")]
-#[pyo3(signature = (high, low, close, period, kernel=None))]
-pub fn di_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = DiParams {
-        period: Some(period),
-    };
-    let input = DiInput::from_slices(high_slice, low_slice, close_slice, params);
-
-    let (plus_vec, minus_vec) = py
-        .allow_threads(|| di_with_kernel(&input, kern).map(|o| (o.plus, o.minus)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((plus_vec.into_pyarray(py), minus_vec.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DiStream")]
-pub struct DiStreamPy {
-    inner: DiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DiStreamPy {
-    #[new]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let params = DiParams {
-            period: Some(period),
-        };
-        let inner = DiStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(DiStreamPy { inner })
-    }
-
-    pub fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.inner.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "di_batch")]
-#[pyo3(signature = (high, low, close, period_range, kernel=None))]
-pub fn di_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = DiBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = high_slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("di: size overflow in rows*cols"))?;
-
-    let out_plus = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_minus = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let pl = unsafe { out_plus.as_slice_mut()? };
-    let mi = unsafe { out_minus.as_slice_mut()? };
-
-    let first = (0..cols)
-        .find(|&i| !(high_slice[i].is_nan() || low_slice[i].is_nan() || close_slice[i].is_nan()))
-        .ok_or_else(|| PyValueError::new_err("di: All values are NaN"))?;
-    let warm: Vec<usize> = combos
-        .iter()
-        .map(|p| first + p.period.unwrap() - 1)
-        .collect();
-
-    unsafe {
-        let plus_mu = std::slice::from_raw_parts_mut(
-            pl.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>,
-            total,
-        );
-        let minus_mu = std::slice::from_raw_parts_mut(
-            mi.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>,
-            total,
-        );
-        init_matrix_prefixes(plus_mu, cols, &warm);
-        init_matrix_prefixes(minus_mu, cols, &warm);
-    }
-
-    let combos = py
-        .allow_threads(|| {
-            let simd = match kern {
-                Kernel::Auto => match detect_best_batch_kernel() {
-                    Kernel::Avx512Batch => Kernel::Avx512,
-                    Kernel::Avx2Batch => Kernel::Avx2,
-                    _ => Kernel::Scalar,
-                },
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                k => k,
-            };
-
-            di_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &sweep,
-                simd,
-                true,
-                pl,
-                mi,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("plus", out_plus.reshape((rows, cols))?)?;
-    dict.set_item("minus", out_minus.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaDi;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::prelude::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::os::raw::c_void;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32DiPy {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32DiPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let itemsize = std::mem::size_of::<f32>();
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "di_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, period_range, device_id=0))]
-pub fn di_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = DiBatchRange {
-        period: period_range,
-    };
-    let (plus_dev, minus_dev, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let res = cuda
-            .di_batch_dev(h, l, c, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((res.0, res.1, res.2, cuda.context_arc(), cuda.device_id()))
-    })?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "plus",
-        Py::new(
-            py,
-            DeviceArrayF32DiPy {
-                inner: plus_dev,
-                ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "minus",
-        Py::new(
-            py,
-            DeviceArrayF32DiPy {
-                inner: minus_dev,
-                ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", h.len())?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "di_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, period, device_id=0))]
-pub fn di_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    close_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h_shape = high_tm_f32.shape();
-    let l_shape = low_tm_f32.shape();
-    let c_shape = close_tm_f32.shape();
-    if h_shape != l_shape || l_shape != c_shape || h_shape.len() != 2 {
-        return Err(PyValueError::new_err(
-            "expected three 2D arrays of same shape",
-        ));
-    }
-    let rows = h_shape[0];
-    let cols = h_shape[1];
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let (pair, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let p = cuda
-            .di_many_series_one_param_time_major_dev(h, l, c, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((p, cuda.context_arc(), cuda.device_id()))
-    })?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "plus",
-        Py::new(
-            py,
-            DeviceArrayF32DiPy {
-                inner: pair.plus,
-                ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "minus",
-        Py::new(
-            py,
-            DeviceArrayF32DiPy {
-                inner: pair.minus,
-                ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("period", period)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DiJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = di)]
-pub fn di_js(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Result<JsValue, JsValue> {
-    let params = DiParams {
-        period: Some(period),
-    };
-    let input = DiInput::from_slices(high, low, close, params);
-    let out = di_with_kernel(&input, crate::utilities::enums::Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let cols = high.len();
-    let total = cols
-        .checked_mul(2)
-        .ok_or_else(|| JsValue::from_str("di_js: size overflow"))?;
-    let mut values = Vec::with_capacity(total);
-    values.extend_from_slice(&out.plus);
-    values.extend_from_slice(&out.minus);
-    let result = DiJsResult {
-        values,
-        rows: 2,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn di_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn di_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn di_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer to di_into"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let params = DiParams {
-            period: Some(period),
-        };
-        let input = DiInput::from_slices(h, l, c, params);
-
-        let DiOutput { plus, minus } =
-            di_with_kernel(&input, crate::utilities::enums::Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let total = len
-            .checked_mul(2)
-            .ok_or_else(|| JsValue::from_str("di_into: size overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        out[..len].copy_from_slice(&plus);
-        out[len..total].copy_from_slice(&minus);
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DiBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub periods: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = di_batch)]
-pub fn di_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: DiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = DiBatchRange {
-        period: cfg.period_range,
-    };
-    let output = di_batch_slice(
-        high,
-        low,
-        close,
-        &sweep,
-        crate::utilities::enums::Kernel::Scalar,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = output
-        .rows
-        .checked_mul(2)
-        .ok_or_else(|| JsValue::from_str("di_batch_unified_js: rows overflow"))?;
-    let cols = output.cols;
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("di_batch_unified_js: size overflow"))?;
-    let mut values = Vec::with_capacity(total);
-
-    for combo_idx in 0..output.rows {
-        let start = combo_idx * cols;
-        values.extend_from_slice(&output.plus[start..start + cols]);
-        values.extend_from_slice(&output.minus[start..start + cols]);
-    }
-
-    let js = DiBatchJsOutput {
-        values,
-        rows,
-        cols,
-        periods: output
-            .combos
-            .iter()
-            .map(|p| p.period.unwrap())
-            .collect::<Vec<_>>(),
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn di_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    plus_ptr: *mut f64,
-    minus_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || plus_ptr.is_null()
-        || minus_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = DiBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let total_size = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("di_batch_into: size overflow"))?;
-
-        let out_plus = std::slice::from_raw_parts_mut(plus_ptr, total_size);
-        let out_minus = std::slice::from_raw_parts_mut(minus_ptr, total_size);
-
-        di_batch_inner_into(
-            high,
-            low,
-            close,
-            &sweep,
-            Kernel::Auto,
-            false,
-            out_plus,
-            out_minus,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

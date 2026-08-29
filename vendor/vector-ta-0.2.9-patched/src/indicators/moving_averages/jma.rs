@@ -1,12 +1,4 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaJma;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::jma_wrapper::DeviceArrayF32Jma;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -57,10 +49,6 @@ pub struct JmaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct JmaParams {
     pub period: Option<usize>,
     pub phase: Option<f64>,
@@ -346,7 +334,6 @@ pub fn jma_with_kernel_into(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn jma_into(input: &JmaInput, out: &mut [f64]) -> Result<(), JmaError> {
     jma_with_kernel_into(input, Kernel::Auto, out)
 }
@@ -1257,72 +1244,18 @@ pub fn expand_grid_jma(r: &JmaBatchRange) -> Vec<JmaParams> {
     expand_grid(r)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_output_into_js(
-    data: &[f64],
-    period: usize,
-    phase: f64,
-    power: u32,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = jma_js(data, period, phase, power)?;
-    crate::write_wasm_f64_output("jma_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    phase_start: f64,
-    phase_end: f64,
-    phase_step: f64,
-    power_start: u32,
-    power_end: u32,
-    power_step: u32,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = jma_batch_js(
-        data,
-        period_start,
-        period_end,
-        period_step,
-        phase_start,
-        phase_end,
-        phase_step,
-        power_start,
-        power_end,
-        power_step,
-    )?;
-    crate::write_wasm_f64_output("jma_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = jma_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("jma_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_jma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = JmaParams {
             period: None,
@@ -1338,8 +1271,8 @@ mod tests {
 
     fn check_jma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = JmaInput::from_candles(&candles, "close", JmaParams::default());
         let result = jma_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -1367,8 +1300,8 @@ mod tests {
 
     fn check_jma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = JmaInput::with_default_candles(&candles);
         match input.data {
             JmaData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1438,8 +1371,8 @@ mod tests {
 
     fn check_jma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = JmaParams {
             period: Some(7),
             phase: None,
@@ -1460,8 +1393,8 @@ mod tests {
 
     fn check_jma_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = JmaInput::from_candles(
             &candles,
             "close",
@@ -1488,8 +1421,8 @@ mod tests {
 
     fn check_jma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 7;
         let phase = 50.0;
         let power = 2;
@@ -1538,8 +1471,8 @@ mod tests {
     fn check_jma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             JmaParams::default(),
@@ -1992,8 +1925,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = JmaBatchBuilder::new()
             .kernel(kernel)
@@ -2025,8 +1958,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let batch_configs = vec![
             (5, 20, 5, 0.0, 100.0, 50.0, 1, 3, 1),
@@ -2063,64 +1996,80 @@ mod tests {
                         "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {}) \
                         in batch config #{}: period_range=({},{},{}), phase_range=({},{},{}), power_range=({},{},{}) \
                         combo params: period={}, phase={}, power={}",
-                        test, val, bits, row, col, val_idx, idx,
-                        config.0, config.1, config.2, config.3, config.4, config.5, config.6, config.7, config.8,
-                        combo.period.unwrap_or(7), combo.phase.unwrap_or(50.0), combo.power.unwrap_or(2)
+                        test,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        val_idx,
+                        idx,
+                        config.0,
+                        config.1,
+                        config.2,
+                        config.3,
+                        config.4,
+                        config.5,
+                        config.6,
+                        config.7,
+                        config.8,
+                        combo.period.unwrap_or(7),
+                        combo.phase.unwrap_or(50.0),
+                        combo.power.unwrap_or(2)
                     );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {}) \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {}) \
                         in batch config #{}: period_range=({},{},{}), phase_range=({},{},{}), power_range=({},{},{}) \
                         combo params: period={}, phase={}, power={}",
-						test,
-						val,
-						bits,
-						row,
-						col,
-						val_idx,
-						idx,
-						config.0,
-						config.1,
-						config.2,
-						config.3,
-						config.4,
-						config.5,
-						config.6,
-						config.7,
-						config.8,
-						combo.period.unwrap_or(7),
-						combo.phase.unwrap_or(50.0),
-						combo.power.unwrap_or(2)
-					);
+                        test,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        val_idx,
+                        idx,
+                        config.0,
+                        config.1,
+                        config.2,
+                        config.3,
+                        config.4,
+                        config.5,
+                        config.6,
+                        config.7,
+                        config.8,
+                        combo.period.unwrap_or(7),
+                        combo.phase.unwrap_or(50.0),
+                        combo.power.unwrap_or(2)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {}) \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {}) \
                         in batch config #{}: period_range=({},{},{}), phase_range=({},{},{}), power_range=({},{},{}) \
                         combo params: period={}, phase={}, power={}",
-						test,
-						val,
-						bits,
-						row,
-						col,
-						val_idx,
-						idx,
-						config.0,
-						config.1,
-						config.2,
-						config.3,
-						config.4,
-						config.5,
-						config.6,
-						config.7,
-						config.8,
-						combo.period.unwrap_or(7),
-						combo.phase.unwrap_or(50.0),
-						combo.power.unwrap_or(2)
-					);
+                        test,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        val_idx,
+                        idx,
+                        config.0,
+                        config.1,
+                        config.2,
+                        config.3,
+                        config.4,
+                        config.5,
+                        config.6,
+                        config.7,
+                        config.8,
+                        combo.period.unwrap_or(7),
+                        combo.phase.unwrap_or(50.0),
+                        combo.power.unwrap_or(2)
+                    );
                 }
             }
         }
@@ -2175,7 +2124,6 @@ mod tests {
 
         let mut out = vec![0.0; data.len()];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             jma_into(&input, &mut out)?;
 
@@ -2190,308 +2138,6 @@ mod tests {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "jma")]
-#[pyo3(signature = (data, period, phase=50.0, power=2, kernel=None))]
-pub fn jma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    phase: f64,
-    power: u32,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = JmaParams {
-        period: Some(period),
-        phase: Some(phase),
-        power: Some(power),
-    };
-    let jma_in = JmaInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| jma_with_kernel(&jma_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "jma_batch")]
-#[pyo3(signature = (data, period_range, phase_range=(50.0, 50.0, 0.0), power_range=(2, 2, 0), kernel=None))]
-pub fn jma_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    phase_range: (f64, f64, f64),
-    power_range: (u32, u32, u32),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = JmaBatchRange {
-        period: period_range,
-        phase: phase_range,
-        power: power_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    if combos.is_empty() {
-        return Err(PyValueError::new_err("Invalid parameter ranges"));
-    }
-
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let (combos_result, _, _) = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            jma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "periods",
-        combos_result
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "phases",
-        combos_result
-            .iter()
-            .map(|p| p.phase.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "powers",
-        combos_result
-            .iter()
-            .map(|p| p.power.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "jma_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, phase_range=(50.0, 50.0, 0.0), power_range=(2, 2, 0), device_id=0))]
-pub fn jma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    phase_range: (f64, f64, f64),
-    power_range: (u32, u32, u32),
-    device_id: usize,
-) -> PyResult<JmaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = JmaBatchRange {
-        period: period_range,
-        phase: phase_range,
-        power: power_range,
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaJma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.jma_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(JmaDeviceArrayF32Py { inner: Some(inner) })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "jma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, period, phase=50.0, power=2, device_id=0))]
-pub fn jma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: PyReadonlyArray2<'_, f32>,
-    period: usize,
-    phase: f64,
-    power: u32,
-    device_id: usize,
-) -> PyResult<JmaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let shape = prices_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("prices matrix must be 2-dimensional"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let prices_flat = prices_tm_f32.as_slice()?;
-    let params = JmaParams {
-        period: Some(period),
-        phase: Some(phase),
-        power: Some(power),
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaJma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.jma_many_series_one_param_time_major_dev(prices_flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(JmaDeviceArrayF32Py { inner: Some(inner) })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct JmaDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32Jma>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl JmaDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        let dev = self.inner.as_ref().map(|h| h.device_id as i32).unwrap_or(0);
-        (2, dev)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "JmaStream")]
-pub struct JmaStreamPy {
-    inner: JmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl JmaStreamPy {
-    #[new]
-    #[pyo3(signature = (period, phase=50.0, power=2))]
-    fn new(period: usize, phase: f64, power: u32) -> PyResult<Self> {
-        let params = JmaParams {
-            period: Some(period),
-            phase: Some(phase),
-            power: Some(power),
-        };
-
-        let stream = JmaStream::try_new(params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-
-        Ok(Self { inner: stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
     }
 }
 
@@ -2510,253 +2156,4 @@ pub fn jma_into_slice(dst: &mut [f64], input: &JmaInput, kern: Kernel) -> Result
     }
 
     jma_with_kernel_into(input, kern, dst)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_js(data: &[f64], period: usize, phase: f64, power: u32) -> Result<Vec<f64>, JsValue> {
-    let params = JmaParams {
-        period: Some(period),
-        phase: Some(phase),
-        power: Some(power),
-    };
-    let input = JmaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    jma_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    phase: f64,
-    power: u32,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to jma_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = JmaParams {
-            period: Some(period),
-            phase: Some(phase),
-            power: Some(power),
-        };
-        let input = JmaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            jma_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            jma_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct JmaBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub phase_range: (f64, f64, f64),
-    pub power_range: (u32, u32, u32),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct JmaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<JmaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = jma_batch)]
-pub fn jma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: JmaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = JmaBatchRange {
-        period: config.period_range,
-        phase: config.phase_range,
-        power: config.power_range,
-    };
-
-    let simd = match detect_best_batch_kernel() {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => Kernel::Scalar,
-    };
-
-    let output = jma_batch_inner(data, &sweep, simd, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = JmaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(since = "1.0.0", note = "Use jma_batch instead")]
-pub fn jma_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    phase_start: f64,
-    phase_end: f64,
-    phase_step: f64,
-    power_start: u32,
-    power_end: u32,
-    power_step: u32,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = JmaBatchRange {
-        period: (period_start, period_end, period_step),
-        phase: (phase_start, phase_end, phase_step),
-        power: (power_start, power_end, power_step),
-    };
-
-    jma_batch_inner(data, &sweep, Kernel::Scalar, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    phase_start: f64,
-    phase_end: f64,
-    phase_step: f64,
-    power_start: u32,
-    power_end: u32,
-    power_step: u32,
-) -> Vec<f64> {
-    let mut metadata = Vec::new();
-
-    let mut current_period = period_start;
-    while current_period <= period_end {
-        let mut current_phase = phase_start;
-        while current_phase <= phase_end || (phase_step == 0.0 && current_phase == phase_start) {
-            let mut current_power = power_start;
-            while current_power <= power_end || (power_step == 0 && current_power == power_start) {
-                metadata.push(current_period as f64);
-                metadata.push(current_phase);
-                metadata.push(current_power as f64);
-
-                if power_step == 0 {
-                    break;
-                }
-                current_power += power_step;
-            }
-            if phase_step == 0.0 {
-                break;
-            }
-            current_phase += phase_step;
-        }
-        if period_step == 0 {
-            break;
-        }
-        current_period += period_step;
-    }
-
-    metadata
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn jma_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    phase_start: f64,
-    phase_end: f64,
-    phase_step: f64,
-    power_start: u32,
-    power_end: u32,
-    power_step: u32,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to jma_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = JmaBatchRange {
-            period: (period_start, period_end, period_step),
-            phase: (phase_start, phase_end, phase_step),
-            power: (power_start, power_end, power_step),
-        };
-
-        let combos = expand_grid_jma(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        jma_batch_inner_into(data, &sweep, Kernel::Scalar, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

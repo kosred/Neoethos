@@ -181,6 +181,12 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut startup_trace = StartupTrace::default();
+    // Linux signal masks are per-thread. SourceSeal must reserve/block its
+    // SIGIO + real-time signal set on the initial thread before Tokio, Tauri,
+    // logging, or any dependency can create another thread.
+    neoethos_data::initialize_source_seal_before_runtime()?;
+    startup_trace.record(StartupEvent::ImportSignalPreflightCompleted)?;
     let raw_args: Vec<String> = std::env::args().collect();
     let args = Args::parse_from(&raw_args);
     // #101 follow-up + #179: the help dialog must fire BEFORE the
@@ -197,7 +203,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
 
     let settings = Settings::from_yaml(&args.config)?;
-    let mut startup_trace = StartupTrace::default();
     startup_trace.record(StartupEvent::ConfigurationLoaded)?;
 
     let parent_cpu_assignment = parse_parent_cpu_assignment(&raw_args)
@@ -596,11 +601,6 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
     let (tx, _rx) = mpsc::channel(1000);
 
     if runtime.auto_discovery {
-        let symbol = symbols
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "EURUSD".to_string());
-        info!("Headless: auto-starting discovery for {}", symbol);
         // ── 2026-08-10, config consolidation ─────────────────────────────
         // This built `DiscoveryConfig::default()`. Every discovery knob the
         // operator had set — population, generations, gates, cost model,
@@ -614,17 +614,38 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
         // NOT quietly fall back to the compiled defaults and run anyway —
         // that is the failure wearing the costume of a choice. The run is
         // refused and the reason is named.
-        let discovery_config = match Settings::from_yaml(&runtime.config_path) {
+        let discovery_setup = match Settings::from_yaml(&runtime.config_path) {
             Ok(settings) => match neoethos_search::DiscoveryConfig::try_from_settings(&settings) {
                 Ok(cfg) => {
-                    info!(
-                        config_path = %runtime.config_path,
-                        population = cfg.population,
-                        generations = cfg.generations,
-                        min_history_years = cfg.runtime_overrides.min_history_years,
-                        "Headless: discovery config resolved from the config file"
-                    );
-                    Some(cfg)
+                    let symbol = settings.system.resolve_symbol();
+                    let base_tf = settings.system.resolve_base_timeframe();
+                    match app_services::discovery::resolve_unique_background_dataset_identity(
+                        &runtime.data_dir,
+                        &symbol,
+                        &base_tf,
+                    ) {
+                        Ok(dataset_identity) => {
+                            let higher_tfs = settings.system.resolve_higher_timeframes(&base_tf);
+                            info!(
+                                config_path = %runtime.config_path,
+                                dataset_identity = %dataset_identity.to_path_component(),
+                                population = cfg.population,
+                                generations = cfg.generations,
+                                min_history_years = cfg.runtime_overrides.min_history_years,
+                                "Headless: discovery config and exact dataset identity resolved"
+                            );
+                            Some((dataset_identity, higher_tfs, cfg))
+                        }
+                        Err(err) => {
+                            error!(
+                                symbol = %symbol,
+                                base_tf = %base_tf,
+                                error = %err,
+                                "Headless: refusing auto-discovery because background selection did not resolve exactly one canonical dataset identity"
+                            );
+                            None
+                        }
+                    }
                 }
                 Err(err) => {
                     error!(
@@ -648,18 +669,30 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
                 None
             }
         };
-        if let Some(discovery_config) = discovery_config {
-            let request = DiscoveryRequest {
-                data_root: runtime.data_dir.clone(),
-                symbol,
-                base_tf: "M1".to_string(),
-                higher_tfs: vec!["M5".to_string(), "M15".to_string(), "H1".to_string()],
-                config: discovery_config,
-                prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
-            };
-            match start_discovery_job(request, tx.clone()) {
-                Ok(_handle) => info!("Headless: discovery job started"),
-                Err(err) => error!("Headless: failed to start discovery: {}", err),
+        if let Some((dataset_identity, higher_tfs, discovery_config)) = discovery_setup {
+            match app_services::discovery::pin_current_discovery_input(
+                &runtime.data_dir,
+                &dataset_identity,
+                &higher_tfs,
+            ) {
+                Ok(pinned_input) => {
+                    let request = DiscoveryRequest {
+                        data_root: runtime.data_dir.clone(),
+                        pinned_input: std::sync::Arc::new(pinned_input),
+                        higher_tfs,
+                        config: discovery_config,
+                        prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
+                    };
+                    match start_discovery_job(request, tx.clone()) {
+                        Ok(_handle) => info!("Headless: discovery job started"),
+                        Err(err) => error!("Headless: failed to start discovery: {}", err),
+                    }
+                }
+                Err(err) => error!(
+                    dataset_identity = %dataset_identity.to_path_component(),
+                    error = %err,
+                    "Headless: exact discovery generations could not be pinned; acquire/refresh data before retrying"
+                ),
             }
         }
     }

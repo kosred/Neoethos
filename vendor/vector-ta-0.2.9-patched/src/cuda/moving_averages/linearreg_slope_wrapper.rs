@@ -1,18 +1,18 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::linearreg_slope::{LinearRegSlopeBatchRange, LinearRegSlopeParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, CopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug)]
@@ -104,7 +104,6 @@ impl CudaLinearregSlope {
         let sm_count = device.get_attribute(DeviceAttribute::MultiprocessorCount)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/linearreg_slope_kernel.ptx"));
         let module = crate::load_cuda_embedded_module!("linearreg_slope_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;

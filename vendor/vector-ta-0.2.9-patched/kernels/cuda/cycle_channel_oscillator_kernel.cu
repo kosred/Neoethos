@@ -161,9 +161,8 @@ extern "C" __global__ void cycle_channel_oscillator_batch_f64(
 // NEOETHOS f64 LANE  --  closer 3
 //
 // CPU reference: src/indicators/cycle_channel_oscillator.rs:594
-// (`cycle_channel_oscillator_with_kernel`). The column this emits is `fast`,
-// which is what `output_id == "value"` resolves to
-// (dispatch/cpu_batch.rs:9950-9952).
+// (`cycle_channel_oscillator_with_kernel`). The preserved primary entry emits
+// canonical `fast`; the full entry above emits canonical `[fast, slow]`.
 //
 // SHAPE: one thread per combo, bars ascending. FORCED sequential -- three
 // interlocking Wilder RMA recurrences (the short MA, the medium MA and the
@@ -172,14 +171,12 @@ extern "C" __global__ void cycle_channel_oscillator_batch_f64(
 // on bars where source, high, low and close are ALL finite, so a bar-parallel
 // form cannot know its own history index.
 //
-// PERIOD-INVARIANT. `compute_cycle_channel_oscillator_batch`
-// (cpu_batch.rs:9968-9979) reads `source`, `short_cycle_length`,
-// `medium_cycle_length`, `short_multiplier` and `medium_multiplier` and NEVER
-// `period`, so five swept periods give five identical CPU columns and this
-// kernel emits five identical rows. Every CPU default is pinned below, and
-// `source` defaults to "close" (:9968) -- which is why this kernel takes the
-// Hlc triple and reads CLOSE where the multi-output entry point above takes a
-// separate `source` pointer.
+// DEFAULT-ONLY PRIMARY ABI. The canonical production planner maps its admitted
+// ratio points into explicit short/medium lengths and launches the full
+// two-output entry point above. This preserved primary entry pins every CPU
+// default below and emits only canonical `fast`; `source` defaults to "close",
+// which is why this kernel takes the HLC triple and reads CLOSE where the full
+// entry point takes a separate `source` pointer.
 //
 // THE DELAY HISTORY IS A RING, NOT THE WHOLE SERIES. The entry point above
 // keeps a `len`-long history per row because it is handed scratch; a lane

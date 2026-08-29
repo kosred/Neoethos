@@ -44,9 +44,7 @@ impl Regime {
     /// strings the pre-unification systems emitted.
     pub fn from_lenient(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "trend" | "trending" | "strong_trend" | "trend_up" | "trend_down" => {
-                Some(Self::Trend)
-            }
+            "trend" | "trending" | "strong_trend" | "trend_up" | "trend_down" => Some(Self::Trend),
             "range" | "ranging" | "sideways" | "mean_revert" => Some(Self::Range),
             "neutral" | "mixed" | "ambiguous" => Some(Self::Neutral),
             _ => None,
@@ -65,8 +63,7 @@ impl Regime {
 pub struct RegimeClassifierVersion(pub u32);
 
 /// Current canonical-classifier schema version.
-pub const REGIME_CLASSIFIER_VERSION_CURRENT: RegimeClassifierVersion =
-    RegimeClassifierVersion(1);
+pub const REGIME_CLASSIFIER_VERSION_CURRENT: RegimeClassifierVersion = RegimeClassifierVersion(1);
 
 // ---------------------------------------------------------------------------
 // Thresholds — single source of truth for the canonical classifier
@@ -164,8 +161,14 @@ mod tests {
 
     #[test]
     fn nan_inputs_collapse_to_neutral() {
-        assert_eq!(infer_regime_canonical(f64::NAN, 0.65, 1.0, 1.0), Regime::Neutral);
-        assert_eq!(infer_regime_canonical(30.0, f64::NAN, 1.0, 1.0), Regime::Neutral);
+        assert_eq!(
+            infer_regime_canonical(f64::NAN, 0.65, 1.0, 1.0),
+            Regime::Neutral
+        );
+        assert_eq!(
+            infer_regime_canonical(30.0, f64::NAN, 1.0, 1.0),
+            Regime::Neutral
+        );
     }
 
     #[test]

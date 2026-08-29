@@ -6,6 +6,15 @@
 
 #![forbid(unsafe_code)]
 
+mod x86_64_v3;
+
+pub use x86_64_v3::{
+    DetectedCpuArchitectureV1, X86_64_V3_REQUIREMENTS_V1, X8664V3FeatureSetV1,
+    X8664V3PreflightErrorCodeV1, X8664V3PreflightErrorV1, X8664V3RequirementV1, X8664V3SnapshotV1,
+    detect_current_x86_64_v3_snapshot_v1, evaluate_x86_64_v3_snapshot_v1,
+    require_current_x86_64_v3_v1,
+};
+
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::error::Error;
@@ -260,12 +269,12 @@ pub fn detected_request_with_parent(parent: Option<WorkerLimit>) -> ExecutionBud
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StartupEvent {
+    ImportSignalPreflightCompleted,
     ConfigurationSeededOrLocated,
     ConfigurationLoaded,
     ParentCpuCapParsed,
     CpuBudgetResolved,
     CpuBudgetInstalled,
-    ImportSignalPreflightCompleted,
     RuntimeSettingsInstalled,
     TokioRuntimeBuilt,
     TauriAsyncRuntimeInstalled,
@@ -275,12 +284,12 @@ pub enum StartupEvent {
 impl StartupEvent {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ImportSignalPreflightCompleted => "import_signal_preflight_completed",
             Self::ConfigurationSeededOrLocated => "configuration_seeded_or_located",
             Self::ConfigurationLoaded => "configuration_loaded",
             Self::ParentCpuCapParsed => "parent_cpu_cap_parsed",
             Self::CpuBudgetResolved => "cpu_budget_resolved",
             Self::CpuBudgetInstalled => "cpu_budget_installed",
-            Self::ImportSignalPreflightCompleted => "import_signal_preflight_completed",
             Self::RuntimeSettingsInstalled => "runtime_settings_installed",
             Self::TokioRuntimeBuilt => "tokio_runtime_built",
             Self::TauriAsyncRuntimeInstalled => "tauri_async_runtime_installed",
@@ -666,6 +675,45 @@ impl CpuPermitRequest {
     }
 }
 
+/// A positive bound on an auxiliary resource pool coordinated with CPU
+/// permits. The resource remains deliberately unnamed so callers can use the
+/// same authority for signal slots, codec slots, device-init slots, or another
+/// bounded one-at-a-time prerequisite without creating a second CPU budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AuxiliarySlotLimit(NonZeroUsize);
+
+impl AuxiliarySlotLimit {
+    pub fn new(value: usize) -> Result<Self, InvalidPositiveCount> {
+        NonZeroUsize::new(value)
+            .map(Self)
+            .ok_or(InvalidPositiveCount {
+                kind: "auxiliary slots",
+            })
+    }
+
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuxiliarySlotRequest {
+    None,
+    One,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompositeAdmissionRequest {
+    pub cpu: CpuPermitRequest,
+    pub auxiliary: AuxiliarySlotRequest,
+}
+
+impl CompositeAdmissionRequest {
+    pub const fn new(cpu: CpuPermitRequest, auxiliary: AuxiliarySlotRequest) -> Self {
+        Self { cpu, auxiliary }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AcquireError {
     ExceedsInstalledLimit { requested: usize, installed: usize },
@@ -746,10 +794,25 @@ struct BrokerState {
     waiters: VecDeque<Waiter>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Waiter {
     id: u64,
     request: CpuPermitRequest,
+    auxiliary_pool: Option<Arc<AuxiliaryPoolInner>>,
+}
+
+struct AuxiliaryPoolInner {
+    limit: AuxiliarySlotLimit,
+    state: Mutex<AuxiliaryPoolState>,
+}
+
+struct AuxiliaryPoolState {
+    free_slots: Vec<usize>,
+}
+
+struct AcquiredResources {
+    cpu_lease: CpuLease,
+    auxiliary_slot: Option<AuxiliarySlotLease>,
 }
 
 impl CpuPermitBroker {
@@ -769,20 +832,7 @@ impl CpuPermitBroker {
 
     pub fn snapshot(&self) -> BrokerSnapshot {
         let state = lock_unpoisoned(&self.inner.state);
-        let queued_children = state
-            .waiters
-            .iter()
-            .filter(|waiter| waiter.request.priority == CpuPriority::Child)
-            .count();
-        let queued_local = state.waiters.len() - queued_children;
-        BrokerSnapshot {
-            installed_limit: self.inner.installed_limit,
-            available_permits: state.available,
-            live_reserved_sum: self.inner.installed_limit.get() - state.available,
-            queued_total: state.waiters.len(),
-            queued_children,
-            queued_local,
-        }
+        broker_snapshot_from_state(&self.inner, &state)
     }
 
     /// True only when the transfer was issued by this exact broker instance.
@@ -797,16 +847,29 @@ impl CpuPermitBroker {
 
     /// Acquire immediately without bypassing an already queued request.
     pub fn try_acquire(&self, request: CpuPermitRequest) -> Result<Option<CpuLease>, AcquireError> {
+        self.try_acquire_resources(request, None)
+            .map(|resources| resources.map(|resources| resources.cpu_lease))
+    }
+
+    fn try_acquire_resources(
+        &self,
+        request: CpuPermitRequest,
+        auxiliary_pool: Option<Arc<AuxiliaryPoolInner>>,
+    ) -> Result<Option<AcquiredResources>, AcquireError> {
         reject_nested_acquisition()?;
         self.validate_width(request.width)?;
         let mut state = lock_unpoisoned(&self.inner.state);
-        if !state.waiters.is_empty() || state.available < request.width.get() {
+        if !state.waiters.is_empty()
+            || state.available < request.width.get()
+            || !auxiliary_slot_available(auxiliary_pool.as_ref())
+        {
             return Ok(None);
         }
-        state.available -= request.width.get();
-        Ok(Some(CpuLease::new(
-            Arc::clone(&self.inner),
-            request.width.get(),
+        Ok(Some(reserve_resources(
+            &self.inner,
+            &mut state,
+            request,
+            auxiliary_pool,
         )))
     }
 
@@ -829,6 +892,16 @@ impl CpuPermitBroker {
         request: CpuPermitRequest,
         cancellation: Option<&CancellationToken>,
     ) -> Result<CpuLease, AcquireError> {
+        self.acquire_resources_inner(request, None, cancellation)
+            .map(|resources| resources.cpu_lease)
+    }
+
+    fn acquire_resources_inner(
+        &self,
+        request: CpuPermitRequest,
+        auxiliary_pool: Option<Arc<AuxiliaryPoolInner>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<AcquiredResources, AcquireError> {
         reject_nested_acquisition()?;
         self.validate_width(request.width)?;
         if let Some(cancellation) = cancellation {
@@ -844,7 +917,11 @@ impl CpuPermitBroker {
             .next_waiter_id
             .checked_add(1)
             .ok_or(AcquireError::WaiterSequenceExhausted)?;
-        state.waiters.push_back(Waiter { id, request });
+        state.waiters.push_back(Waiter {
+            id,
+            request,
+            auxiliary_pool: auxiliary_pool.clone(),
+        });
 
         loop {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -854,11 +931,14 @@ impl CpuPermitBroker {
             }
 
             let eligible = next_eligible_waiter(&state).is_some_and(|waiter| waiter.id == id);
-            if eligible && state.available >= request.width.get() {
+            if eligible
+                && state.available >= request.width.get()
+                && auxiliary_slot_available(auxiliary_pool.as_ref())
+            {
                 remove_waiter(&mut state, id);
-                state.available -= request.width.get();
+                let resources = reserve_resources(&self.inner, &mut state, request, auxiliary_pool);
                 self.inner.changed.notify_all();
-                return Ok(CpuLease::new(Arc::clone(&self.inner), request.width.get()));
+                return Ok(resources);
             }
 
             state = wait_unpoisoned(&self.inner.changed, state);
@@ -880,6 +960,239 @@ impl CpuPermitBroker {
 impl fmt::Debug for CpuPermitBroker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.snapshot().fmt(f)
+    }
+}
+
+fn broker_snapshot_from_state(inner: &BrokerInner, state: &BrokerState) -> BrokerSnapshot {
+    let queued_children = state
+        .waiters
+        .iter()
+        .filter(|waiter| waiter.request.priority == CpuPriority::Child)
+        .count();
+    let queued_local = state.waiters.len() - queued_children;
+    BrokerSnapshot {
+        installed_limit: inner.installed_limit,
+        available_permits: state.available,
+        live_reserved_sum: inner.installed_limit.get() - state.available,
+        queued_total: state.waiters.len(),
+        queued_children,
+        queued_local,
+    }
+}
+
+fn auxiliary_slot_available(pool: Option<&Arc<AuxiliaryPoolInner>>) -> bool {
+    pool.is_none_or(|pool| !lock_unpoisoned(&pool.state).free_slots.is_empty())
+}
+
+fn reserve_resources(
+    broker: &Arc<BrokerInner>,
+    state: &mut BrokerState,
+    request: CpuPermitRequest,
+    auxiliary_pool: Option<Arc<AuxiliaryPoolInner>>,
+) -> AcquiredResources {
+    let auxiliary_slot = auxiliary_pool.map(|pool| {
+        let index = {
+            let mut auxiliary = lock_unpoisoned(&pool.state);
+            auxiliary
+                .free_slots
+                .pop()
+                .expect("an auxiliary slot was checked before reservation")
+        };
+        AuxiliarySlotLease {
+            broker: Arc::clone(broker),
+            pool,
+            index,
+        }
+    });
+    state.available -= request.width.get();
+    AcquiredResources {
+        cpu_lease: CpuLease::new(Arc::clone(broker), request.width.get()),
+        auxiliary_slot,
+    }
+}
+
+/// One CPU broker plus one independently bounded auxiliary pool. Composite
+/// requests join the CPU broker's existing priority/FIFO queue, so they are
+/// coordinated with ordinary [`CpuPermitBroker`] callers. Neither resource is
+/// removed until the selected waiter can receive both in one critical section.
+#[derive(Clone)]
+pub struct CompositeAdmissionAuthority {
+    broker: CpuPermitBroker,
+    auxiliary_pool: Arc<AuxiliaryPoolInner>,
+}
+
+impl CompositeAdmissionAuthority {
+    pub fn new(broker: CpuPermitBroker, auxiliary_limit: AuxiliarySlotLimit) -> Self {
+        let free_slots = (0..auxiliary_limit.get()).rev().collect();
+        Self {
+            broker,
+            auxiliary_pool: Arc::new(AuxiliaryPoolInner {
+                limit: auxiliary_limit,
+                state: Mutex::new(AuxiliaryPoolState { free_slots }),
+            }),
+        }
+    }
+
+    pub fn snapshot(&self) -> CompositeAdmissionSnapshot {
+        let broker_state = lock_unpoisoned(&self.broker.inner.state);
+        let auxiliary_state = lock_unpoisoned(&self.auxiliary_pool.state);
+        let queued_requiring_auxiliary = broker_state
+            .waiters
+            .iter()
+            .filter(|waiter| {
+                waiter
+                    .auxiliary_pool
+                    .as_ref()
+                    .is_some_and(|pool| Arc::ptr_eq(pool, &self.auxiliary_pool))
+            })
+            .count();
+        let available_auxiliary_slots = auxiliary_state.free_slots.len();
+        CompositeAdmissionSnapshot {
+            cpu: broker_snapshot_from_state(&self.broker.inner, &broker_state),
+            auxiliary_limit: self.auxiliary_pool.limit,
+            available_auxiliary_slots,
+            live_auxiliary_slots: self.auxiliary_pool.limit.get() - available_auxiliary_slots,
+            queued_requiring_auxiliary,
+        }
+    }
+
+    pub fn try_acquire(
+        &self,
+        request: CompositeAdmissionRequest,
+    ) -> Result<Option<CompositeAdmissionGrant>, AcquireError> {
+        self.broker
+            .try_acquire_resources(request.cpu, self.requested_pool(request.auxiliary))
+            .map(|resources| resources.map(CompositeAdmissionGrant::from_resources))
+    }
+
+    /// Blocking acquisition for a coordinator or synchronous top-level
+    /// thread. Async runtime workers must queue through such a coordinator.
+    pub fn acquire(
+        &self,
+        request: CompositeAdmissionRequest,
+    ) -> Result<CompositeAdmissionGrant, AcquireError> {
+        self.broker
+            .acquire_resources_inner(request.cpu, self.requested_pool(request.auxiliary), None)
+            .map(CompositeAdmissionGrant::from_resources)
+    }
+
+    pub fn acquire_cancellable(
+        &self,
+        request: CompositeAdmissionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CompositeAdmissionGrant, AcquireError> {
+        self.broker
+            .acquire_resources_inner(
+                request.cpu,
+                self.requested_pool(request.auxiliary),
+                Some(cancellation),
+            )
+            .map(CompositeAdmissionGrant::from_resources)
+    }
+
+    fn requested_pool(&self, request: AuxiliarySlotRequest) -> Option<Arc<AuxiliaryPoolInner>> {
+        match request {
+            AuxiliarySlotRequest::None => None,
+            AuxiliarySlotRequest::One => Some(Arc::clone(&self.auxiliary_pool)),
+        }
+    }
+}
+
+impl fmt::Debug for CompositeAdmissionAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.snapshot().fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompositeAdmissionSnapshot {
+    pub cpu: BrokerSnapshot,
+    pub auxiliary_limit: AuxiliarySlotLimit,
+    pub available_auxiliary_slots: usize,
+    pub live_auxiliary_slots: usize,
+    pub queued_requiring_auxiliary: usize,
+}
+
+/// A grant created only after CPU permits and the optional auxiliary slot were
+/// simultaneously available. The two RAII parts may be retained together or
+/// separated when a caller must release the auxiliary prerequisite earlier
+/// than its CPU reservation.
+#[must_use = "dropping the grant returns its CPU permits and auxiliary slot"]
+pub struct CompositeAdmissionGrant {
+    cpu_lease: CpuLease,
+    auxiliary_slot: Option<AuxiliarySlotLease>,
+}
+
+impl CompositeAdmissionGrant {
+    fn from_resources(resources: AcquiredResources) -> Self {
+        Self {
+            cpu_lease: resources.cpu_lease,
+            auxiliary_slot: resources.auxiliary_slot,
+        }
+    }
+
+    pub fn cpu_lease(&self) -> &CpuLease {
+        &self.cpu_lease
+    }
+
+    pub fn auxiliary_slot(&self) -> Option<&AuxiliarySlotLease> {
+        self.auxiliary_slot.as_ref()
+    }
+
+    pub fn into_parts(self) -> (CpuLease, Option<AuxiliarySlotLease>) {
+        (self.cpu_lease, self.auxiliary_slot)
+    }
+}
+
+impl fmt::Debug for CompositeAdmissionGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompositeAdmissionGrant")
+            .field("cpu_width", &self.cpu_lease.width())
+            .field(
+                "auxiliary_slot",
+                &self.auxiliary_slot.as_ref().map(AuxiliarySlotLease::index),
+            )
+            .finish()
+    }
+}
+
+/// One non-cloneable slot from the authority's bounded auxiliary pool.
+#[must_use = "dropping the lease returns its auxiliary slot"]
+pub struct AuxiliarySlotLease {
+    broker: Arc<BrokerInner>,
+    pool: Arc<AuxiliaryPoolInner>,
+    index: usize,
+}
+
+impl AuxiliarySlotLease {
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+}
+
+impl fmt::Debug for AuxiliarySlotLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuxiliarySlotLease")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AuxiliarySlotLease {
+    fn drop(&mut self) {
+        let _broker_state = lock_unpoisoned(&self.broker.state);
+        let mut auxiliary = lock_unpoisoned(&self.pool.state);
+        assert!(
+            !auxiliary.free_slots.contains(&self.index),
+            "auxiliary slot {} was returned more than once",
+            self.index
+        );
+        auxiliary.free_slots.push(self.index);
+        assert!(
+            auxiliary.free_slots.len() <= self.pool.limit.get(),
+            "returned auxiliary slots exceed the configured limit"
+        );
+        self.broker.changed.notify_all();
     }
 }
 

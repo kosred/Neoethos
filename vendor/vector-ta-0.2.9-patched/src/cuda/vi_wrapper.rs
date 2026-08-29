@@ -1,12 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::vi::{ViBatchRange, ViParams};
 use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer, DeviceCopy, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, DeviceCopy, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -109,11 +109,6 @@ impl CudaVi {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/vi_kernel.ptx"));
-        let jit = [
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("vi_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         let _ = cust::context::CurrentContext::set_cache_config(CacheConfig::PreferL1);

@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -79,10 +63,6 @@ pub enum AdaptiveBoundsRsiOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdaptiveBoundsRsiParams {
     pub rsi_length: Option<usize>,
     pub alpha: Option<f64>,
@@ -227,7 +207,9 @@ pub enum AdaptiveBoundsRsiError {
     EmptyInputData,
     #[error("adaptive_bounds_rsi: all values are NaN")]
     AllValuesNaN,
-    #[error("adaptive_bounds_rsi: invalid rsi_length: rsi_length = {rsi_length}, data length = {data_len}")]
+    #[error(
+        "adaptive_bounds_rsi: invalid rsi_length: rsi_length = {rsi_length}, data length = {data_len}"
+    )]
     InvalidRsiLength { rsi_length: usize, data_len: usize },
     #[error("adaptive_bounds_rsi: invalid alpha: {alpha}")]
     InvalidAlpha { alpha: f64 },
@@ -493,10 +475,16 @@ fn prepare_input<'a>(
         return Err(AdaptiveBoundsRsiError::InvalidAlpha { alpha });
     }
 
-    let valid = data[first..]
-        .iter()
-        .filter(|value| value.is_finite())
-        .count();
+    let mut valid = 0usize;
+    let mut finite_run = 0usize;
+    for value in &data[first..] {
+        if value.is_finite() {
+            finite_run += 1;
+            valid = valid.max(finite_run);
+        } else {
+            finite_run = 0;
+        }
+    }
     let needed = rsi_length + 1;
     if valid < needed {
         return Err(AdaptiveBoundsRsiError::NotEnoughValidData { needed, valid });
@@ -1249,327 +1237,6 @@ unsafe fn vec_f64_from_mu_guard(buf: ManuallyDrop<Vec<MaybeUninit<f64>>>) -> Vec
     Vec::from_raw_parts(buf.as_mut_ptr() as *mut f64, buf.len(), buf.capacity())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "adaptive_bounds_rsi")]
-#[pyo3(signature = (data, rsi_length=DEFAULT_RSI_LENGTH, alpha=DEFAULT_ALPHA, kernel=None))]
-pub fn adaptive_bounds_rsi_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    rsi_length: usize,
-    alpha: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = AdaptiveBoundsRsiInput::from_slice(
-        data,
-        AdaptiveBoundsRsiParams {
-            rsi_length: Some(rsi_length),
-            alpha: Some(alpha),
-        },
-    );
-    let output = py
-        .allow_threads(|| adaptive_bounds_rsi_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("rsi", output.rsi.into_pyarray(py))?;
-    dict.set_item("lower_bound", output.lower_bound.into_pyarray(py))?;
-    dict.set_item("lower_mid", output.lower_mid.into_pyarray(py))?;
-    dict.set_item("mid", output.mid.into_pyarray(py))?;
-    dict.set_item("upper_mid", output.upper_mid.into_pyarray(py))?;
-    dict.set_item("upper_bound", output.upper_bound.into_pyarray(py))?;
-    dict.set_item("regime", output.regime.into_pyarray(py))?;
-    dict.set_item("regime_flip", output.regime_flip.into_pyarray(py))?;
-    dict.set_item("lower_signal", output.lower_signal.into_pyarray(py))?;
-    dict.set_item("upper_signal", output.upper_signal.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adaptive_bounds_rsi_batch")]
-#[pyo3(signature = (data, rsi_length_range, alpha_range, kernel=None))]
-pub fn adaptive_bounds_rsi_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    rsi_length_range: (usize, usize, usize),
-    alpha_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            adaptive_bounds_rsi_batch_with_kernel(
-                data,
-                &AdaptiveBoundsRsiBatchRange {
-                    rsi_length: rsi_length_range,
-                    alpha: alpha_range,
-                },
-                kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let total = output.rows * output.cols;
-    let arrays = [
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-    ];
-    unsafe { arrays[0].as_slice_mut()? }.copy_from_slice(&output.rsi);
-    unsafe { arrays[1].as_slice_mut()? }.copy_from_slice(&output.lower_bound);
-    unsafe { arrays[2].as_slice_mut()? }.copy_from_slice(&output.lower_mid);
-    unsafe { arrays[3].as_slice_mut()? }.copy_from_slice(&output.mid);
-    unsafe { arrays[4].as_slice_mut()? }.copy_from_slice(&output.upper_mid);
-    unsafe { arrays[5].as_slice_mut()? }.copy_from_slice(&output.upper_bound);
-    unsafe { arrays[6].as_slice_mut()? }.copy_from_slice(&output.regime);
-    unsafe { arrays[7].as_slice_mut()? }.copy_from_slice(&output.regime_flip);
-    unsafe { arrays[8].as_slice_mut()? }.copy_from_slice(&output.lower_signal);
-    unsafe { arrays[9].as_slice_mut()? }.copy_from_slice(&output.upper_signal);
-
-    let dict = PyDict::new(py);
-    dict.set_item("rsi", arrays[0].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "lower_bound",
-        arrays[1].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item("lower_mid", arrays[2].reshape((output.rows, output.cols))?)?;
-    dict.set_item("mid", arrays[3].reshape((output.rows, output.cols))?)?;
-    dict.set_item("upper_mid", arrays[4].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "upper_bound",
-        arrays[5].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item("regime", arrays[6].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "regime_flip",
-        arrays[7].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "lower_signal",
-        arrays[8].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "upper_signal",
-        arrays[9].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "rsi_lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.rsi_length.unwrap_or(DEFAULT_RSI_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "alphas",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdaptiveBoundsRsiStream")]
-pub struct AdaptiveBoundsRsiStreamPy {
-    stream: AdaptiveBoundsRsiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdaptiveBoundsRsiStreamPy {
-    #[new]
-    #[pyo3(signature = (rsi_length=DEFAULT_RSI_LENGTH, alpha=DEFAULT_ALPHA))]
-    fn new(rsi_length: usize, alpha: f64) -> PyResult<Self> {
-        let stream = AdaptiveBoundsRsiStream::try_new(AdaptiveBoundsRsiParams {
-            rsi_length: Some(rsi_length),
-            alpha: Some(alpha),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
-        self.stream.update(value).map(|output| {
-            (
-                output.rsi,
-                output.lower_bound,
-                output.lower_mid,
-                output.mid,
-                output.upper_mid,
-                output.upper_bound,
-                output.regime,
-                output.regime_flip,
-                output.lower_signal,
-                output.upper_signal,
-            )
-        })
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_adaptive_bounds_rsi_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(adaptive_bounds_rsi_py, m)?)?;
-    m.add_function(wrap_pyfunction!(adaptive_bounds_rsi_batch_py, m)?)?;
-    m.add_class::<AdaptiveBoundsRsiStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveBoundsRsiJsOutput {
-    pub rsi: Vec<f64>,
-    pub lower_bound: Vec<f64>,
-    pub lower_mid: Vec<f64>,
-    pub mid: Vec<f64>,
-    pub upper_mid: Vec<f64>,
-    pub upper_bound: Vec<f64>,
-    pub regime: Vec<f64>,
-    pub regime_flip: Vec<f64>,
-    pub lower_signal: Vec<f64>,
-    pub upper_signal: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_bounds_rsi_js)]
-pub fn adaptive_bounds_rsi_js(
-    data: &[f64],
-    rsi_length: usize,
-    alpha: f64,
-) -> Result<JsValue, JsValue> {
-    let input = AdaptiveBoundsRsiInput::from_slice(
-        data,
-        AdaptiveBoundsRsiParams {
-            rsi_length: Some(rsi_length),
-            alpha: Some(alpha),
-        },
-    );
-    let output = adaptive_bounds_rsi_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&AdaptiveBoundsRsiJsOutput {
-        rsi: output.rsi,
-        lower_bound: output.lower_bound,
-        lower_mid: output.lower_mid,
-        mid: output.mid,
-        upper_mid: output.upper_mid,
-        upper_bound: output.upper_bound,
-        regime: output.regime,
-        regime_flip: output.regime_flip,
-        lower_signal: output.lower_signal,
-        upper_signal: output.upper_signal,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveBoundsRsiBatchConfig {
-    pub rsi_length_range: (usize, usize, usize),
-    pub alpha_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveBoundsRsiBatchJsOutput {
-    pub rsi: Vec<f64>,
-    pub lower_bound: Vec<f64>,
-    pub lower_mid: Vec<f64>,
-    pub mid: Vec<f64>,
-    pub upper_mid: Vec<f64>,
-    pub upper_bound: Vec<f64>,
-    pub regime: Vec<f64>,
-    pub regime_flip: Vec<f64>,
-    pub lower_signal: Vec<f64>,
-    pub upper_signal: Vec<f64>,
-    pub rsi_lengths: Vec<usize>,
-    pub alphas: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_bounds_rsi_batch)]
-pub fn adaptive_bounds_rsi_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: AdaptiveBoundsRsiBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let output = adaptive_bounds_rsi_batch_with_kernel(
-        data,
-        &AdaptiveBoundsRsiBatchRange {
-            rsi_length: cfg.rsi_length_range,
-            alpha: cfg.alpha_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&AdaptiveBoundsRsiBatchJsOutput {
-        rsi: output.rsi,
-        lower_bound: output.lower_bound,
-        lower_mid: output.lower_mid,
-        mid: output.mid,
-        upper_mid: output.upper_mid,
-        upper_bound: output.upper_bound,
-        regime: output.regime,
-        regime_flip: output.regime_flip,
-        lower_signal: output.lower_signal,
-        upper_signal: output.upper_signal,
-        rsi_lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.rsi_length.unwrap_or(DEFAULT_RSI_LENGTH))
-            .collect(),
-        alphas: output
-            .combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect(),
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_bounds_rsi_output_into_js(
-    data: &[f64],
-    rsi_length: usize,
-    alpha: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adaptive_bounds_rsi_js(data, rsi_length, alpha)?;
-    crate::write_wasm_object_f64_outputs("adaptive_bounds_rsi_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_bounds_rsi_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adaptive_bounds_rsi_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "adaptive_bounds_rsi_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,6 +1261,210 @@ mod tests {
                 "series mismatch at {index}: left={a}, right={b}"
             );
         }
+    }
+
+    /// Direct transcription of the published Adaptive Bounds RSI equations.
+    /// It deliberately does not call `RsiState`, the production crossing
+    /// helpers, the stream, or either batch implementation.
+    fn independent_formula(data: &[f64], period: usize, alpha: f64) -> AdaptiveBoundsRsiOutput {
+        let mut output = AdaptiveBoundsRsiOutput {
+            rsi: vec![f64::NAN; data.len()],
+            lower_bound: vec![f64::NAN; data.len()],
+            lower_mid: vec![f64::NAN; data.len()],
+            mid: vec![f64::NAN; data.len()],
+            upper_mid: vec![f64::NAN; data.len()],
+            upper_bound: vec![f64::NAN; data.len()],
+            regime: vec![f64::NAN; data.len()],
+            regime_flip: vec![f64::NAN; data.len()],
+            lower_signal: vec![f64::NAN; data.len()],
+            upper_signal: vec![f64::NAN; data.len()],
+        };
+        let mut centroids = [20.0_f64, 40.0, 50.0, 60.0, 80.0];
+        let mut previous_price = None;
+        let mut seed_count = 0usize;
+        let mut seed_gain = 0.0;
+        let mut seed_loss = 0.0;
+        let mut averages = None;
+        let mut previous_rsi = None;
+        let mut previous_lower = None;
+        let mut previous_upper = None;
+        let mut previous_regime = None;
+        let mut lower_armed = true;
+        let mut upper_armed = true;
+        let inverse_period = 1.0 / period as f64;
+
+        for (index, &price) in data.iter().enumerate() {
+            if !price.is_finite() {
+                previous_price = None;
+                seed_count = 0;
+                seed_gain = 0.0;
+                seed_loss = 0.0;
+                averages = None;
+                previous_rsi = None;
+                previous_lower = None;
+                previous_upper = None;
+                previous_regime = None;
+                continue;
+            }
+
+            let Some(prior_price) = previous_price.replace(price) else {
+                continue;
+            };
+            let delta = price - prior_price;
+            let gain = if delta > 0.0 { delta } else { 0.0 };
+            let loss = if delta < 0.0 { -delta } else { 0.0 };
+            let (average_gain, average_loss) = match averages {
+                Some((prior_gain, prior_loss)) => {
+                    let next = (
+                        (prior_gain * (period - 1) as f64 + gain) * inverse_period,
+                        (prior_loss * (period - 1) as f64 + loss) * inverse_period,
+                    );
+                    averages = Some(next);
+                    next
+                }
+                None => {
+                    seed_gain += gain;
+                    seed_loss += loss;
+                    seed_count += 1;
+                    if seed_count != period {
+                        continue;
+                    }
+                    let seeded = (seed_gain * inverse_period, seed_loss * inverse_period);
+                    averages = Some(seeded);
+                    seeded
+                }
+            };
+            let denominator = average_gain + average_loss;
+            let rsi = if denominator == 0.0 {
+                50.0
+            } else {
+                100.0 * average_gain / denominator
+            };
+
+            let mut winner = 0usize;
+            let mut winning_distance = (rsi - centroids[0]).abs();
+            for candidate in 1..centroids.len() {
+                let distance = (rsi - centroids[candidate]).abs();
+                if distance < winning_distance {
+                    winner = candidate;
+                    winning_distance = distance;
+                }
+            }
+            centroids[winner] += (rsi - centroids[winner]) * alpha;
+
+            let regime = if rsi <= centroids[0] {
+                -2
+            } else if rsi <= centroids[1] {
+                -1
+            } else if rsi <= centroids[2] {
+                0
+            } else if rsi <= centroids[3] {
+                1
+            } else {
+                2
+            };
+
+            if previous_rsi
+                .is_some_and(|prior| (prior <= 50.0 && rsi > 50.0) || (prior >= 50.0 && rsi < 50.0))
+            {
+                lower_armed = true;
+                upper_armed = true;
+            }
+            let lower_signal =
+                previous_rsi
+                    .zip(previous_lower)
+                    .is_some_and(|(prior_rsi, prior_bound)| {
+                        prior_rsi >= prior_bound && rsi < centroids[0] && lower_armed
+                    });
+            let upper_signal =
+                previous_rsi
+                    .zip(previous_upper)
+                    .is_some_and(|(prior_rsi, prior_bound)| {
+                        prior_rsi <= prior_bound && rsi > centroids[4] && upper_armed
+                    });
+            if lower_signal {
+                lower_armed = false;
+            }
+            if upper_signal {
+                upper_armed = false;
+            }
+            let regime_flip = previous_regime.is_some_and(|prior| prior == 0 && regime != 0);
+
+            output.rsi[index] = rsi;
+            output.lower_bound[index] = centroids[0];
+            output.lower_mid[index] = centroids[1];
+            output.mid[index] = centroids[2];
+            output.upper_mid[index] = centroids[3];
+            output.upper_bound[index] = centroids[4];
+            output.regime[index] = regime as f64;
+            output.regime_flip[index] = f64::from(regime_flip);
+            output.lower_signal[index] = f64::from(lower_signal);
+            output.upper_signal[index] = f64::from(upper_signal);
+
+            previous_rsi = Some(rsi);
+            previous_lower = Some(centroids[0]);
+            previous_upper = Some(centroids[4]);
+            previous_regime = Some(regime);
+        }
+
+        output
+    }
+
+    #[test]
+    fn adaptive_bounds_rsi_matches_independent_published_formula() {
+        let mut data = Vec::new();
+        for cycle in 0..5 {
+            let base = 100.0 + cycle as f64;
+            data.extend((0..10).map(|step| base + step as f64 * 3.0));
+            data.extend((0..20).map(|step| base + 27.0 - step as f64 * 3.0));
+            data.extend((0..10).map(|step| base - 30.0 + step as f64 * 3.0));
+        }
+        data.splice(81..81, [f64::NAN, f64::NAN]);
+        let period = 3;
+        let alpha = 0.25;
+        let actual = adaptive_bounds_rsi(&AdaptiveBoundsRsiInput::from_slice(
+            &data,
+            AdaptiveBoundsRsiParams {
+                rsi_length: Some(period),
+                alpha: Some(alpha),
+            },
+        ))
+        .expect("the scalar implementation must accept the reviewed fixture");
+        let expected = independent_formula(&data, period, alpha);
+
+        assert_series_eq(&actual.rsi, &expected.rsi);
+        assert_series_eq(&actual.lower_bound, &expected.lower_bound);
+        assert_series_eq(&actual.lower_mid, &expected.lower_mid);
+        assert_series_eq(&actual.mid, &expected.mid);
+        assert_series_eq(&actual.upper_mid, &expected.upper_mid);
+        assert_series_eq(&actual.upper_bound, &expected.upper_bound);
+        assert_series_eq(&actual.regime, &expected.regime);
+        assert_series_eq(&actual.regime_flip, &expected.regime_flip);
+        assert_series_eq(&actual.lower_signal, &expected.lower_signal);
+        assert_series_eq(&actual.upper_signal, &expected.upper_signal);
+        assert!(actual.lower_signal.iter().any(|&value| value == 1.0));
+        assert!(actual.upper_signal.iter().any(|&value| value == 1.0));
+        assert!(actual.regime_flip.iter().any(|&value| value == 1.0));
+    }
+
+    #[test]
+    fn adaptive_bounds_rsi_requires_one_complete_finite_seed_run() {
+        let data = [1.0, 2.0, 3.0, f64::NAN, 4.0, 5.0, 6.0];
+        let error = adaptive_bounds_rsi(&AdaptiveBoundsRsiInput::from_slice(
+            &data,
+            AdaptiveBoundsRsiParams {
+                rsi_length: Some(3),
+                alpha: Some(0.25),
+            },
+        ))
+        .expect_err("fragmented finite bars cannot seed a resetting RSI");
+        assert!(matches!(
+            error,
+            AdaptiveBoundsRsiError::NotEnoughValidData {
+                needed: 4,
+                valid: 3
+            }
+        ));
     }
 
     #[test]

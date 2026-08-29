@@ -50,9 +50,16 @@ pub enum TradeMode {
 /// design §6 (`Gene` / `Ensemble` / `Blend`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrategySource {
-    Gene { id: String },
-    Ensemble { dir: String },
-    Blend { gene_id: String, ensemble_dir: String },
+    Gene {
+        id: String,
+    },
+    Ensemble {
+        dir: String,
+    },
+    Blend {
+        gene_id: String,
+        ensemble_dir: String,
+    },
 }
 
 /// One thing the trader watches: a (symbol, base_tf, higher_tfs) tuple with the

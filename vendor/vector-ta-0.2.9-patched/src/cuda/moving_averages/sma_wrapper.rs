@@ -1,12 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
-use crate::indicators::moving_averages::sma::{expand_grid_sma, SmaBatchRange, SmaParams};
+use crate::indicators::moving_averages::sma::{SmaBatchRange, SmaParams, expand_grid_sma};
 use cust::context::{CacheConfig, Context};
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, DevicePointer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, DevicePointer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -58,20 +58,6 @@ impl CudaSma {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/sma_kernel.ptx"));
-
-        let opt = match env::var("SMA_JIT_OPT").ok().as_deref() {
-            Some("O0") => OptLevel::O0,
-            Some("O1") => OptLevel::O1,
-            Some("O2") => OptLevel::O2,
-            Some("O3") => OptLevel::O3,
-            Some("O4") => OptLevel::O4,
-            _ => OptLevel::O2,
-        };
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(opt),
-        ];
         let module = crate::load_cuda_embedded_module!("sma_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

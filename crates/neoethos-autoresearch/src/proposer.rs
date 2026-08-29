@@ -147,11 +147,7 @@ fn record_identity_refusal(
 /// shorten the sweep silently — a sweep of fewer than 100 searches is not the
 /// experiment the judge is told it is."* One record per abandoned slot, so the
 /// journal carries them and the session's own census folds them.
-fn abandon_remaining_slots(
-    out: &mut DrawnSweep,
-    from_slot: usize,
-    consecutive_collisions: usize,
-) {
+fn abandon_remaining_slots(out: &mut DrawnSweep, from_slot: usize, consecutive_collisions: usize) {
     out.exhausted = true;
     out.slots_abandoned = SWEEP_SEARCHES.saturating_sub(from_slot);
     let drawn = out.proposals.len();
@@ -162,8 +158,13 @@ fn abandon_remaining_slots(
             of: SWEEP_SEARCHES,
             consecutive_collisions,
         });
-        out.census.record_refusal(&reason, "<never drawn: the space is enumerated (U5)>");
-        out.refused.push(RefusedDraw { slot: abandoned, config_hash: String::new(), reason });
+        out.census
+            .record_refusal(&reason, "<never drawn: the space is enumerated (U5)>");
+        out.refused.push(RefusedDraw {
+            slot: abandoned,
+            config_hash: String::new(),
+            reason,
+        });
     }
 }
 
@@ -191,7 +192,12 @@ pub struct CellKey {
 impl CellKey {
     pub fn of(p: &Proposal) -> Self {
         let k = p.key();
-        Self { axis_a: k.axis_a, variant: k.variant, param: k.param, refusals: k.refusals }
+        Self {
+            axis_a: k.axis_a,
+            variant: k.variant,
+            param: k.param,
+            refusals: k.refusals,
+        }
     }
 }
 
@@ -285,7 +291,10 @@ pub struct DrawRefusal {
 
 impl DrawRefusal {
     fn new(reason: ProposalRefused, trace: &[String]) -> Self {
-        Self { reason, drawn_so_far: trace.join(" ") }
+        Self {
+            reason,
+            drawn_so_far: trace.join(" "),
+        }
     }
 }
 
@@ -379,9 +388,7 @@ impl Proposer {
         let drawable = crate::objective::axis_b_live_check(&caps, scenario)
             .map_err(|inert| anyhow::anyhow!("{inert}"))?;
 
-        let pip_value_per_lot = base_config
-            .try_evaluation_config(None)?
-            .pip_value_per_lot;
+        let pip_value_per_lot = base_config.try_evaluation_config(None)?.pip_value_per_lot;
         let mut me = Self {
             caps,
             scenario,
@@ -664,7 +671,10 @@ impl Proposer {
                     &mut out.census,
                 ) {
                     Ok(c) => c,
-                    Err(DrawRefusal { reason, drawn_so_far }) => {
+                    Err(DrawRefusal {
+                        reason,
+                        drawn_so_far,
+                    }) => {
                         // `drawn_so_far` and not `"<draw>"`. The census line for
                         // a refusal that never reached a whole proposal used to
                         // be the literal string `<draw>`, which counted the
@@ -719,7 +729,9 @@ impl Proposer {
                 if first_seen.is_some() || replicate >= MAX_REPLICATES_PER_CELL {
                     let reason = match first_seen {
                         Some(first_seen) => ProposalRefused::Duplicate { first_seen },
-                        None => ProposalRefused::CellReplicatesExhausted { replicates: replicate },
+                        None => ProposalRefused::CellReplicatesExhausted {
+                            replicates: replicate,
+                        },
                     };
                     record_identity_refusal(
                         &mut out,
@@ -733,11 +745,7 @@ impl Proposer {
                         out.census.uniform_collisions += 1;
                         consecutive_uniform_collisions += 1;
                         if consecutive_uniform_collisions >= PROPOSER_RETRIES {
-                            abandon_remaining_slots(
-                                &mut out,
-                                slot,
-                                consecutive_uniform_collisions,
-                            );
+                            abandon_remaining_slots(&mut out, slot, consecutive_uniform_collisions);
                             tracing::warn!(
                                 target: "neoethos_autoresearch::proposer",
                                 %sweep,
@@ -822,7 +830,10 @@ impl Proposer {
         let best = session.best_ever.as_ref()?;
         let proposals = session.proposals_of(best.sweep)?;
         let p = proposals.get(best.slot)?;
-        Some(ParentReference { sweep: best.sweep, axis_a: p.axis_a })
+        Some(ParentReference {
+            sweep: best.sweep,
+            axis_a: p.axis_a,
+        })
     }
 
     /// Axis-B variants still owing coverage, most-owed first.
@@ -836,7 +847,12 @@ impl Proposer {
                     && session.coverage.get("objective", v.label()).sweeps < B_MIN_DRAWS
             })
             .collect();
-        owed.sort_by_key(|v| (session.coverage.get("objective", v.label()).sweeps, v.index()));
+        owed.sort_by_key(|v| {
+            (
+                session.coverage.get("objective", v.label()).sweeps,
+                v.index(),
+            )
+        });
         owed
     }
 
@@ -880,7 +896,14 @@ impl Proposer {
         // configuration that was abandoned instead of printing `<draw>`.
         let mut trace: Vec<String> = Vec::with_capacity(FACTOR_COUNT + 8);
         trace.push(format!("slot={slot}"));
-        trace.push(format!("origin={}", if force_uniform { "uniform" } else { "posterior" }));
+        trace.push(format!(
+            "origin={}",
+            if force_uniform {
+                "uniform"
+            } else {
+                "posterior"
+            }
+        ));
         macro_rules! named {
             ($trace:expr, $e:expr) => {
                 match $e {
@@ -893,14 +916,19 @@ impl Proposer {
         // ── axis A ─────────────────────────────────────────────────────────
         let mut levels = [0u8; FACTOR_COUNT];
         for f in FactorId::ALL {
-            let available: Vec<u8> =
-                (0..f.arity() as u8).filter(|l| f.level_available(*l, &self.caps)).collect();
+            let available: Vec<u8> = (0..f.arity() as u8)
+                .filter(|l| f.level_available(*l, &self.caps))
+                .collect();
             levels[f.index()] = if force_uniform {
                 available[rng.random_range(0..available.len())]
             } else {
                 argmax_sampled(rng, &available, |l| evidence(f.label(), &f.level_label(l)))
             };
-            trace.push(format!("{}={}", f.label(), f.level_label(levels[f.index()])));
+            trace.push(format!(
+                "{}={}",
+                f.label(),
+                f.level_label(levels[f.index()])
+            ));
         }
         let mut axis_a = named!(
             trace,
@@ -914,9 +942,7 @@ impl Proposer {
         // asked to be explored, their arity is small enough to enumerate, and
         // coverage debt already forces that enumeration. A trust region over
         // them would skip the skipped half all over again.
-        if !force_uniform
-            && let Some(parent) = parent
-        {
+        if !force_uniform && let Some(parent) = parent {
             axis_a = named!(
                 trace,
                 apply_trust_region(axis_a, &parent.axis_a, &self.caps, &evidence, census)
@@ -978,7 +1004,11 @@ impl Proposer {
             }
         };
         let mut param = rng.random_range(0..variant.param_count()) as u8;
-        trace.push(format!("objective={}[{}]", variant.label(), variant.param_label(param)));
+        trace.push(format!(
+            "objective={}[{}]",
+            variant.label(),
+            variant.param_label(param)
+        ));
 
         // ── the lane / horizon pairing rule ────────────────────────────────
         //
@@ -1053,11 +1083,7 @@ impl Proposer {
                     }
                 }
             }
-            note_example(
-                census,
-                format!("constraint_resampled: {repair}"),
-                abandoned,
-            );
+            note_example(census, format!("constraint_resampled: {repair}"), abandoned);
         }
 
         // ── the refusal vector ─────────────────────────────────────────────
@@ -1073,7 +1099,11 @@ impl Proposer {
             };
         }
         for d in RefusalDim::ALL {
-            trace.push(format!("{}={}", d.label(), d.level_label(refusal_levels[d.index()])));
+            trace.push(format!(
+                "{}={}",
+                d.label(),
+                d.level_label(refusal_levels[d.index()])
+            ));
         }
         let refusals = named!(
             trace,
@@ -1099,7 +1129,11 @@ impl Proposer {
                 0,
                 origin,
                 slot,
-                if force_uniform { None } else { parent.map(|p| p.sweep) },
+                if force_uniform {
+                    None
+                } else {
+                    parent.map(|p| p.sweep)
+                },
                 &self.caps,
                 self.scenario,
             )
@@ -1153,12 +1187,17 @@ where
         // reader of the census asks next.
         let drawn = f.level_label(axis_a.level(f));
         let reverted_to = f.level_label(parent.level(f));
-        axis_a = axis_a.with_level(f, parent.level(f), caps).map_err(ProposalRefused::Space)?;
+        axis_a = axis_a
+            .with_level(f, parent.level(f), caps)
+            .map_err(ProposalRefused::Space)?;
         census.trust_region_reverted += 1;
         note_example(
             census,
             format!("trust_region_reverted: {} -> {reverted_to}", f.label()),
-            format!("{}={drawn} (drawn), outside the {MAX_DELTA_FACTORS}-factor trust region", f.label()),
+            format!(
+                "{}={drawn} (drawn), outside the {MAX_DELTA_FACTORS}-factor trust region",
+                f.label()
+            ),
         );
     }
     Ok(axis_a)
@@ -1286,7 +1325,10 @@ mod tests {
             sum += x;
         }
         let mean = sum / 2000.0;
-        assert!((mean - 0.8).abs() < 0.03, "Beta(8,2) mean was {mean}, expected ~0.8");
+        assert!(
+            (mean - 0.8).abs() < 0.03,
+            "Beta(8,2) mean was {mean}, expected ~0.8"
+        );
     }
 
     #[test]
@@ -1318,7 +1360,10 @@ mod tests {
                 zeros += 1;
             }
         }
-        assert!((400..600).contains(&zeros), "uniform prior favoured a level: {zeros}/1000");
+        assert!(
+            (400..600).contains(&zeros),
+            "uniform prior favoured a level: {zeros}/1000"
+        );
     }
 
     #[test]
@@ -1335,7 +1380,10 @@ mod tests {
         let bounded =
             apply_trust_region(far, &parent, &caps, &evidence_uniform(), &mut census).unwrap();
         assert_eq!(bounded.differing_factors(&parent).len(), MAX_DELTA_FACTORS);
-        assert_eq!(census.trust_region_reverted, FACTOR_COUNT - MAX_DELTA_FACTORS);
+        assert_eq!(
+            census.trust_region_reverted,
+            FACTOR_COUNT - MAX_DELTA_FACTORS
+        );
     }
 
     #[test]
@@ -1354,7 +1402,11 @@ mod tests {
         // `population` level 1 has a strong record; everything else is untried,
         // so the gap there is 0 and it is reverted first.
         let evidence = |factor: &str, level: &str| {
-            if factor == "population" && level == "2048" { (30.0, 1.0) } else { (1.0, 1.0) }
+            if factor == "population" && level == "2048" {
+                (30.0, 1.0)
+            } else {
+                (1.0, 1.0)
+            }
         };
         let mut census = ProposerCensus::default();
         let bounded = apply_trust_region(far, &parent, &caps, &evidence, &mut census).unwrap();
@@ -1393,7 +1445,9 @@ mod tests {
         .unwrap();
         let proposer = test_proposer();
         assert!(
-            proposer.credits_for(&[p.clone()], &[Sig(true, true)]).is_empty(),
+            proposer
+                .credits_for(&[p.clone()], &[Sig(true, true)])
+                .is_empty(),
             "an unavailable screen must not touch the posterior"
         );
         let credits = proposer.credits_for(&[p], &[Sig(true, false)]);
@@ -1436,7 +1490,10 @@ mod tests {
         let credits = test_proposer().credits_for(&proposals, &outcomes);
         // Ten proposals, all carrying the same levels, five of them passing:
         // exactly ONE credit per (factor, level), and it is a success.
-        let population: Vec<_> = credits.iter().filter(|c| c.factor == "population").collect();
+        let population: Vec<_> = credits
+            .iter()
+            .filter(|c| c.factor == "population")
+            .collect();
         assert_eq!(population.len(), 1);
         assert!(population[0].success);
     }
@@ -1468,7 +1525,10 @@ mod tests {
         .unwrap();
         let credits = test_proposer().credits_for(&[p.clone(), p], &[Fail, Fail]);
         assert!(credits.iter().all(|c| !c.success));
-        assert_eq!(credits.iter().filter(|c| c.factor == "population").count(), 1);
+        assert_eq!(
+            credits.iter().filter(|c| c.factor == "population").count(),
+            1
+        );
     }
 
     #[test]
@@ -1539,7 +1599,11 @@ mod tests {
         };
         let a = replicate_seed(7, &cell, 0);
         assert_ne!(a, replicate_seed(7, &cell, 1));
-        assert_eq!(a, replicate_seed(7, &cell, 0), "a resumed session must redraw the same seed");
+        assert_eq!(
+            a,
+            replicate_seed(7, &cell, 0),
+            "a resumed session must redraw the same seed"
+        );
         assert_ne!(a, replicate_seed(8, &cell, 0));
     }
 
@@ -1599,7 +1663,9 @@ mod tests {
             assert!(crate::objective::carries_the_axis(&drawable));
         }
         // …and the rule the gate applies rejects a ModeNative-only set.
-        assert!(!crate::objective::carries_the_axis(&[ObjectiveVariant::B5TerminalWealth]));
+        assert!(!crate::objective::carries_the_axis(&[
+            ObjectiveVariant::B5TerminalWealth
+        ]));
     }
 
     #[test]
@@ -1634,14 +1700,30 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(3);
         let mut census = ProposerCensus::default();
         let err = p
-            .draw_one(&Session::default(), &mut rng, 7, true, None, None, &mut census)
+            .draw_one(
+                &Session::default(),
+                &mut rng,
+                7,
+                true,
+                None,
+                None,
+                &mut census,
+            )
             .expect_err("every drawable variant is capped and spent");
 
         // Counted AND named: the partial draw, not a placeholder.
         assert_ne!(err.drawn_so_far, "<draw>");
         assert!(err.drawn_so_far.contains("slot=7"), "{}", err.drawn_so_far);
-        assert!(err.drawn_so_far.contains("population="), "{}", err.drawn_so_far);
-        assert!(err.drawn_so_far.contains("base_timeframe="), "{}", err.drawn_so_far);
+        assert!(
+            err.drawn_so_far.contains("population="),
+            "{}",
+            err.drawn_so_far
+        );
+        assert!(
+            err.drawn_so_far.contains("base_timeframe="),
+            "{}",
+            err.drawn_so_far
+        );
         // …and the reason names the cap rather than the sampler silently
         // re-admitting the control past its own ceiling.
         assert!(
@@ -1663,13 +1745,24 @@ mod tests {
         // counter and no census line. It must refuse instead.
         let mut p = test_proposer();
         p.drawable_variants = vec![ObjectiveVariant::B0ScoringTable];
-        p.b0_drawn = ObjectiveVariant::B0ScoringTable.spec().max_draws_per_session.unwrap();
+        p.b0_drawn = ObjectiveVariant::B0ScoringTable
+            .spec()
+            .max_draws_per_session
+            .unwrap();
         let mut rng = ChaCha20Rng::seed_from_u64(5);
         let mut census = ProposerCensus::default();
         for slot in 0..8 {
             assert!(
-                p.draw_one(&Session::default(), &mut rng, slot, true, None, None, &mut census)
-                    .is_err(),
+                p.draw_one(
+                    &Session::default(),
+                    &mut rng,
+                    slot,
+                    true,
+                    None,
+                    None,
+                    &mut census
+                )
+                .is_err(),
                 "slot {slot} drew a variant whose per-session cap was already spent"
             );
         }
@@ -1689,14 +1782,24 @@ mod tests {
             3,
             "fnv64:aaaa",
             "population=512 objective=B1_selectivity[max_in_market=0.10]",
-            ProposalRefused::CellReplicatesExhausted { replicates: MAX_REPLICATES_PER_CELL },
+            ProposalRefused::CellReplicatesExhausted {
+                replicates: MAX_REPLICATES_PER_CELL,
+            },
             None,
         );
-        assert!(out.duplicates.is_empty(), "a spent replicate budget is not a duplicate");
+        assert!(
+            out.duplicates.is_empty(),
+            "a spent replicate budget is not a duplicate"
+        );
         assert_eq!(out.refused.len(), 1);
         assert_eq!(out.refused[0].slot, 3);
         assert_eq!(out.refused[0].config_hash, "fnv64:aaaa");
-        assert!(out.refused[0].reason.to_string().contains("replicate budget"));
+        assert!(
+            out.refused[0]
+                .reason
+                .to_string()
+                .contains("replicate budget")
+        );
         assert_eq!(out.census.cell_replicates_exhausted, 1);
         assert_eq!(out.census.duplicates_refused, 0);
         // …and the example names the configuration, not a placeholder.
@@ -1709,7 +1812,9 @@ mod tests {
             4,
             "fnv64:bbbb",
             "population=512",
-            ProposalRefused::Duplicate { first_seen: SweepId(2) },
+            ProposalRefused::Duplicate {
+                first_seen: SweepId(2),
+            },
             Some(SweepId(2)),
         );
         assert_eq!(out.duplicates.len(), 1);
@@ -1739,7 +1844,10 @@ mod tests {
         let text = out.refused[0].reason.to_string();
         assert!(text.contains("ABANDONED"), "{text}");
         assert!(text.contains("enumerated"), "{text}");
-        assert!(text.contains(&format!("{PROPOSER_RETRIES} consecutive")), "{text}");
+        assert!(
+            text.contains(&format!("{PROPOSER_RETRIES} consecutive")),
+            "{text}"
+        );
         // The accounting identity the whole fix exists for: every slot of the
         // sweep is either drawn or named. In `draw_sweep` the slots before
         // `from_slot` each pushed exactly one proposal (the inner loop leaves no
@@ -1762,7 +1870,10 @@ mod tests {
         }
         let mut census = ProposerCensus::default();
         apply_trust_region(far, &parent, &caps, &evidence_uniform(), &mut census).unwrap();
-        assert_eq!(census.trust_region_reverted, FACTOR_COUNT - MAX_DELTA_FACTORS);
+        assert_eq!(
+            census.trust_region_reverted,
+            FACTOR_COUNT - MAX_DELTA_FACTORS
+        );
         assert_eq!(
             census.examples.len(),
             FACTOR_COUNT - MAX_DELTA_FACTORS,

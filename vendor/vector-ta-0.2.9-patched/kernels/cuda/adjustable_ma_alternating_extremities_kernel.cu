@@ -5,6 +5,7 @@ namespace {
 
 constexpr double TWO_PI = 6.28318530717958647692528676655900577;
 constexpr double WEIGHT_SUM_EPS = 1e-12;
+#define AMAE_MAX_LENGTH 512
 
 __device__ inline bool valid_bar(double high, double low, double close) {
     return isfinite(high) && isfinite(low) && isfinite(close);
@@ -32,8 +33,8 @@ extern "C" __global__ void adjustable_ma_alternating_extremities_batch_f64(
     int len,
     const int* __restrict__ lengths,
     const double* __restrict__ mults,
-    const double* __restrict__ alphas,
-    const double* __restrict__ betas,
+    const double* __restrict__ normalized_weights,
+    int weight_stride,
     int rows,
     double* __restrict__ out_ma,
     double* __restrict__ out_upper,
@@ -53,8 +54,6 @@ extern "C" __global__ void adjustable_ma_alternating_extremities_batch_f64(
 
     const int length = lengths[row];
     const double mult = mults[row];
-    const double alpha = alphas[row];
-    const double beta = betas[row];
 
     double* row_ma = out_ma + static_cast<size_t>(row) * static_cast<size_t>(len);
     double* row_upper = out_upper + static_cast<size_t>(row) * static_cast<size_t>(len);
@@ -84,87 +83,104 @@ extern "C" __global__ void adjustable_ma_alternating_extremities_batch_f64(
         row_smoothed_close[i] = NAN;
     }
 
-    if (length < 2 || length > len || !isfinite(mult) || mult < 1.0 || !isfinite(alpha) ||
-        alpha < 0.0 || !isfinite(beta) || beta < 0.0) {
-        return;
-    }
-
-    int first = -1;
-    for (int i = 0; i < len; ++i) {
-        if (valid_bar(high[i], low[i], close[i])) {
-            first = i;
-            break;
-        }
-    }
-    if (first < 0) {
+    if (length < 2 || length > len || length > AMAE_MAX_LENGTH || !isfinite(mult) || mult < 1.0 ||
+        normalized_weights == nullptr || weight_stride < length) {
         return;
     }
 
     const int needed = (length * 2) - 1;
-    if (len - first < needed) {
-        return;
-    }
-
-    double weight_sum = 0.0;
-    for (int j = 0; j < length; ++j) {
-        weight_sum += raw_weight(j, length, alpha, beta);
-    }
-    if (!isfinite(weight_sum) || fabs(weight_sum) <= WEIGHT_SUM_EPS) {
-        return;
-    }
-    const double inv_weight_sum = 1.0 / weight_sum;
-
-    const int ma_start = first + length - 1;
-    for (int i = ma_start; i < len; ++i) {
-        double ma_acc = 0.0;
-        double high_acc = 0.0;
-        double low_acc = 0.0;
-        for (int j = 0; j < length; ++j) {
-            const double w = raw_weight(j, length, alpha, beta) * inv_weight_sum;
-            ma_acc += close[i - j] * w;
-            high_acc += high[i - j] * w;
-            low_acc += low[i - j] * w;
+    int longest_run = 0;
+    int current_run = 0;
+    for (int i = 0; i < len; ++i) {
+        if (valid_bar(high[i], low[i], close[i])) {
+            ++current_run;
+            longest_run = current_run > longest_run ? current_run : longest_run;
+        } else {
+            current_run = 0;
         }
-        row_ma[i] = ma_acc;
-        row_smoothed_close[i] = ma_acc;
-        row_smoothed_high[i] = high_acc;
-        row_smoothed_low[i] = low_acc;
+    }
+    if (longest_run < needed) {
+        return;
     }
 
-    const int open_start = ma_start + 2;
-    for (int i = open_start; i < len; ++i) {
-        row_smoothed_open[i] = 0.5 * (row_ma[i - 1] + row_ma[i - 2]);
-    }
+    // Gate172 exposed the first coefficient-authority divergence at fixture row
+    // 53: CPU 0x3ff1335952bbb637 versus libdevice-rebuilt
+    // 0x3ff1335952bbb636. The host uploads the exact normalized vector produced
+    // by the same Rust function the CPU calculation consumes. Explicit RN
+    // multiply then add preserves the CPU's non-fast-math operation order.
+    const double* row_weights =
+        normalized_weights + static_cast<size_t>(row) * static_cast<size_t>(weight_stride);
 
-    const int band_start = first + (length * 2) - 2;
-    double rolling = 0.0;
-    for (int i = ma_start; i <= band_start; ++i) {
-        rolling += fabs(close[i] - row_ma[i]);
-    }
-    const double first_dev = (rolling / static_cast<double>(length)) * mult;
-    row_upper[band_start] = row_ma[band_start] + first_dev;
-    row_lower[band_start] = row_ma[band_start] - first_dev;
+    int cursor = 0;
+    while (cursor < len) {
+        while (cursor < len && !valid_bar(high[cursor], low[cursor], close[cursor])) {
+            ++cursor;
+        }
+        const int run_start = cursor;
+        while (cursor < len && valid_bar(high[cursor], low[cursor], close[cursor])) {
+            ++cursor;
+        }
+        const int run_end = cursor;
+        if (run_end - run_start < length) {
+            continue;
+        }
 
-    for (int i = band_start + 1; i < len; ++i) {
-        rolling += fabs(close[i] - row_ma[i]);
-        rolling -= fabs(close[i - length] - row_ma[i - length]);
-        const double dev = (rolling / static_cast<double>(length)) * mult;
-        row_upper[i] = row_ma[i] + dev;
-        row_lower[i] = row_ma[i] - dev;
-    }
+        const int ma_start = run_start + length - 1;
+        for (int i = ma_start; i < run_end; ++i) {
+            double ma_acc = 0.0;
+            double high_acc = 0.0;
+            double low_acc = 0.0;
+            for (int j = 0; j < length; ++j) {
+                ma_acc = __dadd_rn(ma_acc, __dmul_rn(close[i - j], row_weights[j]));
+                high_acc = __dadd_rn(high_acc, __dmul_rn(high[i - j], row_weights[j]));
+                low_acc = __dadd_rn(low_acc, __dmul_rn(low[i - j], row_weights[j]));
+            }
+            row_ma[i] = ma_acc;
+            row_smoothed_close[i] = ma_acc;
+            row_smoothed_high[i] = high_acc;
+            row_smoothed_low[i] = low_acc;
+        }
 
-    row_state[band_start] = 0.0;
-    row_changed[band_start] = 0.0;
-    row_extremity[band_start] = row_lower[band_start];
+        const int open_start = ma_start + 2;
+        for (int i = open_start; i < run_end; ++i) {
+            row_smoothed_open[i] = 0.5 * (row_ma[i - 1] + row_ma[i - 2]);
+        }
 
-    for (int i = band_start + 1; i < len; ++i) {
-        const double prev_state = row_state[i - 1];
-        const bool cross_high = pine_cross(high[i - 1], row_upper[i - 1], high[i], row_upper[i]);
-        const bool cross_low = pine_cross(low[i - 1], row_lower[i - 1], low[i], row_lower[i]);
-        const double next_state = cross_high ? 1.0 : (cross_low ? 0.0 : prev_state);
-        row_state[i] = next_state;
-        row_changed[i] = fabs(next_state - prev_state) > 0.0 ? 1.0 : 0.0;
-        row_extremity[i] = next_state >= 0.5 ? row_upper[i] : row_lower[i];
+        if (run_end - run_start < needed) {
+            continue;
+        }
+        const int band_start = run_start + needed - 1;
+        double rolling = 0.0;
+        for (int i = ma_start; i <= band_start; ++i) {
+            rolling += fabs(close[i] - row_ma[i]);
+        }
+        const double first_dev = (rolling / static_cast<double>(length)) * mult;
+        row_upper[band_start] = row_ma[band_start] + first_dev;
+        row_lower[band_start] = row_ma[band_start] - first_dev;
+
+        for (int i = band_start + 1; i < run_end; ++i) {
+            rolling += fabs(close[i] - row_ma[i]);
+            rolling -= fabs(close[i - length] - row_ma[i - length]);
+            const double dev = (rolling / static_cast<double>(length)) * mult;
+            row_upper[i] = row_ma[i] + dev;
+            row_lower[i] = row_ma[i] - dev;
+        }
+
+        row_state[band_start] = 0.0;
+        row_changed[band_start] = 0.0;
+        row_extremity[band_start] = row_lower[band_start];
+
+        for (int i = band_start + 1; i < run_end; ++i) {
+            const double prev_state = row_state[i - 1];
+            const bool cross_high =
+                pine_cross(high[i - 1], row_upper[i - 1], high[i], row_upper[i]);
+            const bool cross_low =
+                pine_cross(low[i - 1], row_lower[i - 1], low[i], row_lower[i]);
+            const double next_state = cross_high ? 1.0 : (cross_low ? 0.0 : prev_state);
+            row_state[i] = next_state;
+            row_changed[i] = fabs(next_state - prev_state) > 0.0 ? 1.0 : 0.0;
+            row_extremity[i] = next_state >= 0.5 ? row_upper[i] : row_lower[i];
+        }
     }
 }
 
@@ -211,8 +227,6 @@ extern "C" __global__ void adjustable_ma_alternating_extremities_batch_f64(
 // bound is a property of this COMPILED kernel; `length` is pinned at the CPU
 // default 50, so it can never be approached, and it is checked rather than
 // assumed.
-#define NEO_AMAE_MAX_LENGTH 512
-
 extern "C" __global__ void adjustable_ma_alternating_extremities_neo_batch_f64(
     const double* __restrict__ high,
     const double* __restrict__ low,
@@ -242,7 +256,7 @@ extern "C" __global__ void adjustable_ma_alternating_extremities_neo_batch_f64(
     const double alpha = NEO_AMAE_ALPHA;
     const double beta = NEO_AMAE_BETA;
 
-    if (length < 2 || length > n || length > NEO_AMAE_MAX_LENGTH) {
+    if (length < 2 || length > n || length > AMAE_MAX_LENGTH) {
         return;
     }
     if (!isfinite(mult) || mult < 1.0 || !isfinite(alpha) || alpha < 0.0 ||
@@ -250,23 +264,22 @@ extern "C" __global__ void adjustable_ma_alternating_extremities_neo_batch_f64(
         return;
     }
 
-    int first = -1;
+    const int needed = (length * 2) - 1;
+    int longest_run = 0;
+    int current_run = 0;
     for (int i = 0; i < n; ++i) {
         if (valid_bar(high[i], low[i], close[i])) {
-            first = i;
-            break;
+            ++current_run;
+            longest_run = current_run > longest_run ? current_run : longest_run;
+        } else {
+            current_run = 0;
         }
     }
-    if (first < 0) {
+    if (longest_run < needed) {
         return;
     }
 
-    const int needed = (length * 2) - 1;
-    if (n - first < needed) {
-        return;
-    }
-
-    double w[NEO_AMAE_MAX_LENGTH];
+    double w[AMAE_MAX_LENGTH];
     double weight_sum = 0.0;
     for (int j = 0; j < length; ++j) {
         w[j] = raw_weight(j, length, alpha, beta);
@@ -280,12 +293,26 @@ extern "C" __global__ void adjustable_ma_alternating_extremities_neo_batch_f64(
         w[j] *= inv_weight_sum;
     }
 
-    const int ma_start = first + length - 1;
-    for (int i = ma_start; i < n; ++i) {
-        double acc = 0.0;
-        for (int j = 0; j < length; ++j) {
-            acc += close[i - j] * w[j];
+    int cursor = 0;
+    while (cursor < n) {
+        while (cursor < n && !valid_bar(high[cursor], low[cursor], close[cursor])) {
+            ++cursor;
         }
-        row[i] = acc;
+        const int run_start = cursor;
+        while (cursor < n && valid_bar(high[cursor], low[cursor], close[cursor])) {
+            ++cursor;
+        }
+        const int run_end = cursor;
+        if (run_end - run_start < length) {
+            continue;
+        }
+        const int ma_start = run_start + length - 1;
+        for (int i = ma_start; i < run_end; ++i) {
+            double acc = 0.0;
+            for (int j = 0; j < length; ++j) {
+                acc += close[i - j] * w[j];
+            }
+            row[i] = acc;
+        }
     }
 }

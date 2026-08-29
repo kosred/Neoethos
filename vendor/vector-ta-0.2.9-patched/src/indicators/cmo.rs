@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -12,11 +12,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for CmoInput<'a> {
     #[inline(always)]
@@ -43,10 +38,6 @@ pub struct CmoOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct CmoParams {
     pub period: Option<usize>,
 }
@@ -270,7 +261,6 @@ pub fn cmo_into_slice(dst: &mut [f64], input: &CmoInput, kern: Kernel) -> Result
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn cmo_into(input: &CmoInput, out: &mut [f64]) -> Result<(), CmoError> {
     let (data, period, first, chosen) = cmo_prepare(input, Kernel::Auto)?;
@@ -1150,236 +1140,12 @@ impl CmoStream {
     }
 }
 
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaCmo;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "cmo")]
-#[pyo3(signature = (data, period=None, kernel=None))]
-pub fn cmo_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = CmoParams { period };
-    let input = CmoInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| cmo_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "CmoStream")]
-pub struct CmoStreamPy {
-    stream: CmoStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl CmoStreamPy {
-    #[new]
-    fn new(period: Option<usize>) -> PyResult<Self> {
-        let params = CmoParams { period };
-        let stream =
-            CmoStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(CmoStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "cmo_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn cmo_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-
-    let sweep = CmoBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "cmo_batch: size overflow for rows={} cols={}",
-            rows, cols
-        ))
-    })?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            cmo_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "cmo_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn cmo_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, pyo3::types::PyDict>)> {
-    use crate::cuda::cuda_available;
-    use numpy::IntoPyArray;
-    use pyo3::types::PyDict;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let prices = data_f32.as_slice()?;
-    let sweep = CmoBatchRange {
-        period: period_range,
-    };
-    let (inner, ctx_arc, dev_id) = py.allow_threads(|| {
-        let cuda = CudaCmo::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_arc = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.cmo_batch_dev(prices, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-            .map(|inner| (inner, ctx_arc, dev_id))
-    })?;
-
-    let dict = PyDict::new(py);
-    let periods: Vec<u64> = expand_grid(&sweep)
-        .iter()
-        .map(|p| p.period.unwrap_or(14) as u64)
-        .collect();
-    dict.set_item("periods", periods.into_pyarray(py))?;
-
-    Ok((
-        DeviceArrayF32Py {
-            inner,
-            _ctx: Some(ctx_arc),
-            device_id: Some(dev_id),
-        },
-        dict,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "cmo_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn cmo_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let flat = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = CmoParams {
-        period: Some(period),
-    };
-    let (inner, ctx_arc, dev_id) = py.allow_threads(|| {
-        let cuda = CudaCmo::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_arc = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.cmo_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-            .map(|inner| (inner, ctx_arc, dev_id))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx_arc),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cmo_output_into_js(
-    data: &[f64],
-    period: Option<usize>,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = cmo_js(data, period)?;
-    crate::write_wasm_f64_output("cmo_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cmo_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = cmo_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("cmo_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_cmo_into_matches_api() -> Result<(), Box<dyn Error>> {
         let mut data = vec![f64::NAN; 3];
@@ -1416,8 +1182,8 @@ mod tests {
 
     fn check_cmo_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = CmoParams { period: None };
         let input = CmoInput::from_candles(&candles, "close", default_params);
         let output = cmo_with_kernel(&input, kernel)?;
@@ -1431,8 +1197,8 @@ mod tests {
 
     fn check_cmo_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = CmoParams { period: Some(14) };
         let input = CmoInput::from_candles(&candles, "close", params);
         let cmo_result = cmo_with_kernel(&input, kernel)?;
@@ -1461,8 +1227,8 @@ mod tests {
 
     fn check_cmo_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = CmoInput::with_default_candles(&candles);
         match input.data {
             CmoData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1520,8 +1286,8 @@ mod tests {
 
     fn check_cmo_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = CmoParams { period: Some(14) };
         let first_input = CmoInput::from_candles(&candles, "close", first_params);
         let first_result = cmo_with_kernel(&first_input, kernel)?;
@@ -1544,8 +1310,8 @@ mod tests {
     fn check_cmo_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_periods = vec![7, 14, 21, 28];
 
@@ -1565,23 +1331,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
             }
         }
@@ -1790,8 +1556,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = CmoBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1805,8 +1571,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = CmoBatchBuilder::new()
             .kernel(kernel)
@@ -1824,23 +1590,23 @@ mod tests {
 
             if bits == 0x11111111_11111111 {
                 panic!(
-					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
-					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
-					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
         }
 
@@ -1874,142 +1640,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cmo_js(data: &[f64], period: Option<usize>) -> Result<Vec<f64>, JsValue> {
-    let params = CmoParams { period };
-    let input = CmoInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    cmo_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cmo_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: Option<usize>,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = CmoParams { period };
-        let input = CmoInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            cmo_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            cmo_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cmo_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cmo_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CmoBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CmoBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<CmoParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = cmo_batch)]
-pub fn cmo_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: CmoBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let (p_start, p_end, p_step) = config.period_range;
-
-    let batch_range = CmoBatchRange {
-        period: (p_start, p_end, p_step),
-    };
-
-    let output = cmo_batch_with_kernel(data, &batch_range, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = CmoBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cmo_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to cmo_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = CmoBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        cmo_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

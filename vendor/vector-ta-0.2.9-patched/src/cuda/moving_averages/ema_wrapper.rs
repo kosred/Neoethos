@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::ema::{EmaBatchRange, EmaParams};
@@ -7,8 +7,8 @@ use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, DevicePointer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, DevicePointer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -23,7 +23,9 @@ pub enum CudaEmaError {
     Cuda(#[from] cust::error::CudaError),
     #[error("Invalid input: {0}")]
     InvalidInput(String),
-    #[error("Out of memory on device: required={required} bytes, free={free} bytes, headroom={headroom} bytes")]
+    #[error(
+        "Out of memory on device: required={required} bytes, free={free} bytes, headroom={headroom} bytes"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -128,19 +130,7 @@ impl CudaEma {
         let context = Context::new(device)?;
         let ctx = Arc::new(context);
 
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/ema_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
-        let module = match Module::from_ptx(ptx, jit_opts) {
-            Ok(m) => m,
-            Err(_) => match Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]) {
-                Ok(m) => m,
-                Err(_) => Module::from_ptx(ptx, &[])?,
-            },
-        };
+        let module = crate::load_cuda_embedded_module!("ema_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
         let max_grid_x = device.get_attribute(cust::device::DeviceAttribute::MaxGridDimX)? as usize;

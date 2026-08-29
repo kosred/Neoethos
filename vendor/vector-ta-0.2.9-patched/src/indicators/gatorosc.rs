@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
@@ -49,10 +49,6 @@ pub struct GatorOscOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct GatorOscParams {
     pub jaws_length: Option<usize>,
     pub jaws_shift: Option<usize>,
@@ -417,11 +413,7 @@ pub unsafe fn gatorosc_scalar(
     while i < n {
         let x = {
             let xi = *data.get_unchecked(i);
-            if xi.is_nan() {
-                jema
-            } else {
-                xi
-            }
+            if xi.is_nan() { jema } else { xi }
         };
 
         jema = jma.mul_add(jema, ja * x);
@@ -666,11 +658,7 @@ pub unsafe fn gatorosc_avx2(
     while i < n {
         let x = {
             let xi = *data.get_unchecked(i);
-            if xi.is_nan() {
-                jema
-            } else {
-                xi
-            }
+            if xi.is_nan() { jema } else { xi }
         };
         let vx = _mm256_set1_pd(x);
         let oma_e = _mm256_mul_pd(oma, e);
@@ -843,11 +831,7 @@ pub unsafe fn gatorosc_avx512_short(
     while i < n {
         let x = {
             let xi = *data.get_unchecked(i);
-            if xi.is_nan() {
-                jema
-            } else {
-                xi
-            }
+            if xi.is_nan() { jema } else { xi }
         };
         let vx = _mm512_set1_pd(x);
         let oma_e = _mm512_mul_pd(oma, e);
@@ -1215,7 +1199,6 @@ pub fn gatorosc_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn gatorosc_into(
     input: &GatorOscInput,
@@ -2374,366 +2357,11 @@ pub fn gatorosc_batch_par_slice(
     })
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct GatorOscJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gatorosc_js(
-    data: &[f64],
-    jaws_length: usize,
-    jaws_shift: usize,
-    teeth_length: usize,
-    teeth_shift: usize,
-    lips_length: usize,
-    lips_shift: usize,
-) -> Result<JsValue, JsValue> {
-    let params = GatorOscParams {
-        jaws_length: Some(jaws_length),
-        jaws_shift: Some(jaws_shift),
-        teeth_length: Some(teeth_length),
-        teeth_shift: Some(teeth_shift),
-        lips_length: Some(lips_length),
-        lips_shift: Some(lips_shift),
-    };
-    let input = GatorOscInput::from_slice(data, params);
-
-    let len = data.len();
-    let mut values = vec![0.0; 4 * len];
-
-    let (upper_part, rest) = values.split_at_mut(len);
-    let (lower_part, rest) = rest.split_at_mut(len);
-    let (upper_change_part, lower_change_part) = rest.split_at_mut(len);
-
-    gatorosc_into_slice(
-        upper_part,
-        lower_part,
-        upper_change_part,
-        lower_change_part,
-        &input,
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let output = GatorOscJsOutput {
-        values,
-        rows: 4,
-        cols: len,
-    };
-
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gatorosc_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gatorosc_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gatorosc_into(
-    in_ptr: *const f64,
-    upper_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    upper_change_ptr: *mut f64,
-    lower_change_ptr: *mut f64,
-    len: usize,
-    jaws_length: usize,
-    jaws_shift: usize,
-    teeth_length: usize,
-    teeth_shift: usize,
-    lips_length: usize,
-    lips_shift: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null()
-        || upper_ptr.is_null()
-        || lower_ptr.is_null()
-        || upper_change_ptr.is_null()
-        || lower_change_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = GatorOscParams {
-            jaws_length: Some(jaws_length),
-            jaws_shift: Some(jaws_shift),
-            teeth_length: Some(teeth_length),
-            teeth_shift: Some(teeth_shift),
-            lips_length: Some(lips_length),
-            lips_shift: Some(lips_shift),
-        };
-        let input = GatorOscInput::from_slice(data, params);
-
-        let needs_temp = in_ptr == upper_ptr as *const f64
-            || in_ptr == lower_ptr as *const f64
-            || in_ptr == upper_change_ptr as *const f64
-            || in_ptr == lower_change_ptr as *const f64;
-
-        if needs_temp {
-            let mut temp = vec![0.0; 4 * len];
-
-            let (temp_upper, rest) = temp.split_at_mut(len);
-            let (temp_lower, rest) = rest.split_at_mut(len);
-            let (temp_upper_change, temp_lower_change) = rest.split_at_mut(len);
-
-            gatorosc_into_slice(
-                temp_upper,
-                temp_lower,
-                temp_upper_change,
-                temp_lower_change,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let upper_out = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let lower_out = std::slice::from_raw_parts_mut(lower_ptr, len);
-            let upper_change_out = std::slice::from_raw_parts_mut(upper_change_ptr, len);
-            let lower_change_out = std::slice::from_raw_parts_mut(lower_change_ptr, len);
-
-            upper_out.copy_from_slice(temp_upper);
-            lower_out.copy_from_slice(temp_lower);
-            upper_change_out.copy_from_slice(temp_upper_change);
-            lower_change_out.copy_from_slice(temp_lower_change);
-        } else {
-            let upper_out = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let lower_out = std::slice::from_raw_parts_mut(lower_ptr, len);
-            let upper_change_out = std::slice::from_raw_parts_mut(upper_change_ptr, len);
-            let lower_change_out = std::slice::from_raw_parts_mut(lower_change_ptr, len);
-
-            gatorosc_into_slice(
-                upper_out,
-                lower_out,
-                upper_change_out,
-                lower_change_out,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct GatorOscBatchConfig {
-    pub jaws_length_range: (usize, usize, usize),
-    pub jaws_shift_range: (usize, usize, usize),
-    pub teeth_length_range: (usize, usize, usize),
-    pub teeth_shift_range: (usize, usize, usize),
-    pub lips_length_range: (usize, usize, usize),
-    pub lips_shift_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct GatorOscBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<GatorOscParams>,
-    pub rows: usize,
-    pub cols: usize,
-    pub outputs: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = gatorosc_batch)]
-pub fn gatorosc_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: GatorOscBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = GatorOscBatchRange {
-        jaws_length: config.jaws_length_range,
-        jaws_shift: config.jaws_shift_range,
-        teeth_length: config.teeth_length_range,
-        teeth_shift: config.teeth_shift_range,
-        lips_length: config.lips_length_range,
-        lips_shift: config.lips_shift_range,
-    };
-
-    let combos = expand_grid_gatorosc(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let n_combos = combos.len();
-    let len = data.len();
-
-    let total_size = n_combos
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("gatorosc_batch_js: rows*cols overflow"))?;
-    let slots = total_size
-        .checked_mul(4)
-        .ok_or_else(|| JsValue::from_str("gatorosc_batch_js: output size overflow"))?;
-    let mut values = vec![0.0; slots];
-
-    let (upper_part, rest) = values.split_at_mut(total_size);
-    let (lower_part, rest) = rest.split_at_mut(total_size);
-    let (upper_change_part, lower_change_part) = rest.split_at_mut(total_size);
-
-    gatorosc_batch_inner_into(
-        data,
-        &sweep,
-        Kernel::Auto,
-        false,
-        upper_part,
-        lower_part,
-        upper_change_part,
-        lower_change_part,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = GatorOscBatchJsOutput {
-        values,
-        combos,
-        rows: n_combos,
-        cols: len,
-        outputs: 4,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gatorosc_batch_into(
-    in_ptr: *const f64,
-    upper_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    upper_change_ptr: *mut f64,
-    lower_change_ptr: *mut f64,
-    len: usize,
-    jaws_length_start: usize,
-    jaws_length_end: usize,
-    jaws_length_step: usize,
-    jaws_shift_start: usize,
-    jaws_shift_end: usize,
-    jaws_shift_step: usize,
-    teeth_length_start: usize,
-    teeth_length_end: usize,
-    teeth_length_step: usize,
-    teeth_shift_start: usize,
-    teeth_shift_end: usize,
-    teeth_shift_step: usize,
-    lips_length_start: usize,
-    lips_length_end: usize,
-    lips_length_step: usize,
-    lips_shift_start: usize,
-    lips_shift_end: usize,
-    lips_shift_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null()
-        || upper_ptr.is_null()
-        || lower_ptr.is_null()
-        || upper_change_ptr.is_null()
-        || lower_change_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = GatorOscBatchRange {
-            jaws_length: (jaws_length_start, jaws_length_end, jaws_length_step),
-            jaws_shift: (jaws_shift_start, jaws_shift_end, jaws_shift_step),
-            teeth_length: (teeth_length_start, teeth_length_end, teeth_length_step),
-            teeth_shift: (teeth_shift_start, teeth_shift_end, teeth_shift_step),
-            lips_length: (lips_length_start, lips_length_end, lips_length_step),
-            lips_shift: (lips_shift_start, lips_shift_end, lips_shift_step),
-        };
-
-        let combos = expand_grid_gatorosc(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let n_combos = combos.len();
-        let total_size = n_combos
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("gatorosc_batch_into: rows*cols overflow"))?;
-
-        let upper_out = std::slice::from_raw_parts_mut(upper_ptr, total_size);
-        let lower_out = std::slice::from_raw_parts_mut(lower_ptr, total_size);
-        let upper_change_out = std::slice::from_raw_parts_mut(upper_change_ptr, total_size);
-        let lower_change_out = std::slice::from_raw_parts_mut(lower_change_ptr, total_size);
-
-        gatorosc_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Auto,
-            false,
-            upper_out,
-            lower_out,
-            upper_change_out,
-            lower_change_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(n_combos)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gatorosc_output_into_js(
-    data: &[f64],
-    jaws_length: usize,
-    jaws_shift: usize,
-    teeth_length: usize,
-    teeth_shift: usize,
-    lips_length: usize,
-    lips_shift: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = gatorosc_js(
-        data,
-        jaws_length,
-        jaws_shift,
-        teeth_length,
-        teeth_shift,
-        lips_length,
-        lips_shift,
-    )?;
-    crate::write_wasm_object_f64_outputs("gatorosc_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gatorosc_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = gatorosc_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("gatorosc_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
@@ -2742,8 +2370,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = GatorOscParams::default();
         let input = GatorOscInput::from_candles(&candles, "close", default_params);
         let output = gatorosc_with_kernel(&input, kernel)?;
@@ -2752,7 +2380,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     fn test_gatorosc_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let len = 256;
         let mut data = vec![0.0_f64; len];
@@ -2825,8 +2452,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = GatorOscInput::from_candles(&candles, "close", GatorOscParams::default());
         let output = gatorosc_with_kernel(&input, kernel)?;
         assert_eq!(output.upper.len(), candles.close.len());
@@ -2880,8 +2507,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = GatorOscInput::with_default_candles(&candles);
         let output = gatorosc_with_kernel(&input, kernel)?;
         assert_eq!(output.upper.len(), candles.close.len());
@@ -2893,8 +2520,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = GatorOscBatchBuilder::new()
             .kernel(kernel)
             .apply_slice(&c.close)?;
@@ -2923,8 +2550,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             GatorOscParams::default(),
@@ -3511,8 +3138,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = GatorOscBatchBuilder::new()
             .kernel(kernel)
@@ -3546,8 +3173,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let builder = GatorOscBatchBuilder::new()
             .kernel(kernel)
@@ -3591,8 +3218,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (5, 20, 5, 8, 8, 0, 8, 8, 0, 5, 5, 0, 5, 5, 0, 3, 3, 0),
@@ -3657,35 +3284,65 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 							at row {} col {} (flat index {}) in {} output with params: jl={}, js={}, tl={}, ts={}, ll={}, ls={}",
-							test, cfg_idx, val, bits, row, col, idx, matrix_name,
-							combo.jaws_length.unwrap_or(13), combo.jaws_shift.unwrap_or(8),
-							combo.teeth_length.unwrap_or(8), combo.teeth_shift.unwrap_or(5),
-							combo.lips_length.unwrap_or(5), combo.lips_shift.unwrap_or(3)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            matrix_name,
+                            combo.jaws_length.unwrap_or(13),
+                            combo.jaws_shift.unwrap_or(8),
+                            combo.teeth_length.unwrap_or(8),
+                            combo.teeth_shift.unwrap_or(5),
+                            combo.lips_length.unwrap_or(5),
+                            combo.lips_shift.unwrap_or(3)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 							at row {} col {} (flat index {}) in {} output with params: jl={}, js={}, tl={}, ts={}, ll={}, ls={}",
-							test, cfg_idx, val, bits, row, col, idx, matrix_name,
-							combo.jaws_length.unwrap_or(13), combo.jaws_shift.unwrap_or(8),
-							combo.teeth_length.unwrap_or(8), combo.teeth_shift.unwrap_or(5),
-							combo.lips_length.unwrap_or(5), combo.lips_shift.unwrap_or(3)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            matrix_name,
+                            combo.jaws_length.unwrap_or(13),
+                            combo.jaws_shift.unwrap_or(8),
+                            combo.teeth_length.unwrap_or(8),
+                            combo.teeth_shift.unwrap_or(5),
+                            combo.lips_length.unwrap_or(5),
+                            combo.lips_shift.unwrap_or(3)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 							at row {} col {} (flat index {}) in {} output with params: jl={}, js={}, tl={}, ts={}, ll={}, ls={}",
-							test, cfg_idx, val, bits, row, col, idx, matrix_name,
-							combo.jaws_length.unwrap_or(13), combo.jaws_shift.unwrap_or(8),
-							combo.teeth_length.unwrap_or(8), combo.teeth_shift.unwrap_or(5),
-							combo.lips_length.unwrap_or(5), combo.lips_shift.unwrap_or(3)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            matrix_name,
+                            combo.jaws_length.unwrap_or(13),
+                            combo.jaws_shift.unwrap_or(8),
+                            combo.teeth_length.unwrap_or(8),
+                            combo.teeth_shift.unwrap_or(5),
+                            combo.lips_length.unwrap_or(5),
+                            combo.lips_shift.unwrap_or(3)
+                        );
                     }
                 }
             };
@@ -3736,479 +3393,4 @@ mod tests {
     gen_batch_tests!(check_batch_multi_param_sweep);
     gen_batch_tests!(check_batch_not_enough_data);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "gatorosc")]
-#[pyo3(signature = (data, jaws_length=13, jaws_shift=8, teeth_length=8, teeth_shift=5, lips_length=5, lips_shift=3, kernel=None))]
-pub fn gatorosc_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    jaws_length: usize,
-    jaws_shift: usize,
-    teeth_length: usize,
-    teeth_shift: usize,
-    lips_length: usize,
-    lips_shift: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = GatorOscParams {
-        jaws_length: Some(jaws_length),
-        jaws_shift: Some(jaws_shift),
-        teeth_length: Some(teeth_length),
-        teeth_shift: Some(teeth_shift),
-        lips_length: Some(lips_length),
-        lips_shift: Some(lips_shift),
-    };
-    let input = GatorOscInput::from_slice(slice_in, params);
-
-    let (upper_vec, lower_vec, upper_change_vec, lower_change_vec) = py
-        .allow_threads(|| {
-            gatorosc_with_kernel(&input, kern)
-                .map(|o| (o.upper, o.lower, o.upper_change, o.lower_change))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        upper_vec.into_pyarray(py),
-        lower_vec.into_pyarray(py),
-        upper_change_vec.into_pyarray(py),
-        lower_change_vec.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "GatorOscStream")]
-pub struct GatorOscStreamPy {
-    stream: GatorOscStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl GatorOscStreamPy {
-    #[new]
-    #[pyo3(signature = (jaws_length=13, jaws_shift=8, teeth_length=8, teeth_shift=5, lips_length=5, lips_shift=3))]
-    fn new(
-        jaws_length: usize,
-        jaws_shift: usize,
-        teeth_length: usize,
-        teeth_shift: usize,
-        lips_length: usize,
-        lips_shift: usize,
-    ) -> PyResult<Self> {
-        let params = GatorOscParams {
-            jaws_length: Some(jaws_length),
-            jaws_shift: Some(jaws_shift),
-            teeth_length: Some(teeth_length),
-            teeth_shift: Some(teeth_shift),
-            lips_length: Some(lips_length),
-            lips_shift: Some(lips_shift),
-        };
-        let stream =
-            GatorOscStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(GatorOscStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "gatorosc_batch")]
-#[pyo3(signature = (data, jaws_length_range=(13, 13, 0), jaws_shift_range=(8, 8, 0), teeth_length_range=(8, 8, 0), teeth_shift_range=(5, 5, 0), lips_length_range=(5, 5, 0), lips_shift_range=(3, 3, 0), kernel=None))]
-pub fn gatorosc_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    jaws_length_range: (usize, usize, usize),
-    jaws_shift_range: (usize, usize, usize),
-    teeth_length_range: (usize, usize, usize),
-    teeth_shift_range: (usize, usize, usize),
-    lips_length_range: (usize, usize, usize),
-    lips_shift_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = GatorOscBatchRange {
-        jaws_length: jaws_length_range,
-        jaws_shift: jaws_shift_range,
-        teeth_length: teeth_length_range,
-        teeth_shift: teeth_shift_range,
-        lips_length: lips_length_range,
-        lips_shift: lips_shift_range,
-    };
-
-    let combos = expand_grid_gatorosc(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("gatorosc_batch_py: rows*cols overflow"))?;
-    let upper_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let lower_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let upper_change_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let lower_change_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let slice_upper = unsafe { upper_arr.as_slice_mut()? };
-    let slice_lower = unsafe { lower_arr.as_slice_mut()? };
-    let slice_upper_change = unsafe { upper_change_arr.as_slice_mut()? };
-    let slice_lower_change = unsafe { lower_change_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-
-            gatorosc_batch_inner_into(
-                slice_in,
-                &sweep,
-                simd,
-                true,
-                slice_upper,
-                slice_lower,
-                slice_upper_change,
-                slice_lower_change,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("upper", upper_arr.reshape((rows, cols))?)?;
-    dict.set_item("lower", lower_arr.reshape((rows, cols))?)?;
-    dict.set_item("upper_change", upper_change_arr.reshape((rows, cols))?)?;
-    dict.set_item("lower_change", lower_change_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "jaws_lengths",
-        combos
-            .iter()
-            .map(|p| p.jaws_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "jaws_shifts",
-        combos
-            .iter()
-            .map(|p| p.jaws_shift.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "teeth_lengths",
-        combos
-            .iter()
-            .map(|p| p.teeth_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "teeth_shifts",
-        combos
-            .iter()
-            .map(|p| p.teeth_shift.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "lips_lengths",
-        combos
-            .iter()
-            .map(|p| p.lips_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "lips_shifts",
-        combos
-            .iter()
-            .map(|p| p.lips_shift.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::gatorosc_wrapper::CudaGatorOsc;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "GatorDeviceArrayF32", unsendable)]
-pub struct DeviceArrayF32GatorPy {
-    pub(crate) inner: crate::cuda::moving_averages::DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32GatorPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr_val: usize = if self.inner.rows == 0 || self.inner.cols == 0 {
-            0
-        } else {
-            self.inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "__dlpack__(copy=True) not implemented for Gator CUDA handle",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err(
-                            "dl_device mismatch for Gator DLPack tensor",
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        if let Some(copy_obj) = copy.as_ref() {
-            let do_copy: bool = copy_obj.extract(py)?;
-            if do_copy {
-                return Err(PyValueError::new_err(
-                    "__dlpack__(copy=True) not implemented for Gator CUDA handle",
-                ));
-            }
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let rows = self.inner.rows;
-        let cols = self.inner.cols;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            crate::cuda::moving_averages::DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, inner.buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "gatorosc_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, jaws_length_range=(13,13,0), jaws_shift_range=(8,8,0), teeth_length_range=(8,8,0), teeth_shift_range=(5,5,0), lips_length_range=(5,5,0), lips_shift_range=(3,3,0), device_id=0))]
-pub fn gatorosc_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    jaws_length_range: (usize, usize, usize),
-    jaws_shift_range: (usize, usize, usize),
-    teeth_length_range: (usize, usize, usize),
-    teeth_shift_range: (usize, usize, usize),
-    lips_length_range: (usize, usize, usize),
-    lips_shift_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(
-    DeviceArrayF32GatorPy,
-    DeviceArrayF32GatorPy,
-    DeviceArrayF32GatorPy,
-    DeviceArrayF32GatorPy,
-)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let data = data_f32.as_slice()?;
-    let sweep = GatorOscBatchRange {
-        jaws_length: jaws_length_range,
-        jaws_shift: jaws_shift_range,
-        teeth_length: teeth_length_range,
-        teeth_shift: teeth_shift_range,
-        lips_length: lips_length_range,
-        lips_shift: lips_shift_range,
-    };
-    let (upper, lower, upper_change, lower_change) = py.allow_threads(|| {
-        let cuda =
-            CudaGatorOsc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let ctx = cuda.ctx();
-        let quad = cuda
-            .gatorosc_batch_dev(data, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((
-            DeviceArrayF32GatorPy {
-                inner: quad.upper,
-                _ctx_guard: ctx.clone(),
-                _device_id: dev_id,
-            },
-            DeviceArrayF32GatorPy {
-                inner: quad.lower,
-                _ctx_guard: ctx.clone(),
-                _device_id: dev_id,
-            },
-            DeviceArrayF32GatorPy {
-                inner: quad.upper_change,
-                _ctx_guard: ctx.clone(),
-                _device_id: dev_id,
-            },
-            DeviceArrayF32GatorPy {
-                inner: quad.lower_change,
-                _ctx_guard: ctx,
-                _device_id: dev_id,
-            },
-        ))
-    })?;
-    Ok((upper, lower, upper_change, lower_change))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "gatorosc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, cols, rows, jaws_length=13, jaws_shift=8, teeth_length=8, teeth_shift=5, lips_length=5, lips_shift=3, device_id=0))]
-pub fn gatorosc_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    jaws_length: usize,
-    jaws_shift: usize,
-    teeth_length: usize,
-    teeth_shift: usize,
-    lips_length: usize,
-    lips_shift: usize,
-    device_id: usize,
-) -> PyResult<(
-    DeviceArrayF32GatorPy,
-    DeviceArrayF32GatorPy,
-    DeviceArrayF32GatorPy,
-    DeviceArrayF32GatorPy,
-)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let prices = prices_tm_f32.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if prices.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let (upper, lower, upper_change, lower_change) = py.allow_threads(|| {
-        let cuda =
-            CudaGatorOsc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let ctx = cuda.ctx();
-        let quad = cuda
-            .gatorosc_many_series_one_param_time_major_dev(
-                prices,
-                cols,
-                rows,
-                jaws_length,
-                jaws_shift,
-                teeth_length,
-                teeth_shift,
-                lips_length,
-                lips_shift,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((
-            DeviceArrayF32GatorPy {
-                inner: quad.upper,
-                _ctx_guard: ctx.clone(),
-                _device_id: dev_id,
-            },
-            DeviceArrayF32GatorPy {
-                inner: quad.lower,
-                _ctx_guard: ctx.clone(),
-                _device_id: dev_id,
-            },
-            DeviceArrayF32GatorPy {
-                inner: quad.upper_change,
-                _ctx_guard: ctx.clone(),
-                _device_id: dev_id,
-            },
-            DeviceArrayF32GatorPy {
-                inner: quad.lower_change,
-                _ctx_guard: ctx,
-                _device_id: dev_id,
-            },
-        ))
-    })?;
-    Ok((upper, lower, upper_change, lower_change))
 }

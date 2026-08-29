@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::Path;
 
-use crate::base::{ExpertModel, dataframe_to_float32_array, feature_columns_from_dataframe};
+use crate::base::{
+    ExpertModel, feature_columns_from_frame, feature_frame_to_f64_array, validate_model_labels,
+};
 use crate::runtime::artifacts::TrainingSummaryMetadata;
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
@@ -17,24 +20,27 @@ use crate::tree_models::common::{
 
 const MODEL_FILE_NAME: &str = "model.json";
 const SKLEARS_RUNTIME_FILE_NAME: &str = "runtime.json";
+const SKLEARS_F64_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum TreeNode {
     Leaf {
         class_counts: [usize; 3],
-        probabilities: [f32; 3],
+        probabilities: [f64; 3],
     },
     Split {
         feature_index: usize,
-        threshold: f32,
-        probabilities: [f32; 3],
+        threshold: f64,
+        probabilities: [f64; 3],
         left: Box<TreeNode>,
         right: Box<TreeNode>,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DecisionTreeArtifact {
+    schema_version: u32,
     max_depth: usize,
     min_samples_split: usize,
     min_samples_leaf: usize,
@@ -43,20 +49,22 @@ struct DecisionTreeArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SklearsRuntimeArtifact {
+    schema_version: u32,
     feature_columns: Vec<String>,
     training_summary: TrainingSummaryMetadata,
 }
 
-fn validate_probability_vector(probabilities: &[f32; 3]) -> Result<()> {
-    let mut sum = 0.0_f32;
+fn validate_probability_vector(probabilities: &[f64; 3]) -> Result<()> {
+    let mut sum = 0.0_f64;
     for value in probabilities {
         if !value.is_finite() || *value < 0.0 {
             bail!("sklears-tree probabilities must be finite and non-negative");
         }
         sum += *value;
     }
-    if sum <= f32::EPSILON {
+    if sum <= f64::EPSILON {
         bail!("sklears-tree probabilities must have positive mass");
     }
     if (sum - 1.0).abs() > 1e-3 {
@@ -150,22 +158,17 @@ impl SklearsTreeExpert {
         }
     }
 
-    fn labels_from_series(y: &Series) -> Result<Vec<usize>> {
-        let labels = y
-            .cast(&DataType::Int32)
-            .context("cast sklears-tree labels to Int32")?;
+    fn labels_from_slice(labels: &[i32], expected_rows: usize) -> Result<Vec<usize>> {
+        validate_model_labels(labels, expected_rows)?;
         labels
-            .i32()
-            .context("access sklears-tree labels as Int32")?
-            .into_iter()
+            .iter()
             .map(|value| match value {
-                Some(0) => Ok(0usize),
-                Some(1) => Ok(1usize),
-                Some(-1) => Ok(2usize),
-                Some(other) => {
+                0 => Ok(0usize),
+                1 => Ok(1usize),
+                -1 => Ok(2usize),
+                other => {
                     bail!("unsupported sklears-tree label: {other}; expected one of -1, 0, 1")
                 }
-                None => bail!("sklears-tree labels may not contain nulls"),
             })
             .collect()
     }
@@ -178,49 +181,49 @@ impl SklearsTreeExpert {
         counts
     }
 
-    fn probabilities_from_counts(counts: [usize; 3]) -> [f32; 3] {
-        let total = counts.iter().sum::<usize>() as f32;
-        if total <= f32::EPSILON {
-            return [1.0, 0.0, 0.0];
+    fn probabilities_from_counts(counts: [usize; 3]) -> Result<[f64; 3]> {
+        let total = counts.iter().sum::<usize>() as f64;
+        if total <= f64::EPSILON {
+            bail!("sklears-tree node cannot derive probabilities from zero observations");
         }
-        [
-            counts[0] as f32 / total,
-            counts[1] as f32 / total,
-            counts[2] as f32 / total,
-        ]
+        Ok([
+            counts[0] as f64 / total,
+            counts[1] as f64 / total,
+            counts[2] as f64 / total,
+        ])
     }
 
     fn is_pure(counts: [usize; 3]) -> bool {
         counts.iter().filter(|count| **count > 0).count() <= 1
     }
 
-    fn gini_from_counts(counts: [usize; 3]) -> f32 {
-        let total = counts.iter().sum::<usize>() as f32;
-        if total <= f32::EPSILON {
+    fn gini_from_counts(counts: [usize; 3]) -> f64 {
+        let total = counts.iter().sum::<usize>() as f64;
+        if total <= f64::EPSILON {
             return 0.0;
         }
         1.0 - counts
             .iter()
             .map(|count| {
-                let prob = *count as f32 / total;
+                let prob = *count as f64 / total;
                 prob * prob
             })
-            .sum::<f32>()
+            .sum::<f64>()
     }
 
     fn candidate_thresholds(
         &self,
-        features: &Array2<f32>,
+        features: &Array2<f64>,
         rows: &[usize],
         feature_idx: usize,
-    ) -> Vec<f32> {
+    ) -> Vec<f64> {
         let mut values = rows
             .iter()
             .map(|row| features[(*row, feature_idx)])
             .filter(|value| value.is_finite())
             .collect::<Vec<_>>();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-        values.dedup_by(|a, b| (*a - *b).abs() <= f32::EPSILON);
+        values.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON);
         if values.len() < 2 {
             return Vec::new();
         }
@@ -233,7 +236,7 @@ impl SklearsTreeExpert {
             return midpoints;
         }
 
-        let step = ((midpoints.len() as f32) / (self.max_thresholds_per_feature as f32))
+        let step = ((midpoints.len() as f64) / (self.max_thresholds_per_feature as f64))
             .ceil()
             .max(1.0) as usize;
         midpoints
@@ -244,10 +247,10 @@ impl SklearsTreeExpert {
     }
 
     fn split_rows(
-        features: &Array2<f32>,
+        features: &Array2<f64>,
         rows: &[usize],
         feature_idx: usize,
-        threshold: f32,
+        threshold: f64,
     ) -> (Vec<usize>, Vec<usize>) {
         let mut left = Vec::new();
         let mut right = Vec::new();
@@ -263,13 +266,13 @@ impl SklearsTreeExpert {
 
     fn best_split(
         &self,
-        features: &Array2<f32>,
+        features: &Array2<f64>,
         labels: &[usize],
         rows: &[usize],
-    ) -> Option<(usize, f32, Vec<usize>, Vec<usize>)> {
+    ) -> Option<(usize, f64, Vec<usize>, Vec<usize>)> {
         let parent_counts = Self::class_counts(labels, rows);
         let parent_gini = Self::gini_from_counts(parent_counts);
-        let mut best_gain = f32::NEG_INFINITY;
+        let mut best_gain = f64::NEG_INFINITY;
         let mut best_split = None;
 
         for feature_idx in 0..features.ncols() {
@@ -284,8 +287,8 @@ impl SklearsTreeExpert {
 
                 let left_counts = Self::class_counts(labels, &left_rows);
                 let right_counts = Self::class_counts(labels, &right_rows);
-                let left_weight = left_rows.len() as f32 / rows.len() as f32;
-                let right_weight = right_rows.len() as f32 / rows.len() as f32;
+                let left_weight = left_rows.len() as f64 / rows.len() as f64;
+                let right_weight = right_rows.len() as f64 / rows.len() as f64;
                 let gain = parent_gini
                     - (left_weight * Self::gini_from_counts(left_counts))
                     - (right_weight * Self::gini_from_counts(right_counts));
@@ -302,43 +305,43 @@ impl SklearsTreeExpert {
 
     fn build_node(
         &self,
-        features: &Array2<f32>,
+        features: &Array2<f64>,
         labels: &[usize],
         rows: &[usize],
         depth: usize,
-    ) -> TreeNode {
+    ) -> Result<TreeNode> {
         let counts = Self::class_counts(labels, rows);
-        let probabilities = Self::probabilities_from_counts(counts);
+        let probabilities = Self::probabilities_from_counts(counts)?;
         if depth >= self.max_depth || rows.len() < self.min_samples_split || Self::is_pure(counts) {
-            return TreeNode::Leaf {
+            return Ok(TreeNode::Leaf {
                 class_counts: counts,
                 probabilities,
-            };
+            });
         }
 
         if let Some((feature_index, threshold, left_rows, right_rows)) =
             self.best_split(features, labels, rows)
         {
-            return TreeNode::Split {
+            return Ok(TreeNode::Split {
                 feature_index,
                 threshold,
                 probabilities,
-                left: Box::new(self.build_node(features, labels, &left_rows, depth + 1)),
-                right: Box::new(self.build_node(features, labels, &right_rows, depth + 1)),
-            };
+                left: Box::new(self.build_node(features, labels, &left_rows, depth + 1)?),
+                right: Box::new(self.build_node(features, labels, &right_rows, depth + 1)?),
+            });
         }
 
-        TreeNode::Leaf {
+        Ok(TreeNode::Leaf {
             class_counts: counts,
             probabilities,
-        }
+        })
     }
 
     fn predict_row_probabilities(
         node: &TreeNode,
-        features: &Array2<f32>,
+        features: &Array2<f64>,
         row_idx: usize,
-    ) -> [f32; 3] {
+    ) -> [f64; 3] {
         match node {
             TreeNode::Leaf { probabilities, .. } => *probabilities,
             TreeNode::Split {
@@ -398,36 +401,29 @@ impl Default for SklearsTreeExpert {
 }
 
 impl ExpertModel for SklearsTreeExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], _lease: &CpuLease) -> Result<()> {
         let features =
-            dataframe_to_float32_array(x).context("build sklears-tree feature matrix")?;
+            feature_frame_to_f64_array(x).context("build f64 sklears-tree feature matrix")?;
         if features.nrows() == 0 || features.ncols() == 0 {
             bail!("sklears-tree requires a non-empty feature matrix");
         }
-        let labels = Self::labels_from_series(y)?;
-        if labels.len() != features.nrows() {
-            bail!(
-                "sklears-tree row/label mismatch: {} rows vs {} labels",
-                features.nrows(),
-                labels.len()
-            );
-        }
+        let labels = Self::labels_from_slice(y, features.nrows())?;
 
         let rows = (0..features.nrows()).collect::<Vec<_>>();
-        self.root = Some(self.build_node(&features, &labels, &rows, 0));
-        self.feature_columns = feature_columns_from_dataframe(x);
+        self.root = Some(self.build_node(&features, &labels, &rows, 0)?);
+        self.feature_columns = feature_columns_from_frame(x);
         self.training_summary = Some(default_training_summary(x));
         Ok(())
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    fn predict_proba(&self, x: &FeatureFrame, _lease: &CpuLease) -> Result<Array2<f64>> {
         let root = self
             .root
             .as_ref()
             .context("sklears-tree model not fitted")?;
         ensure_feature_columns_match(&self.feature_columns, x)?;
         let features =
-            dataframe_to_float32_array(x).context("build sklears-tree inference matrix")?;
+            feature_frame_to_f64_array(x).context("build f64 sklears-tree inference matrix")?;
         let mut probabilities = Array2::zeros((features.nrows(), 3));
         for row_idx in 0..features.nrows() {
             let row_probs = Self::predict_row_probabilities(root, &features, row_idx);
@@ -445,6 +441,7 @@ impl ExpertModel for SklearsTreeExpert {
             .as_ref()
             .context("sklears-tree model not fitted")?;
         let artifact = DecisionTreeArtifact {
+            schema_version: SKLEARS_F64_ARTIFACT_SCHEMA_VERSION,
             max_depth: self.max_depth,
             min_samples_split: self.min_samples_split,
             min_samples_leaf: self.min_samples_leaf,
@@ -454,6 +451,7 @@ impl ExpertModel for SklearsTreeExpert {
         let (model_path, metadata_path) = tree_artifact_paths(path, MODEL_FILE_NAME);
         write_tree_json_artifact(&model_path, &artifact, "sklears-tree artifact")?;
         let runtime_artifact = SklearsRuntimeArtifact {
+            schema_version: SKLEARS_F64_ARTIFACT_SCHEMA_VERSION,
             feature_columns: self.feature_columns.clone(),
             training_summary: self.stored_training_summary(),
         };
@@ -477,7 +475,23 @@ impl ExpertModel for SklearsTreeExpert {
         let (model_path, metadata_path) = tree_artifact_paths(path, MODEL_FILE_NAME);
         let artifact: DecisionTreeArtifact =
             read_tree_json_artifact(&model_path, "sklears-tree artifact")?;
+        if artifact.schema_version != SKLEARS_F64_ARTIFACT_SCHEMA_VERSION {
+            bail!(
+                "sklears-tree artifact schema {} is unsupported; expected f64 schema {}",
+                artifact.schema_version,
+                SKLEARS_F64_ARTIFACT_SCHEMA_VERSION
+            );
+        }
         let runtime_artifact = Self::read_runtime_artifact(path)?;
+        if let Some(runtime) = runtime_artifact.as_ref()
+            && runtime.schema_version != SKLEARS_F64_ARTIFACT_SCHEMA_VERSION
+        {
+            bail!(
+                "sklears-tree runtime artifact schema {} is unsupported; expected f64 schema {}",
+                runtime.schema_version,
+                SKLEARS_F64_ARTIFACT_SCHEMA_VERSION
+            );
+        }
         let metadata = if metadata_path.exists() {
             let metadata = read_runtime_metadata(&metadata_path)?;
             if metadata.model_name != "sklears_tree" || metadata.family != ModelFamily::Tree {
@@ -537,39 +551,65 @@ impl SklearsTreeExpert {
         &self.feature_columns
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
         self.ensure_runtime_state_ready()?;
-        let probabilities = self.predict_proba(x)?;
-        build_tree_runtime_predictions(
-            "sklears_tree",
-            &probabilities,
-            true,
-            "sklears_tree_native",
-            None,
-            "native_sklears_tree_unavailable",
-            "sklears_tree_unknown",
-        )
+        let probabilities = self.predict_proba(x, lease)?;
+        build_tree_runtime_predictions("sklears_tree", &probabilities, "sklears_tree_f64")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ExpertModel, SklearsTreeExpert};
+    use super::{ExpertModel, SklearsTreeExpert, TreeNode};
     use crate::runtime::artifacts::TrainingSummaryMetadata;
-    use polars::df;
-    use polars::prelude::*;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame};
+    use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn sample_three_class_dataset() -> (DataFrame, Series) {
-        let x = df![
-            "momentum" => &[0.96, 0.93, 0.89, 0.07, 0.03, 0.11, -0.94, -0.91, -0.88],
-            "trend" => &[0.87, 0.91, 0.86, 0.01, -0.02, 0.04, -0.9, -0.86, -0.93],
-            "volatility" => &[0.62, 0.58, 0.6, 0.2, 0.18, 0.23, 0.69, 0.66, 0.64],
-        ]
-        .expect("build training dataframe");
-        let y = Series::new("label".into(), &[1_i32, 1, 1, 0, 0, 0, -1, -1, -1]);
-        (x, y)
+    fn frame(columns: Vec<(&str, Vec<f64>)>) -> FeatureFrame {
+        let rows = columns.first().map(|(_, values)| values.len()).unwrap_or(0);
+        let columns = columns
+            .into_iter()
+            .map(|(name, values)| {
+                FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+                    .expect("valid feature column")
+            })
+            .collect::<Vec<_>>();
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+        .expect("valid feature frame")
+    }
+
+    fn sample_three_class_dataset() -> (FeatureFrame, Vec<i32>) {
+        let x = frame(vec![
+            (
+                "momentum",
+                vec![0.96, 0.93, 0.89, 0.07, 0.03, 0.11, -0.94, -0.91, -0.88],
+            ),
+            (
+                "trend",
+                vec![0.87, 0.91, 0.86, 0.01, -0.02, 0.04, -0.9, -0.86, -0.93],
+            ),
+            (
+                "volatility",
+                vec![0.62, 0.58, 0.6, 0.2, 0.18, 0.23, 0.69, 0.66, 0.64],
+            ),
+        ]);
+        (x, vec![1, 1, 1, 0, 0, 0, -1, -1, -1])
+    }
+
+    fn single_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("single-worker lease")
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -586,9 +626,10 @@ mod tests {
     fn sklears_save_rejects_missing_training_summary() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("sklears-missing-summary");
+        let lease = single_worker_lease();
 
         let mut expert = SklearsTreeExpert::new();
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
         expert.training_summary = None;
 
         let err = expert
@@ -600,14 +641,15 @@ mod tests {
     #[test]
     fn sklears_predict_runtime_returns_runtime_predictions() {
         let (x, y) = sample_three_class_dataset();
+        let lease = single_worker_lease();
 
         let mut expert = SklearsTreeExpert::new();
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
 
         let predictions = expert
-            .predict_runtime(&x)
+            .predict_runtime(&x, &lease)
             .expect("runtime prediction should succeed");
-        assert_eq!(predictions.len(), x.height());
+        assert_eq!(predictions.len(), x.n_samples());
         assert!(predictions.iter().all(|prediction| {
             prediction.class_probabilities().len() == 3
                 && prediction
@@ -621,9 +663,10 @@ mod tests {
     fn sklears_load_rejects_inconsistent_training_summary() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("sklears-bad-summary");
+        let lease = single_worker_lease();
 
         let mut expert = SklearsTreeExpert::new();
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
         expert.save(&artifact_dir).expect("save should succeed");
 
         let metadata_path = artifact_dir.join("metadata.json");
@@ -648,9 +691,10 @@ mod tests {
     fn sklears_load_uses_runtime_artifact_when_metadata_sidecar_missing() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("sklears-metadata-missing");
+        let lease = single_worker_lease();
 
         let mut expert = SklearsTreeExpert::new();
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
         expert.save(&artifact_dir).expect("save should succeed");
 
         let metadata_path = artifact_dir.join("metadata.json");
@@ -667,8 +711,33 @@ mod tests {
             .load(&artifact_dir)
             .expect("load should reconstruct metadata from runtime artifact");
         let probabilities = loaded
-            .predict_proba(&x)
+            .predict_proba(&x, &lease)
             .expect("prediction should succeed after metadata reconstruction");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
+        assert_eq!(probabilities.dim(), (x.n_samples(), 3));
+    }
+
+    #[test]
+    fn sklears_keeps_split_information_beyond_f32_precision() {
+        let values = (0..8)
+            .map(|index| 1.0_f64 + index as f64 * 1.0e-9)
+            .collect::<Vec<_>>();
+        assert!(
+            values.iter().all(|value| *value as f32 == 1.0_f32),
+            "fixture must collapse when narrowed to f32"
+        );
+        let x = frame(vec![("sub_f32_resolution", values)]);
+        let y = vec![0, 0, 0, 0, 1, 1, 1, 1];
+        let lease = single_worker_lease();
+        let mut expert = SklearsTreeExpert::new();
+        expert.min_samples_leaf = 1;
+        expert.min_samples_split = 2;
+        expert.max_thresholds_per_feature = 16;
+
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
+
+        assert!(
+            matches!(expert.root, Some(TreeNode::Split { .. })),
+            "the project-owned tree must retain f64-only separation instead of collapsing samples"
+        );
     }
 }

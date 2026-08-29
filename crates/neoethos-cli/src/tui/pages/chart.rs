@@ -1,8 +1,8 @@
 //! Chart — braille candlestick view of a symbol/timeframe's Vortex data.
 //!
-//! Reads OHLCV via `neoethos_data::load_symbol_timeframe_tail` (the same
-//! integrity-gated path the server chart uses) and renders the trailing
-//! N candles on a ratatui `Canvas` with the Braille marker.
+//! Inventories exact canonical identities without hashing data on every UI
+//! refresh, then fully verifies and generation-pins the selected identity
+//! before rendering its trailing N candles on a ratatui `Canvas`.
 //!
 //! Defensive by contract (see the operator's "clear-errors, no-unwrap"
 //! directive): every failure mode — missing data dir, no symbols, a
@@ -36,6 +36,8 @@ struct Candle {
 /// Per-session Chart page state. Lives in [`AppShared`].
 pub struct ChartState {
     data_root: std::path::PathBuf,
+    inventory_entries: Vec<neoethos_data::DataFileEntry>,
+    inventory_rejections: Vec<String>,
     symbols: Vec<String>,
     symbol_idx: usize,
     timeframes: Vec<String>,
@@ -43,7 +45,7 @@ pub struct ChartState {
     candles: Vec<Candle>,
     /// `(symbol, timeframe)` currently loaded into `candles`; `None` means
     /// "needs (re)load on next draw".
-    loaded_key: Option<(String, String)>,
+    loaded_key: Option<(String, String, String)>,
     /// Human-readable status shown when there's nothing to plot. Always a
     /// message — never a panic.
     status: String,
@@ -53,6 +55,8 @@ impl ChartState {
     pub fn new(data_root: &std::path::Path) -> Self {
         let mut s = Self {
             data_root: data_root.to_path_buf(),
+            inventory_entries: Vec::new(),
+            inventory_rejections: Vec::new(),
             symbols: Vec::new(),
             symbol_idx: 0,
             timeframes: Vec::new(),
@@ -66,23 +70,63 @@ impl ChartState {
     }
 
     fn refresh_symbols(&mut self) {
-        match neoethos_data::discover_symbols(&self.data_root) {
-            Ok(syms) if !syms.is_empty() => {
-                self.symbols = syms;
+        match neoethos_data::DatasetDiscovery::scan_metadata(&self.data_root) {
+            Ok(report) => {
+                self.inventory_rejections = report
+                    .skipped
+                    .into_iter()
+                    .map(|skipped| {
+                        format!(
+                            "path={} category={} detail={:?}",
+                            skipped.path.display(),
+                            skipped.reason.category(),
+                            skipped.reason
+                        )
+                    })
+                    .collect();
+                self.inventory_entries.clear();
+                for entry in report.entries {
+                    if entry.symbol.is_none() || entry.timeframe.is_none() {
+                        self.inventory_rejections.push(format!(
+                            "path={} category=invalid_inventory_entry detail=missing symbol/timeframe for identity={} generation={} manifest_binding_sha256={} verification={:?}",
+                            entry.path.display(),
+                            entry.dataset_identity,
+                            entry.generation,
+                            entry.manifest_binding_sha256,
+                            entry.verification
+                        ));
+                    } else {
+                        self.inventory_entries.push(entry);
+                    }
+                }
+                self.symbols = self
+                    .inventory_entries
+                    .iter()
+                    .filter_map(|entry| entry.symbol.clone())
+                    .collect();
+                self.symbols.sort();
+                self.symbols.dedup();
+                if self.symbols.is_empty() {
+                    self.timeframes.clear();
+                    let rejected = if self.inventory_rejections.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Rejected: {}", self.inventory_rejections.join(" | "))
+                    };
+                    self.status = format!(
+                        "No canonical dataset identities under {}.",
+                        self.data_root.display()
+                    ) + &rejected;
+                    return;
+                }
                 if self.symbol_idx >= self.symbols.len() {
                     self.symbol_idx = 0;
                 }
                 self.refresh_timeframes();
             }
-            Ok(_) => {
-                self.symbols.clear();
-                self.timeframes.clear();
-                self.status = format!(
-                    "No symbols under {}. Import data or run Data Bootstrap first.",
-                    self.data_root.display()
-                );
-            }
             Err(e) => {
+                self.inventory_entries.clear();
+                self.inventory_rejections.clear();
                 self.symbols.clear();
                 self.timeframes.clear();
                 self.status = format!("Could not scan {}: {e}", self.data_root.display());
@@ -96,21 +140,26 @@ impl ChartState {
             self.timeframes.clear();
             return;
         };
-        match neoethos_data::discover_timeframes(&self.data_root, &symbol) {
-            Ok(tfs) if !tfs.is_empty() => {
-                self.timeframes = tfs;
-                if self.tf_idx >= self.timeframes.len() {
-                    self.tf_idx = 0;
-                }
-            }
-            Ok(_) => {
-                self.timeframes.clear();
-                self.status = format!("{symbol}: no usable timeframes (all missing/partial).");
-            }
-            Err(e) => {
-                self.timeframes.clear();
-                self.status = format!("{symbol}: could not list timeframes: {e}");
-            }
+        self.timeframes = self
+            .inventory_entries
+            .iter()
+            .filter(|entry| entry.symbol.as_deref() == Some(symbol.as_str()))
+            .filter_map(|entry| entry.timeframe.clone())
+            .collect();
+        self.timeframes.sort_by(|left, right| {
+            let code = |timeframe: &str| {
+                timeframe
+                    .parse::<neoethos_data::CanonicalTimeframe>()
+                    .map(|value| value.ctrader_protocol_code())
+                    .unwrap_or(i32::MAX)
+            };
+            code(left).cmp(&code(right))
+        });
+        self.timeframes.dedup();
+        if self.timeframes.is_empty() {
+            self.status = format!("{symbol}: no canonical manifest timeframes.");
+        } else if self.tf_idx >= self.timeframes.len() {
+            self.tf_idx = 0;
         }
     }
 
@@ -131,21 +180,101 @@ impl ChartState {
             self.candles.clear();
             return; // status already set by refresh_*
         };
-        if self.loaded_key.as_ref() == Some(&(symbol.clone(), tf.clone())) {
+        let matching = self
+            .inventory_entries
+            .iter()
+            .filter(|entry| {
+                entry.symbol.as_deref() == Some(symbol.as_str())
+                    && entry.timeframe.as_deref() == Some(tf.as_str())
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            self.candles.clear();
+            self.loaded_key = None;
+            let exact = matching
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "identity={} generation={}",
+                        entry.dataset_identity, entry.generation
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            self.status = format!(
+                "{symbol} {tf}: expected exactly one canonical identity, found {}. {exact}",
+                matching.len()
+            );
+            return;
+        }
+        let entry = (*matching[0]).clone();
+        let key = (symbol.clone(), tf.clone(), entry.generation.clone());
+        if self.loaded_key.as_ref() == Some(&key) {
             return; // already loaded — no per-frame disk thrash
         }
-        self.loaded_key = Some((symbol.clone(), tf.clone()));
         self.candles.clear();
+        self.loaded_key = None;
         self.status.clear();
-
-        let ohlcv =
-            match neoethos_data::load_symbol_timeframe_tail(&self.data_root, &symbol, &tf, TAIL) {
-                Ok(o) => o,
-                Err(e) => {
-                    self.status = format!("{symbol} {tf}: {e}");
-                    return;
-                }
-            };
+        if entry.verification != neoethos_data::DataVerificationStatus::ManifestOnly {
+            self.status = format!(
+                "{symbol} {tf}: inventory entry has unexpected verification {:?}",
+                entry.verification
+            );
+            return;
+        }
+        let identity = match neoethos_data::CanonicalDatasetIdentity::from_path_component(
+            &entry.dataset_identity,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.status = format!("{symbol} {tf}: invalid exact identity: {error}");
+                return;
+            }
+        };
+        let loaded = match neoethos_data::core::canonical_ohlcv::load_canonical_timeframe(
+            &self.data_root,
+            &identity,
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.status = format!(
+                    "{symbol} {tf} identity={} generation={}: {error:#}",
+                    entry.dataset_identity, entry.generation
+                );
+                return;
+            }
+        };
+        let binding = match loaded.artifact().source_binding("tui-chart-source") {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.status = format!("{symbol} {tf}: source binding failed: {error}");
+                return;
+            }
+        };
+        if binding.generation_id() != entry.generation.as_str()
+            || hex_sha256(binding.manifest_hash()) != entry.manifest_binding_sha256
+        {
+            self.loaded_key = None;
+            self.status = format!(
+                "{symbol} {tf}: canonical generation changed after inventory; refresh before loading"
+            );
+            return;
+        }
+        let mut ohlcv = loaded.ohlcv().clone();
+        let total = ohlcv.len();
+        if total > TAIL {
+            let drop = total - TAIL;
+            ohlcv.open.drain(..drop);
+            ohlcv.high.drain(..drop);
+            ohlcv.low.drain(..drop);
+            ohlcv.close.drain(..drop);
+            if let Some(timestamps) = ohlcv.timestamp.as_mut() {
+                timestamps.drain(..drop);
+            }
+            if let Some(volume) = ohlcv.volume.as_mut() {
+                volume.drain(..drop);
+            }
+        }
 
         // Defensive: never index blindly. The data layer already enforces
         // equal column lengths, but re-check here so a future regression
@@ -176,6 +305,7 @@ impl ChartState {
             return;
         }
         self.candles = out;
+        self.loaded_key = Some(key);
     }
 
     fn step_symbol(&mut self, delta: isize) {
@@ -197,15 +327,68 @@ impl ChartState {
         self.tf_idx = (((self.tf_idx as isize + delta) % len_i + len_i) % len_i) as usize;
         self.loaded_key = None;
     }
+
+    fn inventory_notice(&self) -> String {
+        let current = match (self.current_symbol(), self.current_tf()) {
+            (Some(symbol), Some(timeframe)) => self
+                .inventory_entries
+                .iter()
+                .filter(|entry| {
+                    entry.symbol.as_deref() == Some(symbol)
+                        && entry.timeframe.as_deref() == Some(timeframe)
+                })
+                .map(|entry| {
+                    format!(
+                        "identity={} generation={} manifest_binding_sha256={} verification={:?}",
+                        entry.dataset_identity,
+                        entry.generation,
+                        entry.manifest_binding_sha256,
+                        entry.verification
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | "),
+            _ => String::new(),
+        };
+        if self.inventory_rejections.is_empty() {
+            current
+        } else if current.is_empty() {
+            format!(
+                "REJECTED {}",
+                self.inventory_rejections.join(" | REJECTED ")
+            )
+        } else {
+            format!(
+                "{current} | REJECTED {}",
+                self.inventory_rejections.join(" | REJECTED ")
+            )
+        }
+    }
+}
+
+fn hex_sha256(bytes: &[u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 pub fn draw(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
     shared.chart_state.ensure_loaded();
     let st = &shared.chart_state;
+    let inventory_notice = st.inventory_notice();
+    let notice_height = u16::from(!inventory_notice.is_empty());
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(4)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(notice_height),
+            Constraint::Min(4),
+        ])
         .margin(1)
         .split(area);
 
@@ -241,6 +424,9 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         ])
     };
     Paragraph::new(header).render(rows[0], buf);
+    if !inventory_notice.is_empty() {
+        Paragraph::new(Line::styled(inventory_notice, theme::caption_style())).render(rows[1], buf);
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -253,8 +439,8 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         } else {
             st.status.clone()
         };
-        let inner = block.inner(rows[1]);
-        block.render(rows[1], buf);
+        let inner = block.inner(rows[2]);
+        block.render(rows[2], buf);
         Paragraph::new(Line::styled(msg, theme::warn_style())).render(inner, buf);
         return;
     }
@@ -313,7 +499,7 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
                 });
             }
         })
-        .render(rows[1], buf);
+        .render(rows[2], buf);
 }
 
 pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {

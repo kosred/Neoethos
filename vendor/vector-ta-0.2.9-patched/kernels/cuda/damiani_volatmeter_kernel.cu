@@ -446,27 +446,21 @@ void damiani_volatmeter_many_series_one_param_time_major_f32(
 /* f64::EPSILON — NOT the f32 1.1920929e-7f the f32 kernel above uses. */
 #define NEO_F64_EPSILON 2.2204460492503131e-16
 
-extern "C" __global__
-void damiani_volatmeter_neo_batch_f64(const double* __restrict__ data,
-                                      int series_len,
-                                      const int* __restrict__ periods,
-                                      int n_combos,
-                                      int first_valid,
-                                      double* __restrict__ out)
+__device__ __forceinline__
+void damiani_volatmeter_row_f64(
+    const double* __restrict__ prices,
+    int len,
+    int first_valid,
+    int vis_atr,
+    int vis_std,
+    int sed_atr,
+    int sed_std,
+    double threshold,
+    double* __restrict__ ring_vis,
+    double* __restrict__ ring_sed,
+    double* __restrict__ vol,
+    double* __restrict__ anti)
 {
-    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (combo >= n_combos) return;
-
-    const int len = series_len;
-    double* __restrict__ o = out + (size_t)combo * (size_t)len;
-    (void)periods;   /* period-invariant — see the header. */
-
-    const int vis_atr = NEO_DAMIANI_VIS_ATR;
-    const int vis_std = NEO_DAMIANI_VIS_STD;
-    const int sed_atr = NEO_DAMIANI_SED_ATR;
-    const int sed_std = NEO_DAMIANI_SED_STD;
-
-    /* needed = max(vis_atr, vis_std, sed_atr, sed_std, 3) */
     int needed = vis_atr;
     if (vis_std > needed) needed = vis_std;
     if (sed_atr > needed) needed = sed_atr;
@@ -474,65 +468,68 @@ void damiani_volatmeter_neo_batch_f64(const double* __restrict__ data,
     if (3 > needed) needed = 3;
 
     if (len <= 0 || first_valid < 0 || first_valid >= len ||
+        vis_atr <= 0 || vis_std <= 0 || sed_atr <= 0 || sed_std <= 0 ||
         vis_atr > len || vis_std > len || sed_atr > len || sed_std > len ||
         (len - first_valid) < needed) {
-        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        for (int i = 0; i < len; ++i) {
+            vol[i] = NEO_F64_NAN;
+            if (anti) anti[i] = NEO_F64_NAN;
+        }
         return;
     }
 
-    /* Whole row NaN — see "A DEFECT IN THE REFERENCE" above. */
-    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    for (int i = 0; i < len; ++i) {
+        vol[i] = NEO_F64_NAN;
+        if (anti) anti[i] = NEO_F64_NAN;
+    }
+    for (int i = 0; i < vis_std; ++i) ring_vis[i] = 0.0;
+    for (int i = 0; i < sed_std; ++i) ring_sed[i] = 0.0;
 
-    /* high == low == close on this path (prepare:323). */
-    const double* high  = data;
-    const double* low   = data;
-    const double* close = data;
-
+    /* Slice input authority: high == low == close == prices. */
+    const double* __restrict__ high = prices;
+    const double* __restrict__ low = prices;
+    const double* __restrict__ close = prices;
     double atr_vis_val = NEO_F64_NAN;
     double atr_sed_val = NEO_F64_NAN;
-    double sum_vis = 0.0, sum_sed = 0.0;
-
+    double sum_vis = 0.0;
+    double sum_sed = 0.0;
     const double vis_atr_f = (double)vis_atr;
     const double sed_atr_f = (double)sed_atr;
-
     double prev_close = NEO_F64_NAN;
     bool have_prev = false;
-
-    double ring_vis[NEO_DAMIANI_VIS_STD];
-    double ring_sed[NEO_DAMIANI_SED_STD];
-    for (int k = 0; k < vis_std; ++k) ring_vis[k] = 0.0;
-    for (int k = 0; k < sed_std; ++k) ring_sed[k] = 0.0;
-
-    double sum_vis_std = 0.0, sum_sq_vis_std = 0.0;
-    double sum_sed_std = 0.0, sum_sq_sed_std = 0.0;
-    int idx_vis = 0, idx_sed = 0;
-    int filled_vis = 0, filled_sed = 0;
-
+    double sum_vis_std = 0.0;
+    double sum_sq_vis_std = 0.0;
+    double sum_sed_std = 0.0;
+    double sum_sq_sed_std = 0.0;
+    int idx_vis = 0;
+    int idx_sed = 0;
+    int filled_vis = 0;
+    int filled_sed = 0;
     const double lag_s = 0.5;
 
     for (int i = first_valid; i < len; ++i) {
         const double ci = close[i];
-
         double tr;
         if (have_prev && isfinite(ci)) {
             const double tr1 = high[i] - low[i];
             const double tr2 = fabs(high[i] - prev_close);
             const double tr3 = fabs(low[i] - prev_close);
-            tr = fmax(fmax(tr1, tr2), tr3);   /* :538 is `f64::max` */
+            tr = fmax(fmax(tr1, tr2), tr3);
         } else {
             tr = 0.0;
         }
+        if (isfinite(ci)) {
+            prev_close = ci;
+            have_prev = true;
+        }
 
-        if (isfinite(ci)) { prev_close = ci; have_prev = true; }
-
-        /* :548 — ABSOLUTE index, see the header. */
+        /* The scalar authority intentionally uses the absolute row index. */
         if (i < vis_atr) {
             sum_vis += tr;
             if (i == vis_atr - 1) atr_vis_val = sum_vis / vis_atr_f;
         } else if (isfinite(atr_vis_val)) {
             atr_vis_val = ((vis_atr_f - 1.0) * atr_vis_val + tr) / vis_atr_f;
         }
-
         if (i < sed_atr) {
             sum_sed += tr;
             if (i == sed_atr - 1) atr_sed_val = sum_sed / sed_atr_f;
@@ -541,7 +538,6 @@ void damiani_volatmeter_neo_batch_f64(const double* __restrict__ data,
         }
 
         const double val = isnan(ci) ? 0.0 : ci;
-
         const double old_v = ring_vis[idx_vis];
         ring_vis[idx_vis] = val;
         idx_vis = (idx_vis + 1) % vis_std;
@@ -567,23 +563,117 @@ void damiani_volatmeter_neo_batch_f64(const double* __restrict__ data,
         }
 
         if (i >= needed) {
-            const double v1 = (i >= 1) ? o[i - 1] : NEO_F64_NAN;
-            const double v3 = (i >= 3) ? o[i - 3] : NEO_F64_NAN;
-            const double p1 = (i >= 1 && !isnan(v1)) ? v1 : 0.0;
-            const double p3 = (i >= 3 && !isnan(v3)) ? v3 : 0.0;
-
+            const double p1 = (i >= 1 && !isnan(vol[i - 1])) ? vol[i - 1] : 0.0;
+            const double p3 = (i >= 3 && !isnan(vol[i - 3])) ? vol[i - 3] : 0.0;
             const double sed_safe =
                 (isfinite(atr_sed_val) && atr_sed_val != 0.0)
                     ? atr_sed_val
                     : (atr_sed_val + NEO_F64_EPSILON);
+            vol[i] = (atr_vis_val / sed_safe) + lag_s * (p1 - p3);
 
-            o[i] = (atr_vis_val / sed_safe) + lag_s * (p1 - p3);
+            if (anti && filled_vis == vis_std && filled_sed == sed_std) {
+                const double mean_vis = sum_vis_std / (double)vis_std;
+                const double mean_sq_vis = sum_sq_vis_std / (double)vis_std;
+                const double var_vis = fmax(mean_sq_vis - mean_vis * mean_vis, 0.0);
+                const double std_vis = sqrt(var_vis);
+                const double mean_sed = sum_sed_std / (double)sed_std;
+                const double mean_sq_sed = sum_sq_sed_std / (double)sed_std;
+                const double var_sed = fmax(mean_sq_sed - mean_sed * mean_sed, 0.0);
+                const double std_sed = sqrt(var_sed);
+                const double ratio =
+                    (std_sed != 0.0) ? (std_vis / std_sed)
+                                     : (std_vis / (std_sed + NEO_F64_EPSILON));
+                anti[i] = threshold - ratio;
+            }
         }
     }
 
-    /* :412-418 — the SECOND NaN pass, AFTER the loop. */
     const int warm_end = first_valid + needed - 1;
     int cut = warm_end + 1;
     if (cut > len) cut = len;
-    for (int i = 0; i < cut; ++i) o[i] = NEO_F64_NAN;
+    for (int i = 0; i < cut; ++i) {
+        vol[i] = NEO_F64_NAN;
+        if (anti) anti[i] = NEO_F64_NAN;
+    }
+}
+
+extern "C" __global__
+void damiani_volatmeter_neo_batch_f64(const double* __restrict__ data,
+                                      int series_len,
+                                      const int* __restrict__ periods,
+                                      int n_combos,
+                                      int first_valid,
+                                      double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods;   /* period-invariant — see the header. */
+
+    double ring_vis[NEO_DAMIANI_VIS_STD];
+    double ring_sed[NEO_DAMIANI_SED_STD];
+    double* __restrict__ vol = out + (size_t)combo * (size_t)series_len;
+    damiani_volatmeter_row_f64(
+        data,
+        series_len,
+        first_valid,
+        NEO_DAMIANI_VIS_ATR,
+        NEO_DAMIANI_VIS_STD,
+        NEO_DAMIANI_SED_ATR,
+        NEO_DAMIANI_SED_STD,
+        NEO_DAMIANI_THRESHOLD,
+        ring_vis,
+        ring_sed,
+        vol,
+        0);
+}
+
+/* Dynamic NeoEthos production route. The preserved primary entry point above
+ * remains fixed-default and period-invariant; this exact ABI carries the
+ * registry's four coupled windows and both canonical outputs in one launch. */
+extern "C" __global__
+void damiani_volatmeter_outputs_f64(
+    const double* __restrict__ prices,
+    int series_len,
+    const int* __restrict__ vis_atrs,
+    const int* __restrict__ vis_stds,
+    const int* __restrict__ sed_atrs,
+    const int* __restrict__ sed_stds,
+    const double* __restrict__ thresholds,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ ring_vis_scratch,
+    int ring_vis_stride,
+    double* __restrict__ ring_sed_scratch,
+    int ring_sed_stride,
+    double* __restrict__ out_vol,
+    double* __restrict__ out_anti)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int vis_atr = vis_atrs[combo];
+    const int vis_std = vis_stds[combo];
+    const int sed_atr = sed_atrs[combo];
+    const int sed_std = sed_stds[combo];
+    if (vis_std > ring_vis_stride || sed_std > ring_sed_stride) return;
+
+    double* __restrict__ ring_vis =
+        ring_vis_scratch + (size_t)combo * (size_t)ring_vis_stride;
+    double* __restrict__ ring_sed =
+        ring_sed_scratch + (size_t)combo * (size_t)ring_sed_stride;
+    double* __restrict__ vol = out_vol + (size_t)combo * (size_t)series_len;
+    double* __restrict__ anti = out_anti + (size_t)combo * (size_t)series_len;
+    damiani_volatmeter_row_f64(
+        prices,
+        series_len,
+        first_valid,
+        vis_atr,
+        vis_std,
+        sed_atr,
+        sed_std,
+        thresholds[combo],
+        ring_vis,
+        ring_sed,
+        vol,
+        anti);
 }

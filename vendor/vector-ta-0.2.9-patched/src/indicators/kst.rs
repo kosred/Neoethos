@@ -1,8 +1,8 @@
 use crate::indicators::moving_averages::sma::{
-    sma, SmaData, SmaError, SmaInput, SmaOutput, SmaParams,
+    SmaData, SmaError, SmaInput, SmaOutput, SmaParams, sma,
 };
-use crate::indicators::roc::{roc, RocData, RocError, RocInput, RocOutput, RocParams};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::roc::{RocData, RocError, RocInput, RocOutput, RocParams, roc};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -16,24 +16,6 @@ use rayon::prelude::*;
 use std::convert::AsRef;
 use std::error::Error;
 use thiserror::Error;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use js_sys;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaKst;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-#[cfg(feature = "python")]
-use numpy::PyReadonlyArray1;
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum KstData<'a> {
@@ -51,10 +33,6 @@ pub struct KstOutput {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct KstParams {
     pub sma_period1: Option<usize>,
     pub sma_period2: Option<usize>,
@@ -914,7 +892,6 @@ pub fn kst_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn kst_into(
     input: &KstInput,
@@ -989,10 +966,6 @@ pub fn kst_batch_with_kernel(
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct KstBatchRange {
     pub sma_period1: (usize, usize, usize),
     pub sma_period2: (usize, usize, usize),
@@ -2122,48 +2095,18 @@ impl KstStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kst_output_into_js(
-    data: &[f64],
-    sma1: usize,
-    sma2: usize,
-    sma3: usize,
-    sma4: usize,
-    roc1: usize,
-    roc2: usize,
-    roc3: usize,
-    roc4: usize,
-    sig: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kst_js(data, sma1, sma2, sma3, sma4, roc1, roc2, roc3, roc4, sig)?;
-    crate::write_wasm_object_f64_outputs("kst_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kst_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kst_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("kst_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_kst_default_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KstInput::with_default_candles(&candles);
         let result = kst_with_kernel(&input, kernel)?;
         assert_eq!(result.line.len(), candles.close.len());
@@ -2173,8 +2116,8 @@ mod tests {
 
     fn check_kst_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KstInput::with_default_candles(&candles);
         let result = kst_with_kernel(&input, kernel)?;
         let expected_last_five_line = [
@@ -2245,8 +2188,8 @@ mod tests {
     fn check_kst_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             KstParams::default(),
@@ -2866,14 +2809,8 @@ mod tests {
         let mut out_line = vec![0.0; n];
         let mut out_signal = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             kst_into(&input, &mut out_line, &mut out_signal).expect("kst_into");
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            kst_into_slice(&mut out_line, &mut out_signal, &input, Kernel::Auto)
-                .expect("kst_into_slice");
         }
 
         assert_eq!(base.line.len(), n);
@@ -2903,8 +2840,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = KstBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2930,8 +2867,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (
@@ -3194,651 +3131,5 @@ mod tests {
             Err(e) => panic!("Expected AllValuesNaN, got: {:?}", e),
             Ok(_) => panic!("All NaN should have failed"),
         }
-    }
-}
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kst")]
-#[pyo3(signature=(data,
-    sma_period1=None, sma_period2=None, sma_period3=None, sma_period4=None,
-    roc_period1=None, roc_period2=None, roc_period3=None, roc_period4=None,
-    signal_period=None, kernel=None))]
-pub fn kst_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    sma_period1: Option<usize>,
-    sma_period2: Option<usize>,
-    sma_period3: Option<usize>,
-    sma_period4: Option<usize>,
-    roc_period1: Option<usize>,
-    roc_period2: Option<usize>,
-    roc_period3: Option<usize>,
-    roc_period4: Option<usize>,
-    signal_period: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice = data.as_slice()?;
-    let prm = KstParams {
-        sma_period1: Some(sma_period1.unwrap_or(10)),
-        sma_period2: Some(sma_period2.unwrap_or(10)),
-        sma_period3: Some(sma_period3.unwrap_or(10)),
-        sma_period4: Some(sma_period4.unwrap_or(15)),
-        roc_period1: Some(roc_period1.unwrap_or(10)),
-        roc_period2: Some(roc_period2.unwrap_or(15)),
-        roc_period3: Some(roc_period3.unwrap_or(20)),
-        roc_period4: Some(roc_period4.unwrap_or(30)),
-        signal_period: Some(signal_period.unwrap_or(9)),
-    };
-    let input = KstInput::from_slice(slice, prm);
-    let kern = validate_kernel(kernel, false)?;
-    let (line, signal) = py
-        .allow_threads(|| kst_with_kernel(&input, kern).map(|o| (o.line, o.signal)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((line.into_pyarray(py), signal.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "KstStream")]
-pub struct KstStreamPy {
-    stream: KstStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl KstStreamPy {
-    #[new]
-    fn new(
-        sma_period1: Option<usize>,
-        sma_period2: Option<usize>,
-        sma_period3: Option<usize>,
-        sma_period4: Option<usize>,
-        roc_period1: Option<usize>,
-        roc_period2: Option<usize>,
-        roc_period3: Option<usize>,
-        roc_period4: Option<usize>,
-        signal_period: Option<usize>,
-    ) -> PyResult<Self> {
-        let params = KstParams {
-            sma_period1,
-            sma_period2,
-            sma_period3,
-            sma_period4,
-            roc_period1,
-            roc_period2,
-            roc_period3,
-            roc_period4,
-            signal_period,
-        };
-        let stream =
-            KstStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(KstStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kst_batch")]
-#[pyo3(signature=(data,
-    sma1_range, sma2_range, sma3_range, sma4_range,
-    roc1_range, roc2_range, roc3_range, roc4_range,
-    sig_range, kernel=None))]
-pub fn kst_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    sma1_range: (usize, usize, usize),
-    sma2_range: (usize, usize, usize),
-    sma3_range: (usize, usize, usize),
-    sma4_range: (usize, usize, usize),
-    roc1_range: (usize, usize, usize),
-    roc2_range: (usize, usize, usize),
-    roc3_range: (usize, usize, usize),
-    roc4_range: (usize, usize, usize),
-    sig_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    let slice = data.as_slice()?;
-    let sweep = KstBatchRange {
-        sma_period1: sma1_range,
-        sma_period2: sma2_range,
-        sma_period3: sma3_range,
-        sma_period4: sma4_range,
-        roc_period1: roc1_range,
-        roc_period2: roc2_range,
-        roc_period3: roc3_range,
-        roc_period4: roc4_range,
-        signal_period: sig_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-    let combos;
-    let rows;
-    let cols = slice.len();
-    let (line_arr, sig_arr) = {
-        let tmp_combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        rows = tmp_combos.len();
-        combos = tmp_combos;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("kst: size overflow in batch output"))?;
-        let out_line = unsafe { PyArray1::<f64>::new(py, [total], false) };
-        let out_sig = unsafe { PyArray1::<f64>::new(py, [total], false) };
-        let lo = unsafe { out_line.as_slice_mut()? };
-        let so = unsafe { out_sig.as_slice_mut()? };
-        py.allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                x => x,
-            };
-            let simd = match k {
-                Kernel::ScalarBatch => Kernel::Scalar,
-                Kernel::Avx2Batch => Kernel::Scalar,
-                Kernel::Avx512Batch => Kernel::Scalar,
-                _ => Kernel::Scalar,
-            };
-            kst_batch_inner_into(slice, &sweep, simd, true, lo, so)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        (out_line, out_sig)
-    };
-
-    let d = pyo3::types::PyDict::new(py);
-    d.set_item("line", line_arr.reshape((rows, cols))?)?;
-    d.set_item("signal", sig_arr.reshape((rows, cols))?)?;
-
-    d.set_item(
-        "sma1",
-        combos
-            .iter()
-            .map(|c| c.sma_period1.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "sma2",
-        combos
-            .iter()
-            .map(|c| c.sma_period2.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "sma3",
-        combos
-            .iter()
-            .map(|c| c.sma_period3.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "sma4",
-        combos
-            .iter()
-            .map(|c| c.sma_period4.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "roc1",
-        combos
-            .iter()
-            .map(|c| c.roc_period1.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "roc2",
-        combos
-            .iter()
-            .map(|c| c.roc_period2.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "roc3",
-        combos
-            .iter()
-            .map(|c| c.roc_period3.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "roc4",
-        combos
-            .iter()
-            .map(|c| c.roc_period4.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "sig",
-        combos
-            .iter()
-            .map(|c| c.signal_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(feature = "python")]
-pub fn register_kst_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(kst_py, m)?)?;
-    m.add_function(wrap_pyfunction!(kst_batch_py, m)?)?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(kst_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(kst_cuda_many_series_one_param_dev_py, m)?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kst_cuda_batch_dev")]
-#[pyo3(signature = (
-    data_f32,
-    s1_range, s2_range, s3_range, s4_range,
-    r1_range, r2_range, r3_range, r4_range,
-    sig_range,
-    device_id=0
-))]
-pub fn kst_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    s1_range: (usize, usize, usize),
-    s2_range: (usize, usize, usize),
-    s3_range: (usize, usize, usize),
-    s4_range: (usize, usize, usize),
-    r1_range: (usize, usize, usize),
-    r2_range: (usize, usize, usize),
-    r3_range: (usize, usize, usize),
-    r4_range: (usize, usize, usize),
-    sig_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let prices = data_f32.as_slice()?;
-    let sweep = KstBatchRange {
-        sma_period1: s1_range,
-        sma_period2: s2_range,
-        sma_period3: s3_range,
-        sma_period4: s4_range,
-        roc_period1: r1_range,
-        roc_period2: r2_range,
-        roc_period3: r3_range,
-        roc_period4: r4_range,
-        signal_period: sig_range,
-    };
-    let (pair, ctx, dev) = py.allow_threads(|| {
-        let cuda = CudaKst::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        cuda.kst_batch_dev(prices, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-            .map(|(pair, _combos)| (pair, ctx, dev))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: pair.line,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev),
-        },
-        DeviceArrayF32Py {
-            inner: pair.signal,
-            _ctx: Some(ctx),
-            device_id: Some(dev),
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kst_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (
-    data_tm_f32,
-    cols, rows,
-    s1, s2, s3, s4,
-    r1, r2, r3, r4,
-    sig,
-    device_id=0
-))]
-pub fn kst_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    s1: usize,
-    s2: usize,
-    s3: usize,
-    s4: usize,
-    r1: usize,
-    r2: usize,
-    r3: usize,
-    r4: usize,
-    sig: usize,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let prices_tm = data_tm_f32.as_slice()?;
-    let params = KstParams {
-        sma_period1: Some(s1),
-        sma_period2: Some(s2),
-        sma_period3: Some(s3),
-        sma_period4: Some(s4),
-        roc_period1: Some(r1),
-        roc_period2: Some(r2),
-        roc_period3: Some(r3),
-        roc_period4: Some(r4),
-        signal_period: Some(sig),
-    };
-    let (pair, ctx, dev) = py.allow_threads(|| {
-        let cuda = CudaKst::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        cuda.kst_many_series_one_param_time_major_dev(prices_tm, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-            .map(|pair| (pair, ctx, dev))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: pair.line,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev),
-        },
-        DeviceArrayF32Py {
-            inner: pair.signal,
-            _ctx: Some(ctx),
-            device_id: Some(dev),
-        },
-    ))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KstJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kst")]
-pub fn kst_js(
-    data: &[f64],
-    sma1: usize,
-    sma2: usize,
-    sma3: usize,
-    sma4: usize,
-    roc1: usize,
-    roc2: usize,
-    roc3: usize,
-    roc4: usize,
-    sig: usize,
-) -> Result<JsValue, JsValue> {
-    let prm = KstParams {
-        sma_period1: Some(sma1),
-        sma_period2: Some(sma2),
-        sma_period3: Some(sma3),
-        sma_period4: Some(sma4),
-        roc_period1: Some(roc1),
-        roc_period2: Some(roc2),
-        roc_period3: Some(roc3),
-        roc_period4: Some(roc4),
-        signal_period: Some(sig),
-    };
-    let input = KstInput::from_slice(data, prm);
-
-    let mut line = vec![0.0; data.len()];
-    let mut signal = vec![0.0; data.len()];
-    kst_into_slice(&mut line, &mut signal, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = line;
-    values.extend_from_slice(&signal);
-    let result = KstJsResult {
-        values,
-        rows: 2,
-        cols: data.len(),
-    };
-    serde_wasm_bindgen::to_value(&result)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kst_into(
-    in_ptr: *const f64,
-    out_line_ptr: *mut f64,
-    out_signal_ptr: *mut f64,
-    len: usize,
-    sma1: usize,
-    sma2: usize,
-    sma3: usize,
-    sma4: usize,
-    roc1: usize,
-    roc2: usize,
-    roc3: usize,
-    roc4: usize,
-    sig: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_line_ptr.is_null() || out_signal_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let in_beg = in_ptr as usize;
-        let in_end = in_beg + len * 8;
-        let lo_beg = out_line_ptr as usize;
-        let lo_end = lo_beg + len * 8;
-        let so_beg = out_signal_ptr as usize;
-        let so_end = so_beg + len * 8;
-        let overlap = |a0: usize, a1: usize, b0: usize, b1: usize| a0 < b1 && b0 < a1;
-
-        let data_slice = std::slice::from_raw_parts(in_ptr, len);
-        let shadow;
-        let data =
-            if overlap(in_beg, in_end, lo_beg, lo_end) || overlap(in_beg, in_end, so_beg, so_end) {
-                shadow = data_slice.to_vec();
-                &shadow[..]
-            } else {
-                data_slice
-            };
-
-        let prm = KstParams {
-            sma_period1: Some(sma1),
-            sma_period2: Some(sma2),
-            sma_period3: Some(sma3),
-            sma_period4: Some(sma4),
-            roc_period1: Some(roc1),
-            roc_period2: Some(roc2),
-            roc_period3: Some(roc3),
-            roc_period4: Some(roc4),
-            signal_period: Some(sig),
-        };
-        let input = KstInput::from_slice(data, prm);
-
-        let ldst = std::slice::from_raw_parts_mut(out_line_ptr, len);
-        let sdst = std::slice::from_raw_parts_mut(out_signal_ptr, len);
-
-        kst_into_slice(ldst, sdst, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kst_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kst_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KstBatchConfig {
-    pub sma_period1_range: (usize, usize, usize),
-    pub sma_period2_range: (usize, usize, usize),
-    pub sma_period3_range: (usize, usize, usize),
-    pub sma_period4_range: (usize, usize, usize),
-    pub roc_period1_range: (usize, usize, usize),
-    pub roc_period2_range: (usize, usize, usize),
-    pub roc_period3_range: (usize, usize, usize),
-    pub roc_period4_range: (usize, usize, usize),
-    pub signal_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KstBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<KstParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kst_batch")]
-pub fn kst_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let sweep: KstBatchRange = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("kst: size overflow in kst_batch_unified_js"))?;
-    let mut lines = vec![0.0; total];
-    let mut sigs = vec![0.0; total];
-    kst_batch_inner_into(
-        data,
-        &sweep,
-        detect_best_kernel(),
-        false,
-        &mut lines,
-        &mut sigs,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = lines;
-    values.extend_from_slice(&sigs);
-
-    let out = KstBatchJsOutput {
-        values,
-        combos,
-        rows: rows * 2,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kst_batch_into(
-    in_ptr: *const f64,
-    line_out_ptr: *mut f64,
-    signal_out_ptr: *mut f64,
-    len: usize,
-    sma_period1_start: usize,
-    sma_period1_end: usize,
-    sma_period1_step: usize,
-    sma_period2_start: usize,
-    sma_period2_end: usize,
-    sma_period2_step: usize,
-    sma_period3_start: usize,
-    sma_period3_end: usize,
-    sma_period3_step: usize,
-    sma_period4_start: usize,
-    sma_period4_end: usize,
-    sma_period4_step: usize,
-    roc_period1_start: usize,
-    roc_period1_end: usize,
-    roc_period1_step: usize,
-    roc_period2_start: usize,
-    roc_period2_end: usize,
-    roc_period2_step: usize,
-    roc_period3_start: usize,
-    roc_period3_end: usize,
-    roc_period3_step: usize,
-    roc_period4_start: usize,
-    roc_period4_end: usize,
-    roc_period4_step: usize,
-    signal_period_start: usize,
-    signal_period_end: usize,
-    signal_period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || line_out_ptr.is_null() || signal_out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to kst_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = KstBatchRange {
-            sma_period1: (sma_period1_start, sma_period1_end, sma_period1_step),
-            sma_period2: (sma_period2_start, sma_period2_end, sma_period2_step),
-            sma_period3: (sma_period3_start, sma_period3_end, sma_period3_step),
-            sma_period4: (sma_period4_start, sma_period4_end, sma_period4_step),
-            roc_period1: (roc_period1_start, roc_period1_end, roc_period1_step),
-            roc_period2: (roc_period2_start, roc_period2_end, roc_period2_step),
-            roc_period3: (roc_period3_start, roc_period3_end, roc_period3_step),
-            roc_period4: (roc_period4_start, roc_period4_end, roc_period4_step),
-            signal_period: (signal_period_start, signal_period_end, signal_period_step),
-        };
-
-        let count_range = |r: &(usize, usize, usize)| {
-            if r.2 == 0 {
-                0
-            } else {
-                ((r.1.saturating_sub(r.0)) / r.2) + 1
-            }
-        };
-
-        let rows = count_range(&sweep.sma_period1)
-            .max(1)
-            .checked_mul(count_range(&sweep.sma_period2).max(1))
-            .and_then(|x| x.checked_mul(count_range(&sweep.sma_period3).max(1)))
-            .and_then(|x| x.checked_mul(count_range(&sweep.sma_period4).max(1)))
-            .and_then(|x| x.checked_mul(count_range(&sweep.roc_period1).max(1)))
-            .and_then(|x| x.checked_mul(count_range(&sweep.roc_period2).max(1)))
-            .and_then(|x| x.checked_mul(count_range(&sweep.roc_period3).max(1)))
-            .and_then(|x| x.checked_mul(count_range(&sweep.roc_period4).max(1)))
-            .and_then(|x| x.checked_mul(count_range(&sweep.signal_period).max(1)))
-            .ok_or_else(|| JsValue::from_str("kst: size overflow in kst_batch_into"))?;
-        let cols = len;
-
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("kst: size overflow in kst_batch_into buffers"))?;
-
-        let line_out = std::slice::from_raw_parts_mut(line_out_ptr, total);
-        let signal_out = std::slice::from_raw_parts_mut(signal_out_ptr, total);
-
-        kst_batch_inner_into(data, &sweep, Kernel::Auto, false, line_out, signal_out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
     }
 }

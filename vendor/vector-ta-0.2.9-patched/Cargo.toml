@@ -21,24 +21,26 @@ include = [
     "/NOTICE",
     "/COPYRIGHT",
     "/build.rs",
+    "/build_support/**/*.rs",
     "/src/lib.rs",
     "/src/bin/generate_references.rs",
     "/src/bin/profile_yang_zhang_cuda.rs",
-    "/src/bindings/**/*.rs",
     "/src/cuda/**/*.rs",
     "/src/indicators/**/*.rs",
     "/src/utilities/**/*.rs",
+    "/src/data/README.md",
+    "/src/data/**/*.vortex",
     "/benches/**",
     "/kernels/cuda/**/*.cu",
     "/kernels/cuda/**/*.cuh",
-    "/kernels/ptx/**",
+    "/tests/native_cuda_build_harness.rs",
 ]
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "High-performance technical analysis indicators with optional SIMD/CUDA and language bindings."
+description = "High-performance Rust technical analysis indicators with optional SIMD/CUDA."
 homepage = "https://vectoralpha.dev/projects/ta"
 documentation = "https://vectoralpha.dev/projects/ta"
 readme = "README.md"
@@ -52,38 +54,20 @@ categories = ["algorithms"]
 license = "Apache-2.0"
 repository = "https://github.com/VectorAlpha-dev/VectorTA"
 
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = false
-
-[package.metadata.wasm-pack.profile.dev]
-wasm-opt = false
-
 [build-dependencies]
 jobserver = "0.1.34"
 
 [features]
-cuda = [
+cuda-build-native = [
     "cust",
     "cust_derive",
 ]
-cuda-build-ptx = ["cuda"]
 default = []
 nightly-avx = []
 proptest = []
-python = [
-    "pyo3",
-    "numpy",
-]
-wasm = [
-    "wasm-bindgen",
-    "serde-wasm-bindgen",
-    "js-sys",
-]
-
 [lib]
 name = "vector_ta"
 crate-type = [
-    "cdylib",
     "rlib",
 ]
 path = "src/lib.rs"
@@ -97,17 +81,58 @@ path = "src/bin/generate_references.rs"
 name = "profile_yang_zhang_cuda"
 path = "src/bin/profile_yang_zhang_cuda.rs"
 
+[[test]]
+name = "native_cuda_build_harness"
+path = "tests/native_cuda_build_harness.rs"
+harness = false
+
+[[test]]
+name = "cci_cycle_classic_v9"
+path = "tests/cci_cycle_classic_v9.rs"
+
+[[test]]
+name = "neoethos_f64_window_contract"
+path = "tests/neoethos_f64_window_contract.rs"
+
+[[test]]
+name = "neoethos_f64_period_metadata_source_contract"
+path = "tests/neoethos_f64_period_metadata_source_contract.rs"
+
+[[test]]
+name = "adosc_ao_apo_f64_period_routing_source_contract"
+path = "tests/adosc_ao_apo_f64_period_routing_source_contract.rs"
+
+[[test]]
+name = "frama_v3_bounded_deque_source_contract"
+path = "tests/frama_v3_bounded_deque_source_contract.rs"
+
+[[test]]
+name = "half_causal_estimator_f64_v2_source_contract"
+path = "tests/half_causal_estimator_f64_v2_source_contract.rs"
+
+[[test]]
+name = "half_causal_estimator_f64_v2_direct_oracle"
+path = "tests/half_causal_estimator_f64_v2_direct_oracle.rs"
+
+[[test]]
+name = "fisher_f64_v2_authority_source_contract"
+path = "tests/fisher_f64_v2_authority_source_contract.rs"
+
+[[test]]
+name = "resident_single_sweep_preallocation_v4_source_contract"
+path = "tests/resident_single_sweep_preallocation_v4_source_contract.rs"
+
 [[bench]]
 name = "cuda_bench"
 path = "benches/cuda_bench.rs"
 harness = false
-required-features = ["cuda"]
+required-features = ["cuda-build-native"]
 
 [[bench]]
 name = "cuda_dispatch_vram_benchmark"
 path = "benches/cuda_dispatch_vram_benchmark.rs"
 harness = false
-required-features = ["cuda"]
+required-features = ["cuda-build-native"]
 
 [[bench]]
 name = "indicator_benchmark"
@@ -122,7 +147,7 @@ path = "benches/ma_dispatch_benchmark.rs"
 name = "pattern_recognition_cuda_benchmark"
 path = "benches/pattern_recognition_cuda_benchmark.rs"
 harness = false
-required-features = ["cuda"]
+required-features = ["cuda-build-native"]
 
 [dependencies.aligned-vec]
 version = "0.6.4"
@@ -134,9 +159,6 @@ version = "1.0.98"
 version = "0.4.39"
 features = ["std"]
 default-features = false
-
-[dependencies.csv]
-version = "1.1"
 
 [dependencies.cust]
 version = "0.3.2"
@@ -152,44 +174,15 @@ version = "0.10.0"
 [dependencies.itertools]
 version = "0.14.0"
 
-[dependencies.js-sys]
-version = "0.3"
-optional = true
-
-[dependencies.libc]
-version = "0.2.172"
-
-[dependencies.lru]
-version = "0.14.0"
-
-[dependencies.ndarray]
-version = "0.16.1"
-
-[dependencies.num-traits]
-version = "0.2.19"
-
-[dependencies.numpy]
-version = "0.25.0"
-optional = true
-
 [dependencies.once_cell]
 version = "1.21.3"
 
 [dependencies.paste]
 version = "1.0.15"
 
-[dependencies.pyo3]
-version = "0.25.0"
-features = ["extension-module"]
-optional = true
-
 [dependencies.serde]
 version = "1.0"
 features = ["derive"]
-
-[dependencies.serde-wasm-bindgen]
-version = "0.6"
-optional = true
 
 [dependencies.serde_json]
 version = "1.0"
@@ -200,13 +193,12 @@ version = "1.15.1"
 [dependencies.thiserror]
 version = "2.0.9"
 
-[dependencies.wasm-bindgen]
-version = "0.2.95"
-optional = true
-
 [dev-dependencies.criterion]
 version = "0.5.1"
 features = ["html_reports"]
+
+[dev-dependencies.jobserver]
+version = "0.1.34"
 
 [dev-dependencies.proptest]
 version = "1.7.0"
@@ -217,13 +209,20 @@ version = "0.4.2"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.rayon]
 version = "1.10.0"
 
-[target.'cfg(target_arch = "wasm32")'.dependencies.chrono]
-version = "0.4.39"
-features = ["wasmbind"]
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.vortex-array]
+version = "0.67.0"
 
-[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
-version = "0.2"
-features = ["js"]
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.vortex-file]
+version = "0.67.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.vortex-io]
+version = "0.67.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.vortex-layout]
+version = "0.67.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.vortex-session]
+version = "0.67.0"
 
 [profile.bench]
 opt-level = 3
@@ -254,12 +253,3 @@ strip = "none"
 
 [profile.release.build-override]
 codegen-units = 255
-
-[profile.wasm]
-opt-level = "z"
-lto = false
-inherits = "release"
-strip = "symbols"
-
-[profile.wasm.build-override]
-codegen-units = 1

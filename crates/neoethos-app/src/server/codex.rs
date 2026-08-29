@@ -30,8 +30,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use neoethos_codex::{
-    AuthStore, AuthorizationRequest, CallbackResult, CallbackServer, CodexClient,
-    ChatCompletionRequest, ChatMessage, StoredAuth, exchange_code,
+    AuthStore, AuthorizationRequest, CallbackResult, CallbackServer, ChatCompletionRequest,
+    ChatMessage, CodexClient, StoredAuth, exchange_code,
 };
 
 use super::errors::actionable_error;
@@ -172,7 +172,8 @@ pub async fn start(
         // 5 minutes is generous; if the operator hasn't completed
         // by then they almost certainly abandoned the tab.
         let outcome = listener.wait_for_callback(300).await;
-        let final_error = drive_callback_to_completion(state_clone.clone(), &request_for_task, outcome).await;
+        let final_error =
+            drive_callback_to_completion(state_clone.clone(), &request_for_task, outcome).await;
         let mut codex_state = state_clone.codex.lock().await;
         let slot = codex_state.get_or_insert_with(CodexFlowState::default);
         slot.in_flight = None;
@@ -210,9 +211,7 @@ async fn drive_callback_to_completion(
         }
     };
     if state_param != request.state {
-        return Some(
-            "OAuth state mismatch — refusing to continue (possible CSRF).".to_string(),
-        );
+        return Some("OAuth state mismatch — refusing to continue (possible CSRF).".to_string());
     }
     let bundle = match exchange_code(&code, request).await {
         Ok(b) => b,
@@ -269,10 +268,7 @@ pub struct CodexChatResponseDto {
     pub total_tokens: u32,
 }
 
-pub async fn chat(
-    State(_state): State<AppApiState>,
-    Json(body): Json<CodexChatBody>,
-) -> Response {
+pub async fn chat(State(_state): State<AppApiState>, Json(body): Json<CodexChatBody>) -> Response {
     if body.prompt.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,

@@ -1,29 +1,17 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::{CudaDema, DeviceArrayF32};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum DemaData<'a> {
@@ -61,10 +49,6 @@ fn dema_source_type<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct DemaParams {
     pub period: Option<usize>,
 }
@@ -271,7 +255,6 @@ pub fn dema_with_kernel(input: &DemaInput, kernel: Kernel) -> Result<DemaOutput,
     Ok(DemaOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn dema_into(input: &DemaInput, out: &mut [f64]) -> Result<(), DemaError> {
     dema_into_slice(out, input, Kernel::Auto)
@@ -1033,150 +1016,17 @@ unsafe fn dema_row_avx512(data: &[f64], first: usize, period: usize, out: &mut [
     dema_avx512(data, period, first, out)
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Dema", unsendable)]
-pub struct DeviceArrayF32DemaPy {
-    pub(crate) inner: DeviceArrayF32,
-    _ctx_guard: std::sync::Arc<cust::context::Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32DemaPy {
-    #[new]
-    fn py_new() -> PyResult<Self> {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "use factory methods from CUDA functions",
-        ))
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let d = pyo3::types::PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        let size = self.inner.rows.saturating_mul(self.inner.cols);
-        let ptr_val: usize = if size == 0 {
-            0
-        } else {
-            self.inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let dummy = cust::memory::DeviceBuffer::from_slice(&[])
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32DemaPy {
-    pub fn new(
-        inner: DeviceArrayF32,
-        ctx_guard: std::sync::Arc<cust::context::Context>,
-        device_id: u32,
-    ) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dema_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = dema_js(data, period)?;
-    crate::write_wasm_f64_output("dema_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dema_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dema_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("dema_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use proptest::prelude::*;
 
     fn check_dema_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = DemaParams { period: None };
         let input_default = DemaInput::from_candles(&candles, "close", default_params);
@@ -1197,8 +1047,8 @@ mod tests {
 
     fn check_dema_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DemaInput::with_default_candles(&candles);
         let result = dema_with_kernel(&input, kernel)?;
@@ -1227,8 +1077,8 @@ mod tests {
 
     fn check_dema_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DemaInput::with_default_candles(&candles);
         match input.data {
             DemaData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1278,8 +1128,8 @@ mod tests {
 
     fn check_dema_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = DemaParams { period: Some(80) };
         let first_input = DemaInput::from_candles(&candles, "close", first_params);
@@ -1300,8 +1150,8 @@ mod tests {
 
     fn check_dema_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = DemaParams { period: Some(30) };
         let input = DemaInput::from_candles(&candles, "close", params);
         let result = dema_with_kernel(&input, kernel)?;
@@ -1369,7 +1219,7 @@ mod tests {
                     (Err(e1), Err(e2))
                         if std::mem::discriminant(&e1) == std::mem::discriminant(&e2) =>
                     {
-                        return Ok(())
+                        return Ok(());
                     }
 
                     (Err(e1), Err(e2)) => {
@@ -1446,9 +1296,9 @@ mod tests {
 
                             if period == 1 {
                                 prop_assert!(
-									(y - ys).abs() <= 1e-9 || (y.is_nan() && ys.is_nan()),
-									"idx {i}: stream mismatch for period=1 - batch={y}, stream={ys}"
-								);
+                                    (y - ys).abs() <= 1e-9 || (y.is_nan() && ys.is_nan()),
+                                    "idx {i}: stream mismatch for period=1 - batch={y}, stream={ys}"
+                                );
                             } else if i < period - 1 {
                                 prop_assert!(
                                     ys.is_nan(),
@@ -1469,21 +1319,27 @@ mod tests {
             .unwrap();
 
         assert!(dema(&DemaInput::from_slice(&[], DemaParams::default())).is_err());
-        assert!(dema(&DemaInput::from_slice(
-            &[f64::NAN; 12],
-            DemaParams::default()
-        ))
-        .is_err());
-        assert!(dema(&DemaInput::from_slice(
-            &[1.0; 5],
-            DemaParams { period: Some(12) }
-        ))
-        .is_err());
-        assert!(dema(&DemaInput::from_slice(
-            &[1.0; 5],
-            DemaParams { period: Some(0) }
-        ))
-        .is_err());
+        assert!(
+            dema(&DemaInput::from_slice(
+                &[f64::NAN; 12],
+                DemaParams::default()
+            ))
+            .is_err()
+        );
+        assert!(
+            dema(&DemaInput::from_slice(
+                &[1.0; 5],
+                DemaParams { period: Some(12) }
+            ))
+            .is_err()
+        );
+        assert!(
+            dema(&DemaInput::from_slice(
+                &[1.0; 5],
+                DemaParams { period: Some(0) }
+            ))
+            .is_err()
+        );
 
         Ok(())
     }
@@ -1491,8 +1347,8 @@ mod tests {
     fn check_dema_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 30;
         let input = DemaInput::from_candles(
@@ -1542,8 +1398,8 @@ mod tests {
     fn check_dema_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DemaParams::default(),
@@ -1647,8 +1503,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_periods = vec![10, 20, 30, 50];
 
@@ -1705,21 +1561,16 @@ mod tests {
 
     #[test]
     fn test_dema_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DemaInput::with_default_candles(&candles);
         let baseline = dema(&input)?.values;
 
         let mut out = vec![0.0; candles.close.len()];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             dema_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            dema_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(out.len(), baseline.len());
@@ -1738,8 +1589,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = DemaBatchBuilder::new()
             .kernel(kernel)
@@ -1771,8 +1622,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 5, 1),
@@ -1886,8 +1737,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = DemaBatchBuilder::new()
             .kernel(kernel)
@@ -1930,369 +1781,4 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
     gen_batch_tests!(check_batch_warmup_nan_preservation);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dema")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn dema_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = DemaParams {
-        period: Some(period),
-    };
-    let dema_in = DemaInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| dema_with_kernel(&dema_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DemaStream")]
-pub struct DemaStreamPy {
-    stream: DemaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DemaStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = DemaParams {
-            period: Some(period),
-        };
-        let stream =
-            DemaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(DemaStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dema_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn dema_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-    use std::mem::ManuallyDrop;
-
-    let slice_in = data.as_slice()?;
-    let sweep = DemaBatchRange {
-        period: period_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid(&sweep);
-    if combos.is_empty() {
-        return Err(PyValueError::new_err(
-            "invalid period range: empty expansion",
-        ));
-    }
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let mut buf_mu = make_uninit_matrix(rows, cols);
-    let first = slice_in.iter().position(|x| !x.is_nan()).unwrap_or(0);
-    let warm: Vec<usize> = combos
-        .iter()
-        .map(|c| first + c.period.unwrap() - 1)
-        .collect();
-    init_matrix_prefixes(&mut buf_mu, cols, &warm);
-
-    let mut guard = ManuallyDrop::new(buf_mu);
-    let out: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
-
-    let simd = match match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        k => k,
-    } {
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx512Batch => Kernel::Avx512,
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx2Batch => Kernel::Scalar,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => unreachable!(),
-    };
-
-    let combos = py
-        .allow_threads(|| dema_batch_inner_into(slice_in, &sweep, simd, true, out))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let values: Vec<f64> = unsafe {
-        Vec::from_raw_parts(
-            guard.as_mut_ptr() as *mut f64,
-            guard.len(),
-            guard.capacity(),
-        )
-    };
-    let arr = values.into_pyarray(py).reshape((rows, cols))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", arr)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dema_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn dema_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32DemaPy> {
-    use crate::cuda::cuda_available;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = DemaBatchRange {
-        period: period_range,
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDema::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .dema_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32DemaPy::new(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dema_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn dema_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32DemaPy> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if period == 0 {
-        return Err(PyValueError::new_err("period must be positive"));
-    }
-    let flat = data_tm_f32.as_slice()?;
-    let shape = data_tm_f32.shape();
-    let series_len = shape[0];
-    let num_series = shape[1];
-    let params = DemaParams {
-        period: Some(period),
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDema::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .dema_many_series_one_param_time_major_dev(flat, num_series, series_len, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(DeviceArrayF32DemaPy::new(inner, ctx, dev_id))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dema_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = DemaParams {
-        period: Some(period),
-    };
-    let input = DemaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    dema_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DemaBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DemaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<DemaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dema_batch)]
-pub fn dema_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: DemaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = DemaBatchRange {
-        period: config.period_range,
-    };
-
-    let output = dema_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = DemaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Failed to serialize output: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(since = "1.0.0", note = "Use dema_batch instead")]
-pub fn dema_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = DemaBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let metadata: Vec<f64> = combos
-        .iter()
-        .map(|combo| combo.period.unwrap() as f64)
-        .collect();
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dema_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dema_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dema_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to dema_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = DemaParams {
-            period: Some(period),
-        };
-        let input = DemaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            dema_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            dema_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dema_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to dema_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = DemaBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        dema_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

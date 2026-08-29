@@ -1,18 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::pwma_wrapper::DeviceArrayF32Pwma;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaPwma;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -24,53 +15,7 @@ use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
 
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 const PWMA_PERIOD5_WEIGHTS: [f64; 5] = [0.0625, 0.25, 0.375, 0.25, 0.0625];
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub struct PrimaryCtxGuardPwma {
-    dev: i32,
-    ctx: cust::sys::CUcontext,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl PrimaryCtxGuardPwma {
-    fn new(device_id: u32) -> Result<Self, cust::error::CudaError> {
-        unsafe {
-            let mut ctx: cust::sys::CUcontext = core::ptr::null_mut();
-            let dev = device_id as i32;
-            let rc = cust::sys::cuDevicePrimaryCtxRetain(&mut ctx as *mut _, dev);
-            if rc != cust::sys::CUresult::CUDA_SUCCESS {
-                return Err(cust::error::CudaError::UnknownError);
-            }
-            Ok(PrimaryCtxGuardPwma { dev, ctx })
-        }
-    }
-    #[inline]
-    unsafe fn push_current(&self) {
-        let _ = cust::sys::cuCtxSetCurrent(self.ctx);
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl Drop for PrimaryCtxGuardPwma {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = cust::sys::cuDevicePrimaryCtxRelease_v2(self.dev);
-        }
-    }
-}
 
 impl<'a> AsRef<[f64]> for PwmaInput<'a> {
     #[inline(always)]
@@ -335,7 +280,6 @@ pub fn pwma_with_kernel(input: &PwmaInput, kernel: Kernel) -> Result<PwmaOutput,
     Ok(PwmaOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline(always)]
 pub fn pwma_into(input: &PwmaInput, out: &mut [f64]) -> Result<(), PwmaError> {
     let (data, weights, period, first, chosen) = pwma_prepare(input, Kernel::Auto)?;
@@ -1481,40 +1425,16 @@ fn combination_f64(n: usize, r: usize) -> f64 {
     result
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = pwma_js(data, period)?;
-    crate::write_wasm_f64_output("pwma_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = pwma_batch_js(data, period_start, period_end, period_step)?;
-    crate::write_wasm_f64_output("pwma_batch_output_into_js", &values, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_pwma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = PwmaParams { period: None };
         let input = PwmaInput::from_candles(&candles, "close", default_params);
         let output = pwma_with_kernel(&input, kernel)?;
@@ -1525,8 +1445,8 @@ mod tests {
     fn check_pwma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
         let expected_last_five = [59313.25, 59309.6875, 59249.3125, 59175.625, 59094.875];
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PwmaInput::from_candles(&candles, "close", PwmaParams::default());
         let result = pwma_with_kernel(&input, kernel)?;
         let start = result.values.len().saturating_sub(5);
@@ -1547,8 +1467,8 @@ mod tests {
 
     fn check_pwma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PwmaInput::with_default_candles(&candles);
         match input.data {
             PwmaData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1609,8 +1529,8 @@ mod tests {
 
     fn check_pwma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = PwmaParams { period: Some(5) };
         let first_input = PwmaInput::from_candles(&candles, "close", first_params);
         let first_result = pwma_with_kernel(&first_input, kernel)?;
@@ -1623,8 +1543,8 @@ mod tests {
 
     fn check_pwma_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PwmaInput::from_candles(&candles, "close", PwmaParams { period: Some(5) });
         let res = pwma_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -1643,8 +1563,8 @@ mod tests {
 
     fn check_pwma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 5;
         let input = PwmaInput::from_candles(
             &candles,
@@ -1698,8 +1618,8 @@ mod tests {
     fn check_pwma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_cases = vec![
             PwmaParams { period: Some(5) },
@@ -1766,8 +1686,8 @@ mod tests {
         use proptest::prelude::*;
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_data = &candles.close;
 
         let strat = (
@@ -1939,8 +1859,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = PwmaBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1967,8 +1887,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let batch_configs = vec![
             (3, 10, 1),
@@ -1999,26 +1919,26 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}",
-						test, val, bits, row, col, idx, combo.period
-					);
+                        test, val, bits, row, col, idx, combo.period
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}",
-						test, val, bits, row, col, idx, combo.period
-					);
+                        test, val, bits, row, col, idx, combo.period
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}",
-						test, val, bits, row, col, idx, combo.period
-					);
+                        test, val, bits, row, col, idx, combo.period
+                    );
                 }
             }
         }
@@ -2048,13 +1968,8 @@ mod tests {
         let baseline = pwma(&input)?;
 
         let mut out = vec![0.0; data.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             pwma_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            pwma_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.values.len(), out.len());
@@ -2064,456 +1979,5 @@ mod tests {
             assert!(both_nan || a == b, "mismatch: got {b:?}, expected {a:?}");
         }
         Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "pwma")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn pwma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = PwmaParams {
-        period: Some(period),
-    };
-    let pwma_in = PwmaInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| pwma_with_kernel(&pwma_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "PwmaStream")]
-pub struct PwmaStreamPy {
-    stream: PwmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PwmaStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = PwmaParams {
-            period: Some(period),
-        };
-        let stream =
-            PwmaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PwmaStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "pwma_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn pwma_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = PwmaBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            pwma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pwma_cuda_batch_dev")]
-#[pyo3(signature = (data, period_range, device_id=0))]
-pub fn pwma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: PyReadonlyArray1<'_, f64>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<PwmaDeviceArrayF32Py> {
-    use numpy::PyArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data.as_slice()?;
-    let sweep = PwmaBatchRange {
-        period: period_range,
-    };
-    let data_f32: Vec<f32> = slice_in.iter().map(|&v| v as f32).collect();
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaPwma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.pwma_batch_dev(&data_f32, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    make_pwma_device_array_py(device_id, inner)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pwma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn pwma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<PwmaDeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = PwmaParams {
-        period: Some(period),
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaPwma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.pwma_multi_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    make_pwma_device_array_py(device_id, inner)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Pwma", unsendable)]
-pub struct PwmaDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32Pwma,
-    device_id: u32,
-    pc_guard: PrimaryCtxGuardPwma,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub fn make_pwma_device_array_py(
-    device_id: usize,
-    inner: DeviceArrayF32Pwma,
-) -> PyResult<PwmaDeviceArrayF32Py> {
-    let guard = PrimaryCtxGuardPwma::new(device_id as u32)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(PwmaDeviceArrayF32Py {
-        inner,
-        device_id: device_id as u32,
-        pc_guard: guard,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl PwmaDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr_val: usize = if inner.rows == 0 || inner.cols == 0 {
-            0
-        } else {
-            inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        Ok((2, self.device_id as i32))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let dummy = cust::memory::DeviceBuffer::from_slice(&[])
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_clone = self.inner.ctx.clone();
-        let dev_id = self.device_id;
-        let inner = core::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Pwma {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx: ctx_clone,
-                device_id: dev_id,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl Drop for PwmaDeviceArrayF32Py {
-    fn drop(&mut self) {
-        unsafe {
-            self.pc_guard.push_current();
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = PwmaParams {
-        period: Some(period),
-    };
-    let input = PwmaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    pwma_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = PwmaBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    pwma_batch_inner(data, &sweep, Kernel::Scalar, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = PwmaBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let metadata: Vec<f64> = combos
-        .iter()
-        .map(|combo| combo.period.unwrap() as f64)
-        .collect();
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_batch_rows_cols_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    data_len: usize,
-) -> Vec<usize> {
-    let sweep = PwmaBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = data_len;
-
-    vec![rows, cols]
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    core::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to pwma_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = PwmaParams {
-            period: Some(period),
-        };
-        let input = PwmaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            pwma_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            pwma_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pwma_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to pwma_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = PwmaBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        pwma_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
     }
 }

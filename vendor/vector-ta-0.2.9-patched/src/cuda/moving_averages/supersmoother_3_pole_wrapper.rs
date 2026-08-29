@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::supersmoother_3_pole::{
@@ -8,15 +8,15 @@ use cust::context::{CacheConfig, Context};
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::memory::{
-    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info,
 };
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[inline(always)]
 fn div_up(a: usize, b: usize) -> usize {
@@ -109,19 +109,6 @@ impl CudaSupersmoother3Pole {
         let context = Context::new(device)?;
         let ctx = Arc::new(context);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/supersmoother_3_pole_kernel.ptx"));
-
-        let opt = match std::env::var("CUDA_JIT_OPT").ok().as_deref() {
-            Some("O0") => OptLevel::O0,
-            Some("O1") => OptLevel::O1,
-            Some("O2") => OptLevel::O2,
-            Some("O3") => OptLevel::O3,
-            _ => OptLevel::O4,
-        };
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(opt),
-        ];
         let module = crate::load_cuda_embedded_module!("supersmoother_3_pole_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -850,116 +837,6 @@ impl CudaSupersmoother3Pole {
                     (*(self as *const _ as *mut CudaSupersmoother3Pole)).debug_many_logged = true;
                 }
             }
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::prelude::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::types::PyDict;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32")]
-pub struct DeviceArrayF32Py {
-    pub inner: DeviceArrayF32,
-    stream_handle: usize,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
-        let itemsize = std::mem::size_of::<f32>();
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        let size = self.inner.rows.saturating_mul(self.inner.cols);
-        let ptr_val: usize = if size == 0 {
-            0
-        } else {
-            self.inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-        d.set_item("version", 3)?;
-        Ok(d.into())
-    }
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "dl_device mismatch for __dlpack__",
-                        ));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let dummy = DeviceBuffer::from_slice(&[])
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32Py {
-    pub fn new_from_rust(
-        inner: DeviceArrayF32,
-        stream_handle: usize,
-        ctx_guard: Arc<Context>,
-        device_id: u32,
-    ) -> Self {
-        Self {
-            inner,
-            stream_handle,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
         }
     }
 }

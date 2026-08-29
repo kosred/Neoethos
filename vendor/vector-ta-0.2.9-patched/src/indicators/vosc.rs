@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -10,138 +10,6 @@ use core::arch::x86_64::*;
 use rayon::prelude::*;
 use std::convert::AsRef;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-mod vosc_python_cuda_handle {
-    use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-    use cust::context::Context;
-    use cust::memory::DeviceBuffer;
-    use pyo3::exceptions::PyValueError;
-    use pyo3::prelude::*;
-    use pyo3::types::PyDict;
-    use std::ffi::c_void;
-    use std::sync::Arc;
-
-    #[pyclass(module = "vector_ta", unsendable, name = "DeviceArrayF32Py")]
-    pub struct DeviceArrayF32Py {
-        pub(crate) buf: Option<DeviceBuffer<f32>>,
-        pub(crate) rows: usize,
-        pub(crate) cols: usize,
-        pub(crate) _ctx: Arc<Context>,
-        pub(crate) device_id: u32,
-    }
-
-    #[pymethods]
-    impl DeviceArrayF32Py {
-        #[getter]
-        fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-            let d = PyDict::new(py);
-            d.set_item("shape", (self.rows, self.cols))?;
-            d.set_item("typestr", "<f4")?;
-            d.set_item(
-                "strides",
-                (
-                    self.cols * std::mem::size_of::<f32>(),
-                    std::mem::size_of::<f32>(),
-                ),
-            )?;
-            let ptr = self
-                .buf
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-                .as_device_ptr()
-                .as_raw() as usize;
-            d.set_item("data", (ptr, false))?;
-            d.set_item("version", 3)?;
-            Ok(d)
-        }
-
-        fn __dlpack_device__(&self) -> (i32, i32) {
-            let mut device_ordinal: i32 = self.device_id as i32;
-            unsafe {
-                let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-                let mut value = std::mem::MaybeUninit::<i32>::uninit();
-                let ptr = self
-                    .buf
-                    .as_ref()
-                    .map(|b| b.as_device_ptr().as_raw())
-                    .unwrap_or(0);
-                if ptr != 0 {
-                    let rc = cust::sys::cuPointerGetAttribute(
-                        value.as_mut_ptr() as *mut c_void,
-                        attr,
-                        ptr,
-                    );
-                    if rc == cust::sys::CUresult::CUDA_SUCCESS {
-                        device_ordinal = value.assume_init();
-                    }
-                }
-            }
-            (2, device_ordinal)
-        }
-
-        #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-        fn __dlpack__<'py>(
-            &mut self,
-            py: Python<'py>,
-            stream: Option<pyo3::PyObject>,
-            max_version: Option<pyo3::PyObject>,
-            dl_device: Option<pyo3::PyObject>,
-            copy: Option<pyo3::PyObject>,
-        ) -> PyResult<PyObject> {
-            let (kdl, alloc_dev) = self.__dlpack_device__();
-            if let Some(dev_obj) = dl_device.as_ref() {
-                if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                    if dev_ty != kdl || dev_id != alloc_dev {
-                        let wants_copy = copy
-                            .as_ref()
-                            .and_then(|c| c.extract::<bool>(py).ok())
-                            .unwrap_or(false);
-                        if wants_copy {
-                            return Err(PyValueError::new_err(
-                                "device copy not implemented for __dlpack__",
-                            ));
-                        } else {
-                            return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                        }
-                    }
-                }
-            }
-            let _ = stream;
-
-            let buf = self
-                .buf
-                .take()
-                .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-            let rows = self.rows;
-            let cols = self.cols;
-            let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-            export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-        }
-    }
-
-    pub use DeviceArrayF32Py as VoscDeviceArrayF32Py;
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use self::vosc_python_cuda_handle::VoscDeviceArrayF32Py;
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for VoscInput<'a> {
     #[inline(always)]
@@ -171,10 +39,6 @@ pub struct VoscOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VoscParams {
     pub short_period: Option<usize>,
     pub long_period: Option<usize>,
@@ -1327,42 +1191,19 @@ fn vosc_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vosc_output_into_js(
-    data: &[f64],
-    short_period: usize,
-    long_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = vosc_js(data, short_period, long_period)?;
-    crate::write_wasm_f64_output("vosc_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vosc_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vosc_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("vosc_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_vosc_accuracy(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let volume = candles
             .select_candle_field("volume")
             .expect("Failed to extract volume data");
@@ -1482,8 +1323,8 @@ mod tests {
 
     fn check_vosc_streaming(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let volume = candles
             .select_candle_field("volume")
             .expect("Failed to extract volume data");
@@ -1536,8 +1377,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             VoscParams::default(),
@@ -1821,8 +1662,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = VoscBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "volume")?;
@@ -1851,8 +1692,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (1, 5, 1, 2, 10, 2),
@@ -1969,11 +1810,10 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_vosc_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let volume = candles
             .select_candle_field("volume")
             .expect("Failed to extract volume data");
@@ -2004,213 +1844,6 @@ mod tests {
 
         Ok(())
     }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vosc")]
-#[pyo3(signature = (data, short_period=2, long_period=5, kernel=None))]
-pub fn vosc_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    short_period: usize,
-    long_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = VoscParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-    };
-    let input = VoscInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| vosc_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VoscStream")]
-pub struct VoscStreamPy {
-    stream: VoscStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VoscStreamPy {
-    #[new]
-    fn new(short_period: usize, long_period: usize) -> PyResult<Self> {
-        let params = VoscParams {
-            short_period: Some(short_period),
-            long_period: Some(long_period),
-        };
-        let stream =
-            VoscStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(VoscStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vosc_batch")]
-#[pyo3(signature = (data, short_period_range, long_period_range, kernel=None))]
-pub fn vosc_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    short_period_range: (usize, usize, usize),
-    long_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = VoscBatchRange {
-        short_period: short_period_range,
-        long_period: long_period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    if combos.is_empty() {
-        return Err(PyValueError::new_err("No valid parameter combinations"));
-    }
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow in vosc_batch_py"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| -> Result<Vec<VoscParams>, VoscError> {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            vosc_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "short_periods",
-        combos
-            .iter()
-            .map(|p| p.short_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "long_periods",
-        combos
-            .iter()
-            .map(|p| p.long_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vosc_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, short_period_range, long_period_range, device_id=0))]
-pub fn vosc_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    short_period_range: (usize, usize, usize),
-    long_period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<VoscDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaVosc;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in: &[f32] = data_f32.as_slice()?;
-    let sweep = VoscBatchRange {
-        short_period: short_period_range,
-        long_period: long_period_range,
-    };
-    let (dev, ctx, dev_id_u32) = py.allow_threads(|| {
-        let cuda = CudaVosc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id_u32 = cuda.device_id();
-        cuda.vosc_batch_dev(slice_in, &sweep)
-            .map(|(dev, _combos)| (dev, ctx, dev_id_u32))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(VoscDeviceArrayF32Py {
-        buf: Some(dev.buf),
-        rows: dev.rows,
-        cols: dev.cols,
-        _ctx: ctx,
-        device_id: dev_id_u32,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vosc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, short_period, long_period, device_id=0))]
-pub fn vosc_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    short_period: usize,
-    long_period: usize,
-    device_id: usize,
-) -> PyResult<VoscDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaVosc;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let flat_in: &[f32] = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = VoscParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-    };
-    let (dev, ctx, dev_id_u32) = py.allow_threads(|| {
-        let cuda = CudaVosc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id_u32 = cuda.device_id();
-        cuda.vosc_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map(|dev| (dev, ctx, dev_id_u32))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(VoscDeviceArrayF32Py {
-        buf: Some(dev.buf),
-        rows: dev.rows,
-        cols: dev.cols,
-        _ctx: ctx,
-        device_id: dev_id_u32,
-    })
 }
 
 #[inline]
@@ -2296,7 +1929,7 @@ pub fn vosc_into_slice(dst: &mut [f64], input: &VoscInput, kern: Kernel) -> Resu
             return Err(VoscError::InvalidPeriod {
                 period: long_period,
                 data_len: data.len(),
-            })
+            });
         }
     };
     let limit = warm.min(dst.len());
@@ -2307,165 +1940,7 @@ pub fn vosc_into_slice(dst: &mut [f64], input: &VoscInput, kern: Kernel) -> Resu
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn vosc_into(input: &VoscInput, out: &mut [f64]) -> Result<(), VoscError> {
     vosc_into_slice(out, input, Kernel::Auto)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vosc_js(data: &[f64], short_period: usize, long_period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = VoscParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-    };
-    let input = VoscInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    vosc_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vosc_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period: usize,
-    long_period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = VoscParams {
-            short_period: Some(short_period),
-            long_period: Some(long_period),
-        };
-        let input = VoscInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            vosc_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            vosc_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vosc_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vosc_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VoscBatchConfig {
-    pub short_period_range: (usize, usize, usize),
-    pub long_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VoscBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<VoscParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = vosc_batch)]
-pub fn vosc_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: VoscBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = VoscBatchRange {
-        short_period: config.short_period_range,
-        long_period: config.long_period_range,
-    };
-
-    let output = vosc_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = VoscBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vosc_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_start: usize,
-    short_end: usize,
-    short_step: usize,
-    long_start: usize,
-    long_end: usize,
-    long_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to vosc_batch_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = VoscBatchRange {
-            short_period: (short_start, short_end, short_step),
-            long_period: (long_start, long_end, long_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        if rows == 0 {
-            return Err(JsValue::from_str(
-                "vosc_batch_into: no valid parameter combinations",
-            ));
-        }
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("vosc_batch_into: rows * cols overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        vosc_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

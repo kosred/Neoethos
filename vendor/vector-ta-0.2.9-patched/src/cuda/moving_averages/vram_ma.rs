@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::{
     CudaAlma, CudaCoraWave, CudaCwma, CudaDema, CudaEdcf, CudaEhlersITrend, CudaEma, CudaEpma,

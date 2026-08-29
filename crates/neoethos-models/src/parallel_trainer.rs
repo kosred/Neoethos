@@ -1,8 +1,8 @@
 // Parallel Model Trainer - multi-core training for Rust-native workloads.
 // The runtime now treats every active family as a native or self-contained path.
 use anyhow::{Context, Result};
-use ndarray::Array2;
-use polars::prelude::{Column, DataFrame, NamedFrom, Series};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use rayon::prelude::*;
 use std::sync::{
     Arc,
@@ -10,14 +10,7 @@ use std::sync::{
 };
 use tracing::info;
 
-use crate::base::dataframe_to_float32_array;
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
-
-fn rust_threads_hint() -> usize {
-    // Shares the single config-driven CPU budget with tree-model training
-    // (core hardware knob -> RAYON_NUM_THREADS -> cores-1).
-    crate::tree_models::config::cpu_threads_hint()
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelTrainingFailure {
@@ -55,79 +48,54 @@ pub struct ParallelTrainingSummary {
 
 #[derive(Debug, Clone)]
 pub struct TrainingPayload {
-    pub frame: Arc<DataFrame>,
-    pub dense_features: Arc<Array2<f32>>,
+    /// The single physical f64+validity feature backing shared by every model.
+    /// Backend-local f32 conversion, when intrinsically required, happens only
+    /// inside that backend's named adapter after validity selection.
+    pub frame: Arc<FeatureFrame>,
     pub labels: Arc<Vec<i32>>,
+    /// Stable mapping back to the canonical feature rows. Orchestration may
+    /// select eligible rows, but it must never silently lose their identity.
+    pub source_row_indices: Arc<Vec<usize>>,
 }
 
 impl TrainingPayload {
-    pub fn from_frame(frame: DataFrame, labels: Vec<i32>) -> Result<Self> {
-        if frame.height() != labels.len() {
-            anyhow::bail!(
-                "training payload row/label mismatch: {} rows vs {} labels",
-                frame.height(),
-                labels.len()
-            );
-        }
-
-        let dense_features = dataframe_to_float32_array(&frame)
-            .context("build dense feature matrix from training dataframe")?;
-
-        Ok(Self {
-            frame: Arc::new(frame),
-            dense_features: Arc::new(dense_features),
-            labels: Arc::new(labels),
-        })
+    pub fn from_frame(frame: FeatureFrame, labels: Vec<i32>) -> Result<Self> {
+        let source_row_indices = (0..frame.n_samples()).collect();
+        Self::from_frame_with_source_rows(frame, labels, source_row_indices)
     }
 
-    pub fn from_dense(dense_features: Array2<f32>, labels: Vec<i32>) -> Result<Self> {
-        let feature_names = (0..dense_features.ncols())
-            .map(|column_idx| format!("feature_{column_idx}"))
-            .collect::<Vec<_>>();
-
-        Self::from_named_dense(dense_features, labels, feature_names)
-    }
-
-    pub fn from_named_dense(
-        dense_features: Array2<f32>,
+    pub fn from_frame_with_source_rows(
+        frame: FeatureFrame,
         labels: Vec<i32>,
-        feature_names: Vec<String>,
+        source_row_indices: Vec<usize>,
     ) -> Result<Self> {
-        if dense_features.nrows() != labels.len() {
+        if frame.n_samples() != labels.len() {
             anyhow::bail!(
                 "training payload row/label mismatch: {} rows vs {} labels",
-                dense_features.nrows(),
+                frame.n_samples(),
                 labels.len()
             );
         }
-
-        if dense_features.ncols() != feature_names.len() {
+        if source_row_indices.len() != labels.len() {
             anyhow::bail!(
-                "training payload feature-name mismatch: {} cols vs {} names",
-                dense_features.ncols(),
-                feature_names.len()
+                "training payload source-row mismatch: {} source rows vs {} labels",
+                source_row_indices.len(),
+                labels.len(),
+            );
+        }
+        for pair in source_row_indices.windows(2) {
+            anyhow::ensure!(
+                pair[0] < pair[1],
+                "training payload source-row indices must be strictly increasing; found {} then {}",
+                pair[0],
+                pair[1]
             );
         }
 
-        let columns = feature_names
-            .into_iter()
-            .enumerate()
-            .map(|(column_idx, column_name)| {
-                let values = dense_features
-                    .column(column_idx)
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>();
-                Column::from(Series::new(column_name.into(), values))
-            })
-            .collect::<Vec<_>>();
-
-        let frame = DataFrame::new(columns).context("build dataframe from dense features")?;
-
         Ok(Self {
             frame: Arc::new(frame),
-            dense_features: Arc::new(dense_features),
             labels: Arc::new(labels),
+            source_row_indices: Arc::new(source_row_indices),
         })
     }
 }
@@ -136,12 +104,14 @@ impl TrainingPayload {
 pub fn train_models_parallel<F>(
     model_configs: Vec<ModelConfig>,
     payload: Arc<TrainingPayload>,
+    lease: &CpuLease,
     train_fn: F,
 ) -> Result<Vec<String>>
 where
-    F: Fn(&ModelConfig, &TrainingPayload) -> Result<()> + Send + Sync + Clone + 'static,
+    F: Fn(&ModelConfig, &TrainingPayload, &CpuLease) -> Result<()> + Send + Sync + Clone,
 {
-    let summary = train_models_parallel_with_progress(model_configs, payload, |_| {}, train_fn)?;
+    let summary =
+        train_models_parallel_with_progress(model_configs, payload, lease, |_| {}, train_fn)?;
 
     if !summary.failed_models.is_empty() {
         anyhow::bail!(
@@ -162,19 +132,20 @@ where
 pub fn train_models_parallel_with_progress<F, R>(
     model_configs: Vec<ModelConfig>,
     payload: Arc<TrainingPayload>,
+    lease: &CpuLease,
     progress_fn: R,
     train_fn: F,
 ) -> Result<ParallelTrainingSummary>
 where
-    F: Fn(&ModelConfig, &TrainingPayload) -> Result<()> + Send + Sync + Clone + 'static,
-    R: Fn(ModelTrainingProgress) + Send + Sync + Clone + 'static,
+    F: Fn(&ModelConfig, &TrainingPayload, &CpuLease) -> Result<()> + Send + Sync + Clone,
+    R: Fn(ModelTrainingProgress) + Send + Sync + Clone,
 {
     if model_configs.is_empty() {
         anyhow::bail!("No model configs provided for parallel training");
     }
 
     let total_models = model_configs.len();
-    let threads = rust_threads_hint();
+    let threads = lease.width().get();
     let completed_counter = Arc::new(AtomicUsize::new(0));
     let failed_counter = Arc::new(AtomicUsize::new(0));
 
@@ -194,74 +165,76 @@ where
     // each model `budget / concurrency` threads instead of the full budget
     // (previously budget² threads thrashed on `budget` cores). The guard
     // restores the single-model default on drop, even on panic.
-    let _concurrency_guard = crate::tree_models::config::TrainingConcurrencyGuard::new(
-        threads.min(total_models),
-    );
+    let _concurrency_guard =
+        crate::tree_models::config::TrainingConcurrencyGuard::new(threads.min(total_models));
 
     let results: Vec<Result<String, ModelTrainingFailure>> = pool.install(|| {
-        model_configs
-            .into_par_iter()
-            .map(|config| {
-                let payload = Arc::clone(&payload);
-                let train_fn = train_fn.clone();
-                let progress_fn = progress_fn.clone();
-                let completed_counter = Arc::clone(&completed_counter);
-                let failed_counter = Arc::clone(&failed_counter);
+        lease.scope(|| {
+            model_configs
+                .into_par_iter()
+                .map(|config| {
+                    let payload = Arc::clone(&payload);
+                    let train_fn = train_fn.clone();
+                    let progress_fn = progress_fn.clone();
+                    let completed_counter = Arc::clone(&completed_counter);
+                    let failed_counter = Arc::clone(&failed_counter);
 
-                progress_fn(ModelTrainingProgress::Started {
-                    model: config.name.clone(),
-                    total_models,
-                });
-                info!(
-                    "Thread {:?}: Training {}",
-                    std::thread::current().id(),
-                    config.name
-                );
+                    progress_fn(ModelTrainingProgress::Started {
+                        model: config.name.clone(),
+                        total_models,
+                    });
+                    info!(
+                        "Thread {:?}: Training {}",
+                        std::thread::current().id(),
+                        config.name
+                    );
 
-                let result = train_fn(&config, &payload);
+                    let result = train_fn(&config, &payload, lease);
 
-                match result {
-                    Ok(_) => {
-                        let completed_models = completed_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        let failed_models = failed_counter.load(Ordering::SeqCst);
-                        progress_fn(ModelTrainingProgress::Succeeded {
-                            model: config.name.clone(),
-                            completed_models,
-                            failed_models,
-                            total_models,
-                        });
-                        info!(
-                            "Thread {:?}: Completed {}",
-                            std::thread::current().id(),
-                            config.name
-                        );
-                        Ok(config.name)
+                    match result {
+                        Ok(_) => {
+                            let completed_models =
+                                completed_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            let failed_models = failed_counter.load(Ordering::SeqCst);
+                            progress_fn(ModelTrainingProgress::Succeeded {
+                                model: config.name.clone(),
+                                completed_models,
+                                failed_models,
+                                total_models,
+                            });
+                            info!(
+                                "Thread {:?}: Completed {}",
+                                std::thread::current().id(),
+                                config.name
+                            );
+                            Ok(config.name)
+                        }
+                        Err(err) => {
+                            let error = err.to_string();
+                            let failed_models = failed_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            let completed_models = completed_counter.load(Ordering::SeqCst);
+                            progress_fn(ModelTrainingProgress::Failed {
+                                model: config.name.clone(),
+                                error: error.clone(),
+                                completed_models,
+                                failed_models,
+                                total_models,
+                            });
+                            info!(
+                                "Thread {:?}: Failed {} - {}",
+                                std::thread::current().id(),
+                                config.name,
+                                error
+                            );
+                            Err(ModelTrainingFailure {
+                                name: config.name,
+                                error,
+                            })
+                        }
                     }
-                    Err(err) => {
-                        let error = err.to_string();
-                        let failed_models = failed_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        let completed_models = completed_counter.load(Ordering::SeqCst);
-                        progress_fn(ModelTrainingProgress::Failed {
-                            model: config.name.clone(),
-                            error: error.clone(),
-                            completed_models,
-                            failed_models,
-                            total_models,
-                        });
-                        info!(
-                            "Thread {:?}: Failed {} - {}",
-                            std::thread::current().id(),
-                            config.name,
-                            error
-                        );
-                        Err(ModelTrainingFailure {
-                            name: config.name,
-                            error,
-                        })
-                    }
-                }
-            })
-            .collect()
+                })
+                .collect()
+        })
     });
 
     let mut successes = Vec::new();
@@ -345,7 +318,39 @@ pub enum ModelType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+    use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::sync::{Arc, Mutex};
+
+    fn sample_payload(rows: usize, features: usize) -> Arc<TrainingPayload> {
+        let columns = (0..features)
+            .map(|feature| {
+                FeatureColumnF64::new(
+                    format!("feature_{feature}"),
+                    (0..rows)
+                        .map(|row| row as f64 + feature as f64 / 10.0)
+                        .collect(),
+                    vec![FeatureCellValidity::Valid; rows],
+                )
+                .expect("valid test feature column")
+            })
+            .collect();
+        let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+        .expect("valid canonical test feature frame");
+        Arc::new(
+            TrainingPayload::from_frame(frame, vec![0; rows]).expect("build f64 training payload"),
+        )
+    }
+
+    fn lease(width: usize) -> CpuLease {
+        let width = WorkerLimit::new(width).expect("positive worker width");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("isolated test lease")
+    }
 
     #[test]
     fn test_parallel_training() {
@@ -353,13 +358,8 @@ mod tests {
         let n_samples = 1000;
         let n_features = 20;
 
-        let payload = Arc::new(
-            TrainingPayload::from_dense(
-                Array2::<f32>::zeros((n_samples, n_features)),
-                vec![0i32; n_samples],
-            )
-            .expect("build dense payload"),
-        );
+        let payload = sample_payload(n_samples, n_features);
+        let cpu_lease = lease(3);
 
         // Create model configs
         let configs = vec![
@@ -387,14 +387,15 @@ mod tests {
         ];
 
         // Test helper training function
-        let train_fn = |config: &ModelConfig, _payload: &TrainingPayload| {
+        let train_fn = |config: &ModelConfig, _payload: &TrainingPayload, lease: &CpuLease| {
+            assert_eq!(lease.width().get(), 3);
             println!("Training {}", config.name);
             std::thread::sleep(std::time::Duration::from_millis(100));
             Ok(())
         };
 
         // Train in parallel
-        let results = train_models_parallel(configs, payload, train_fn).unwrap();
+        let results = train_models_parallel(configs, payload, &cpu_lease, train_fn).unwrap();
 
         assert_eq!(results.len(), 3);
         println!("Successfully trained: {:?}", results);
@@ -402,10 +403,8 @@ mod tests {
 
     #[test]
     fn test_parallel_training_returns_error_when_any_model_fails() {
-        let payload = Arc::new(
-            TrainingPayload::from_dense(Array2::<f32>::zeros((16, 4)), vec![0i32; 16])
-                .expect("build dense payload"),
-        );
+        let payload = sample_payload(16, 4);
+        let cpu_lease = lease(2);
         let configs = vec![
             ModelConfig {
                 name: "ok_model".to_string(),
@@ -423,14 +422,15 @@ mod tests {
             },
         ];
 
-        let train_fn = |config: &ModelConfig, _payload: &TrainingPayload| -> Result<()> {
-            if config.name == "bad_model" {
-                anyhow::bail!("synthetic failure");
-            }
-            Ok(())
-        };
+        let train_fn =
+            |config: &ModelConfig, _payload: &TrainingPayload, _lease: &CpuLease| -> Result<()> {
+                if config.name == "bad_model" {
+                    anyhow::bail!("synthetic failure");
+                }
+                Ok(())
+            };
 
-        let err = train_models_parallel(configs, payload, train_fn)
+        let err = train_models_parallel(configs, payload, &cpu_lease, train_fn)
             .expect_err("expected aggregated failure");
         let msg = err.to_string();
         assert!(msg.contains("bad_model"), "unexpected error: {msg}");
@@ -439,25 +439,24 @@ mod tests {
 
     #[test]
     fn test_parallel_training_rejects_empty_model_set() {
-        let payload = Arc::new(
-            TrainingPayload::from_dense(Array2::<f32>::zeros((8, 2)), vec![0i32; 8])
-                .expect("build dense payload"),
-        );
+        let payload = sample_payload(8, 2);
+        let cpu_lease = lease(1);
         let configs: Vec<ModelConfig> = Vec::new();
 
-        let train_fn = |_config: &ModelConfig, _payload: &TrainingPayload| -> Result<()> { Ok(()) };
+        let train_fn = |_config: &ModelConfig,
+                        _payload: &TrainingPayload,
+                        _lease: &CpuLease|
+         -> Result<()> { Ok(()) };
 
-        let err = train_models_parallel(configs, payload, train_fn)
+        let err = train_models_parallel(configs, payload, &cpu_lease, train_fn)
             .expect_err("expected empty-config error");
         assert!(err.to_string().contains("No model configs"));
     }
 
     #[test]
     fn test_parallel_training_summary_reports_live_model_events() {
-        let payload = Arc::new(
-            TrainingPayload::from_dense(Array2::<f32>::zeros((12, 3)), vec![0i32; 12])
-                .expect("build dense payload"),
-        );
+        let payload = sample_payload(12, 3);
+        let cpu_lease = lease(2);
         let configs = vec![
             ModelConfig {
                 name: "ok_model".to_string(),
@@ -477,16 +476,18 @@ mod tests {
         let seen_events = Arc::new(Mutex::new(Vec::new()));
         let event_sink = Arc::clone(&seen_events);
 
-        let train_fn = |config: &ModelConfig, _payload: &TrainingPayload| -> Result<()> {
-            if config.name == "bad_model" {
-                anyhow::bail!("synthetic failure");
-            }
-            Ok(())
-        };
+        let train_fn =
+            |config: &ModelConfig, _payload: &TrainingPayload, _lease: &CpuLease| -> Result<()> {
+                if config.name == "bad_model" {
+                    anyhow::bail!("synthetic failure");
+                }
+                Ok(())
+            };
 
         let summary = train_models_parallel_with_progress(
             configs,
             payload,
+            &cpu_lease,
             move |event| {
                 event_sink
                     .lock()

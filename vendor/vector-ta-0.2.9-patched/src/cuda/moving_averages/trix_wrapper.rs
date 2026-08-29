@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::DeviceArrayF32;
 use super::{BatchKernelPolicy, ManySeriesKernelPolicy};
@@ -6,8 +6,8 @@ use crate::indicators::trix::{TrixBatchRange, TrixParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -91,11 +91,6 @@ impl CudaTrix {
         let max_grid_x = device.get_attribute(DeviceAttribute::MaxGridDimX)? as u32;
         let context = Context::new(device)?;
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/trix_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("trix_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
@@ -515,12 +510,11 @@ impl CudaTrix {
             if trace {
                 eprintln!(
                     "[TRACE] trix.launch_batch_kernel: warp-scan path (block_x={}, warps_per_block={}, grid_x={}, combos={})",
-                    block_x,
-                    warps_per_block,
-                    grid_x,
-                    n_combos
+                    block_x, warps_per_block, grid_x, n_combos
                 );
-                eprintln!("[TRACE] trix.launch_batch_kernel: module.get_function(trix_batch_warp_scan_f32) (begin)");
+                eprintln!(
+                    "[TRACE] trix.launch_batch_kernel: module.get_function(trix_batch_warp_scan_f32) (begin)"
+                );
             }
             let func = self
                 .module
@@ -529,7 +523,9 @@ impl CudaTrix {
                     name: "trix_batch_warp_scan_f32",
                 })?;
             if trace {
-                eprintln!("[TRACE] trix.launch_batch_kernel: module.get_function(trix_batch_warp_scan_f32) (done)");
+                eprintln!(
+                    "[TRACE] trix.launch_batch_kernel: module.get_function(trix_batch_warp_scan_f32) (done)"
+                );
             }
             let grid: GridSize = (grid_x.max(1), 1, 1).into();
             let block: BlockSize = (block_x, 1, 1).into();
@@ -614,7 +610,10 @@ impl CudaTrix {
                     &mut out_ptr as *mut _ as *mut c_void,
                 ];
                 if trace {
-                    eprintln!("[TRACE] trix.launch_batch_kernel: stream.launch(plain) launched={} chunk={}", launched, chunk);
+                    eprintln!(
+                        "[TRACE] trix.launch_batch_kernel: stream.launch(plain) launched={} chunk={}",
+                        launched, chunk
+                    );
                 }
                 self.stream.launch(&func, grid, block, 0, args)?;
             }
@@ -1054,15 +1053,17 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "trix",
-            "one_series_many_params",
-            "trix_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "trix",
+                "one_series_many_params",
+                "trix_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }
 

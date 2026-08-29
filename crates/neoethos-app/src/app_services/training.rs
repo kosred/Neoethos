@@ -5,7 +5,7 @@ use crate::app_services::{
         push_recent_event,
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use neoethos_core::{
     Settings,
     logging::{canonical_log_path, write_subsystem_record},
@@ -575,11 +575,21 @@ pub fn start_training_job(
         // halts training mid-run (single-instance → a process-global is safe).
         neoethos_models::set_training_cancel(Some(cancel.cancel_arc()));
         let train_result = tokio::task::spawn_blocking(move || {
+            let installed = neoethos_core::execution_budget::installed_process_budget()
+                .context("training requires the immutable process CPU budget")?;
+            let width = installed.resolved().effective_worker_limit;
+            let lease = installed
+                .broker()
+                .acquire(neoethos_core::execution_budget::CpuPermitRequest::local(
+                    width,
+                ))
+                .context("acquire process CPU budget for model training")?;
             let orchestrator =
                 TrainingOrchestrator::new(settings, train_request.models_dir.clone());
             orchestrator.train_symbol_with_progress(
                 &train_request.symbol,
                 &train_request.base_tf,
+                &lease,
                 move |event| {
                     if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
                         apply_backend_progress_event(&mut snapshot, &event);
@@ -922,5 +932,4 @@ mod tests {
                 .any(|entry| entry.contains("failed | mlp"))
         );
     }
-
 }

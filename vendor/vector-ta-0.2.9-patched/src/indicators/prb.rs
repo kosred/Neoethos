@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -50,10 +34,6 @@ pub struct PrbOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct PrbParams {
     pub smooth_data: Option<bool>,
     pub smooth_period: Option<usize>,
@@ -1536,7 +1516,6 @@ pub fn prb_into_slice(
     )
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn prb_into(
     input: &PrbInput,
@@ -2079,610 +2058,17 @@ fn expand_grid(r: &PrbBatchRange, smooth_flag: bool) -> Result<Vec<PrbParams>, P
     Ok(out)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "prb")]
-#[pyo3(signature = (data, smooth_data, smooth_period, regression_period, polynomial_order, regression_offset, ndev, kernel=None))]
-pub fn prb_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    smooth_data: bool,
-    smooth_period: usize,
-    regression_period: usize,
-    polynomial_order: usize,
-    regression_offset: i32,
-    ndev: f64,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let slice_in = data.as_slice()?;
-    let params = PrbParams {
-        smooth_data: Some(smooth_data),
-        smooth_period: Some(smooth_period),
-        regression_period: Some(regression_period),
-        polynomial_order: Some(polynomial_order),
-        regression_offset: Some(regression_offset),
-        ndev: Some(ndev),
-        equ_from: Some(0),
-    };
-    let input = PrbInput::from_slice(slice_in, params);
-    let kern = validate_kernel(kernel, false)?;
-    let (m, u, l) = py
-        .allow_threads(|| {
-            prb_with_kernel(&input, kern).map(|o| (o.values, o.upper_band, o.lower_band))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((m.into_pyarray(py), u.into_pyarray(py), l.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(name = "prb_batch")]
-pub fn prb_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    smooth_data: bool,
-    smooth_period_start: usize,
-    smooth_period_end: usize,
-    smooth_period_step: usize,
-    regression_period_start: usize,
-    regression_period_end: usize,
-    regression_period_step: usize,
-    polynomial_order_start: usize,
-    polynomial_order_end: usize,
-    polynomial_order_step: usize,
-    regression_offset_start: i32,
-    regression_offset_end: i32,
-    regression_offset_step: i32,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = PrbBatchRange {
-        smooth_period: (smooth_period_start, smooth_period_end, smooth_period_step),
-        regression_period: (
-            regression_period_start,
-            regression_period_end,
-            regression_period_step,
-        ),
-        polynomial_order: (
-            polynomial_order_start,
-            polynomial_order_end,
-            polynomial_order_step,
-        ),
-        regression_offset: (
-            regression_offset_start,
-            regression_offset_end,
-            regression_offset_step,
-        ),
-    };
-
-    let out = prb_batch_with_kernel(slice_in, &sweep, kern, smooth_data)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-
-    let dict = PyDict::new(py);
-
-    use ndarray::Array2;
-    let values_arr = Array2::from_shape_vec((rows, cols), out.values)
-        .map_err(|e| PyValueError::new_err(format!("Failed to reshape values: {}", e)))?;
-    let upper_arr = Array2::from_shape_vec((rows, cols), out.upper_band)
-        .map_err(|e| PyValueError::new_err(format!("Failed to reshape upper: {}", e)))?;
-    let lower_arr = Array2::from_shape_vec((rows, cols), out.lower_band)
-        .map_err(|e| PyValueError::new_err(format!("Failed to reshape lower: {}", e)))?;
-
-    dict.set_item("values", values_arr.into_pyarray(py))?;
-    dict.set_item("upper", upper_arr.into_pyarray(py))?;
-    dict.set_item("lower", lower_arr.into_pyarray(py))?;
-
-    dict.set_item(
-        "smooth_periods",
-        out.combos
-            .iter()
-            .map(|p| p.smooth_period.unwrap_or(10) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "regression_periods",
-        out.combos
-            .iter()
-            .map(|p| p.regression_period.unwrap_or(100) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "polynomial_orders",
-        out.combos
-            .iter()
-            .map(|p| p.polynomial_order.unwrap_or(2) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "regression_offsets",
-        out.combos
-            .iter()
-            .map(|p| p.regression_offset.unwrap_or(0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict.into())
-}
-
-#[cfg(feature = "python")]
-#[pyclass]
-pub struct PrbStreamPy {
-    stream: PrbStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PrbStreamPy {
-    #[new]
-    fn new(
-        smooth_data: Option<bool>,
-        smooth_period: Option<usize>,
-        regression_period: Option<usize>,
-        polynomial_order: Option<usize>,
-        regression_offset: Option<i32>,
-        ndev: Option<f64>,
-    ) -> PyResult<Self> {
-        let params = PrbParams {
-            smooth_data,
-            smooth_period,
-            regression_period,
-            polynomial_order,
-            regression_offset,
-            ndev,
-            equ_from: Some(0),
-        };
-        let stream =
-            PrbStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PrbStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct PrbJsResult {
-    values: Vec<f64>,
-    rows: usize,
-    cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl PrbJsResult {
-    #[wasm_bindgen(getter)]
-    pub fn values(&self) -> Vec<f64> {
-        self.values.clone()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn cols(&self) -> usize {
-        self.cols
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "prb")]
-pub fn prb_js(
-    data: &[f64],
-    smooth_data: bool,
-    smooth_period: usize,
-    regression_period: usize,
-    polynomial_order: usize,
-    regression_offset: i32,
-    ndev: f64,
-) -> Result<PrbJsResult, JsValue> {
-    let params = PrbParams {
-        smooth_data: Some(smooth_data),
-        smooth_period: Some(smooth_period),
-        regression_period: Some(regression_period),
-        polynomial_order: Some(polynomial_order),
-        regression_offset: Some(regression_offset),
-        ndev: Some(ndev),
-        equ_from: Some(0),
-    };
-    let input = PrbInput::from_slice(data, params);
-
-    let output = prb(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = output.values;
-    values.extend(output.upper_band);
-    values.extend(output.lower_band);
-
-    Ok(PrbJsResult {
-        values,
-        rows: 3,
-        cols: data.len(),
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "prb_batch")]
-pub fn prb_batch_js(
-    data: &[f64],
-    smooth_data: bool,
-    smooth_period_start: usize,
-    smooth_period_end: usize,
-    smooth_period_step: usize,
-    regression_period_start: usize,
-    regression_period_end: usize,
-    regression_period_step: usize,
-    polynomial_order_start: usize,
-    polynomial_order_end: usize,
-    polynomial_order_step: usize,
-    regression_offset_start: i32,
-    regression_offset_end: i32,
-    regression_offset_step: i32,
-) -> Result<JsValue, JsValue> {
-    let sweep = PrbBatchRange {
-        smooth_period: (smooth_period_start, smooth_period_end, smooth_period_step),
-        regression_period: (
-            regression_period_start,
-            regression_period_end,
-            regression_period_step,
-        ),
-        polynomial_order: (
-            polynomial_order_start,
-            polynomial_order_end,
-            polynomial_order_step,
-        ),
-        regression_offset: (
-            regression_offset_start,
-            regression_offset_end,
-            regression_offset_step,
-        ),
-    };
-
-    let out = prb_batch_slice(data, &sweep, detect_best_kernel(), smooth_data)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values =
-        Vec::with_capacity(out.values.len() + out.upper_band.len() + out.lower_band.len());
-    values.extend_from_slice(&out.values);
-    values.extend_from_slice(&out.upper_band);
-    values.extend_from_slice(&out.lower_band);
-
-    let flat = PrbBatchFlatJs {
-        values,
-        rows: 3 * out.rows,
-        cols: out.cols,
-        combos: out.combos,
-    };
-    serde_wasm_bindgen::to_value(&flat)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn prb_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    core::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn prb_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn prb_into(
-    in_ptr: *const f64,
-    out_main: *mut f64,
-    out_upper: *mut f64,
-    out_lower: *mut f64,
-    len: usize,
-    smooth_data: bool,
-    smooth_period: usize,
-    regression_period: usize,
-    polynomial_order: usize,
-    regression_offset: i32,
-    ndev: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_main.is_null() || out_upper.is_null() || out_lower.is_null() {
-        return Err(JsValue::from_str("null pointer passed to prb_into"));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(in_ptr, len);
-        let mut m = core::slice::from_raw_parts_mut(out_main, len);
-        let mut u = core::slice::from_raw_parts_mut(out_upper, len);
-        let mut l = core::slice::from_raw_parts_mut(out_lower, len);
-        let params = PrbParams {
-            smooth_data: Some(smooth_data),
-            smooth_period: Some(smooth_period),
-            regression_period: Some(regression_period),
-            polynomial_order: Some(polynomial_order),
-            regression_offset: Some(regression_offset),
-            ndev: Some(ndev),
-            equ_from: Some(0),
-        };
-        let input = PrbInput::from_slice(data, params);
-        prb_into_slice(&mut m, &mut u, &mut l, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PrbBatchJsOutput {
-    pub values: Vec<f64>,
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub combos: Vec<PrbParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PrbBatchFlatJs {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub combos: Vec<PrbParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "prb_batch_unified")]
-pub fn prb_batch_unified_js(
-    data: &[f64],
-    config: JsValue,
-    smooth_data: bool,
-) -> Result<JsValue, JsValue> {
-    #[derive(Serialize, Deserialize)]
-    struct Cfg {
-        smooth_period: (usize, usize, usize),
-        regression_period: (usize, usize, usize),
-        polynomial_order: (usize, usize, usize),
-        regression_offset: (i32, i32, i32),
-    }
-    let cfg: Cfg = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = PrbBatchRange {
-        smooth_period: cfg.smooth_period,
-        regression_period: cfg.regression_period,
-        polynomial_order: cfg.polynomial_order,
-        regression_offset: cfg.regression_offset,
-    };
-    let out = prb_batch_inner(data, &sweep, detect_best_kernel(), smooth_data, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = PrbBatchJsOutput {
-        values: out.values,
-        upper: out.upper_band,
-        lower: out.lower_band,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaPrb};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::{pyfunction, PyResult, Python};
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "prb_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, smooth_data, smooth_period_range=(10,10,0), regression_period_range=(100,100,0), polynomial_order_range=(2,2,0), regression_offset_range=(0,0,0), device_id=0))]
-pub fn prb_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    smooth_data: bool,
-    smooth_period_range: (usize, usize, usize),
-    regression_period_range: (usize, usize, usize),
-    polynomial_order_range: (usize, usize, usize),
-    regression_offset_range: (i32, i32, i32),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_f32.as_slice()?;
-    let sweep = PrbBatchRange {
-        smooth_period: smooth_period_range,
-        regression_period: regression_period_range,
-        polynomial_order: polynomial_order_range,
-        regression_offset: regression_offset_range,
-    };
-    let (main_d, up_d, lo_d, ctx, dev) = py.allow_threads(|| {
-        let cuda = CudaPrb::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        cuda.prb_batch_dev(slice, &sweep, smooth_data)
-            .map(|(m, u, l)| (m, u, l, ctx, dev))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: main_d,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev),
-        },
-        DeviceArrayF32Py {
-            inner: up_d,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev),
-        },
-        DeviceArrayF32Py {
-            inner: lo_d,
-            _ctx: Some(ctx),
-            device_id: Some(dev),
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "prb_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, cols, rows, smooth_data, smooth_period, regression_period, polynomial_order, regression_offset, ndev=2.0, device_id=0))]
-pub fn prb_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    smooth_data: bool,
-    smooth_period: usize,
-    regression_period: usize,
-    polynomial_order: usize,
-    regression_offset: i32,
-    ndev: f64,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let tm = prices_tm_f32.as_slice()?;
-    let params = PrbParams {
-        smooth_data: Some(smooth_data),
-        smooth_period: Some(smooth_period),
-        regression_period: Some(regression_period),
-        polynomial_order: Some(polynomial_order),
-        regression_offset: Some(regression_offset),
-        ndev: Some(ndev),
-        equ_from: Some(0),
-    };
-    let (m_d, u_d, l_d, ctx, dev) = py.allow_threads(|| {
-        let cuda = CudaPrb::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        cuda.prb_many_series_one_param_time_major_dev(tm, cols, rows, &params)
-            .map(|(m, u, l)| (m, u, l, ctx, dev))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: m_d,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev),
-        },
-        DeviceArrayF32Py {
-            inner: u_d,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev),
-        },
-        DeviceArrayF32Py {
-            inner: l_d,
-            _ctx: Some(ctx),
-            device_id: Some(dev),
-        },
-    ))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn prb_output_into_js(
-    data: &[f64],
-    smooth_data: bool,
-    smooth_period: usize,
-    regression_period: usize,
-    polynomial_order: usize,
-    regression_offset: i32,
-    ndev: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let result = prb_js(
-        data,
-        smooth_data,
-        smooth_period,
-        regression_period,
-        polynomial_order,
-        regression_offset,
-        ndev,
-    )?;
-    crate::write_wasm_f64_output("prb_output_into_js", &result.values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn prb_batch_output_into_js(
-    data: &[f64],
-    smooth_data: bool,
-    smooth_period_start: usize,
-    smooth_period_end: usize,
-    smooth_period_step: usize,
-    regression_period_start: usize,
-    regression_period_end: usize,
-    regression_period_step: usize,
-    polynomial_order_start: usize,
-    polynomial_order_end: usize,
-    polynomial_order_step: usize,
-    regression_offset_start: i32,
-    regression_offset_end: i32,
-    regression_offset_step: i32,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = prb_batch_js(
-        data,
-        smooth_data,
-        smooth_period_start,
-        smooth_period_end,
-        smooth_period_step,
-        regression_period_start,
-        regression_period_end,
-        regression_period_step,
-        polynomial_order_start,
-        polynomial_order_end,
-        polynomial_order_step,
-        regression_offset_start,
-        regression_offset_end,
-        regression_offset_step,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs("prb_batch_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn prb_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    smooth_data: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = prb_batch_unified_js(data, config, smooth_data)?;
-    crate::write_wasm_selected_object_f64_outputs("prb_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     #[test]
     fn test_prb_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = PrbInput::from_candles(&candles, "close", PrbParams::default());
 
@@ -2693,7 +2079,6 @@ mod tests {
         let mut up = vec![0.0f64; len];
         let mut lo = vec![0.0f64; len];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             prb_into(&input, &mut main, &mut up, &mut lo)?;
         }
@@ -2736,8 +2121,8 @@ mod tests {
 
     fn check_prb_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = PrbParams {
             smooth_data: Some(false),
@@ -2794,8 +2179,8 @@ mod tests {
 
     fn check_prb_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = PrbParams {
             smooth_data: None,
@@ -2944,8 +2329,8 @@ mod tests {
 
     fn check_prb_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = PrbParams {
             smooth_data: Some(false),
@@ -2978,8 +2363,8 @@ mod tests {
 
     fn check_prb_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = PrbInput::from_candles(
             &candles,
@@ -3046,8 +2431,8 @@ mod tests {
     fn check_prb_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = PrbParams {
             smooth_data: Some(false),
@@ -3104,8 +2489,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = PrbBatchBuilder::new()
             .kernel(kernel)
             .smooth_data(false)
@@ -3122,8 +2507,8 @@ mod tests {
 
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = PrbBatchBuilder::new()
             .kernel(kernel)
             .smooth_data(false)
@@ -3142,8 +2527,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = PrbBatchBuilder::new()
             .kernel(kernel)
             .smooth_data(false)
@@ -3229,5 +2614,6 @@ mod tests {
 
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_sweep);
+    #[cfg(debug_assertions)]
     gen_batch_tests!(check_batch_no_poison);
 }

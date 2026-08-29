@@ -1,21 +1,3 @@
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyBufferError;
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
@@ -32,14 +14,57 @@ use std::error::Error;
 use std::mem::ManuallyDrop;
 use thiserror::Error;
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::chop_wrapper::DeviceArrayF32 as DeviceArrayF32Chop;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaChop;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+/// Canonical CHOP semantics follow TradingView's published operation shape:
+/// `100 * LOG10(SUM(ATR(1), n) / range) / LOG10(n)`.
+///
+/// Source: https://www.tradingview.com/support/solutions/43000501980-choppiness-index-chop/
+pub const CHOP_TRADINGVIEW_LOG10_SEMANTICS_V1: &str =
+    "chop-tradingview-log10.fixed-order-f64.semantic-v1";
+
+const CHOP_LN_2_BITS_V1: u64 = 0x3fe6_2e42_fefa_39ef;
+const CHOP_LN_10_BITS_V1: u64 = 0x4002_6bb1_bbb5_5515;
+const CHOP_MANTISSA_MASK_V1: u64 = 0x000f_ffff_ffff_ffff;
+const CHOP_ONE_EXPONENT_BITS_V1: u64 = 0x3ff0_0000_0000_0000;
+const CHOP_TWO_POW_54_BITS_V1: u64 = 0x4350_0000_0000_0000;
+
+#[inline]
+fn chop_ln_positive_exact_v1(value: f64) -> f64 {
+    if value == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    if value <= 0.0 || value.is_nan() {
+        return f64::NAN;
+    }
+    let (normalized, exponent_adjustment) = if value.is_subnormal() {
+        (value * f64::from_bits(CHOP_TWO_POW_54_BITS_V1), -54)
+    } else {
+        (value, 0)
+    };
+    let bits = normalized.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32 - 1023 + exponent_adjustment;
+    let mantissa = f64::from_bits((bits & CHOP_MANTISSA_MASK_V1) | CHOP_ONE_EXPONENT_BITS_V1);
+    let z = (mantissa - 1.0) / (mantissa + 1.0);
+    let z_squared = z * z;
+    let mut term = z;
+    let mut sum = z;
+    let mut denominator = 3_u32;
+    while denominator <= 49 {
+        term *= z_squared;
+        sum += term / denominator as f64;
+        denominator += 2;
+    }
+    exponent as f64 * f64::from_bits(CHOP_LN_2_BITS_V1) + 2.0 * sum
+}
+
+#[inline]
+pub(crate) fn chop_log10_positive_exact_v1(value: f64) -> f64 {
+    chop_ln_positive_exact_v1(value) / f64::from_bits(CHOP_LN_10_BITS_V1)
+}
+
+#[inline]
+fn chop_value_from_ratio_exact_v1(ratio: f64, scalar: f64, log10_period: f64) -> f64 {
+    (scalar * chop_log10_positive_exact_v1(ratio)) / log10_period
+}
 
 #[derive(Debug, Clone)]
 pub enum ChopData<'a> {
@@ -57,10 +82,6 @@ pub struct ChopOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct ChopParams {
     pub period: Option<usize>,
     pub scalar: Option<f64>,
@@ -449,7 +470,6 @@ pub fn chop_into_slice(dst: &mut [f64], input: &ChopInput, kern: Kernel) -> Resu
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn chop_into(input: &ChopInput, out: &mut [f64]) -> Result<(), ChopError> {
     let len = match &input.data {
@@ -488,7 +508,7 @@ pub unsafe fn chop_scalar(
     }
 
     let alpha = 1.0 / (drift as f64);
-    let logp = (period as f64).log10();
+    let log10_period = chop_log10_positive_exact_v1(period as f64);
 
     let mut atr_ring = vec![0.0_f64; period];
     let mut atr_ring_idx: usize = 0;
@@ -529,11 +549,7 @@ pub unsafe fn chop_scalar(
         prev_close = close[i];
 
         let current_atr = if rel < drift {
-            if rel == drift - 1 {
-                rma_atr
-            } else {
-                f64::NAN
-            }
+            if rel == drift - 1 { rma_atr } else { f64::NAN }
         } else {
             rma_atr
         };
@@ -589,7 +605,8 @@ pub unsafe fn chop_scalar(
             let ll_idx = *dq_low.front().unwrap();
             let range = high[hh_idx] - low[ll_idx];
             if range > 0.0 && rolling_sum_atr > 0.0 {
-                out[i] = (scalar * (rolling_sum_atr.log10() - range.log10())) / logp;
+                let ratio = rolling_sum_atr / range;
+                out[i] = chop_value_from_ratio_exact_v1(ratio, scalar, log10_period);
             } else {
                 out[i] = f64::NAN;
             }
@@ -621,7 +638,7 @@ unsafe fn chop_scalar_period_14_drift_1(
     }
 
     let len = close.len();
-    let scale_ln = scalar / (PERIOD as f64).ln();
+    let log10_period = chop_log10_positive_exact_v1(PERIOD as f64);
 
     let mut atr_ring = [0.0_f64; PERIOD];
     let mut atr_ring_idx: usize = 0;
@@ -713,11 +730,8 @@ unsafe fn chop_scalar_period_14_drift_1(
             let range = h_val[h_head] - l_val[l_head];
             if range > 0.0 && rolling_sum_atr > 0.0 {
                 let ratio = rolling_sum_atr / range;
-                *out.get_unchecked_mut(i) = if (ratio - 1.0).abs() < 1e-8 {
-                    scale_ln * (ratio - 1.0).ln_1p()
-                } else {
-                    scale_ln * ratio.ln()
-                };
+                *out.get_unchecked_mut(i) =
+                    chop_value_from_ratio_exact_v1(ratio, scalar, log10_period);
             } else {
                 *out.get_unchecked_mut(i) = f64::NAN;
             }
@@ -1235,7 +1249,7 @@ pub struct ChopStream {
     scalar: f64,
 
     inv_drift: f64,
-    scale_ln: f64,
+    log10_period: f64,
 
     atr_ring: Vec<f64>,
     ring_idx: usize,
@@ -1268,14 +1282,14 @@ impl ChopStream {
         let scalar = params.scalar.unwrap_or(100.0);
 
         let inv_drift = 1.0 / (drift as f64);
-        let scale_ln = scalar / (period as f64).ln();
+        let log10_period = chop_log10_positive_exact_v1(period as f64);
 
         Ok(Self {
             period,
             drift,
             scalar,
             inv_drift,
-            scale_ln,
+            log10_period,
 
             atr_ring: vec![0.0; period],
             ring_idx: 0,
@@ -1381,11 +1395,7 @@ impl ChopStream {
             let range = self.dq_high.front().unwrap().val - self.dq_low.front().unwrap().val;
             if range > 0.0 && self.rolling_sum_atr > 0.0 {
                 let ratio = self.rolling_sum_atr / range;
-                let y = if (ratio - 1.0).abs() < 1e-8 {
-                    self.scale_ln * (ratio - 1.0).ln_1p()
-                } else {
-                    self.scale_ln * ratio.ln()
-                };
+                let y = chop_value_from_ratio_exact_v1(ratio, self.scalar, self.log10_period);
                 Some(y)
             } else {
                 Some(f64::NAN)
@@ -1396,40 +1406,28 @@ impl ChopStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chop_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    scalar: f64,
-    drift: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = chop_js(high, low, close, period, scalar, drift)?;
-    crate::write_wasm_f64_output("chop_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chop_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = chop_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("chop_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
+
+    #[test]
+    fn published_log10_authority_has_stable_gate_196_bits() {
+        assert_eq!(chop_log10_positive_exact_v1(1.0).to_bits(), 0_u64);
+        assert_eq!(
+            chop_log10_positive_exact_v1(f64::INFINITY).to_bits(),
+            f64::INFINITY.to_bits()
+        );
+        assert!(chop_log10_positive_exact_v1(0.0).is_nan());
+        assert!(chop_log10_positive_exact_v1(f64::NAN).is_nan());
+
+        let ratio = f64::from_bits(0x4025_bae2_2390_9d3f);
+        let log10_period = chop_log10_positive_exact_v1(14.0);
+        let value = chop_value_from_ratio_exact_v1(ratio, 100.0, log10_period);
+        assert_eq!(value.to_bits(), 0x4056_9935_e3af_9c87);
+    }
 
     #[test]
     fn test_chop_into_matches_api() -> Result<(), Box<dyn Error>> {
@@ -1460,13 +1458,8 @@ mod tests {
         let baseline = chop(&input)?.values;
 
         let mut out = vec![0.0; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             chop_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            chop_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1487,8 +1480,8 @@ mod tests {
     }
     fn check_chop_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = ChopParams {
             period: Some(30),
             scalar: None,
@@ -1508,8 +1501,8 @@ mod tests {
             46.19823574588033,
             56.22876423352909,
         ];
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = ChopInput::with_default_candles(&candles);
         let result = chop_with_kernel(&input, kernel)?;
         let start_idx = result.values.len() - 5;
@@ -1529,8 +1522,8 @@ mod tests {
     }
     fn check_chop_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = ChopInput::with_default_candles(&candles);
         match input.data {
             ChopData::Candles(_) => {}
@@ -1542,8 +1535,8 @@ mod tests {
     }
     fn check_chop_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = ChopParams {
             period: Some(0),
             ..Default::default()
@@ -1562,8 +1555,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = ChopParams {
             period: Some(999999),
             ..Default::default()
@@ -1579,8 +1572,8 @@ mod tests {
     }
     fn check_chop_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = ChopInput::with_default_candles(&candles);
         let result = chop_with_kernel(&input, kernel)?;
         let check_index = 240;
@@ -1596,8 +1589,8 @@ mod tests {
     }
     fn check_chop_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 14;
         let scalar = 100.0;
         let drift = 1;
@@ -1646,8 +1639,8 @@ mod tests {
     fn check_chop_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = ChopInput::with_default_candles(&candles);
         let output = chop_with_kernel(&input, kernel)?;
@@ -1712,23 +1705,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with params {:?}",
-						test_name, val, bits, i, input.params
-					);
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with params {:?}",
+                        test_name, val, bits, i, input.params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with params {:?}",
-						test_name, val, bits, i, input.params
-					);
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with params {:?}",
+                        test_name, val, bits, i, input.params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with params {:?}",
-						test_name, val, bits, i, input.params
-					);
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with params {:?}",
+                        test_name, val, bits, i, input.params
+                    );
                 }
             }
         }
@@ -2138,8 +2131,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let high = c.high.as_slice();
         let low = c.low.as_slice();
@@ -2172,8 +2165,8 @@ mod tests {
 
     fn check_batch_param_row_lookup(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let high = c.high.as_slice();
         let low = c.low.as_slice();
         let close = c.close.as_slice();
@@ -2207,8 +2200,8 @@ mod tests {
 
     fn check_batch_huge_period(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let high = c.high.as_slice();
         let low = c.low.as_slice();
         let close = c.close.as_slice();
@@ -2225,8 +2218,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let high = c.high.as_slice();
         let low = c.low.as_slice();
@@ -2250,23 +2243,23 @@ mod tests {
 
             if bits == 0x11111111_11111111 {
                 panic!(
-					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
-					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
-					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
         }
 
@@ -2418,485 +2411,4 @@ fn chop_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "chop")]
-#[pyo3(signature = (high, low, close, period, scalar, drift, kernel=None))]
-pub fn chop_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    scalar: f64,
-    drift: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::PyArrayMethods;
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = ChopInput::from_slices(
-        h,
-        l,
-        c,
-        ChopParams {
-            period: Some(period),
-            scalar: Some(scalar),
-            drift: Some(drift),
-        },
-    );
-    let vec_out: Vec<f64> = py
-        .allow_threads(|| chop_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(vec_out.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ChopStream")]
-pub struct ChopStreamPy {
-    stream: ChopStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ChopStreamPy {
-    #[new]
-    fn new(period: usize, scalar: f64, drift: usize) -> PyResult<Self> {
-        let s = ChopStream::try_new(ChopParams {
-            period: Some(period),
-            scalar: Some(scalar),
-            drift: Some(drift),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream: s })
-    }
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "chop_batch")]
-#[pyo3(signature = (high, low, close, period_range, scalar_range, drift_range, kernel=None))]
-pub fn chop_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    scalar_range: (f64, f64, f64),
-    drift_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let sweep = ChopBatchRange {
-        period: period_range,
-        scalar: scalar_range,
-        drift: drift_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = c.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    let _ = py
-        .allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            let simd = match k {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => k,
-            };
-            chop_batch_inner_into(h, l, c, &sweep, simd, true, out_slice)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "scalars",
-        combos
-            .iter()
-            .map(|p| p.scalar.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "drifts",
-        combos
-            .iter()
-            .map(|p| p.drift.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "chop_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, period_range, scalar_range, drift_range, device_id=0))]
-pub fn chop_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    scalar_range: (f64, f64, f64),
-    drift_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<ChopDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = ChopBatchRange {
-        period: period_range,
-        scalar: scalar_range,
-        drift: drift_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaChop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (arr, _combos) = cuda
-            .chop_batch_dev(h, l, c, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>(arr)
-    })?;
-    Ok(ChopDeviceArrayF32Py { inner: Some(inner) })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "chop_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, period, scalar=100.0, drift=1, device_id=0))]
-pub fn chop_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    scalar: f64,
-    drift: usize,
-    device_id: usize,
-) -> PyResult<ChopDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let params = ChopParams {
-        period: Some(period),
-        scalar: Some(scalar),
-        drift: Some(drift),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaChop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.chop_many_series_one_param_time_major_dev(h, l, c, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(ChopDeviceArrayF32Py { inner: Some(inner) })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct ChopDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32Chop>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl ChopDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        let row_stride = inner
-            .cols
-            .checked_mul(itemsize)
-            .ok_or_else(|| PyValueError::new_err("byte stride overflow"))?;
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (row_stride, itemsize))?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        Ok((2, inner.device_id as i32))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyBufferError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err(
-                            "dl_device mismatch for chop CUDA buffer",
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        if let Some(copy_obj) = copy.as_ref() {
-            let do_copy: bool = copy_obj.extract(py).unwrap_or(false);
-            if do_copy {
-                return Err(PyBufferError::new_err(
-                    "__dlpack__(copy=True) not supported for chop CUDA buffers",
-                ));
-            }
-        }
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chop_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    scalar: f64,
-    drift: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let input = ChopInput::from_slices(
-        high,
-        low,
-        close,
-        ChopParams {
-            period: Some(period),
-            scalar: Some(scalar),
-            drift: Some(drift),
-        },
-    );
-    let mut out = vec![0.0; close.len()];
-    chop_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chop_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chop_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chop_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    scalar: f64,
-    drift: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer to chop_into"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        let input = ChopInput::from_slices(
-            h,
-            l,
-            c,
-            ChopParams {
-                period: Some(period),
-                scalar: Some(scalar),
-                drift: Some(drift),
-            },
-        );
-        chop_into_slice(out, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ChopBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub scalar_range: (f64, f64, f64),
-    pub drift_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ChopBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<ChopParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = chop_batch)]
-pub fn chop_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: ChopBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = ChopBatchRange {
-        period: cfg.period_range,
-        scalar: cfg.scalar_range,
-        drift: cfg.drift_range,
-    };
-    let rows = expand_grid(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let mut values = vec![0.0f64; total];
-
-    let combos = chop_batch_inner_into(
-        high,
-        low,
-        close,
-        &sweep,
-        detect_best_kernel(),
-        false,
-        &mut values,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = ChopBatchJsOutput {
-        values,
-        combos,
-        rows,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chop_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    scalar_start: f64,
-    scalar_end: f64,
-    scalar_step: f64,
-    drift_start: usize,
-    drift_end: usize,
-    drift_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer to chop_batch_into"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let sweep = ChopBatchRange {
-            period: (period_start, period_end, period_step),
-            scalar: (scalar_start, scalar_end, scalar_step),
-            drift: (drift_start, drift_end, drift_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        chop_batch_inner_into(h, l, c, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
 }

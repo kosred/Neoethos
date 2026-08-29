@@ -3800,35 +3800,6 @@ extern "C" __global__ void pattern_row_cdltristar_u8_kernel(
     }
 }
 
-extern "C" __global__ void pattern_pack_u8_to_u64_kernel(
-    const uint8_t* __restrict__ matrix,
-    int rows,
-    int cols,
-    int words_per_row,
-    unsigned long long* __restrict__ out_words)
-{
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = blockDim.x * gridDim.x;
-    const int total_words = rows * words_per_row;
-
-    for (int idx = tid; idx < total_words; idx += stride) {
-        const int row = idx / words_per_row;
-        const int word = idx - row * words_per_row;
-        const int col0 = word * 64;
-
-        unsigned long long bits = 0ull;
-        #pragma unroll
-        for (int bit = 0; bit < 64; ++bit) {
-            const int col = col0 + bit;
-            if (col < cols) {
-                const uint8_t v = matrix[row * cols + col];
-                bits |= (static_cast<unsigned long long>(v != 0u) << bit);
-            }
-        }
-        out_words[idx] = bits;
-    }
-}
-
 extern "C" __global__ void pattern_u8_to_f32_kernel(
     const uint8_t* __restrict__ matrix_u8,
     float* __restrict__ matrix_f32,

@@ -1,12 +1,5 @@
 // ema_deviation_corrected_t3 — CUDA f64 kernel.
 //
-// WHAT THIS REPLACES
-// ------------------
-// NOTHING. No `.cu`, no wrapper, no `F64_KERNELS` row: the lane answered
-// `CudaF64KernelMissing`. (`tilson_kernel.cu` carries a T3, but a DIFFERENT
-// one — plain T3 with no deviation correction — and it is registered under the
-// id `tilson`. It is the in-repo precedent for the shape, not for the maths.)
-//
 // CPU REFERENCE — src/indicators/moving_averages/ema_deviation_corrected_t3.rs
 // -----------------------------------------------------------------------------
 //   :267 alpha_t3                    :276 correction_variance_scale
@@ -15,19 +8,13 @@
 //                                          the brief names)
 //   :353 compute_into_slices         — the loop this kernel reproduces
 //
-// WHICH OUTPUT
-// ------------
-// Two outputs. registry.rs:537 settles which one this lane emits: "Primary
-// output is the corrected line; secondary output is the raw T3 line." This
-// kernel writes `corrected` (:420). The `t3` column is not emitted, for the
-// same reason the multi-output indicators in this table emit one column: the
-// lane's contract is one row per period.
-//
-// THE PARAMETERS THAT ARE NOT IN THE LANE ABI
-// -------------------------------------------
-// `hot` and `t3_mode` are not periods, so the sweep cannot carry them. The CPU
-// defaults are DEFAULT_HOT = 0.7 (:31) and DEFAULT_T3_MODE = 0 (:32), and with
-// mode 0 `alpha_t3` (:269) is `2 / (2 + (period - 1) / 2)`. `period` is swept.
+// OUTPUT / ABI AUTHORITY
+// ----------------------
+// `ema_deviation_corrected_t3_row_f64` is the single complete arithmetic
+// authority. The preserved primary ABI selects canonical hot=0.7/mode=0 and
+// emits corrected; the production pair ABI carries exact period/hot/mode rows
+// and emits canonical [corrected,t3] in one launch. Neither wrapper recomputes
+// a price-dependent value or delegates to the other ABI.
 //
 // SHAPE — ONE THREAD PER COLUMN, BARS ASCENDING
 // ---------------------------------------------
@@ -68,63 +55,55 @@ __device__ __forceinline__ double edct3_qnan() {
     return __longlong_as_double(0x7ff8000000000000ULL);
 }
 
-extern "C" __global__ void ema_deviation_corrected_t3_neo_batch_f64(
+__device__ __forceinline__ void ema_deviation_corrected_t3_row_f64(
     const double* __restrict__ data,
     int n,
-    const int* __restrict__ periods,
-    int n_combos,
-    int first_valid,
-    double* __restrict__ out)
+    int period_i,
+    double hot,
+    int t3_mode,
+    double* __restrict__ corrected_row,
+    double* __restrict__ t3_row)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= n_combos) return;
-
-    double* __restrict__ row = out + (size_t)r * (size_t)n;
-    const int period_i = periods[r];
-
-    // prepare_input (:292): EmptyInputData, then AllValuesNaN when NO value is
-    // finite (:298 — `all(|v| !v.is_finite())`, so an all-infinite series is
-    // rejected too), then validate_params_for_len (:310): period == 0 or
-    // period > len. `hot` is the finite default and mode 0 is valid, so
-    // neither of those two branches can fire here.
-    if (n <= 0 || period_i <= 0 || period_i > n) {
-        for (int i = 0; i < n; ++i) row[i] = edct3_qnan();
+    // prepare_input (:292): EmptyInputData, AllValuesNaN when no value is
+    // finite, then the exact period/hot/mode validation.
+    if (n <= 0 || period_i <= 0 || period_i > n || !isfinite(hot) ||
+        (t3_mode != 0 && t3_mode != 1)) {
+        for (int i = 0; i < n; ++i) {
+            if (corrected_row != nullptr) corrected_row[i] = edct3_qnan();
+            if (t3_row != nullptr) t3_row[i] = edct3_qnan();
+        }
         return;
     }
-    {
-        bool any_finite = false;
+    bool any_finite = false;
+    for (int i = 0; i < n; ++i) {
+        if (isfinite(data[i])) {
+            any_finite = true;
+            break;
+        }
+    }
+    if (!any_finite) {
         for (int i = 0; i < n; ++i) {
-            if (isfinite(data[i])) { any_finite = true; break; }
+            if (corrected_row != nullptr) corrected_row[i] = edct3_qnan();
+            if (t3_row != nullptr) t3_row[i] = edct3_qnan();
         }
-        if (!any_finite) {
-            for (int i = 0; i < n; ++i) row[i] = edct3_qnan();
-            return;
-        }
+        return;
     }
 
     const double period = (double)period_i;
-
-    // alpha_t3 (:269), mode 0.
-    const double alpha_t3 = 2.0 / (2.0 + (period - 1.0) / 2.0);
+    const double alpha_t3 = (t3_mode == 0)
+        ? (2.0 / (2.0 + (period - 1.0) / 2.0))
+        : (2.0 / (1.0 + period));
     const double alpha_ema = 2.0 / (1.0 + period);
-
-    // correction_variance_scale (:276): `period / period.saturating_sub(1).max(1)`.
     const int denom_i = (period_i >= 2) ? (period_i - 1) : 1;
     const double variance_scale = period / (double)denom_i;
 
-    // compute_coefficients (:281). Written term for term, in the CPU's order.
-    const double hot = EDCT3_DEFAULT_HOT;
+    // compute_coefficients (:281), term for term in scalar CPU order.
     const double hot2 = hot * hot;
     const double hot3 = hot2 * hot;
     const double c1 = -hot3;
     const double c2 = 3.0 * hot2 + 3.0 * hot3;
     const double c3 = -6.0 * hot2 - 3.0 * hot - 3.0 * hot3;
     const double c4 = 1.0 + 3.0 * hot + hot3 + 3.0 * hot2;
-
-    // The CPU loop starts at index 0 and resets on every non-finite bar
-    // (:373); there is no warmup prefix hanging off a first-valid index, which
-    // is why the row is registered F64FirstValidRule::Ignored.
-    (void)first_valid;
 
     double t0 = 0.0, t1 = 0.0, t2 = 0.0, t3s = 0.0, t4 = 0.0, t5 = 0.0;
     double ema0 = 0.0, ema1 = 0.0, corr = 0.0;
@@ -136,7 +115,8 @@ extern "C" __global__ void ema_deviation_corrected_t3_neo_batch_f64(
             t0 = 0.0; t1 = 0.0; t2 = 0.0; t3s = 0.0; t4 = 0.0; t5 = 0.0;
             ema0 = 0.0; ema1 = 0.0; corr = 0.0;
             seeded_ema = false;
-            row[i] = edct3_qnan();
+            if (corrected_row != nullptr) corrected_row[i] = edct3_qnan();
+            if (t3_row != nullptr) t3_row[i] = edct3_qnan();
             continue;
         }
 
@@ -148,7 +128,6 @@ extern "C" __global__ void ema_deviation_corrected_t3_neo_batch_f64(
         t5 += alpha_t3 * (t4 - t5);
 
         const double t3_value = c1 * t5 + c2 * t4 + c3 * t3s + c4 * t2;
-
         const double price_sq = value * value;
         if (seeded_ema) {
             ema0 += alpha_ema * (value - ema0);
@@ -159,12 +138,54 @@ extern "C" __global__ void ema_deviation_corrected_t3_neo_batch_f64(
             seeded_ema = true;
         }
 
-        // :405 — `f64::max`, so `fmax`; see the header.
         const double variance_sq = fmax(ema1 - ema0 * ema0, 0.0) * variance_scale;
         const double v2 = (corr - t3_value) * (corr - t3_value);
-        const double c = (v2 < variance_sq || v2 == 0.0) ? 0.0 : (1.0 - variance_sq / v2);
+        const double c = (v2 < variance_sq || v2 == 0.0)
+            ? 0.0
+            : (1.0 - variance_sq / v2);
         corr += c * (t3_value - corr);
 
-        row[i] = corr;
+        if (corrected_row != nullptr) corrected_row[i] = corr;
+        if (t3_row != nullptr) t3_row[i] = t3_value;
     }
+}
+
+extern "C" __global__ void ema_deviation_corrected_t3_outputs_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    const double* __restrict__ hots,
+    const int* __restrict__ t3_modes,
+    int n_combos,
+    double* __restrict__ corrected_out,
+    double* __restrict__ t3_out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    double* __restrict__ corrected_row = corrected_out + (size_t)r * (size_t)n;
+    double* __restrict__ t3_row = t3_out + (size_t)r * (size_t)n;
+    ema_deviation_corrected_t3_row_f64(
+        data, n, periods[r], hots[r], t3_modes[r], corrected_row, t3_row);
+}
+
+extern "C" __global__ void ema_deviation_corrected_t3_neo_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    (void)first_valid;
+    double* __restrict__ corrected_row = out + (size_t)r * (size_t)n;
+    ema_deviation_corrected_t3_row_f64(
+        data,
+        n,
+        periods[r],
+        EDCT3_DEFAULT_HOT,
+        EDCT3_DEFAULT_T3_MODE,
+        corrected_row,
+        nullptr);
 }

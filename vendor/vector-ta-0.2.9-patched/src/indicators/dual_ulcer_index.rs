@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -58,10 +42,6 @@ pub enum DualUlcerIndexOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DualUlcerIndexParams {
     pub period: Option<usize>,
     pub auto_threshold: Option<bool>,
@@ -226,9 +206,7 @@ pub enum DualUlcerIndexError {
     },
     #[error("dual_ulcer_index: Invalid kernel for batch: {0:?}")]
     InvalidKernelForBatch(Kernel),
-    #[error(
-        "dual_ulcer_index: Output length mismatch: dst = {dst_len}, expected = {expected_len}"
-    )]
+    #[error("dual_ulcer_index: Output length mismatch: dst = {dst_len}, expected = {expected_len}")]
     MismatchedOutputLen { dst_len: usize, expected_len: usize },
     #[error("dual_ulcer_index: Invalid input: {msg}")]
     InvalidInput { msg: String },
@@ -795,7 +773,6 @@ pub fn dual_ulcer_index_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn dual_ulcer_index_into(
     input: &DualUlcerIndexInput,
@@ -813,10 +790,6 @@ pub fn dual_ulcer_index_into(
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DualUlcerIndexBatchRange {
     pub period: (usize, usize, usize),
     pub threshold: (f64, f64, f64),
@@ -1334,402 +1307,11 @@ pub fn expand_grid_dual_ulcer_index(range: &DualUlcerIndexBatchRange) -> Vec<Dua
     expand_grid_checked(range).unwrap_or_default()
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "dual_ulcer_index")]
-#[pyo3(signature = (data, period=5, auto_threshold=true, threshold=0.1, kernel=None))]
-pub fn dual_ulcer_index_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    auto_threshold: bool,
-    threshold: f64,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-)> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = DualUlcerIndexInput::from_slice(
-        slice_in,
-        DualUlcerIndexParams {
-            period: Some(period),
-            auto_threshold: Some(auto_threshold),
-            threshold: Some(threshold),
-        },
-    );
-    let out = py
-        .allow_threads(|| dual_ulcer_index_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.long_ulcer.into_pyarray(py),
-        out.short_ulcer.into_pyarray(py),
-        out.threshold.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DualUlcerIndexStream")]
-pub struct DualUlcerIndexStreamPy {
-    stream: DualUlcerIndexStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DualUlcerIndexStreamPy {
-    #[new]
-    #[pyo3(signature = (period=5, auto_threshold=true, threshold=0.1))]
-    fn new(period: usize, auto_threshold: bool, threshold: f64) -> PyResult<Self> {
-        let stream = DualUlcerIndexStream::try_new(DualUlcerIndexParams {
-            period: Some(period),
-            auto_threshold: Some(auto_threshold),
-            threshold: Some(threshold),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, close: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dual_ulcer_index_batch")]
-#[pyo3(signature = (data, period_range=(5,5,0), threshold_range=(0.1,0.1,0.0), auto_threshold=true, kernel=None))]
-pub fn dual_ulcer_index_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    threshold_range: (f64, f64, f64),
-    auto_threshold: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = DualUlcerIndexBatchRange {
-        period: period_range,
-        threshold: threshold_range,
-        auto_threshold,
-    };
-
-    let output = py
-        .allow_threads(|| dual_ulcer_index_batch_with_kernel(slice_in, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = output.rows;
-    let cols = output.cols;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "long_ulcer",
-        output.long_ulcer.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "short_ulcer",
-        output.short_ulcer.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "threshold",
-        output.threshold.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "periods",
-        output
-            .combos
-            .iter()
-            .map(|params| params.period.unwrap_or(5) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "threshold_values",
-        output
-            .combos
-            .iter()
-            .map(|params| params.threshold.unwrap_or(0.1))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "auto_threshold",
-        output
-            .combos
-            .iter()
-            .map(|params| params.auto_threshold.unwrap_or(true))
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_dual_ulcer_index_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(dual_ulcer_index_py, m)?)?;
-    m.add_function(wrap_pyfunction!(dual_ulcer_index_batch_py, m)?)?;
-    m.add_class::<DualUlcerIndexStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dual_ulcer_index_js)]
-pub fn dual_ulcer_index_js(
-    data: &[f64],
-    period: usize,
-    auto_threshold: bool,
-    threshold: f64,
-) -> Result<JsValue, JsValue> {
-    let input = DualUlcerIndexInput::from_slice(
-        data,
-        DualUlcerIndexParams {
-            period: Some(period),
-            auto_threshold: Some(auto_threshold),
-            threshold: Some(threshold),
-        },
-    );
-    let out = dual_ulcer_index_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("long_ulcer"),
-        &serde_wasm_bindgen::to_value(&out.long_ulcer).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("short_ulcer"),
-        &serde_wasm_bindgen::to_value(&out.short_ulcer).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("threshold"),
-        &serde_wasm_bindgen::to_value(&out.threshold).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DualUlcerIndexBatchConfig {
-    pub period_range: Vec<usize>,
-    pub threshold_range: Vec<f64>,
-    pub auto_threshold: bool,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dual_ulcer_index_batch_js)]
-pub fn dual_ulcer_index_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: DualUlcerIndexBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-
-    if config.period_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: period_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    if config.threshold_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: threshold_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = DualUlcerIndexBatchRange {
-        period: (
-            config.period_range[0],
-            config.period_range[1],
-            config.period_range[2],
-        ),
-        threshold: (
-            config.threshold_range[0],
-            config.threshold_range[1],
-            config.threshold_range[2],
-        ),
-        auto_threshold: config.auto_threshold,
-    };
-
-    let out = dual_ulcer_index_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("long_ulcer"),
-        &serde_wasm_bindgen::to_value(&out.long_ulcer).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("short_ulcer"),
-        &serde_wasm_bindgen::to_value(&out.short_ulcer).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("threshold"),
-        &serde_wasm_bindgen::to_value(&out.threshold).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dual_ulcer_index_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(3 * len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dual_ulcer_index_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, 3 * len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dual_ulcer_index_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    auto_threshold: bool,
-    threshold: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to dual_ulcer_index_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 3 * len);
-        let (dst_long_ulcer, rem) = out.split_at_mut(len);
-        let (dst_short_ulcer, dst_threshold) = rem.split_at_mut(len);
-        let input = DualUlcerIndexInput::from_slice(
-            data,
-            DualUlcerIndexParams {
-                period: Some(period),
-                auto_threshold: Some(auto_threshold),
-                threshold: Some(threshold),
-            },
-        );
-        dual_ulcer_index_into_slice(
-            dst_long_ulcer,
-            dst_short_ulcer,
-            dst_threshold,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dual_ulcer_index_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    threshold_start: f64,
-    threshold_end: f64,
-    threshold_step: f64,
-    auto_threshold: bool,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to dual_ulcer_index_batch_into",
-        ));
-    }
-
-    let sweep = DualUlcerIndexBatchRange {
-        period: (period_start, period_end, period_step),
-        threshold: (threshold_start, threshold_end, threshold_step),
-        auto_threshold,
-    };
-    let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .and_then(|v| v.checked_mul(3))
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow in dual_ulcer_index_batch_into"))?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let split = rows * len;
-        let (dst_long_ulcer, rem) = out.split_at_mut(split);
-        let (dst_short_ulcer, dst_threshold) = rem.split_at_mut(split);
-        dual_ulcer_index_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Auto,
-            false,
-            dst_long_ulcer,
-            dst_short_ulcer,
-            dst_threshold,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dual_ulcer_index_output_into_js(
-    data: &[f64],
-    period: usize,
-    auto_threshold: bool,
-    threshold: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dual_ulcer_index_js(data, period, auto_threshold, threshold)?;
-    crate::write_wasm_object_f64_outputs("dual_ulcer_index_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dual_ulcer_index_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dual_ulcer_index_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "dual_ulcer_index_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu, IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue,
+        IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue, compute_cpu,
     };
 
     fn sample_close(len: usize) -> Vec<f64> {

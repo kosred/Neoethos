@@ -1,9 +1,9 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::device_types::{
-    ensure_same_device, CudaDeviceCloseVolumeRef, CudaDeviceHighLowRef, CudaDeviceMatrixF32,
-    CudaDeviceOhlc, CudaDeviceOhlcv, CudaDeviceVectorF32, CudaDeviceVectorI32, CudaDeviceVectorI64,
-    CudaDeviceViewError,
+    CudaDeviceCloseVolumeRef, CudaDeviceHighLowRef, CudaDeviceMatrixF32, CudaDeviceOhlc,
+    CudaDeviceOhlcv, CudaDeviceVectorF32, CudaDeviceVectorI32, CudaDeviceVectorI64,
+    CudaDeviceViewError, ensure_same_device,
 };
 use super::device_types_f64::{CudaDeviceMatrixF64, CudaDeviceOhlcvF64, CudaDeviceVectorF64};
 use cust::context::Context;
@@ -28,6 +28,19 @@ pub struct CudaSession {
     context: Arc<Context>,
     stream: Arc<Stream>,
     device_id: u32,
+}
+
+/// Stable-for-the-process identity of one borrowed CUDA execution session.
+///
+/// Device ordinal alone is not a residency contract: a producer and consumer
+/// must use the exact same primary context and stream before a raw resident
+/// allocation may cross their boundary without an extra synchronization or
+/// copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaSessionIdentity {
+    pub device_id: u32,
+    pub context: u64,
+    pub stream: u64,
 }
 
 impl std::fmt::Debug for CudaSession {
@@ -80,6 +93,15 @@ impl CudaSession {
         self.device_id
     }
 
+    #[inline]
+    pub fn identity(&self) -> CudaSessionIdentity {
+        CudaSessionIdentity {
+            device_id: self.device_id,
+            context: self.context.as_raw() as usize as u64,
+            stream: self.stream.as_inner() as usize as u64,
+        }
+    }
+
     pub fn synchronize(&self) -> Result<(), CudaRuntimeError> {
         self.stream.synchronize()?;
         Ok(())
@@ -130,6 +152,11 @@ impl CudaRuntime {
     #[inline]
     pub fn session_arc(&self) -> Arc<CudaSession> {
         self.session.clone()
+    }
+
+    #[inline]
+    pub fn session_identity(&self) -> CudaSessionIdentity {
+        self.session.identity()
     }
 
     pub fn synchronize(&self) -> Result<(), CudaRuntimeError> {
@@ -350,8 +377,8 @@ impl CudaRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cuda::moving_averages::ma_selector::{CudaMaDeviceDataRef, CudaMaSelector};
     use crate::cuda::moving_averages::CudaOtt;
+    use crate::cuda::moving_averages::ma_selector::{CudaMaDeviceDataRef, CudaMaSelector};
     use crate::indicators::ott::OttBatchRange;
 
     #[test]

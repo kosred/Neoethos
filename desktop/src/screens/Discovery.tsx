@@ -1,8 +1,27 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { enginesStatus, settings, updateSettings, dataImport, pickDataFile, dataCoverage, riskInfo, type SymbolCoverage } from "../api";
+import {
+  dataBootstrap,
+  dataImport,
+  enginesStatus,
+  pickDataFile,
+  riskInfo,
+  settings,
+  updateSettings,
+} from "../api";
 import { usePoll } from "../hooks";
-import { useSymbolOptions, useTimeframeOptions, TimeframeSelect } from "../components/Select";
+import { TimeframeSelect } from "../components/Select";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
+import {
+  dataImportIdentityKey,
+  dataOperationErrorText,
+  expectedGenerationFor,
+  recordDatasetGeneration,
+  type CanonicalDatasetIdentity,
+  type DataImportBody,
+  type DataImportSourceFormat,
+  type DatasetInventoryEntry,
+  type DatasetGenerationReceipts,
+} from "../apiContracts";
 import {
   subscribe,
   getSnapshot,
@@ -14,11 +33,12 @@ import {
   labelFor,
   type QItem,
 } from "../discoveryQueue";
+import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
 
 // Fast-first TF order so the cheap, high-yield timeframes run before the
 // dense ones (M5/M3 take hours) — you get strategies quickly and the slow
 // units land last. Lower index = runs earlier.
-const TF_SPEED = ["MN1", "W1", "D1", "H12", "H4", "H1", "M30", "M15", "M5", "M3", "M1"];
+const TF_SPEED: string[] = [...CANONICAL_BROKER_TIMEFRAMES].reverse();
 const tfRank = (t: string) => {
   const i = TF_SPEED.indexOf(t);
   return i < 0 ? 99 : i;
@@ -32,41 +52,17 @@ const statusIcon: Record<QItem["status"], string> = {
   failed: "✗",
 };
 
-function Chips({
-  opts,
-  sel,
-  onToggle,
-}: {
-  opts: string[];
-  sel: string[];
-  onToggle: (v: string) => void;
-}) {
-  return (
-    <div className="chip-row">
-      {opts.map((o) => (
-        <button
-          key={o}
-          type="button"
-          className={`chip ${sel.includes(o) ? "on" : ""}`}
-          onClick={() => onToggle(o)}
-        >
-          {o}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 export default function Discovery() {
   const { data: st, error } = usePoll(enginesStatus, 2000);
   const { data: cfg, reload: reloadCfg } = usePoll(settings, 0);
+  const {
+    data: inventory,
+    error: inventoryError,
+    reload: reloadInventory,
+  } = usePoll(dataBootstrap, 5_000);
   const q = useSyncExternalStore(subscribe, getSnapshot);
-  const symOpts = useSymbolOptions();
-  const tfOpts = useTimeframeOptions();
-
-  const [selSyms, setSelSyms] = useState<string[]>([]);
-  const [selTfs, setSelTfs] = useState<string[]>([]);
-  const [cov, setCov] = useState<SymbolCoverage[]>([]);
+  const [selectedDatasetIds, setSelectedDatasetIds] =
+    useState<CanonicalDatasetIdentity[]>([]);
   const [riskPct, setRiskPct] = useState<number | null>(null);
   const [adv, setAdv] = useState(false);
   const [population, setPopulation] = useState("");
@@ -77,10 +73,15 @@ export default function Discovery() {
 
   // Import data file (lives here because data is only for search + training).
   const [impSrc, setImpSrc] = useState("");
+  const [impFormat, setImpFormat] = useState<DataImportSourceFormat>("csv");
+  const [impNamespace, setImpNamespace] = useState("operator-upload");
   const [impSym, setImpSym] = useState("EURUSD");
   const [impTf, setImpTf] = useState("H1");
+  const [impTimestampConvention, setImpTimestampConvention] =
+    useState<DataImportBody["barTimestampConvention"]>("bar_open");
   const [impMsg, setImpMsg] = useState("");
   const [impBusy, setImpBusy] = useState(false);
+  const [importReceipts, setImportReceipts] = useState<DatasetGenerationReceipts>({});
 
   const browse = async () => {
     try {
@@ -92,20 +93,43 @@ export default function Discovery() {
   };
   const doImport = async () => {
     if (!impSrc) { setImpMsg("Choose a file first (Browse…)."); return; }
+    if (!impNamespace.trim()) { setImpMsg("Source namespace must be non-empty."); return; }
+    const sourceNamespace = impNamespace.trim();
+    const symbol = impSym.trim();
+    const requestIdentity = dataImportIdentityKey(
+      sourceNamespace,
+      symbol,
+      impTf,
+      impTimestampConvention,
+    );
     setImpBusy(true);
     setImpMsg("Importing…");
     try {
-      const r: any = await dataImport(impSrc, impSym.toUpperCase(), impTf.toUpperCase());
-      setImpMsg(`✓ Imported → ${r?.writtenPath ?? r?.written_path ?? "done"}`);
+      const outcome = await dataImport(
+        impSrc,
+        impFormat,
+        sourceNamespace,
+        symbol,
+        impTf,
+        impTimestampConvention,
+        expectedGenerationFor(importReceipts, requestIdentity),
+      );
+      setImportReceipts((current) =>
+        recordDatasetGeneration(current, requestIdentity, outcome),
+      );
+      await reloadInventory();
+      setImpMsg(
+        `✓ Imported ${outcome.rowCount} rows as ${outcome.datasetIdentity} @ ${outcome.generation} → ${outcome.writtenPath}`,
+      );
     } catch (e) {
-      setImpMsg(`Import failed: ${e}`);
+      setImpMsg(`Import failed: ${dataOperationErrorText(e)}`);
     } finally {
       setImpBusy(false);
     }
   };
 
   const state = st?.discovery ?? "…";
-  const running = state.toLowerCase().startsWith("running");
+  const running = state === "Running";
   const stage = st?.discoveryStage ?? st?.discovery_stage ?? "";
   const percent = st?.discoveryPercent ?? st?.discovery_percent ?? 0;
   const summary = st?.discoverySummary ?? st?.discovery_summary ?? "";
@@ -119,23 +143,15 @@ export default function Discovery() {
 
   // Drive the queue forward on every poll tick.
   useEffect(() => {
-    if (st) void drive(running, summary);
+    if (st) void drive(st.discovery, summary);
   }, [st]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Pre-flight: risk % + per-pair data coverage (years/bars) so the operator
-  // sees EXACTLY what's about to run before starting.
-  const probeTf = selTfs.length ? [...selTfs].sort((a, b) => tfRank(a) - tfRank(b))[0] : "H1";
+  // Pre-flight risk visibility is independent from the exact data selector.
   useEffect(() => {
     let live = true;
     riskInfo().then((r) => { if (live) setRiskPct(r.riskPerTrade); }).catch(() => {});
     return () => { live = false; };
   }, []);
-  useEffect(() => {
-    if (selSyms.length === 0) { setCov([]); return; }
-    let live = true;
-    dataCoverage(selSyms, probeTf).then((c) => { if (live) setCov(c); }).catch(() => {});
-    return () => { live = false; };
-  }, [selSyms, probeTf]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const applyMode = async (m: "risky" | "prop_firm") => {
     try {
@@ -153,29 +169,44 @@ export default function Discovery() {
     } catch { /* ignore */ }
   };
 
-  const toggle =
-    (set: React.Dispatch<React.SetStateAction<string[]>>) => (v: string) =>
-      set((cur) => (cur.includes(v) ? cur.filter((x) => x !== v) : [...cur, v]));
+  const inventoryEntries = inventory ? inventory.datasets : [];
+  const selectedDatasets = inventoryEntries
+    .filter((entry) => selectedDatasetIds.includes(entry.datasetIdentity))
+    .slice()
+    .sort((left, right) => {
+      const symbolOrder = (left.symbol ?? "").localeCompare(right.symbol ?? "");
+      if (symbolOrder !== 0) return symbolOrder;
+      const timeframeOrder = tfRank(left.timeframe ?? "") - tfRank(right.timeframe ?? "");
+      return timeframeOrder || left.datasetIdentity.localeCompare(right.datasetIdentity);
+    });
+
+  const toggleDataset = (entry: DatasetInventoryEntry) => {
+    setSelectedDatasetIds((current) =>
+      current.includes(entry.datasetIdentity)
+        ? current.filter((identity) => identity !== entry.datasetIdentity)
+        : [...current, entry.datasetIdentity],
+    );
+  };
 
   const queued = q.items.length;
   const done = q.items.filter((i) => i.status === "done").length;
   const failed = q.items.filter((i) => i.status === "failed").length;
 
   const launch = () => {
-    const syms = selSyms.length ? selSyms : [""]; // "" → resolve from config
-    const tfs = (selTfs.length ? selTfs : [""])
-      .slice()
-      .sort((a, b) => tfRank(a) - tfRank(b));
-    // symbol-major: finish a pair's TFs before moving on.
-    const pairs = syms.flatMap((s) => tfs.map((t) => ({ symbol: s, tf: t })));
-    setQueue(pairs, {
+    if (selectedDatasets.length === 0) {
+      setMsg("Select at least one exact canonical dataset generation from Data.");
+      return;
+    }
+    setQueue(selectedDatasets, {
       population: num(population),
       generations: num(generations),
       target_candidates: num(targets),
       portfolio_size: num(portfolio),
     });
     startQueue();
-    setMsg(`Queued ${pairs.length} run${pairs.length === 1 ? "" : "s"}.`);
+    setMsg(
+      `Queued ${selectedDatasets.length} exact dataset run${selectedDatasets.length === 1 ? "" : "s"}.`,
+    );
   };
 
   const stop = async () => {
@@ -199,17 +230,16 @@ export default function Discovery() {
 
       <HelpPanel id="discovery">
         <p>
-          Discovery is the <b>strategy factory</b>. Pick one or more <b>symbols</b> and{" "}
-          <b>timeframes</b>, press <b>Start queue</b>, and it runs each combination in turn — breeding
-          and testing thousands of rules, keeping only the ones that survive out-of-sample validation.
+          Discovery is the <b>strategy factory</b>. Select one or more exact canonical datasets from
+          the authoritative Data inventory, press <b>Start queue</b>, and it runs each identity in turn.
         </p>
         <HelpStep n={1}>
-          Tick the symbols and timeframes you want (or leave both empty to use your config defaults).
-          Each symbol × timeframe becomes one queued run.
+          Select the exact <b>identity + current generation</b>. Symbol and timeframe labels are shown
+          only as consistency assertions; they never choose a file.
         </HelpStep>
         <HelpStep n={2}>
-          Timeframes run <b>fastest-first</b> (H1 in minutes, M3 can take ~hours on 11-year data), so
-          you get results early. Watch the live bar, stage and counters for whatever is running now.
+          Every timeframe must be downloaded from the broker or imported directly at that same
+          timeframe. Missing higher-timeframe data stops that run and reports the backend error.
         </HelpStep>
         <HelpStep n={3}>
           The <b>RAM / disk</b> strip shows what the run is consuming: cubes that fit in RAM use no
@@ -255,6 +285,7 @@ export default function Discovery() {
       </div>
       {summary && <div className="banner info">{summary}</div>}
       {error && <div className="banner warn">{error}</div>}
+      {inventoryError && <div className="banner warn">{inventoryError}</div>}
 
       {counters.length > 0 && (
         <div
@@ -284,7 +315,7 @@ export default function Discovery() {
             {q.items.map((it) => (
               <div className={`q-item q-${it.status}`} key={it.id}>
                 <span className="q-icon">{statusIcon[it.status]}</span>
-                <span className="q-name">{labelFor(it.symbol, it.tf)}</span>
+                <span className="q-name">{labelFor(it.symbol ?? "?", it.timeframe ?? "?", it.generation)}</span>
                 {it.status === "running" && (
                   <span className="q-prog">
                     <span className="q-bar">
@@ -306,23 +337,67 @@ export default function Discovery() {
       <h2>Build a queue</h2>
       <div className="ticket">
         <label className="picker-label">
-          Symbols <span className="muted">({selSyms.length || "config default"})</span>
+          Exact canonical datasets <span className="muted">({selectedDatasets.length} selected)</span>
           <div className="picker-actions">
-            <button type="button" className="link" onClick={() => setSelSyms(symOpts)}>all</button>
-            <button type="button" className="link" onClick={() => setSelSyms([])}>none</button>
+            <button
+              type="button"
+              className="link"
+              onClick={() => setSelectedDatasetIds(
+                inventoryEntries
+                  .filter((entry) => entry.symbol !== null && entry.timeframe !== null)
+                  .map((entry) => entry.datasetIdentity),
+              )}
+            >all</button>
+            <button type="button" className="link" onClick={() => setSelectedDatasetIds([])}>none</button>
           </div>
         </label>
-        <Chips opts={symOpts} sel={selSyms} onToggle={toggle(setSelSyms)} />
+        {inventoryEntries.length === 0 ? (
+          <div className="banner warn">
+            No canonical dataset generation is available. Download or import each exact timeframe in Data.
+          </div>
+        ) : (
+          <table className="tbl">
+            <thead>
+              <tr><th>Select</th><th>Symbol</th><th>TF</th><th>Current generation</th><th>Exact identity</th><th>Verification</th></tr>
+            </thead>
+            <tbody>
+              {inventoryEntries.map((entry) => {
+                const assertionMetadataMissing = entry.symbol === null || entry.timeframe === null;
+                return (
+                  <tr key={entry.datasetIdentity}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        checked={selectedDatasetIds.includes(entry.datasetIdentity)}
+                        disabled={assertionMetadataMissing}
+                        onChange={() => toggleDataset(entry)}
+                        aria-label={`Select exact dataset ${entry.datasetIdentity}`}
+                      />
+                    </td>
+                    <td>{entry.symbol ?? "missing"}</td>
+                    <td>{entry.timeframe ?? "missing"}</td>
+                    <td><code>{entry.generation}</code></td>
+                    <td><code style={{ overflowWrap: "anywhere" }}>{entry.datasetIdentity}</code></td>
+                    <td>{assertionMetadataMissing ? "missing assertion metadata" : entry.verification}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
 
-        <label className="picker-label" style={{ marginTop: 12 }}>
-          Timeframes <span className="muted">({selTfs.length ? "fastest-first" : "config default"})</span>
-          <div className="picker-actions">
-            <button type="button" className="link" onClick={() => setSelTfs(["H1", "M30", "M15", "M5"])}>productive</button>
-            <button type="button" className="link" onClick={() => setSelTfs(tfOpts)}>all</button>
-            <button type="button" className="link" onClick={() => setSelTfs([])}>none</button>
+        {(inventory?.skipped.length ?? 0) > 0 && (
+          <div className="banner warn">
+            <b>Import/download required or rejected data:</b>
+            <ul>
+              {inventory!.skipped.map((item) => (
+                <li key={`${item.path}:${item.category}:${item.detail}`}>
+                  <code>{item.path}</code> — {item.category}: {item.detail}
+                </li>
+              ))}
+            </ul>
           </div>
-        </label>
-        <Chips opts={tfOpts} sel={selTfs} onToggle={toggle(setSelTfs)} />
+        )}
 
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 12 }}>
           <input type="checkbox" checked={adv} onChange={(e) => setAdv(e.target.checked)} /> Advanced knobs
@@ -382,38 +457,33 @@ export default function Discovery() {
             />
           </label>
           <div className="muted small" style={{ paddingBottom: 6 }}>
-            {(selSyms.length || 1)} pair{(selSyms.length || 1) === 1 ? "" : "s"} × {(selTfs.length || 1)} TF ={" "}
-            <b>{(selSyms.length || 1) * (selTfs.length || 1)} run{(selSyms.length || 1) * (selTfs.length || 1) === 1 ? "" : "s"}</b>
-            {selSyms.length === 0 && <> · <span className="muted">pairs/TFs from config defaults</span></>}
+            <b>{selectedDatasets.length} exact run{selectedDatasets.length === 1 ? "" : "s"}</b>
             {cfg?.searchGenerations != null && (
               <> · <b>gen</b> {cfg.searchGenerations} · <b>pop</b> {cfg.searchPopulation} · <b>prefilter</b> {cfg.prefilterTopK}</>
             )}
           </div>
         </div>
-        {selSyms.length > 0 && (
+        {selectedDatasets.length > 0 && (
           <table className="tbl">
-            <thead><tr><th>Pair</th><th>Years of data</th><th>Bars ({probeTf})</th></tr></thead>
+            <thead><tr><th>Pair</th><th>TF</th><th>Current generation</th><th>Exact identity</th></tr></thead>
             <tbody>
-              {selSyms.map((s) => {
-                const c = cov.find((x) => x.symbol === s);
-                const yrs = c?.years ?? 0;
-                return (
-                  <tr key={s}>
-                    <td><b>{s}</b></td>
-                    <td className={c && yrs < 2 ? "sell" : ""}>
-                      {c ? `${yrs.toFixed(1)}y${yrs < 2 ? " ⚠ low" : ""}` : "…"}
-                    </td>
-                    <td>{c ? (c.bars > 0 ? c.bars.toLocaleString() : "⚠ no data") : "…"}</td>
+              {selectedDatasets.map((entry) => (
+                  <tr key={entry.datasetIdentity}>
+                    <td><b>{entry.symbol}</b></td>
+                    <td>{entry.timeframe}</td>
+                    <td><code>{entry.generation}</code></td>
+                    <td><code style={{ overflowWrap: "anywhere" }}>{entry.datasetIdentity}</code></td>
                   </tr>
-                );
-              })}
+              ))}
             </tbody>
           </table>
         )}
-        <p className="muted small">Years = local history span (same across TFs); bars shown for the fastest selected TF ({probeTf}). TFs run fastest-first.</p>
+        <p className="muted small">
+          The queue uses these exact opaque identities. Required higher timeframes are separate direct broker downloads/imports; missing ones fail visibly.
+        </p>
 
         <div className="btn-row">
-          <button className="primary" disabled={q.active} onClick={launch}>
+          <button className="primary" disabled={q.active || selectedDatasets.length === 0} onClick={launch}>
             {q.active ? "Queue running…" : "Start queue"}
           </button>
           <button className="danger" disabled={!q.active && !running} onClick={stop}>
@@ -429,15 +499,38 @@ export default function Discovery() {
       {/* ── Import data file (data is only for search + training) ── */}
       <h2>Import data file</h2>
       <div className="ticket">
-        <p className="muted small">Bring in a CSV / Parquet / TSV you already have — it's converted into the engine's format so you can search + train on it.</p>
+        <p className="muted small">Bring in CSV, TSV, JSON, Parquet, Arrow IPC, or Vortex data. Choose Format explicitly; the filename extension never changes it automatically. A successful import publishes a verified canonical Vortex generation; runtime never opens the source format.</p>
         <div className="ticket-row">
           <button onClick={browse} disabled={impBusy}>Browse…</button>
           <label style={{ flex: 1 }}>
             File
             <input value={impSrc} onChange={(e) => setImpSrc(e.target.value)} placeholder="(choose a file with Browse…)" style={{ width: "100%" }} />
           </label>
+          <label>
+            Format
+            <select value={impFormat} onChange={(e) => setImpFormat(e.target.value as DataImportSourceFormat)}>
+              <option value="csv">CSV</option>
+              <option value="tsv">TSV</option>
+              <option value="json-array">JSON array</option>
+              <option value="json-lines">JSON lines</option>
+              <option value="parquet">Parquet</option>
+              <option value="arrow-ipc-file">Arrow IPC file</option>
+              <option value="arrow-ipc-stream">Arrow IPC stream</option>
+              <option value="vortex">Vortex</option>
+            </select>
+          </label>
+          <label>Source namespace<input value={impNamespace} onChange={(e) => setImpNamespace(e.target.value)} style={{ width: 130 }} placeholder="operator-upload" /></label>
           <label>Symbol<input value={impSym} onChange={(e) => setImpSym(e.target.value)} style={{ width: 90 }} placeholder="EURUSD" /></label>
           <label>TF<TimeframeSelect value={impTf} onChange={setImpTf} style={{ width: 80 }} /></label>
+          <label>
+            Timestamp meaning
+            <select value={impTimestampConvention} onChange={(e) => setImpTimestampConvention(e.target.value as DataImportBody["barTimestampConvention"])}>
+              <option value="bar_open">Bar open</option>
+              <option value="bar_close">Bar close (rejected)</option>
+              <option value="bar_end">Bar end (rejected)</option>
+              <option value="unknown">Unknown (rejected)</option>
+            </select>
+          </label>
           <button className="primary" disabled={impBusy || !impSrc} onClick={doImport}>Import</button>
         </div>
         {impMsg && <div className="banner info">{impMsg}</div>}

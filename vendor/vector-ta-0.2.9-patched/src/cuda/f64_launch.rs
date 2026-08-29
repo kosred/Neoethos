@@ -24,7 +24,7 @@
 //! more passes; it does not run out of memory. That is the whole point of
 //! planning slots instead of allocating per row.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
@@ -120,9 +120,7 @@ pub fn plan_slots(
     }
 
     let (free, _total) = mem_get_info().unwrap_or((0, 0));
-    let budget = free
-        .saturating_sub(headroom)
-        .saturating_sub(fixed_bytes);
+    let budget = free.saturating_sub(headroom).saturating_sub(fixed_bytes);
 
     let affordable = budget / bytes_per_slot;
     if affordable == 0 {

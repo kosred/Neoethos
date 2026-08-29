@@ -28,6 +28,23 @@ extern "C" std::int32_t neoethos_gpu_cuda_runtime_available() {
   return cudaGetDeviceCount(&count) == cudaSuccess && count > 0 ? 1 : 0;
 }
 
+extern "C" std::int32_t neoethos_gpu_cuda_probe_device_count_v1(
+    std::uint32_t* out_count) {
+  if (out_count == nullptr) {
+    return NEO_CUDA_DEVICE_PROBE_INVALID_OUTPUT;
+  }
+  int count = 0;
+  const cudaError_t status = cudaGetDeviceCount(&count);
+  if (status != cudaSuccess) {
+    return static_cast<std::int32_t>(status);
+  }
+  if (count < 0) {
+    return NEO_CUDA_DEVICE_PROBE_INVALID_OUTPUT;
+  }
+  *out_count = static_cast<std::uint32_t>(count);
+  return NEO_CUDA_DEVICE_PROBE_OK;
+}
+
 extern "C" std::int32_t neoethos_gpu_cuda_smoke(const std::uint32_t* input,
                                                   std::uint32_t* output,
                                                   std::size_t len) {

@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -62,10 +44,6 @@ pub struct EhlersAutocorrelationPeriodogramOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersAutocorrelationPeriodogramParams {
     pub min_period: Option<usize>,
     pub max_period: Option<usize>,
@@ -235,16 +213,24 @@ pub enum EhlersAutocorrelationPeriodogramError {
     AllValuesNaN,
     #[error("ehlers_autocorrelation_periodogram: Invalid min_period: {min_period}")]
     InvalidMinPeriod { min_period: usize },
-    #[error("ehlers_autocorrelation_periodogram: Invalid max_period: max_period = {max_period}, data length = {data_len}")]
+    #[error(
+        "ehlers_autocorrelation_periodogram: Invalid max_period: max_period = {max_period}, data length = {data_len}"
+    )]
     InvalidMaxPeriod { max_period: usize, data_len: usize },
-    #[error("ehlers_autocorrelation_periodogram: Invalid period order: min_period = {min_period}, max_period = {max_period}")]
+    #[error(
+        "ehlers_autocorrelation_periodogram: Invalid period order: min_period = {min_period}, max_period = {max_period}"
+    )]
     InvalidPeriodOrder {
         min_period: usize,
         max_period: usize,
     },
-    #[error("ehlers_autocorrelation_periodogram: Not enough valid data: needed = {needed}, valid = {valid}")]
+    #[error(
+        "ehlers_autocorrelation_periodogram: Not enough valid data: needed = {needed}, valid = {valid}"
+    )]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("ehlers_autocorrelation_periodogram: Output length mismatch: expected = {expected}, dominant_cycle = {dominant_cycle_got}, normalized_power = {normalized_power_got}")]
+    #[error(
+        "ehlers_autocorrelation_periodogram: Output length mismatch: expected = {expected}, dominant_cycle = {dominant_cycle_got}, normalized_power = {normalized_power_got}"
+    )]
     OutputLengthMismatch {
         expected: usize,
         dominant_cycle_got: usize,
@@ -268,6 +254,87 @@ struct ResolvedParams {
     max_period: usize,
     avg_length: usize,
     enhance: bool,
+}
+
+/// Immutable parameter-only arithmetic prepared by the canonical CPU
+/// authority and uploaded by the NeoEthos resident CUDA route.
+///
+/// No price or output value enters this object.  Its exact f64 bits are the
+/// ones the scalar state machine already used for its filter coefficients and
+/// trigonometric lookup tables, so CUDA consumes the same platform results
+/// instead of independently calling libdevice transcendental functions.
+#[derive(Debug, Clone)]
+pub(crate) struct EhlersAutocorrelationPeriodogramExactCoefficients {
+    pub(crate) min_period: usize,
+    pub(crate) max_period: usize,
+    pub(crate) avg_length: usize,
+    pub(crate) enhance: bool,
+    pub(crate) hp_coef: f64,
+    pub(crate) hp_prev1_coef: f64,
+    pub(crate) hp_prev2_coef: f64,
+    pub(crate) filt_c1: f64,
+    pub(crate) filt_c2: f64,
+    pub(crate) filt_c3: f64,
+    pub(crate) decay: f64,
+    pub(crate) cos_table: Vec<f64>,
+    pub(crate) sin_table: Vec<f64>,
+    pub(crate) trig_stride: usize,
+}
+
+#[inline]
+fn build_exact_coefficients(
+    params: ResolvedParams,
+) -> EhlersAutocorrelationPeriodogramExactCoefficients {
+    let alpha_hp = highpass_alpha(params.max_period);
+    let one_minus = 1.0 - alpha_hp;
+    let a1 = (-SQRT_2 * PI / params.min_period as f64).exp();
+    let b1 = 2.0 * a1 * (SQRT_2 * PI / params.min_period as f64).cos();
+    let c2 = b1;
+    let c3 = -(a1 * a1);
+    let diff = (params.max_period - params.min_period) as f64;
+    let decay = if diff > 0.0 {
+        10.0_f64.powf(-0.15 / diff)
+    } else {
+        1.0
+    };
+    let trig_stride = params.max_period + 1;
+    let trig_len = trig_stride * trig_stride;
+    let mut cos_table = vec![0.0; trig_len];
+    let mut sin_table = vec![0.0; trig_len];
+    for period in params.min_period..=params.max_period {
+        let period_f = period as f64;
+        let base = period * trig_stride;
+        for n in 2..=params.max_period {
+            let angle = 2.0 * PI * n as f64 / period_f;
+            cos_table[base + n] = angle.cos();
+            sin_table[base + n] = angle.sin();
+        }
+    }
+    EhlersAutocorrelationPeriodogramExactCoefficients {
+        min_period: params.min_period,
+        max_period: params.max_period,
+        avg_length: params.avg_length,
+        enhance: params.enhance,
+        hp_coef: (1.0 - alpha_hp * 0.5).powi(2),
+        hp_prev1_coef: 2.0 * one_minus,
+        hp_prev2_coef: one_minus.powi(2),
+        filt_c1: 1.0 - c2 - c3,
+        filt_c2: c2,
+        filt_c3: c3,
+        decay,
+        cos_table,
+        sin_table,
+        trig_stride,
+    }
+}
+
+/// Resolve defaults and produce the exact immutable coefficient/table payload
+/// used by both the CPU state constructor and the resident CUDA launch.
+pub(crate) fn ehlers_autocorrelation_periodogram_exact_coefficients(
+    params: &EhlersAutocorrelationPeriodogramParams,
+) -> Result<EhlersAutocorrelationPeriodogramExactCoefficients, EhlersAutocorrelationPeriodogramError>
+{
+    Ok(build_exact_coefficients(resolve_params(params, 0)?))
 }
 
 #[derive(Debug, Clone)]
@@ -311,31 +378,7 @@ impl EhlersAutocorrelationPeriodogramStream {
     #[inline]
     fn new_resolved(params: ResolvedParams) -> Self {
         let size = params.max_period + 1;
-        let alpha_hp = highpass_alpha(params.max_period);
-        let one_minus = 1.0 - alpha_hp;
-        let a1 = (-SQRT_2 * PI / params.min_period as f64).exp();
-        let b1 = 2.0 * a1 * (SQRT_2 * PI / params.min_period as f64).cos();
-        let c2 = b1;
-        let c3 = -(a1 * a1);
-        let diff = (params.max_period - params.min_period) as f64;
-        let decay = if diff > 0.0 {
-            10.0_f64.powf(-0.15 / diff)
-        } else {
-            1.0
-        };
-        let trig_stride = params.max_period + 1;
-        let trig_len = trig_stride * trig_stride;
-        let mut cos_table = vec![0.0; trig_len];
-        let mut sin_table = vec![0.0; trig_len];
-        for period in params.min_period..=params.max_period {
-            let period_f = period as f64;
-            let base = period * trig_stride;
-            for n in 2..=params.max_period {
-                let angle = 2.0 * PI * n as f64 / period_f;
-                cos_table[base + n] = angle.cos();
-                sin_table[base + n] = angle.sin();
-            }
-        }
+        let exact = build_exact_coefficients(params);
         Self {
             params,
             prev_price_1: 0.0,
@@ -348,16 +391,16 @@ impl EhlersAutocorrelationPeriodogramStream {
             corr: vec![0.0; size],
             power: vec![0.0; size],
             smooth: vec![0.0; size],
-            cos_table,
-            sin_table,
-            trig_stride,
-            hp_coef: (1.0 - alpha_hp * 0.5).powi(2),
-            hp_prev1_coef: 2.0 * one_minus,
-            hp_prev2_coef: one_minus.powi(2),
-            filt_c1: 1.0 - c2 - c3,
-            filt_c2: c2,
-            filt_c3: c3,
-            decay,
+            cos_table: exact.cos_table,
+            sin_table: exact.sin_table,
+            trig_stride: exact.trig_stride,
+            hp_coef: exact.hp_coef,
+            hp_prev1_coef: exact.hp_prev1_coef,
+            hp_prev2_coef: exact.hp_prev2_coef,
+            filt_c1: exact.filt_c1,
+            filt_c2: exact.filt_c2,
+            filt_c3: exact.filt_c3,
+            decay: exact.decay,
             dom: (params.min_period + params.max_period) as f64 * 0.5,
             max_pwr: 0.0,
             e: 1.0,
@@ -717,7 +760,6 @@ pub fn ehlers_autocorrelation_periodogram_into_slices(
     )
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ehlers_autocorrelation_periodogram_into(
     input: &EhlersAutocorrelationPeriodogramInput,
@@ -1068,465 +1110,6 @@ pub fn ehlers_autocorrelation_periodogram_batch_inner_into(
     dominant_cycle_out.copy_from_slice(&out.dominant_cycle);
     normalized_power_out.copy_from_slice(&out.normalized_power);
     Ok(out.combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_autocorrelation_periodogram")]
-#[pyo3(signature = (data, min_period=None, max_period=None, avg_length=None, enhance=None, kernel=None))]
-pub fn ehlers_autocorrelation_periodogram_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    min_period: Option<usize>,
-    max_period: Option<usize>,
-    avg_length: Option<usize>,
-    enhance: Option<bool>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = EhlersAutocorrelationPeriodogramInput::from_slice(
-        data,
-        EhlersAutocorrelationPeriodogramParams {
-            min_period,
-            max_period,
-            avg_length,
-            enhance,
-        },
-    );
-    let out = py
-        .allow_threads(|| ehlers_autocorrelation_periodogram_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.dominant_cycle.into_pyarray(py),
-        out.normalized_power.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersAutocorrelationPeriodogramStream")]
-pub struct EhlersAutocorrelationPeriodogramStreamPy {
-    inner: EhlersAutocorrelationPeriodogramStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersAutocorrelationPeriodogramStreamPy {
-    #[new]
-    #[pyo3(signature = (min_period=DEFAULT_MIN_PERIOD, max_period=DEFAULT_MAX_PERIOD, avg_length=DEFAULT_AVG_LENGTH, enhance=DEFAULT_ENHANCE))]
-    fn new(
-        min_period: usize,
-        max_period: usize,
-        avg_length: usize,
-        enhance: bool,
-    ) -> PyResult<Self> {
-        let inner = EhlersAutocorrelationPeriodogramStream::try_new(
-            EhlersAutocorrelationPeriodogramParams {
-                min_period: Some(min_period),
-                max_period: Some(max_period),
-                avg_length: Some(avg_length),
-                enhance: Some(enhance),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.inner.update(value)
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.inner.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_autocorrelation_periodogram_batch")]
-#[pyo3(signature = (data, min_period_range=(DEFAULT_MIN_PERIOD, DEFAULT_MIN_PERIOD, 0), max_period_range=(DEFAULT_MAX_PERIOD, DEFAULT_MAX_PERIOD, 0), avg_length_range=(DEFAULT_AVG_LENGTH, DEFAULT_AVG_LENGTH, 0), enhance=DEFAULT_ENHANCE, kernel=None))]
-pub fn ehlers_autocorrelation_periodogram_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    min_period_range: (usize, usize, usize),
-    max_period_range: (usize, usize, usize),
-    avg_length_range: (usize, usize, usize),
-    enhance: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = EhlersAutocorrelationPeriodogramBatchRange {
-        min_period: min_period_range,
-        max_period: max_period_range,
-        avg_length: avg_length_range,
-        enhance,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let dom_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let pwr_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let dom_slice = unsafe { dom_arr.as_slice_mut()? };
-    let pwr_slice = unsafe { pwr_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            ehlers_autocorrelation_periodogram_batch_inner_into(
-                data,
-                &sweep,
-                batch.to_non_batch(),
-                dom_slice,
-                pwr_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("dominant_cycle", dom_arr.reshape((rows, cols))?)?;
-    dict.set_item("normalized_power", pwr_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "min_periods",
-        combos
-            .iter()
-            .map(|p| p.min_period.unwrap_or(DEFAULT_MIN_PERIOD) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "max_periods",
-        combos
-            .iter()
-            .map(|p| p.max_period.unwrap_or(DEFAULT_MAX_PERIOD) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "avg_lengths",
-        combos
-            .iter()
-            .map(|p| p.avg_length.unwrap_or(DEFAULT_AVG_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "enhance_flags",
-        combos
-            .iter()
-            .map(|p| p.enhance.unwrap_or(DEFAULT_ENHANCE))
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_ehlers_autocorrelation_periodogram_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(
-        ehlers_autocorrelation_periodogram_py,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        ehlers_autocorrelation_periodogram_batch_py,
-        module
-    )?)?;
-    module.add_class::<EhlersAutocorrelationPeriodogramStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_autocorrelation_periodogram_js")]
-pub fn ehlers_autocorrelation_periodogram_js(
-    data: &[f64],
-    min_period: usize,
-    max_period: usize,
-    avg_length: usize,
-    enhance: bool,
-) -> Result<JsValue, JsValue> {
-    let input = EhlersAutocorrelationPeriodogramInput::from_slice(
-        data,
-        EhlersAutocorrelationPeriodogramParams {
-            min_period: Some(min_period),
-            max_period: Some(max_period),
-            avg_length: Some(avg_length),
-            enhance: Some(enhance),
-        },
-    );
-    let out = ehlers_autocorrelation_periodogram(&input)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let result = js_sys::Object::new();
-
-    let dom = js_sys::Float64Array::new_with_length(out.dominant_cycle.len() as u32);
-    dom.copy_from(&out.dominant_cycle);
-    js_sys::Reflect::set(&result, &JsValue::from_str("dominant_cycle"), &dom)?;
-
-    let pwr = js_sys::Float64Array::new_with_length(out.normalized_power.len() as u32);
-    pwr.copy_from(&out.normalized_power);
-    js_sys::Reflect::set(&result, &JsValue::from_str("normalized_power"), &pwr)?;
-
-    Ok(result.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_autocorrelation_periodogram_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_autocorrelation_periodogram_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_autocorrelation_periodogram_into")]
-pub fn ehlers_autocorrelation_periodogram_into_js(
-    data_ptr: *const f64,
-    dominant_cycle_ptr: *mut f64,
-    normalized_power_ptr: *mut f64,
-    len: usize,
-    min_period: usize,
-    max_period: usize,
-    avg_length: usize,
-    enhance: bool,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || dominant_cycle_ptr.is_null() || normalized_power_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let input = EhlersAutocorrelationPeriodogramInput::from_slice(
-            data,
-            EhlersAutocorrelationPeriodogramParams {
-                min_period: Some(min_period),
-                max_period: Some(max_period),
-                avg_length: Some(avg_length),
-                enhance: Some(enhance),
-            },
-        );
-        let alias = data_ptr == dominant_cycle_ptr
-            || data_ptr == normalized_power_ptr
-            || dominant_cycle_ptr == normalized_power_ptr;
-        if alias {
-            let mut dom_tmp = vec![0.0; len];
-            let mut pwr_tmp = vec![0.0; len];
-            ehlers_autocorrelation_periodogram_into_slices(
-                &mut dom_tmp,
-                &mut pwr_tmp,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(dominant_cycle_ptr, len).copy_from_slice(&dom_tmp);
-            std::slice::from_raw_parts_mut(normalized_power_ptr, len).copy_from_slice(&pwr_tmp);
-        } else {
-            ehlers_autocorrelation_periodogram_into_slices(
-                std::slice::from_raw_parts_mut(dominant_cycle_ptr, len),
-                std::slice::from_raw_parts_mut(normalized_power_ptr, len),
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersAutocorrelationPeriodogramBatchConfig {
-    pub min_period_range: (usize, usize, usize),
-    pub max_period_range: Option<(usize, usize, usize)>,
-    pub avg_length_range: Option<(usize, usize, usize)>,
-    pub enhance: Option<bool>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersAutocorrelationPeriodogramBatchJsOutput {
-    pub dominant_cycle: Vec<f64>,
-    pub normalized_power: Vec<f64>,
-    pub combos: Vec<EhlersAutocorrelationPeriodogramParams>,
-    pub min_periods: Vec<usize>,
-    pub max_periods: Vec<usize>,
-    pub avg_lengths: Vec<usize>,
-    pub enhance_flags: Vec<bool>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_autocorrelation_periodogram_batch_js")]
-pub fn ehlers_autocorrelation_periodogram_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: EhlersAutocorrelationPeriodogramBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = EhlersAutocorrelationPeriodogramBatchRange {
-        min_period: cfg.min_period_range,
-        max_period: cfg
-            .max_period_range
-            .unwrap_or((DEFAULT_MAX_PERIOD, DEFAULT_MAX_PERIOD, 0)),
-        avg_length: cfg
-            .avg_length_range
-            .unwrap_or((DEFAULT_AVG_LENGTH, DEFAULT_AVG_LENGTH, 0)),
-        enhance: cfg.enhance.unwrap_or(DEFAULT_ENHANCE),
-    };
-    let out = ehlers_autocorrelation_periodogram_batch_inner(
-        data,
-        &sweep,
-        detect_best_batch_kernel().to_non_batch(),
-        false,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersAutocorrelationPeriodogramBatchJsOutput {
-        min_periods: out
-            .combos
-            .iter()
-            .map(|p| p.min_period.unwrap_or(DEFAULT_MIN_PERIOD))
-            .collect(),
-        max_periods: out
-            .combos
-            .iter()
-            .map(|p| p.max_period.unwrap_or(DEFAULT_MAX_PERIOD))
-            .collect(),
-        avg_lengths: out
-            .combos
-            .iter()
-            .map(|p| p.avg_length.unwrap_or(DEFAULT_AVG_LENGTH))
-            .collect(),
-        enhance_flags: out
-            .combos
-            .iter()
-            .map(|p| p.enhance.unwrap_or(DEFAULT_ENHANCE))
-            .collect(),
-        dominant_cycle: out.dominant_cycle,
-        normalized_power: out.normalized_power,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_autocorrelation_periodogram_batch_into")]
-pub fn ehlers_autocorrelation_periodogram_batch_into_js(
-    data_ptr: *const f64,
-    dominant_cycle_ptr: *mut f64,
-    normalized_power_ptr: *mut f64,
-    len: usize,
-    min_start: usize,
-    min_end: usize,
-    min_step: usize,
-    max_start: usize,
-    max_end: usize,
-    max_step: usize,
-    avg_start: usize,
-    avg_end: usize,
-    avg_step: usize,
-    enhance: bool,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || dominant_cycle_ptr.is_null() || normalized_power_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    let sweep = EhlersAutocorrelationPeriodogramBatchRange {
-        min_period: (min_start, min_end, min_step),
-        max_period: (max_start, max_end, max_step),
-        avg_length: (avg_start, avg_end, avg_step),
-        enhance,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let alias = data_ptr == dominant_cycle_ptr
-            || data_ptr == normalized_power_ptr
-            || dominant_cycle_ptr == normalized_power_ptr;
-        if alias {
-            let mut dom_tmp = vec![0.0; total];
-            let mut pwr_tmp = vec![0.0; total];
-            ehlers_autocorrelation_periodogram_batch_inner_into(
-                data,
-                &sweep,
-                detect_best_batch_kernel().to_non_batch(),
-                &mut dom_tmp,
-                &mut pwr_tmp,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(dominant_cycle_ptr, total).copy_from_slice(&dom_tmp);
-            std::slice::from_raw_parts_mut(normalized_power_ptr, total).copy_from_slice(&pwr_tmp);
-        } else {
-            ehlers_autocorrelation_periodogram_batch_inner_into(
-                data,
-                &sweep,
-                detect_best_batch_kernel().to_non_batch(),
-                std::slice::from_raw_parts_mut(dominant_cycle_ptr, total),
-                std::slice::from_raw_parts_mut(normalized_power_ptr, total),
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_autocorrelation_periodogram_output_into_js(
-    data: &[f64],
-    min_period: usize,
-    max_period: usize,
-    avg_length: usize,
-    enhance: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value =
-        ehlers_autocorrelation_periodogram_js(data, min_period, max_period, avg_length, enhance)?;
-    crate::write_wasm_object_f64_outputs(
-        "ehlers_autocorrelation_periodogram_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_autocorrelation_periodogram_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_autocorrelation_periodogram_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_autocorrelation_periodogram_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

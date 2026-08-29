@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
@@ -12,121 +12,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, moving_averages::CudaHighPass2};
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct HighPass2DeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl HighPass2DeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum HighPass2Data<'a> {
@@ -153,10 +38,6 @@ pub struct HighPass2Output {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct HighPass2Params {
     pub period: Option<usize>,
     pub k: Option<f64>,
@@ -332,7 +213,9 @@ pub enum HighPass2Error {
     InvalidK { k: f64 },
     #[error("highpass_2_pole: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("highpass_2_pole: Output buffer length mismatch: out_len = {out_len}, expected = {expected}")]
+    #[error(
+        "highpass_2_pole: Output buffer length mismatch: out_len = {out_len}, expected = {expected}"
+    )]
     OutputLengthMismatch { out_len: usize, expected: usize },
     #[error("highpass_2_pole: Invalid kernel for batch API: {0:?}")]
     InvalidKernelForBatch(Kernel),
@@ -1257,38 +1140,11 @@ pub unsafe fn highpass_2_pole_row_avx512(
     highpass_2_pole_row_avx2(data, first, period, k, out);
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn highpass_2_pole_output_into_js(
-    data: &[f64],
-    period: usize,
-    k: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = highpass_2_pole_js(data, period, k)?;
-    crate::write_wasm_f64_output("highpass_2_pole_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn highpass_2_pole_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = highpass_2_pole_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "highpass_2_pole_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
 
     #[test]
@@ -1333,8 +1189,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = HighPass2Params {
             period: None,
             k: None,
@@ -1346,8 +1202,8 @@ mod tests {
     }
     fn check_highpass2_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = HighPass2Input::from_candles(&candles, "close", HighPass2Params::default());
         let result = highpass_2_pole_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -1377,8 +1233,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = HighPass2Input::with_default_candles(&candles);
         match input.data {
             HighPass2Data::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1441,8 +1297,8 @@ mod tests {
     }
     fn check_highpass2_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = HighPass2Params {
             period: Some(48),
             k: None,
@@ -1463,8 +1319,8 @@ mod tests {
     }
     fn check_highpass2_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = HighPass2Input::from_candles(&candles, "close", HighPass2Params::default());
         let res = highpass_2_pole_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -1862,8 +1718,8 @@ mod tests {
     fn check_highpass2_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_cases = vec![
             HighPass2Params {
@@ -1968,8 +1824,8 @@ mod tests {
     generate_all_highpass2_tests!(check_highpass2_property);
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = HighPass2BatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2018,8 +1874,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let batch_configs = vec![
             ((10, 30, 10), (0.5, 0.9, 0.2)),
@@ -2050,26 +1906,26 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}, k={:?}",
-						test, val, bits, row, col, idx, combo.period, combo.k
-					);
+                        test, val, bits, row, col, idx, combo.period, combo.k
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}, k={:?}",
-						test, val, bits, row, col, idx, combo.period, combo.k
-					);
+                        test, val, bits, row, col, idx, combo.period, combo.k
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}, k={:?}",
-						test, val, bits, row, col, idx, combo.period, combo.k
-					);
+                        test, val, bits, row, col, idx, combo.period, combo.k
+                    );
                 }
             }
         }
@@ -2170,381 +2026,4 @@ fn highpass_2_pole_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "highpass_2_pole")]
-#[pyo3(signature = (data, period, k, kernel=None))]
-pub fn highpass_2_pole_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    k: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = HighPass2Params {
-        period: Some(period),
-        k: Some(k),
-    };
-    let hp2_in = HighPass2Input::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| highpass_2_pole_with_kernel(&hp2_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "highpass_2_pole_batch")]
-#[pyo3(signature = (data, period_range, k_range, kernel=None))]
-pub fn highpass_2_pole_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    k_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = HighPass2BatchRange {
-        period: period_range,
-        k: k_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total: usize = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            highpass_2_pole_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "k",
-        combos
-            .iter()
-            .map(|p| p.k.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "highpass_2_pole_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range=(48, 48, 0), k_range=(0.707, 0.707, 0.0), device_id=0))]
-pub fn highpass_2_pole_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    k_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<HighPass2DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = HighPass2BatchRange {
-        period: period_range,
-        k: k_range,
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaHighPass2::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .highpass2_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out, cuda.context_arc(), cuda.device_id()))
-    })?;
-
-    let crate::cuda::DeviceArrayF32 { buf, rows, cols } = inner;
-    Ok(HighPass2DeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "highpass_2_pole_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, k, device_id=0))]
-pub fn highpass_2_pole_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    period: usize,
-    k: f64,
-    device_id: usize,
-) -> PyResult<HighPass2DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if period < 2 {
-        return Err(PyValueError::new_err("period must be >= 2"));
-    }
-    if !(k > 0.0) || !k.is_finite() {
-        return Err(PyValueError::new_err("k must be positive and finite"));
-    }
-
-    let flat = data_tm_f32.as_slice()?;
-    let shape = data_tm_f32.shape();
-    let series_len = shape[0];
-    let num_series = shape[1];
-    let params = HighPass2Params {
-        period: Some(period),
-        k: Some(k),
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaHighPass2::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .highpass2_many_series_one_param_time_major_dev(flat, num_series, series_len, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out, cuda.context_arc(), cuda.device_id()))
-    })?;
-
-    let crate::cuda::DeviceArrayF32 { buf, rows, cols } = inner;
-    Ok(HighPass2DeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "HighPass2Stream")]
-pub struct HighPass2StreamPy {
-    inner: HighPass2Stream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl HighPass2StreamPy {
-    #[new]
-    pub fn new(period: usize, k: f64) -> PyResult<Self> {
-        let params = HighPass2Params {
-            period: Some(period),
-            k: Some(k),
-        };
-        let inner =
-            HighPass2Stream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn highpass_2_pole_js(data: &[f64], period: usize, k: f64) -> Result<Vec<f64>, JsValue> {
-    let params = HighPass2Params {
-        period: Some(period),
-        k: Some(k),
-    };
-    let input = HighPass2Input::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    highpass_2_pole_into(&input, &mut output).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn highpass_2_pole_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn highpass_2_pole_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = highpass_2_pole_into)]
-pub fn highpass_2_pole_into_wasm(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    k: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = HighPass2Params {
-            period: Some(period),
-            k: Some(k),
-        };
-        let input = HighPass2Input::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            highpass_2_pole_into(&input, &mut temp)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            highpass_2_pole_into(&input, out).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HighPass2BatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub k_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HighPass2BatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<HighPass2Params>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = highpass_2_pole_batch)]
-pub fn highpass_2_pole_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: HighPass2BatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = HighPass2BatchRange {
-        period: config.period_range,
-        k: config.k_range,
-    };
-
-    let batch_kernel = detect_best_batch_kernel();
-    let compute_kernel = match batch_kernel {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => Kernel::Scalar,
-    };
-    let out = highpass_2_pole_batch_inner(data, &sweep, compute_kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = HighPass2BatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn highpass_2_pole_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    k_start: f64,
-    k_end: f64,
-    k_step: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = HighPass2BatchRange {
-            period: (period_start, period_end, period_step),
-            k: (k_start, k_end, k_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        if rows * cols == 0 {
-            return Err(JsValue::from_str("Invalid dimensions"));
-        }
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        let kernel = detect_best_batch_kernel();
-
-        let compute_kernel = match kernel {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => Kernel::Scalar,
-        };
-
-        highpass_2_pole_batch_inner_into(data, &sweep, compute_kernel, true, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(())
-    }
 }

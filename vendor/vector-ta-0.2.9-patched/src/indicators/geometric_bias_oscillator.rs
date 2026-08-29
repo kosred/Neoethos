@@ -1,59 +1,10 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn geometric_bias_oscillator_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    multiplier: f64,
-    atr_length: usize,
-    smooth: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values =
-        geometric_bias_oscillator_js(high, low, close, length, multiplier, atr_length, smooth)?;
-    crate::write_wasm_f64_output("geometric_bias_oscillator_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn geometric_bias_oscillator_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = geometric_bias_oscillator_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "geometric_bias_oscillator_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
 
 #[cfg(test)]
 use std::error::Error as StdError;
@@ -103,19 +54,11 @@ pub enum GeometricBiasOscillatorData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct GeometricBiasOscillatorOutput {
     pub values: Vec<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct GeometricBiasOscillatorParams {
     pub length: Option<usize>,
     pub multiplier: Option<f64>,
@@ -341,9 +284,7 @@ pub enum GeometricBiasOscillatorError {
     InvalidMultiplier { multiplier: f64 },
     #[error("geometric_bias_oscillator: invalid smooth: {smooth}")]
     InvalidSmooth { smooth: usize },
-    #[error(
-        "geometric_bias_oscillator: not enough valid data: needed = {needed}, valid = {valid}"
-    )]
+    #[error("geometric_bias_oscillator: not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
     #[error(
         "geometric_bias_oscillator: output length mismatch: expected = {expected}, got = {got}"
@@ -1091,7 +1032,6 @@ pub fn geometric_bias_oscillator_with_kernel(
     Ok(GeometricBiasOscillatorOutput { values })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn geometric_bias_oscillator_into(
     out: &mut [f64],
     input: &GeometricBiasOscillatorInput,
@@ -1265,354 +1205,10 @@ fn geometric_bias_oscillator_batch_impl(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "geometric_bias_oscillator")]
-#[pyo3(signature = (high, low, close, length=DEFAULT_LENGTH, multiplier=DEFAULT_MULTIPLIER, atr_length=DEFAULT_ATR_LENGTH, smooth=DEFAULT_SMOOTH, kernel=None))]
-pub fn geometric_bias_oscillator_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    multiplier: f64,
-    atr_length: usize,
-    smooth: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = GeometricBiasOscillatorInput::from_slices(
-        high_slice,
-        low_slice,
-        close_slice,
-        GeometricBiasOscillatorParams {
-            length: Some(length),
-            multiplier: Some(multiplier),
-            atr_length: Some(atr_length),
-            smooth: Some(smooth),
-        },
-    );
-    let output = py
-        .allow_threads(|| geometric_bias_oscillator_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(output.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "geometric_bias_oscillator_batch")]
-#[pyo3(signature = (high, low, close, length_range=(DEFAULT_LENGTH, DEFAULT_LENGTH, 0), multiplier_range=(DEFAULT_MULTIPLIER, DEFAULT_MULTIPLIER, 0.0), atr_length_range=(DEFAULT_ATR_LENGTH, DEFAULT_ATR_LENGTH, 0), smooth_range=(DEFAULT_SMOOTH, DEFAULT_SMOOTH, 0), kernel=None))]
-pub fn geometric_bias_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    multiplier_range: (f64, f64, f64),
-    atr_length_range: (usize, usize, usize),
-    smooth_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = GeometricBiasOscillatorBatchRange {
-        length: length_range,
-        multiplier: multiplier_range,
-        atr_length: atr_length_range,
-        smooth: smooth_range,
-    };
-
-    let combos = expand_grid_geometric_bias_oscillator(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close_slice.len();
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        PyValueError::new_err("rows*cols overflow in geometric_bias_oscillator_batch")
-    })?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            geometric_bias_oscillator_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &sweep,
-                !matches!(kernel, Kernel::Scalar | Kernel::ScalarBatch),
-                out_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|params| params.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "multipliers",
-        combos
-            .iter()
-            .map(|params| params.multiplier.unwrap_or(DEFAULT_MULTIPLIER))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "atr_lengths",
-        combos
-            .iter()
-            .map(|params| params.atr_length.unwrap_or(DEFAULT_ATR_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooths",
-        combos
-            .iter()
-            .map(|params| params.smooth.unwrap_or(DEFAULT_SMOOTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "GeometricBiasOscillatorStream")]
-pub struct GeometricBiasOscillatorStreamPy {
-    stream: GeometricBiasOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl GeometricBiasOscillatorStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, multiplier=DEFAULT_MULTIPLIER, atr_length=DEFAULT_ATR_LENGTH, smooth=DEFAULT_SMOOTH))]
-    fn new(length: usize, multiplier: f64, atr_length: usize, smooth: usize) -> PyResult<Self> {
-        let stream = GeometricBiasOscillatorStream::try_new(GeometricBiasOscillatorParams {
-            length: Some(length),
-            multiplier: Some(multiplier),
-            atr_length: Some(atr_length),
-            smooth: Some(smooth),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct GeometricBiasOscillatorBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub multiplier_range: (f64, f64, f64),
-    pub atr_length_range: (usize, usize, usize),
-    pub smooth_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct GeometricBiasOscillatorBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<GeometricBiasOscillatorParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn geometric_bias_oscillator_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    multiplier: f64,
-    atr_length: usize,
-    smooth: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let input = GeometricBiasOscillatorInput::from_slices(
-        high,
-        low,
-        close,
-        GeometricBiasOscillatorParams {
-            length: Some(length),
-            multiplier: Some(multiplier),
-            atr_length: Some(atr_length),
-            smooth: Some(smooth),
-        },
-    );
-    let mut out = vec![0.0; close.len()];
-    geometric_bias_oscillator_into_slice(&mut out, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn geometric_bias_oscillator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn geometric_bias_oscillator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn geometric_bias_oscillator_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    multiplier: f64,
-    atr_length: usize,
-    smooth: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let input = GeometricBiasOscillatorInput::from_slices(
-            high,
-            low,
-            close,
-            GeometricBiasOscillatorParams {
-                length: Some(length),
-                multiplier: Some(multiplier),
-                atr_length: Some(atr_length),
-                smooth: Some(smooth),
-            },
-        );
-
-        if high_ptr as *const u8 == out_ptr as *const u8
-            || low_ptr as *const u8 == out_ptr as *const u8
-            || close_ptr as *const u8 == out_ptr as *const u8
-        {
-            let output = geometric_bias_oscillator_with_kernel(&input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&output.values);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            geometric_bias_oscillator_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = geometric_bias_oscillator_batch)]
-pub fn geometric_bias_oscillator_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: GeometricBiasOscillatorBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = GeometricBiasOscillatorBatchRange {
-        length: config.length_range,
-        multiplier: config.multiplier_range,
-        atr_length: config.atr_length_range,
-        smooth: config.smooth_range,
-    };
-    let output =
-        geometric_bias_oscillator_batch_with_kernel(high, low, close, &sweep, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js_output = GeometricBiasOscillatorBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn geometric_bias_oscillator_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    multiplier_start: f64,
-    multiplier_end: f64,
-    multiplier_step: f64,
-    atr_length_start: usize,
-    atr_length_end: usize,
-    atr_length_step: usize,
-    smooth_start: usize,
-    smooth_end: usize,
-    smooth_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = GeometricBiasOscillatorBatchRange {
-        length: (length_start, length_end, length_step),
-        multiplier: (multiplier_start, multiplier_end, multiplier_step),
-        atr_length: (atr_length_start, atr_length_end, atr_length_step),
-        smooth: (smooth_start, smooth_end, smooth_step),
-    };
-    let rows = expand_grid_geometric_bias_oscillator(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*len overflow"))?;
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        geometric_bias_oscillator_batch_inner_into(high, low, close, &sweep, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn trend_data(size: usize, slope: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let mut high = Vec::with_capacity(size);
@@ -1665,8 +1261,8 @@ mod tests {
     }
 
     #[test]
-    fn geometric_bias_oscillator_decreasing_trend_reaches_negative_hundred(
-    ) -> Result<(), Box<dyn StdError>> {
+    fn geometric_bias_oscillator_decreasing_trend_reaches_negative_hundred()
+    -> Result<(), Box<dyn StdError>> {
         let (high, low, close) = trend_data(160, -1.0);
         let input = GeometricBiasOscillatorInput::from_slices(
             &high,
@@ -1850,8 +1446,8 @@ mod tests {
 
     #[test]
     fn geometric_bias_oscillator_default_candles_smoke() -> Result<(), Box<dyn StdError>> {
-        let path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(path)?;
+        let path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(path)?;
         let input = GeometricBiasOscillatorInput::with_default_candles(&candles);
         let out = geometric_bias_oscillator(&input)?;
         assert_eq!(out.values.len(), candles.close.len());

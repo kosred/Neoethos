@@ -37,9 +37,9 @@ env:
   # any 13.x driver.
   CUDA_TOOLKIT_VERSION: "13.2.0"
 
-  # Cargo features enabled in the release. Keep in sync with the
-  # neoethos-app Cargo.toml `gpu` feature definition.
-  RELEASE_FEATURES: "gpu"
+  # Full NVIDIA release surface, including the Burn CUDA backend used by the
+  # deep/Exit/SAC model lane. Keep in sync with neoethos-app Cargo.toml.
+  RELEASE_FEATURES: "gpu-nvidia-full"
 
   # candle-kernels (RL models via rlkit) compiles its CUDA kernels through
   # bindgen_cuda, which probes `nvidia-smi` for the compute capability —
@@ -48,6 +48,15 @@ env:
   # forward-JITs onto 8.6/8.9/9.0/12.0 cards. Turing (sm_75) users still
   # get the Vulkan path; only candle RL kernels need 8.0+.
   CUDA_COMPUTE_CAP: "80"
+
+  # Cardless release builds cannot use visible-device discovery. The typed
+  # NeoEthos pair is the sole architecture authority for XGBoost, LightGBM,
+  # CubeCL and the native GPU crate. VectorTA's reviewed build currently reads
+  # CUDA_ARCHS, so it mirrors the same exact set; the shared resolver rejects
+  # it before launching tools unless both parsed canonical sets are equal.
+  NEOETHOS_CUDA_BUILD_MODE: "cross_release_explicit"
+  NEOETHOS_CUDA_ARCHS: "80"
+  CUDA_ARCHS: "80"
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
@@ -107,6 +116,19 @@ jobs:
         run: |
           cargo build -p neoethos-app --release --no-default-features --features "${env:RELEASE_FEATURES}"
 
+      - name: Build portable x86-64 v3 launch pair
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = "target\x86-64-v3-payload"
+          $env:RUSTFLAGS = "-C target-cpu=x86-64-v3"
+          cargo build -p neoethos-app --release --no-default-features --features "${env:RELEASE_FEATURES}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $env:CARGO_TARGET_DIR = "target\x86-64-baseline-launcher"
+          $env:RUSTFLAGS = "-C target-cpu=x86-64"
+          cargo build -p neoethos-x86-64-v3-launcher --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Stage native runtime DLLs
         # Stages every native runtime dependency next to the binary so the
         # NSIS packager and the portable zip both pick them up:
@@ -121,13 +143,16 @@ jobs:
         run: |
           $release = "target\release"
           # Tree-model bindings
-          Copy-Item "$release\deps\xgboost.dll" "$release\xgboost.dll" -Force -ErrorAction SilentlyContinue
-          if (Test-Path "$release\catboostmodel.dll") {
-              Copy-Item "$release\catboostmodel.dll" "crates\neoethos-app\catboostmodel.dll" -Force
+          $xgboostTarget = Join-Path $release "xgboost.dll"
+          $catboostTarget = Join-Path $release "catboostmodel.dll"
+          if (-not (Test-Path -LiteralPath $xgboostTarget -PathType Leaf) -or (Get-Item -LiteralPath $xgboostTarget).Length -le 0) {
+              throw "Required XGBoost runtime is missing or empty: $xgboostTarget"
           }
-          if (Test-Path "$release\xgboost.dll") {
-              Copy-Item "$release\xgboost.dll" "crates\neoethos-app\xgboost.dll" -Force
+          if (-not (Test-Path -LiteralPath $catboostTarget -PathType Leaf) -or (Get-Item -LiteralPath $catboostTarget).Length -le 0) {
+              throw "Required CatBoost runtime is missing or empty: $catboostTarget"
           }
+          Copy-Item -LiteralPath $catboostTarget -Destination "crates\neoethos-app\catboostmodel.dll" -Force
+          Copy-Item -LiteralPath $xgboostTarget -Destination "crates\neoethos-app\xgboost.dll" -Force
           # CUDA runtime redistributables from the toolkit installed above.
           $cudaBin = Join-Path $env:CUDA_PATH "bin"
           if (-not (Test-Path $cudaBin)) {
@@ -186,11 +211,23 @@ jobs:
         run: |
           $version = "${{ github.ref_name || inputs.version }}"
           $outDir = "dist\NeoEthos-windows-x64-gpu"
+          $release = "target\release"
+          $payloadRelease = "target\x86-64-v3-payload\release"
+          $xgboostPayload = Join-Path $payloadRelease "xgboost.dll"
+          $catboostPayload = Join-Path $payloadRelease "catboostmodel.dll"
+          foreach ($runtime in @($xgboostPayload, $catboostPayload)) {
+            if (-not (Test-Path -LiteralPath $runtime -PathType Leaf) -or (Get-Item -LiteralPath $runtime).Length -le 0) {
+              throw "Required selected native runtime is missing or empty: $runtime"
+            }
+          }
           New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-          Copy-Item "target\release\neoethos-app.exe" "$outDir\NeoEthos.exe"
-          Copy-Item "target\release\catboostmodel.dll" "$outDir\catboostmodel.dll" -ErrorAction SilentlyContinue
-          Copy-Item "target\release\xgboost.dll"       "$outDir\xgboost.dll"       -ErrorAction SilentlyContinue
-          Copy-Item "target\release\*.dll"             "$outDir\" -Force
+          Copy-Item "target\x86-64-baseline-launcher\release\neoethos-x86-64-v3-launcher.exe" "$outDir\NeoEthos.exe"
+          Copy-Item "target\x86-64-v3-payload\release\neoethos-app.exe" "$outDir\NeoEthos.x86-64-v3.exe"
+          Copy-Item -LiteralPath $xgboostPayload -Destination "$outDir\xgboost.dll"
+          Copy-Item -LiteralPath $catboostPayload -Destination "$outDir\catboostmodel.dll"
+          Get-ChildItem "$release\*.dll" |
+            Where-Object { $_.Name -notin @("catboostmodel.dll", "xgboost.dll") } |
+            Copy-Item -Destination "$outDir\" -Force
           Copy-Item "config.yaml"                      "$outDir\config.yaml"
           # Drop a README so end users know what's bundled
           @"
@@ -288,11 +325,19 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "nvrtc-dev", "thrust"]'
           non-cuda-sub-packages: '["libcublas-dev", "libcusparse-dev", "libcusolver-dev", "libcurand-dev"]'
 
-      - name: Install cargo-packager
-        run: cargo install cargo-packager --locked --version "^0.11"
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
 
       - name: Build release binary (GPU)
         run: cargo build -p neoethos-app --release --no-default-features --features "${RELEASE_FEATURES}"
+
+      - name: Build portable x86-64 v3 launch pair
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR=target/x86-64-v3-payload RUSTFLAGS='-C target-cpu=x86-64-v3' \
+            cargo build -p neoethos-app --release --no-default-features --features "${RELEASE_FEATURES}"
+          CARGO_TARGET_DIR=target/x86-64-baseline-launcher RUSTFLAGS='-C target-cpu=x86-64' \
+            cargo build -p neoethos-x86-64-v3-launcher --release
 
       - name: Create portable tar.gz with the CUDA runtime
         run: |
@@ -301,9 +346,18 @@ jobs:
           OUTDIR="dist/NeoEthos-${VERSION}-linux-x64-gpu"
           mkdir -p "$OUTDIR/lib"
 
-          # Binary
-          cp target/release/neoethos-app "$OUTDIR/NeoEthos"
-          chmod +x "$OUTDIR/NeoEthos"
+          # Baseline public launcher plus its private optimized payload.
+          cp target/x86-64-baseline-launcher/release/neoethos-x86-64-v3-launcher "$OUTDIR/NeoEthos"
+          cp target/x86-64-v3-payload/release/neoethos-app "$OUTDIR/NeoEthos.x86-64-v3"
+          chmod +x "$OUTDIR/NeoEthos" "$OUTDIR/NeoEthos.x86-64-v3"
+
+          # Tree-model runtimes must come from the same private optimized
+          # Cargo profile as the payload that will load them.
+          PAYLOAD_RELEASE="target/x86-64-v3-payload/release"
+          for library in libcatboostmodel.so libxgboost.so; do
+            test -s "$PAYLOAD_RELEASE/$library"
+            install -m 0644 "$PAYLOAD_RELEASE/$library" "$OUTDIR/$library"
+          done
 
           # CUDA runtime redistributables. Explicitly named, not globbed: a
           # glob of the toolkit lib64/ would also pull the static archives and
@@ -334,12 +388,22 @@ jobs:
           cp config.yaml "$OUTDIR/config.yaml"
           cat > "$OUTDIR/run-neoethos.sh" <<'SH'
           #!/usr/bin/env bash
-          # Launcher that points the dynamic linker at the bundled CUDA runtime
           DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-          export LD_LIBRARY_PATH="$DIR/lib:${LD_LIBRARY_PATH:-}"
           exec "$DIR/NeoEthos" "$@"
           SH
           chmod +x "$OUTDIR/run-neoethos.sh"
+
+          # The payload itself owns runtime discovery. Prove the archive does
+          # not depend on an environment-variable fallback, and that both tree
+          # runtimes resolve to the selected files beside the payload.
+          readelf -d "$OUTDIR/NeoEthos.x86-64-v3" > "$OUTDIR/readelf.log"
+          grep -Fq '$ORIGIN/lib' "$OUTDIR/readelf.log"
+          env -u LD_LIBRARY_PATH ldd "$OUTDIR/NeoEthos.x86-64-v3" > "$OUTDIR/ldd.log"
+          for library in libcatboostmodel.so libxgboost.so; do
+            resolved="$(awk -v library="$library" '$1 == library && $2 == "=>" { print $3; exit }' "$OUTDIR/ldd.log")"
+            test -n "$resolved"
+            test "$(realpath "$resolved")" = "$(realpath "$OUTDIR/$library")"
+          done
 
           # README
           cat > "$OUTDIR/README.txt" <<EOF
@@ -352,20 +416,31 @@ jobs:
             - The CUDA runtime libs bundled in lib/ are everything the binary
               loads; you do NOT need to install the CUDA toolkit separately.
 
-          To run: ./run-neoethos.sh   (the wrapper sets LD_LIBRARY_PATH)
-          Or run directly with:
-              LD_LIBRARY_PATH=\$(pwd)/lib ./NeoEthos
+          To run: ./run-neoethos.sh
+          The payload uses executable-relative RUNPATH entries for the bundled
+          tree-model and CUDA runtimes; no environment override is required.
 
           Bundled CUDA runtime: ${CUDA_TOOLKIT_VERSION}
           EOF
 
           tar -czf "dist/NeoEthos-${VERSION}-linux-x64-gpu.tar.gz" -C dist "NeoEthos-${VERSION}-linux-x64-gpu"
 
-      - name: Package .deb (optional, no bundled CUDA runtime)
+      - name: Package .deb (system CUDA runtime required)
         # The .deb does not bundle the CUDA runtime (it would push the package
         # past the ~50 MB Debian threshold). It depends on the system CUDA
         # install — useful for ops that prefer apt/dpkg.
-        run: cargo packager --release -p neoethos-app --formats deb || true
+        run: cargo deb -p neoethos-app --no-build
+
+      - name: Verify GPU deb native runtime layout
+        run: |
+          set -euo pipefail
+          deb="$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          test -n "$deb"
+          listing="$(mktemp)"
+          trap 'rm -f -- "$listing"' EXIT
+          dpkg-deb -c "$deb" > "$listing"
+          grep -Fq 'usr/lib/neoethos-app/libxgboost.so' "$listing"
+          grep -Fq 'usr/lib/neoethos-app/libcatboostmodel.so' "$listing"
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
@@ -373,8 +448,8 @@ jobs:
           name: linux-release-gpu
           path: |
             dist/*.tar.gz
-            target/release/debian/*.deb
-          if-no-files-found: warn
+            target/debian/*.deb
+          if-no-files-found: error
 
   # ────────────────────────────────────────────────────────────────────────────
   # Publish GitHub Release with all artifacts

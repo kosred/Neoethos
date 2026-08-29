@@ -22,8 +22,8 @@ pub mod risky_mode;
 pub use demo_gate::{DemoForwardDecision, DemoForwardGateConfig, evaluate_demo_forward_gate};
 pub use kelly::{risk_constrained_kelly, risk_constrained_kelly_empirical};
 pub use promotion_gate::{
-    CriterionResult, PromotionDecision, PromotionGateConfig, PromotionMetrics,
-    aggregate_portfolio, evaluate_promotion,
+    CriterionResult, PromotionDecision, PromotionGateConfig, PromotionMetrics, aggregate_portfolio,
+    evaluate_promotion,
 };
 pub use prop_firm::{
     PropFirmChallengeDefaults, PropFirmConstraints, PropFirmPhaseRiskDefaults,

@@ -1,4 +1,6 @@
 // elastic_volume_weighted_moving_average (EVWMA) — CUDA f64 kernel.
+// PRODUCTION/SEARCH AUTHORITY:
+// evwma_rolling_volume_close_length_key_default30_chronological_rn_f64_v1
 //
 // WHAT THIS REPLACES
 // ------------------

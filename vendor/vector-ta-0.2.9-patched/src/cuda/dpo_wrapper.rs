@@ -1,12 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::dpo::{DpoBatchRange, DpoParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer};
-use cust::module::{Module, ModuleJitOption};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -93,8 +93,6 @@ impl CudaDpo {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
-
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/dpo_kernel.ptx"));
 
         let module = crate::load_cuda_embedded_module!("dpo_kernel")?;
 

@@ -125,8 +125,10 @@ pub fn log_summary(context: &str) {
     if registry.is_empty() {
         return;
     }
-    let mut rows: Vec<(&'static str, Tally)> =
-        registry.iter().map(|(name, tally)| (*name, *tally)).collect();
+    let mut rows: Vec<(&'static str, Tally)> = registry
+        .iter()
+        .map(|(name, tally)| (*name, *tally))
+        .collect();
     rows.sort_by(|a, b| b.1.nanos.cmp(&a.1.nanos));
     let total: u128 = rows.iter().map(|(_, tally)| tally.nanos).sum();
     for (name, tally) in rows {
@@ -137,7 +139,11 @@ pub fn log_summary(context: &str) {
         // about the same. Deciding what to optimise needs the span; deciding
         // where CPU went needs the sum.
         let span_seconds = tally.last_ns.saturating_sub(tally.first_ns) as f64 / 1e9;
-        let parallelism = if span_seconds > 0.001 { seconds / span_seconds } else { 1.0 };
+        let parallelism = if span_seconds > 0.001 {
+            seconds / span_seconds
+        } else {
+            1.0
+        };
         tracing::info!(
             target: "neoethos_search::eval_telemetry",
             context,
@@ -181,7 +187,10 @@ static CALLER: std::sync::atomic::AtomicPtr<u8> =
 impl CallerScope {
     /// Attribute everything measured until the guard drops.
     pub fn enter(name: &'static str) -> Self {
-        CALLER.store(name.as_ptr() as *mut u8, std::sync::atomic::Ordering::Relaxed);
+        CALLER.store(
+            name.as_ptr() as *mut u8,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         LEN.store(name.len(), std::sync::atomic::Ordering::Relaxed);
         Self
     }
@@ -387,7 +396,8 @@ impl Drop for LaneScope {
 /// that forgot to declare its lane is still attributed to something true — and
 /// is visibly missing a lane name rather than silently folded into one.
 pub fn current_lane() -> &'static str {
-    LANE.with(|slot| slot.get()).unwrap_or("prototype_b (lane undeclared)")
+    LANE.with(|slot| slot.get())
+        .unwrap_or("prototype_b (lane undeclared)")
 }
 
 // ── Recursive population splits ──────────────────────────────────────────────
@@ -582,12 +592,17 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         reset();
-        measure("test::alpha", 10, || std::thread::sleep(Duration::from_millis(2)));
+        measure("test::alpha", 10, || {
+            std::thread::sleep(Duration::from_millis(2))
+        });
         measure("test::alpha", 5, || ());
         measure("test::beta", 1, || ());
         {
             let registry = registry().lock().expect("registry");
-            let alpha = registry.get("test::alpha").copied().expect("alpha recorded");
+            let alpha = registry
+                .get("test::alpha")
+                .copied()
+                .expect("alpha recorded");
             assert_eq!(alpha.calls, 2);
             assert_eq!(alpha.items, 15);
             assert!(alpha.nanos > 0);
@@ -643,10 +658,18 @@ mod tests {
         assert_eq!(metrics.split_leaves, 1, "a split leaf is still a launch");
         assert_eq!(metrics.kernel_submissions, 6);
         assert_eq!(metrics.synchronization_events, 8);
-        assert_eq!(metrics.host_prep_nanos, Duration::from_millis(40).as_nanos());
+        assert_eq!(
+            metrics.host_prep_nanos,
+            Duration::from_millis(40).as_nanos()
+        );
         assert_eq!(metrics.device_nanos, Duration::from_millis(20).as_nanos());
         reset();
-        assert!(device_registry().lock().expect("device registry").is_empty());
+        assert!(
+            device_registry()
+                .lock()
+                .expect("device registry")
+                .is_empty()
+        );
     }
 
     /// A launch files itself under the lane its caller declared, and the two

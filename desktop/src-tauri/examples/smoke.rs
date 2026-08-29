@@ -3,76 +3,82 @@
 //! data + broker logic without the GUI. Read-only only: it never places or
 //! closes an order (financial actions need explicit per-action approval).
 
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 use neoethos_app::app_services::broker_api;
 use neoethos_app::app_services::broker_persistence::load_broker_settings;
 use neoethos_app::app_services::secure_store::production_ctrader_token_store;
 
-fn data_root() -> PathBuf {
-    neoethos_core::Settings::load()
-        .ok()
-        .map(|s| s.system.data_dir)
-        .filter(|d| d.exists())
-        .unwrap_or_else(|| PathBuf::from(r"C:\Users\konst\development\forex-ai\data"))
+fn data_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(neoethos_core::Settings::load()?.system.data_dir)
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("================ NeoEthos Tauri smoke test ================\n");
 
     // ── 1. app_info / data root ──────────────────────────────────────────
-    let root = data_root();
+    let root = data_root()?;
     println!(
         "[app_info]  version=0.5.0  data_root={}  exists={}",
         root.display(),
         root.exists()
     );
 
-    // ── 2. list_symbols (local vortex) ───────────────────────────────────
-    match neoethos_data::discover_symbols(&root) {
-        Ok(syms) => println!(
-            "[list_symbols]  OK  {} symbols: {:?}",
-            syms.len(),
-            &syms.iter().take(8).collect::<Vec<_>>()
-        ),
-        Err(e) => println!("[list_symbols]  ERR  {e}"),
-    }
+    // ── 2. exact canonical inventory
+    let inventory = neoethos_data::DatasetDiscovery::scan_metadata(&root)?;
+    let selected = inventory.entries.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no canonical dataset generation is available under {}; import or download one exact timeframe first",
+                root.display()
+            ),
+        )
+    })?;
+    let identity =
+        neoethos_data::CanonicalDatasetIdentity::from_path_component(&selected.dataset_identity)?;
+    println!(
+        "[dataset_selection]  dataset_identity={}  generation={}  verification={}",
+        selected.dataset_identity,
+        selected.generation,
+        selected.verification.as_str(),
+    );
 
-    // ── 3. list_timeframes(EURUSD) + 4. chart(EURUSD,H1) ─────────────────
-    let probe_sym = "EURUSD";
-    match neoethos_data::discover_timeframes(&root, probe_sym) {
-        Ok(tfs) => {
-            println!("[list_timeframes {probe_sym}]  OK  {tfs:?}");
-            let tf = if tfs.iter().any(|t| t == "H1") {
-                "H1"
-            } else {
-                tfs.first().map(|s| s.as_str()).unwrap_or("H1")
-            };
-            match neoethos_data::load_symbol_timeframe(&root, probe_sym, tf) {
-                Ok(o) => {
-                    let n = o.close.len();
-                    let last = o.close.last().copied().unwrap_or(f64::NAN);
-                    let first_ts = o
-                        .timestamp
-                        .as_ref()
-                        .and_then(|t| t.first())
-                        .copied()
-                        .unwrap_or(0);
-                    let last_ts = o
-                        .timestamp
-                        .as_ref()
-                        .and_then(|t| t.last())
-                        .copied()
-                        .unwrap_or(0);
-                    println!(
-                        "[chart {probe_sym} {tf}]  OK  {n} candles  last_close={last:.5}  span_ms=[{first_ts}..{last_ts}]"
-                    );
-                }
-                Err(e) => println!("[chart {probe_sym} {tf}]  ERR  {e}"),
-            }
-        }
-        Err(e) => println!("[list_timeframes {probe_sym}]  ERR  {e}"),
+    // ── 3. full selected-generation verification + chart
+    let loaded = neoethos_data::load_canonical_timeframe(&root, &identity)?;
+    let actual_generation = loaded.artifact().generation_id();
+    if actual_generation != selected.generation {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "selected generation receipt for {} changed during smoke verification: selected {:?}, current {:?}; refresh the inventory",
+                selected.dataset_identity, selected.generation, actual_generation,
+            ),
+        )
+        .into());
     }
+    let ohlcv = loaded.ohlcv();
+    let candles = ohlcv.close.len();
+    let last_close = ohlcv.close.last().copied().unwrap_or(f64::NAN);
+    let first_ms = ohlcv
+        .timestamp
+        .as_ref()
+        .and_then(|timestamps| timestamps.first())
+        .copied()
+        .unwrap_or(0);
+    let last_ms = ohlcv
+        .timestamp
+        .as_ref()
+        .and_then(|timestamps| timestamps.last())
+        .copied()
+        .unwrap_or(0);
+    println!(
+        "[chart]  OK  dataset_identity={}  generation={}  symbol={}  timeframe={}  {candles} candles  last_close={last_close:.5}  span_ms=[{first_ms}..{last_ms}]",
+        selected.dataset_identity,
+        actual_generation,
+        identity.symbol_name(),
+        identity.timeframe(),
+    );
 
     // ── 5. broker_status (cheap, no network) ─────────────────────────────
     let s = load_broker_settings();
@@ -101,7 +107,7 @@ fn main() {
             "\n[broker]  SKIP live calls — broker not configured (no client_id/secret). Local data path verified above."
         );
         println!("\n================ smoke test done ================");
-        return;
+        return Ok(());
     }
 
     // ── 6. broker_symbols (live — triggers AUTO token refresh) ───────────
@@ -191,4 +197,5 @@ fn main() {
     // and is registered; firing them is a deliberate user action.
 
     println!("\n================ smoke test done ================");
+    Ok(())
 }

@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -9,12 +9,8 @@ use aligned_vec::{AVec, CACHELINE_ALIGN};
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::convert::AsRef;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for PmaInput<'a> {
     #[inline(always)]
@@ -714,10 +710,6 @@ impl PmaBatchOutput {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct PmaBatchOutputUnified {
     pub values: Vec<f64>,
     pub rows: usize,
@@ -876,7 +868,6 @@ pub fn pma_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn pma_into(
     input: &PmaInput,
@@ -886,381 +877,19 @@ pub fn pma_into(
     pma_into_slice(predict_out, trigger_out, input, Kernel::Auto)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pma_js(data: &[f64]) -> Result<Vec<f64>, JsValue> {
-    let input = PmaInput::from_slice(data, PmaParams {});
-    let rows = 2usize;
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str(&PmaError::SizeOverflow { rows, cols }.to_string()))?;
-    let mut values = vec![0.0; total];
-    {
-        let (pred, trig) = values.split_at_mut(cols);
-        pma_into_slice(pred, trig, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pma_into(
-    in_ptr: *const f64,
-    predict_ptr: *mut f64,
-    trigger_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || predict_ptr.is_null() || trigger_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = PmaParams {};
-        let input = PmaInput::from_slice(data, params);
-
-        let need_temp =
-            in_ptr == predict_ptr || in_ptr == trigger_ptr || predict_ptr == trigger_ptr;
-
-        if need_temp {
-            let mut temp_predict = vec![0.0; len];
-            let mut temp_trigger = vec![0.0; len];
-
-            pma_into_slice(&mut temp_predict, &mut temp_trigger, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let predict_out = std::slice::from_raw_parts_mut(predict_ptr, len);
-            let trigger_out = std::slice::from_raw_parts_mut(trigger_ptr, len);
-
-            predict_out.copy_from_slice(&temp_predict);
-            trigger_out.copy_from_slice(&temp_trigger);
-        } else {
-            let predict_out = std::slice::from_raw_parts_mut(predict_ptr, len);
-            let trigger_out = std::slice::from_raw_parts_mut(trigger_ptr, len);
-
-            pma_into_slice(predict_out, trigger_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pma_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pma_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PmaBatchConfig {
-    pub dummy: Option<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PmaJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PmaBatchJsOutput {
-    pub predict: Vec<f64>,
-    pub trigger: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pma_batch(data: &[f64]) -> Result<JsValue, JsValue> {
-    let input = PmaInput::from_slice(data, PmaParams {});
-    let mut predict = vec![0.0; data.len()];
-    let mut trigger = vec![0.0; data.len()];
-
-    pma_into_slice(&mut predict, &mut trigger, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let output = PmaBatchJsOutput {
-        predict,
-        trigger,
-        rows: 1,
-        cols: data.len(),
-    };
-
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pma_unified_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    let rows = 2usize;
-    let cols = len;
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str(&PmaError::SizeOverflow { rows, cols }.to_string()))?;
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let input = PmaInput::from_slice(data, PmaParams {});
-        let (pred, trig) = out.split_at_mut(cols);
-        pma_into_slice(pred, trig, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pma_batch_into(
-    in_ptr: *const f64,
-    predict_ptr: *mut f64,
-    trigger_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    pma_into(in_ptr, predict_ptr, trigger_ptr, len)?;
-    Ok(1)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct PmaStreamWasm {
-    stream: PmaStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl PmaStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> Result<PmaStreamWasm, JsValue> {
-        let params = PmaParams {};
-        let stream = PmaStream::try_new(params).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(PmaStreamWasm { stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> Result<Vec<f64>, JsValue> {
-        match self.stream.update(value) {
-            Some((predict, trigger)) => Ok(vec![predict, trigger]),
-            None => Ok(vec![f64::NAN, f64::NAN]),
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, moving_averages::CudaPma};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "pma")]
-#[pyo3(signature = (data, kernel=None))]
-pub fn pma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let input = PmaInput::from_slice(slice_in, PmaParams {});
-
-    let out = py
-        .allow_threads(|| pma_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((out.predict.into_pyarray(py), out.trigger.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "PmaStream")]
-pub struct PmaStreamPy {
-    stream: PmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PmaStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        let params = PmaParams {};
-        let stream =
-            PmaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PmaStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "pma_batch")]
-#[pyo3(signature = (data, kernel=None))]
-pub fn pma_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let (rows, cols) = (2usize, slice_in.len());
-    let size = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err(PmaError::SizeOverflow { rows, cols }.to_string()))?;
-
-    let values_arr = unsafe { PyArray1::<f64>::new(py, [size], false) };
-    let values_slice = unsafe { values_arr.as_slice_mut()? };
-
-    py.allow_threads(|| -> PyResult<()> {
-        let first =
-            pma_first_valid_idx(slice_in).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        let warm = first + 7 - 1;
-        let warm_prefixes = [warm; 2];
-        let values_mu: &mut [core::mem::MaybeUninit<f64>] = unsafe {
-            core::slice::from_raw_parts_mut(
-                values_slice.as_mut_ptr() as *mut core::mem::MaybeUninit<f64>,
-                values_slice.len(),
-            )
-        };
-        init_matrix_prefixes(values_mu, cols, &warm_prefixes);
-
-        let (row0, row1) = values_slice.split_at_mut(cols);
-        pma_compute_into(
-            slice_in,
-            first,
-            match kern {
-                Kernel::Auto => Kernel::Scalar,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::Avx512Batch => Kernel::Avx512,
-                _ => Kernel::Scalar,
-            },
-            row0,
-            row1,
-        );
-        Ok(())
-    })?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", values_arr.reshape((rows, cols))?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pma_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, device_id=0))]
-pub fn pma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = PmaBatchRange::default();
-    let pair = py.allow_threads(|| {
-        let cuda = CudaPma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.pma_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let predict = make_device_array_py(device_id, pair.predict)?;
-    let trigger = make_device_array_py(device_id, pair.trigger)?;
-    Ok((predict, trigger))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, device_id=0))]
-pub fn pma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected time-major 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let pair = py.allow_threads(|| {
-        let cuda = CudaPma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.pma_many_series_one_param_time_major_dev(flat, cols, rows)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let predict = make_device_array_py(device_id, pair.predict)?;
-    let trigger = make_device_array_py(device_id, pair.trigger)?;
-    Ok((predict, trigger))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pma_output_into_js(data: &[f64], out: &js_sys::Float64Array) -> Result<usize, JsValue> {
-    let values = pma_js(data)?;
-    crate::write_wasm_f64_output("pma_output_into_js", &values, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_pma_default_candles(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PmaInput::with_default_candles(&candles);
         let output = pma_with_kernel(&input, kernel)?;
         assert_eq!(output.predict.len(), candles.close.len());
@@ -1310,8 +939,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PmaInput::from_candles(&candles, "hl2", PmaParams {});
         let result = pma_with_kernel(&input, kernel)?;
 
@@ -1402,8 +1031,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_sources = vec![
             "close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume",
@@ -1686,8 +1315,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = PmaBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1759,8 +1388,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_sources = vec!["close", "open", "high", "low", "hl2", "hlc3", "ohlc4"];
 
@@ -1850,8 +1479,8 @@ mod tests {
 
     #[test]
     fn test_pma_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PmaInput::with_default_candles(&candles);
 
         let base = pma_with_kernel(&input, Kernel::Auto)?;
@@ -1860,7 +1489,6 @@ mod tests {
         let mut out_predict = vec![0.0; n];
         let mut out_trigger = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             pma_into(&input, &mut out_predict, &mut out_trigger)?;
         }

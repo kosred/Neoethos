@@ -290,7 +290,11 @@ pub fn query_closed_trades(
     out
 }
 
-pub fn query_equity(data_dir: &Path, from_ms: Option<i64>, to_ms: Option<i64>) -> Vec<EquitySample> {
+pub fn query_equity(
+    data_dir: &Path,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+) -> Vec<EquitySample> {
     let mut all: Vec<EquitySample> = read_jsonl(&equity_path(data_dir), "equity");
     all.retain(|s| from_ms.map_or(true, |f| s.ts_ms >= f) && to_ms.map_or(true, |to| s.ts_ms < to));
     all.sort_by_key(|s| s.ts_ms);

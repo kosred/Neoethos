@@ -42,9 +42,11 @@
 //! - Actor loss (exact expectation over the 3 actions):
 //!   `L_π = Σ_a p(a) · [ α·logp(a) − Qmin(s,a) ]`
 //! - Temperature loss (automatic entropy tuning):
-//!   `L_α = − Σ_a p(a) · log_alpha · ( logp(a).detach + H )`
+//!   `L_α = − Σ_a p(a) · log_alpha · ( stop_gradient(logp(a)) + H )`
 //!
-//! All target / stop-gradient terms use [`Tensor::detach`].
+//! All target / stop-gradient terms run on the inner inference backend via
+//! [`AutodiffModule::valid`] and [`Tensor::inner`]. They are wrapped back as
+//! untracked leaves only where a differentiable loss consumes them.
 //!
 //! ## Conventions mirrored from [`crate::exit_agent`]
 //!
@@ -64,7 +66,9 @@ use burn::prelude::*;
 use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
 use burn::tensor::backend::BackendTypes;
 
-use polars::prelude::{DataFrame, Series};
+use ndarray::Array2;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -72,18 +76,42 @@ use crate::base::{
     build_runtime_prediction_with_details, canonical_three_class_label_mapping,
     three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
-use crate::burn_models::{TrainBackend, resolve_train_device};
+use crate::burn_models::validate_loaded_burn_device_identity;
+use crate::burn_models::{InferBackend, TrainBackend, resolve_train_device};
 use crate::rl::{TradingEpisode, build_training_episodes_public};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    FeatureScaler, METADATA_FILE_NAME, feature_matrix_from_dataframe, read_json,
+    FeatureScaler, METADATA_FILE_NAME, feature_matrix_from_frame, read_json,
     remap_three_class_labels, write_json,
 };
 
 /// Number of discrete trading actions (Hold / Buy / Sell).
 const NUM_ACTIONS: usize = 3;
+
+fn sac_backend_f32_matrix(values: &Array2<f64>, context: &str) -> Result<Array2<f32>> {
+    let mut narrowed = Vec::with_capacity(values.len());
+    for ((row, column), value) in values.indexed_iter() {
+        if !value.is_finite() {
+            bail!("{context} contains non-finite value {value} at row {row}, column {column}");
+        }
+        let narrowed_value = *value as f32;
+        if !narrowed_value.is_finite() {
+            bail!(
+                "{context} value {value} at row {row}, column {column} overflows the SAC f32 backend"
+            );
+        }
+        if *value != 0.0 && narrowed_value == 0.0 {
+            bail!(
+                "{context} value {value} at row {row}, column {column} underflows the SAC f32 backend"
+            );
+        }
+        narrowed.push(narrowed_value);
+    }
+    Array2::from_shape_vec(values.raw_dim(), narrowed)
+        .context("shape checked SAC f32 backend matrix")
+}
 
 // ============================================================================
 // NETWORKS
@@ -495,7 +523,7 @@ fn validate_sac_artifact(artifact: &SoftActorCriticArtifact) -> Result<()> {
         {
             bail!("sac artifact feature_scaler contains non-finite values");
         }
-        if scaler.stds.iter().any(|value| *value <= f32::EPSILON) {
+        if scaler.stds.iter().any(|value| *value <= f64::EPSILON) {
             bail!("sac artifact feature_scaler contains non-positive standard deviations");
         }
     }
@@ -671,7 +699,8 @@ impl SoftActorCritic {
     pub fn with_hidden_dim(state_dim: usize, hidden_dim: usize) -> Self {
         let state_dim = state_dim.max(1);
         let hidden_dim = hidden_dim.max(8);
-        let (device, selection) = resolve_train_device("auto");
+        let (device, selection) =
+            resolve_train_device("auto").expect("canonical Burn auto training policy must resolve");
         let cfg = SacNetConfig::new()
             .with_input_dim(state_dim)
             .with_hidden_dim(hidden_dim);
@@ -718,6 +747,44 @@ impl SoftActorCritic {
             persisted_effective_device_policy: None,
             persisted_execution_backend: None,
         }
+    }
+
+    pub fn with_device_policy(mut self, policy: impl Into<String>) -> Result<Self> {
+        let requested = policy.into();
+        let (device, selection) = resolve_train_device(&requested)?;
+        let cfg = SacNetConfig::new()
+            .with_input_dim(self.state_dim)
+            .with_hidden_dim(self.hidden_dim);
+        let actor = cfg.init_actor(&device);
+        let critic1 = cfg.init_critic(&device);
+        let critic2 = cfg.init_critic(&device);
+        let temperature = SacTemperature::init(&device, self.init_log_alpha);
+
+        self.target_critic1 = critic1.clone();
+        self.target_critic2 = critic2.clone();
+        self.actor_optim = AdamWConfig::new().with_weight_decay(1e-4).init();
+        self.critic1_optim = AdamWConfig::new().with_weight_decay(1e-4).init();
+        self.critic2_optim = AdamWConfig::new().with_weight_decay(1e-4).init();
+        self.alpha_optim = AdamWConfig::new().with_weight_decay(0.0).init();
+        self.actor = actor;
+        self.critic1 = critic1;
+        self.critic2 = critic2;
+        self.temperature = temperature;
+        self.feature_columns.clear();
+        self.feature_scaler = None;
+        self.train_rows = 0;
+        self.tuple_count = 0;
+        self.final_alpha = self.init_log_alpha.exp();
+        self.training_report = None;
+        self.trained_checkpoint_ready = false;
+        self.device = device;
+        self.requested_device_policy = selection.requested_policy;
+        self.effective_device_policy = selection.effective_policy;
+        self.execution_backend = selection.execution_backend;
+        self.persisted_requested_device_policy = None;
+        self.persisted_effective_device_policy = None;
+        self.persisted_execution_backend = None;
+        Ok(self)
     }
 
     /// Read-only view of the trained feature column names + ordering.
@@ -767,7 +834,16 @@ impl SoftActorCritic {
         self
     }
 
-    fn preprocess_state(&self, state: &[f32]) -> Result<Vec<f32>> {
+    fn preprocess_state(&self, state: &[f64]) -> Result<Vec<f32>> {
+        if state.len() != self.state_dim {
+            bail!(
+                "sac runtime state dimension mismatch: expected {}, got {}",
+                self.state_dim,
+                state.len()
+            );
+        }
+        let features = Array2::from_shape_vec((1, state.len()), state.to_vec())
+            .context("shape typed SAC runtime state")?;
         if let Some(scaler) = self.feature_scaler.as_ref() {
             if state.len() != scaler.means.len() {
                 bail!(
@@ -776,22 +852,36 @@ impl SoftActorCritic {
                     state.len()
                 );
             }
-            let features = ndarray::Array2::from_shape_vec((1, state.len()), state.to_vec())
-                .context("shape sac runtime state for scaling")?;
             let scaled = scaler.transform(&features)?;
-            Ok(scaled.row(0).iter().copied().collect())
+            Ok(sac_backend_f32_matrix(&scaled, "scaled SAC runtime state")?
+                .row(0)
+                .iter()
+                .copied()
+                .collect())
         } else {
-            Ok(state.to_vec())
+            Ok(sac_backend_f32_matrix(&features, "SAC runtime state")?
+                .row(0)
+                .iter()
+                .copied()
+                .collect())
         }
     }
 
     /// Soft-update the target critics toward the live critics by `tau`
     /// (Polyak averaging). `θ_tgt ← τ·θ + (1−τ)·θ_tgt`.
     fn soft_update_targets(&mut self) {
+        let target_critic1 =
+            polyak_update(self.target_critic1.valid(), &self.critic1.valid(), self.tau);
+        let target_critic2 =
+            polyak_update(self.target_critic2.valid(), &self.critic2.valid(), self.tau);
         self.target_critic1 =
-            polyak_update(self.target_critic1.clone(), &self.critic1, self.tau);
+            <SacCriticNet<TrainBackend> as AutodiffModule<TrainBackend>>::from_inner(
+                target_critic1,
+            );
         self.target_critic2 =
-            polyak_update(self.target_critic2.clone(), &self.critic2, self.tau);
+            <SacCriticNet<TrainBackend> as AutodiffModule<TrainBackend>>::from_inner(
+                target_critic2,
+            );
     }
 
     /// Forward the full training batch and apply ONE SAC update step
@@ -822,41 +912,41 @@ impl SoftActorCritic {
             TensorData::new(states_flat, [batch_size, self.state_dim]),
             &device,
         );
-        let next_states: Tensor<TrainBackend, 2> = Tensor::from_data(
+        let next_states: Tensor<InferBackend, 2> = Tensor::from_data(
             TensorData::new(next_states_flat, [batch_size, self.state_dim]),
             &device,
         );
-        let rewards: Tensor<TrainBackend, 2> = Tensor::from_data(
+        let rewards: Tensor<InferBackend, 2> = Tensor::from_data(
             TensorData::new(rewards_flat, [batch_size, NUM_ACTIONS]),
             &device,
         );
-        let not_done: Tensor<TrainBackend, 2> = Tensor::from_data(
+        let not_done: Tensor<InferBackend, 2> = Tensor::from_data(
             TensorData::new(not_done_flat, [batch_size, NUM_ACTIONS]),
             &device,
         );
 
-        let alpha = self.temperature.alpha_value(&device)?;
+        let alpha = self.temperature.valid().alpha_value(&device)?;
 
         // ---- Soft state value of next state V(s') ----
         // V(s') = Σ_a p'(a)·[ min(Q1ₜ,Q2ₜ)(s',a) − α·logp'(a) ]
-        let next_logits = self.actor.forward(next_states.clone());
+        let next_logits = self.actor.valid().forward(next_states.clone());
         let next_probs = burn::tensor::activation::softmax(next_logits.clone(), 1);
         let next_log_probs = burn::tensor::activation::log_softmax(next_logits, 1);
-        let next_q1 = self.target_critic1.forward(next_states.clone());
-        let next_q2 = self.target_critic2.forward(next_states);
+        let next_q1 = self.target_critic1.valid().forward(next_states.clone());
+        let next_q2 = self.target_critic2.valid().forward(next_states);
         let next_qmin = tensor_min(next_q1, next_q2);
         // soft per-action value of s': Qmin − α·logp'
         let soft_next = next_qmin - next_log_probs.clone().mul_scalar(alpha);
         // V(s') broadcast back to all actions: Σ_a p'(a)·soft_next, shape [batch,1] → [batch,3]
-        let next_v = (next_probs * soft_next)
-            .sum_dim(1)
-            .reshape([batch_size, 1]);
+        let next_v = (next_probs * soft_next).sum_dim(1).reshape([batch_size, 1]);
 
         // ---- Critic targets (all actions, full information) ----
         // y(s,a) = r(s,a) + γ·(1−done)·V(s')   — stop-gradient
         let gamma = self.gamma;
         let next_v_broadcast = next_v.repeat_dim(1, NUM_ACTIONS);
-        let targets = (rewards + not_done * next_v_broadcast.mul_scalar(gamma)).detach();
+        let targets = Tensor::<TrainBackend, 2>::from_inner(
+            rewards + not_done * next_v_broadcast.mul_scalar(gamma),
+        );
 
         // ---- Critic loss & update ----
         let q1_pred = self.critic1.forward(states.clone());
@@ -865,13 +955,12 @@ impl SoftActorCritic {
             targets.clone(),
             burn::nn::loss::Reduction::Mean,
         );
-        let critic1_loss_value =
-            scalar_from_tensor(critic1_loss.clone(), "sac critic1 loss")?;
+        let critic1_loss_value = scalar_from_tensor(critic1_loss.clone(), "sac critic1 loss")?;
         let grads = critic1_loss.backward();
         let grads_params = GradientsParams::from_grads(grads, &self.critic1);
-        self.critic1 = self
-            .critic1_optim
-            .step(self.learning_rate, self.critic1.clone(), grads_params);
+        self.critic1 =
+            self.critic1_optim
+                .step(self.learning_rate, self.critic1.clone(), grads_params);
 
         let q2_pred = self.critic2.forward(states.clone());
         let critic2_loss = burn::nn::loss::MseLoss::new().forward(
@@ -879,26 +968,26 @@ impl SoftActorCritic {
             targets,
             burn::nn::loss::Reduction::Mean,
         );
-        let critic2_loss_value =
-            scalar_from_tensor(critic2_loss.clone(), "sac critic2 loss")?;
+        let critic2_loss_value = scalar_from_tensor(critic2_loss.clone(), "sac critic2 loss")?;
         let grads = critic2_loss.backward();
         let grads_params = GradientsParams::from_grads(grads, &self.critic2);
-        self.critic2 = self
-            .critic2_optim
-            .step(self.learning_rate, self.critic2.clone(), grads_params);
+        self.critic2 =
+            self.critic2_optim
+                .step(self.learning_rate, self.critic2.clone(), grads_params);
 
         // ---- Actor loss & update ----
-        // L_π = Σ_a p(a)·[ α·logp(a) − min(Q1,Q2)(s,a) ]  (Q detached)
+        // L_π = Σ_a p(a)·[ α·logp(a) − min(Q1,Q2)(s,a) ]
+        // Q is stop-gradient on the inner inference backend.
         let logits = self.actor.forward(states.clone());
         let probs = burn::tensor::activation::softmax(logits.clone(), 1);
         let log_probs = burn::tensor::activation::log_softmax(logits, 1);
-        let q1 = self.critic1.forward(states.clone()).detach();
-        let q2 = self.critic2.forward(states).detach();
-        let qmin = tensor_min(q1, q2);
+        let critic_states = states.inner();
+        let q1 = self.critic1.valid().forward(critic_states.clone());
+        let q2 = self.critic2.valid().forward(critic_states);
+        let qmin = Tensor::<TrainBackend, 2>::from_inner(tensor_min(q1, q2));
         let actor_objective = log_probs.clone().mul_scalar(alpha) - qmin;
         // mean over batch of Σ_a p(a)·objective(a)
-        let actor_loss =
-            (probs.clone() * actor_objective).sum() / (batch_size as f32);
+        let actor_loss = (probs.clone() * actor_objective).sum() / (batch_size as f32);
         let actor_loss_value = scalar_from_tensor(actor_loss.clone(), "sac actor loss")?;
         let grads = actor_loss.backward();
         let grads_params = GradientsParams::from_grads(grads, &self.actor);
@@ -907,13 +996,14 @@ impl SoftActorCritic {
             .step(self.learning_rate, self.actor.clone(), grads_params);
 
         // ---- Temperature (entropy) loss & update ----
-        // L_α = − Σ_a p(a)·log_alpha·( logp(a).detach + H )
-        // policy terms are detached (only log_alpha is optimized here).
-        let probs_d = probs.detach();
-        let log_probs_d = log_probs.detach();
-        let entropy_gap = (log_probs_d + self.target_entropy) * probs_d;
-        // Σ_a entropy_gap(a) per row → [batch, 1]
-        let entropy_gap_sum = entropy_gap.sum_dim(1).reshape([batch_size, 1]);
+        // L_α = − Σ_a p(a)·log_alpha·( stop_gradient(logp(a)) + H )
+        // Policy terms cross the inner-backend boundary, so only log_alpha is optimized here.
+        let entropy_gap_sum = ((log_probs.inner() + self.target_entropy) * probs.inner())
+            .sum_dim(1)
+            .reshape([batch_size, 1]);
+        // Σ_a entropy_gap(a) per row → [batch, 1]. Re-enter autodiff as
+        // an untracked leaf so only log_alpha receives gradients.
+        let entropy_gap_sum = Tensor::<TrainBackend, 2>::from_inner(entropy_gap_sum);
         let log_alpha = self.temperature.log_alpha(&device); // [1,1], differentiable
         let log_alpha_broadcast = log_alpha.repeat_dim(0, batch_size);
         // mean over batch of  −log_alpha·entropy_gap_sum
@@ -932,15 +1022,23 @@ impl SoftActorCritic {
         Ok((critic_loss_value, actor_loss_value, alpha))
     }
 
-    /// Train from a feature DataFrame + label Series (the standard
-    /// orchestrator entry point). Builds episodes via the shared RL
-    /// builder, scales features, and runs `epochs` passes of
-    /// mini-batched SAC updates.
-    pub fn train_on_frame(&mut self, x: &DataFrame, y: &Series) -> Result<SacTrainingReport> {
-        let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
+    /// Train from the canonical typed feature frame and labels. Builds episodes
+    /// via the shared RL builder, scales features, and runs `epochs` passes of
+    /// mini-batched SAC updates within the caller-owned CPU lease.
+    pub fn train_on_frame(
+        &mut self,
+        x: &FeatureFrame,
+        y: &[i32],
+        lease: &CpuLease,
+    ) -> Result<SacTrainingReport> {
+        lease.scope(|| self.train_on_frame_scoped(x, y))
+    }
+
+    fn train_on_frame_scoped(&mut self, x: &FeatureFrame, y: &[i32]) -> Result<SacTrainingReport> {
+        let (features, feature_columns) = feature_matrix_from_frame(x)?;
         if features.ncols() != self.state_dim {
             bail!(
-                "sac feature mismatch: configured state_dim {} vs dataframe {}",
+                "sac feature mismatch: configured state_dim {} vs typed frame {}",
                 self.state_dim,
                 features.ncols()
             );
@@ -949,10 +1047,14 @@ impl SoftActorCritic {
             bail!("sac requires at least one feature column");
         }
         if features.nrows() < 48 {
-            bail!("sac requires at least 48 rows, received {}", features.nrows());
+            bail!(
+                "sac requires at least 48 rows, received {}",
+                features.nrows()
+            );
         }
         let scaler = FeatureScaler::fit(&features)?;
-        let scaled = scaler.transform(&features)?;
+        let scaled_f64 = scaler.transform(&features)?;
+        let scaled = sac_backend_f32_matrix(&scaled_f64, "scaled SAC training features")?;
         let labels = remap_three_class_labels(y)?;
         if scaled.nrows() != labels.len() {
             bail!(
@@ -1053,7 +1155,12 @@ impl SoftActorCritic {
 
         info!(
             "trained SAC-discrete agent (rows={}, tuples={}, batches={}, final_alpha={:.4}, critic_loss={:.5}, actor_loss={:.5})",
-            self.train_rows, self.tuple_count, batches, final_alpha, final_critic_loss, final_actor_loss
+            self.train_rows,
+            self.tuple_count,
+            batches,
+            final_alpha,
+            final_critic_loss,
+            final_actor_loss
         );
         Ok(report)
     }
@@ -1121,6 +1228,11 @@ impl SoftActorCritic {
     /// Maps directly to the canonical 3-class `[neutral, buy, sell]`
     /// ordering (Hold == neutral), matching the DQN entry voter.
     pub fn policy_probabilities(&self, state: &[f32]) -> Result<[f32; NUM_ACTIONS]> {
+        let typed_state = state.iter().copied().map(f64::from).collect::<Vec<_>>();
+        self.policy_probabilities_f64(&typed_state)
+    }
+
+    fn policy_probabilities_f64(&self, state: &[f64]) -> Result<[f32; NUM_ACTIONS]> {
         if state.len() != self.state_dim {
             bail!(
                 "sac policy state dimension mismatch: expected {}, got {}",
@@ -1129,13 +1241,13 @@ impl SoftActorCritic {
             );
         }
         let scaled = self.preprocess_state(state)?;
-        let state_tensor = Tensor::<TrainBackend, 1>::from_data(
+        let state_tensor = Tensor::<InferBackend, 1>::from_data(
             TensorData::new(scaled, [self.state_dim]),
             &self.device,
         )
         .unsqueeze::<2>();
-        let probs = self
-            .actor
+        let inference_actor = self.actor.valid();
+        let probs = inference_actor
             .policy(state_tensor)
             .into_data()
             .to_vec::<f32>()
@@ -1164,12 +1276,20 @@ impl SoftActorCritic {
         Ok(out)
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        lease.scope(|| self.predict_runtime_scoped(x))
+    }
+
+    fn predict_runtime_scoped(&self, x: &FeatureFrame) -> Result<Vec<RuntimePrediction>> {
         self.ensure_runtime_ready()?;
-        let (features, columns) = feature_matrix_from_dataframe(x)?;
+        let (features, columns) = feature_matrix_from_frame(x)?;
         if features.ncols() != self.state_dim {
             bail!(
-                "sac prediction feature mismatch: configured state_dim {} vs dataframe {}",
+                "sac prediction feature mismatch: configured state_dim {} vs typed frame {}",
                 self.state_dim,
                 features.ncols()
             );
@@ -1186,13 +1306,14 @@ impl SoftActorCritic {
         let mut predictions = Vec::with_capacity(features.nrows());
         for row in features.outer_iter() {
             let state = row.iter().copied().collect::<Vec<_>>();
-            let probabilities = self.policy_probabilities(&state)?;
-            let (confidence, abstain) = three_class_runtime_confidence(probabilities)?;
+            let probabilities = self.policy_probabilities_f64(&state)?;
+            let probabilities_f64 = probabilities.map(f64::from);
+            let (confidence, abstain) = three_class_runtime_confidence(probabilities_f64)?;
             predictions.push(build_runtime_prediction_with_details(
                 "sac",
                 ModelFamily::Rl,
                 CapabilityState::Implemented,
-                probabilities,
+                probabilities_f64,
                 Some(confidence),
                 Some(abstain),
                 Some(self.execution_backend.clone()),
@@ -1332,9 +1453,7 @@ impl SoftActorCritic {
                 .clone()
                 .valid()
                 .save_file(Self::temperature_record_base(&staged_path), &recorder)
-                .with_context(|| {
-                    format!("persist sac temperature to {}", staged_path.display())
-                })?;
+                .with_context(|| format!("persist sac temperature to {}", staged_path.display()))?;
 
             let runtime_metadata =
                 sac_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows)?;
@@ -1370,7 +1489,14 @@ impl SoftActorCritic {
         let persisted_requested_device_policy = artifact.requested_device_policy.clone();
         let persisted_effective_device_policy = artifact.effective_device_policy.clone();
         let persisted_execution_backend = artifact.execution_backend.clone();
-        let (device, selection) = resolve_train_device(&requested_device_policy);
+        let (device, selection) = resolve_train_device(&requested_device_policy)?;
+        validate_loaded_burn_device_identity(
+            "sac",
+            persisted_requested_device_policy.as_deref(),
+            persisted_effective_device_policy.as_deref(),
+            persisted_execution_backend.as_deref(),
+            &selection,
+        )?;
         if let Some(persisted) = persisted_effective_device_policy.as_deref()
             && persisted != selection.effective_policy
         {
@@ -1456,11 +1582,11 @@ fn tensor_min<B: Backend>(a: Tensor<B, 2>, b: Tensor<B, 2>) -> Tensor<B, 2> {
 
 /// Polyak (soft) update: `dst ← τ·src + (1−τ)·dst`, applied to every
 /// float parameter tensor of the critic module.
-fn polyak_update<B: Backend>(
-    dst: SacCriticNet<B>,
-    src: &SacCriticNet<B>,
+fn polyak_update(
+    dst: SacCriticNet<InferBackend>,
+    src: &SacCriticNet<InferBackend>,
     tau: f32,
-) -> SacCriticNet<B> {
+) -> SacCriticNet<InferBackend> {
     let SacCriticNet { fc1, fc2, head } = dst;
     SacCriticNet {
         fc1: blend_linear(fc1, &src.fc1, tau),
@@ -1469,15 +1595,17 @@ fn polyak_update<B: Backend>(
     }
 }
 
-fn blend_linear<B: Backend>(dst: nn::Linear<B>, src: &nn::Linear<B>, tau: f32) -> nn::Linear<B> {
+fn blend_linear(
+    dst: nn::Linear<InferBackend>,
+    src: &nn::Linear<InferBackend>,
+    tau: f32,
+) -> nn::Linear<InferBackend> {
     let mut out = dst;
-    // detach so the target network is a non-differentiable copy.
-    let new_weight =
-        out.weight.val().mul_scalar(1.0 - tau) + src.weight.val().mul_scalar(tau);
-    out.weight = burn::module::Param::from_tensor(new_weight.detach());
+    let new_weight = out.weight.val().mul_scalar(1.0 - tau) + src.weight.val().mul_scalar(tau);
+    out.weight = burn::module::Param::from_tensor(new_weight);
     if let (Some(dst_bias), Some(src_bias)) = (out.bias.take(), src.bias.as_ref()) {
         let new_bias = dst_bias.val().mul_scalar(1.0 - tau) + src_bias.val().mul_scalar(tau);
-        out.bias = Some(burn::module::Param::from_tensor(new_bias.detach()));
+        out.bias = Some(burn::module::Param::from_tensor(new_bias));
     }
     out
 }

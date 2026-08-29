@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -62,10 +44,6 @@ pub struct VelocityOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VelocityParams {
     pub length: Option<usize>,
     pub smooth_length: Option<usize>,
@@ -282,11 +260,7 @@ impl VelocityCore {
         }
         let idx = (self.history_head + self.length - lag) % self.length;
         let value = self.history[idx];
-        if value.is_finite() {
-            value
-        } else {
-            0.0
-        }
+        if value.is_finite() { value } else { 0.0 }
     }
 
     #[inline(always)]
@@ -431,11 +405,7 @@ fn compute_velocity_default_into(data: &[f64], first_valid: usize, out: &mut [f6
                         hist_idx -= DEFAULT_LENGTH;
                     }
                     let past = history[hist_idx];
-                    if past.is_finite() {
-                        past
-                    } else {
-                        0.0
-                    }
+                    if past.is_finite() { past } else { 0.0 }
                 } else {
                     0.0
                 };
@@ -545,7 +515,6 @@ pub fn velocity_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn velocity_into(input: &VelocityInput, out: &mut [f64]) -> Result<(), VelocityError> {
     velocity_into_slice(out, input, Kernel::Auto)
@@ -960,347 +929,10 @@ fn velocity_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "velocity")]
-#[pyo3(signature = (data, length=21, smooth_length=5, kernel=None))]
-pub fn velocity_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    smooth_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = VelocityInput::from_slice(
-        slice,
-        VelocityParams {
-            length: Some(length),
-            smooth_length: Some(smooth_length),
-        },
-    );
-    let out = py
-        .allow_threads(|| velocity_with_kernel(&input, kernel).map(|output| output.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "velocity_batch")]
-#[pyo3(signature = (data, length_range, smooth_length_range, kernel=None))]
-pub fn velocity_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    smooth_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = VelocityBatchRange {
-        length: length_range,
-        smooth_length: smooth_length_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch_kernel = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            velocity_batch_inner_into(
-                slice,
-                &sweep,
-                batch_kernel,
-                !matches!(batch_kernel, Kernel::ScalarBatch),
-                out_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_lengths",
-        combos
-            .iter()
-            .map(|combo| combo.smooth_length.unwrap_or(DEFAULT_SMOOTH_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VelocityStream")]
-pub struct VelocityStreamPy {
-    inner: VelocityStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VelocityStreamPy {
-    #[new]
-    pub fn new(length: usize, smooth_length: usize) -> PyResult<Self> {
-        let inner = VelocityStream::try_new(VelocityParams {
-            length: Some(length),
-            smooth_length: Some(smooth_length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_velocity_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(velocity_py, m)?)?;
-    m.add_function(wrap_pyfunction!(velocity_batch_py, m)?)?;
-    m.add_class::<VelocityStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VelocityBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub smooth_length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VelocityBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<VelocityParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_js(data: &[f64], length: usize, smooth_length: usize) -> Result<Vec<f64>, JsValue> {
-    let input = VelocityInput::from_slice(
-        data,
-        VelocityParams {
-            length: Some(length),
-            smooth_length: Some(smooth_length),
-        },
-    );
-    let mut out = vec![0.0; data.len()];
-    velocity_into_slice(&mut out, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = velocity_batch)]
-pub fn velocity_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: VelocityBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = VelocityBatchRange {
-        length: config.length_range,
-        smooth_length: config.smooth_length_range,
-    };
-    let output = velocity_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&VelocityBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_alloc(len: usize) -> *mut f64 {
-    let mut values = Vec::<f64>::with_capacity(len);
-    let ptr = values.as_mut_ptr();
-    std::mem::forget(values);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    smooth_length: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to velocity_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = VelocityInput::from_slice(
-            data,
-            VelocityParams {
-                length: Some(length),
-                smooth_length: Some(smooth_length),
-            },
-        );
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            velocity_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            velocity_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    smooth_length_start: usize,
-    smooth_length_end: usize,
-    smooth_length_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to velocity_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = VelocityBatchRange {
-            length: (length_start, length_end, length_step),
-            smooth_length: (smooth_length_start, smooth_length_end, smooth_length_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let batch_kernel = detect_best_batch_kernel();
-        velocity_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel,
-            !matches!(batch_kernel, Kernel::ScalarBatch),
-            out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct VelocityStreamWasm {
-    inner: VelocityStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl VelocityStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(length: usize, smooth_length: usize) -> Result<VelocityStreamWasm, JsValue> {
-        Ok(Self {
-            inner: VelocityStream::try_new(VelocityParams {
-                length: Some(length),
-                smooth_length: Some(smooth_length),
-            })
-            .map_err(|e| JsValue::from_str(&e.to_string()))?,
-        })
-    }
-
-    pub fn update(&mut self, value: f64) -> Result<JsValue, JsValue> {
-        match self.inner.update(value) {
-            Some(output) => {
-                serde_wasm_bindgen::to_value(&output).map_err(|e| JsValue::from_str(&e.to_string()))
-            }
-            None => Ok(JsValue::NULL),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_output_into_js(
-    data: &[f64],
-    length: usize,
-    smooth_length: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = velocity_js(data, length, smooth_length)?;
-    crate::write_wasm_f64_output("velocity_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = velocity_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("velocity_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     fn naive_velocity(data: &[f64], length: usize, smooth_length: usize) -> Vec<f64> {
@@ -1320,11 +952,7 @@ mod tests {
             for lag in 1..=length {
                 let hist = if idx >= lag {
                     let prev = data[idx - lag];
-                    if prev.is_finite() {
-                        prev
-                    } else {
-                        0.0
-                    }
+                    if prev.is_finite() { prev } else { 0.0 }
                 } else {
                     0.0
                 };
@@ -1435,7 +1063,7 @@ mod tests {
 
     #[test]
     fn velocity_fixture_has_values() -> Result<(), Box<dyn Error>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let out = velocity(&VelocityInput::with_default_candles(&candles))?;
         assert_eq!(out.values.len(), candles.close.len());
         assert!(out.values.iter().skip(64).any(|value| value.is_finite()));

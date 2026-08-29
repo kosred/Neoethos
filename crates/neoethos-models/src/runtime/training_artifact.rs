@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use crate::base::feature_columns_from_dataframe;
+use crate::burn_models::active_burn_backend_name;
 use crate::parallel_trainer::{ModelConfig, TrainingPayload};
 use crate::runtime::capabilities::{
     ModelFamily, runtime_backend_kind_from_label, runtime_mode_from_details,
@@ -105,15 +105,15 @@ fn build_training_profile_provenance(
     let runtime_mode = runtime_mode_from_details(Some(backend_kind), degraded_message.as_deref())
         .unwrap_or(RuntimeMode::Canonical);
     let runtime_degraded_reason = typed_runtime_degraded_reason(degraded_message.as_deref());
-    let feature_columns = feature_columns_from_dataframe(&payload.frame);
+    let feature_columns = payload.frame.names.clone();
 
     let provenance = ArtifactProvenance::new(
         artifact_kind,
         stable_json_hash(&serde_json::json!({
             "feature_columns": feature_columns,
-            "feature_count": payload.frame.width(),
+            "feature_count": payload.frame.n_features(),
         }))?,
-        training_dataset_fingerprint(payload),
+        training_dataset_fingerprint(payload)?,
         stable_json_hash(&serde_json::json!({
             "symbols": [profile.symbol.as_str()],
         }))?,
@@ -212,21 +212,39 @@ fn training_label_histogram(labels: &[i32]) -> BTreeMap<i32, usize> {
     histogram
 }
 
-fn training_dataset_fingerprint(payload: &TrainingPayload) -> String {
-    let mut hash = fnv1a64(b"training-dataset-v1");
-    hash = fnv1a64_update(hash, &(payload.frame.height() as u64).to_le_bytes());
-    hash = fnv1a64_update(hash, &(payload.frame.width() as u64).to_le_bytes());
-    for column_name in feature_columns_from_dataframe(&payload.frame) {
+fn training_dataset_fingerprint(payload: &TrainingPayload) -> Result<String> {
+    let mut hash = fnv1a64(b"training-dataset-f64-validity-v2");
+    hash = fnv1a64_update(hash, &(payload.frame.n_samples() as u64).to_le_bytes());
+    hash = fnv1a64_update(hash, &(payload.frame.n_features() as u64).to_le_bytes());
+    hash = fnv1a64_update(hash, payload.frame.plan_identity().to_hex().as_bytes());
+    hash = fnv1a64_update(
+        hash,
+        payload.frame.provenance_identity().to_hex().as_bytes(),
+    );
+    for column_name in &payload.frame.names {
         hash = fnv1a64_update(hash, column_name.as_bytes());
         hash = fnv1a64_update(hash, b"\0");
     }
-    for value in payload.dense_features.iter() {
+    for timestamp in &payload.frame.timestamps {
+        hash = fnv1a64_update(hash, &timestamp.to_le_bytes());
+    }
+    for source_row in payload.source_row_indices.iter() {
+        hash = fnv1a64_update(hash, &(*source_row as u64).to_le_bytes());
+    }
+    let dense = payload
+        .frame
+        .to_dense_samples_major()
+        .context("materialize f64+validity payload for artifact fingerprint")?;
+    for value in dense.values.iter() {
         hash = fnv1a64_update(hash, &value.to_le_bytes());
+    }
+    for validity in dense.validity.iter() {
+        hash = fnv1a64_update(hash, &[validity.code()]);
     }
     for label in payload.labels.iter() {
         hash = fnv1a64_update(hash, &label.to_le_bytes());
     }
-    format!("fnv64:{hash:016x}")
+    Ok(format!("fnv64:{hash:016x}"))
 }
 
 fn training_runtime_backend_label(
@@ -240,9 +258,20 @@ fn training_runtime_backend_label(
         .unwrap_or("auto")
         .trim()
         .to_ascii_lowercase();
-    let fallback = match config.capability_family {
+    resolve_training_runtime_backend_label(config.capability_family, &raw_backend)
+}
+
+fn resolve_training_runtime_backend_label(
+    capability_family: ModelFamily,
+    raw_backend: &str,
+) -> String {
+    let fallback = match capability_family {
         ModelFamily::Tree => "tree_cpu",
-        ModelFamily::Deep | ModelFamily::Exit => "burn_cpu",
+        ModelFamily::Deep | ModelFamily::Exit => match active_burn_backend_name() {
+            "cuda" => "burn_cuda",
+            "wgpu" => "wgpu",
+            _ => "burn_cpu",
+        },
         ModelFamily::Forecasting
         | ModelFamily::Meta
         | ModelFamily::Evolutionary
@@ -254,7 +283,7 @@ fn training_runtime_backend_label(
         return fallback.to_string();
     }
 
-    match config.capability_family {
+    match capability_family {
         ModelFamily::Tree if raw_backend == "cpu" => "tree_cpu".to_string(),
         ModelFamily::Tree
             if raw_backend == "gpu"
@@ -266,14 +295,11 @@ fn training_runtime_backend_label(
         }
         ModelFamily::Deep | ModelFamily::Exit if raw_backend == "cpu" => "burn_cpu".to_string(),
         ModelFamily::Deep | ModelFamily::Exit
-            if matches!(
-                raw_backend.as_str(),
-                "wgpu" | "vulkan" | "metal" | "dx12" | "rocm"
-            ) =>
+            if matches!(raw_backend, "wgpu" | "vulkan" | "metal" | "dx12" | "rocm") =>
         {
             "wgpu".to_string()
         }
-        _ => raw_backend,
+        _ => raw_backend.to_string(),
     }
 }
 
@@ -356,4 +382,41 @@ fn training_source_commit() -> String {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown-local-source".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_auto_backend_records_the_compiled_burn_runtime() {
+        let label = resolve_training_runtime_backend_label(ModelFamily::Deep, "auto");
+
+        #[cfg(feature = "burn-cuda-backend")]
+        {
+            assert_eq!(label, "burn_cuda");
+            assert_eq!(
+                runtime_backend_kind_from_label(Some(&label)),
+                Some(BackendKind::NativeCuda)
+            );
+        }
+
+        #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+        {
+            assert_eq!(label, "wgpu");
+            assert_eq!(
+                runtime_backend_kind_from_label(Some(&label)),
+                Some(BackendKind::BurnWgpu)
+            );
+        }
+
+        #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+        {
+            assert_eq!(label, "burn_cpu");
+            assert_eq!(
+                runtime_backend_kind_from_label(Some(&label)),
+                Some(BackendKind::BurnCpu)
+            );
+        }
+    }
 }

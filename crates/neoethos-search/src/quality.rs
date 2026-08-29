@@ -7,6 +7,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
+const TARGET_DOWNSIDE_SORTINO_SEMANTICS_V1: &str = "neoethos.target-downside-sortino.v1";
+const TARGET_DOWNSIDE_SORTINO_PRIMARY_SOURCE_V1: &str =
+    "https://www.cmegroup.com/education/files/rr-sortino-a-sharper-ratio.pdf";
+const SORTINO_TARGET_RETURN_V1: f64 = 0.0;
+const INVALID_TARGET_DOWNSIDE_SORTINO_V1: f64 = f64::NEG_INFINITY;
+
 /// Typed replacement for the legacy `NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH`
 /// and `NEOETHOS_BOT_TRADING_DAYS_PER_MONTH` env vars. Previously read inline
 /// inside monthly metric aggregation, both knobs change canonical strategy
@@ -44,13 +50,12 @@ impl QualityRuntimeOverrides {
     /// test guarantees a fresh `Settings` reproduces [`Self::default`].
     pub fn from_settings(s: &neoethos_core::Settings) -> Self {
         let c = &s.models.quality_runtime;
-        let trading_days = if c.trading_days_per_month.is_finite()
-            && c.trading_days_per_month >= 1.0
-        {
-            c.trading_days_per_month
-        } else {
-            Self::default().trading_days_per_month
-        };
+        let trading_days =
+            if c.trading_days_per_month.is_finite() && c.trading_days_per_month >= 1.0 {
+                c.trading_days_per_month
+            } else {
+                Self::default().trading_days_per_month
+            };
         Self {
             min_trades_per_month: c.min_trades_per_month,
             trading_days_per_month: trading_days,
@@ -74,18 +79,6 @@ pub fn install_quality_runtime_overrides(
     overrides: QualityRuntimeOverrides,
 ) -> Result<(), QualityRuntimeOverrides> {
     QUALITY_RUNTIME_OVERRIDES.set(overrides)
-}
-
-/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
-/// Kept only because `lib.rs` re-exports it; see the handoff for the one-line
-/// removal.
-pub fn install_quality_runtime_overrides_from_env() {
-    tracing::error!(
-        target: "neoethos_search::retired_env",
-        "install_quality_runtime_overrides_from_env() is RETIRED and installs typed \
-         DEFAULTS. Call install_quality_runtime_overrides_from_settings(&settings)."
-    );
-    let _ = QUALITY_RUNTIME_OVERRIDES.set(QualityRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the quality knobs from the single
@@ -381,6 +374,13 @@ impl StrategyQualityAnalyzer {
         let trades_per_year = (trades_per_month_raw * 12.0).max(1.0);
         let sharpe = calculate_sharpe(&returns, trades_per_year);
         let sortino = calculate_sortino(&returns, trades_per_year);
+        if !sortino.is_finite() {
+            let mut invalid = empty_metrics(strategy_id);
+            invalid.sortino_ratio = INVALID_TARGET_DOWNSIDE_SORTINO_V1;
+            invalid.quality_score = f64::NEG_INFINITY;
+            invalid.recommendation = "INVALID_SORTINO_INPUT".to_string();
+            return invalid;
+        }
 
         let total_return = pnls.iter().sum::<f64>();
         let total_return_pct = total_return / initial_balance;
@@ -779,20 +779,44 @@ fn calculate_sharpe(returns: &[f64], trades_per_year: f64) -> f64 {
 }
 
 fn calculate_sortino(returns: &[f64], trades_per_year: f64) -> f64 {
+    let _authority = (
+        TARGET_DOWNSIDE_SORTINO_SEMANTICS_V1,
+        TARGET_DOWNSIDE_SORTINO_PRIMARY_SOURCE_V1,
+    );
+    if !trades_per_year.is_finite() || returns.iter().any(|value| !value.is_finite()) {
+        return INVALID_TARGET_DOWNSIDE_SORTINO_V1;
+    }
     if returns.len() < 2 {
         return 0.0;
     }
-    let mean_ret = mean(returns);
-    let downside: Vec<f64> = returns.iter().cloned().filter(|v| *v < 0.0).collect();
-    if downside.len() < 2 {
-        return 0.0;
+
+    let mean_return = mean(returns);
+    if !mean_return.is_finite() {
+        return INVALID_TARGET_DOWNSIDE_SORTINO_V1;
     }
-    let std_down = stddev_sample(&downside, 0.0);
-    if std_down < 1e-9 {
+    let mut downside_sum_squares = 0.0;
+    for &period_return in returns {
+        let shortfall = (period_return - SORTINO_TARGET_RETURN_V1).min(0.0);
+        downside_sum_squares += shortfall * shortfall;
+        if !downside_sum_squares.is_finite() {
+            return INVALID_TARGET_DOWNSIDE_SORTINO_V1;
+        }
+    }
+    let target_downside_deviation = (downside_sum_squares / returns.len() as f64).sqrt();
+    if !target_downside_deviation.is_finite() {
+        return INVALID_TARGET_DOWNSIDE_SORTINO_V1;
+    }
+    if target_downside_deviation < 1e-9 {
         return 0.0;
     }
     let annualization = trades_per_year.max(1.0).sqrt();
-    (mean_ret / std_down) * annualization
+    let sortino =
+        ((mean_return - SORTINO_TARGET_RETURN_V1) / target_downside_deviation) * annualization;
+    if sortino.is_finite() {
+        sortino
+    } else {
+        INVALID_TARGET_DOWNSIDE_SORTINO_V1
+    }
 }
 
 fn longest_streak(pnls: &[f64], win: bool) -> usize {
@@ -837,7 +861,10 @@ fn time_in_market(trades: &[Trade]) -> f64 {
     if total <= 0.0 {
         return 0.0;
     }
-    let held: f64 = spans.iter().map(|(entry, exit)| (exit - entry) as f64).sum();
+    let held: f64 = spans
+        .iter()
+        .map(|(entry, exit)| (exit - entry) as f64)
+        .sum();
     held / total
 }
 

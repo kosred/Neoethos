@@ -1,24 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -26,11 +11,6 @@ use core::arch::x86_64::*;
 use rayon::prelude::*;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaMedprice};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
 
 #[derive(Debug, Clone)]
 pub enum MedpriceData<'a> {
@@ -51,10 +31,6 @@ pub struct MedpriceOutput {
 }
 
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MedpriceParams;
 
 #[derive(Debug, Clone)]
@@ -246,7 +222,6 @@ pub fn medprice_with_kernel(
     Ok(MedpriceOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn medprice_into(input: &MedpriceInput, out: &mut [f64]) -> Result<(), MedpriceError> {
     medprice_into_slice(out, input, Kernel::Auto)
@@ -835,127 +810,11 @@ pub fn medprice_into_slice(
     Ok(())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "medprice")]
-#[pyo3(signature = (high, low, kernel=None))]
-pub fn medprice_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let input = MedpriceInput::from_slices(high_slice, low_slice, MedpriceParams::default());
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| medprice_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MedpriceStream")]
-pub struct MedpriceStreamPy {
-    stream: MedpriceStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MedpriceStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        let stream = MedpriceStream::try_new().map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(MedpriceStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "medprice_batch")]
-#[pyo3(signature = (high, low, dummy_range=None, kernel=None))]
-pub fn medprice_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    dummy_range: Option<(usize, usize, usize)>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    let range_tuple = dummy_range.unwrap_or((0, 0, 0));
-    let range = MedpriceBatchRange { dummy: range_tuple };
-    let _ = expand_grid(&range).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows: usize = 1;
-    let cols: usize = high_slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("medprice_batch: rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let _combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => Kernel::ScalarBatch,
-                k => k,
-            };
-            medprice_batch_inner_into(high_slice, low_slice, kernel, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    dict.set_item("params", Vec::<u64>::new().into_pyarray(py))?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medprice_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = medprice_js(high, low)?;
-    crate::write_wasm_f64_output("medprice_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medprice_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = medprice_batch_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs("medprice_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     fn check_medprice_with_default_candles(
@@ -963,8 +822,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MedpriceInput::with_default_candles(&candles);
         let output = medprice_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -976,8 +835,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MedpriceInput::from_candles(&candles, "high", "low", MedpriceParams);
         let result = medprice_with_kernel(&input, kernel)?;
         assert_eq!(
@@ -1151,8 +1010,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let high = source_type(&c, "high");
         let low = source_type(&c, "low");
@@ -1242,7 +1101,6 @@ mod tests {
         let baseline = medprice(&input).expect("baseline medprice failed").values;
 
         let mut out = vec![0.0; baseline.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             medprice_into(&input, &mut out).expect("medprice_into failed");
         }
@@ -1263,207 +1121,4 @@ mod tests {
             );
         }
     }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medprice_js(high: &[f64], low: &[f64]) -> Result<Vec<f64>, JsValue> {
-    let mut output = vec![0.0; high.len()];
-
-    medprice_into_slice_raw(&mut output, high, low, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medprice_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medprice_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medprice_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to medprice_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        if high_ptr == out_ptr || low_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            medprice_into_slice_raw(&mut temp, high, low, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            medprice_into_slice_raw(out, high, low, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MedpriceBatchConfig {
-    pub dummy_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MedpriceBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<MedpriceParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = medprice_batch)]
-pub fn medprice_batch_js(high: &[f64], low: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let _config: Option<MedpriceBatchConfig> = if config.is_object() {
-        serde_wasm_bindgen::from_value(config).ok()
-    } else {
-        None
-    };
-
-    let mut output = vec![0.0; high.len()];
-    medprice_into_slice_raw(&mut output, high, low, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = MedpriceBatchJsOutput {
-        values: output,
-        combos: vec![MedpriceParams::default()],
-        rows: 1,
-        cols: high.len(),
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(feature = "python")]
-pub fn register_medprice_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(medprice_py, m)?)?;
-    m.add_function(wrap_pyfunction!(medprice_batch_py, m)?)?;
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "medprice_cuda_dev")]
-#[pyo3(signature = (high, low, device_id=0))]
-pub fn medprice_cuda_dev_py(
-    py: Python<'_>,
-    high: numpy::PyReadonlyArray1<'_, f32>,
-    low: numpy::PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaMedprice::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.medprice_dev(hs, ls)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "medprice_cuda_batch_dev")]
-#[pyo3(signature = (high, low, device_id=0))]
-pub fn medprice_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: numpy::PyReadonlyArray1<'_, f32>,
-    low: numpy::PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaMedprice::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.medprice_batch_dev(hs, ls)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "medprice_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, cols, rows, device_id=0))]
-pub fn medprice_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let hs = high_tm.as_slice()?;
-    let ls = low_tm.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaMedprice::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.medprice_many_series_one_param_time_major_dev(hs, ls, cols, rows)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
 }

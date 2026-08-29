@@ -12,10 +12,27 @@
 // FILE-LOCAL allow only — NOT a workspace lint override.
 #![allow(dead_code)]
 
+use super::ctrader_historical_admission::{
+    CTRADER_CONNECT_TIMEOUT, CTRADER_HISTORICAL_REQUEST_MIN_INTERVAL,
+    CTRADER_RESPONSE_POLL_INTERVAL, CTRADER_RESPONSE_TIMEOUT, CTRADER_SOCKET_WRITE_TIMEOUT,
+    CTraderIoDirection, CTraderIoPhase, CTraderOperationBudget, CTraderSocketConnector,
+    ConnectionHistoricalAdmission, ConnectionResponseDeadline, DeadlineIo,
+    HistoricalAdmissionSendError, HistoricalRequestCancellation, HistoricalRequestCancelled,
+    SystemCTraderMonotonicClock, establish_ctrader_socket_with_connector,
+    should_retry_ctrader_error,
+};
 use anyhow::{Context, Result, anyhow};
+use hickory_resolver::Resolver;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tungstenite::{Message, connect};
+use std::fmt;
+use std::io;
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::time::Duration;
+use tungstenite::handshake::HandshakeError;
+use tungstenite::protocol::WebSocketConfig;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket, client_tls_with_config};
 
 // 2026-08-09 (D2b): `CTRADER_TRANSPORT_ENV_VAR`
 // (`NEOETHOS_BOT_CTRADER_TRANSPORT`) was removed here together with the
@@ -479,8 +496,245 @@ pub trait CTraderOpenApiTransport {
     fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>>;
 }
 
+/// The request payloads covered by cTrader's historical-data quota. Keep this
+/// list exact: authentication, symbol metadata, and live trading messages must
+/// never inherit historical pacing.
+fn is_ctrader_historical_request(payload_type: u32) -> bool {
+    matches!(
+        payload_type,
+        CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE
+            | CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE
+            | CTRADER_OA_CASH_FLOW_HISTORY_LIST_REQUEST_PAYLOAD_TYPE
+            | CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE
+    )
+}
+
 pub struct ProductionCTraderOpenApiTransport {
     endpoint_host: String,
+}
+
+const CTRADER_JSON_WSS_PORT: u16 = 5036;
+const CTRADER_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const CTRADER_MAX_WEBSOCKET_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const CTRADER_MAX_WEBSOCKET_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+
+type ProductionCTraderBudget = CTraderOperationBudget<SystemCTraderMonotonicClock>;
+type ProductionCTraderDeadlineIo = DeadlineIo<TcpStream, SystemCTraderMonotonicClock>;
+type ProductionCTraderSocket = WebSocket<MaybeTlsStream<ProductionCTraderDeadlineIo>>;
+
+struct ProductionCTraderSocketConnector {
+    endpoint_host: String,
+    url: String,
+}
+
+impl ProductionCTraderSocketConnector {
+    fn new(endpoint_host: &str, url: String) -> Self {
+        Self {
+            endpoint_host: endpoint_host.to_owned(),
+            url,
+        }
+    }
+}
+
+fn ctrader_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .write_buffer_size(16 * 1024)
+        .max_write_buffer_size(CTRADER_MAX_WEBSOCKET_WRITE_BUFFER_BYTES)
+        .max_message_size(Some(CTRADER_MAX_WEBSOCKET_MESSAGE_BYTES))
+        .max_frame_size(Some(CTRADER_MAX_WEBSOCKET_FRAME_BYTES))
+}
+
+fn ctrader_io_error(context: &str, error: impl fmt::Display) -> io::Error {
+    io::Error::other(format!("{context}: {error}"))
+}
+
+fn ctrader_runtime(phase: CTraderIoPhase) -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| {
+            ctrader_io_error(&format!("failed to create cTrader {phase} runtime"), error)
+        })
+}
+
+fn resolve_ctrader_endpoint(
+    endpoint_host: &str,
+    budget: &ProductionCTraderBudget,
+) -> io::Result<Vec<SocketAddr>> {
+    budget.check_io(CTraderIoPhase::Dns)?;
+    if let Ok(ip) = endpoint_host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, CTRADER_JSON_WSS_PORT)]);
+    }
+
+    let runtime = ctrader_runtime(CTraderIoPhase::Dns)?;
+    let resolved = runtime.block_on(async {
+        budget.check_io(CTraderIoPhase::Dns)?;
+        let resolver = Resolver::builder_tokio()
+            .map_err(|error| ctrader_io_error("failed to load system DNS configuration", error))?
+            .build()
+            .map_err(|error| ctrader_io_error("failed to build cTrader DNS resolver", error))?;
+        let mut lookup = Box::pin(resolver.lookup_ip(endpoint_host));
+        let lookup = loop {
+            let poll = budget
+                .remaining_io(CTraderIoPhase::Dns)?
+                .min(CTRADER_RESPONSE_POLL_INTERVAL);
+            match tokio::time::timeout(poll, lookup.as_mut()).await {
+                Ok(result) => {
+                    break result.map_err(|error| {
+                        ctrader_io_error("failed to resolve cTrader endpoint", error)
+                    })?;
+                }
+                Err(_) => budget.check_io(CTraderIoPhase::Dns)?,
+            }
+        };
+        budget.check_io(CTraderIoPhase::Dns)?;
+        let addresses = lookup
+            .iter()
+            .map(|ip| SocketAddr::new(ip, CTRADER_JSON_WSS_PORT))
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "cTrader DNS response contained no usable IP addresses",
+            ));
+        }
+        Ok(addresses)
+    });
+    drop(runtime);
+    resolved
+}
+
+fn connect_ctrader_tcp(
+    addresses: Vec<SocketAddr>,
+    budget: &ProductionCTraderBudget,
+) -> io::Result<TcpStream> {
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "cTrader TCP connect received no resolved addresses",
+        ));
+    }
+    let runtime = ctrader_runtime(CTraderIoPhase::TcpConnect)?;
+    let connected = runtime.block_on(async {
+        let mut last_error = None;
+        for address in addresses {
+            budget.check_io(CTraderIoPhase::TcpConnect)?;
+            let mut connect = Box::pin(tokio::net::TcpStream::connect(address));
+            let result = loop {
+                let poll = budget
+                    .remaining_io(CTraderIoPhase::TcpConnect)?
+                    .min(CTRADER_RESPONSE_POLL_INTERVAL);
+                match tokio::time::timeout(poll, connect.as_mut()).await {
+                    Ok(result) => break result,
+                    Err(_) => budget.check_io(CTraderIoPhase::TcpConnect)?,
+                }
+            };
+            match result {
+                Ok(stream) => {
+                    budget.check_io(CTraderIoPhase::TcpConnect)?;
+                    stream.set_nodelay(true)?;
+                    let stream = stream.into_std()?;
+                    stream.set_nonblocking(false)?;
+                    return Ok(stream);
+                }
+                Err(error) => last_error = Some((address, error)),
+            }
+        }
+        let (address, error) = last_error.expect("non-empty address list produced an attempt");
+        Err(ctrader_io_error(
+            &format!("failed to connect to cTrader address {address}"),
+            error,
+        ))
+    });
+    drop(runtime);
+    connected
+}
+
+fn configure_ctrader_tcp_timeout(
+    stream: &mut TcpStream,
+    direction: CTraderIoDirection,
+    timeout: Duration,
+) -> io::Result<()> {
+    match direction {
+        CTraderIoDirection::Read => stream.set_read_timeout(Some(timeout)),
+        CTraderIoDirection::Write => stream.set_write_timeout(Some(timeout)),
+    }
+}
+
+fn ctrader_handshake_error(error: tungstenite::Error) -> io::Error {
+    match error {
+        tungstenite::Error::Io(error) => error,
+        error => ctrader_io_error("cTrader TLS/WebSocket handshake failed", error),
+    }
+}
+
+fn handshake_ctrader_websocket(
+    stream: TcpStream,
+    url: &str,
+    budget: &ProductionCTraderBudget,
+) -> io::Result<ProductionCTraderSocket> {
+    let io = DeadlineIo::with_timeout_configurer(
+        stream,
+        budget.clone(),
+        CTraderIoPhase::TlsWebSocketHandshake,
+        CTRADER_RESPONSE_POLL_INTERVAL,
+        configure_ctrader_tcp_timeout,
+    );
+    let mut handshake = client_tls_with_config(url, io, Some(ctrader_websocket_config()), None);
+    loop {
+        match handshake {
+            Ok((socket, _response)) => return Ok(socket),
+            Err(HandshakeError::Failure(error)) => return Err(ctrader_handshake_error(error)),
+            Err(HandshakeError::Interrupted(mid_handshake)) => {
+                budget.wait_for_poll(
+                    CTraderIoPhase::TlsWebSocketHandshake,
+                    CTRADER_RESPONSE_POLL_INTERVAL,
+                )?;
+                handshake = mid_handshake.handshake();
+            }
+        }
+    }
+}
+
+impl CTraderSocketConnector<SystemCTraderMonotonicClock> for ProductionCTraderSocketConnector {
+    type Resolved = Vec<SocketAddr>;
+    type Stream = TcpStream;
+    type Socket = ProductionCTraderSocket;
+
+    fn resolve(&mut self, budget: &ProductionCTraderBudget) -> io::Result<Self::Resolved> {
+        resolve_ctrader_endpoint(&self.endpoint_host, budget)
+    }
+
+    fn connect_tcp(
+        &mut self,
+        resolved: Self::Resolved,
+        budget: &ProductionCTraderBudget,
+    ) -> io::Result<Self::Stream> {
+        connect_ctrader_tcp(resolved, budget)
+    }
+
+    fn tls_websocket_handshake(
+        &mut self,
+        stream: Self::Stream,
+        budget: &ProductionCTraderBudget,
+    ) -> io::Result<Self::Socket> {
+        handshake_ctrader_websocket(stream, &self.url, budget)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CTraderOpenApiSessionResponse {
+    Expected(String),
+    BrokerError(String),
+}
+
+/// One connected cTrader JSON-WSS socket. Authentication and every historical
+/// page sent through this value share exactly one connection-local admission
+/// clock; independent instances never share quota state.
+pub(crate) struct ProductionCTraderOpenApiSession {
+    socket: ProductionCTraderSocket,
+    historical_admission: ConnectionHistoricalAdmission,
 }
 
 impl ProductionCTraderOpenApiTransport {
@@ -489,6 +743,72 @@ impl ProductionCTraderOpenApiTransport {
             endpoint_host: endpoint_host.into(),
         }
     }
+
+    pub(crate) fn connect_session(
+        &self,
+        cancellation: Option<&HistoricalRequestCancellation>,
+    ) -> Result<ProductionCTraderOpenApiSession> {
+        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
+        let url = ctrader_json_wss_url(&self.endpoint_host);
+        let budget = CTraderOperationBudget::new(
+            SystemCTraderMonotonicClock,
+            CTRADER_CONNECT_TIMEOUT,
+            cancellation.cloned(),
+        )?;
+        let mut connector = ProductionCTraderSocketConnector::new(&self.endpoint_host, url.clone());
+        let socket = establish_ctrader_socket_with_connector(&mut connector, &budget)
+            .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
+        Ok(ProductionCTraderOpenApiSession {
+            socket,
+            historical_admission: ConnectionHistoricalAdmission::new(
+                CTRADER_HISTORICAL_REQUEST_MIN_INTERVAL,
+            ),
+        })
+    }
+}
+
+fn ctrader_deadline_io_mut(
+    socket: &mut ProductionCTraderSocket,
+) -> Result<&mut ProductionCTraderDeadlineIo> {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(io) => Ok(io),
+        MaybeTlsStream::Rustls(stream) => Ok(&mut stream.sock),
+        _ => Err(anyhow!(
+            "cTrader socket transport is not the configured rustls transport"
+        )),
+    }
+}
+
+fn arm_ctrader_socket_budget(
+    socket: &mut ProductionCTraderSocket,
+    timeout: Duration,
+    cancellation: Option<&HistoricalRequestCancellation>,
+    phase: CTraderIoPhase,
+) -> Result<ProductionCTraderBudget> {
+    let budget =
+        CTraderOperationBudget::new(SystemCTraderMonotonicClock, timeout, cancellation.cloned())?;
+    ctrader_deadline_io_mut(socket)?.arm(budget.clone(), phase, CTRADER_RESPONSE_POLL_INTERVAL);
+    Ok(budget)
+}
+
+fn arm_ctrader_socket_with_budget(
+    socket: &mut ProductionCTraderSocket,
+    budget: ProductionCTraderBudget,
+    phase: CTraderIoPhase,
+) -> Result<()> {
+    ctrader_deadline_io_mut(socket)?.arm(budget, phase, CTRADER_RESPONSE_POLL_INTERVAL);
+    Ok(())
+}
+
+fn is_ctrader_socket_poll_timeout(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+    )
 }
 
 pub fn build_application_auth_json(
@@ -1039,44 +1359,11 @@ pub fn build_get_trendbars_request(
 }
 
 pub fn trendbar_period_value(label: &str) -> Result<i32> {
-    // Map our canonical timeframe labels to cTrader's wire-protocol
-    // `ProtoOATrendbarPeriod` codes. cTrader itself supports a slightly
-    // different set (M2/M4/M10) that we deliberately omit; we only emit
-    // the canonical 11 to keep every subsystem (UI, training, discovery)
-    // aligned. M2/M4/M10 and any non-canonical label are rejected.
-    //
-    // Native cTrader periods (per `openapi-proto-messages/OpenApiModelMessages.proto`):
-    //   M1=1, M2=2, M3=3, M4=4, M5=5, M10=6, M15=7, M30=8,
-    //   H1=9, H4=10, H12=11, D1=12, W1=13, MN1=14.
-    //
-    // Note: M3 IS native (enum value 3) — we send it directly. H2 is
-    // intentionally absent from neoethos_core::CANONICAL_TIMEFRAMES (see
-    // the verbatim operator instruction documented there) and cTrader
-    // does not natively expose H2 either, so no H2 routing is needed.
     let upper = label.trim().to_ascii_uppercase();
-    if !neoethos_core::is_canonical_timeframe(&upper) {
-        return Err(anyhow!(
-            "unsupported cTrader trendbar period label {} (not in canonical timeframes)",
-            label
-        ));
-    }
-    match upper.as_str() {
-        "M1" => Ok(1),
-        "M3" => Ok(3),
-        "M5" => Ok(5),
-        "M15" => Ok(7),
-        "M30" => Ok(8),
-        "H1" => Ok(9),
-        "H4" => Ok(10),
-        "H12" => Ok(11),
-        "D1" => Ok(12),
-        "W1" => Ok(13),
-        "MN1" => Ok(14),
-        other => Err(anyhow!(
-            "unsupported cTrader trendbar period label {} (canonical but unmapped)",
-            other
-        )),
-    }
+    let timeframe = upper
+        .parse::<neoethos_core::CanonicalTimeframe>()
+        .map_err(|_| anyhow!("unsupported cTrader trendbar period label {label}"))?;
+    Ok(timeframe.ctrader_protocol_code())
 }
 
 pub fn build_get_tick_data_request(
@@ -1277,7 +1564,9 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_EXPECTED_MARGIN_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE)
         }
-        CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE)
+        }
         CTRADER_OA_CASH_FLOW_HISTORY_LIST_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE)
         }
@@ -1327,27 +1616,165 @@ pub fn is_matching_open_api_response(
 }
 
 pub fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
-    let (_code, message) = parse_ctrader_error_payload_parts(payload)?;
-    Ok(message)
+    Ok(parse_ctrader_error_payload_detail(payload)?.message)
 }
 
-pub fn parse_ctrader_error_payload_parts(payload: &Value) -> Result<(String, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCTraderErrorPayload {
+    error_code: String,
+    description: Option<String>,
+    message: String,
+    retry_after_seconds: Option<u64>,
+}
+
+/// Broker rate-limit rejection for historical Open API requests.
+///
+/// This remains a concrete error underneath any [`anyhow::Context`] layers so
+/// HTTP callers can downcast it without parsing a display string. cTrader's
+/// `retryAfter` field is optional, so absence is preserved rather than guessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderBlockedPayloadError {
+    description: Option<String>,
+    retry_after_seconds: Option<u64>,
+}
+
+impl CTraderBlockedPayloadError {
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        self.retry_after_seconds
+    }
+}
+
+impl std::fmt::Display for CTraderBlockedPayloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BLOCKED_PAYLOAD_TYPE")?;
+        if let Some(description) = self
+            .description
+            .as_deref()
+            .filter(|description| !description.trim().is_empty())
+        {
+            write!(formatter, ": {}", description.trim())?;
+        }
+        if let Some(retry_after_seconds) = self.retry_after_seconds {
+            write!(formatter, " (retryAfter={retry_after_seconds}s)")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CTraderBlockedPayloadError {}
+
+/// A cTrader proxy could not route a request to its backing server.
+///
+/// The official error contract defines `CANT_ROUTE_REQUEST` as a lost or
+/// unsupported server connection. Keeping that condition typed lets the
+/// historical connector rebuild the same exact authenticated session with a
+/// bounded backoff, while every credential, environment, account, and symbol
+/// assertion remains unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderCannotRouteRequestError {
+    description: Option<String>,
+}
+
+impl std::fmt::Display for CTraderCannotRouteRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CANT_ROUTE_REQUEST")?;
+        if let Some(description) = self
+            .description
+            .as_deref()
+            .filter(|description| !description.trim().is_empty())
+        {
+            write!(formatter, ": {}", description.trim())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CTraderCannotRouteRequestError {}
+
+fn parse_ctrader_error_payload_detail(payload: &Value) -> Result<ParsedCTraderErrorPayload> {
     #[derive(Debug, Deserialize)]
-    struct CTraderErrorPayload {
+    struct WireErrorPayload {
         #[serde(rename = "errorCode")]
         error_code: String,
         description: Option<String>,
+        #[serde(rename = "retryAfter")]
+        retry_after: Option<Value>,
     }
 
-    let error: CTraderErrorPayload =
+    let error: WireErrorPayload =
         serde_json::from_value(payload.clone()).context("failed to parse cTrader error payload")?;
-    let formatted = match &error.description {
+    let retry_after_seconds =
+        match error.retry_after {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(value)) => Some(value.as_u64().ok_or_else(|| {
+                anyhow!("cTrader error retryAfter must be a non-negative integer")
+            })?),
+            Some(Value::String(value)) => Some(value.trim().parse::<u64>().with_context(|| {
+                format!("cTrader error retryAfter is not an unsigned integer: {value}")
+            })?),
+            Some(_) => {
+                return Err(anyhow!(
+                    "cTrader error retryAfter must be an integer or integer string"
+                ));
+            }
+        };
+    let mut message = match &error.description {
         Some(description) if !description.trim().is_empty() => {
             format!("{}: {}", error.error_code, description)
         }
         _ => error.error_code.clone(),
     };
-    Ok((error.error_code, formatted))
+    if let Some(retry_after_seconds) = retry_after_seconds {
+        message.push_str(&format!(" (retryAfter={retry_after_seconds}s)"));
+    }
+    Ok(ParsedCTraderErrorPayload {
+        error_code: error.error_code,
+        description: error.description,
+        message,
+        retry_after_seconds,
+    })
+}
+
+pub fn parse_ctrader_error_payload_parts(payload: &Value) -> Result<(String, String)> {
+    let detail = parse_ctrader_error_payload_detail(payload)?;
+    Ok((detail.error_code, detail.message))
+}
+
+fn ctrader_error_from_response(response: &str) -> Result<Option<ParsedCTraderErrorPayload>> {
+    let envelope = parse_open_api_envelope(response)?;
+    if envelope.payload_type != CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+        return Ok(None);
+    }
+    parse_ctrader_error_payload_detail(&envelope.payload).map(Some)
+}
+
+pub(crate) fn ctrader_historical_session_error_from_response(
+    response: &str,
+) -> Result<anyhow::Error> {
+    let envelope = parse_open_api_envelope(response)?;
+    if envelope.payload_type != CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "expected cTrader broker error payload type {}, received {}",
+            CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+            envelope.payload_type
+        ));
+    }
+    let detail = parse_ctrader_error_payload_detail(&envelope.payload)?;
+    if detail
+        .error_code
+        .eq_ignore_ascii_case("BLOCKED_PAYLOAD_TYPE")
+    {
+        return Ok(anyhow!(CTraderBlockedPayloadError {
+            description: detail.description,
+            retry_after_seconds: detail.retry_after_seconds,
+        }));
+    }
+    if detail.error_code.eq_ignore_ascii_case("CANT_ROUTE_REQUEST") {
+        return Ok(anyhow!(CTraderCannotRouteRequestError {
+            description: detail.description,
+        }));
+    }
+    Ok(anyhow!(detail.message))
 }
 
 /// If `response` is a cTrader error envelope (payloadType 2142), return its
@@ -1355,11 +1782,10 @@ pub fn parse_ctrader_error_payload_parts(payload: &Value) -> Result<(String, Str
 /// callers surface the REAL broker rejection instead of a misleading
 /// "received N responses" count.
 pub fn ctrader_error_detail_from_response(response: &str) -> Option<String> {
-    let envelope = parse_open_api_envelope(response).ok()?;
-    if envelope.payload_type != CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-        return None;
-    }
-    parse_ctrader_error_payload(&envelope.payload).ok()
+    ctrader_error_from_response(response)
+        .ok()
+        .flatten()
+        .map(|error| error.message)
 }
 
 /// Run a `send_sequence`, retrying transient failures (cold-connection
@@ -1380,18 +1806,41 @@ pub fn send_sequence_resilient<T: CTraderOpenApiTransport>(
     for attempt in 1..=MAX_ATTEMPTS {
         match transport.send_sequence(messages) {
             Ok(responses) => {
-                let err_in_prefix = responses
+                let parsed_errors = responses
+                    .iter()
+                    .map(|response| ctrader_error_from_response(response))
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(blocked) = parsed_errors
+                    .iter()
+                    .flatten()
+                    .find(|error| !should_retry_ctrader_error(&error.error_code))
+                {
+                    let retry_status = if blocked.retry_after_seconds.is_some() {
+                        "The broker's retryAfter was surfaced without retry."
+                    } else {
+                        "The broker supplied no retryAfter; the error was surfaced without retry."
+                    };
+                    return Err(anyhow!(
+                        "{label} was rate-limited by cTrader — {}. {retry_status}",
+                        blocked.message,
+                    ));
+                }
+                let err_in_prefix = parsed_errors
                     .iter()
                     .take(min_ok)
-                    .find_map(|r| ctrader_error_detail_from_response(r));
+                    .flatten()
+                    .map(|error| error.message.clone())
+                    .next();
                 if responses.len() >= min_ok && err_in_prefix.is_none() {
                     return Ok(responses);
                 }
                 detail = err_in_prefix
                     .or_else(|| {
-                        responses
+                        parsed_errors
                             .iter()
-                            .find_map(|r| ctrader_error_detail_from_response(r))
+                            .flatten()
+                            .map(|error| error.message.clone())
+                            .next()
                     })
                     .or_else(|| {
                         Some(format!(
@@ -1522,7 +1971,9 @@ impl CTraderMarginCallListSnapshot {
             .iter()
             .map(|t| t.margin_level_threshold)
             .filter(|v| v.is_finite() && *v > 0.0)
-            .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
+            .fold(None, |acc: Option<f64>, v| {
+                Some(acc.map_or(v, |a| a.max(v)))
+            })
     }
 }
 
@@ -1739,100 +2190,155 @@ pub fn is_ctrader_auth_token_error(error_code: &str) -> bool {
 /// retry once. Kept as a constant so caller and producer agree on the marker.
 pub const CTRADER_TOKEN_EXPIRED_SENTINEL: &str = "CTRADER_TOKEN_EXPIRED";
 
-impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
-    fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
-        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
-        let url = ctrader_json_wss_url(&self.endpoint_host);
-        let (mut socket, _) = connect(url.as_str())
-            .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
-        let mut responses = Vec::with_capacity(messages.len());
+impl ProductionCTraderOpenApiSession {
+    pub(crate) fn send_one(
+        &mut self,
+        message: &CTraderOpenApiJsonMessage,
+        cancellation: Option<&HistoricalRequestCancellation>,
+    ) -> Result<CTraderOpenApiSessionResponse> {
+        if cancellation.is_some_and(HistoricalRequestCancellation::is_cancelled) {
+            return Err(anyhow!(HistoricalRequestCancelled));
+        }
+        let expected_payload_type = expected_response_payload_type(message.payload_type)?;
+        let serialized = serde_json::to_string(message)
+            .context("failed to serialize cTrader open api message")?;
+        tracing::debug!(
+            target: "neoethos_app::ctrader_transport",
+            request_msg_id = %message.client_msg_id,
+            request_payload_type = message.payload_type,
+            expected_response_payload_type = expected_payload_type,
+            "session → ctrader"
+        );
 
-        for message in messages {
-            let expected_payload_type = expected_response_payload_type(message.payload_type)?;
-            let serialized = serde_json::to_string(message)
-                .context("failed to serialize cTrader open api message")?;
-            // Per-frame transport trace. Was INFO during the 2026-06 protocol-
-            // flow investigation (now closed) — at info level it fired on every
-            // frame of every bridge poll and dominated log growth. DEBUG keeps
-            // it available via RUST_LOG=neoethos_app::ctrader_transport=debug.
-            tracing::debug!(
-                target: "neoethos_app::ctrader_transport",
-                request_msg_id = %message.client_msg_id,
-                request_payload_type = message.payload_type,
-                expected_response_payload_type = expected_payload_type,
-                "send_sequence → ctrader"
-            );
-            socket
+        if is_ctrader_historical_request(message.payload_type) {
+            let socket = &mut self.socket;
+            self.historical_admission
+                .admit_and_send(cancellation, || {
+                    arm_ctrader_socket_budget(
+                        socket,
+                        CTRADER_SOCKET_WRITE_TIMEOUT,
+                        cancellation,
+                        CTraderIoPhase::RequestWrite,
+                    )?;
+                    socket
+                        .send(Message::Text(serialized.into()))
+                        .context("failed to send cTrader open api message")
+                })
+                .map_err(|error| match error {
+                    HistoricalAdmissionSendError::ClockOverflow(error) => anyhow!(error),
+                    HistoricalAdmissionSendError::Cancelled(error) => anyhow!(error),
+                    HistoricalAdmissionSendError::Send(error) => error,
+                })?;
+        } else {
+            arm_ctrader_socket_budget(
+                &mut self.socket,
+                CTRADER_SOCKET_WRITE_TIMEOUT,
+                cancellation,
+                CTraderIoPhase::RequestWrite,
+            )?;
+            self.socket
                 .send(Message::Text(serialized.into()))
                 .context("failed to send cTrader open api message")?;
+        }
 
-            loop {
-                match socket
-                    .read()
-                    .context("failed to read cTrader open api response")?
-                {
-                    Message::Text(text) => {
-                        if text.trim().is_empty() {
-                            return Err(anyhow!("empty cTrader open api response"));
-                        }
-                        let envelope = parse_open_api_envelope(text.as_ref())?;
-                        // Per-frame receive trace — DEBUG for the same reason as
-                        // the send-side trace above (was INFO during the closed
-                        // 2026-06 protocol-flow investigation; at info it logged
-                        // a 220-char body preview per frame per poll).
-                        tracing::debug!(
-                            target: "neoethos_app::ctrader_transport",
-                            recv_payload_type = envelope.payload_type,
-                            recv_msg_id = %envelope.client_msg_id,
-                            awaiting_payload_type = expected_payload_type,
-                            awaiting_msg_id = %message.client_msg_id,
-                            body_preview = %text.chars().take(220).collect::<String>(),
-                            "send_sequence ← ctrader"
-                        );
-                        if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-                            responses.push(text.to_string());
-                            let _ = socket.close(None);
-                            return Ok(responses);
-                        }
-                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
-                        {
-                            responses.push(text.to_string());
-                            break;
-                        }
-                    }
-                    Message::Binary(bytes) => {
-                        let text = String::from_utf8(bytes.to_vec())
-                            .context("failed to decode cTrader binary response")?;
-                        if text.trim().is_empty() {
-                            return Err(anyhow!("empty cTrader open api response"));
-                        }
-                        let envelope = parse_open_api_envelope(&text)?;
-                        if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-                            responses.push(text);
-                            let _ = socket.close(None);
-                            return Ok(responses);
-                        }
-                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
-                        {
-                            responses.push(text);
-                            break;
-                        }
-                    }
-                    Message::Ping(payload) => {
-                        socket
-                            .send(Message::Pong(payload))
-                            .context("failed to reply to cTrader ping")?;
-                    }
-                    Message::Pong(_) => {}
-                    Message::Close(_) => {
-                        return Err(anyhow!("cTrader open api socket closed unexpectedly"));
-                    }
-                    Message::Frame(_) => {}
+        let response_budget = arm_ctrader_socket_budget(
+            &mut self.socket,
+            CTRADER_RESPONSE_TIMEOUT,
+            cancellation,
+            CTraderIoPhase::ResponseRead,
+        )?;
+        let response_deadline = ConnectionResponseDeadline::new(CTRADER_RESPONSE_TIMEOUT)?;
+        loop {
+            response_deadline.check(cancellation)?;
+            let frame = match self.socket.read() {
+                Ok(frame) => frame,
+                Err(error) if is_ctrader_socket_poll_timeout(&error) => {
+                    response_deadline.check(cancellation)?;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow!(error).context("failed to read cTrader open api response"));
+                }
+            };
+            response_deadline.check(cancellation)?;
+            let text = match frame {
+                Message::Text(text) => text.to_string(),
+                Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
+                    .context("failed to decode cTrader binary response")?,
+                Message::Ping(payload) => {
+                    let pong_budget = response_budget.capped_from_now(
+                        CTRADER_SOCKET_WRITE_TIMEOUT,
+                        CTraderIoPhase::RequestWrite,
+                    )?;
+                    arm_ctrader_socket_with_budget(
+                        &mut self.socket,
+                        pong_budget,
+                        CTraderIoPhase::RequestWrite,
+                    )?;
+                    self.socket
+                        .send(Message::Pong(payload))
+                        .context("failed to reply to cTrader ping")?;
+                    arm_ctrader_socket_with_budget(
+                        &mut self.socket,
+                        response_budget.clone(),
+                        CTraderIoPhase::ResponseRead,
+                    )?;
+                    continue;
+                }
+                Message::Pong(_) | Message::Frame(_) => continue,
+                Message::Close(_) => {
+                    return Err(anyhow!("cTrader open api socket closed unexpectedly"));
+                }
+            };
+            if text.trim().is_empty() {
+                return Err(anyhow!("empty cTrader open api response"));
+            }
+            let envelope = parse_open_api_envelope(&text)?;
+            tracing::debug!(
+                target: "neoethos_app::ctrader_transport",
+                recv_payload_type = envelope.payload_type,
+                recv_msg_id = %envelope.client_msg_id,
+                awaiting_payload_type = expected_payload_type,
+                awaiting_msg_id = %message.client_msg_id,
+                body_preview = %text.chars().take(220).collect::<String>(),
+                "session ← ctrader"
+            );
+            if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                if envelope.client_msg_id != message.client_msg_id {
+                    return Err(anyhow!(
+                        "cTrader error response clientMsgId mismatch: expected {:?}, received {:?}",
+                        message.client_msg_id,
+                        envelope.client_msg_id
+                    ));
+                }
+                return Ok(CTraderOpenApiSessionResponse::BrokerError(text));
+            }
+            if is_matching_open_api_response(&envelope, message, expected_payload_type) {
+                return Ok(CTraderOpenApiSessionResponse::Expected(text));
+            }
+        }
+    }
+}
+
+impl Drop for ProductionCTraderOpenApiSession {
+    fn drop(&mut self) {
+        let _ = self.socket.close(None);
+    }
+}
+
+impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
+    fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
+        let mut session = self.connect_session(None)?;
+        let mut responses = Vec::with_capacity(messages.len());
+        for message in messages {
+            match session.send_one(message, None)? {
+                CTraderOpenApiSessionResponse::Expected(response) => responses.push(response),
+                CTraderOpenApiSessionResponse::BrokerError(error) => {
+                    responses.push(error);
+                    break;
                 }
             }
         }
-
-        let _ = socket.close(None);
         Ok(responses)
     }
 }

@@ -251,7 +251,7 @@ extern "C" __global__ void correlation_cycle_state_many_series_one_param_f32(
 }
 
 // ===========================================================================
-// S3 f64 LANE — correlation_cycle (real component)
+// S3 f64 LANE — correlation_cycle (real / imag / angle / state)
 // ===========================================================================
 // Reference: src/indicators/correlation_cycle.rs
 //   correlation_cycle_with_kernel (:230)      — first_valid + Err branches
@@ -259,14 +259,14 @@ extern "C" __global__ void correlation_cycle_state_many_series_one_param_f32(
 //   correlation_cycle_window_sums (:494)      — the O(period) rebase
 // Batch defaults: period 20, threshold 9.0, source close.
 //
-// WHICH OUTPUT. Multi-output (real / imag / angle / state); compute_
-// correlation_cycle_batch maps "value" to REAL, so this kernel is the real
-// component.
+// WHICH OUTPUT. The preserved primary ABI emits REAL. The production ABI emits
+// the canonical REAL / IMAG / ANGLE / STATE matrices from this same row
+// authority in one launch.
 //
-// THE TRIG TABLES ARE RECOMPUTED, NOT ALLOCATED. cos_table[j] = cos(w*(j+1))
-// and sin_table[j] = -sin(w*(j+1)) are pure functions of j, so the two
-// period-length Vecs the CPU builds are replaced by evaluation at the point of
-// use. Same values, no device scratch.
+// THE TRIG TABLES ARE RECOMPUTED, NOT ALLOCATED. Each cos_table/sin_table pair
+// comes from the same deterministic FreeBSD-msun weight authority as the CPU.
+// The four-wide angle construction, argument reduction, polynomial constants
+// and operation order are mirrored exactly, with no device scratch.
 //
 // THE SEED SUMS GROUP BY FOUR, AND THE mul_add CHAIN NESTS RIGHT-TO-LEFT.
 //   sum_x2 = x0.mul_add(x0, x1.mul_add(x1, x2.mul_add(x2, x3.mul_add(x3, sum))))
@@ -293,32 +293,255 @@ extern "C" __global__ void correlation_cycle_state_many_series_one_param_f32(
 // window, and it is also where drift accumulates — which is why the rebase
 // exists and why its period must be 256 exactly.
 //
-// ANGLE. a = atan(r/i) + asin(1.0), then to_degrees, then -180 if i_val > 0.
-// half_pi is spelled f64::asin(1.0) by the reference rather than a PI/2
-// literal; asin(1.0) is exactly PI/2 rounded, so the constant below is written
-// the same way. to_degrees multiplies by 180/PI as a single folded constant.
-//
-// TRIG PARITY CAVEAT, STATED RATHER THAN HIDDEN: CUDA's double sin/cos/atan are
-// specified to <= 2 ulp, glibc's are effectively correctly rounded. Every value
-// here is derived from those, so this kernel matches the reference to a few ulp
-// rather than bit-for-bit. That is a property of the transcendental library, not
-// of this transcription, and it cannot be removed by writing the arithmetic
-// differently.
+// ANGLE. The full signed f64 ratio passes through the mirrored FreeBSD-msun
+// s_atan reduction/polynomial, then exact-bit pi/2 and 180/pi constants. The
+// production f64 lane does not call host libm or CUDA libdevice transcendental
+// functions, so exact CPU-bit parity remains an executable contract.
 //
 // One thread per column.
 // ===========================================================================
-
-#define NEO_S3_CC_THRESHOLD 9.0
 
 __device__ __forceinline__ double neo_s3_qnan() {
     return __longlong_as_double(0x7ff8000000000000LL);
 }
 
-__device__ __forceinline__ double neo_s3_cc_cos(double w, int j) {
-    return cos(w * ((double)j + 1.0));
+/* FreeBSD msun k_sin/k_cos, medium pi/2 reduction and s_atan.
+ *
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ * Developed at SunPro/SunSoft. Permission to use, copy, modify, and
+ * distribute this software is freely granted, provided this notice is
+ * preserved.
+ */
+static __device__ __forceinline__ double neo_s3_cc_ms_k_cos(double x, double y) {
+    const double c1 = 0x1.555555555554cp-5;
+    const double c2 = -0x1.6c16c16c15177p-10;
+    const double c3 = 0x1.a01a019cb1590p-16;
+    const double c4 = -0x1.27e4f809c52adp-22;
+    const double c5 = 0x1.1ee9ebdb4b1c4p-29;
+    const double c6 = -0x1.8fae9be8838d4p-37;
+    const double z = x * x;
+    const double w2 = z * z;
+    const double r = z * (c1 + z * (c2 + z * c3))
+        + w2 * w2 * (c4 + z * (c5 + z * c6));
+    const double hz = 0.5 * z;
+    const double w = 1.0 - hz;
+    return w + (((1.0 - w) - hz) + (z * r - x * y));
 }
-__device__ __forceinline__ double neo_s3_cc_sin(double w, int j) {
-    return -sin(w * ((double)j + 1.0));
+
+static __device__ __forceinline__ double neo_s3_cc_ms_k_sin(
+    double x,
+    double y,
+    bool has_tail) {
+    const double s1 = -0x1.5555555555549p-3;
+    const double s2 = 0x1.111111110f8a6p-7;
+    const double s3 = -0x1.a01a019c161d5p-13;
+    const double s4 = 0x1.71de357b1fe7dp-19;
+    const double s5 = -0x1.ae5e68a2b9cebp-26;
+    const double s6 = 0x1.5d93a5acfd57cp-33;
+    const double z = x * x;
+    const double w = z * z;
+    const double r = s2 + z * (s3 + z * s4) + z * w * (s5 + z * s6);
+    const double v = z * x;
+    if (has_tail) {
+        return x - ((z * (0.5 * y - v * r) - y) - v * s1);
+    }
+    return x + v * (s1 + z * r);
+}
+
+static __device__ __forceinline__ int neo_s3_cc_reduce_pio2(
+    double x,
+    double* y0_out,
+    double* y1_out) {
+    const double inv_pio2 = 0x1.45f306dc9c883p-1;
+    const double to_int = 0x1.8p+52;
+    const double pio2_1 = 0x1.921fb54400000p+0;
+    const double pio2_1t = 0x1.0b4611a626331p-34;
+    const double pio2_2 = 0x1.0b4611a600000p-34;
+    const double pio2_2t = 0x1.3198a2e037073p-69;
+    const double pio2_3 = 0x1.3198a2e000000p-69;
+    const double pio2_3t = 0x1.b839a252049c1p-104;
+
+    const double tmp = x * inv_pio2 + to_int;
+    const double f_n = tmp - to_int;
+    const int n = static_cast<int>(f_n);
+    double r = x - f_n * pio2_1;
+    double w = f_n * pio2_1t;
+    double y0 = r - w;
+    const unsigned long long x_bits =
+        static_cast<unsigned long long>(__double_as_longlong(x));
+    const int ex = static_cast<int>((x_bits >> 52) & 0x7ffULL);
+    unsigned long long y_bits =
+        static_cast<unsigned long long>(__double_as_longlong(y0));
+    int ey = static_cast<int>((y_bits >> 52) & 0x7ffULL);
+    if (ex - ey > 16) {
+        const double t = r;
+        w = f_n * pio2_2;
+        r = t - w;
+        w = f_n * pio2_2t - ((t - r) - w);
+        y0 = r - w;
+        y_bits = static_cast<unsigned long long>(__double_as_longlong(y0));
+        ey = static_cast<int>((y_bits >> 52) & 0x7ffULL);
+        if (ex - ey > 49) {
+            const double t2 = r;
+            w = f_n * pio2_3;
+            r = t2 - w;
+            w = f_n * pio2_3t - ((t2 - r) - w);
+            y0 = r - w;
+        }
+    }
+    *y0_out = y0;
+    *y1_out = (r - y0) - w;
+    return n;
+}
+
+static __device__ __forceinline__ void neo_s3_cc_deterministic_sin_cos(
+    double x,
+    double* sin_out,
+    double* cos_out) {
+    const unsigned long long bits =
+        static_cast<unsigned long long>(__double_as_longlong(x));
+    const unsigned int high = static_cast<unsigned int>((bits >> 32) & 0x7fffffffULL);
+    if (high <= 0x3fe921fbU) {
+        *sin_out = neo_s3_cc_ms_k_sin(x, 0.0, false);
+        *cos_out = neo_s3_cc_ms_k_cos(x, 0.0);
+        return;
+    }
+
+    double y0;
+    double y1;
+    const int quadrant = neo_s3_cc_reduce_pio2(x, &y0, &y1);
+    const double sin = neo_s3_cc_ms_k_sin(y0, y1, true);
+    const double cos = neo_s3_cc_ms_k_cos(y0, y1);
+    switch (quadrant & 3) {
+        case 0: *sin_out = sin;  *cos_out = cos;  return;
+        case 1: *sin_out = cos;  *cos_out = -sin; return;
+        case 2: *sin_out = -sin; *cos_out = -cos; return;
+        default: *sin_out = -cos; *cos_out = sin; return;
+    }
+}
+
+static __device__ __forceinline__ void neo_s3_cc_deterministic_weight(
+    double w,
+    int j,
+    double* cos_out,
+    double* neg_sin_out) {
+    const int group_start = j & ~3;
+    double angle = w * (static_cast<double>(group_start) + 1.0);
+    int offset = j & 3;
+    while (offset != 0) {
+        angle += w;
+        --offset;
+    }
+    double sin;
+    double cos;
+    neo_s3_cc_deterministic_sin_cos(angle, &sin, &cos);
+    *cos_out = cos;
+    *neg_sin_out = -sin;
+}
+
+static __device__ __forceinline__ double neo_s3_cc_deterministic_atan(double input) {
+    const double atan_hi[4] = {
+        0x1.dac670561bb4fp-2,
+        0x1.921fb54442d18p-1,
+        0x1.f730bd281f69bp-1,
+        0x1.921fb54442d18p+0,
+    };
+    const double atan_lo[4] = {
+        0x1.a2b7f222f65e2p-56,
+        0x1.1a62633145c07p-55,
+        0x1.007887af0cbbdp-56,
+        0x1.1a62633145c07p-54,
+    };
+    const double coefficients[11] = {
+        0x1.555555555550dp-2,
+        -0x1.999999998ebc4p-3,
+        0x1.24924920083ffp-3,
+        -0x1.c71c6fe231671p-4,
+        0x1.745cdc54c206ep-4,
+        -0x1.3b0f2af749a6dp-4,
+        0x1.10d66a0d03d51p-4,
+        -0x1.dde2d52defd9ap-5,
+        0x1.97b4b24760debp-5,
+        -0x1.2b4442c6a6c2fp-5,
+        0x1.0ad3ae322da11p-6,
+    };
+    const double half_pi = 0x1.921fb54442d18p+0;
+
+    double x = input;
+    const unsigned long long input_bits =
+        static_cast<unsigned long long>(__double_as_longlong(x));
+    unsigned int high = static_cast<unsigned int>(input_bits >> 32);
+    const unsigned int sign = high >> 31;
+    high &= 0x7fffffffU;
+    if (high >= 0x44100000U) {
+        if (isnan(x)) {
+            return x;
+        }
+        return sign != 0U ? -half_pi : half_pi;
+    }
+
+    int reduction;
+    if (high < 0x3fdc0000U) {
+        if (high < 0x3e400000U) {
+            return x;
+        }
+        reduction = -1;
+    } else {
+        x = __longlong_as_double(static_cast<long long>(
+            input_bits & 0x7fffffffffffffffULL));
+        if (high < 0x3ff30000U) {
+            if (high < 0x3fe60000U) {
+                x = (2.0 * x - 1.0) / (2.0 + x);
+                reduction = 0;
+            } else {
+                x = (x - 1.0) / (x + 1.0);
+                reduction = 1;
+            }
+        } else if (high < 0x40038000U) {
+            x = (x - 1.5) / (1.0 + 1.5 * x);
+            reduction = 2;
+        } else {
+            x = -1.0 / x;
+            reduction = 3;
+        }
+    }
+
+    const double z = x * x;
+    const double w = z * z;
+    const double s1 = z * (
+        coefficients[0] + w * (
+            coefficients[2] + w * (
+                coefficients[4] + w * (
+                    coefficients[6] + w * (
+                        coefficients[8] + w * coefficients[10])))));
+    const double s2 = w * (
+        coefficients[1] + w * (
+            coefficients[3] + w * (
+                coefficients[5] + w * (
+                    coefficients[7] + w * coefficients[9]))));
+    if (reduction < 0) {
+        return x - x * (s1 + s2);
+    }
+
+    const double result = atan_hi[reduction]
+        - ((x * (s1 + s2) - atan_lo[reduction]) - x);
+    return sign != 0U ? -result : result;
+}
+
+static __device__ __forceinline__ double neo_s3_cc_deterministic_angle(
+    double real,
+    double imag) {
+    if (imag == 0.0) {
+        return 0.0;
+    }
+    const double half_pi = 0x1.921fb54442d18p+0;
+    const double radians_to_degrees = 0x1.ca5dc1a63c1f8p+5;
+    double angle = (neo_s3_cc_deterministic_atan(real / imag) + half_pi)
+        * radians_to_degrees;
+    if (imag > 0.0) {
+        angle -= 180.0;
+    }
+    return angle;
 }
 
 // correlation_cycle_window_sums (:494) — 4-wide, right-nested fma chains.
@@ -340,10 +563,14 @@ __device__ __forceinline__ void neo_s3_cc_window_sums(
         double x2 = d[idx2]; if (isnan(x2)) x2 = 0.0;
         double x3 = d[idx3]; if (isnan(x3)) x3 = 0.0;
 
-        const double c0 = neo_s3_cc_cos(w, j),     s0 = neo_s3_cc_sin(w, j);
-        const double c1 = neo_s3_cc_cos(w, j + 1), s1 = neo_s3_cc_sin(w, j + 1);
-        const double c2 = neo_s3_cc_cos(w, j + 2), s2 = neo_s3_cc_sin(w, j + 2);
-        const double c3 = neo_s3_cc_cos(w, j + 3), s3 = neo_s3_cc_sin(w, j + 3);
+        double c0, s0;
+        double c1, s1;
+        double c2, s2;
+        double c3, s3;
+        neo_s3_cc_deterministic_weight(w, j, &c0, &s0);
+        neo_s3_cc_deterministic_weight(w, j + 1, &c1, &s1);
+        neo_s3_cc_deterministic_weight(w, j + 2, &c2, &s2);
+        neo_s3_cc_deterministic_weight(w, j + 3, &c3, &s3);
 
         sum_x += x0 + x1 + x2 + x3;
         sum_x2 = fma(x0, x0, fma(x1, x1, fma(x2, x2, fma(x3, x3, sum_x2))));
@@ -354,8 +581,8 @@ __device__ __forceinline__ void neo_s3_cc_window_sums(
     while (j < period) {
         const int idx = i - (j + 1);
         double x = d[idx]; if (isnan(x)) x = 0.0;
-        const double c = neo_s3_cc_cos(w, j);
-        const double s = neo_s3_cc_sin(w, j);
+        double c, s;
+        neo_s3_cc_deterministic_weight(w, j, &c, &s);
         sum_x  += x;
         sum_x2 = fma(x, x, sum_x2);
         sum_xc = fma(x, c, sum_xc);
@@ -366,34 +593,40 @@ __device__ __forceinline__ void neo_s3_cc_window_sums(
     *o_sx = sum_x; *o_sx2 = sum_x2; *o_sxc = sum_xc; *o_sxs = sum_xs;
 }
 
-extern "C" __global__ void neoethos_correlation_cycle_batch_f64(
+__device__ __forceinline__ void neo_s3_correlation_cycle_row_f64(
     const double* __restrict__ data,
     int n,
-    const int* __restrict__ periods,
-    int n_combos,
+    int period,
+    double threshold,
     int first_valid,
-    double* __restrict__ out)
+    double* out_real,
+    double* out_imag,
+    double* out_angle,
+    double* out_state)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= n_combos) return;
-
-    double* __restrict__ row = out + (size_t)r * (size_t)n;
-    const int period = periods[r];
-
     const bool declined =
         (n <= 0) ||
         (first_valid < 0) || (first_valid >= n) ||
         (period == 0) || (period > n) ||
         ((n - first_valid) < period);
     if (declined) {
-        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        for (int i = 0; i < n; ++i) {
+            if (out_real != nullptr) out_real[i] = neo_s3_qnan();
+            if (out_imag != nullptr) out_imag[i] = neo_s3_qnan();
+            if (out_angle != nullptr) out_angle[i] = neo_s3_qnan();
+            if (out_state != nullptr) out_state[i] = neo_s3_qnan();
+        }
         return;
     }
 
-    for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+    for (int i = 0; i < n; ++i) {
+        if (out_real != nullptr) out_real[i] = neo_s3_qnan();
+        if (out_imag != nullptr) out_imag[i] = neo_s3_qnan();
+        if (out_angle != nullptr) out_angle[i] = neo_s3_qnan();
+        if (out_state != nullptr) out_state[i] = neo_s3_qnan();
+    }
 
-    const double half_pi = asin(1.0);
-    const double two_pi  = 4.0 * asin(1.0);
+    const double two_pi = 0x1.921fb54442d18p+2;
     const double nn = (double)period;
     const double w  = two_pi / nn;
 
@@ -403,8 +636,8 @@ extern "C" __global__ void neoethos_correlation_cycle_batch_f64(
         int j = 0;
         while (j + 4 <= period) {
             for (int q = 0; q < 4; ++q) {
-                const double c = neo_s3_cc_cos(w, j + q);
-                const double ys = neo_s3_cc_sin(w, j + q);
+                double c, ys;
+                neo_s3_cc_deterministic_weight(w, j + q, &c, &ys);
                 sum_cos += c;
                 sum_sin += ys;
                 sum_cos2 += c * c;
@@ -413,8 +646,8 @@ extern "C" __global__ void neoethos_correlation_cycle_batch_f64(
             j += 4;
         }
         while (j < period) {
-            const double c = neo_s3_cc_cos(w, j);
-            const double ys = neo_s3_cc_sin(w, j);
+            double c, ys;
+            neo_s3_cc_deterministic_weight(w, j, &c, &ys);
             sum_cos += c;
             sum_sin += ys;
             sum_cos2 += c * c;
@@ -432,18 +665,21 @@ extern "C" __global__ void neoethos_correlation_cycle_batch_f64(
 
     const int start_ria = first_valid + period;
     if (start_ria >= n) return;
+    const int start_state = start_ria + 1;
 
     int rebase_interval = 256;
     for (int i = first_valid; i < n; ++i) {
         if (isinf(data[i])) { rebase_interval = 1; break; }
     }
 
-    const double z_re = neo_s3_cc_cos(w, 0);
-    const double z_im = neo_s3_cc_sin(w, 0);
+    double z_re, z_im;
+    neo_s3_cc_deterministic_weight(w, 0, &z_re, &z_im);
     int last_rebase = start_ria;
 
     double sum_x, sum_x2, sum_xc, sum_xs;
     neo_s3_cc_window_sums(data, w, start_ria, period, &sum_x, &sum_x2, &sum_xc, &sum_xs);
+    double prev_angle = neo_s3_qnan();
+    const bool needs_angle = (out_angle != nullptr) || (out_state != nullptr);
 
     for (int i = start_ria; i < n; ++i) {
         const double t1 = fma(nn, sum_x2, -(sum_x * sum_x));
@@ -462,8 +698,20 @@ extern "C" __global__ void neoethos_correlation_cycle_batch_f64(
             }
         }
 
-        row[i] = r_val;
-        (void)half_pi;   // the angle/state outputs are not this entry point's
+        if (out_real != nullptr) out_real[i] = r_val;
+        if (out_imag != nullptr) out_imag[i] = i_val;
+
+        if (needs_angle) {
+            const double angle = neo_s3_cc_deterministic_angle(r_val, i_val);
+            if (out_angle != nullptr) out_angle[i] = angle;
+            if (out_state != nullptr && i >= start_state) {
+                const double delta = fabs(angle - prev_angle);
+                out_state[i] = !isnan(prev_angle) && delta < threshold
+                    ? (angle >= 0.0 ? 1.0 : -1.0)
+                    : 0.0;
+            }
+            prev_angle = angle;
+        }
 
         const int next_i = i + 1;
         if (next_i < n) {
@@ -487,4 +735,56 @@ extern "C" __global__ void neoethos_correlation_cycle_batch_f64(
             }
         }
     }
+}
+
+extern "C" __global__ void neoethos_correlation_cycle_batch_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    double* __restrict__ row = out + (size_t)r * (size_t)n;
+    neo_s3_correlation_cycle_row_f64(
+        data,
+        n,
+        periods[r],
+        9.0,
+        first_valid,
+        row,
+        nullptr,
+        nullptr,
+        nullptr);
+}
+
+extern "C" __global__ void correlation_cycle_outputs_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    const double* __restrict__ thresholds,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out_real,
+    double* __restrict__ out_imag,
+    double* __restrict__ out_angle,
+    double* __restrict__ out_state)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+
+    const size_t offset = (size_t)r * (size_t)n;
+    neo_s3_correlation_cycle_row_f64(
+        data,
+        n,
+        periods[r],
+        thresholds[r],
+        first_valid,
+        out_real + offset,
+        out_imag + offset,
+        out_angle + offset,
+        out_state + offset);
 }

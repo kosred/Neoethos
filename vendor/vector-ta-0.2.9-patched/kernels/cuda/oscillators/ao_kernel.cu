@@ -182,15 +182,19 @@ extern "C" __global__ void ao_many_series_one_param_f32(
 // ===========================================================================
 // S3 f64 LANE — ao (Awesome Oscillator)
 // ===========================================================================
+// Creator source oracle (the exact vendored release commit):
+// https://raw.githubusercontent.com/VectorAlpha-dev/VectorTA/e6197777837a18b88e43ce5c163b2e0023f73a2a/src/indicators/ao.rs
+// Bill Williams formula oracle (official MetaTrader documentation):
+// https://www.metatrader5.com/en/terminal/help/indicators/bw_indicators/awesome
 // Reference: src/indicators/ao.rs
 //   `ao_prepare` (:289) — first_valid + the four Err branches
 //   `ao_with_kernel` (:318) — `alloc_with_nan_prefix(len, first + long - 1)`
 //   `ao_scalar` (:367) — the arithmetic, including the 2x unroll
 //
-// PERIOD-INVARIANT. `compute_ao_batch` reads `short_period` (default 5) and
-// `long_period` (default 34) and NEVER reads `period`, so a sweep over periods
-// produces `n_combos` byte-identical rows. `(void)periods` below is that fact,
-// not an oversight — the same contract `neoethos_tsi_batch_f64` documents.
+// PARAMETER ROUTING. NeoEthos' generic f64 ABI carries the sweep's long-period
+// anchor in periods[r]. The CPU plan scales Bill Williams' 5:34 tuple with
+// positive integer half-up rounding. Thus 7/21/50/100/200 map to short
+// 1/3/7/15/29, and both the formula and warmup must use the reconstructed row.
 //
 // SOURCE. `compute_ao_batch` resolves `source.unwrap_or("hl2")`. The single
 // price series this kernel receives MUST be hl2, not close; feeding close
@@ -206,9 +210,6 @@ extern "C" __global__ void ao_many_series_one_param_f32(
 // the same order on the same values, so one loop reproduces both.
 // ===========================================================================
 
-#define NEO_S3_AO_SHORT 5
-#define NEO_S3_AO_LONG  34
-
 __device__ __forceinline__ double neo_s3_qnan() {
     return __longlong_as_double(0x7ff8000000000000LL);
 }
@@ -223,12 +224,13 @@ extern "C" __global__ void neoethos_ao_batch_f64(
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= n_combos) return;
-    (void)periods;  // PERIOD-INVARIANT — see the header.
 
     double* __restrict__ row = out + (size_t)r * (size_t)n;
 
-    const int shortp = NEO_S3_AO_SHORT;
-    const int longp  = NEO_S3_AO_LONG;
+    const int longp = periods[r];
+    const long long scaled_short =
+        (5LL * (long long)longp + 17LL) / 34LL;
+    const int shortp = (scaled_short < 1LL) ? 1 : (int)scaled_short;
 
     const bool declined =
         (n <= 0) ||

@@ -474,7 +474,7 @@ impl ResolvedConfig {
                 root: data_root,
                 recursive_scan: true,
                 vortex_force_rebuild: false,
-                canonical_layout: "data/symbol={SYM}/timeframe={TF}/data.vortex".to_string(),
+                canonical_layout: "data/d1-<canonical-dataset-identity>/data.vortex.complete -> g1-<sha256>.vortex".to_string(),
             },
             timeframes: ResolvedTimeframesConfig {
                 base: s.system.base_timeframe.clone(),

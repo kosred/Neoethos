@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
     init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -49,10 +33,6 @@ pub struct YangZhangVolatilityOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct YangZhangVolatilityParams {
     pub lookback: Option<usize>,
     pub k_override: Option<bool>,
@@ -224,7 +204,9 @@ pub enum YangZhangVolatilityError {
     InvalidLookback { lookback: usize, data_len: usize },
     #[error("yang_zhang_volatility: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("yang_zhang_volatility: Inconsistent slice lengths: open={open_len}, high={high_len}, low={low_len}, close={close_len}")]
+    #[error(
+        "yang_zhang_volatility: Inconsistent slice lengths: open={open_len}, high={high_len}, low={low_len}, close={close_len}"
+    )]
     InconsistentSliceLengths {
         open_len: usize,
         high_len: usize,
@@ -1224,7 +1206,6 @@ pub fn yang_zhang_volatility_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn yang_zhang_volatility_into(
     input: &YangZhangVolatilityInput,
@@ -1913,476 +1894,14 @@ fn yang_zhang_volatility_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "yang_zhang_volatility")]
-#[pyo3(signature = (open, high, low, close, lookback, k_override=false, k=0.34, kernel=None))]
-pub fn yang_zhang_volatility_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    lookback: usize,
-    k_override: bool,
-    k: f64,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let o = open.as_slice()?;
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    if o.len() != h.len() || o.len() != l.len() || o.len() != c.len() {
-        return Err(PyValueError::new_err("OHLC slice length mismatch"));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = YangZhangVolatilityParams {
-        lookback: Some(lookback),
-        k_override: Some(k_override),
-        k: Some(k),
-    };
-    let input = YangZhangVolatilityInput::from_slices(o, h, l, c, params);
-
-    let out = py
-        .allow_threads(|| yang_zhang_volatility_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((out.yz.into_pyarray(py), out.rs.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "YangZhangVolatilityStream")]
-pub struct YangZhangVolatilityStreamPy {
-    stream: YangZhangVolatilityStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl YangZhangVolatilityStreamPy {
-    #[new]
-    fn new(lookback: usize, k_override: bool, k: f64) -> PyResult<Self> {
-        let params = YangZhangVolatilityParams {
-            lookback: Some(lookback),
-            k_override: Some(k_override),
-            k: Some(k),
-        };
-        let stream = YangZhangVolatilityStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, open: f64, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.stream.update(open, high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "yang_zhang_volatility_batch")]
-#[pyo3(signature = (open, high, low, close, lookback_range, k_override=false, k_range=(0.34,0.34,0.0), kernel=None))]
-pub fn yang_zhang_volatility_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    lookback_range: (usize, usize, usize),
-    k_override: bool,
-    k_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let o = open.as_slice()?;
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    if o.len() != h.len() || o.len() != l.len() || o.len() != c.len() {
-        return Err(PyValueError::new_err("OHLC slice length mismatch"));
-    }
-
-    let sweep = YangZhangVolatilityBatchRange {
-        lookback: lookback_range,
-        k_override,
-        k: k_range,
-    };
-
-    let combos =
-        expand_grid_yang_zhang(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = c.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let yz_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let rs_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let yz_out = unsafe { yz_arr.as_slice_mut()? };
-    let rs_out = unsafe { rs_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let batch = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        yang_zhang_volatility_batch_inner_into(
-            o,
-            h,
-            l,
-            c,
-            &sweep,
-            batch.to_non_batch(),
-            true,
-            yz_out,
-            rs_out,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("yz", yz_arr.reshape((rows, cols))?)?;
-    dict.set_item("rs", rs_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lookbacks",
-        combos
-            .iter()
-            .map(|p| p.lookback.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "k_overrides",
-        combos
-            .iter()
-            .map(|p| p.k_override.unwrap_or(false))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ks",
-        combos
-            .iter()
-            .map(|p| p.k.unwrap_or(0.34))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_yang_zhang_volatility_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(yang_zhang_volatility_py, m)?)?;
-    m.add_function(wrap_pyfunction!(yang_zhang_volatility_batch_py, m)?)?;
-    m.add_class::<YangZhangVolatilityStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "yang_zhang_volatility_js")]
-pub fn yang_zhang_volatility_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    lookback: usize,
-    k_override: bool,
-    k: f64,
-) -> Result<JsValue, JsValue> {
-    if open.len() != high.len() || open.len() != low.len() || open.len() != close.len() {
-        return Err(JsValue::from_str("OHLC slice length mismatch"));
-    }
-
-    let params = YangZhangVolatilityParams {
-        lookback: Some(lookback),
-        k_override: Some(k_override),
-        k: Some(k),
-    };
-    let input = YangZhangVolatilityInput::from_slices(open, high, low, close, params);
-
-    let mut yz = vec![0.0; close.len()];
-    let mut rs = vec![0.0; close.len()];
-    yang_zhang_volatility_into_slice(&mut yz, &mut rs, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("yz"),
-        &serde_wasm_bindgen::to_value(&yz).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rs"),
-        &serde_wasm_bindgen::to_value(&rs).unwrap(),
-    )?;
-
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct YangZhangVolatilityBatchConfig {
-    pub lookback_range: Vec<usize>,
-    pub k_override: bool,
-    pub k_range: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "yang_zhang_volatility_batch_js")]
-pub fn yang_zhang_volatility_batch_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    if open.len() != high.len() || open.len() != low.len() || open.len() != close.len() {
-        return Err(JsValue::from_str("OHLC slice length mismatch"));
-    }
-
-    let config: YangZhangVolatilityBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-
-    if config.lookback_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: lookback_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    if config.k_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: k_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = YangZhangVolatilityBatchRange {
-        lookback: (
-            config.lookback_range[0],
-            config.lookback_range[1],
-            config.lookback_range[2],
-        ),
-        k_override: config.k_override,
-        k: (config.k_range[0], config.k_range[1], config.k_range[2]),
-    };
-
-    let combos = expand_grid_yang_zhang(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-    let mut yz = vec![0.0; total];
-    let mut rs = vec![0.0; total];
-
-    yang_zhang_volatility_batch_inner_into(
-        open,
-        high,
-        low,
-        close,
-        &sweep,
-        detect_best_kernel(),
-        false,
-        &mut yz,
-        &mut rs,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("yz"),
-        &serde_wasm_bindgen::to_value(&yz).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rs"),
-        &serde_wasm_bindgen::to_value(&rs).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn yang_zhang_volatility_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(2 * len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn yang_zhang_volatility_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn yang_zhang_volatility_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    lookback: usize,
-    k_override: bool,
-    k: f64,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to yang_zhang_volatility_into",
-        ));
-    }
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * len);
-
-        let params = YangZhangVolatilityParams {
-            lookback: Some(lookback),
-            k_override: Some(k_override),
-            k: Some(k),
-        };
-        let input = YangZhangVolatilityInput::from_slices(open, high, low, close, params);
-
-        let (yz, rs) = out.split_at_mut(len);
-        yang_zhang_volatility_into_slice(yz, rs, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn yang_zhang_volatility_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    yz_ptr: *mut f64,
-    rs_ptr: *mut f64,
-    len: usize,
-    lookback_start: usize,
-    lookback_end: usize,
-    lookback_step: usize,
-    k_override: bool,
-    k_start: f64,
-    k_end: f64,
-    k_step: f64,
-) -> Result<usize, JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || yz_ptr.is_null()
-        || rs_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = YangZhangVolatilityBatchRange {
-            lookback: (lookback_start, lookback_end, lookback_step),
-            k_override,
-            k: (k_start, k_end, k_step),
-        };
-
-        let combos =
-            expand_grid_yang_zhang(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let yz_out = std::slice::from_raw_parts_mut(yz_ptr, rows * cols);
-        let rs_out = std::slice::from_raw_parts_mut(rs_ptr, rows * cols);
-
-        yang_zhang_volatility_batch_inner_into(
-            open,
-            high,
-            low,
-            close,
-            &sweep,
-            detect_best_kernel(),
-            false,
-            yz_out,
-            rs_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn yang_zhang_volatility_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    lookback: usize,
-    k_override: bool,
-    k: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = yang_zhang_volatility_js(open, high, low, close, lookback, k_override, k)?;
-    crate::write_wasm_object_f64_outputs("yang_zhang_volatility_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn yang_zhang_volatility_batch_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = yang_zhang_volatility_batch_js(open, high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "yang_zhang_volatility_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
-    const TEST_FILE: &str = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
+    const TEST_FILE: &str = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
 
     #[inline]
     fn eq_or_both_nan_eps(a: f64, b: f64, eps: f64) -> bool {
@@ -2409,7 +1928,7 @@ mod tests {
 
     fn check_yang_zhang_partial_params(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let params = YangZhangVolatilityParams {
             lookback: None,
             k_override: None,
@@ -2424,7 +1943,7 @@ mod tests {
 
     fn check_yang_zhang_default_candles(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let input = YangZhangVolatilityInput::with_default_candles(&candles);
         match input.data {
             YangZhangVolatilityData::Candles { .. } => {}
@@ -2573,7 +2092,7 @@ mod tests {
 
     fn check_yang_zhang_nan_handling(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let input = YangZhangVolatilityInput::with_default_candles(&candles);
         let out = yang_zhang_volatility_with_kernel(&input, kernel)?;
         let first = first_valid_ohlc(&candles.open, &candles.high, &candles.low, &candles.close);
@@ -2590,7 +2109,7 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let params = YangZhangVolatilityParams {
             lookback: Some(20),
             k_override: Some(true),
@@ -2620,7 +2139,7 @@ mod tests {
 
     fn check_yang_zhang_streaming(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let params = YangZhangVolatilityParams {
             lookback: Some(20),
             k_override: Some(true),
@@ -2661,7 +2180,7 @@ mod tests {
 
     fn check_yang_zhang_matches_naive(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let input = YangZhangVolatilityInput::with_default_candles(&candles);
         let out = yang_zhang_volatility_with_kernel(&input, kernel)?;
 
@@ -2814,7 +2333,7 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_yang_zhang_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let configs = [
             YangZhangVolatilityParams::default(),
             YangZhangVolatilityParams {
@@ -2911,7 +2430,7 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let batch = YangZhangVolatilityBatchBuilder::new()
             .kernel(kernel)
             .lookback_range(14, 16, 1)
@@ -2933,7 +2452,7 @@ mod tests {
 
     fn check_batch_sweep_vs_single(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let batch = YangZhangVolatilityBatchBuilder::new()
             .kernel(kernel)
             .lookback_range(8, 12, 2)
@@ -2973,7 +2492,7 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let configs = [
             (2, 10, 2, true, 0.0, 1.0, 0.2),
             (5, 25, 5, false, 0.34, 0.34, 0.0),
@@ -3046,7 +2565,7 @@ mod tests {
 
     #[test]
     fn test_batch_invalid_kernel_for_batch() -> Result<(), Box<dyn Error>> {
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let sweep = YangZhangVolatilityBatchRange {
             lookback: (8, 12, 2),
             k_override: true,
@@ -3070,7 +2589,7 @@ mod tests {
 
     #[test]
     fn test_batch_inner_into_output_length_mismatch() -> Result<(), Box<dyn Error>> {
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let sweep = YangZhangVolatilityBatchRange {
             lookback: (8, 12, 2),
             k_override: true,
@@ -3101,10 +2620,9 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_yang_zhang_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let params = YangZhangVolatilityParams {
             lookback: Some(14),
             k_override: Some(true),
@@ -3136,7 +2654,7 @@ mod tests {
 
     #[test]
     fn test_yang_zhang_builder_apply_matches_slices() -> Result<(), Box<dyn Error>> {
-        let candles = read_candles_from_csv(TEST_FILE)?;
+        let candles = read_candles_from_vortex(TEST_FILE)?;
         let b = YangZhangVolatilityBuilder::new()
             .lookback(20)
             .k_override(true)

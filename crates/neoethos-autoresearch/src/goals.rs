@@ -303,7 +303,11 @@ impl GoalSet {
                 let primary = RiskyScenario {
                     label: format!(
                         "{start:.0} -> {target:.0} (x{:.0})",
-                        if start > 0.0 { target / start } else { f64::NAN }
+                        if start > 0.0 {
+                            target / start
+                        } else {
+                            f64::NAN
+                        }
                     ),
                     start_balance_usd: start,
                     target_balance_usd: target,
@@ -605,7 +609,10 @@ mod tests {
         let mut s = prop_firm_settings();
         s.risk.monthly_profit_target_pct = 0.0;
         let err = GoalSet::load(&s).expect_err("a 0% monthly target is not a goal");
-        assert!(matches!(err, GoalRefusal::G3MonthlyTargetNotPositive { .. }));
+        assert!(matches!(
+            err,
+            GoalRefusal::G3MonthlyTargetNotPositive { .. }
+        ));
         assert!(err.to_string().contains("risk.monthly_profit_target_pct"));
     }
 
@@ -679,6 +686,9 @@ mod tests {
             .assert_mirror_agrees(100.0, 25_000.0, 180.0)
             .expect_err("a mirror at half the target must be refused");
         assert!(err.to_string().contains("system.risky_target_balance_usd"));
-        assert!(err.to_string().contains("DiscoveryConfig::risky_target_balance"));
+        assert!(
+            err.to_string()
+                .contains("DiscoveryConfig::risky_target_balance")
+        );
     }
 }

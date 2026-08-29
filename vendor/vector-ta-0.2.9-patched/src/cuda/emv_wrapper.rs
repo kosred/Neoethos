@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
 use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -19,11 +19,7 @@ const H2D_PINNED_THRESHOLD_BYTES: usize = 128 * 1024 * 1024;
 fn round_block_x_to_warp(x: u32) -> u32 {
     const WARP: u32 = 32;
     let y = (x / WARP) * WARP;
-    if y == 0 {
-        WARP
-    } else {
-        y.min(1024)
-    }
+    if y == 0 { WARP } else { y.min(1024) }
 }
 
 #[inline]
@@ -116,11 +112,6 @@ impl CudaEmv {
         let device = Device::get_device(device_id as u32)?;
         let context = std::sync::Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/emv_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("emv_kernel")?;
 
         let _ = cust::context::CurrentContext::set_cache_config(CacheConfig::PreferL1);

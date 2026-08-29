@@ -1,5 +1,5 @@
-use crate::indicators::moving_averages::ma::{ma, MaData};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::moving_averages::ma::{MaData, ma};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -14,11 +14,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::ManuallyDrop;
 use thiserror::Error;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for CoppockInput<'a> {
     #[inline(always)]
@@ -45,10 +40,6 @@ pub struct CoppockOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct CoppockParams {
     pub short_roc_period: Option<usize>,
     pub long_roc_period: Option<usize>,
@@ -229,13 +220,6 @@ pub enum CoppockError {
     InvalidInput(String),
     #[error("coppock: Underlying MA error: {0}")]
     MaError(#[from] Box<dyn Error + Send + Sync>),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-impl From<CoppockError> for JsValue {
-    fn from(err: CoppockError) -> Self {
-        JsValue::from_str(&err.to_string())
-    }
 }
 
 #[inline]
@@ -474,7 +458,6 @@ pub fn coppock_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn coppock_into(input: &CoppockInput, out: &mut [f64]) -> Result<(), CoppockError> {
     coppock_into_slice(out, input, Kernel::ScalarBatch)
@@ -886,11 +869,7 @@ fn bump(i: &mut usize, n: usize) {
 #[inline(always)]
 fn wrap_sub(idx: usize, offset: usize, n: usize) -> usize {
     let j = idx + n - offset;
-    if j >= n {
-        j - n
-    } else {
-        j
-    }
+    if j >= n { j - n } else { j }
 }
 
 #[inline(always)]
@@ -1581,45 +1560,16 @@ fn expand_grid_coppock(_r: &CoppockBatchRange) -> Vec<CoppockParams> {
     vec![CoppockParams::default()]
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn coppock_output_into_js(
-    data: &[f64],
-    short_roc: usize,
-    long_roc: usize,
-    ma_period: usize,
-    ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = coppock_js(data, short_roc, long_roc, ma_period, ma_type)?;
-    crate::write_wasm_f64_output("coppock_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn coppock_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = coppock_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "coppock_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_coppock_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = CoppockParams::default();
         let input = CoppockInput::from_candles(&candles, "close", default_params);
         let output = coppock_with_kernel(&input, kernel)?;
@@ -1637,13 +1587,8 @@ mod tests {
         let baseline = coppock(&input)?.values;
 
         let mut out = vec![0.0; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             coppock_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            out.copy_from_slice(&baseline);
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1659,8 +1604,8 @@ mod tests {
     }
     fn check_coppock_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = CoppockInput::with_default_candles(&candles);
         let result = coppock_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -1690,8 +1635,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = CoppockInput::with_default_candles(&candles);
         match input.data {
             CoppockData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1764,8 +1709,8 @@ mod tests {
     fn check_coppock_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = CoppockParams::default();
         let first_input = CoppockInput::from_candles(&candles, "close", default_params.clone());
         let first_result = coppock_with_kernel(&first_input, kernel)?;
@@ -1807,8 +1752,8 @@ mod tests {
     }
     fn check_coppock_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = CoppockInput::from_candles(
             &candles,
             "close",
@@ -1834,8 +1779,8 @@ mod tests {
         Ok(())
     }
     fn check_coppock_streaming(test_name: &str, _kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let short = 11;
         let long = 14;
         let ma_period = 10;
@@ -1887,8 +1832,8 @@ mod tests {
     fn check_coppock_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let param_combos = vec![
             CoppockParams {
@@ -2290,8 +2235,8 @@ mod tests {
     generate_all_coppock_tests!(check_coppock_property);
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = CoppockBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2320,8 +2265,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = CoppockBatchBuilder::new()
             .kernel(kernel)
@@ -2341,23 +2286,23 @@ mod tests {
 
             if bits == 0x11111111_11111111 {
                 panic!(
-					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
-					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
-					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
         }
 
@@ -2391,467 +2336,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn coppock_js(
-    data: &[f64],
-    short_roc: usize,
-    long_roc: usize,
-    ma_period: usize,
-    ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let params = CoppockParams {
-        short_roc_period: Some(short_roc),
-        long_roc_period: Some(long_roc),
-        ma_period: Some(ma_period),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = CoppockInput::from_slice(data, params);
-    let mut out = vec![0.0; data.len()];
-    coppock_into_slice(&mut out, &input, detect_best_kernel()).map_err(JsValue::from)?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CoppockBatchConfig {
-    pub short_range: (usize, usize, usize),
-    pub long_range: (usize, usize, usize),
-    pub ma_range: (usize, usize, usize),
-    pub ma_type: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CoppockBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<CoppockParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = coppock_batch)]
-pub fn coppock_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: CoppockBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = CoppockBatchRange {
-        short: cfg.short_range,
-        long: cfg.long_range,
-        ma: cfg.ma_range,
-    };
-    let out =
-        coppock_batch_inner(data, &sweep, detect_best_kernel(), false).map_err(JsValue::from)?;
-    let js = CoppockBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn coppock_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn coppock_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn coppock_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_roc: usize,
-    long_roc: usize,
-    ma_period: usize,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    if short_roc == 0 || long_roc == 0 || ma_period == 0 {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-
-    let max_period = short_roc.max(long_roc).max(ma_period);
-    if max_period > len {
-        return Err(JsValue::from_str("Period exceeds data length"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = CoppockParams {
-            short_roc_period: Some(short_roc),
-            long_roc_period: Some(long_roc),
-            ma_period: Some(ma_period),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let input = CoppockInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut tmp = vec![0.0; len];
-            coppock_into_slice(&mut tmp, &input, detect_best_kernel()).map_err(JsValue::from)?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            coppock_into_slice(out, &input, detect_best_kernel()).map_err(JsValue::from)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "coppock")]
-#[pyo3(signature = (data, short_roc_period, long_roc_period, ma_period, ma_type=None, kernel=None))]
-pub fn coppock_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    short_roc_period: usize,
-    long_roc_period: usize,
-    ma_period: usize,
-    ma_type: Option<&str>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = CoppockParams {
-        short_roc_period: Some(short_roc_period),
-        long_roc_period: Some(long_roc_period),
-        ma_period: Some(ma_period),
-        ma_type: ma_type
-            .map(|s| s.to_string())
-            .or_else(|| Some("wma".to_string())),
-    };
-    let input = CoppockInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| coppock_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "CoppockStream")]
-pub struct CoppockStreamPy {
-    stream: CoppockStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl CoppockStreamPy {
-    #[new]
-    fn new(
-        short_roc_period: usize,
-        long_roc_period: usize,
-        ma_period: usize,
-        ma_type: Option<&str>,
-    ) -> PyResult<Self> {
-        let params = CoppockParams {
-            short_roc_period: Some(short_roc_period),
-            long_roc_period: Some(long_roc_period),
-            ma_period: Some(ma_period),
-            ma_type: ma_type
-                .map(|s| s.to_string())
-                .or_else(|| Some("wma".to_string())),
-        };
-        let stream =
-            CoppockStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(CoppockStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "coppock_batch")]
-#[pyo3(signature = (data, short_range, long_range, ma_range, ma_type=None, kernel=None))]
-pub fn coppock_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    short_range: (usize, usize, usize),
-    long_range: (usize, usize, usize),
-    ma_range: (usize, usize, usize),
-    ma_type: Option<&str>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = CoppockBatchRange {
-        short: short_range,
-        long: long_range,
-        ma: ma_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            let mut filled_combos = combos.clone();
-            if let Some(mt) = ma_type {
-                for combo in &mut filled_combos {
-                    combo.ma_type = Some(mt.to_string());
-                }
-            }
-
-            coppock_batch_inner_into(slice_in, &sweep, simd, true, slice_out)?;
-            Ok::<Vec<CoppockParams>, CoppockError>(filled_combos)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "shorts",
-        combos
-            .iter()
-            .map(|p| p.short_roc_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "longs",
-        combos
-            .iter()
-            .map(|p| p.long_roc_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_periods",
-        combos
-            .iter()
-            .map(|p| p.ma_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_types",
-        combos
-            .iter()
-            .map(|p| p.ma_type.as_deref().unwrap_or("wma"))
-            .collect::<Vec<_>>(),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::coppock_wrapper::{CudaCoppock, DeviceArrayF32Coppock};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct CoppockDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32Coppock,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl CoppockDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-        use cust::memory::DeviceBuffer;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        if let Some(s) = stream.as_ref() {
-            if let Ok(i) = s.extract::<i64>(py) {
-                if i == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__: stream 0 is disallowed for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_clone = self.inner.ctx.clone();
-        let device_id = self.inner.device_id;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Coppock {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx: ctx_clone,
-                device_id,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "coppock_cuda_batch_dev")]
-#[pyo3(signature = (data, short_range, long_range, ma_range, device_id=0))]
-pub fn coppock_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: numpy::PyReadonlyArray1<'_, f64>,
-    short_range: (usize, usize, usize),
-    long_range: (usize, usize, usize),
-    ma_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<CoppockDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let price = data.as_slice()?;
-    let price_f32: Vec<f32> = price.iter().map(|&v| v as f32).collect();
-    let sweep = CoppockBatchRange {
-        short: short_range,
-        long: long_range,
-        ma: ma_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaCoppock::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.coppock_batch_dev(&price_f32, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(CoppockDeviceArrayF32Py { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "coppock_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm, cols, rows, short_period, long_period, ma_period, device_id=0))]
-pub fn coppock_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm: numpy::PyReadonlyArray1<'_, f64>,
-    cols: usize,
-    rows: usize,
-    short_period: usize,
-    long_period: usize,
-    ma_period: usize,
-    device_id: usize,
-) -> PyResult<CoppockDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if slice.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let price_f32: Vec<f32> = slice.iter().map(|&v| v as f32).collect();
-    let inner = py.allow_threads(|| {
-        let cuda = CudaCoppock::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.coppock_many_series_one_param_time_major_dev(
-            &price_f32,
-            cols,
-            rows,
-            short_period,
-            long_period,
-            ma_period,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(CoppockDeviceArrayF32Py { inner })
 }

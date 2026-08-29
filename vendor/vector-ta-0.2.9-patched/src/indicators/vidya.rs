@@ -1,37 +1,12 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaVidya;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
 use paste::paste;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -66,51 +41,22 @@ impl<'a> AsRef<[f64]> for VidyaInput<'a> {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vidya_output_into_js(
-    data: &[f64],
-    short_period: usize,
-    long_period: usize,
-    alpha: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = vidya_js(data, short_period, long_period, alpha)?;
-    crate::write_wasm_f64_output("vidya_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vidya_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vidya_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("vidya_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests_into_parity {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_vidya_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VidyaInput::with_default_candles(&candles);
 
         let baseline = vidya(&input)?.values;
 
         let mut out = vec![0.0; candles.close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             vidya_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            vidya_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -148,10 +94,6 @@ pub struct VidyaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VidyaParams {
     pub short_period: Option<usize>,
     pub long_period: Option<usize>,
@@ -484,7 +426,6 @@ pub fn vidya_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn vidya_into(input: &VidyaInput, out: &mut [f64]) -> Result<(), VidyaError> {
     vidya_into_slice(out, input, Kernel::Auto)
@@ -1386,15 +1327,15 @@ unsafe fn vidya_row_avx512_long(
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_vidya_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = VidyaParams {
             short_period: None,
             long_period: Some(10),
@@ -1411,8 +1352,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_prices = &candles.close;
 
         let params = VidyaParams {
@@ -1453,8 +1394,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VidyaInput::with_default_candles(&candles);
         match input.data {
             VidyaData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1524,8 +1465,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = VidyaParams {
             short_period: Some(2),
@@ -1551,8 +1492,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = VidyaParams {
             short_period: Some(2),
             long_period: Some(5),
@@ -1573,8 +1514,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let short_period = 2;
         let long_period = 5;
@@ -1622,8 +1563,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             VidyaParams::default(),
@@ -2013,8 +1954,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = VidyaBatchBuilder::new()
             .kernel(kernel)
@@ -2046,8 +1987,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 5, 1, 5, 10, 1, 0.2, 0.2, 0.0),
@@ -2233,476 +2174,4 @@ pub fn vidya_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vidya")]
-#[pyo3(signature = (data, short_period, long_period, alpha, kernel=None))]
-pub fn vidya_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    short_period: usize,
-    long_period: usize,
-    alpha: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = VidyaParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-        alpha: Some(alpha),
-    };
-    let input = VidyaInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| vidya_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VidyaStream")]
-pub struct VidyaStreamPy {
-    stream: VidyaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VidyaStreamPy {
-    #[new]
-    fn new(short_period: usize, long_period: usize, alpha: f64) -> PyResult<Self> {
-        let params = VidyaParams {
-            short_period: Some(short_period),
-            long_period: Some(long_period),
-            alpha: Some(alpha),
-        };
-        let stream =
-            VidyaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(VidyaStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vidya_batch")]
-#[pyo3(signature = (data, short_period_range, long_period_range, alpha_range, kernel=None))]
-pub fn vidya_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    short_period_range: (usize, usize, usize),
-    long_period_range: (usize, usize, usize),
-    alpha_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-
-    let sweep = VidyaBatchRange {
-        short_period: short_period_range,
-        long_period: long_period_range,
-        alpha: alpha_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => match detect_best_batch_kernel() {
-                    Kernel::Avx512Batch => Kernel::Avx2Batch,
-                    other => other,
-                },
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-            vidya_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "short_periods",
-        combos
-            .iter()
-            .map(|p| p.short_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "long_periods",
-        combos
-            .iter()
-            .map(|p| p.long_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "alphas",
-        combos
-            .iter()
-            .map(|p| p.alpha.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "VidyaDeviceArrayF32", unsendable)]
-pub struct VidyaDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) _ctx: std::sync::Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl VidyaDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        Ok((2, self.device_id as i32))
-    }
-
-    #[pyo3(signature=(_stream=None, max_version=None, _dl_device=None, _copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        _stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        _dl_device: Option<pyo3::PyObject>,
-        _copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = _dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = _copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = _stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vidya_cuda_batch_dev")]
-#[pyo3(signature = (data, short_period_range, long_period_range, alpha_range, device_id=0))]
-pub fn vidya_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: PyReadonlyArray1<'_, f32>,
-    short_period_range: (usize, usize, usize),
-    long_period_range: (usize, usize, usize),
-    alpha_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<VidyaDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data.as_slice()?;
-    let sweep = VidyaBatchRange {
-        short_period: short_period_range,
-        long_period: long_period_range,
-        alpha: alpha_range,
-    };
-    let (inner, ctx_arc, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVidya::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let arr = cuda
-            .vidya_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, cuda.context_arc_clone(), cuda.device_id()))
-    })?;
-    Ok(VidyaDeviceArrayF32Py {
-        inner,
-        _ctx: ctx_arc,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vidya_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm, cols, rows, short_period, long_period, alpha, device_id=0))]
-pub fn vidya_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    short_period: usize,
-    long_period: usize,
-    alpha: f64,
-    device_id: usize,
-) -> PyResult<VidyaDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if slice.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let params = VidyaParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-        alpha: Some(alpha),
-    };
-    let (inner, ctx_arc, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVidya::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let arr = cuda
-            .vidya_many_series_one_param_time_major_dev(slice, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, cuda.context_arc_clone(), cuda.device_id()))
-    })?;
-    Ok(VidyaDeviceArrayF32Py {
-        inner,
-        _ctx: ctx_arc,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vidya_js(
-    data: &[f64],
-    short_period: usize,
-    long_period: usize,
-    alpha: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let params = VidyaParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-        alpha: Some(alpha),
-    };
-    let input = VidyaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    vidya_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vidya_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period: usize,
-    long_period: usize,
-    alpha: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = VidyaParams {
-            short_period: Some(short_period),
-            long_period: Some(long_period),
-            alpha: Some(alpha),
-        };
-        let input = VidyaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            vidya_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            vidya_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vidya_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vidya_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VidyaBatchConfig {
-    pub short_period_range: (usize, usize, usize),
-    pub long_period_range: (usize, usize, usize),
-    pub alpha_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VidyaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<VidyaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = vidya_batch)]
-pub fn vidya_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: VidyaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = VidyaBatchRange {
-        short_period: config.short_period_range,
-        long_period: config.long_period_range,
-        alpha: config.alpha_range,
-    };
-
-    let mut output = vec![0.0; data.len() * 232];
-    let kernel = match detect_best_kernel() {
-        Kernel::Avx512 => Kernel::Avx2,
-        other => other,
-    };
-    let combos = vidya_batch_inner_into(data, &sweep, kernel, false, &mut output)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let rows = combos.len();
-    let cols = data.len();
-    output.truncate(rows * cols);
-
-    let result = VidyaBatchJsOutput {
-        values: output,
-        combos,
-        rows,
-        cols,
-    };
-
-    serde_wasm_bindgen::to_value(&result)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vidya_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period_start: usize,
-    short_period_end: usize,
-    short_period_step: usize,
-    long_period_start: usize,
-    long_period_end: usize,
-    long_period_step: usize,
-    alpha_start: f64,
-    alpha_end: f64,
-    alpha_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = VidyaBatchRange {
-            short_period: (short_period_start, short_period_end, short_period_step),
-            long_period: (long_period_start, long_period_end, long_period_step),
-            alpha: (alpha_start, alpha_end, alpha_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let total_size = combos
-            .len()
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
-
-        let kernel = match detect_best_kernel() {
-            Kernel::Avx512 => Kernel::Avx2,
-            other => other,
-        };
-        vidya_batch_inner_into(data, &sweep, kernel, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(combos.len())
-    }
 }

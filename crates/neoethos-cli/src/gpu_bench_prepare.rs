@@ -56,32 +56,41 @@ pub fn run_prepare(args: &[String]) -> Result<()> {
         pip_value_per_lot: parse_f64(args, "--pip-value-per-lot", 10.0)?,
     };
 
-    // Two input paths. `--symbol` reads the project's own store and computes
-    // the same feature set discovery uses, so a paid run measures real market
-    // data. `--csv` remains for an externally supplied series.
-    let prepared = match (flag(args, "--symbol"), flag(args, "--csv")) {
-        (Some(_), Some(_)) => {
-            bail!("bench-prepare accepts either --symbol or --csv, not both")
-        }
-        (Some(symbol), None) => {
-            let request = StoreRequest {
-                data_root: PathBuf::from(
-                    flag(args, "--data-root")
-                        .or_else(|| flag(args, "--root"))
-                        .unwrap_or_else(|| "data".to_string()),
-                ),
-                symbol,
-                timeframe: timeframe.clone(),
-                bars: parse_usize(args, "--bars", 50_000)?,
-                max_features: parse_usize(args, "--max-features", 32)?,
-            };
-            prepare_snapshot_from_store(&request, &out, &options)?
-        }
-        (None, Some(csv)) => prepare_snapshot(Path::new(&csv), &out, &timeframe, &options)?,
-        (None, None) => {
-            bail!("bench-prepare requires --symbol <SYMBOL> (real store) or --csv <file>")
-        }
+    // Paid preparation consumes only a canonical Vortex generation produced by
+    // the shared importer/broker publisher. Source formats never reach this
+    // command, so benchmark input cannot bypass validation or provenance.
+    let symbol = flag(args, "--symbol").context("bench-prepare requires --symbol <SYMBOL>")?;
+    let encoded_identity = flag(args, "--dataset-identity").context(
+        "bench-prepare requires --dataset-identity <d1-...>; a paid run must not infer a source/account",
+    )?;
+    let dataset_identity =
+        neoethos_data::CanonicalDatasetIdentity::from_path_component(&encoded_identity)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .with_context(|| format!("decode --dataset-identity {encoded_identity}"))?;
+    anyhow::ensure!(
+        dataset_identity.symbol_name().eq_ignore_ascii_case(&symbol),
+        "--dataset-identity belongs to {}, but --symbol selected {symbol}",
+        dataset_identity.symbol_name()
+    );
+    anyhow::ensure!(
+        dataset_identity
+            .timeframe()
+            .as_str()
+            .eq_ignore_ascii_case(&timeframe),
+        "--dataset-identity is {}, but --timeframe selected {timeframe}",
+        dataset_identity.timeframe()
+    );
+    let request = StoreRequest {
+        data_root: PathBuf::from(
+            flag(args, "--data-root")
+                .or_else(|| flag(args, "--root"))
+                .unwrap_or_else(|| "data".to_string()),
+        ),
+        dataset_identity,
+        bars: parse_usize(args, "--bars", 50_000)?,
+        max_features: parse_usize(args, "--max-features", usize::MAX)?,
     };
+    let prepared = prepare_snapshot_from_store(&request, &out, &options)?;
     println!("{}", serde_json::to_string_pretty(&prepared)?);
     Ok(())
 }
@@ -90,8 +99,7 @@ pub fn run_prepare(args: &[String]) -> Result<()> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoreRequest {
     pub data_root: PathBuf,
-    pub symbol: String,
-    pub timeframe: String,
+    pub dataset_identity: neoethos_data::CanonicalDatasetIdentity,
     /// Number of most recent bars to keep. Snapshots are JSON, so an unbounded
     /// M1 history would produce a file nobody can move to a rented box.
     pub bars: usize,
@@ -117,43 +125,42 @@ pub fn prepare_snapshot_from_store(
         bail!("--max-features must be positive");
     }
 
-    let ohlcv = neoethos_data::load_symbol_timeframe(
+    let loaded = neoethos_data::core::canonical_ohlcv::load_canonical_timeframe(
         &request.data_root,
-        &request.symbol,
-        &request.timeframe,
+        &request.dataset_identity,
     )
     .with_context(|| {
         format!(
-            "load {} {} from {}",
-            request.symbol,
-            request.timeframe,
+            "fully verify exact canonical dataset {} under {}",
+            request.dataset_identity.to_path_component(),
             request.data_root.display()
         )
     })?;
+    let ohlcv = loaded.ohlcv();
+    let symbol = request.dataset_identity.symbol_name();
+    let timeframe = request.dataset_identity.timeframe().as_str();
     let timestamps = ohlcv.timestamp.clone().with_context(|| {
         format!(
             "{} {} has no timestamp column; a benchmark snapshot needs a calendar",
-            request.symbol, request.timeframe
+            symbol, timeframe
         )
     })?;
     if timestamps.len() != ohlcv.close.len() {
         bail!(
             "{} {} timestamp length {} does not match {} bars",
-            request.symbol,
-            request.timeframe,
+            symbol,
+            timeframe,
             timestamps.len(),
             ohlcv.close.len()
         );
     }
 
-    let frame = neoethos_data::compute_hpc_features(&ohlcv).with_context(|| {
-        format!(
-            "compute features for {} {}",
-            request.symbol, request.timeframe
-        )
-    })?;
-    let view = frame.as_indicators_view();
-    let (available_features, feature_rows) = (view.nrows(), view.ncols());
+    let frame = neoethos_data::compute_hpc_features(&loaded)
+        .with_context(|| format!("compute features for {} {}", symbol, timeframe))?;
+    let dense = frame
+        .to_dense_samples_major()
+        .context("materialize exact f64 benchmark feature matrix")?;
+    let (available_features, feature_rows) = (frame.n_features(), frame.n_samples());
     if feature_rows != ohlcv.close.len() {
         bail!(
             "feature frame has {feature_rows} rows but the series has {} bars",
@@ -167,7 +174,12 @@ pub fn prepare_snapshot_from_store(
 
     // First row where every retained feature is finite: indicator warmup.
     let warmup = (0..feature_rows)
-        .find(|row| (0..feature_count).all(|feature| view[[feature, *row]].is_finite()))
+        .find(|row| {
+            (0..feature_count).all(|feature| {
+                dense.validity[[*row, feature]].is_valid()
+                    && dense.values[[*row, feature]].is_finite()
+            })
+        })
         .context("every row contains a non-finite feature value")?;
     let usable = feature_rows - warmup;
     if usable < 64 {
@@ -182,10 +194,10 @@ pub fn prepare_snapshot_from_store(
     let mut indicators = Vec::with_capacity(feature_count * bars);
     for feature in 0..feature_count {
         for row in start..feature_rows {
-            let value = view[[feature, row]];
-            if !value.is_finite() {
+            let value = dense.values[[row, feature]];
+            if !dense.validity[[row, feature]].is_valid() || !value.is_finite() {
                 bail!(
-                    "feature {} is non-finite at bar {row} after warmup trimming",
+                    "feature {} is invalid at bar {row} after warmup trimming",
                     frame.names.get(feature).map_or("<unnamed>", String::as_str)
                 );
             }
@@ -206,12 +218,12 @@ pub fn prepare_snapshot_from_store(
     let source_description = format!(
         "{} {} from {} — bars {start}..{feature_rows} of {feature_rows}, {feature_count} of \
          {available_features} canonical features",
-        request.symbol,
-        request.timeframe,
+        symbol,
+        timeframe,
         request.data_root.display()
     );
     let dto = build_snapshot_dto(
-        &request.timeframe,
+        timeframe,
         source_description,
         close,
         high,
@@ -221,7 +233,7 @@ pub fn prepare_snapshot_from_store(
         feature_count,
         options,
     );
-    finalize_snapshot(dto, out, &request.timeframe)
+    finalize_snapshot(dto, out, timeframe)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -255,55 +267,7 @@ impl Default for PrepareOptions {
     }
 }
 
-/// Convert canonical CSV into a deterministic, validated snapshot.
-///
-/// The same input and options always produce byte-identical JSON, so the
-/// printed SHA-256 is a stable attribution key for a paid run.
-pub fn prepare_snapshot(
-    csv: &Path,
-    out: &Path,
-    timeframe: &str,
-    options: &PrepareOptions,
-) -> Result<PreparedSnapshot> {
-    if options.population == 0 {
-        bail!("--population must be positive");
-    }
-    let raw = std::fs::read(csv).with_context(|| format!("read {}", csv.display()))?;
-    let series = parse_canonical_csv(&raw)?;
-    let bars = series.close.len();
-    if bars < 64 {
-        bail!("snapshot CSV must contain at least 64 bars, found {bars}");
-    }
-
-    let feature_count = series.feature_names.len();
-    let mut indicators = Vec::with_capacity(feature_count * bars);
-    for feature in 0..feature_count {
-        for row in &series.features {
-            indicators.push(row[feature] as f32);
-        }
-    }
-
-    let source_hash = hex_digest(&raw);
-    let source_name = csv
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| csv.display().to_string());
-
-    let dto = build_snapshot_dto(
-        timeframe,
-        format!("{source_name} sha256={source_hash}"),
-        series.close,
-        series.high,
-        series.low,
-        series.timestamps,
-        indicators,
-        feature_count,
-        options,
-    );
-    finalize_snapshot(dto, out, timeframe)
-}
-
-/// Assemble the versioned DTO shared by both input paths.
+/// Assemble the versioned DTO from one fully verified canonical series.
 #[allow(clippy::too_many_arguments)]
 fn build_snapshot_dto(
     timeframe: &str,
@@ -312,7 +276,7 @@ fn build_snapshot_dto(
     high: Vec<f64>,
     low: Vec<f64>,
     timestamps: Vec<i64>,
-    indicators: Vec<f32>,
+    indicators: Vec<f64>,
     feature_count: usize,
     options: &PrepareOptions,
 ) -> SnapshotFixtureDto {
@@ -345,7 +309,7 @@ fn build_snapshot_dto(
         stop_vol_multipliers: vec![0.0; options.population],
         smc_data: vec![[0_i8; SMC_WIDTH]; bars],
         gene_smc_flags: vec![[0_i8; SMC_WIDTH]; options.population],
-        smc_weights: [0.0_f32; SMC_WIDTH],
+        smc_weights: [0.0_f64; SMC_WIDTH],
         settings: SnapshotSettingsDto {
             session_spread_profile: None,
             max_hold_bars: options.max_hold_bars,
@@ -399,108 +363,12 @@ fn finalize_snapshot(
     })
 }
 
-struct CanonicalSeries {
-    timestamps: Vec<i64>,
-    high: Vec<f64>,
-    low: Vec<f64>,
-    close: Vec<f64>,
-    feature_names: Vec<String>,
-    features: Vec<Vec<f64>>,
-}
-
-fn parse_canonical_csv(raw: &[u8]) -> Result<CanonicalSeries> {
-    let text = String::from_utf8_lossy(raw);
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    let header = lines.next().context("CSV has no header")?;
-    let columns: Vec<String> = header
-        .split(',')
-        .map(|name| name.trim().to_string())
-        .collect();
-    let index_of = |wanted: &str| {
-        columns
-            .iter()
-            .position(|name| name.eq_ignore_ascii_case(wanted))
-    };
-    let timestamp_index = index_of("timestamp").context("CSV is missing a timestamp column")?;
-    let high_index = index_of("high").context("CSV is missing a high column")?;
-    let low_index = index_of("low").context("CSV is missing a low column")?;
-    let close_index = index_of("close").context("CSV is missing a close column")?;
-    let reserved = [timestamp_index, high_index, low_index, close_index];
-    let feature_indices: Vec<usize> = (0..columns.len())
-        .filter(|index| !reserved.contains(index))
-        .collect();
-    if feature_indices.is_empty() {
-        bail!("CSV must contain at least one numeric feature column");
-    }
-
-    let mut series = CanonicalSeries {
-        timestamps: Vec::new(),
-        high: Vec::new(),
-        low: Vec::new(),
-        close: Vec::new(),
-        feature_names: feature_indices
-            .iter()
-            .map(|index| columns[*index].clone())
-            .collect(),
-        features: Vec::new(),
-    };
-    for (offset, line) in lines.enumerate() {
-        let row_number = offset + 2;
-        let cells: Vec<&str> = line.split(',').map(str::trim).collect();
-        if cells.len() != columns.len() {
-            bail!(
-                "row {row_number} has {} cells, expected {}",
-                cells.len(),
-                columns.len()
-            );
-        }
-        let timestamp = finite(cells[timestamp_index], "timestamp", row_number)?;
-        let mut milliseconds = timestamp as i64;
-        if milliseconds.abs() < 10_000_000_000 {
-            milliseconds *= 1000;
-        }
-        let high = finite(cells[high_index], "high", row_number)?;
-        let low = finite(cells[low_index], "low", row_number)?;
-        if low > high {
-            bail!("row {row_number}: low {low} exceeds high {high}");
-        }
-        if let Some(previous) = series.timestamps.last() {
-            if milliseconds <= *previous {
-                bail!("row {row_number}: timestamps must be strictly increasing");
-            }
-        }
-        series.timestamps.push(milliseconds);
-        series.high.push(high);
-        series.low.push(low);
-        series
-            .close
-            .push(finite(cells[close_index], "close", row_number)?);
-        let mut features = Vec::with_capacity(feature_indices.len());
-        for index in &feature_indices {
-            features.push(finite(cells[*index], &columns[*index], row_number)?);
-        }
-        series.features.push(features);
-    }
-    Ok(series)
-}
-
-fn finite(value: &str, label: &str, row: usize) -> Result<f64> {
-    let parsed: f64 = value
-        .parse()
-        .with_context(|| format!("row {row}: {label} is not numeric: {value:?}"))?;
-    if !parsed.is_finite() {
-        bail!("row {row}: {label} is not finite");
-    }
-    Ok(parsed)
-}
-
 struct DeterministicGenes {
     offsets: Vec<i32>,
     indices: Vec<i32>,
-    weights: Vec<f32>,
-    long_thresholds: Vec<f32>,
-    short_thresholds: Vec<f32>,
+    weights: Vec<f64>,
+    long_thresholds: Vec<f64>,
+    short_thresholds: Vec<f64>,
 }
 
 fn deterministic_genes(
@@ -521,7 +389,7 @@ fn deterministic_genes(
             genes
                 .indices
                 .push(((candidate + term * 3) % feature_count) as i32);
-            let magnitude = 0.35 + ((candidate + term) % 5) as f32 * 0.11;
+            let magnitude = 0.35 + ((candidate + term) % 5) as f64 * 0.11;
             genes.weights.push(if (candidate + term) % 2 == 0 {
                 magnitude
             } else {
@@ -529,7 +397,7 @@ fn deterministic_genes(
             });
         }
         genes.offsets.push(genes.indices.len() as i32);
-        let threshold = 0.20 + (candidate % 3) as f32 * 0.03;
+        let threshold = 0.20 + (candidate % 3) as f64 * 0.03;
         genes.long_thresholds.push(threshold);
         genes.short_thresholds.push(-threshold);
     }
@@ -1217,94 +1085,11 @@ fn parse_f64(args: &[String], name: &str, default: f64) -> Result<f64> {
 mod tests {
     use super::*;
 
-    fn tiny_csv() -> String {
-        let mut csv = String::from("timestamp,high,low,close,f0,f1\n");
-        for bar in 0..96_i64 {
-            let base = 1.10 + (bar as f64 * 0.01).sin() * 0.002;
-            csv.push_str(&format!(
-                "{},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
-                1_700_000_000 + bar * 60,
-                base + 0.0007,
-                base - 0.0007,
-                base,
-                (bar as f64 * 0.05).sin(),
-                (bar as f64 * 0.03).cos(),
-            ));
-        }
-        csv
-    }
-
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("neoethos-bench-prepare-{name}"));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
-    }
-
-    #[test]
-    fn snapshot_preparation_is_deterministic_and_validated() {
-        let directory = temp_dir("deterministic");
-        let csv = directory.join("EURUSD_M1.csv");
-        std::fs::write(&csv, tiny_csv()).unwrap();
-        let options = PrepareOptions {
-            population: 8,
-            ..PrepareOptions::default()
-        };
-
-        let first = prepare_snapshot(&csv, &directory.join("a.json"), "m1", &options).unwrap();
-        let second = prepare_snapshot(&csv, &directory.join("b.json"), "m1", &options).unwrap();
-
-        assert_eq!(
-            first.sha256, second.sha256,
-            "the same input must hash equal"
-        );
-        assert_eq!(first.timeframe, "M1");
-        assert_eq!(first.bars, 96);
-        assert_eq!(first.features, 2);
-        assert_eq!(first.population, 8);
-        assert_eq!(
-            std::fs::read(directory.join("a.json")).unwrap(),
-            std::fs::read(directory.join("b.json")).unwrap()
-        );
-    }
-
-    #[test]
-    fn malformed_csv_is_rejected_with_the_offending_row() {
-        let directory = temp_dir("malformed");
-        let csv = directory.join("bad.csv");
-        let mut text = tiny_csv();
-        text.push_str("1700010000,1.1,1.2,1.1,0.0,0.0\n");
-        std::fs::write(&csv, text).unwrap();
-        let error = prepare_snapshot(
-            &csv,
-            &directory.join("out.json"),
-            "M1",
-            &PrepareOptions {
-                population: 4,
-                ..PrepareOptions::default()
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("low"), "{error}");
-    }
-
-    #[test]
-    fn a_short_series_is_refused_rather_than_padded() {
-        let directory = temp_dir("short");
-        let csv = directory.join("short.csv");
-        std::fs::write(
-            &csv,
-            "timestamp,high,low,close,f0\n1700000000,1.1,1.0,1.05,0.5\n",
-        )
-        .unwrap();
-        let error = prepare_snapshot(
-            &csv,
-            &directory.join("out.json"),
-            "M1",
-            &PrepareOptions::default(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("at least 64 bars"), "{error}");
     }
 
     #[test]

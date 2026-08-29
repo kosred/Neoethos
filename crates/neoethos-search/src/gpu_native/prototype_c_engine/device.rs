@@ -42,24 +42,24 @@ const PROTOTYPE_C_BACKEND_ID: u32 = 22;
 // ---------------------------------------------------------------------------
 
 /// Candidate x bar signal synthesis. Terms accumulate in ascending CSR order so
-/// the device reproduces the canonical `f32` accumulation order.
+/// the device reproduces the canonical `f64` accumulation order.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn c_population_signals_kernel(
-    indicators: &Array<f32>,
+    indicators: &Array<f64>,
     gene_offsets: &Array<i32>,
     gene_indices: &Array<i32>,
-    gene_weights: &Array<f32>,
-    long_thresholds: &Array<f32>,
-    short_thresholds: &Array<f32>,
+    gene_weights: &Array<f64>,
+    long_thresholds: &Array<f64>,
+    short_thresholds: &Array<f64>,
     smc_rows: &Array<i32>,
     smc_flags: &Array<i32>,
-    smc_weights: &Array<f32>,
+    smc_weights: &Array<f64>,
     signals_out: &mut Array<i32>,
-    confidences_out: &mut Array<f32>,
+    confidences_out: &mut Array<f64>,
     n_bars: u32,
     population: u32,
-    gate_threshold: f32,
+    gate_threshold: f64,
     smc_gate_disabled: u32,
 ) {
     let bars = n_bars as usize;
@@ -69,7 +69,7 @@ fn c_population_signals_kernel(
         let candidate = flat / bars;
         let bar = flat - candidate * bars;
 
-        let combined = RuntimeCell::<f32>::new(0.0);
+        let combined = RuntimeCell::<f64>::new(0.0);
         let start = gene_offsets[candidate] as usize;
         let end = gene_offsets[candidate + 1] as usize;
         for term in start..end {
@@ -88,19 +88,19 @@ fn c_population_signals_kernel(
         }
 
         let emitted = RuntimeCell::<i32>::new(0);
-        let confidence = RuntimeCell::<f32>::new(0.0);
+        let confidence = RuntimeCell::<f64>::new(0.0);
         if signal.read() != 0 {
-            let raw_gap = f32::abs(long_threshold - short_threshold);
-            let gap = RuntimeCell::<f32>::new(1.0e-6);
+            let raw_gap = f64::abs(long_threshold - short_threshold);
+            let gap = RuntimeCell::<f64>::new(1.0e-6);
             if raw_gap > 1.0e-6 {
                 gap.store(raw_gap);
             }
-            let margin = RuntimeCell::<f32>::new(short_threshold - value);
+            let margin = RuntimeCell::<f64>::new(short_threshold - value);
             if signal.read() == 1 {
                 margin.store(value - long_threshold);
             }
             let scaled = margin.read() / gap.read();
-            let clamped = RuntimeCell::<f32>::new(scaled);
+            let clamped = RuntimeCell::<f64>::new(scaled);
             if scaled < 0.0 {
                 clamped.store(0.0);
             } else if scaled > 1.0 {
@@ -108,7 +108,7 @@ fn c_population_signals_kernel(
             }
             confidence.store(clamped.read());
 
-            let active_sum = RuntimeCell::<f32>::new(0.0);
+            let active_sum = RuntimeCell::<f64>::new(0.0);
             for slot in 0..SMC_WIDTH {
                 if smc_flags[candidate * SMC_WIDTH + slot] != 0 {
                     active_sum.store(active_sum.read() + smc_weights[slot]);
@@ -117,14 +117,14 @@ fn c_population_signals_kernel(
             if smc_gate_disabled != 0 {
                 active_sum.store(0.0);
             }
-            let gate = RuntimeCell::<f32>::new(active_sum.read());
+            let gate = RuntimeCell::<f64>::new(active_sum.read());
             if gate_threshold < active_sum.read() {
                 gate.store(gate_threshold);
             }
 
             let passes = RuntimeCell::<i32>::new(1);
             if active_sum.read() > 0.0 {
-                let score = RuntimeCell::<f32>::new(0.0);
+                let score = RuntimeCell::<f64>::new(0.0);
                 for slot in 0..SMC_WIDTH {
                     if smc_flags[candidate * SMC_WIDTH + slot] != 0 {
                         let row = smc_rows[bar * SMC_WIDTH + slot];
@@ -207,11 +207,11 @@ fn c_population_scan_offsets_kernel(
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn emit_c_population_events(
-    close_pips: &Array<f32>,
-    adaptive_base_pips: &Array<f32>,
-    stop_pips: &Array<f32>,
-    target_pips: &Array<f32>,
-    stop_vol_multipliers: &Array<f32>,
+    close_pips: &Array<f64>,
+    adaptive_base_pips: &Array<f64>,
+    stop_pips: &Array<f64>,
+    target_pips: &Array<f64>,
+    stop_vol_multipliers: &Array<f64>,
     signals: &Array<i32>,
     event_offsets: &Array<i32>,
     event_candidate_out: &mut Array<i32>,
@@ -219,14 +219,14 @@ fn emit_c_population_events(
     event_entry_out: &mut Array<i32>,
     event_last_out: &mut Array<i32>,
     event_direction_out: &mut Array<i32>,
-    event_stop_out: &mut Array<f32>,
-    event_target_out: &mut Array<f32>,
+    event_stop_out: &mut Array<f64>,
+    event_target_out: &mut Array<f64>,
     n_bars: u32,
     population: u32,
     max_hold_bars: u32,
     min_hold_bars: u32,
-    half_spread_pips: f32,
-    adaptive_rr: f32,
+    half_spread_pips: f64,
+    adaptive_rr: f64,
     has_adaptive_base: u32,
 ) {
     if ABSOLUTE_POS < population as usize {
@@ -242,10 +242,10 @@ fn emit_c_population_events(
             if direction != 0 {
                 let slot = write.read() as usize;
                 let signal_bar = bar - 1;
-                let entry_pips = close_pips[bar] + direction as f32 * half_spread_pips;
+                let entry_pips = close_pips[bar] + direction as f64 * half_spread_pips;
 
-                let stop_distance = RuntimeCell::<f32>::new(stop_pips[candidate]);
-                let target_distance = RuntimeCell::<f32>::new(target_pips[candidate]);
+                let stop_distance = RuntimeCell::<f64>::new(stop_pips[candidate]);
+                let target_distance = RuntimeCell::<f64>::new(target_pips[candidate]);
                 if multiplier > 0.0 && has_adaptive_base != 0 {
                     let adaptive_stop = multiplier * adaptive_base_pips[signal_bar];
                     let adaptive_target = adaptive_rr * adaptive_stop;
@@ -255,8 +255,8 @@ fn emit_c_population_events(
                     }
                 }
 
-                let stop_level = RuntimeCell::<f32>::new(entry_pips + stop_distance.read());
-                let target_level = RuntimeCell::<f32>::new(entry_pips - target_distance.read());
+                let stop_level = RuntimeCell::<f64>::new(entry_pips + stop_distance.read());
+                let target_level = RuntimeCell::<f64>::new(entry_pips - target_distance.read());
                 if direction > 0 {
                     stop_level.store(entry_pips - stop_distance.read());
                     target_level.store(entry_pips + target_distance.read());
@@ -295,14 +295,14 @@ fn emit_c_population_events(
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn c_population_first_hit_kernel(
-    high_pips: &Array<f32>,
-    low_pips: &Array<f32>,
+    high_pips: &Array<f64>,
+    low_pips: &Array<f64>,
     gap_flags: &Array<i32>,
     event_entry: &Array<i32>,
     event_last: &Array<i32>,
     event_direction: &Array<i32>,
-    event_stop: &Array<f32>,
-    event_target: &Array<f32>,
+    event_stop: &Array<f64>,
+    event_target: &Array<f64>,
     exit_bar_out: &mut Array<i32>,
     exit_reason_out: &mut Array<i32>,
     event_count: u32,
@@ -474,43 +474,43 @@ fn stitch_c_population_trades(
 ///
 /// `month_workspace` holds the completed monthly P&L in its first half and the
 /// month starting equity in its second half, so one buffer carries both.
-/// `timestamp_pair` holds `[day_since_epoch, ms_of_day]` per bar, which keeps
-/// the overnight carry term exact without an `f64` device type.
+/// `timestamp_pair` holds `[day_since_epoch, ms_of_day]` per bar, while all
+/// price, cost, sizing, equity and metric arithmetic stays canonical `f64`.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn reduce_c_population_metrics(
-    close_pips: &Array<f32>,
-    high_pips: &Array<f32>,
-    low_pips: &Array<f32>,
+    close_pips: &Array<f64>,
+    high_pips: &Array<f64>,
+    low_pips: &Array<f64>,
     month_idx: &Array<i32>,
     day_idx: &Array<i32>,
     timestamp_pair: &Array<i32>,
-    confidences: &Array<f32>,
+    confidences: &Array<f64>,
     event_entry: &Array<i32>,
     event_direction: &Array<i32>,
-    event_stop: &Array<f32>,
-    event_target: &Array<f32>,
+    event_stop: &Array<f64>,
+    event_target: &Array<f64>,
     exit_bar: &Array<i32>,
     exit_reason: &Array<i32>,
     accepted_event: &Array<i32>,
     accepted_count: &Array<i32>,
     event_offsets: &Array<i32>,
-    month_workspace: &mut Array<f32>,
-    metrics_out: &mut Array<f32>,
+    month_workspace: &mut Array<f64>,
+    metrics_out: &mut Array<f64>,
     n_bars: u32,
     population: u32,
     month_capacity: u32,
-    initial_equity: f32,
-    half_spread_pips: f32,
-    commission_per_trade: f32,
-    pip_value_per_lot: f32,
-    swap_long_pips_per_day: f32,
-    swap_short_pips_per_day: f32,
-    pnl_conversion_fee_rate: f32,
+    initial_equity: f64,
+    half_spread_pips: f64,
+    commission_per_trade: f64,
+    pip_value_per_lot: f64,
+    swap_long_pips_per_day: f64,
+    swap_short_pips_per_day: f64,
+    pnl_conversion_fee_rate: f64,
     risk_based_sizing: u32,
-    risk_per_trade_min: f32,
-    risk_per_trade_max: f32,
-    high_quality_confidence: f32,
+    risk_per_trade_min: f64,
+    risk_per_trade_max: f64,
+    high_quality_confidence: f64,
 ) {
     if ABSOLUTE_POS < population as usize {
         let candidate = ABSOLUTE_POS;
@@ -528,31 +528,31 @@ fn reduce_c_population_metrics(
         let range_start = event_offsets[candidate] as usize;
         let accepted_total = accepted_count[candidate];
 
-        let equity = RuntimeCell::<f32>::new(initial_equity);
-        let peak_equity = RuntimeCell::<f32>::new(initial_equity);
-        let max_drawdown = RuntimeCell::<f32>::new(0.0);
+        let equity = RuntimeCell::<f64>::new(initial_equity);
+        let peak_equity = RuntimeCell::<f64>::new(initial_equity);
+        let max_drawdown = RuntimeCell::<f64>::new(0.0);
         let trade_count = RuntimeCell::<i32>::new(0);
         let wins = RuntimeCell::<i32>::new(0);
-        let gross_profit = RuntimeCell::<f32>::new(0.0);
-        let gross_loss = RuntimeCell::<f32>::new(0.0);
+        let gross_profit = RuntimeCell::<f64>::new(0.0);
+        let gross_loss = RuntimeCell::<f64>::new(0.0);
 
         let last_month = RuntimeCell::<i32>::new(-1);
-        let current_month_pnl = RuntimeCell::<f32>::new(0.0);
-        let current_month_start_equity = RuntimeCell::<f32>::new(initial_equity);
+        let current_month_pnl = RuntimeCell::<f64>::new(0.0);
+        let current_month_start_equity = RuntimeCell::<f64>::new(initial_equity);
         let month_ptr = RuntimeCell::<i32>::new(-1);
 
         let last_day = RuntimeCell::<i32>::new(-1);
-        let day_peak = RuntimeCell::<f32>::new(initial_equity);
-        let day_low = RuntimeCell::<f32>::new(initial_equity);
-        let max_daily_drawdown = RuntimeCell::<f32>::new(0.0);
+        let day_peak = RuntimeCell::<f64>::new(initial_equity);
+        let day_low = RuntimeCell::<f64>::new(initial_equity);
+        let max_daily_drawdown = RuntimeCell::<f64>::new(0.0);
 
         let accepted_cursor = RuntimeCell::<i32>::new(0);
         let has_position = RuntimeCell::<i32>::new(0);
-        let position_entry_pips = RuntimeCell::<f32>::new(0.0);
-        let position_lots = RuntimeCell::<f32>::new(0.0);
+        let position_entry_pips = RuntimeCell::<f64>::new(0.0);
+        let position_lots = RuntimeCell::<f64>::new(0.0);
         let position_direction = RuntimeCell::<i32>::new(0);
-        let position_stop = RuntimeCell::<f32>::new(0.0);
-        let position_target = RuntimeCell::<f32>::new(0.0);
+        let position_stop = RuntimeCell::<f64>::new(0.0);
+        let position_target = RuntimeCell::<f64>::new(0.0);
         let position_exit_bar = RuntimeCell::<i32>::new(-1);
         let position_exit_reason = RuntimeCell::<i32>::new(C_EXIT_NONE);
         let position_entry_bar = RuntimeCell::<i32>::new(-1);
@@ -599,8 +599,8 @@ fn reduce_c_population_metrics(
                 } else {
                     let low = low_pips[bar];
                     let high = high_pips[bar];
-                    let worst = RuntimeCell::<f32>::new(0.0);
-                    let best = RuntimeCell::<f32>::new(0.0);
+                    let worst = RuntimeCell::<f64>::new(0.0);
+                    let best = RuntimeCell::<f64>::new(0.0);
                     if position_direction.read() > 0 {
                         worst.store((low - position_entry_pips.read()) * pip_value_per_lot);
                         best.store((high - position_entry_pips.read()) * pip_value_per_lot);
@@ -643,13 +643,13 @@ fn reduce_c_population_metrics(
                 }
 
                 if realize.read() != 0 {
-                    let exit_level = RuntimeCell::<f32>::new(close_pips[bar]);
+                    let exit_level = RuntimeCell::<f64>::new(close_pips[bar]);
                     if position_exit_reason.read() == C_EXIT_STOP {
                         exit_level.store(position_stop.read());
                     } else if position_exit_reason.read() == C_EXIT_TARGET {
                         exit_level.store(position_target.read());
                     }
-                    let price_pnl = RuntimeCell::<f32>::new(
+                    let price_pnl = RuntimeCell::<f64>::new(
                         (position_entry_pips.read() - exit_level.read()) * pip_value_per_lot,
                     );
                     if position_direction.read() > 0 {
@@ -665,13 +665,13 @@ fn reduce_c_population_metrics(
                     let entry_ms = timestamp_pair[entry_bar_index * 2 + 1];
                     let exit_days = timestamp_pair[bar * 2];
                     let exit_ms = timestamp_pair[bar * 2 + 1];
-                    let overnight_days = RuntimeCell::<f32>::new(0.0);
+                    let overnight_days = RuntimeCell::<f64>::new(0.0);
                     if exit_days > entry_days || (exit_days == entry_days && exit_ms > entry_ms) {
-                        let day_part = (exit_days - entry_days) as f32;
-                        let ms_part = (exit_ms - entry_ms) as f32 / 86_400_000.0;
+                        let day_part = (exit_days - entry_days) as f64;
+                        let ms_part = (exit_ms - entry_ms) as f64 / 86_400_000.0;
                         overnight_days.store(day_part + ms_part);
                     }
-                    let swap_pips = RuntimeCell::<f32>::new(swap_short_pips_per_day);
+                    let swap_pips = RuntimeCell::<f64>::new(swap_short_pips_per_day);
                     if position_direction.read() > 0 {
                         swap_pips.store(swap_long_pips_per_day);
                     }
@@ -680,7 +680,7 @@ fn reduce_c_population_metrics(
                             * overnight_days.read()
                             * pip_value_per_lot
                             * position_lots.read();
-                    let pnl = RuntimeCell::<f32>::new(with_carry);
+                    let pnl = RuntimeCell::<f64>::new(with_carry);
                     if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
                         pnl.store(with_carry * (1.0 - pnl_conversion_fee_rate));
                     }
@@ -692,7 +692,7 @@ fn reduce_c_population_metrics(
                         wins.store(wins.read() + 1);
                         gross_profit.store(gross_profit.read() + pnl.read());
                     } else {
-                        gross_loss.store(gross_loss.read() + f32::abs(pnl.read()));
+                        gross_loss.store(gross_loss.read() + f64::abs(pnl.read()));
                     }
 
                     if equity.read() > peak_equity.read() {
@@ -727,19 +727,19 @@ fn reduce_c_population_metrics(
                     if event_entry[event] == bar as i32 {
                         accepted_cursor.store(accepted_cursor.read() + 1);
                         let direction = event_direction[event];
-                        let entry_pips = close_pips[bar] + direction as f32 * half_spread_pips;
+                        let entry_pips = close_pips[bar] + direction as f64 * half_spread_pips;
                         let stop_level = event_stop[event];
-                        let stop_distance = f32::abs(stop_level - entry_pips);
-                        let lots = RuntimeCell::<f32>::new(1.0);
+                        let stop_distance = f64::abs(stop_level - entry_pips);
+                        let lots = RuntimeCell::<f64>::new(1.0);
                         if risk_based_sizing != 0 {
                             let confidence = confidences[confidence_base + bar - 1];
-                            let clamped = RuntimeCell::<f32>::new(confidence);
+                            let clamped = RuntimeCell::<f64>::new(confidence);
                             if confidence < 0.0 {
                                 clamped.store(0.0);
                             } else if confidence > 1.0 {
                                 clamped.store(1.0);
                             }
-                            let scale = RuntimeCell::<f32>::new(1.0);
+                            let scale = RuntimeCell::<f64>::new(1.0);
                             if high_quality_confidence > 0.0 {
                                 let ratio = clamped.read() / high_quality_confidence;
                                 if ratio < 1.0 {
@@ -748,13 +748,13 @@ fn reduce_c_population_metrics(
                             }
                             let risk = risk_per_trade_min
                                 + (risk_per_trade_max - risk_per_trade_min) * scale.read();
-                            let guarded_stop = RuntimeCell::<f32>::new(1.0);
+                            let guarded_stop = RuntimeCell::<f64>::new(1.0);
                             if stop_distance > 1.0 {
                                 guarded_stop.store(stop_distance);
                             }
                             let denominator = guarded_stop.read() * pip_value_per_lot;
-                            let sized = RuntimeCell::<f32>::new(0.0);
-                            if equity.read() > 0.0 && f32::abs(denominator) > 1.0e-12 {
+                            let sized = RuntimeCell::<f64>::new(0.0);
+                            if equity.read() > 0.0 && f64::abs(denominator) > 1.0e-12 {
                                 sized.store(risk * equity.read() / denominator);
                             }
                             if sized.read() < 0.0 {
@@ -787,13 +787,13 @@ fn reduce_c_population_metrics(
         }
 
         let net_profit = equity.read() - initial_equity;
-        let win_rate = RuntimeCell::<f32>::new(0.0);
-        let expectancy = RuntimeCell::<f32>::new(0.0);
+        let win_rate = RuntimeCell::<f64>::new(0.0);
+        let expectancy = RuntimeCell::<f64>::new(0.0);
         if trade_count.read() > 0 {
-            win_rate.store(wins.read() as f32 / trade_count.read() as f32);
-            expectancy.store(net_profit / trade_count.read() as f32);
+            win_rate.store(wins.read() as f64 / trade_count.read() as f64);
+            expectancy.store(net_profit / trade_count.read() as f64);
         }
-        let profit_factor = RuntimeCell::<f32>::new(0.0);
+        let profit_factor = RuntimeCell::<f64>::new(0.0);
         if gross_loss.read() > 0.0 {
             profit_factor.store(gross_profit.read() / gross_loss.read());
         } else if gross_profit.read() > 0.0 {
@@ -810,30 +810,110 @@ fn reduce_c_population_metrics(
             }
         }
 
-        let monthly_mean = RuntimeCell::<f32>::new(0.0);
-        let monthly_std = RuntimeCell::<f32>::new(0.0);
+        let monthly_mean = RuntimeCell::<f64>::new(0.0);
+        let monthly_std = RuntimeCell::<f64>::new(0.0);
         if limit.read() >= 1 {
             let count = limit.read() + 1;
-            let sum = RuntimeCell::<f32>::new(0.0);
+            let sum = RuntimeCell::<f64>::new(0.0);
             for index in 0..count as usize {
                 sum.store(sum.read() + month_workspace[month_base + index]);
             }
-            let mean = sum.read() / count as f32;
-            let variance = RuntimeCell::<f32>::new(0.0);
+            let mean = sum.read() / count as f64;
+            let variance = RuntimeCell::<f64>::new(0.0);
             for index in 0..count as usize {
                 let delta = month_workspace[month_base + index] - mean;
                 variance.store(variance.read() + delta * delta);
             }
             monthly_mean.store(mean);
-            monthly_std.store(f32::sqrt(variance.read() / (count - 1) as f32));
+            monthly_std.store(f64::sqrt(variance.read() / (count - 1) as f64));
         }
 
-        let sharpe = RuntimeCell::<f32>::new(0.0);
-        let consistency = RuntimeCell::<f32>::new(0.0);
+        let monthly_return_inputs_valid = RuntimeCell::<i32>::new(1);
+        let monthly_return_mean = RuntimeCell::<f64>::new(0.0);
+        let monthly_return_std = RuntimeCell::<f64>::new(0.0);
+        if limit.read() >= 0 {
+            let count = limit.read() + 1;
+            let sum = RuntimeCell::<f64>::new(0.0);
+            for index in 0..count as usize {
+                let monthly_pnl = month_workspace[month_base + index];
+                let start_equity = month_workspace[start_base + index];
+                if monthly_pnl.is_nan()
+                    || monthly_pnl.is_inf()
+                    || start_equity.is_nan()
+                    || start_equity.is_inf()
+                    || start_equity <= 0.0
+                {
+                    monthly_return_inputs_valid.store(0);
+                } else {
+                    let period_return = monthly_pnl / start_equity;
+                    let next_sum = sum.read() + period_return;
+                    if period_return.is_nan()
+                        || period_return.is_inf()
+                        || next_sum.is_nan()
+                        || next_sum.is_inf()
+                    {
+                        monthly_return_inputs_valid.store(0);
+                    } else {
+                        sum.store(next_sum);
+                    }
+                }
+            }
+            if monthly_return_inputs_valid.read() == 1 && count >= 2 {
+                let mean = sum.read() / count as f64;
+                if mean.is_nan() || mean.is_inf() {
+                    monthly_return_inputs_valid.store(0);
+                } else {
+                    monthly_return_mean.store(mean);
+                }
+            }
+            if monthly_return_inputs_valid.read() == 1 && count >= 2 {
+                let variance = RuntimeCell::<f64>::new(0.0);
+                for index in 0..count as usize {
+                    let start_equity = month_workspace[start_base + index];
+                    let period_return = month_workspace[month_base + index] / start_equity;
+                    let delta = period_return - monthly_return_mean.read();
+                    let squared_delta = delta * delta;
+                    let next_variance = variance.read() + squared_delta;
+                    if squared_delta.is_nan()
+                        || squared_delta.is_inf()
+                        || next_variance.is_nan()
+                        || next_variance.is_inf()
+                    {
+                        monthly_return_inputs_valid.store(0);
+                    } else {
+                        variance.store(next_variance);
+                    }
+                }
+                if monthly_return_inputs_valid.read() == 1 {
+                    let stddev = f64::sqrt(variance.read() / (count - 1) as f64);
+                    if stddev.is_nan() || stddev.is_inf() {
+                        monthly_return_inputs_valid.store(0);
+                    } else {
+                        monthly_return_std.store(stddev);
+                    }
+                }
+            }
+        }
+
+        let sharpe = RuntimeCell::<f64>::new(f64::NEG_INFINITY);
+        if monthly_return_inputs_valid.read() == 1 {
+            if monthly_return_std.read() > 0.0 {
+                let ratio = monthly_return_mean.read() / monthly_return_std.read();
+                let candidate_sharpe = ratio * 3.4641;
+                if candidate_sharpe.is_nan() || candidate_sharpe.is_inf() {
+                    monthly_return_inputs_valid.store(0);
+                } else {
+                    sharpe.store(candidate_sharpe);
+                }
+            } else {
+                sharpe.store(0.0);
+            }
+        }
+
+        let consistency = RuntimeCell::<f64>::new(0.0);
         if monthly_std.read() > 0.0 {
             let ratio = monthly_mean.read() / monthly_std.read();
-            sharpe.store(ratio * 3.4641);
-            let clamped = RuntimeCell::<f32>::new(ratio);
+            let clamped = RuntimeCell::<f64>::new(ratio);
             if ratio < 0.0 {
                 clamped.store(0.0);
             } else if ratio > 1.0 {
@@ -844,7 +924,7 @@ fn reduce_c_population_metrics(
             consistency.store(1.0);
         }
 
-        let monthly_target_hit_rate = RuntimeCell::<f32>::new(0.0);
+        let monthly_target_hit_rate = RuntimeCell::<f64>::new(0.0);
         if limit.read() >= 0 {
             let hits = RuntimeCell::<i32>::new(0);
             let counted = RuntimeCell::<i32>::new(0);
@@ -858,7 +938,7 @@ fn reduce_c_population_metrics(
                 }
             }
             if counted.read() > 0 {
-                monthly_target_hit_rate.store(hits.read() as f32 / counted.read() as f32);
+                monthly_target_hit_rate.store(hits.read() as f64 / counted.read() as f64);
             }
         }
 
@@ -871,7 +951,7 @@ fn reduce_c_population_metrics(
         metrics_out[metric_base + 5] = profit_factor.read();
         metrics_out[metric_base + 6] = expectancy.read();
         metrics_out[metric_base + 7] = monthly_target_hit_rate.read();
-        metrics_out[metric_base + 8] = trade_count.read() as f32;
+        metrics_out[metric_base + 8] = trade_count.read() as f64;
         metrics_out[metric_base + 9] = consistency.read();
         metrics_out[metric_base + 10] = max_daily_drawdown.read();
     }
@@ -977,6 +1057,9 @@ pub struct PrototypeCResources<R: Runtime> {
 pub struct PrototypeCBacktestEngine<R: Runtime> {
     session: GpuDiscoverySession<PrototypeCResources<R>>,
     max_events: usize,
+    // Keep this field last so resident handles drop before the scope performs
+    // the exact-stream CubeCL pool cleanup.
+    _residency_scope: crate::cubecl_eval::CubeClResidencyScope,
 }
 
 pub fn create_prototype_c_engine(
@@ -989,6 +1072,7 @@ pub fn create_prototype_c_engine(
             "Prototype C max event capacity must be non-zero".into(),
         ));
     }
+    let residency_scope = crate::cubecl_eval::cubecl_residency_scope();
     let client = crate::cubecl_eval::create_gpu_client(device_override).map_err(|error| {
         let message = error.to_string();
         if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
@@ -1020,6 +1104,7 @@ pub fn create_prototype_c_engine(
             },
         ),
         max_events,
+        _residency_scope: residency_scope,
     })
 }
 
@@ -1102,13 +1187,7 @@ impl<R: Runtime> PrototypeCBacktestEngine<R> {
                 .settings
                 .to_settings()
         };
-        let pip = if settings.pip_value.abs() < 1.0e-12 {
-            1.0e-12
-        } else {
-            settings.pip_value
-        };
-        let _ = pip;
-        let half_spread_pips = (settings.spread_pips * 0.5) as f32;
+        let half_spread_pips = settings.spread_pips * 0.5;
 
         {
             let resources = self.session.backend();
@@ -1242,7 +1321,7 @@ impl<R: Runtime> PrototypeCBacktestEngine<R> {
                 settings.max_hold_bars as u32,
                 settings.min_hold_bars as u32,
                 half_spread_pips,
-                settings.adaptive_rr as f32,
+                settings.adaptive_rr,
                 u32::from(dataset.has_adaptive_base),
             );
 
@@ -1317,17 +1396,17 @@ impl<R: Runtime> PrototypeCBacktestEngine<R> {
                 bars as u32,
                 population as u32,
                 month_capacity as u32,
-                crate::eval::current_backtest_runtime_overrides().initial_equity as f32,
+                crate::eval::current_backtest_runtime_overrides().initial_equity,
                 half_spread_pips,
-                settings.commission_per_trade as f32,
-                settings.pip_value_per_lot as f32,
-                settings.swap_long_pips_per_day as f32,
-                settings.swap_short_pips_per_day as f32,
-                settings.pnl_conversion_fee_rate as f32,
+                settings.commission_per_trade,
+                settings.pip_value_per_lot,
+                settings.swap_long_pips_per_day,
+                settings.swap_short_pips_per_day,
+                settings.pnl_conversion_fee_rate,
                 u32::from(settings.risk_based_sizing),
-                settings.risk_per_trade_min as f32,
-                settings.risk_per_trade_max as f32,
-                settings.high_quality_confidence as f32,
+                settings.risk_per_trade_min,
+                settings.risk_per_trade_max,
+                settings.high_quality_confidence,
             );
         }
 
@@ -1359,8 +1438,8 @@ impl<R: Runtime> PrototypeCBacktestEngine<R> {
             entry: client.empty(capacity * size_of::<i32>()),
             last: client.empty(capacity * size_of::<i32>()),
             direction: client.empty(capacity * size_of::<i32>()),
-            stop: client.empty(capacity * size_of::<f32>()),
-            target: client.empty(capacity * size_of::<f32>()),
+            stop: client.empty(capacity * size_of::<f64>()),
+            target: client.empty(capacity * size_of::<f64>()),
             exit_bar: client.empty(capacity * size_of::<i32>()),
             exit_reason: client.empty(capacity * size_of::<i32>()),
             accepted_event: client.empty(capacity * size_of::<i32>()),
@@ -1402,16 +1481,16 @@ impl<R: Runtime> BacktestEngine for PrototypeCBacktestEngine<R> {
             let client = &self.session.backend().client;
             DatasetResident {
                 handle,
-                close: client.create_from_slice(f32::as_bytes(&buffers.close_pips)),
-                high: client.create_from_slice(f32::as_bytes(&buffers.high_pips)),
-                low: client.create_from_slice(f32::as_bytes(&buffers.low_pips)),
-                indicators: client.create_from_slice(f32::as_bytes(&upload.indicators)),
+                close: client.create_from_slice(f64::as_bytes(&buffers.close_pips)),
+                high: client.create_from_slice(f64::as_bytes(&buffers.high_pips)),
+                low: client.create_from_slice(f64::as_bytes(&buffers.low_pips)),
+                indicators: client.create_from_slice(f64::as_bytes(&upload.indicators)),
                 months: client.create_from_slice(i32::as_bytes(&buffers.months)),
                 days: client.create_from_slice(i32::as_bytes(&buffers.days)),
                 timestamp_pair: client.create_from_slice(i32::as_bytes(&buffers.timestamp_pair)),
                 gap_flags: client.create_from_slice(i32::as_bytes(&buffers.gap_flags)),
                 smc_rows: client.create_from_slice(i32::as_bytes(&buffers.smc_rows)),
-                adaptive_base: client.create_from_slice(f32::as_bytes(&buffers.adaptive_base_pips)),
+                adaptive_base: client.create_from_slice(f64::as_bytes(&buffers.adaptive_base_pips)),
                 adaptive_base_len: buffers.adaptive_base_pips.len(),
                 has_adaptive_base: buffers.has_adaptive_base,
                 bars: buffers.bars,
@@ -1422,7 +1501,7 @@ impl<R: Runtime> BacktestEngine for PrototypeCBacktestEngine<R> {
         };
         let upload_bytes =
             ((resident.bars * 3 + resident.indicator_len + resident.adaptive_base_len)
-                * size_of::<f32>()
+                * size_of::<f64>()
                 + (resident.bars * 5 + resident.bars * SMC_WIDTH) * size_of::<i32>())
                 as u64;
         self.session.transfers().record_dataset_upload(upload_bytes);
@@ -1468,22 +1547,6 @@ impl<R: Runtime> BacktestEngine for PrototypeCBacktestEngine<R> {
             .flatten()
             .map(|value| i32::from(*value))
             .collect::<Vec<i32>>();
-        let stop_pips = upload
-            .stop_pips
-            .iter()
-            .map(|value| *value as f32)
-            .collect::<Vec<f32>>();
-        let target_pips = upload
-            .target_pips
-            .iter()
-            .map(|value| *value as f32)
-            .collect::<Vec<f32>>();
-        let stop_vol_multipliers = upload
-            .stop_vol_multipliers
-            .iter()
-            .map(|value| *value as f32)
-            .collect::<Vec<f32>>();
-
         let signal_len = population * bars;
         let month_workspace_len = population * month_capacity * 2;
         let metrics_len = population * C_METRIC_WIDTH;
@@ -1495,22 +1558,22 @@ impl<R: Runtime> BacktestEngine for PrototypeCBacktestEngine<R> {
                 handle,
                 offsets: client.create_from_slice(i32::as_bytes(&upload.offsets)),
                 indices: client.create_from_slice(i32::as_bytes(&pad_i32(&upload.indices))),
-                weights: client.create_from_slice(f32::as_bytes(&pad_f32(&upload.weights))),
-                long_thresholds: client.create_from_slice(f32::as_bytes(&upload.long_thresholds)),
-                short_thresholds: client.create_from_slice(f32::as_bytes(&upload.short_thresholds)),
-                stop_pips: client.create_from_slice(f32::as_bytes(&stop_pips)),
-                target_pips: client.create_from_slice(f32::as_bytes(&target_pips)),
+                weights: client.create_from_slice(f64::as_bytes(&pad_f64(&upload.weights))),
+                long_thresholds: client.create_from_slice(f64::as_bytes(&upload.long_thresholds)),
+                short_thresholds: client.create_from_slice(f64::as_bytes(&upload.short_thresholds)),
+                stop_pips: client.create_from_slice(f64::as_bytes(&upload.stop_pips)),
+                target_pips: client.create_from_slice(f64::as_bytes(&upload.target_pips)),
                 stop_vol_multipliers: client
-                    .create_from_slice(f32::as_bytes(&stop_vol_multipliers)),
+                    .create_from_slice(f64::as_bytes(&upload.stop_vol_multipliers)),
                 smc_flags: client.create_from_slice(i32::as_bytes(&smc_flags)),
-                smc_weights: client.create_from_slice(f32::as_bytes(&upload.smc_weights)),
+                smc_weights: client.create_from_slice(f64::as_bytes(&upload.smc_weights)),
                 signals: client.empty(signal_len * size_of::<i32>()),
-                confidences: client.empty(signal_len * size_of::<f32>()),
+                confidences: client.empty(signal_len * size_of::<f64>()),
                 event_counts: client.empty(population * size_of::<i32>()),
                 event_offsets: client.empty((population + 1) * size_of::<i32>()),
                 event_total: client.empty(size_of::<i32>()),
-                month_workspace: client.empty(month_workspace_len * size_of::<f32>()),
-                metrics: client.empty(metrics_len * size_of::<f32>()),
+                month_workspace: client.empty(month_workspace_len * size_of::<f64>()),
+                metrics: client.empty(metrics_len * size_of::<f64>()),
                 accepted_count: client.empty(population * size_of::<i32>()),
                 term_len,
                 signal_len,
@@ -1523,7 +1586,7 @@ impl<R: Runtime> BacktestEngine for PrototypeCBacktestEngine<R> {
         };
         let upload_bytes =
             ((resident.upload.offsets.len() + term_len + smc_flags.len()) * size_of::<i32>()
-                + (term_len + population * 5 + SMC_WIDTH) * size_of::<f32>()) as u64;
+                + (term_len + population * 5 + SMC_WIDTH) * size_of::<f64>()) as u64;
         self.session.transfers().record_gene_upload(upload_bytes);
         self.session.transfers().record_workspace_allocations(8);
         let resources = self.session.backend_mut();
@@ -1710,7 +1773,7 @@ impl<R: Runtime> BacktestEngine for PrototypeCBacktestEngine<R> {
                 })?;
             (bytes, genes.metrics_len)
         };
-        let metrics = f32::from_bytes(metrics_bytes.as_ref()).to_vec();
+        let metrics = f64::from_bytes(metrics_bytes.as_ref()).to_vec();
         if metrics.len() != metrics_len {
             return Err(EngineError::Backend(format!(
                 "Prototype C metric readback returned {} values, expected {metrics_len}",
@@ -1719,7 +1782,7 @@ impl<R: Runtime> BacktestEngine for PrototypeCBacktestEngine<R> {
         }
         self.session
             .transfers()
-            .record_compact_readback((metrics.len() * size_of::<f32>()) as u64);
+            .record_compact_readback((metrics.len() * size_of::<f64>()) as u64);
 
         let (genes_upload, scenarios_upload) = {
             let resources = self.session.backend();
@@ -1758,7 +1821,7 @@ fn pad_i32(values: &[i32]) -> Vec<i32> {
     }
 }
 
-fn pad_f32(values: &[f32]) -> Vec<f32> {
+fn pad_f64(values: &[f64]) -> Vec<f64> {
     if values.is_empty() {
         vec![0.0]
     } else {

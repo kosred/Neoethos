@@ -1,35 +1,10 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaEhma;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-use core::arch::x86_64::*;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -38,6 +13,234 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
+
+pub const EHMA_F64_AUTHORITY_V2: &str =
+    "ehma_hann_f64_msun_ddangle_symmetric_pow2_anchored_dot2_v2";
+
+const EHMA_PI_HI_V2: f64 = f64::from_bits(0x4009_21fb_5444_2d18);
+const EHMA_PI_LO_V2: f64 = f64::from_bits(0x3ca1_a626_3314_5c07);
+const EHMA_CANONICAL_QNAN_V2: f64 = f64::from_bits(0x7ff8_0000_0000_0000);
+
+/* FreeBSD msun k_sin/k_cos and medium pi/2 reduction.
+ *
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ * Developed at SunPro/SunSoft. Permission to use, copy, modify, and
+ * distribute this software is freely granted, provided this notice is
+ * preserved.
+ *
+ * EHMA evaluates only finite half-angles in [0, pi/2]. The strict CUDA f64
+ * row mirrors every constant, branch, operation, and parenthesisation below,
+ * so neither host libm nor libdevice defines an f64 coefficient.
+ */
+#[inline(always)]
+fn ehma_msun_k_cos_v2(x: f64, y: f64) -> f64 {
+    let c1 = f64::from_bits(0x3fa5_5555_5555_554c);
+    let c2 = f64::from_bits(0xbf56_c16c_16c1_5177);
+    let c3 = f64::from_bits(0x3efa_01a0_19cb_1590);
+    let c4 = f64::from_bits(0xbe92_7e4f_809c_52ad);
+    let c5 = f64::from_bits(0x3e21_ee9e_bdb4_b1c4);
+    let c6 = f64::from_bits(0xbda8_fae9_be88_38d4);
+    let z = x * x;
+    let w2 = z * z;
+    let r = z * (c1 + z * (c2 + z * c3)) + w2 * w2 * (c4 + z * (c5 + z * c6));
+    let hz = 0.5 * z;
+    let w = 1.0 - hz;
+    w + (((1.0 - w) - hz) + (z * r - x * y))
+}
+
+#[inline(always)]
+fn ehma_msun_k_sin_v2(x: f64, y: f64, has_tail: bool) -> f64 {
+    let s1 = f64::from_bits(0xbfc5_5555_5555_5549);
+    let s2 = f64::from_bits(0x3f81_1111_1110_f8a6);
+    let s3 = f64::from_bits(0xbf2a_01a0_19c1_61d5);
+    let s4 = f64::from_bits(0x3ec7_1de3_57b1_fe7d);
+    let s5 = f64::from_bits(0xbe5a_e5e6_8a2b_9ceb);
+    let s6 = f64::from_bits(0x3de5_d93a_5acf_d57c);
+    let z = x * x;
+    let w = z * z;
+    let r = s2 + z * (s3 + z * s4) + z * w * (s5 + z * s6);
+    let v = z * x;
+    if has_tail {
+        x - ((z * (0.5 * y - v * r) - y) - v * s1)
+    } else {
+        x + v * (s1 + z * r)
+    }
+}
+
+#[inline(always)]
+fn ehma_reduce_pio2_v2(x: f64) -> (i32, f64, f64) {
+    let inv_pio2 = f64::from_bits(0x3fe4_5f30_6dc9_c883);
+    let to_int = f64::from_bits(0x4338_0000_0000_0000);
+    let pio2_1 = f64::from_bits(0x3ff9_21fb_5440_0000);
+    let pio2_1t = f64::from_bits(0x3dd0_b461_1a62_6331);
+    let pio2_2 = f64::from_bits(0x3dd0_b461_1a60_0000);
+    let pio2_2t = f64::from_bits(0x3ba3_198a_2e03_7073);
+    let pio2_3 = f64::from_bits(0x3ba3_198a_2e00_0000);
+    let pio2_3t = f64::from_bits(0x397b_839a_2520_49c1);
+
+    let tmp = x * inv_pio2 + to_int;
+    let f_n = tmp - to_int;
+    let n = f_n as i32;
+    let mut r = x - f_n * pio2_1;
+    let mut w = f_n * pio2_1t;
+    let mut y0 = r - w;
+    let ex = ((x.to_bits() >> 52) & 0x7ff) as i32;
+    let mut ey = ((y0.to_bits() >> 52) & 0x7ff) as i32;
+    if ex - ey > 16 {
+        let t = r;
+        w = f_n * pio2_2;
+        r = t - w;
+        w = f_n * pio2_2t - ((t - r) - w);
+        y0 = r - w;
+        ey = ((y0.to_bits() >> 52) & 0x7ff) as i32;
+        if ex - ey > 49 {
+            let t = r;
+            w = f_n * pio2_3;
+            r = t - w;
+            w = f_n * pio2_3t - ((t - r) - w);
+            y0 = r - w;
+        }
+    }
+    (n, y0, (r - y0) - w)
+}
+
+#[inline(always)]
+fn ehma_deterministic_sin_v2(x: f64) -> f64 {
+    debug_assert!(x.is_finite() && (0.0..=EHMA_PI_HI_V2 * 0.5).contains(&x));
+    let high = ((x.to_bits() >> 32) as u32) & 0x7fff_ffff;
+    if high <= 0x3fe9_21fb {
+        return ehma_msun_k_sin_v2(x, 0.0, false);
+    }
+
+    let (quadrant, y0, y1) = ehma_reduce_pio2_v2(x);
+    let sin = ehma_msun_k_sin_v2(y0, y1, true);
+    let cos = ehma_msun_k_cos_v2(y0, y1);
+    match quadrant & 3 {
+        0 => sin,
+        1 => cos,
+        2 => -sin,
+        _ => -cos,
+    }
+}
+
+#[inline(always)]
+fn ehma_half_angle_v2(period: usize, k: usize) -> f64 {
+    let denominator = period as f64 + 1.0;
+    let numerator = k as f64;
+    let quotient = numerator / denominator;
+    let quotient_remainder = (-quotient).mul_add(denominator, numerator);
+    let product = quotient * EHMA_PI_HI_V2;
+    let product_error = quotient.mul_add(EHMA_PI_HI_V2, -product);
+    let correction = (product_error + quotient * EHMA_PI_LO_V2)
+        + (quotient_remainder / denominator) * EHMA_PI_HI_V2;
+    product + correction
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EhmaDot2V2 {
+    sum: f64,
+    correction: f64,
+}
+
+impl EhmaDot2V2 {
+    #[inline(always)]
+    fn add_product(&mut self, left: f64, right: f64) {
+        let product = left * right;
+        let product_error = left.mul_add(right, -product);
+        let updated = self.sum + product;
+        let recovered = updated - self.sum;
+        let addition_error = (self.sum - (updated - recovered)) + (product - recovered);
+        self.sum = updated;
+        self.correction += product_error + addition_error;
+    }
+
+    #[inline(always)]
+    fn value(self) -> f64 {
+        self.sum + self.correction
+    }
+}
+
+#[inline(always)]
+fn build_hann_weights_v2(period: usize) -> (AVec<f64>, f64) {
+    let _authority = EHMA_F64_AUTHORITY_V2;
+    let mut weights = AVec::<f64>::with_capacity(CACHELINE_ALIGN, period);
+    weights.resize(period, 0.0);
+    for k in 1..=((period + 1) / 2) {
+        let sine = ehma_deterministic_sin_v2(ehma_half_angle_v2(period, k));
+        let weight = 2.0 * (sine * sine);
+        weights[k - 1] = weight;
+        weights[period - k] = weight;
+    }
+
+    let mut coefficient = EhmaDot2V2::default();
+    for &weight in weights.iter() {
+        coefficient.add_product(1.0, weight);
+    }
+    (weights, coefficient.value())
+}
+
+#[inline(always)]
+fn floor_power_of_two_scale_v2(max_abs_input: f64) -> f64 {
+    let bits = max_abs_input.to_bits();
+    let exponent = (bits >> 52) & 0x7ff;
+    if exponent != 0 {
+        return f64::from_bits(exponent << 52);
+    }
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let highest_bit = 63_u32 - fraction.leading_zeros();
+    f64::from_bits(1_u64 << highest_bit)
+}
+
+#[inline(always)]
+fn ehma_stable_window_indexed_v2<F>(
+    period: usize,
+    weights: &[f64],
+    coefficient: f64,
+    mut value_at: F,
+) -> f64
+where
+    F: FnMut(usize) -> f64,
+{
+    let mut max_abs_input = 0.0_f64;
+    let mut has_infinite = false;
+    for index in 0..period {
+        let value = value_at(index);
+        if value.is_nan() {
+            return EHMA_CANONICAL_QNAN_V2;
+        }
+        if value.is_infinite() {
+            has_infinite = true;
+        } else {
+            max_abs_input = max_abs_input.max(value.abs());
+        }
+    }
+
+    if has_infinite {
+        let mut sum = 0.0_f64;
+        for index in 0..period {
+            sum = value_at(index).mul_add(weights[index], sum);
+        }
+        let result = sum / coefficient;
+        return if result.is_nan() {
+            EHMA_CANONICAL_QNAN_V2
+        } else {
+            result
+        };
+    }
+    if max_abs_input == 0.0 {
+        return 0.0;
+    }
+
+    let scale = floor_power_of_two_scale_v2(max_abs_input);
+    let anchor = value_at(0) / scale;
+    let mut shifted = EhmaDot2V2::default();
+    for (index, &weight) in weights.iter().enumerate().take(period) {
+        let normalized_value = value_at(index) / scale;
+        shifted.add_product(normalized_value - anchor, weight);
+    }
+    let result = scale * (anchor + shifted.value() / coefficient);
+    if result == 0.0 { 0.0 } else { result }
+}
 
 impl<'a> AsRef<[f64]> for EhmaInput<'a> {
     #[inline(always)]
@@ -64,10 +267,6 @@ pub struct EhmaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhmaParams {
     pub period: Option<usize>,
 }
@@ -240,7 +439,7 @@ fn ehma_prepare<'a>(
         });
     }
 
-    let (weights, inv_coef) = build_hann_weights_rec(period);
+    let (weights, coefficient) = build_hann_weights_v2(period);
 
     let chosen = match kernel {
         Kernel::Auto => match detect_best_kernel() {
@@ -250,53 +449,22 @@ fn ehma_prepare<'a>(
         k => k,
     };
 
-    Ok((data, weights, period, first, inv_coef, chosen))
-}
-
-#[inline(always)]
-fn build_hann_weights_rec(period: usize) -> (AVec<f64>, f64) {
-    use std::f64::consts::PI;
-    let mut w = AVec::<f64>::with_capacity(CACHELINE_ALIGN, period);
-    w.resize(period, 0.0);
-
-    let omega = 2.0 * PI / (period as f64 + 1.0);
-    let (sin_w, cos_w) = omega.sin_cos();
-
-    let mut cm = cos_w;
-    let mut sm = sin_w;
-    for j in 0..period {
-        w[j] = 1.0 - cm;
-
-        let next_cm = cm * cos_w - sm * sin_w;
-        let next_sm = sm * cos_w + cm * sin_w;
-        cm = next_cm;
-        sm = next_sm;
-    }
-
-    let inv = 1.0 / (period as f64 + 1.0);
-    (w, inv)
-}
-
-#[inline(always)]
-fn reverse_weights_in_place(weights: &mut [f64]) {
-    weights.reverse();
+    Ok((data, weights, period, first, coefficient, chosen))
 }
 
 pub fn ehma_with_kernel(input: &EhmaInput, kernel: Kernel) -> Result<EhmaOutput, EhmaError> {
-    let (data, mut weights, period, first, inv_coef, chosen) = ehma_prepare(input, kernel)?;
-    reverse_weights_in_place(&mut weights);
+    let (data, weights, period, first, coefficient, chosen) = ehma_prepare(input, kernel)?;
 
     let mut out = alloc_with_nan_prefix(data.len(), first + period - 1);
 
-    ehma_compute_into(data, &weights, period, first, inv_coef, chosen, &mut out);
+    ehma_compute_into(data, &weights, period, first, coefficient, chosen, &mut out);
 
     Ok(EhmaOutput { values: out })
 }
 
 #[inline]
 pub fn ehma_into_slice(dst: &mut [f64], input: &EhmaInput, kern: Kernel) -> Result<(), EhmaError> {
-    let (data, mut weights, period, first, inv_coef, chosen) = ehma_prepare(input, kern)?;
-    reverse_weights_in_place(&mut weights);
+    let (data, weights, period, first, coefficient, chosen) = ehma_prepare(input, kern)?;
 
     if dst.len() != data.len() {
         return Err(EhmaError::OutputLengthMismatch {
@@ -305,7 +473,7 @@ pub fn ehma_into_slice(dst: &mut [f64], input: &EhmaInput, kern: Kernel) -> Resu
         });
     }
 
-    ehma_compute_into(data, &weights, period, first, inv_coef, chosen, dst);
+    ehma_compute_into(data, &weights, period, first, coefficient, chosen, dst);
 
     let warmup_end = first + period - 1;
     for v in &mut dst[..warmup_end] {
@@ -315,11 +483,9 @@ pub fn ehma_into_slice(dst: &mut [f64], input: &EhmaInput, kern: Kernel) -> Resu
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ehma_into(input: &EhmaInput, out: &mut [f64]) -> Result<(), EhmaError> {
-    let (data, mut weights, period, first, inv_coef, chosen) = ehma_prepare(input, Kernel::Auto)?;
-    reverse_weights_in_place(&mut weights);
+    let (data, weights, period, first, coefficient, chosen) = ehma_prepare(input, Kernel::Auto)?;
 
     if out.len() != data.len() {
         return Err(EhmaError::OutputLengthMismatch {
@@ -335,7 +501,7 @@ pub fn ehma_into(input: &EhmaInput, out: &mut [f64]) -> Result<(), EhmaError> {
         *v = qnan;
     }
 
-    ehma_compute_into(data, &weights, period, first, inv_coef, chosen, out);
+    ehma_compute_into(data, &weights, period, first, coefficient, chosen, out);
 
     Ok(())
 }
@@ -346,45 +512,15 @@ fn ehma_compute_into(
     weights: &[f64],
     period: usize,
     first: usize,
-    inv_coef: f64,
-    kernel: Kernel,
+    coefficient: f64,
+    _kernel: Kernel,
     out: &mut [f64],
 ) {
-    unsafe {
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        {
-            if matches!(kernel, Kernel::Scalar | Kernel::ScalarBatch) {
-                ehma_simd128(data, weights, period, first, inv_coef, out);
-                return;
-            }
-        }
-
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        {
-            unsafe { ehma_simd128(data, weights, period, first, inv_coef, out) }
-        }
-
-        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-        {
-            match kernel {
-                Kernel::Scalar | Kernel::ScalarBatch => {
-                    ehma_scalar(data, weights, period, first, inv_coef, out)
-                }
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx2 | Kernel::Avx2Batch => unsafe {
-                    ehma_avx2(data, weights, period, first, inv_coef, out)
-                },
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx512 | Kernel::Avx512Batch => {
-                    ehma_avx512(data, weights, period, first, inv_coef, out)
-                }
-                #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-                Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
-                    ehma_scalar(data, weights, period, first, inv_coef, out)
-                }
-                _ => unreachable!(),
-            }
-        }
+    for index in (first + period - 1)..data.len() {
+        let start = index + 1 - period;
+        out[index] = ehma_stable_window_indexed_v2(period, weights, coefficient, |offset| {
+            data[start + offset]
+        });
     }
 }
 
@@ -394,7 +530,7 @@ pub fn ehma_scalar(
     weights: &[f64],
     period: usize,
     first_val: usize,
-    inv_coef: f64,
+    coefficient: f64,
     out: &mut [f64],
 ) {
     assert_eq!(weights.len(), period, "weights.len() must equal `period`");
@@ -403,98 +539,38 @@ pub fn ehma_scalar(
         "`out` must be at least as long as `data`"
     );
 
-    for i in (first_val + period - 1)..data.len() {
-        let start = i + 1 - period;
-        let window = &data[start..start + period];
-
-        let mut sum = 0.0;
-
-        for j in 0..period {
-            sum = window[j].mul_add(weights[j], sum);
-        }
-
-        out[i] = sum * inv_coef;
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-#[inline]
-unsafe fn ehma_simd128(
-    data: &[f64],
-    weights: &[f64],
-    period: usize,
-    first_val: usize,
-    inv_coef: f64,
-    out: &mut [f64],
-) {
-    use core::arch::wasm32::*;
-
-    assert_eq!(weights.len(), period, "weights.len() must equal `period`");
-    assert!(
-        out.len() >= data.len(),
-        "`out` must be at least as long as `data`"
+    ehma_compute_into(
+        data,
+        weights,
+        period,
+        first_val,
+        coefficient,
+        Kernel::Scalar,
+        out,
     );
-
-    const STEP: usize = 2;
-    let chunks = period / STEP;
-    let tail = period % STEP;
-
-    for i in (first_val + period - 1)..data.len() {
-        let start = i + 1 - period;
-        let mut sum = 0.0;
-
-        for j in 0..period {
-            sum += data[start + j] * weights[period - 1 - j];
-        }
-
-        out[i] = sum * inv_coef;
-    }
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 #[inline]
 #[target_feature(enable = "avx2,fma")]
+#[allow(dead_code)] // Retained as the existing low-level API; V2 forbids reassociation.
 unsafe fn ehma_avx2(
     data: &[f64],
     weights: &[f64],
     period: usize,
     first_val: usize,
-    inv_coef: f64,
+    coefficient: f64,
     out: &mut [f64],
 ) {
-    let p4 = period & !3;
-
-    for i in (first_val + period - 1)..data.len() {
-        let start = i + 1 - period;
-        let window = &data[start..start + period];
-
-        let mut acc = _mm256_setzero_pd();
-
-        let mut j = 0usize;
-        while j < p4 {
-            let d = _mm256_loadu_pd(window.as_ptr().add(j));
-
-            let w = _mm256_loadu_pd(weights.as_ptr().add(j));
-
-            acc = _mm256_fmadd_pd(d, w, acc);
-            j += 4;
-        }
-
-        let hi = _mm256_extractf128_pd(acc, 1);
-        let lo = _mm256_castpd256_pd128(acc);
-        let sum128 = _mm_add_pd(hi, lo);
-        let sum64 = _mm_hadd_pd(sum128, sum128);
-        let mut sum = _mm_cvtsd_f64(sum64);
-
-        while j < period {
-            let d = *window.get_unchecked(j);
-            let w = *weights.get_unchecked(j);
-            sum = d.mul_add(w, sum);
-            j += 1;
-        }
-
-        out[i] = sum * inv_coef;
-    }
+    ehma_compute_into(
+        data,
+        weights,
+        period,
+        first_val,
+        coefficient,
+        Kernel::Avx2,
+        out,
+    );
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -505,72 +581,28 @@ pub fn ehma_avx512(
     weights: &[f64],
     period: usize,
     first_val: usize,
-    inv_coef: f64,
+    coefficient: f64,
     out: &mut [f64],
 ) {
-    unsafe { ehma_avx512_impl(data, weights, period, first_val, inv_coef, out) }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline]
-#[target_feature(enable = "avx512f")]
-unsafe fn ehma_avx512_impl(
-    data: &[f64],
-    weights: &[f64],
-    period: usize,
-    first_val: usize,
-    inv_coef: f64,
-    out: &mut [f64],
-) {
-    let p8 = period & !7;
-
-    for i in (first_val + period - 1)..data.len() {
-        let start = i + 1 - period;
-        let window = &data[start..start + period];
-
-        let mut acc = _mm512_setzero_pd();
-
-        let mut j = 0usize;
-        while j < p8 {
-            let dv = _mm512_loadu_pd(window.as_ptr().add(j));
-
-            let w = _mm512_loadu_pd(weights.as_ptr().add(j));
-
-            acc = _mm512_fmadd_pd(dv, w, acc);
-            j += 8;
-        }
-
-        let mut sum = _mm512_reduce_add_pd(acc);
-
-        while j < period {
-            let d = *window.get_unchecked(j);
-            let w = *weights.get_unchecked(j);
-            sum = d.mul_add(w, sum);
-            j += 1;
-        }
-
-        out[i] = sum * inv_coef;
-    }
+    ehma_compute_into(
+        data,
+        weights,
+        period,
+        first_val,
+        coefficient,
+        Kernel::Avx512,
+        out,
+    );
 }
 
 #[derive(Debug, Clone)]
 pub struct EhmaStream {
     period: usize,
-
     buffer: Vec<f64>,
     head: usize,
     filled: bool,
-
-    sum_x: f64,
-    z_re: f64,
-    z_im: f64,
-
-    inv_coef: f64,
-    omega: f64,
-    cos_w: f64,
-    sin_w: f64,
-    cos_wp: f64,
-    sin_wp: f64,
+    weights: AVec<f64>,
+    coefficient: f64,
 }
 
 impl EhmaStream {
@@ -583,72 +615,32 @@ impl EhmaStream {
             });
         }
 
-        use std::f64::consts::PI;
-
-        let omega = 2.0 * PI / (period as f64 + 1.0);
-        let (sin_w, cos_w) = omega.sin_cos();
-        let (sin_wp, cos_wp) = (omega * period as f64).sin_cos();
-
-        let inv_coef = 1.0 / (period as f64 + 1.0);
+        let (weights, coefficient) = build_hann_weights_v2(period);
 
         Ok(Self {
             period,
             buffer: vec![f64::NAN; period],
             head: 0,
             filled: false,
-
-            sum_x: 0.0,
-            z_re: 0.0,
-            z_im: 0.0,
-
-            inv_coef,
-            omega,
-            cos_w,
-            sin_w,
-            cos_wp,
-            sin_wp,
+            weights,
+            coefficient,
         })
     }
 
     #[inline(always)]
-    fn recompute_full(&mut self) -> Option<f64> {
-        let mut sx = 0.0;
-        let mut zr = 0.0;
-        let mut zi = 0.0;
-
-        let mut cm = self.cos_w;
-        let mut sm = self.sin_w;
-
-        let mut idx = self.head;
-        for _m in 1..=self.period {
-            let x = self.buffer[idx];
-            if !x.is_finite() {
-                self.sum_x = f64::NAN;
-                self.z_re = f64::NAN;
-                self.z_im = f64::NAN;
-                return Some(f64::NAN);
-            }
-            sx += x;
-            zr = x.mul_add(cm, zr);
-            zi = x.mul_add(sm, zi);
-
-            let next_cm = cm * self.cos_w - sm * self.sin_w;
-            let next_sm = sm * self.cos_w + cm * self.sin_w;
-            cm = next_cm;
-            sm = next_sm;
-
-            idx = (idx + 1) % self.period;
-        }
-
-        self.sum_x = sx;
-        self.z_re = zr;
-        self.z_im = zi;
-        Some((sx - zr) * self.inv_coef)
+    fn recompute_full(&self) -> Option<f64> {
+        let head = self.head;
+        let period = self.period;
+        Some(ehma_stable_window_indexed_v2(
+            period,
+            &self.weights,
+            self.coefficient,
+            |offset| self.buffer[(head + offset) % period],
+        ))
     }
 
     #[inline(always)]
     pub fn update(&mut self, value: f64) -> Option<f64> {
-        let old = self.buffer[self.head];
         self.buffer[self.head] = value;
         self.head = (self.head + 1) % self.period;
 
@@ -660,25 +652,7 @@ impl EhmaStream {
                 return None;
             }
         }
-
-        if !self.sum_x.is_finite()
-            || !self.z_re.is_finite()
-            || !self.z_im.is_finite()
-            || !old.is_finite()
-            || !value.is_finite()
-        {
-            return self.recompute_full();
-        }
-
-        self.sum_x += value - old;
-
-        let zr_rot = self.z_re.mul_add(self.cos_w, self.z_im * self.sin_w);
-        let zi_rot = self.z_im.mul_add(self.cos_w, -self.z_re * self.sin_w);
-
-        self.z_re = (zr_rot - old) + self.cos_wp * value;
-        self.z_im = zi_rot + self.sin_wp * value;
-
-        Some((self.sum_x - self.z_re) * self.inv_coef)
+        self.recompute_full()
     }
 }
 
@@ -899,9 +873,9 @@ fn ehma_batch_inner(
     let do_row = |row: usize, row_dst: &mut [f64]| {
         let period = combos[row].period.unwrap();
 
-        let (w, inv) = build_hann_weights_rec(period);
+        let (w, coefficient) = build_hann_weights_v2(period);
 
-        unsafe { ehma_compute_into(data, &w, period, first, inv, kern, row_dst) };
+        ehma_compute_into(data, &w, period, first, coefficient, kern, row_dst);
     };
 
     if parallel {
@@ -936,11 +910,6 @@ fn ehma_batch_inner(
         rows: combos.len(),
         cols,
     })
-}
-
-#[inline]
-fn round_up8(x: usize) -> usize {
-    (x + 7) & !7
 }
 
 #[inline(always)]
@@ -980,11 +949,6 @@ pub fn ehma_batch_inner_into(
         .iter()
         .position(|x| !x.is_nan())
         .ok_or(EhmaError::AllValuesNaN)?;
-    let max_p = combos
-        .iter()
-        .map(|c| round_up8(c.period.unwrap()))
-        .max()
-        .unwrap();
     if cols - first < combos.iter().map(|c| c.period.unwrap()).max().unwrap() {
         return Err(EhmaError::NotEnoughValidData {
             needed: combos.iter().map(|c| c.period.unwrap()).max().unwrap(),
@@ -1001,92 +965,13 @@ pub fn ehma_batch_inner_into(
         .collect();
     init_matrix_prefixes(out_mu, cols, &warm);
 
-    let cap = rows.checked_mul(max_p).ok_or(EhmaError::SizeOverflow {
-        what: "rows*max_period",
-    })?;
-    let mut flat_w = AVec::<f64>::with_capacity(CACHELINE_ALIGN, cap);
-    flat_w.resize(cap, 0.0);
-    let mut inv_norms = vec![0.0f64; rows];
-
-    for (row, prm) in combos.iter().enumerate() {
-        let p = prm.period.unwrap();
-        let base = row * max_p;
-
-        let omega = std::f64::consts::PI * 2.0 / (p as f64 + 1.0);
-        let (sin_w, cos_w) = omega.sin_cos();
-        let (mut cm, mut sm) = (cos_w, sin_w);
-        for j in 0..p {
-            flat_w[base + j] = 1.0 - cm;
-            let next_cm = cm * cos_w - sm * sin_w;
-            let next_sm = sm * cos_w + cm * sin_w;
-            cm = next_cm;
-            sm = next_sm;
-        }
-        inv_norms[row] = 1.0 / (p as f64 + 1.0);
-    }
-
-    unsafe fn ehma_row_scalar_ptr(
-        data: &[f64],
-        first: usize,
-        period: usize,
-        w_ptr: *const f64,
-        inv: f64,
-        out: &mut [f64],
-    ) {
-        let p4 = period & !3;
-        for i in (first + period - 1)..data.len() {
-            let start = i + 1 - period;
-            let window = &data[start..start + period];
-
-            let mut sum = 0.0;
-
-            for k in (0..p4).step_by(4) {
-                let w = std::slice::from_raw_parts(w_ptr.add(k), 4);
-                let d = &window[k..k + 4];
-                sum += d[0] * w[0] + d[1] * w[1] + d[2] * w[2] + d[3] * w[3];
-            }
-            for k in p4..period {
-                sum += window[k] * *w_ptr.add(k);
-            }
-            out[i] = sum * inv;
-        }
-    }
-
-    let do_row = |row: usize, row_mu: &mut [MaybeUninit<f64>]| unsafe {
+    let do_row = |row: usize, row_mu: &mut [MaybeUninit<f64>]| {
         let p = combos[row].period.unwrap();
-        let inv = inv_norms[row];
-        let w_ptr = flat_w.as_ptr().add(row * max_p);
-        let row_out =
-            core::slice::from_raw_parts_mut(row_mu.as_mut_ptr() as *mut f64, row_mu.len());
-
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        {
-            let w_slice = core::slice::from_raw_parts(w_ptr, p);
-            ehma_simd128(data, w_slice, p, first, inv, row_out);
-        }
-
-        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-        {
-            match kern {
-                Kernel::Auto | Kernel::Scalar | Kernel::ScalarBatch => {
-                    ehma_row_scalar_ptr(data, first, p, w_ptr, inv, row_out)
-                }
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx2 | Kernel::Avx2Batch => {
-                    let w_slice = core::slice::from_raw_parts(w_ptr, p);
-                    ehma_avx2(data, w_slice, p, first, inv, row_out);
-                }
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx512 | Kernel::Avx512Batch => {
-                    let w_slice = core::slice::from_raw_parts(w_ptr, p);
-                    ehma_avx512(data, w_slice, p, first, inv, row_out);
-                }
-                #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-                Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
-                    ehma_row_scalar_ptr(data, first, p, w_ptr, inv, row_out)
-                }
-            }
-        }
+        let (weights, coefficient) = build_hann_weights_v2(p);
+        let row_out = unsafe {
+            core::slice::from_raw_parts_mut(row_mu.as_mut_ptr() as *mut f64, row_mu.len())
+        };
+        ehma_compute_into(data, &weights, p, first, coefficient, kern, row_out);
     };
 
     if parallel {
@@ -1111,538 +996,10 @@ pub fn ehma_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehma")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn ehma_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = EhmaParams {
-        period: Some(period),
-    };
-
-    let result_vec: Vec<f64> = if let Ok(slice_in) = data.as_slice() {
-        let input = EhmaInput::from_slice(slice_in, params);
-        py.allow_threads(|| ehma_with_kernel(&input, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    } else {
-        let owned = data.as_array().to_owned();
-        let slice_in = owned
-            .as_slice()
-            .expect("owned numpy array should be contiguous");
-        let input = EhmaInput::from_slice(slice_in, params);
-        py.allow_threads(|| ehma_with_kernel(&input, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    };
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehma_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn ehma_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let sweep = EhmaBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-
-    let (slice_in, owned_opt);
-    let cols: usize;
-    if let Ok(s) = data.as_slice() {
-        slice_in = s;
-        owned_opt = None::<Vec<f64>>;
-        cols = slice_in.len();
-    } else {
-        let owned = data.as_array().to_owned();
-        cols = owned.len();
-
-        owned_opt = Some(owned.into_raw_vec());
-
-        slice_in = owned_opt.as_ref().unwrap().as_slice();
-    }
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kern {
-                Kernel::Auto => match detect_best_batch_kernel() {
-                    Kernel::Avx512Batch => Kernel::Avx2Batch,
-                    other => other,
-                },
-                k => k,
-            };
-            let simd = match batch {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            ehma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ehma_cuda_batch_dev")]
-#[pyo3(signature = (data, period_range, device_id=0))]
-pub fn ehma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: numpy::PyReadonlyArray1<'_, f64>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data.as_slice()?;
-    let sweep = EhmaBatchRange {
-        period: period_range,
-    };
-    let data_f32: Vec<f32> = slice_in.iter().map(|&v| v as f32).collect();
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaEhma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.ehma_batch_dev(&data_f32, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(make_device_array_py(device_id, inner)?)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ehma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn ehma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = EhmaParams {
-        period: Some(period),
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaEhma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.ehma_multi_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(make_device_array_py(device_id, inner)?)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhmaStream")]
-pub struct EhmaStreamPy {
-    stream: EhmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhmaStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = EhmaParams {
-            period: Some(period),
-        };
-        Ok(Self {
-            stream: EhmaStream::try_new(params)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_wasm(data: &[f64], period: Option<usize>) -> Result<Vec<f64>, JsValue> {
-    let params = EhmaParams { period };
-    let input = EhmaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    ehma_into_slice(&mut output, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ehma_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = EhmaParams {
-            period: Some(period),
-        };
-        let input = EhmaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            ehma_into_slice(&mut temp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ehma_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhmaBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhmaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<EhmaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehma_batch)]
-pub fn ehma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: EhmaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = EhmaBatchRange {
-        period: cfg.period_range,
-    };
-    let out = ehma_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = EhmaBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    p_start: usize,
-    p_end: usize,
-    p_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ehma_batch_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = EhmaBatchRange {
-            period: (p_start, p_end, p_step),
-        };
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        let simd = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-
-        ehma_batch_inner_into(data, &sweep, simd, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    ehma_wasm(data, Some(period))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct EhmaWasmStream {
-    inner: EhmaStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl EhmaWasmStream {
-    #[wasm_bindgen(constructor)]
-    pub fn new(period: Option<usize>) -> Result<EhmaWasmStream, JsValue> {
-        let params = EhmaParams { period };
-        let stream = EhmaStream::try_new(params).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(Self { inner: stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> JsValue {
-        match self.inner.update(value) {
-            Some(v) => JsValue::from_f64(v),
-            None => JsValue::NULL,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.buffer.fill(f64::NAN);
-        self.inner.head = 0;
-        self.inner.filled = false;
-
-        self.inner.sum_x = 0.0;
-        self.inner.z_re = 0.0;
-        self.inner.z_im = 0.0;
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-)]
-pub struct EhmaContext {
-    weights: Vec<f64>,
-    inv_coef: f64,
-    period: usize,
-    first: usize,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(deprecated)]
-impl EhmaContext {
-    #[wasm_bindgen(constructor)]
-    #[deprecated(
-        since = "1.0.0",
-        note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-    )]
-    pub fn new(period: usize) -> Result<EhmaContext, JsValue> {
-        if period == 0 {
-            return Err(JsValue::from_str("Invalid period: 0"));
-        }
-
-        let mut weights = Vec::with_capacity(period);
-        let mut sum = 0.0;
-        use std::f64::consts::PI;
-        for j in 0..period {
-            let i = (period - j) as f64;
-            let w = 1.0 - ((2.0 * PI * i) / (period as f64 + 1.0)).cos();
-            weights.push(w);
-            sum += w;
-        }
-
-        let inv_coef = 1.0 / sum;
-
-        Ok(EhmaContext {
-            weights,
-            inv_coef,
-            period,
-            first: 0,
-            kernel: detect_best_kernel(),
-        })
-    }
-
-    pub fn update_into(
-        &self,
-        in_ptr: *const f64,
-        out_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if len < self.period {
-            return Err(JsValue::from_str(&format!(
-                "Data length {} is less than period {}",
-                len, self.period
-            )));
-        }
-
-        let data = unsafe { std::slice::from_raw_parts(in_ptr, len) };
-        let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, len) };
-
-        for i in 0..self.period - 1 {
-            out[i] = f64::NAN;
-        }
-
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        unsafe {
-            ehma_simd128(
-                data,
-                &self.weights,
-                self.period,
-                self.first,
-                self.inv_coef,
-                out,
-            )
-        }
-
-        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-        match self.kernel {
-            Kernel::Scalar | Kernel::ScalarBatch => ehma_scalar(
-                data,
-                &self.weights,
-                self.period,
-                self.first,
-                self.inv_coef,
-                out,
-            ),
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2 | Kernel::Avx2Batch => unsafe {
-                ehma_avx2(
-                    data,
-                    &self.weights,
-                    self.period,
-                    self.first,
-                    self.inv_coef,
-                    out,
-                )
-            },
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512 | Kernel::Avx512Batch => unsafe {
-                ehma_avx512(
-                    data,
-                    &self.weights,
-                    self.period,
-                    self.first,
-                    self.inv_coef,
-                    out,
-                )
-            },
-            _ => ehma_scalar(
-                data,
-                &self.weights,
-                self.period,
-                self.first,
-                self.inv_coef,
-                out,
-            ),
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_wasm_output_into_js(
-    data: &[f64],
-    period: Option<usize>,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ehma_wasm(data, period)?;
-    crate::write_wasm_f64_output("ehma_wasm_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ehma_js(data, period)?;
-    crate::write_wasm_f64_output("ehma_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehma_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehma_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("ehma_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     use crate::skip_if_unsupported;
@@ -1684,10 +1041,240 @@ mod tests {
         };
     }
 
+    const REVIEWED_ROUTEABLE_ROW_13_BITS_V2: u64 = 0x3ff1_3338_cd76_5d61;
+
+    fn reviewed_routeable_row_13_v2() -> [f64; 14] {
+        [
+            0x3ff1_335e_310d_bf05,
+            0x3ff1_3317_9f58_f63b,
+            0x3ff1_3342_4cab_aa3d,
+            0x3ff1_330f_a73c_f04b,
+            0x3ff1_334d_3466_391a,
+            0x3ff1_332d_6ece_13f5,
+            0x3ff1_335a_34ff_bc0d,
+            0x3ff1_3324_6a42_93f9,
+            0x3ff1_333f_5d0d_2150,
+            0x3ff1_3319_4cd8_1fe7,
+            0x3ff1_334c_5da6_a444,
+            0x3ff1_3366_4401_b790,
+            0x3ff1_331f_b24c_eec6,
+            0x3ff1_334a_5f9f_a2c8,
+        ]
+        .map(f64::from_bits)
+    }
+
+    fn assert_reviewed_row_13_v2(value: f64, route: &str) {
+        assert_eq!(
+            value.to_bits(),
+            REVIEWED_ROUTEABLE_ROW_13_BITS_V2,
+            "{route} must use the reviewed EHMA f64 v2 authority"
+        );
+    }
+
+    #[test]
+    fn ehma_f64_v2_pins_coefficients_and_exact_symmetry() {
+        assert_eq!(
+            EHMA_F64_AUTHORITY_V2,
+            "ehma_hann_f64_msun_ddangle_symmetric_pow2_anchored_dot2_v2"
+        );
+
+        for period in 1..=512 {
+            let (weights, coefficient) = build_hann_weights_v2(period);
+            assert!(coefficient.is_finite() && coefficient > 0.0);
+            for index in 0..period {
+                assert_eq!(
+                    weights[index].to_bits(),
+                    weights[period - 1 - index].to_bits(),
+                    "period={period}, index={index}"
+                );
+            }
+        }
+
+        for (period, first_bits, middle_bits, coefficient_bits) in [
+            (
+                1,
+                0x4000_0000_0000_0000,
+                0x4000_0000_0000_0000,
+                0x4000_0000_0000_0000,
+            ),
+            (
+                2,
+                0x3ff8_0000_0000_0001,
+                0x3ff8_0000_0000_0001,
+                0x4008_0000_0000_0001,
+            ),
+            (
+                3,
+                0x3fef_ffff_ffff_fffe,
+                0x4000_0000_0000_0000,
+                0x400f_ffff_ffff_ffff,
+            ),
+            (
+                14,
+                0x3fb6_21e2_8804_0356,
+                0x3fff_a67e_193d_003f,
+                0x402e_0000_0000_0000,
+            ),
+            (
+                512,
+                0x3f13_a97e_353f_b772,
+                0x3fff_ffec_5675_b5eb,
+                0x4080_0800_0000_0000,
+            ),
+        ] {
+            let (weights, coefficient) = build_hann_weights_v2(period);
+            assert_eq!(weights[0].to_bits(), first_bits, "period={period}");
+            assert_eq!(
+                weights[(period - 1) / 2].to_bits(),
+                middle_bits,
+                "period={period}"
+            );
+            assert_eq!(coefficient.to_bits(), coefficient_bits, "period={period}");
+        }
+    }
+
+    #[test]
+    fn ehma_f64_v2_reviewed_row_is_exact_on_every_cpu_route() -> Result<(), Box<dyn Error>> {
+        let data = reviewed_routeable_row_13_v2();
+        let input = EhmaInput::from_slice(&data, EhmaParams { period: Some(14) });
+
+        for kernel in [Kernel::Scalar, Kernel::Auto, Kernel::Avx2, Kernel::Avx512] {
+            let output = ehma_with_kernel(&input, kernel)?;
+            assert_reviewed_row_13_v2(output.values[13], &format!("direct {kernel:?}"));
+
+            let mut into = vec![0.0; data.len()];
+            ehma_into_slice(&mut into, &input, kernel)?;
+            assert_reviewed_row_13_v2(into[13], &format!("into {kernel:?}"));
+        }
+
+        let mut auto_into = vec![0.0; data.len()];
+        ehma_into(&input, &mut auto_into)?;
+        assert_reviewed_row_13_v2(auto_into[13], "auto into");
+
+        let sweep = EhmaBatchRange {
+            period: (14, 14, 0),
+        };
+        for kernel in [
+            Kernel::ScalarBatch,
+            Kernel::Auto,
+            Kernel::Avx2Batch,
+            Kernel::Avx512Batch,
+        ] {
+            let output = ehma_batch_with_kernel(&data, &sweep, kernel)?;
+            assert_reviewed_row_13_v2(output.values[13], &format!("batch {kernel:?}"));
+        }
+
+        for parallel in [false, true] {
+            let mut into = vec![0.0; data.len()];
+            ehma_batch_inner_into(&data, &sweep, Kernel::Avx2, parallel, &mut into)?;
+            assert_reviewed_row_13_v2(into[13], &format!("batch into parallel={parallel}"));
+        }
+
+        let mut stream = EhmaStream::try_new(EhmaParams { period: Some(14) })?;
+        let mut streamed = None;
+        for value in data {
+            streamed = stream.update(value);
+        }
+        assert_reviewed_row_13_v2(streamed.expect("period-14 stream must be ready"), "stream");
+        Ok(())
+    }
+
+    #[test]
+    fn ehma_f64_v2_pins_constants_offsets_period_edges_and_gaps() -> Result<(), Box<dyn Error>> {
+        for period in [1, 2, 3, 14, 31, 64, 127, 256, 512] {
+            let constant = f64::from_bits(0x5f30_0000_0000_0000);
+            let data = vec![constant; period];
+            let input = EhmaInput::from_slice(
+                &data,
+                EhmaParams {
+                    period: Some(period),
+                },
+            );
+            assert_eq!(
+                ehma_with_kernel(&input, Kernel::Scalar)?.values[period - 1].to_bits(),
+                constant.to_bits()
+            );
+        }
+
+        let subnormal = f64::from_bits(1);
+        let subnormal_data = [subnormal; 14];
+        let subnormal_input =
+            EhmaInput::from_slice(&subnormal_data, EhmaParams { period: Some(14) });
+        assert_eq!(
+            ehma_with_kernel(&subnormal_input, Kernel::Scalar)?.values[13].to_bits(),
+            1
+        );
+
+        let base_bits = 0x42b0_0000_0000_0000_u64;
+        let offsets = [-7_i64, -2, 5, 1, -4, 8, -1, 3, -6, 7, 2, -3, 6, -5];
+        let large_offset: Vec<f64> = offsets
+            .iter()
+            .map(|offset| f64::from_bits((base_bits as i64 + offset) as u64))
+            .collect();
+        let large_input = EhmaInput::from_slice(&large_offset, EhmaParams { period: Some(14) });
+        let large = ehma_with_kernel(&large_input, Kernel::Scalar)?.values[13];
+        assert_eq!(large.to_bits(), base_bits + 2);
+
+        let reversed: Vec<f64> = large_offset.iter().copied().rev().collect();
+        let reversed_input = EhmaInput::from_slice(&reversed, EhmaParams { period: Some(14) });
+        assert_eq!(
+            ehma_with_kernel(&reversed_input, Kernel::Scalar)?.values[13].to_bits(),
+            large.to_bits()
+        );
+
+        let mut opposite_extremes = vec![f64::MAX; 14];
+        opposite_extremes[7..].fill(-f64::MAX);
+        let opposite_input =
+            EhmaInput::from_slice(&opposite_extremes, EhmaParams { period: Some(14) });
+        assert_eq!(
+            ehma_with_kernel(&opposite_input, Kernel::Scalar)?.values[13].to_bits(),
+            0
+        );
+
+        let positive_infinity = [f64::INFINITY; 14];
+        let positive_infinity_input =
+            EhmaInput::from_slice(&positive_infinity, EhmaParams { period: Some(14) });
+        assert_eq!(
+            ehma_with_kernel(&positive_infinity_input, Kernel::Scalar)?.values[13].to_bits(),
+            f64::INFINITY.to_bits()
+        );
+        let mut mixed_infinity = positive_infinity;
+        mixed_infinity[13] = f64::NEG_INFINITY;
+        let mixed_infinity_input =
+            EhmaInput::from_slice(&mixed_infinity, EhmaParams { period: Some(14) });
+        assert_eq!(
+            ehma_with_kernel(&mixed_infinity_input, Kernel::Scalar)?.values[13].to_bits(),
+            EHMA_CANONICAL_QNAN_V2.to_bits()
+        );
+
+        let clean: Vec<f64> = (0..40)
+            .map(|index| f64::from_bits(0x3ff0_0000_0000_0000 + index * 0x101))
+            .collect();
+        let clean_input = EhmaInput::from_slice(&clean, EhmaParams { period: Some(14) });
+        let clean_output = ehma_with_kernel(&clean_input, Kernel::Scalar)?;
+        let mut gapped = clean.clone();
+        gapped[15] = f64::NAN;
+        let gapped_input = EhmaInput::from_slice(&gapped, EhmaParams { period: Some(14) });
+        let gapped_output = ehma_with_kernel(&gapped_input, Kernel::Scalar)?;
+        for index in 15..=28 {
+            assert_eq!(
+                gapped_output.values[index].to_bits(),
+                EHMA_CANONICAL_QNAN_V2.to_bits()
+            );
+        }
+        for index in 29..clean.len() {
+            assert_eq!(
+                gapped_output.values[index].to_bits(),
+                clean_output.values[index].to_bits()
+            );
+        }
+        Ok(())
+    }
+
     fn check_ehma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EhmaInput::from_candles(&candles, "close", EhmaParams::default());
         let result = ehma_with_kernel(&input, kernel)?;
@@ -1722,8 +1309,8 @@ mod tests {
     }
 
     fn check_ehma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let data: Vec<f64> = candles.close[0..18].to_vec();
 
@@ -1875,8 +1462,8 @@ mod tests {
 
     fn check_ehma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = EhmaParams { period: None };
         let input = EhmaInput::from_candles(&candles, "close", default_params);
@@ -1888,8 +1475,8 @@ mod tests {
 
     fn check_ehma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = EhmaParams { period: Some(14) };
         let first_input = EhmaInput::from_candles(&candles, "close", first_params.clone());
@@ -1918,8 +1505,8 @@ mod tests {
 
     fn check_ehma_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EhmaInput::from_candles(&candles, "close", EhmaParams { period: Some(14) });
         let res = ehma_with_kernel(&input, kernel)?;
@@ -1941,8 +1528,8 @@ mod tests {
     fn check_ehma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 14;
 
@@ -1990,8 +1577,8 @@ mod tests {
     fn check_ehma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             EhmaParams::default(),
@@ -2077,8 +1664,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = EhmaBatchBuilder::new()
             .kernel(kernel)
@@ -2088,10 +1675,11 @@ mod tests {
         let row = output.values_for(&def).expect("default row missing");
 
         assert_eq!(row.len(), c.close.len());
-        assert!(row
-            .iter()
-            .skip(def.period.unwrap() - 1)
-            .any(|v| v.is_finite()));
+        assert!(
+            row.iter()
+                .skip(def.period.unwrap() - 1)
+                .any(|v| v.is_finite())
+        );
 
         Ok(())
     }
@@ -2099,8 +1687,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = EhmaBatchBuilder::new()
             .kernel(kernel)
@@ -2120,8 +1708,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![(5, 15, 5), (10, 30, 10), (14, 14, 1), (20, 50, 15)];
 
@@ -2219,9 +1807,9 @@ mod tests {
 
     #[test]
     fn check_ehma_batch_inner_into_warm_and_no_poison() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let sweep = EhmaBatchRange {
             period: (10, 14, 2),
         };
@@ -2354,13 +1942,13 @@ mod tests {
     fn test_ehma_pinescript_parity() {
         println!("\n=== EHMA PineScript Parity Investigation ===\n");
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path).expect("Failed to load CSV");
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path).expect("failed to load Vortex fixture");
 
         let close: Vec<f64> = candles.close[0..100.min(candles.close.len())].to_vec();
 
         println!(
-            "Using CSV data - first 5 values: {:?}",
+            "Using Vortex data - first 5 values: {:?}",
             &close[..5.min(close.len())]
         );
         println!("Total data points loaded: {}", close.len());
@@ -2524,13 +2112,8 @@ mod tests {
         let baseline = ehma(&input).expect("ehma baseline should succeed").values;
 
         let mut out = vec![0.0; data.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             ehma_into(&input, &mut out).expect("ehma_into should succeed");
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            ehma_into_slice(&mut out, &input, detect_best_kernel()).expect("ehma_into_slice ok");
         }
 
         assert_eq!(baseline.len(), out.len());

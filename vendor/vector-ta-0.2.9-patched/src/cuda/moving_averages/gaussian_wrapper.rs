@@ -1,20 +1,20 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::DeviceArrayF32;
 use crate::indicators::moving_averages::gaussian::{GaussianBatchRange, GaussianParams};
 use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys as cu;
 use std::env;
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const COEFF_STRIDE: usize = 5;
 
@@ -109,11 +109,6 @@ impl CudaGaussian {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/gaussian_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("gaussian_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -1097,163 +1092,6 @@ fn expand_grid_checked(
         ));
     }
     Ok(combos)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::prelude::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::types::PyDict;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::types::PyDictMethods;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32", unsendable)]
-pub struct DeviceArrayF32Py {
-    pub inner: Option<DeviceArrayF32>,
-    stream_handle: usize,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-    pc_guard: PrimaryCtxGuard,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub struct PrimaryCtxGuard {
-    dev: i32,
-    ctx: cu::CUcontext,
-}
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl PrimaryCtxGuard {
-    fn new(device_id: u32) -> Result<Self, cust::error::CudaError> {
-        unsafe {
-            let mut ctx: cu::CUcontext = std::ptr::null_mut();
-            let dev = device_id as i32;
-            let res = cu::cuDevicePrimaryCtxRetain(&mut ctx as *mut _, dev);
-            if res != cu::CUresult::CUDA_SUCCESS {
-                return Err(cust::error::CudaError::UnknownError);
-            }
-            Ok(PrimaryCtxGuard { dev, ctx })
-        }
-    }
-    #[inline]
-    unsafe fn push_current(&self) {
-        let _ = cu::cuCtxSetCurrent(self.ctx);
-    }
-}
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl Clone for PrimaryCtxGuard {
-    fn clone(&self) -> Self {
-        Self {
-            dev: self.dev,
-            ctx: self.ctx,
-        }
-    }
-}
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl Drop for PrimaryCtxGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let dev = self.dev as cu::CUdevice;
-            let _ = cu::cuDevicePrimaryCtxRelease_v2(dev);
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
-        let itemsize = std::mem::size_of::<f32>();
-        let inner = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("buffer already exported via __dlpack__")
-        })?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (inner.cols * itemsize, itemsize))?;
-        let size = inner.rows.saturating_mul(inner.cols);
-        let ptr_val: usize = if size == 0 {
-            0
-        } else {
-            inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-        d.set_item("version", 3)?;
-        Ok(d.into())
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "dl_device mismatch for __dlpack__",
-                        ));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let inner = self.inner.take().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("__dlpack__ may only be called once")
-        })?;
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32Py {
-    pub fn new_from_rust(
-        inner: DeviceArrayF32,
-        stream_handle: usize,
-        ctx_guard: Arc<Context>,
-        device_id: u32,
-    ) -> Self {
-        let pc = PrimaryCtxGuard::new(device_id).unwrap_or(PrimaryCtxGuard {
-            dev: device_id as i32,
-            ctx: std::ptr::null_mut(),
-        });
-        Self {
-            inner: Some(inner),
-            stream_handle,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-            pc_guard: pc,
-        }
-    }
 }
 
 #[cfg(test)]

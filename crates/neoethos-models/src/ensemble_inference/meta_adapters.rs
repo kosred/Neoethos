@@ -28,10 +28,11 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use polars::prelude::DataFrame;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 
-use super::tree_adapters::classification3_per_row;
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
+use super::tree_adapters::{classification3_per_row, classification3_per_row_with_validity};
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, project_expert_frame};
 use crate::base::ExpertModel as BaseExpertModel;
 use crate::ensemble::{
     CalibrationMethod, ConformalPredictionExpert, MetaBlender, MetaDecisionStack,
@@ -54,7 +55,7 @@ use crate::statistical::{BayesianLogitExpert, ElasticNetExpert, LogisticExpert};
 const DEFAULT_LOAD_CALIBRATION_METHOD: CalibrationMethod = CalibrationMethod::Platt;
 /// Default conformal alpha at load() time — same rationale: `load`
 /// overrides this from disk. 0.10 matches the operator config.
-const DEFAULT_LOAD_CONFORMAL_ALPHA: f32 = 0.10;
+const DEFAULT_LOAD_CONFORMAL_ALPHA: f64 = 0.10;
 
 // ---------------------------------------------------------------------------
 // elasticnet
@@ -87,10 +88,11 @@ impl ExpertModel for ElasticNetAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "elasticnet predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -144,10 +146,11 @@ impl ExpertModel for LogisticAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "logistic predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -199,10 +202,11 @@ impl ExpertModel for BayesLogitAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "bayes_logit predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -266,10 +270,11 @@ impl ExpertModel for MetaBlenderAdapter {
     fn feature_columns(&self) -> &[String] {
         &self.inner.feature_columns
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "meta_blender predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -328,10 +333,11 @@ impl ExpertModel for ProbabilityCalibratorAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "probability_calibrator predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -391,10 +397,11 @@ impl ExpertModel for ConformalGateAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "conformal_gate predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -457,10 +464,11 @@ impl ExpertModel for MetaStackAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "meta_stack predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -505,11 +513,9 @@ impl ExpertLoader for MetaStackLoader {
 /// directly — the soft voter consumes it as one of N classification
 /// voters.
 ///
-/// **DataFrame contract**: requires `close`, `high`, `low` columns.
-/// The first row's posterior is a uniform prior `[1/3, 1/3, 1/3]`
-/// (no previous bar → no log-return). Rows 1..N use the trained
-/// Forward-algorithm posterior. See
-/// [`RegimeHmmExpert::predict_proba_from_dataframe`] for details.
+/// The adapter consumes the exact versioned `quant_log_return` and
+/// `quant_log_volatility` columns. Warmup/gap cells remain explicitly invalid
+/// and reset the hidden-state filter; no neutral posterior is fabricated.
 pub struct HmmRegimeAdapter {
     inner: RegimeHmmExpert,
 }
@@ -536,12 +542,13 @@ impl ExpertModel for HmmRegimeAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
-        let probs = self
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
+        let posterior = self
             .inner
-            .predict_proba_from_dataframe(df)
-            .with_context(|| "hmm_regime predict_proba_from_dataframe failed")?;
-        classification3_per_row(&probs)
+            .predict_feature_frame(&projected, lease)
+            .with_context(|| "hmm_regime typed FeatureFrame prediction failed")?;
+        classification3_per_row_with_validity(&posterior.probabilities, &posterior.validity)
     }
 }
 
@@ -712,7 +719,10 @@ mod tests {
         };
         let expert = RegimeHmmExpert::train(
             &obs,
-            vec!["log_return".to_string(), "log_volatility".to_string()],
+            vec![
+                "quant_log_return".to_string(),
+                "quant_log_volatility".to_string(),
+            ],
             cfg,
         )
         .expect("train HMM");
@@ -722,7 +732,10 @@ mod tests {
         assert_eq!(adapter.output_kind(), ExpertOutputKind::Classification3);
         assert_eq!(
             adapter.feature_columns(),
-            &["log_return".to_string(), "log_volatility".to_string()]
+            &[
+                "quant_log_return".to_string(),
+                "quant_log_volatility".to_string(),
+            ]
         );
     }
 }

@@ -1,17 +1,17 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::gatorosc::{GatorOscBatchRange, GatorOscParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
@@ -94,11 +94,6 @@ impl CudaGatorOsc {
         let max_smem_per_block = device
             .get_attribute(DeviceAttribute::MaxSharedMemoryPerBlock)
             .unwrap_or(48 * 1024) as usize;
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/gatorosc_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("gatorosc_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {
@@ -754,14 +749,16 @@ pub mod benches {
         if std::env::var("CUDA_BENCH_ENABLE_GATOROSC").ok().as_deref() != Some("1") {
             return Vec::new();
         }
-        vec![CudaBenchScenario::new(
-            "gatorosc",
-            "one_series_many_params",
-            "gatorosc_cuda_batch_dev",
-            "1m_x_96",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(mem_required())]
+        vec![
+            CudaBenchScenario::new(
+                "gatorosc",
+                "one_series_many_params",
+                "gatorosc_cuda_batch_dev",
+                "1m_x_96",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(mem_required()),
+        ]
     }
 }

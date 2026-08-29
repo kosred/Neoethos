@@ -392,8 +392,9 @@ extern "C" __global__ void vdubus_divergence_wave_pattern_generator_batch_f64(
             double macd = 0.0, signal = 0.0, hist = 0.0;
             {
                 double fast_value, slow_value, signal_value;
-                if (vd_ema_update(&ema_fast, c, &fast_value) &&
-                    vd_ema_update(&ema_slow, c, &slow_value)) {
+                const bool fast_ready = vd_ema_update(&ema_fast, c, &fast_value) != 0;
+                const bool slow_ready = vd_ema_update(&ema_slow, c, &slow_value) != 0;
+                if (fast_ready && slow_ready) {
                     double m = fast_value - slow_value;
                     if (vd_ema_update(&ema_signal, m, &signal_value)) {
                         macd = m;
@@ -401,11 +402,6 @@ extern "C" __global__ void vdubus_divergence_wave_pattern_generator_batch_f64(
                         hist = m - signal_value;
                         have_macd = true;
                     }
-                } else {
-                    // The CPU's `?` on `fast` short-circuits BEFORE `slow` is
-                    // updated. `vd_ema_update` above relies on `&&` doing the
-                    // same, so an unstarted fast EMA leaves slow untouched —
-                    // which is what `MacdState::update` does.
                 }
             }
 
@@ -598,14 +594,11 @@ extern "C" __global__ void vdubus_divergence_wave_pattern_generator_batch_f64(
  *   fixed-span pivot ring buffers and two front-pushed pivot lists all carry
  *   across bars.
  *
- * THE SHORT-CIRCUIT THAT IS EASY TO MISS: `MacdState::update` (:857) is
- *     let fast = self.fast.update(close)?;
- *     let slow = self.slow.update(close)?;
- *   -- Rust `?` RETURNS EARLY, so on every bar before the FAST ema is seeded
- *   the SLOW ema is never updated at all. Its warm-up therefore does not start
- *   at bar 0; it starts at the bar the fast ema first emits. Writing the two
- *   updates unconditionally would seed the slow ema 21 bars early and shift
- *   the whole MACD. The same applies to the signal ema.
+ * CONCURRENT EMA INPUT: MACD's fast and slow EMAs consume every finite close
+ *   on the same bar. A former scalar `?` short-circuit delayed the slow seed
+ *   until the fast EMA emitted; the independent hand-derived oracle exposed
+ *   that as a formula defect. Both updates are therefore unconditional here,
+ *   while the signal EMA still starts only after both price EMAs emit MACD.
  *
  * ARITHMETIC taken verbatim:
  *   * the EMA seed is `sum / length` after exactly `length` FINITE updates
@@ -813,9 +806,8 @@ void vdubus_divergence_wave_pattern_generator_neo_batch_f64(const double* __rest
             continue;
         }
 
-        /* ---- MacdState::update (:857). The `?` SHORT-CIRCUITS -- see the
-         * header. `close` is finite here, so the EmaState non-finite arm
-         * cannot fire; the guard that matters is the seeding count. ---- */
+        /* ---- MacdState::update (:857). Fast and slow consume the same finite
+         * close unconditionally; signal starts only once both emit. ---- */
         bool   macd_ready = false;
         double hist = 0.0;
 
@@ -828,28 +820,26 @@ void vdubus_divergence_wave_pattern_generator_neo_batch_f64(const double* __rest
             fast_ok = true;
         }
 
-        if (fast_ok) {
-            bool slow_ok = false;
-            if (!b_slow) {
-                s_slow += c; c_slow += 1;
-                if (c_slow == NEO_VD_SLOW_LENGTH) { v_slow = s_slow / (double)NEO_VD_SLOW_LENGTH; b_slow = true; slow_ok = true; }
-            } else {
-                v_slow = fma(a_slow, c, (1.0 - a_slow) * v_slow);
-                slow_ok = true;
-            }
+        bool slow_ok = false;
+        if (!b_slow) {
+            s_slow += c; c_slow += 1;
+            if (c_slow == NEO_VD_SLOW_LENGTH) { v_slow = s_slow / (double)NEO_VD_SLOW_LENGTH; b_slow = true; slow_ok = true; }
+        } else {
+            v_slow = fma(a_slow, c, (1.0 - a_slow) * v_slow);
+            slow_ok = true;
+        }
 
-            if (slow_ok) {
-                const double macd = v_fast - v_slow;
-                bool sig_ok = false;
-                if (!b_sig) {
-                    s_sig += macd; c_sig += 1;
-                    if (c_sig == NEO_VD_SIGNAL_LENGTH) { v_sig = s_sig / (double)NEO_VD_SIGNAL_LENGTH; b_sig = true; sig_ok = true; }
-                } else {
-                    v_sig = fma(a_sig, macd, (1.0 - a_sig) * v_sig);
-                    sig_ok = true;
-                }
-                if (sig_ok) { macd_ready = true; hist = macd - v_sig; }
+        if (fast_ok && slow_ok) {
+            const double macd = v_fast - v_slow;
+            bool sig_ok = false;
+            if (!b_sig) {
+                s_sig += macd; c_sig += 1;
+                if (c_sig == NEO_VD_SIGNAL_LENGTH) { v_sig = s_sig / (double)NEO_VD_SIGNAL_LENGTH; b_sig = true; sig_ok = true; }
+            } else {
+                v_sig = fma(a_sig, macd, (1.0 - a_sig) * v_sig);
+                sig_ok = true;
             }
+            if (sig_ok) { macd_ready = true; hist = macd - v_sig; }
         }
 
         /* ---- MomentumState::update (:1000), only when the MACD emitted ---- */

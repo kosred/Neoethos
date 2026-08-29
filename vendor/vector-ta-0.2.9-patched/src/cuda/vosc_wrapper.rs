@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::vosc::{VoscBatchRange, VoscParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -135,11 +135,6 @@ impl CudaVosc {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/vosc_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("vosc_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
@@ -794,90 +789,6 @@ impl CudaVosc {
             row_base += chunk_y;
         }
         Ok(())
-    }
-
-    pub fn vosc_many_series_one_param_time_major_dev(
-        &self,
-        data_tm_f32: &[f32],
-        cols: usize,
-        rows: usize,
-        params: &VoscParams,
-    ) -> Result<DeviceArrayF32, CudaVoscError> {
-        let short = params.short_period.unwrap_or(2);
-        let long = params.long_period.unwrap_or(5);
-
-        let use_ds = rows >= 131_072 || cols >= 1024;
-
-        // COUNTED, not disguised — the `use_ds == false` branch below computes
-        // on the HOST and uploads. See rvi_wrapper.rs for the reasoning. Recorded
-        // unconditionally at the decision point rather than inside the branch, so
-        // the counter cannot drift away from the condition it describes.
-        if !use_ds {
-            crate::cuda::host_fallback::record("vosc");
-        }
-
-        let elems = Self::checked_mul(rows, cols)?;
-        let mut d_out_tm: DeviceBuffer<f32> =
-            unsafe { DeviceBuffer::uninitialized_async(elems, &self.stream)? };
-
-        if use_ds {
-            let (prefix_tm, first_valids) =
-                Self::prepare_many_series_inputs(data_tm_f32, cols, rows, short, long)?;
-            let prefix_bytes = Self::checked_mul(rows + 1, cols)?
-                .checked_mul(std::mem::size_of::<Float2>())
-                .ok_or_else(|| CudaVoscError::InvalidInput("size overflow".into()))?;
-            let fv_bytes = Self::checked_mul(cols, std::mem::size_of::<i32>())?;
-            let out_bytes = Self::checked_mul(elems, std::mem::size_of::<f32>())?;
-            let tmp = Self::checked_add(prefix_bytes, fv_bytes)?;
-            let bytes = Self::checked_add(tmp, out_bytes)?;
-            Self::will_fit(bytes, 64 * 1024 * 1024)?;
-            let d_prefix_tm = unsafe { DeviceBuffer::from_slice_async(&prefix_tm, &self.stream) }?;
-            let d_first = unsafe { DeviceBuffer::from_slice_async(&first_valids, &self.stream) }?;
-            self.launch_many_series_kernel_ds(
-                &d_prefix_tm,
-                &d_first,
-                cols,
-                rows,
-                short,
-                long,
-                &mut d_out_tm,
-            )?;
-        } else {
-            use crate::indicators::vosc::{vosc_with_kernel, VoscData, VoscInput};
-            use crate::utilities::enums::Kernel;
-
-            let params_cpu = VoscParams {
-                short_period: Some(short),
-                long_period: Some(long),
-            };
-            let mut host_out = vec![0f32; elems];
-            for s in 0..cols {
-                let mut series = vec![f64::NAN; rows];
-                for t in 0..rows {
-                    series[t] = data_tm_f32[t * cols + s] as f64;
-                }
-                let input = VoscInput {
-                    data: VoscData::Slice(&series),
-                    params: params_cpu.clone(),
-                };
-                let out = vosc_with_kernel(&input, Kernel::Scalar)
-                    .map_err(|e| CudaVoscError::InvalidInput(e.to_string()))?;
-                for t in 0..rows {
-                    host_out[t * cols + s] = out.values[t] as f32;
-                }
-            }
-
-            d_out_tm = unsafe { DeviceBuffer::uninitialized_async(elems, &self.stream) }?;
-            unsafe { d_out_tm.async_copy_from(host_out.as_slice(), &self.stream) }?;
-        }
-        self.stream.synchronize()?;
-        Ok(DeviceArrayF32 {
-            buf: d_out_tm,
-            rows,
-            cols,
-            ctx: self.context_arc(),
-            device_id: self.device_id,
-        })
     }
 }
 

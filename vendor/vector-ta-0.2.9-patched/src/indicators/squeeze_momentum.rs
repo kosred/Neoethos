@@ -1,20 +1,4 @@
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -327,7 +311,6 @@ pub fn squeeze_momentum_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn squeeze_momentum_into(
     input: &SqueezeMomentumInput,
@@ -428,10 +411,6 @@ impl SqueezeMomentumBatchBuilder {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct SqueezeMomentumBatchParams {
     pub length_bb: usize,
     pub mult_bb: f64,
@@ -945,17 +924,9 @@ fn squeeze_momentum_batch_fill_scalar_shared(
             let next = momentum[i + 1];
             if curr.is_finite() && next.is_finite() {
                 signal[i + 1] = if next > 0.0 {
-                    if next > curr {
-                        1.0
-                    } else {
-                        2.0
-                    }
+                    if next > curr { 1.0 } else { 2.0 }
                 } else {
-                    if next < curr {
-                        -1.0
-                    } else {
-                        -2.0
-                    }
+                    if next < curr { -1.0 } else { -2.0 }
                 };
             } else if i + 1 >= warm_sig {
                 signal[i + 1] = f64::NAN;
@@ -1176,20 +1147,12 @@ pub unsafe fn squeeze_momentum_scalar_classic(
     #[inline(always)]
     fn rb_back(head: usize, len: usize, cap: usize) -> usize {
         let pos = head + len - 1;
-        if pos >= cap {
-            pos - cap
-        } else {
-            pos
-        }
+        if pos >= cap { pos - cap } else { pos }
     }
     #[inline(always)]
     fn rb_write_pos(head: usize, len: usize, cap: usize) -> usize {
         let pos = head + len;
-        if pos >= cap {
-            pos - cap
-        } else {
-            pos
-        }
+        if pos >= cap { pos - cap } else { pos }
     }
 
     for i in first_valid..n {
@@ -1354,17 +1317,9 @@ pub unsafe fn squeeze_momentum_scalar_classic(
                     let prev = *momentum_dst.get_unchecked(i - 1);
                     if prev.is_finite() && yhat_last.is_finite() {
                         *signal_dst.get_unchecked_mut(i) = if yhat_last > 0.0 {
-                            if yhat_last > prev {
-                                1.0
-                            } else {
-                                2.0
-                            }
+                            if yhat_last > prev { 1.0 } else { 2.0 }
                         } else {
-                            if yhat_last < prev {
-                                -1.0
-                            } else {
-                                -2.0
-                            }
+                            if yhat_last < prev { -1.0 } else { -2.0 }
                         };
                     } else if i >= warm_sig {
                         *signal_dst.get_unchecked_mut(i) = f64::NAN;
@@ -1386,17 +1341,9 @@ pub unsafe fn squeeze_momentum_scalar_classic(
                     let prev = *momentum_dst.get_unchecked(i - 1);
                     if prev.is_finite() && yhat_last.is_finite() {
                         *signal_dst.get_unchecked_mut(i) = if yhat_last > 0.0 {
-                            if yhat_last > prev {
-                                1.0
-                            } else {
-                                2.0
-                            }
+                            if yhat_last > prev { 1.0 } else { 2.0 }
                         } else {
-                            if yhat_last < prev {
-                                -1.0
-                            } else {
-                                -2.0
-                            }
+                            if yhat_last < prev { -1.0 } else { -2.0 }
                         };
                     } else if i >= warm_sig {
                         *signal_dst.get_unchecked_mut(i) = f64::NAN;
@@ -2022,496 +1969,16 @@ impl Default for SqueezeMomentumStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyclass(name = "SqueezeMomentumStream")]
-pub struct SqueezeMomentumStreamPy {
-    stream: SqueezeMomentumStream,
-
-    lbb: usize,
-    lkc: usize,
-    n: usize,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl SqueezeMomentumStreamPy {
-    #[new]
-    #[pyo3(signature = (length_bb=20, mult_bb=2.0, length_kc=20, mult_kc=1.5))]
-    fn new(length_bb: usize, mult_bb: f64, length_kc: usize, mult_kc: f64) -> PyResult<Self> {
-        let params = SqueezeMomentumParams {
-            length_bb: Some(length_bb),
-            mult_bb: Some(mult_bb),
-            length_kc: Some(length_kc),
-            mult_kc: Some(mult_kc),
-        };
-        let stream = SqueezeMomentumStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(SqueezeMomentumStreamPy {
-            stream,
-            lbb: length_bb,
-            lkc: length_kc,
-            n: 0,
-        })
-    }
-
-    fn update(
-        &mut self,
-        high: f64,
-        low: f64,
-        close: f64,
-    ) -> (Option<f64>, Option<f64>, Option<f64>) {
-        self.n = self.n.saturating_add(1);
-        match self.stream.update(high, low, close) {
-            Some((squeeze, momentum, signal)) => (Some(squeeze), Some(momentum), Some(signal)),
-            None => {
-                if self.n >= self.lbb.max(self.lkc) {
-                    (Some(0.0), Some(0.0), Some(2.0))
-                } else {
-                    (None, None, None)
-                }
-            }
-        }
-    }
-
-    pub fn count(&self) -> usize {
-        self.n
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "squeeze_momentum")]
-#[pyo3(signature = (high, low, close, length_bb=20, mult_bb=2.0, length_kc=20, mult_kc=1.5, kernel=None))]
-pub fn squeeze_momentum_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_bb: usize,
-    mult_bb: f64,
-    length_kc: usize,
-    mult_kc: f64,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let n = c.len();
-    let sq = unsafe { PyArray1::<f64>::new(py, [n], false) };
-    let mo = unsafe { PyArray1::<f64>::new(py, [n], false) };
-    let si = unsafe { PyArray1::<f64>::new(py, [n], false) };
-
-    let mut sq_slice = unsafe { sq.as_slice_mut()? };
-    let mut mo_slice = unsafe { mo.as_slice_mut()? };
-    let mut si_slice = unsafe { si.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = SqueezeMomentumParams {
-        length_bb: Some(length_bb),
-        mult_bb: Some(mult_bb),
-        length_kc: Some(length_kc),
-        mult_kc: Some(mult_kc),
-    };
-    let input = SqueezeMomentumInput::from_slices(h, l, c, params);
-
-    py.allow_threads(|| {
-        squeeze_momentum_into_slices(&mut sq_slice, &mut mo_slice, &mut si_slice, &input, kern)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((sq, mo, si))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaSqueezeMomentum};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "squeeze_momentum_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, length_bb_range, mult_bb_range, length_kc_range, mult_kc_range, device_id=0))]
-pub fn squeeze_momentum_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: PyReadonlyArray1<'_, f32>,
-    low_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    length_bb_range: (usize, usize, usize),
-    mult_bb_range: (f64, f64, f64),
-    length_kc_range: (usize, usize, usize),
-    mult_kc_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = SqueezeMomentumBatchRange {
-        length_bb: length_bb_range,
-        mult_bb: mult_bb_range,
-        length_kc: length_kc_range,
-        mult_kc: mult_kc_range,
-    };
-    let (sq, mo, si, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaSqueezeMomentum::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.squeeze_momentum_batch_dev(h, l, c, &sweep)
-            .map(|(sq, mo, si)| (sq, mo, si, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: sq,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-        DeviceArrayF32Py {
-            inner: mo,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-        DeviceArrayF32Py {
-            inner: si,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "squeeze_momentum_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, length_bb, mult_bb, length_kc, mult_kc, device_id=0))]
-pub fn squeeze_momentum_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: PyReadonlyArray1<'_, f32>,
-    low_tm_f32: PyReadonlyArray1<'_, f32>,
-    close_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    length_bb: usize,
-    mult_bb: f32,
-    length_kc: usize,
-    mult_kc: f32,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let (sq, mo, si, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaSqueezeMomentum::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.squeeze_momentum_many_series_one_param_time_major_dev(
-            h, l, c, cols, rows, length_bb, mult_bb, length_kc, mult_kc,
-        )
-        .map(|(sq, mo, si)| (sq, mo, si, ctx, dev_id))
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: sq,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-        DeviceArrayF32Py {
-            inner: mo,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-        DeviceArrayF32Py {
-            inner: si,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "squeeze_momentum_batch")]
-#[pyo3(signature = (high, low, close, length_bb_range, mult_bb_range, length_kc_range, mult_kc_range, kernel=None))]
-pub fn squeeze_momentum_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_bb_range: (usize, usize, usize),
-    mult_bb_range: (f64, f64, f64),
-    length_kc_range: (usize, usize, usize),
-    mult_kc_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let sweep = SqueezeMomentumBatchRange {
-        length_bb: length_bb_range,
-        mult_bb: mult_bb_range,
-        length_kc: length_kc_range,
-        mult_kc: mult_kc_range,
-    };
-
-    let out = py.allow_threads(|| {
-        let k = validate_kernel(kernel, true)?;
-        let simd = match k {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        squeeze_momentum_batch_with_kernel(h, l, c, &sweep, simd)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = PyDict::new(py);
-
-    dict.set_item(
-        "values",
-        PyArray1::from_vec(py, out.momentum).reshape((out.rows, out.cols))?,
-    )?;
-
-    dict.set_item(
-        "squeeze",
-        PyArray1::from_vec(py, out.squeeze).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "signal",
-        PyArray1::from_vec(py, out.signal).reshape((out.rows, out.cols))?,
-    )?;
-
-    dict.set_item(
-        "length_bb",
-        PyArray1::from_vec(
-            py,
-            out.combos
-                .iter()
-                .map(|p| p.length_bb as i64)
-                .collect::<Vec<_>>(),
-        ),
-    )?;
-    dict.set_item(
-        "mult_bb",
-        PyArray1::from_vec(py, out.combos.iter().map(|p| p.mult_bb).collect::<Vec<_>>()),
-    )?;
-    dict.set_item(
-        "length_kc",
-        PyArray1::from_vec(
-            py,
-            out.combos
-                .iter()
-                .map(|p| p.length_kc as i64)
-                .collect::<Vec<_>>(),
-        ),
-    )?;
-    dict.set_item(
-        "mult_kc",
-        PyArray1::from_vec(py, out.combos.iter().map(|p| p.mult_kc).collect::<Vec<_>>()),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SmiResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_momentum_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length_bb: usize,
-    mult_bb: f64,
-    length_kc: usize,
-    mult_kc: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let n = close.len();
-    let mut sq = vec![f64::NAN; n];
-    let mut mo = vec![f64::NAN; n];
-    let mut si = vec![f64::NAN; n];
-    let params = SqueezeMomentumParams {
-        length_bb: Some(length_bb),
-        mult_bb: Some(mult_bb),
-        length_kc: Some(length_kc),
-        mult_kc: Some(mult_kc),
-    };
-    let input = SqueezeMomentumInput::from_slices(high, low, close, params);
-    squeeze_momentum_into_slices(&mut sq, &mut mo, &mut si, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut values = Vec::with_capacity(3 * n);
-    values.extend_from_slice(&sq);
-    values.extend_from_slice(&mo);
-    values.extend_from_slice(&si);
-    Ok(values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SmiBatchConfig {
-    pub length_bb_range: (usize, usize, usize),
-    pub mult_bb_range: (f64, f64, f64),
-    pub length_kc_range: (usize, usize, usize),
-    pub mult_kc_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SmiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub length_bb: Vec<usize>,
-    pub mult_bb: Vec<f64>,
-    pub length_kc: Vec<usize>,
-    pub mult_kc: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "squeeze_momentum_batch")]
-pub fn squeeze_momentum_batch(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: SmiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = SqueezeMomentumBatchRange {
-        length_bb: cfg.length_bb_range,
-        mult_bb: cfg.mult_bb_range,
-        length_kc: cfg.length_kc_range,
-        mult_kc: cfg.mult_kc_range,
-    };
-    let out =
-        squeeze_momentum_batch_with_kernel(high, low, close, &sweep, detect_best_batch_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut length_bb = Vec::with_capacity(out.combos.len());
-    let mut mult_bb = Vec::with_capacity(out.combos.len());
-    let mut length_kc = Vec::with_capacity(out.combos.len());
-    let mut mult_kc = Vec::with_capacity(out.combos.len());
-
-    for combo in &out.combos {
-        length_bb.push(combo.length_bb);
-        mult_bb.push(combo.mult_bb);
-        length_kc.push(combo.length_kc);
-        mult_kc.push(combo.mult_kc);
-    }
-
-    let js = SmiBatchJsOutput {
-        values: out.momentum,
-        rows: out.rows,
-        cols: out.cols,
-        length_bb,
-        mult_bb,
-        length_kc,
-        mult_kc,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_momentum_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    vec.resize(len, f64::NAN);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_momentum_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_momentum_into(
-    input_ptr: *const f64,
-    sq_ptr: *mut f64,
-    mo_ptr: *mut f64,
-    si_ptr: *mut f64,
-    len: usize,
-    length_bb: usize,
-    mult_bb: f64,
-    length_kc: usize,
-    mult_kc: f64,
-) -> Result<(), JsValue> {
-    if [
-        input_ptr as usize,
-        sq_ptr as usize,
-        mo_ptr as usize,
-        si_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let input = core::slice::from_raw_parts(input_ptr, len * 3);
-        let h = &input[0..len];
-        let l = &input[len..len * 2];
-        let c = &input[len * 2..len * 3];
-        let sq = core::slice::from_raw_parts_mut(sq_ptr, len);
-        let mo = core::slice::from_raw_parts_mut(mo_ptr, len);
-        let si = core::slice::from_raw_parts_mut(si_ptr, len);
-        let params = SqueezeMomentumParams {
-            length_bb: Some(length_bb),
-            mult_bb: Some(mult_bb),
-            length_kc: Some(length_kc),
-            mult_kc: Some(mult_kc),
-        };
-        let input = SqueezeMomentumInput::from_slices(h, l, c, params);
-        squeeze_momentum_into_slices(sq, mo, si, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_momentum_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length_bb: usize,
-    mult_bb: f64,
-    length_kc: usize,
-    mult_kc: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = squeeze_momentum_js(high, low, close, length_bb, mult_bb, length_kc, mult_kc)?;
-    crate::write_wasm_f64_output("squeeze_momentum_output_into_js", &values, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_squeeze_momentum_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = SqueezeMomentumInput::with_default_candles(&candles);
 
         let baseline = squeeze_momentum(&input)?;
@@ -2520,18 +1987,7 @@ mod tests {
         let mut out_sq = vec![0.0; n];
         let mut out_mo = vec![0.0; n];
         let mut out_si = vec![0.0; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         squeeze_momentum_into(&input, &mut out_sq, &mut out_mo, &mut out_si)?;
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            squeeze_momentum_into_slices(
-                &mut out_sq,
-                &mut out_mo,
-                &mut out_si,
-                &input,
-                Kernel::Auto,
-            )?;
-        }
 
         assert_eq!(baseline.squeeze.len(), n);
         assert_eq!(baseline.momentum.len(), n);
@@ -2573,8 +2029,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = SqueezeMomentumParams {
             length_bb: None,
             mult_bb: None,
@@ -2592,8 +2048,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = SqueezeMomentumInput::with_default_candles(&candles);
         let output = squeeze_momentum_with_kernel(&input, kernel)?;
         let expected_last_five = [-170.9, -155.4, -65.3, -61.1, -178.1];
@@ -2619,8 +2075,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = SqueezeMomentumInput::with_default_candles(&candles);
         let output = squeeze_momentum_with_kernel(&input, kernel)?;
         assert_eq!(output.squeeze.len(), candles.close.len());
@@ -2736,8 +2192,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             SqueezeMomentumParams::default(),
@@ -2816,41 +2272,50 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in squeeze \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in squeeze \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in squeeze \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in squeeze \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in squeeze \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in squeeze \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
             }
 
@@ -2863,41 +2328,50 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in momentum \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in momentum \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in momentum \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in momentum \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in momentum \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in momentum \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
             }
 
@@ -2910,41 +2384,50 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in momentum_signal \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in momentum_signal \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in momentum_signal \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in momentum_signal \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in momentum_signal \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in momentum_signal \
 						 with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={} (param set {})",
-						test_name, val, bits, i,
-						params.length_bb.unwrap_or(20),
-						params.mult_bb.unwrap_or(2.0),
-						params.length_kc.unwrap_or(20),
-						params.mult_kc.unwrap_or(1.5),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.length_bb.unwrap_or(20),
+                        params.mult_bb.unwrap_or(2.0),
+                        params.length_kc.unwrap_or(20),
+                        params.mult_kc.unwrap_or(1.5),
+                        param_idx
+                    );
                 }
             }
         }
@@ -3221,8 +2704,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = SqueezeMomentumBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c)?;
@@ -3241,8 +2724,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 1.0, 2.0, 0.5, 2, 10, 2, 1.0, 2.0, 0.5),
@@ -3297,59 +2780,59 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 							in {} at row {} col {} (flat index {}) with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={}",
-							test,
-							cfg_idx,
-							val,
-							bits,
-							name,
-							row,
-							col,
-							idx,
-							combo.length_bb,
-							combo.mult_bb,
-							combo.length_kc,
-							combo.mult_kc
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            name,
+                            row,
+                            col,
+                            idx,
+                            combo.length_bb,
+                            combo.mult_bb,
+                            combo.length_kc,
+                            combo.mult_kc
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 							in {} at row {} col {} (flat index {}) with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={}",
-							test,
-							cfg_idx,
-							val,
-							bits,
-							name,
-							row,
-							col,
-							idx,
-							combo.length_bb,
-							combo.mult_bb,
-							combo.length_kc,
-							combo.mult_kc
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            name,
+                            row,
+                            col,
+                            idx,
+                            combo.length_bb,
+                            combo.mult_bb,
+                            combo.length_kc,
+                            combo.mult_kc
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 							in {} at row {} col {} (flat index {}) with params: length_bb={}, mult_bb={}, length_kc={}, mult_kc={}",
-							test,
-							cfg_idx,
-							val,
-							bits,
-							name,
-							row,
-							col,
-							idx,
-							combo.length_bb,
-							combo.mult_bb,
-							combo.length_kc,
-							combo.mult_kc
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            name,
+                            row,
+                            col,
+                            idx,
+                            combo.length_bb,
+                            combo.mult_bb,
+                            combo.length_kc,
+                            combo.mult_kc
+                        );
                     }
                 }
             }

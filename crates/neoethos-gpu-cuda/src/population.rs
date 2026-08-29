@@ -11,7 +11,10 @@ use super::{
     ScenarioDescriptor,
 };
 use neoethos_gpu_contracts::ABI_VERSION;
+use sha2::{Digest, Sha256};
 use std::ffi::c_void;
+use std::ops::Range;
+use std::sync::Arc;
 use thiserror::Error;
 
 pub const STATUS_OK: i32 = 0;
@@ -29,6 +32,10 @@ pub const STATUS_READBACK_CAPACITY: i32 = -39;
 pub const STATUS_SYNC_FAILED: i32 = -40;
 pub const STATUS_UNKNOWN_EVENT: i32 = -41;
 pub const STATUS_DATASET_REUPLOAD: i32 = -42;
+pub const STATUS_WORKSPACE_MODE_MISMATCH: i32 = -43;
+pub const STATUS_WORKSPACE_PLAN_MISMATCH: i32 = -44;
+pub const STATUS_STRICT_RESIDENT_IN_FLIGHT: i32 = -45;
+pub const STATUS_STRICT_RESIDENT_POISONED: i32 = -46;
 
 /// Trade slots the kernel reserves per candidate.
 ///
@@ -43,6 +50,9 @@ pub const STATUS_DATASET_REUPLOAD: i32 = -42;
 /// constant. Two languages agreeing by convention is how the retry-smaller path
 /// silently stopped working; this one is checked.
 pub const MAX_TRADES_PER_CANDIDATE: u64 = 8192;
+const POPULATION_METRIC_ROW_BYTES_V1: u64 = 104;
+const POPULATION_SCENARIO_DEVICE_BYTES_V1: u64 = 56;
+const POPULATION_F64_BYTES_V1: u64 = 8;
 
 pub fn population_status_message(status: i32) -> &'static str {
     match status {
@@ -61,6 +71,18 @@ pub fn population_status_message(status: i32) -> &'static str {
         STATUS_SYNC_FAILED => "stream or event synchronization failed",
         STATUS_UNKNOWN_EVENT => "event id does not belong to this session",
         STATUS_DATASET_REUPLOAD => "a session accepts exactly one logical dataset upload",
+        STATUS_WORKSPACE_MODE_MISMATCH => {
+            "population session workspace mode cannot change after first selection"
+        }
+        STATUS_WORKSPACE_PLAN_MISMATCH => {
+            "resident population workspace does not match the sealed plan"
+        }
+        STATUS_STRICT_RESIDENT_IN_FLIGHT => {
+            "strict resident GPU work has not been consumed by the next device stage"
+        }
+        STATUS_STRICT_RESIDENT_POISONED => {
+            "strict resident GPU session is poisoned after an ambiguous or dropped launch"
+        }
         _ => "unknown native status",
     }
 }
@@ -128,8 +150,8 @@ pub struct PopulationDatasetView<'a> {
     pub close: &'a [f64],
     pub high: &'a [f64],
     pub low: &'a [f64],
-    /// Feature-major `[feature][bar]` values.
-    pub indicators: &'a [f32],
+    /// Canonical f64 feature-major `[feature][bar]` values.
+    pub indicators: &'a [f64],
     pub feature_count: usize,
     pub months: &'a [i64],
     pub days: &'a [i64],
@@ -179,13 +201,14 @@ impl PopulationDatasetView<'_> {
                 self.indicators.len()
             )));
         }
-        if let Some(base) = self.adaptive_base_pips {
-            if base.len() != bars {
-                return Err(invalid(format!(
-                    "adaptive base length {} does not match {bars} bars",
-                    base.len()
-                )));
-            }
+        if self
+            .adaptive_base_pips
+            .is_some_and(|base| base.len() != bars)
+        {
+            return Err(invalid(format!(
+                "adaptive base length {} does not match {bars} bars",
+                self.adaptive_base_pips.map_or(0, <[f64]>::len)
+            )));
         }
         for (field, values) in [
             ("close", self.close),
@@ -200,20 +223,456 @@ impl PopulationDatasetView<'_> {
     }
 }
 
-/// Borrowed canonical gene batch.
+/// Immutable canonical parent buffers uploaded once for one native population
+/// session. View-local adaptive settings and row selections deliberately do not
+/// belong here: changing either must bind a view, never upload another parent.
+#[derive(Debug, Clone)]
+pub struct PopulationParentDatasetInputV1 {
+    pub close: Arc<[f64]>,
+    pub high: Arc<[f64]>,
+    pub low: Arc<[f64]>,
+    pub indicators_feature_major: Arc<[f64]>,
+    pub feature_count: usize,
+    pub months: Arc<[i64]>,
+    pub days: Arc<[i64]>,
+    pub timestamps: Arc<[i64]>,
+    pub smc_rows: Arc<[i8]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PopulationParentDatasetV1 {
+    close: Arc<[f64]>,
+    high: Arc<[f64]>,
+    low: Arc<[f64]>,
+    indicators_feature_major: Arc<[f64]>,
+    feature_count: usize,
+    months: Arc<[i64]>,
+    days: Arc<[i64]>,
+    timestamps: Arc<[i64]>,
+    smc_rows: Arc<[i8]>,
+}
+
+impl PopulationParentDatasetV1 {
+    pub fn new(input: PopulationParentDatasetInputV1) -> Result<Self, CudaPopulationError> {
+        let PopulationParentDatasetInputV1 {
+            close,
+            high,
+            low,
+            indicators_feature_major,
+            feature_count,
+            months,
+            days,
+            timestamps,
+            smc_rows,
+        } = input;
+        let rows = close.len();
+        if rows == 0 {
+            return Err(invalid("parent dataset has no rows"));
+        }
+        if feature_count == 0 {
+            return Err(invalid("parent dataset has no features"));
+        }
+        for (field, actual) in [
+            ("high", high.len()),
+            ("low", low.len()),
+            ("months", months.len()),
+            ("days", days.len()),
+            ("timestamps", timestamps.len()),
+        ] {
+            if actual != rows {
+                return Err(invalid(format!(
+                    "parent {field} length {actual} does not match {rows} rows"
+                )));
+            }
+        }
+        let indicator_count = feature_count
+            .checked_mul(rows)
+            .ok_or_else(|| invalid("parent feature extent overflows usize"))?;
+        if indicators_feature_major.len() != indicator_count {
+            return Err(invalid(format!(
+                "parent indicators length {} does not match {indicator_count}",
+                indicators_feature_major.len()
+            )));
+        }
+        let smc_count = rows
+            .checked_mul(SMC_SLOTS)
+            .ok_or_else(|| invalid("parent SMC extent overflows usize"))?;
+        if smc_rows.len() != smc_count {
+            return Err(invalid(format!(
+                "parent smc_rows length {} does not match {rows} rows x {SMC_SLOTS} slots",
+                smc_rows.len()
+            )));
+        }
+        for (field, values) in [
+            ("close", close.as_ref()),
+            ("high", high.as_ref()),
+            ("low", low.as_ref()),
+            ("indicators", indicators_feature_major.as_ref()),
+        ] {
+            if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+                return Err(invalid(format!("parent {field}[{index}] is not finite")));
+            }
+        }
+        if timestamps.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(invalid(
+                "parent canonical timestamps must be strictly increasing",
+            ));
+        }
+
+        Ok(Self {
+            close,
+            high,
+            low,
+            indicators_feature_major,
+            feature_count,
+            months,
+            days,
+            timestamps,
+            smc_rows,
+        })
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.close.len()
+    }
+
+    pub fn feature_count(&self) -> usize {
+        self.feature_count
+    }
+
+    pub fn indicators_feature_major(&self) -> &[f64] {
+        &self.indicators_feature_major
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopulationViewKindV1 {
+    Full,
+    ContiguousRange,
+    OrderedIndices,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopulationTimestampModeV1 {
+    Canonical,
+    DisabledIndexDelta,
+}
+
+/// A view-local row mapping and optional adaptive stop series. Full and range
+/// views are scalar descriptors; only an ordered view owns a compact u64 map.
+#[derive(Debug, Clone)]
+pub struct PopulationEvaluationViewV1 {
+    parent_row_count: usize,
+    kind: PopulationViewKindV1,
+    range: Option<Range<usize>>,
+    ordered_indices: Option<Arc<[u64]>>,
+    timestamp_mode: PopulationTimestampModeV1,
+    adaptive_base_pips: Option<Arc<[f64]>>,
+}
+
+impl PopulationEvaluationViewV1 {
+    pub fn full(
+        parent_row_count: usize,
+        timestamp_mode: PopulationTimestampModeV1,
+        adaptive_base_pips: Option<Arc<[f64]>>,
+    ) -> Result<Self, CudaPopulationError> {
+        Self::build(
+            parent_row_count,
+            PopulationViewKindV1::Full,
+            Some(0..parent_row_count),
+            None,
+            timestamp_mode,
+            adaptive_base_pips,
+        )
+    }
+
+    pub fn contiguous_range(
+        parent_row_count: usize,
+        start: usize,
+        end: usize,
+        timestamp_mode: PopulationTimestampModeV1,
+        adaptive_base_pips: Option<Arc<[f64]>>,
+    ) -> Result<Self, CudaPopulationError> {
+        if start >= end || end > parent_row_count {
+            return Err(invalid(
+                "contiguous population view is empty, reversed, or outside its parent",
+            ));
+        }
+        Self::build(
+            parent_row_count,
+            PopulationViewKindV1::ContiguousRange,
+            Some(start..end),
+            None,
+            timestamp_mode,
+            adaptive_base_pips,
+        )
+    }
+
+    pub fn ordered_indices(
+        parent_row_count: usize,
+        ordered_indices: Arc<[u64]>,
+        timestamp_mode: PopulationTimestampModeV1,
+        adaptive_base_pips: Option<Arc<[f64]>>,
+    ) -> Result<Self, CudaPopulationError> {
+        let parent_rows = u64::try_from(parent_row_count)
+            .map_err(|_| invalid("parent row count does not fit the native u64 view contract"))?;
+        if ordered_indices.is_empty()
+            || ordered_indices.iter().any(|index| *index >= parent_rows)
+            || ordered_indices.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid(
+                "ordered population indices must be non-empty, in bounds, and strictly increasing",
+            ));
+        }
+        Self::build(
+            parent_row_count,
+            PopulationViewKindV1::OrderedIndices,
+            None,
+            Some(ordered_indices),
+            timestamp_mode,
+            adaptive_base_pips,
+        )
+    }
+
+    fn build(
+        parent_row_count: usize,
+        kind: PopulationViewKindV1,
+        range: Option<Range<usize>>,
+        ordered_indices: Option<Arc<[u64]>>,
+        timestamp_mode: PopulationTimestampModeV1,
+        adaptive_base_pips: Option<Arc<[f64]>>,
+    ) -> Result<Self, CudaPopulationError> {
+        if parent_row_count == 0 {
+            return Err(invalid("population view has an empty parent"));
+        }
+        let row_count = ordered_indices.as_ref().map_or_else(
+            || range.as_ref().map_or(0, |range| range.len()),
+            |indices| indices.len(),
+        );
+        if adaptive_base_pips.as_ref().is_some_and(|values| {
+            values.len() != row_count || values.iter().any(|value| !value.is_finite())
+        }) {
+            return Err(invalid(
+                "adaptive population series must be finite and cover the exact view",
+            ));
+        }
+        Ok(Self {
+            parent_row_count,
+            kind,
+            range,
+            ordered_indices,
+            timestamp_mode,
+            adaptive_base_pips,
+        })
+    }
+
+    pub fn kind(&self) -> PopulationViewKindV1 {
+        self.kind
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.ordered_indices.as_ref().map_or_else(
+            || self.range.as_ref().map_or(0, |range| range.len()),
+            |indices| indices.len(),
+        )
+    }
+
+    pub fn range(&self) -> Option<Range<usize>> {
+        self.range
+            .clone()
+            .filter(|_| matches!(self.kind, PopulationViewKindV1::ContiguousRange))
+    }
+
+    pub fn ordered_index_values(&self) -> Option<&[u64]> {
+        self.ordered_indices.as_deref()
+    }
+
+    pub fn timestamp_mode(&self) -> PopulationTimestampModeV1 {
+        self.timestamp_mode
+    }
+
+    pub fn adaptive_base_pips(&self) -> Option<&[f64]> {
+        self.adaptive_base_pips.as_deref()
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PopulationResidencyCountersV1 {
+    parent_upload_count: u64,
+    parent_upload_bytes: u64,
+    view_binding_count: u64,
+    full_binding_count: u64,
+    range_binding_count: u64,
+    ordered_binding_count: u64,
+    ordered_index_upload_bytes: u64,
+    adaptive_upload_bytes: u64,
+    stream_creation_count: u64,
+    explicit_synchronization_count: u64,
+    metric_rows_readback_count: u64,
+    metric_rows_readback_rows: u64,
+    metric_rows_readback_bytes: u64,
+    diagnostic_readback_count: u64,
+    diagnostic_readback_rows: u64,
+    diagnostic_readback_bytes: u64,
+    accepted_trade_total_readback_count: u64,
+    accepted_trade_total_readback_bytes: u64,
+}
+
+impl PopulationResidencyCountersV1 {
+    pub const fn parent_upload_count(self) -> u64 {
+        self.parent_upload_count
+    }
+    pub const fn parent_upload_bytes(self) -> u64 {
+        self.parent_upload_bytes
+    }
+    pub const fn view_binding_count(self) -> u64 {
+        self.view_binding_count
+    }
+    pub const fn full_binding_count(self) -> u64 {
+        self.full_binding_count
+    }
+    pub const fn range_binding_count(self) -> u64 {
+        self.range_binding_count
+    }
+    pub const fn ordered_binding_count(self) -> u64 {
+        self.ordered_binding_count
+    }
+    pub const fn ordered_index_upload_bytes(self) -> u64 {
+        self.ordered_index_upload_bytes
+    }
+    pub const fn adaptive_upload_bytes(self) -> u64 {
+        self.adaptive_upload_bytes
+    }
+    pub const fn stream_creation_count(self) -> u64 {
+        self.stream_creation_count
+    }
+    pub const fn explicit_synchronization_count(self) -> u64 {
+        self.explicit_synchronization_count
+    }
+    pub const fn metric_rows_readback_count(self) -> u64 {
+        self.metric_rows_readback_count
+    }
+    pub const fn metric_rows_readback_rows(self) -> u64 {
+        self.metric_rows_readback_rows
+    }
+    pub const fn metric_rows_readback_bytes(self) -> u64 {
+        self.metric_rows_readback_bytes
+    }
+    pub const fn diagnostic_readback_count(self) -> u64 {
+        self.diagnostic_readback_count
+    }
+    pub const fn diagnostic_readback_rows(self) -> u64 {
+        self.diagnostic_readback_rows
+    }
+    pub const fn diagnostic_readback_bytes(self) -> u64 {
+        self.diagnostic_readback_bytes
+    }
+    pub const fn accepted_trade_total_readback_count(self) -> u64 {
+        self.accepted_trade_total_readback_count
+    }
+    pub const fn accepted_trade_total_readback_bytes(self) -> u64 {
+        self.accepted_trade_total_readback_bytes
+    }
+}
+
+/// Exact physical CUDA device selected by one native population session.
+/// Fields are private so callers cannot construct hardware evidence; the value
+/// can only be read from the already-created native session.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaPopulationDeviceIdentityV1 {
+    selected_device_ordinal: u32,
+    compute_capability_major: u32,
+    compute_capability_minor: u32,
+    multiprocessor_count: u32,
+    total_global_memory_bytes: u64,
+    pci_domain_id: i32,
+    pci_bus_id: i32,
+    pci_device_id: i32,
+    uuid: [u8; 16],
+    name: [u8; 256],
+}
+
+impl Default for CudaPopulationDeviceIdentityV1 {
+    fn default() -> Self {
+        Self {
+            selected_device_ordinal: 0,
+            compute_capability_major: 0,
+            compute_capability_minor: 0,
+            multiprocessor_count: 0,
+            total_global_memory_bytes: 0,
+            pci_domain_id: 0,
+            pci_bus_id: 0,
+            pci_device_id: 0,
+            uuid: [0; 16],
+            name: [0; 256],
+        }
+    }
+}
+
+impl CudaPopulationDeviceIdentityV1 {
+    pub const fn selected_device_ordinal(self) -> u32 {
+        self.selected_device_ordinal
+    }
+
+    pub const fn compute_capability_major(self) -> u32 {
+        self.compute_capability_major
+    }
+
+    pub const fn compute_capability_minor(self) -> u32 {
+        self.compute_capability_minor
+    }
+
+    pub const fn multiprocessor_count(self) -> u32 {
+        self.multiprocessor_count
+    }
+
+    pub const fn total_global_memory_bytes(self) -> u64 {
+        self.total_global_memory_bytes
+    }
+
+    pub const fn pci_domain_id(self) -> i32 {
+        self.pci_domain_id
+    }
+
+    pub const fn pci_bus_id(self) -> i32 {
+        self.pci_bus_id
+    }
+
+    pub const fn pci_device_id(self) -> i32 {
+        self.pci_device_id
+    }
+
+    pub const fn uuid(&self) -> &[u8; 16] {
+        &self.uuid
+    }
+
+    pub fn name_bytes(&self) -> &[u8] {
+        let length = self
+            .name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.name.len());
+        &self.name[..length]
+    }
+}
+
+/// Borrowed canonical gene batch. CSR and SMC signal values stay f64 through
+/// the native upload and device arithmetic.
 #[derive(Debug, Clone, Copy)]
 pub struct PopulationGeneView<'a> {
     pub descriptors: &'a [GeneDescriptor],
     pub offsets: &'a [i32],
     pub indices: &'a [i32],
-    pub weights: &'a [f32],
+    pub weights: &'a [f64],
     pub stop_pips: &'a [f64],
     pub target_pips: &'a [f64],
     pub stop_vol_multipliers: &'a [f64],
     /// Row-major `[candidate][slot]` gene SMC flags.
     pub smc_flags: &'a [i8],
-    pub smc_weights: &'a [f32; SMC_SLOTS],
-    pub gate_threshold: f32,
+    pub smc_weights: &'a [f64; SMC_SLOTS],
+    pub gate_threshold: f64,
     pub smc_gate_disabled: bool,
 }
 
@@ -279,17 +738,175 @@ pub struct PopulationDiagnostics {
     pub outcomes: Vec<NeoPopulationOutcome>,
 }
 
+/// Checked device-memory extent for the strict metrics-only population mode.
+/// Fields are private so callers cannot mint a plan independently of session
+/// extents; the resident handle exposes the plan only after native parity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PopulationMetricsOnlyPlanV1 {
+    scenario_count: u64,
+    month_capacity: u64,
+    metric_rows_bytes: u64,
+    monthly_pnls_bytes: u64,
+    month_start_equities_bytes: u64,
+    scenario_descriptor_bytes: u64,
+    total_device_bytes: u64,
+    outcome_bytes: u64,
+    accepted_trade_total_bytes: u64,
+}
+
+impl PopulationMetricsOnlyPlanV1 {
+    fn checked_from_session_extents_v1(
+        scenario_count: usize,
+        month_capacity: u32,
+    ) -> Result<Self, CudaPopulationError> {
+        let scenario_count = u64::try_from(scenario_count)
+            .map_err(|_| invalid("scenario count does not fit the metrics-only u64 plan"))?;
+        let month_capacity = u64::from(month_capacity);
+        if scenario_count == 0 || month_capacity == 0 {
+            return Err(invalid(
+                "metrics-only plan requires non-zero scenarios and month capacity",
+            ));
+        }
+        let metric_rows_bytes = scenario_count
+            .checked_mul(POPULATION_METRIC_ROW_BYTES_V1)
+            .ok_or_else(|| invalid("metrics-only metric-row bytes overflow u64"))?;
+        let monthly_elements = scenario_count
+            .checked_mul(month_capacity)
+            .ok_or_else(|| invalid("metrics-only monthly element count overflows u64"))?;
+        let monthly_pnls_bytes = monthly_elements
+            .checked_mul(POPULATION_F64_BYTES_V1)
+            .ok_or_else(|| invalid("metrics-only monthly PnL bytes overflow u64"))?;
+        let month_start_equities_bytes = monthly_elements
+            .checked_mul(POPULATION_F64_BYTES_V1)
+            .ok_or_else(|| invalid("metrics-only month-start bytes overflow u64"))?;
+        let scenario_descriptor_bytes = scenario_count
+            .checked_mul(POPULATION_SCENARIO_DEVICE_BYTES_V1)
+            .ok_or_else(|| invalid("metrics-only scenario descriptor bytes overflow u64"))?;
+        let total_device_bytes = metric_rows_bytes
+            .checked_add(monthly_pnls_bytes)
+            .and_then(|total| total.checked_add(month_start_equities_bytes))
+            .and_then(|total| total.checked_add(scenario_descriptor_bytes))
+            .ok_or_else(|| invalid("metrics-only total device bytes overflow u64"))?;
+        Ok(Self {
+            scenario_count,
+            month_capacity,
+            metric_rows_bytes,
+            monthly_pnls_bytes,
+            month_start_equities_bytes,
+            scenario_descriptor_bytes,
+            total_device_bytes,
+            outcome_bytes: 0,
+            accepted_trade_total_bytes: 0,
+        })
+    }
+
+    pub const fn scenario_count(self) -> u64 {
+        self.scenario_count
+    }
+
+    pub const fn month_capacity(self) -> u64 {
+        self.month_capacity
+    }
+
+    pub const fn metric_rows_bytes(self) -> u64 {
+        self.metric_rows_bytes
+    }
+
+    pub const fn monthly_pnls_bytes(self) -> u64 {
+        self.monthly_pnls_bytes
+    }
+
+    pub const fn month_start_equities_bytes(self) -> u64 {
+        self.month_start_equities_bytes
+    }
+
+    pub const fn scenario_descriptor_bytes(self) -> u64 {
+        self.scenario_descriptor_bytes
+    }
+
+    pub const fn total_device_bytes(self) -> u64 {
+        self.total_device_bytes
+    }
+
+    pub const fn outcome_bytes(self) -> u64 {
+        self.outcome_bytes
+    }
+
+    pub const fn accepted_trade_total_bytes(self) -> u64 {
+        self.accepted_trade_total_bytes
+    }
+}
+
 #[repr(C)]
 struct RawDatasetView {
     header: DatasetHeader,
     close: *const f64,
     high: *const f64,
     low: *const f64,
-    indicators: *const f32,
+    indicators: *const f64,
     months: *const i64,
     days: *const i64,
     timestamps: *const i64,
     smc_rows: *const i8,
+    adaptive_base_pips: *const f64,
+    adaptive_base_pips_len: usize,
+}
+
+#[repr(C)]
+struct RawParentDatasetV1 {
+    header: DatasetHeader,
+    close: *const f64,
+    high: *const f64,
+    low: *const f64,
+    indicators_feature_major: *const f64,
+    months: *const i64,
+    days: *const i64,
+    timestamps: *const i64,
+    smc_rows: *const i8,
+}
+
+/// Crate-private immediate FFI view of one already-sealed V3 resident store.
+/// Every pointer is derived from a gpu-cuda-owned allocation and is retained by
+/// `ResidentFeatureStoreImportV3`; no caller can construct this descriptor.
+#[repr(C)]
+#[cfg(feature = "cuda")]
+pub(crate) struct RawResidentFeatureStoreBindV3 {
+    pub(crate) abi_version: u32,
+    pub(crate) selected_device_ordinal: u32,
+    pub(crate) row_count: u64,
+    pub(crate) feature_count: u32,
+    pub(crate) smc_slots: u32,
+    pub(crate) compute_capability_major: u16,
+    pub(crate) compute_capability_minor: u16,
+    pub(crate) reserved: u32,
+    pub(crate) packed_validity_bytes: u64,
+    pub(crate) close: *const f64,
+    pub(crate) high: *const f64,
+    pub(crate) low: *const f64,
+    pub(crate) indicators_bar_major: *const f64,
+    pub(crate) indicators_validity_u4: *const u8,
+    pub(crate) months: *const i64,
+    pub(crate) days: *const i64,
+    pub(crate) timestamps: *const i64,
+    pub(crate) smc_rows: *const i8,
+    pub(crate) admitted_primary_context: *mut c_void,
+    pub(crate) admitted_run_stream: *mut c_void,
+    pub(crate) ready_event: *mut c_void,
+    pub(crate) device_uuid: [u8; 16],
+    pub(crate) admission_identity_sha256: [u8; 32],
+    pub(crate) canonical_content_merkle: [u8; 32],
+}
+
+#[repr(C)]
+struct RawEvaluationViewV1 {
+    abi_version: u32,
+    view_kind: u32,
+    parent_row_count: u64,
+    range_start: u64,
+    row_count: u64,
+    ordered_indices: *const u64,
+    ordered_index_count: usize,
+    timestamp_mode: u32,
     adaptive_base_pips: *const f64,
     adaptive_base_pips_len: usize,
 }
@@ -300,14 +917,14 @@ struct RawGeneView {
     count: usize,
     offsets: *const i32,
     indices: *const i32,
-    weights: *const f32,
+    weights: *const f64,
     term_count: usize,
     stop_pips: *const f64,
     target_pips: *const f64,
     stop_vol_multipliers: *const f64,
     smc_flags: *const i8,
-    smc_weights: *const f32,
-    gate_threshold: f32,
+    smc_weights: *const f64,
+    gate_threshold: f64,
     smc_gate_disabled: u32,
 }
 
@@ -332,6 +949,332 @@ struct RawDiagnosticReadback {
     written: *mut usize,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RawResidentPopulationMetricsHandleV1 {
+    abi_version: u32,
+    reserved: u32,
+    event_id: u64,
+    scenario_count: u64,
+    month_capacity: u64,
+    metric_rows_bytes: u64,
+    monthly_pnls_bytes: u64,
+    month_start_equities_bytes: u64,
+    scenario_descriptor_bytes: u64,
+    total_device_bytes: u64,
+    outcome_bytes: u64,
+    accepted_trade_total_bytes: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct RawTerminalCompactPopulationResultV1 {
+    abi_version: u32,
+    reserved: u32,
+    event_id: u64,
+    scenario_count: u64,
+    metric_row: NeoPopulationMetricRow,
+    terminal_synchronization_count: u64,
+    terminal_readback_count: u64,
+    terminal_readback_rows: u64,
+    terminal_readback_bytes: u64,
+}
+
+fn validate_exact_resident_receipt_v1(
+    receipt: &RawResidentPopulationMetricsHandleV1,
+    plan: PopulationMetricsOnlyPlanV1,
+) -> Result<(), CudaPopulationError> {
+    let exact = receipt.abi_version == ABI_VERSION
+        && receipt.reserved == 0
+        && receipt.event_id != 0
+        && receipt.scenario_count == plan.scenario_count()
+        && receipt.month_capacity == plan.month_capacity()
+        && receipt.metric_rows_bytes == plan.metric_rows_bytes()
+        && receipt.monthly_pnls_bytes == plan.monthly_pnls_bytes()
+        && receipt.month_start_equities_bytes == plan.month_start_equities_bytes()
+        && receipt.scenario_descriptor_bytes == plan.scenario_descriptor_bytes()
+        && receipt.total_device_bytes == plan.total_device_bytes()
+        && receipt.outcome_bytes == plan.outcome_bytes()
+        && receipt.accepted_trade_total_bytes == plan.accepted_trade_total_bytes();
+    if !exact {
+        return Err(invalid(format!(
+            "native resident metrics receipt does not match the exact checked plan: \
+             receipt={receipt:?}, plan={plan:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn hash_length_v1(hasher: &mut Sha256, length: usize) {
+    hasher.update((length as u128).to_le_bytes());
+}
+
+fn hash_f64_v1(hasher: &mut Sha256, value: f64) {
+    hasher.update(value.to_bits().to_le_bytes());
+}
+
+#[cfg(feature = "cuda")]
+fn hash_resident_population_session_identity_v3(
+    resident: &RawResidentFeatureStoreBindV3,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.population.resident-session.v3");
+    hasher.update(resident.selected_device_ordinal.to_le_bytes());
+    hasher.update(resident.row_count.to_le_bytes());
+    hasher.update(resident.feature_count.to_le_bytes());
+    hasher.update(resident.smc_slots.to_le_bytes());
+    hasher.update(resident.compute_capability_major.to_le_bytes());
+    hasher.update(resident.compute_capability_minor.to_le_bytes());
+    hasher.update(resident.device_uuid);
+    hasher.update(resident.admission_identity_sha256);
+    hasher.update(resident.canonical_content_merkle);
+    hasher.finalize().into()
+}
+
+#[cfg(feature = "cuda")]
+fn hash_native_build_identity_v3(resident: &RawResidentFeatureStoreBindV3) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.population.native-build-binding.v3");
+    // The one-shot admission identity already seals the exact gpu-cuda artifact,
+    // NVCC/SASS target, driver/context API versions and math authority. Device
+    // identity is repeated here so this build binding cannot be detached from
+    // the card on which the native session was admitted.
+    hasher.update(resident.admission_identity_sha256);
+    hasher.update(resident.device_uuid);
+    hasher.update(resident.compute_capability_major.to_le_bytes());
+    hasher.update(resident.compute_capability_minor.to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn hash_population_view_identity_v1(view: &PopulationEvaluationViewV1) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.population.view.v1");
+    hash_length_v1(&mut hasher, view.parent_row_count);
+    hasher.update([match view.kind {
+        PopulationViewKindV1::Full => 0,
+        PopulationViewKindV1::ContiguousRange => 1,
+        PopulationViewKindV1::OrderedIndices => 2,
+    }]);
+    if let Some(range) = &view.range {
+        hasher.update([1]);
+        hash_length_v1(&mut hasher, range.start);
+        hash_length_v1(&mut hasher, range.end);
+    } else {
+        hasher.update([0]);
+    }
+    if let Some(indices) = &view.ordered_indices {
+        hasher.update([1]);
+        hash_length_v1(&mut hasher, indices.len());
+        for index in indices.iter() {
+            hasher.update(index.to_le_bytes());
+        }
+    } else {
+        hasher.update([0]);
+    }
+    hasher.update([match view.timestamp_mode {
+        PopulationTimestampModeV1::Canonical => 0,
+        PopulationTimestampModeV1::DisabledIndexDelta => 1,
+    }]);
+    if let Some(values) = &view.adaptive_base_pips {
+        hasher.update([1]);
+        hash_length_v1(&mut hasher, values.len());
+        for value in values.iter().copied() {
+            hash_f64_v1(&mut hasher, value);
+        }
+    } else {
+        hasher.update([0]);
+    }
+    hasher.finalize().into()
+}
+
+fn hash_population_gene_batch_identity_v1(genes: &PopulationGeneView<'_>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.population.gene-batch.v1");
+    hash_length_v1(&mut hasher, genes.descriptors.len());
+    for descriptor in genes.descriptors {
+        hasher.update(descriptor.candidate_id.to_le_bytes());
+        hasher.update(descriptor.term_offset.to_le_bytes());
+        hasher.update(descriptor.term_count.to_le_bytes());
+        hash_f64_v1(&mut hasher, descriptor.long_threshold);
+        hash_f64_v1(&mut hasher, descriptor.short_threshold);
+        hasher.update(descriptor.stop_ticks.to_le_bytes());
+        hasher.update(descriptor.target_ticks.to_le_bytes());
+        hash_f64_v1(&mut hasher, descriptor.stop_vol_multiplier);
+        hasher.update(descriptor.flags.to_le_bytes());
+        hasher.update(descriptor.reserved.to_le_bytes());
+    }
+    hash_length_v1(&mut hasher, genes.offsets.len());
+    for value in genes.offsets {
+        hasher.update(value.to_le_bytes());
+    }
+    hash_length_v1(&mut hasher, genes.indices.len());
+    for value in genes.indices {
+        hasher.update(value.to_le_bytes());
+    }
+    hash_length_v1(&mut hasher, genes.weights.len());
+    for value in genes.weights.iter().copied() {
+        hash_f64_v1(&mut hasher, value);
+    }
+    for values in [
+        genes.stop_pips,
+        genes.target_pips,
+        genes.stop_vol_multipliers,
+    ] {
+        hash_length_v1(&mut hasher, values.len());
+        for value in values.iter().copied() {
+            hash_f64_v1(&mut hasher, value);
+        }
+    }
+    hash_length_v1(&mut hasher, genes.smc_flags.len());
+    for value in genes.smc_flags {
+        hasher.update(value.to_le_bytes());
+    }
+    for value in genes.smc_weights.iter().copied() {
+        hash_f64_v1(&mut hasher, value);
+    }
+    hash_f64_v1(&mut hasher, genes.gate_threshold);
+    hasher.update([u8::from(genes.smc_gate_disabled)]);
+    hasher.finalize().into()
+}
+
+fn hash_population_scenario_batch_identity_v1(scenarios: &[ScenarioDescriptor]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.population.scenario-batch.v1");
+    hash_length_v1(&mut hasher, scenarios.len());
+    for scenario in scenarios {
+        hasher.update(scenario.base_candidate_id.to_le_bytes());
+        hasher.update(scenario.scenario_id.to_le_bytes());
+        hasher.update(scenario.rng_counter.to_le_bytes());
+        hasher.update(scenario.window_offset.to_le_bytes());
+        hasher.update(scenario.window_len.to_le_bytes());
+        hasher.update(scenario.scenario_type.to_le_bytes());
+        hasher.update(scenario.spread_ticks.to_le_bytes());
+        hasher.update(scenario.slippage_ticks.to_le_bytes());
+        hasher.update(scenario.commission_micros.to_le_bytes());
+        hasher.update(scenario.perturbation_offset.to_le_bytes());
+        hasher.update(scenario.perturbation_count.to_le_bytes());
+        hasher.update(scenario.reserved.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn hash_population_settings_identity_v1(settings: &NeoPopulationSettings) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.population.settings.v1");
+    for value in [
+        settings.abi_version,
+        settings.flags,
+        settings.max_hold_bars,
+        settings.min_hold_bars,
+        settings.max_trades_per_day,
+        settings.month_capacity,
+    ] {
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.update(settings.gap_threshold_ms.to_le_bytes());
+    for value in [
+        settings.initial_equity,
+        settings.pip_value,
+        settings.spread_pips,
+        settings.commission_per_trade,
+        settings.pip_value_per_lot,
+        settings.swap_long_pips_per_day,
+        settings.swap_short_pips_per_day,
+        settings.pnl_conversion_fee_rate,
+        settings.risk_per_trade_min,
+        settings.risk_per_trade_max,
+        settings.high_quality_confidence,
+        settings.adaptive_rr,
+    ] {
+        hash_f64_v1(&mut hasher, value);
+    }
+    hasher.update(settings.trailing_enabled.to_le_bytes());
+    hasher.update(settings._trailing_pad.to_le_bytes());
+    for value in [
+        settings.trailing_atr_multiplier,
+        settings.trailing_be_trigger_r,
+        settings.trailing_min_lock_pips,
+        settings.spread_pips_asian,
+        settings.spread_pips_overlap,
+        settings.spread_pips_late_ny,
+    ] {
+        hash_f64_v1(&mut hasher, value);
+    }
+    hasher.finalize().into()
+}
+
+fn validate_terminal_compact_result_v1(
+    raw: &RawTerminalCompactPopulationResultV1,
+    expected_event_id: u64,
+    expected_candidate_id: u64,
+    expected_scenario_id: u64,
+) -> Result<(), CudaPopulationError> {
+    let exact = raw.abi_version == ABI_VERSION
+        && raw.reserved == 0
+        && raw.event_id == expected_event_id
+        && raw.scenario_count == 1
+        && raw.metric_row.candidate_id == expected_candidate_id
+        && raw.metric_row.scenario_id == expected_scenario_id
+        && raw.metric_row.values.iter().all(|value| value.is_finite())
+        && raw.terminal_synchronization_count == 1
+        && raw.terminal_readback_count == 1
+        && raw.terminal_readback_rows == 1
+        && raw.terminal_readback_bytes == POPULATION_METRIC_ROW_BYTES_V1;
+    if !exact {
+        return Err(invalid(format!(
+            "native terminal compact result violated its sealed one-row contract: {raw:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn hash_terminal_compact_result_receipt_v1(
+    raw: &RawTerminalCompactPopulationResultV1,
+    resident_session_identity_sha256: [u8; 32],
+    view_identity_sha256: [u8; 32],
+    gene_batch_identity_sha256: [u8; 32],
+    scenario_batch_identity_sha256: [u8; 32],
+    settings_identity_sha256: [u8; 32],
+    native_build_identity_sha256: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.population.terminal-compact-result.v1");
+    hasher.update(resident_session_identity_sha256);
+    hasher.update(view_identity_sha256);
+    hasher.update(gene_batch_identity_sha256);
+    hasher.update(scenario_batch_identity_sha256);
+    hasher.update(settings_identity_sha256);
+    hasher.update(native_build_identity_sha256);
+    hasher.update(raw.event_id.to_le_bytes());
+    hasher.update(raw.scenario_count.to_le_bytes());
+    hasher.update(raw.metric_row.candidate_id.to_le_bytes());
+    hasher.update(raw.metric_row.scenario_id.to_le_bytes());
+    for value in raw.metric_row.values {
+        hash_f64_v1(&mut hasher, value);
+    }
+    hasher.update(raw.terminal_synchronization_count.to_le_bytes());
+    hasher.update(raw.terminal_readback_count.to_le_bytes());
+    hasher.update(raw.terminal_readback_rows.to_le_bytes());
+    hasher.update(raw.terminal_readback_bytes.to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn strict_enqueue_failure_is_known_prelaunch_v1(status: i32) -> bool {
+    matches!(
+        status,
+        STATUS_UNSUPPORTED
+            | STATUS_NULL_SESSION
+            | STATUS_ABI_MISMATCH
+            | STATUS_INVALID_ARGUMENT
+            | STATUS_DEVICE_UNAVAILABLE
+            | STATUS_ALLOCATION_FAILED
+            | STATUS_MISSING_UPLOAD
+            | STATUS_DATASET_REUPLOAD
+            | STATUS_WORKSPACE_MODE_MISMATCH
+            | STATUS_WORKSPACE_PLAN_MISMATCH
+    )
+}
+
 unsafe extern "C" {
     fn neoethos_gpu_cuda_population_create(
         abi_version: u32,
@@ -343,6 +1286,27 @@ unsafe extern "C" {
         session: *mut c_void,
         dataset: *const RawDatasetView,
     ) -> i32;
+    fn neoethos_gpu_cuda_population_upload_parent_v1(
+        session: *mut c_void,
+        parent: *const RawParentDatasetV1,
+    ) -> i32;
+    #[cfg(feature = "cuda")]
+    fn neoethos_gpu_cuda_population_bind_resident_feature_store_v3(
+        resident: *const RawResidentFeatureStoreBindV3,
+        status: *mut i32,
+    ) -> *mut c_void;
+    fn neoethos_gpu_cuda_population_bind_view_v1(
+        session: *mut c_void,
+        view: *const RawEvaluationViewV1,
+    ) -> i32;
+    fn neoethos_gpu_cuda_population_read_residency_counters_v1(
+        session: *mut c_void,
+        counters: *mut PopulationResidencyCountersV1,
+    ) -> i32;
+    fn neoethos_gpu_cuda_population_read_device_identity_v1(
+        session: *mut c_void,
+        identity: *mut CudaPopulationDeviceIdentityV1,
+    ) -> i32;
     fn neoethos_gpu_cuda_population_upload_genes(
         session: *mut c_void,
         genes: *const RawGeneView,
@@ -350,6 +1314,17 @@ unsafe extern "C" {
     fn neoethos_gpu_cuda_population_upload_scenarios(
         session: *mut c_void,
         scenarios: *const RawScenarioView,
+    ) -> i32;
+    fn neoethos_gpu_cuda_population_b_enqueue_metrics_only_v1(
+        session: *mut c_void,
+        settings: *const NeoPopulationSettings,
+        resident_metrics: *mut RawResidentPopulationMetricsHandleV1,
+        counters: *mut NeoPopulationCounters,
+    ) -> i32;
+    fn neoethos_gpu_cuda_population_consume_terminal_compact_result_v1(
+        session: *mut c_void,
+        resident_metrics: *const RawResidentPopulationMetricsHandleV1,
+        compact_result: *mut RawTerminalCompactPopulationResultV1,
     ) -> i32;
     fn neoethos_gpu_cuda_population_b_evaluate(
         session: *mut c_void,
@@ -367,6 +1342,20 @@ unsafe extern "C" {
         readback: *mut RawDiagnosticReadback,
     ) -> i32;
     fn neoethos_gpu_cuda_population_destroy(session: *mut c_void);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrictResidentSessionStateV1 {
+    StrictIdle,
+    InFlight,
+    Poisoned,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopulationSessionDropPolicyV3 {
+    DestroyWhenIdle,
+    LeakUntilResidentConsumerEvent,
 }
 
 /// Owns exactly one native CUDA population session.
@@ -390,9 +1379,240 @@ pub struct PopulationSession {
     scenarios_uploaded: bool,
     pending_event: Option<u64>,
     metrics_ready: bool,
+    strict_resident_state: StrictResidentSessionStateV1,
+    #[cfg(feature = "cuda")]
+    drop_policy_v3: PopulationSessionDropPolicyV3,
+    parent_source_v1: Option<PopulationParentDatasetV1>,
+    resident_parent_shape_v3: Option<(usize, usize)>,
+    bound_view_source_v1: Option<PopulationEvaluationViewV1>,
+    resident_session_identity_sha256: Option<[u8; 32]>,
+    native_build_identity_sha256: Option<[u8; 32]>,
+    view_identity_sha256: Option<[u8; 32]>,
+    gene_batch_identity_sha256: Option<[u8; 32]>,
+    scenario_batch_identity_sha256: Option<[u8; 32]>,
+    uploaded_candidate_ids: Vec<u64>,
+    terminal_scenario_identity: Option<(u64, u64)>,
+}
+
+/// Opaque evidence for the one bounded host-visible metric row that terminates
+/// the current one-scenario strict resident V1 seam. Every authority field is
+/// derived from the already-sealed session and exact uploaded inputs.
+#[derive(Debug, PartialEq)]
+pub struct TerminalCompactPopulationResultReceiptV1 {
+    metric_row: NeoPopulationMetricRow,
+    resident_session_identity_sha256: [u8; 32],
+    view_identity_sha256: [u8; 32],
+    gene_batch_identity_sha256: [u8; 32],
+    scenario_batch_identity_sha256: [u8; 32],
+    settings_identity_sha256: [u8; 32],
+    native_build_identity_sha256: [u8; 32],
+    event_id: u64,
+    scenario_count: u64,
+    terminal_synchronization_count: u64,
+    terminal_readback_count: u64,
+    terminal_readback_rows: u64,
+    terminal_readback_bytes: u64,
+    receipt_identity_sha256: [u8; 32],
+}
+
+impl TerminalCompactPopulationResultReceiptV1 {
+    pub const fn metric_row(&self) -> &NeoPopulationMetricRow {
+        &self.metric_row
+    }
+
+    pub const fn resident_session_identity_sha256(&self) -> [u8; 32] {
+        self.resident_session_identity_sha256
+    }
+
+    pub const fn view_identity_sha256(&self) -> [u8; 32] {
+        self.view_identity_sha256
+    }
+
+    pub const fn gene_batch_identity_sha256(&self) -> [u8; 32] {
+        self.gene_batch_identity_sha256
+    }
+
+    pub const fn scenario_batch_identity_sha256(&self) -> [u8; 32] {
+        self.scenario_batch_identity_sha256
+    }
+
+    pub const fn settings_identity_sha256(&self) -> [u8; 32] {
+        self.settings_identity_sha256
+    }
+
+    pub const fn native_build_identity_sha256(&self) -> [u8; 32] {
+        self.native_build_identity_sha256
+    }
+
+    pub const fn event_id(&self) -> u64 {
+        self.event_id
+    }
+
+    pub const fn scenario_count(&self) -> u64 {
+        self.scenario_count
+    }
+
+    pub const fn terminal_synchronization_count(&self) -> u64 {
+        self.terminal_synchronization_count
+    }
+
+    pub const fn terminal_readback_count(&self) -> u64 {
+        self.terminal_readback_count
+    }
+
+    pub const fn terminal_readback_rows(&self) -> u64 {
+        self.terminal_readback_rows
+    }
+
+    pub const fn terminal_readback_bytes(&self) -> u64 {
+        self.terminal_readback_bytes
+    }
+
+    pub const fn receipt_identity_sha256(&self) -> [u8; 32] {
+        self.receipt_identity_sha256
+    }
+}
+
+#[must_use = "resident GPU metrics must be consumed by the next device stage"]
+pub struct ResidentPopulationMetricsV1<'session> {
+    session: &'session mut PopulationSession,
+    receipt: RawResidentPopulationMetricsHandleV1,
+    plan: PopulationMetricsOnlyPlanV1,
+    resident_session_identity_sha256: Option<[u8; 32]>,
+    view_identity_sha256: Option<[u8; 32]>,
+    gene_batch_identity_sha256: Option<[u8; 32]>,
+    scenario_batch_identity_sha256: Option<[u8; 32]>,
+    settings_identity_sha256: [u8; 32],
+    native_build_identity_sha256: Option<[u8; 32]>,
+    terminal_scenario_identity: Option<(u64, u64)>,
+    consumed: bool,
+}
+
+impl ResidentPopulationMetricsV1<'_> {
+    pub const fn plan(&self) -> PopulationMetricsOnlyPlanV1 {
+        self.plan
+    }
+
+    pub fn selected_device_ordinal(&self) -> i32 {
+        self.session.device()
+    }
+
+    pub const fn resident_device_bytes(&self) -> u64 {
+        self.receipt.total_device_bytes
+    }
+
+    pub fn consume_terminal_compact_result_v1(
+        mut self,
+    ) -> Result<TerminalCompactPopulationResultReceiptV1, CudaPopulationError> {
+        if self.plan.scenario_count() != 1 {
+            self.session.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            return Err(invalid(
+                "terminal compact-result V1 requires exactly one resident scenario",
+            ));
+        }
+        let (
+            Some(resident_session_identity_sha256),
+            Some(view_identity_sha256),
+            Some(gene_batch_identity_sha256),
+            Some(scenario_batch_identity_sha256),
+            Some(native_build_identity_sha256),
+            Some((expected_candidate_id, expected_scenario_id)),
+        ) = (
+            self.resident_session_identity_sha256,
+            self.view_identity_sha256,
+            self.gene_batch_identity_sha256,
+            self.scenario_batch_identity_sha256,
+            self.native_build_identity_sha256,
+            self.terminal_scenario_identity,
+        )
+        else {
+            self.session.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            return Err(invalid(
+                "terminal compact-result V1 requires sealed resident session, view, gene, scenario and build identities",
+            ));
+        };
+        let mut raw = RawTerminalCompactPopulationResultV1::default();
+        // SAFETY: both fixed-width values are live for the duration of the call;
+        // the native function synchronizes the already-recorded event and
+        // copies exactly one metric row before returning.
+        let status = unsafe {
+            neoethos_gpu_cuda_population_consume_terminal_compact_result_v1(
+                self.session.handle,
+                &self.receipt,
+                &mut raw,
+            )
+        };
+        if status != STATUS_OK {
+            self.session.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            return Err(CudaPopulationError::native(
+                "consume_terminal_compact_result_v1",
+                status,
+            ));
+        }
+        if let Err(error) = validate_terminal_compact_result_v1(
+            &raw,
+            self.receipt.event_id,
+            expected_candidate_id,
+            expected_scenario_id,
+        ) {
+            self.session.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            return Err(error);
+        }
+        self.session.strict_resident_state = StrictResidentSessionStateV1::StrictIdle;
+        self.session.pending_event = None;
+        self.session.metrics_ready = false;
+        self.consumed = true;
+        let receipt_identity_sha256 = hash_terminal_compact_result_receipt_v1(
+            &raw,
+            resident_session_identity_sha256,
+            view_identity_sha256,
+            gene_batch_identity_sha256,
+            scenario_batch_identity_sha256,
+            self.settings_identity_sha256,
+            native_build_identity_sha256,
+        );
+        Ok(TerminalCompactPopulationResultReceiptV1 {
+            metric_row: raw.metric_row,
+            resident_session_identity_sha256,
+            view_identity_sha256,
+            gene_batch_identity_sha256,
+            scenario_batch_identity_sha256,
+            settings_identity_sha256: self.settings_identity_sha256,
+            native_build_identity_sha256,
+            event_id: raw.event_id,
+            scenario_count: raw.scenario_count,
+            terminal_synchronization_count: raw.terminal_synchronization_count,
+            terminal_readback_count: raw.terminal_readback_count,
+            terminal_readback_rows: raw.terminal_readback_rows,
+            terminal_readback_bytes: raw.terminal_readback_bytes,
+            receipt_identity_sha256,
+        })
+    }
+}
+
+impl Drop for ResidentPopulationMetricsV1<'_> {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.session.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+        }
+    }
 }
 
 impl PopulationSession {
+    fn require_strict_idle_v1(&self, operation: &'static str) -> Result<(), CudaPopulationError> {
+        match self.strict_resident_state {
+            StrictResidentSessionStateV1::StrictIdle => Ok(()),
+            StrictResidentSessionStateV1::InFlight => Err(CudaPopulationError::native(
+                operation,
+                STATUS_STRICT_RESIDENT_IN_FLIGHT,
+            )),
+            StrictResidentSessionStateV1::Poisoned => Err(CudaPopulationError::native(
+                operation,
+                STATUS_STRICT_RESIDENT_POISONED,
+            )),
+        }
+    }
+
     pub fn create(device: i32, max_events: usize) -> Result<Self, CudaPopulationError> {
         if max_events == 0 {
             return Err(invalid("max_events must be non-zero"));
@@ -423,7 +1643,129 @@ impl PopulationSession {
             scenarios_uploaded: false,
             pending_event: None,
             metrics_ready: false,
+            strict_resident_state: StrictResidentSessionStateV1::StrictIdle,
+            #[cfg(feature = "cuda")]
+            drop_policy_v3: PopulationSessionDropPolicyV3::DestroyWhenIdle,
+            parent_source_v1: None,
+            resident_parent_shape_v3: None,
+            bound_view_source_v1: None,
+            resident_session_identity_sha256: None,
+            native_build_identity_sha256: None,
+            view_identity_sha256: None,
+            gene_batch_identity_sha256: None,
+            scenario_batch_identity_sha256: None,
+            uploaded_candidate_ids: Vec::new(),
+            terminal_scenario_identity: None,
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn bind_resident_feature_store_v3(
+        resident: RawResidentFeatureStoreBindV3,
+    ) -> Result<Self, CudaPopulationError> {
+        let device = i32::try_from(resident.selected_device_ordinal)
+            .map_err(|_| invalid("resident device ordinal does not fit the native i32 ABI"))?;
+        let rows = usize::try_from(resident.row_count)
+            .map_err(|_| invalid("resident row count does not fit usize"))?;
+        let feature_count = usize::try_from(resident.feature_count)
+            .map_err(|_| invalid("resident feature count does not fit usize"))?;
+        if rows == 0 || feature_count == 0 || resident.smc_slots != SMC_SLOTS as u32 {
+            return Err(invalid(
+                "resident population bind requires non-zero rows/features and exact SMC slots",
+            ));
+        }
+        let resident_session_identity_sha256 =
+            hash_resident_population_session_identity_v3(&resident);
+        let native_build_identity_sha256 = hash_native_build_identity_v3(&resident);
+        let mut status = STATUS_OK;
+        // SAFETY: the opaque resident import retains every allocation, event,
+        // context and stream represented by this immediate descriptor. Native
+        // code retains only device pointers while the Rust wrapper retains the
+        // import for the complete session lifetime.
+        let handle = unsafe {
+            neoethos_gpu_cuda_population_bind_resident_feature_store_v3(&resident, &mut status)
+        };
+        if handle.is_null() {
+            return Err(CudaPopulationError::native(
+                "bind_resident_feature_store_v3",
+                status,
+            ));
+        }
+        Ok(Self {
+            handle,
+            device,
+            // The native population event-capacity parameter is vestigial and
+            // the V3 bind does not fabricate a compatibility-only value.
+            max_events: 0,
+            bars: 0,
+            feature_count,
+            population: 0,
+            scenario_count: 0,
+            emitted_events: 0,
+            dataset_uploaded: true,
+            genes_uploaded: false,
+            scenarios_uploaded: false,
+            pending_event: None,
+            metrics_ready: false,
+            strict_resident_state: StrictResidentSessionStateV1::StrictIdle,
+            drop_policy_v3: PopulationSessionDropPolicyV3::LeakUntilResidentConsumerEvent,
+            parent_source_v1: None,
+            resident_parent_shape_v3: Some((rows, feature_count)),
+            bound_view_source_v1: None,
+            resident_session_identity_sha256: Some(resident_session_identity_sha256),
+            native_build_identity_sha256: Some(native_build_identity_sha256),
+            view_identity_sha256: None,
+            gene_batch_identity_sha256: None,
+            scenario_batch_identity_sha256: None,
+            uploaded_candidate_ids: Vec::new(),
+            terminal_scenario_identity: None,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn arm_resident_session_leak_only_v3(&mut self) {
+        self.drop_policy_v3 = PopulationSessionDropPolicyV3::LeakUntilResidentConsumerEvent;
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn authorize_resident_session_destroy_v3(&mut self) {
+        self.drop_policy_v3 = PopulationSessionDropPolicyV3::DestroyWhenIdle;
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn take_for_resident_consumer_lease_v3(&mut self) -> Self {
+        std::mem::replace(self, Self::detached_resident_v3())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn detached_resident_v3() -> Self {
+        Self {
+            handle: std::ptr::null_mut(),
+            device: -1,
+            max_events: 0,
+            bars: 0,
+            feature_count: 0,
+            population: 0,
+            scenario_count: 0,
+            emitted_events: 0,
+            dataset_uploaded: false,
+            genes_uploaded: false,
+            scenarios_uploaded: false,
+            pending_event: None,
+            metrics_ready: false,
+            strict_resident_state: StrictResidentSessionStateV1::Poisoned,
+            drop_policy_v3: PopulationSessionDropPolicyV3::LeakUntilResidentConsumerEvent,
+            parent_source_v1: None,
+            resident_parent_shape_v3: None,
+            bound_view_source_v1: None,
+            resident_session_identity_sha256: None,
+            native_build_identity_sha256: None,
+            view_identity_sha256: None,
+            gene_batch_identity_sha256: None,
+            scenario_batch_identity_sha256: None,
+            uploaded_candidate_ids: Vec::new(),
+            terminal_scenario_identity: None,
+        }
     }
 
     pub fn device(&self) -> i32 {
@@ -456,6 +1798,10 @@ impl PopulationSession {
         &mut self,
         dataset: PopulationDatasetView<'_>,
     ) -> Result<(), CudaPopulationError> {
+        self.require_strict_idle_v1("upload_dataset")?;
+        // compatibility-only V0 upload. Production Search uses the sealed V1
+        // parent plus explicit view binding below; this function remains until
+        // real-card parity authorizes removal of the old ABI.
         if self.dataset_uploaded {
             return Err(CudaPopulationError::native(
                 "upload_dataset",
@@ -496,10 +1842,192 @@ impl PopulationSession {
         Ok(())
     }
 
+    pub fn upload_parent_dataset_v1(
+        &mut self,
+        parent: PopulationParentDatasetV1,
+    ) -> Result<(), CudaPopulationError> {
+        self.require_strict_idle_v1("upload_parent_dataset_v1")?;
+        if self.dataset_uploaded || self.parent_source_v1.is_some() {
+            return Err(CudaPopulationError::native(
+                "upload_parent_dataset_v1",
+                STATUS_DATASET_REUPLOAD,
+            ));
+        }
+        let rows = parent.row_count();
+        let row_count = u64::try_from(rows)
+            .map_err(|_| invalid("parent row count does not fit the native u64 contract"))?;
+        let feature_count = u32::try_from(parent.feature_count)
+            .map_err(|_| invalid("parent feature count does not fit the native u32 contract"))?;
+        // Retain every asynchronous H2D source before entering native code. If
+        // the native call fails after partially enqueueing transfers, the
+        // buffers stay alive until this session is destroyed; retry is refused
+        // above rather than reusing a partially populated device parent.
+        self.parent_source_v1 = Some(parent);
+        let parent = self
+            .parent_source_v1
+            .as_ref()
+            .ok_or_else(|| invalid("retained parent dataset is missing"))?;
+        let header = DatasetHeader {
+            abi_version: ABI_VERSION,
+            row_count,
+            feature_count,
+            ..DatasetHeader::default()
+        };
+        let raw = RawParentDatasetV1 {
+            header,
+            close: parent.close.as_ptr(),
+            high: parent.high.as_ptr(),
+            low: parent.low.as_ptr(),
+            indicators_feature_major: parent.indicators_feature_major.as_ptr(),
+            months: parent.months.as_ptr(),
+            days: parent.days.as_ptr(),
+            timestamps: parent.timestamps.as_ptr(),
+            smc_rows: parent.smc_rows.as_ptr(),
+        };
+        // SAFETY: validation occurred in the only public constructor. The Arc
+        // allocations are retained in `parent_source_v1` for the lifetime of
+        // every asynchronous transfer submitted by the native session.
+        let status = unsafe { neoethos_gpu_cuda_population_upload_parent_v1(self.handle, &raw) };
+        if status != STATUS_OK {
+            return Err(CudaPopulationError::native(
+                "upload_parent_dataset_v1",
+                status,
+            ));
+        }
+        self.bars = rows;
+        self.feature_count = parent.feature_count;
+        self.dataset_uploaded = true;
+        Ok(())
+    }
+
+    pub fn bind_evaluation_view_v1(
+        &mut self,
+        view: PopulationEvaluationViewV1,
+    ) -> Result<(), CudaPopulationError> {
+        self.require_strict_idle_v1("bind_evaluation_view_v1")?;
+        let resident_parent_rows = self.resident_parent_shape_v3.map(|(rows, _)| rows);
+        let parent_rows = self
+            .parent_source_v1
+            .as_ref()
+            .map(PopulationParentDatasetV1::row_count)
+            .or(resident_parent_rows)
+            .ok_or_else(|| {
+                CudaPopulationError::native("bind_evaluation_view_v1", STATUS_MISSING_UPLOAD)
+            })?;
+        if view.parent_row_count != parent_rows {
+            return Err(invalid(format!(
+                "population view parent has {} rows; uploaded parent has {}",
+                view.parent_row_count, parent_rows
+            )));
+        }
+        let view_identity_sha256 = hash_population_view_identity_v1(&view);
+        let parent_row_count = u64::try_from(view.parent_row_count)
+            .map_err(|_| invalid("view parent row count does not fit the native u64 contract"))?;
+        let row_count = u64::try_from(view.row_count())
+            .map_err(|_| invalid("view row count does not fit the native u64 contract"))?;
+        let (view_kind, range_start) = match view.kind {
+            PopulationViewKindV1::Full => (0, 0),
+            PopulationViewKindV1::ContiguousRange => {
+                let start = view
+                    .range
+                    .as_ref()
+                    .ok_or_else(|| invalid("validated range view lost its range"))?
+                    .start;
+                let start = u64::try_from(start).map_err(|_| {
+                    invalid("view range start does not fit the native u64 contract")
+                })?;
+                (1, start)
+            }
+            PopulationViewKindV1::OrderedIndices => (2, 0),
+        };
+        let raw = RawEvaluationViewV1 {
+            abi_version: ABI_VERSION,
+            view_kind,
+            parent_row_count,
+            range_start,
+            row_count,
+            ordered_indices: view
+                .ordered_indices
+                .as_deref()
+                .map_or(std::ptr::null(), <[u64]>::as_ptr),
+            ordered_index_count: view.ordered_indices.as_deref().map_or(0, <[u64]>::len),
+            timestamp_mode: match view.timestamp_mode {
+                PopulationTimestampModeV1::Canonical => 0,
+                PopulationTimestampModeV1::DisabledIndexDelta => 1,
+            },
+            adaptive_base_pips: view
+                .adaptive_base_pips
+                .as_deref()
+                .map_or(std::ptr::null(), <[f64]>::as_ptr),
+            adaptive_base_pips_len: view.adaptive_base_pips.as_deref().map_or(0, <[f64]>::len),
+        };
+        // SAFETY: every pointer comes from a validated Arc retained below until
+        // the next bind, which native code refuses while work is incomplete.
+        let status = unsafe { neoethos_gpu_cuda_population_bind_view_v1(self.handle, &raw) };
+        if status != STATUS_OK {
+            // See the parent upload above: an error may follow accepted async
+            // copies, so retain this view's host buffers until session teardown.
+            self.bound_view_source_v1 = Some(view);
+            return Err(CudaPopulationError::native(
+                "bind_evaluation_view_v1",
+                status,
+            ));
+        }
+        self.bars = view.row_count();
+        self.bound_view_source_v1 = Some(view);
+        self.view_identity_sha256 = Some(view_identity_sha256);
+        self.scenarios_uploaded = false;
+        self.scenario_count = 0;
+        self.scenario_batch_identity_sha256 = None;
+        self.terminal_scenario_identity = None;
+        self.metrics_ready = false;
+        self.pending_event = None;
+        Ok(())
+    }
+
+    pub fn read_residency_counters_v1(
+        &self,
+    ) -> Result<PopulationResidencyCountersV1, CudaPopulationError> {
+        self.require_strict_idle_v1("read_residency_counters_v1")?;
+        let mut counters = PopulationResidencyCountersV1::default();
+        // SAFETY: `counters` is a live repr(C) out-parameter and the session is
+        // exclusively borrowed for the duration of the call.
+        let status = unsafe {
+            neoethos_gpu_cuda_population_read_residency_counters_v1(self.handle, &mut counters)
+        };
+        if status != STATUS_OK {
+            return Err(CudaPopulationError::native(
+                "read_residency_counters_v1",
+                status,
+            ));
+        }
+        Ok(counters)
+    }
+
+    pub fn read_device_identity_v1(
+        &self,
+    ) -> Result<CudaPopulationDeviceIdentityV1, CudaPopulationError> {
+        self.require_strict_idle_v1("read_device_identity_v1")?;
+        let mut identity = CudaPopulationDeviceIdentityV1::default();
+        // SAFETY: `identity` is a live repr(C) out-parameter and the session is
+        // immutably borrowed for the duration of the read.
+        let status = unsafe {
+            neoethos_gpu_cuda_population_read_device_identity_v1(self.handle, &mut identity)
+        };
+        if status != STATUS_OK {
+            return Err(CudaPopulationError::native(
+                "read_device_identity_v1",
+                status,
+            ));
+        }
+        Ok(identity)
+    }
+
     pub fn upload_genes(
         &mut self,
         genes: PopulationGeneView<'_>,
     ) -> Result<(), CudaPopulationError> {
+        self.require_strict_idle_v1("upload_genes")?;
         if !self.dataset_uploaded {
             return Err(CudaPopulationError::native(
                 "upload_genes",
@@ -507,6 +2035,12 @@ impl PopulationSession {
             ));
         }
         let population = genes.validate(self.feature_count)?;
+        let gene_batch_identity_sha256 = hash_population_gene_batch_identity_v1(&genes);
+        let uploaded_candidate_ids = genes
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.candidate_id)
+            .collect::<Vec<_>>();
         let raw = RawGeneView {
             descriptors: genes.descriptors.as_ptr(),
             count: population,
@@ -529,8 +2063,12 @@ impl PopulationSession {
         }
         self.population = population;
         self.genes_uploaded = true;
+        self.gene_batch_identity_sha256 = Some(gene_batch_identity_sha256);
+        self.uploaded_candidate_ids = uploaded_candidate_ids;
         self.scenarios_uploaded = false;
         self.scenario_count = 0;
+        self.scenario_batch_identity_sha256 = None;
+        self.terminal_scenario_identity = None;
         self.metrics_ready = false;
         self.pending_event = None;
         Ok(())
@@ -552,6 +2090,7 @@ impl PopulationSession {
         &mut self,
         scenarios: &[ScenarioDescriptor],
     ) -> Result<(), CudaPopulationError> {
+        self.require_strict_idle_v1("upload_scenarios")?;
         if !self.genes_uploaded {
             return Err(CudaPopulationError::native(
                 "upload_scenarios",
@@ -571,6 +2110,14 @@ impl PopulationSession {
                 scenario.base_candidate_id, self.population
             )));
         }
+        let scenario_batch_identity_sha256 = hash_population_scenario_batch_identity_v1(scenarios);
+        let terminal_scenario_identity = (scenarios.len() == 1).then(|| {
+            let scenario = scenarios[0];
+            (
+                self.uploaded_candidate_ids[scenario.base_candidate_id as usize],
+                scenario.scenario_id,
+            )
+        });
         let raw = RawScenarioView {
             descriptors: scenarios.as_ptr(),
             count: scenarios.len(),
@@ -582,15 +2129,94 @@ impl PopulationSession {
         }
         self.scenario_count = scenarios.len();
         self.scenarios_uploaded = true;
+        self.scenario_batch_identity_sha256 = Some(scenario_batch_identity_sha256);
+        self.terminal_scenario_identity = terminal_scenario_identity;
         self.metrics_ready = false;
         self.pending_event = None;
         Ok(())
     }
 
+    /// Enqueue the production metrics-only population walk on this session's
+    /// existing native stream. The returned owner keeps the session borrowed;
+    /// only a later resident GPU stage may consume its private event dependency.
+    pub fn enqueue_metrics_only_v1(
+        &mut self,
+        settings: &NeoPopulationSettings,
+    ) -> Result<ResidentPopulationMetricsV1<'_>, CudaPopulationError> {
+        self.require_strict_idle_v1("enqueue_metrics_only_v1")?;
+        if !self.scenarios_uploaded {
+            return Err(CudaPopulationError::native(
+                "enqueue_metrics_only_v1",
+                STATUS_MISSING_UPLOAD,
+            ));
+        }
+        if settings.month_capacity == 0 || settings.month_capacity > i32::MAX as u32 {
+            return Err(invalid(
+                "month_capacity must be non-zero and fit the native signed extent",
+            ));
+        }
+        let plan = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(
+            self.scenario_count,
+            settings.month_capacity,
+        )?;
+        let settings_identity_sha256 = hash_population_settings_identity_v1(settings);
+        let mut receipt = RawResidentPopulationMetricsHandleV1::default();
+        // SAFETY: settings and the fixed-width receipt are live POD values. The
+        // native call retains neither pointer and records work on this session's
+        // already-owned stream before returning.
+        let status = unsafe {
+            neoethos_gpu_cuda_population_b_enqueue_metrics_only_v1(
+                self.handle,
+                settings,
+                &mut receipt,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != STATUS_OK {
+            if !strict_enqueue_failure_is_known_prelaunch_v1(status) {
+                self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            }
+            return Err(CudaPopulationError::native(
+                "enqueue_metrics_only_v1",
+                status,
+            ));
+        }
+        self.strict_resident_state = StrictResidentSessionStateV1::InFlight;
+        self.emitted_events = 0;
+        self.pending_event = Some(receipt.event_id);
+        self.metrics_ready = false;
+        if let Err(error) = validate_exact_resident_receipt_v1(&receipt, plan) {
+            self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            return Err(error);
+        }
+        let resident_session_identity_sha256 = self.resident_session_identity_sha256;
+        let view_identity_sha256 = self.view_identity_sha256;
+        let gene_batch_identity_sha256 = self.gene_batch_identity_sha256;
+        let scenario_batch_identity_sha256 = self.scenario_batch_identity_sha256;
+        let native_build_identity_sha256 = self.native_build_identity_sha256;
+        let terminal_scenario_identity = self.terminal_scenario_identity;
+        Ok(ResidentPopulationMetricsV1 {
+            session: self,
+            receipt,
+            plan,
+            resident_session_identity_sha256,
+            view_identity_sha256,
+            gene_batch_identity_sha256,
+            scenario_batch_identity_sha256,
+            settings_identity_sha256,
+            native_build_identity_sha256,
+            terminal_scenario_identity,
+            consumed: false,
+        })
+    }
+
+    /// Compatibility/DeviceParityOnly. This allocates the legacy diagnostic
+    /// outcome workspace and returns a host-visible event id.
     pub fn evaluate(
         &mut self,
         settings: &NeoPopulationSettings,
     ) -> Result<(u64, NeoPopulationCounters), CudaPopulationError> {
+        self.require_strict_idle_v1("evaluate")?;
         if !self.scenarios_uploaded {
             return Err(CudaPopulationError::native(
                 "evaluate",
@@ -620,7 +2246,9 @@ impl PopulationSession {
         Ok((event_id, counters))
     }
 
+    /// Compatibility/DeviceParityOnly host synchronization.
     pub fn wait(&mut self, event_id: u64) -> Result<(), CudaPopulationError> {
+        self.require_strict_idle_v1("wait")?;
         if self.pending_event != Some(event_id) {
             return Err(CudaPopulationError::native("wait", STATUS_UNKNOWN_EVENT));
         }
@@ -633,7 +2261,9 @@ impl PopulationSession {
         Ok(())
     }
 
+    /// Compatibility/DeviceParityOnly full metric-row D2H readback.
     pub fn read_metrics(&mut self) -> Result<Vec<NeoPopulationMetricRow>, CudaPopulationError> {
+        self.require_strict_idle_v1("read_metrics")?;
         if !self.metrics_ready {
             return Err(CudaPopulationError::native(
                 "read_metrics",
@@ -678,6 +2308,7 @@ impl PopulationSession {
         &mut self,
         scenarios: usize,
     ) -> Result<PopulationDiagnostics, CudaPopulationError> {
+        self.require_strict_idle_v1("read_diagnostics_for")?;
         if !self.metrics_ready {
             return Err(CudaPopulationError::native(
                 "read_diagnostics",
@@ -727,7 +2358,9 @@ impl PopulationSession {
     /// `emitted_events` is `scenario_count * MAX_TRADES_PER_CANDIDATE`, which
     /// grew by ~100x when the scenario became the unit of work. This used to
     /// allocate two vectors of that length unconditionally.
+    /// Compatibility/DeviceParityOnly full diagnostic D2H readback.
     pub fn read_diagnostics(&mut self) -> Result<PopulationDiagnostics, CudaPopulationError> {
+        self.require_strict_idle_v1("read_diagnostics")?;
         const MAX_DIAGNOSTIC_BYTES: usize = 1 << 30;
         let bytes = self
             .emitted_events
@@ -746,6 +2379,24 @@ impl PopulationSession {
 
 impl Drop for PopulationSession {
     fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        let resident_drop_requires_leak =
+            self.drop_policy_v3 == PopulationSessionDropPolicyV3::LeakUntilResidentConsumerEvent;
+        #[cfg(not(feature = "cuda"))]
+        let resident_drop_requires_leak = false;
+        if resident_drop_requires_leak
+            || matches!(
+                self.strict_resident_state,
+                StrictResidentSessionStateV1::InFlight | StrictResidentSessionStateV1::Poisoned
+            )
+        {
+            // Fail closed: native destruction uses synchronous CUDA frees. Until
+            // a future same-stream stage atomically consumes the resident event,
+            // leaking this run-owned session is safer than freeing storage still
+            // reachable by in-flight kernels or a borrowed V3 parent.
+            self.handle = std::ptr::null_mut();
+            return;
+        }
         if !self.handle.is_null() {
             // SAFETY: the handle was produced by `create` and is destroyed once.
             unsafe { neoethos_gpu_cuda_population_destroy(self.handle) };
@@ -758,7 +2409,570 @@ impl Drop for PopulationSession {
 mod tests {
     use super::*;
 
-    fn dataset_slices() -> (Vec<f64>, Vec<f32>, Vec<i64>, Vec<i8>) {
+    fn normalize_source(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn abi_v4_contract_matches_version_layouts_and_signatures() {
+        use core::mem::{align_of, offset_of, size_of};
+        use neoethos_gpu_contracts::device::{
+            BufferRef, HandleToken, Metrics, PropFirmState, TradeOutcome,
+        };
+
+        macro_rules! layout {
+            ($ty:ty, $size:expr, $align:expr) => {
+                assert_eq!(size_of::<$ty>(), $size, "sizeof({})", stringify!($ty));
+                assert_eq!(align_of::<$ty>(), $align, "alignof({})", stringify!($ty));
+            };
+        }
+
+        assert_eq!(ABI_VERSION, 4);
+        layout!(BufferRef, 16, 8);
+        assert_eq!(offset_of!(BufferRef, len), 8);
+        layout!(HandleToken, 32, 8);
+        assert_eq!(offset_of!(HandleToken, generation), 16);
+        assert_eq!(offset_of!(HandleToken, reserved), 28);
+        layout!(DatasetHeader, 152, 8);
+        assert_eq!(offset_of!(DatasetHeader, timestamps), 24);
+        assert_eq!(offset_of!(DatasetHeader, features), 104);
+        assert_eq!(offset_of!(DatasetHeader, days), 136);
+        layout!(GeneDescriptor, 72, 8);
+        assert_eq!(offset_of!(GeneDescriptor, long_threshold), 16);
+        assert_eq!(offset_of!(GeneDescriptor, short_threshold), 24);
+        assert_eq!(offset_of!(GeneDescriptor, stop_ticks), 32);
+        assert_eq!(offset_of!(GeneDescriptor, target_ticks), 40);
+        assert_eq!(offset_of!(GeneDescriptor, stop_vol_multiplier), 48);
+        assert_eq!(offset_of!(GeneDescriptor, flags), 56);
+        assert_eq!(offset_of!(GeneDescriptor, reserved), 64);
+        layout!(ScenarioDescriptor, 72, 8);
+        assert_eq!(offset_of!(ScenarioDescriptor, window_offset), 24);
+        assert_eq!(offset_of!(ScenarioDescriptor, commission_micros), 48);
+        assert_eq!(offset_of!(ScenarioDescriptor, reserved), 64);
+        layout!(TradeOutcome, 56, 8);
+        assert_eq!(offset_of!(TradeOutcome, pnl_micros), 32);
+        assert_eq!(offset_of!(TradeOutcome, reserved), 48);
+        layout!(Metrics, 80, 8);
+        assert_eq!(offset_of!(Metrics, net_profit), 16);
+        assert_eq!(offset_of!(Metrics, trade_count), 56);
+        assert_eq!(offset_of!(Metrics, flags), 72);
+        layout!(PropFirmState, 56, 8);
+        assert_eq!(offset_of!(PropFirmState, trading_days), 48);
+        layout!(crate::CudaFirstHitEvent, 32, 8);
+        assert_eq!(offset_of!(crate::CudaFirstHitEvent, stop_price), 16);
+        assert_eq!(offset_of!(crate::CudaFirstHitEvent, target_price), 24);
+        layout!(crate::CudaFirstHitResult, 8, 4);
+        assert_eq!(offset_of!(crate::CudaFirstHitResult, exit_reason), 4);
+        layout!(NeoPopulationSettings, 184, 8);
+        assert_eq!(offset_of!(NeoPopulationSettings, gap_threshold_ms), 24);
+        assert_eq!(offset_of!(NeoPopulationSettings, adaptive_rr), 120);
+        assert_eq!(offset_of!(NeoPopulationSettings, trailing_enabled), 128);
+        assert_eq!(offset_of!(NeoPopulationSettings, spread_pips_asian), 160);
+        assert_eq!(offset_of!(NeoPopulationSettings, spread_pips_late_ny), 176);
+        layout!(NeoPopulationEvent, 56, 8);
+        assert_eq!(offset_of!(NeoPopulationEvent, direction), 24);
+        assert_eq!(offset_of!(NeoPopulationEvent, stop_price), 32);
+        assert_eq!(offset_of!(NeoPopulationEvent, entry_price), 48);
+        layout!(NeoPopulationOutcome, 72, 8);
+        assert_eq!(offset_of!(NeoPopulationOutcome, exit_bar), 16);
+        assert_eq!(offset_of!(NeoPopulationOutcome, entry_bar), 24);
+        assert_eq!(offset_of!(NeoPopulationOutcome, mfe), 32);
+        assert_eq!(offset_of!(NeoPopulationOutcome, exit_price), 48);
+        assert_eq!(offset_of!(NeoPopulationOutcome, r_multiple), 64);
+        layout!(NeoPopulationMetricRow, 104, 8);
+        assert_eq!(offset_of!(NeoPopulationMetricRow, values), 16);
+        layout!(NeoPopulationCounters, 96, 8);
+        assert_eq!(offset_of!(NeoPopulationCounters, reserved), 72);
+        layout!(RawDatasetView, 232, 8);
+        assert_eq!(offset_of!(RawDatasetView, close), 152);
+        assert_eq!(offset_of!(RawDatasetView, indicators), 176);
+        assert_eq!(offset_of!(RawDatasetView, smc_rows), 208);
+        assert_eq!(offset_of!(RawDatasetView, adaptive_base_pips_len), 224);
+        layout!(RawParentDatasetV1, 216, 8);
+        assert_eq!(
+            offset_of!(RawParentDatasetV1, indicators_feature_major),
+            176
+        );
+        assert_eq!(offset_of!(RawParentDatasetV1, smc_rows), 208);
+        #[cfg(feature = "cuda")]
+        {
+            layout!(RawResidentFeatureStoreBindV3, 216, 8);
+            assert_eq!(offset_of!(RawResidentFeatureStoreBindV3, row_count), 8);
+            assert_eq!(
+                offset_of!(RawResidentFeatureStoreBindV3, compute_capability_major),
+                24
+            );
+            assert_eq!(
+                offset_of!(RawResidentFeatureStoreBindV3, packed_validity_bytes),
+                32
+            );
+            assert_eq!(offset_of!(RawResidentFeatureStoreBindV3, close), 40);
+            assert_eq!(
+                offset_of!(RawResidentFeatureStoreBindV3, indicators_bar_major),
+                64
+            );
+            assert_eq!(
+                offset_of!(RawResidentFeatureStoreBindV3, indicators_validity_u4),
+                72
+            );
+            assert_eq!(
+                offset_of!(RawResidentFeatureStoreBindV3, admitted_primary_context),
+                112
+            );
+            assert_eq!(offset_of!(RawResidentFeatureStoreBindV3, device_uuid), 136);
+            assert_eq!(
+                offset_of!(RawResidentFeatureStoreBindV3, admission_identity_sha256),
+                152
+            );
+            assert_eq!(
+                offset_of!(RawResidentFeatureStoreBindV3, canonical_content_merkle),
+                184
+            );
+        }
+        layout!(RawEvaluationViewV1, 72, 8);
+        assert_eq!(offset_of!(RawEvaluationViewV1, ordered_indices), 32);
+        assert_eq!(offset_of!(RawEvaluationViewV1, adaptive_base_pips), 56);
+        layout!(PopulationResidencyCountersV1, 144, 8);
+        assert_eq!(
+            offset_of!(PopulationResidencyCountersV1, metric_rows_readback_count),
+            80
+        );
+        assert_eq!(
+            offset_of!(PopulationResidencyCountersV1, metric_rows_readback_rows),
+            88
+        );
+        assert_eq!(
+            offset_of!(PopulationResidencyCountersV1, metric_rows_readback_bytes),
+            96
+        );
+        assert_eq!(
+            offset_of!(PopulationResidencyCountersV1, diagnostic_readback_count),
+            104
+        );
+        assert_eq!(
+            offset_of!(PopulationResidencyCountersV1, diagnostic_readback_rows),
+            112
+        );
+        assert_eq!(
+            offset_of!(PopulationResidencyCountersV1, diagnostic_readback_bytes),
+            120
+        );
+        assert_eq!(
+            offset_of!(
+                PopulationResidencyCountersV1,
+                accepted_trade_total_readback_count
+            ),
+            128
+        );
+        assert_eq!(
+            offset_of!(
+                PopulationResidencyCountersV1,
+                accepted_trade_total_readback_bytes
+            ),
+            136
+        );
+        layout!(CudaPopulationDeviceIdentityV1, 312, 8);
+        assert_eq!(
+            offset_of!(CudaPopulationDeviceIdentityV1, total_global_memory_bytes),
+            16
+        );
+        assert_eq!(offset_of!(CudaPopulationDeviceIdentityV1, uuid), 36);
+        assert_eq!(offset_of!(CudaPopulationDeviceIdentityV1, name), 52);
+        layout!(RawGeneView, 104, 8);
+        assert_eq!(offset_of!(RawGeneView, count), 8);
+        assert_eq!(offset_of!(RawGeneView, weights), 32);
+        assert_eq!(offset_of!(RawGeneView, stop_pips), 48);
+        assert_eq!(offset_of!(RawGeneView, smc_flags), 72);
+        assert_eq!(offset_of!(RawGeneView, gate_threshold), 88);
+        assert_eq!(offset_of!(RawGeneView, smc_gate_disabled), 96);
+        layout!(RawScenarioView, 16, 8);
+        assert_eq!(offset_of!(RawScenarioView, count), 8);
+        layout!(RawReadback, 24, 8);
+        assert_eq!(offset_of!(RawReadback, written), 16);
+        layout!(RawDiagnosticReadback, 32, 8);
+        assert_eq!(offset_of!(RawDiagnosticReadback, outcomes), 8);
+        assert_eq!(offset_of!(RawDiagnosticReadback, written), 24);
+        layout!(RawResidentPopulationMetricsHandleV1, 88, 8);
+        assert_eq!(
+            offset_of!(RawResidentPopulationMetricsHandleV1, event_id),
+            8
+        );
+        assert_eq!(
+            offset_of!(RawResidentPopulationMetricsHandleV1, total_device_bytes),
+            64
+        );
+        layout!(RawTerminalCompactPopulationResultV1, 160, 8);
+        assert_eq!(
+            offset_of!(RawTerminalCompactPopulationResultV1, metric_row),
+            24
+        );
+        assert_eq!(
+            offset_of!(
+                RawTerminalCompactPopulationResultV1,
+                terminal_readback_bytes
+            ),
+            152
+        );
+
+        let _: unsafe extern "C" fn() -> u32 = crate::neoethos_gpu_cuda_abi_version;
+        let _: unsafe extern "C" fn() -> i32 = crate::neoethos_gpu_cuda_runtime_available;
+        let _: unsafe extern "C" fn() -> i32 = crate::neoethos_gpu_cuda_device_count;
+        let _: unsafe extern "C" fn(i32) -> u64 = crate::neoethos_gpu_cuda_device_free_memory;
+        let _: unsafe extern "C" fn(*const u32, *mut u32, usize) -> i32 =
+            crate::neoethos_gpu_cuda_smoke;
+        let _: unsafe extern "C" fn(
+            *const f64,
+            *const f64,
+            usize,
+            *const crate::CudaFirstHitEvent,
+            *mut crate::CudaFirstHitResult,
+            usize,
+        ) -> i32 = crate::neoethos_gpu_cuda_warp_first_hit;
+        let _: unsafe extern "C" fn(u32, i32, usize, *mut i32) -> *mut c_void =
+            neoethos_gpu_cuda_population_create;
+        let _: unsafe extern "C" fn(*mut c_void, *const RawDatasetView) -> i32 =
+            neoethos_gpu_cuda_population_upload_dataset;
+        let _: unsafe extern "C" fn(*mut c_void, *const RawParentDatasetV1) -> i32 =
+            neoethos_gpu_cuda_population_upload_parent_v1;
+        #[cfg(feature = "cuda")]
+        let _: unsafe extern "C" fn(
+            *const RawResidentFeatureStoreBindV3,
+            *mut i32,
+        ) -> *mut c_void = neoethos_gpu_cuda_population_bind_resident_feature_store_v3;
+        let _: unsafe extern "C" fn(*mut c_void, *const RawEvaluationViewV1) -> i32 =
+            neoethos_gpu_cuda_population_bind_view_v1;
+        let _: unsafe extern "C" fn(*mut c_void, *mut PopulationResidencyCountersV1) -> i32 =
+            neoethos_gpu_cuda_population_read_residency_counters_v1;
+        let _: unsafe extern "C" fn(*mut c_void, *mut CudaPopulationDeviceIdentityV1) -> i32 =
+            neoethos_gpu_cuda_population_read_device_identity_v1;
+        let _: unsafe extern "C" fn(*mut c_void, *const RawGeneView) -> i32 =
+            neoethos_gpu_cuda_population_upload_genes;
+        let _: unsafe extern "C" fn(*mut c_void, *const RawScenarioView) -> i32 =
+            neoethos_gpu_cuda_population_upload_scenarios;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *const NeoPopulationSettings,
+            *mut RawResidentPopulationMetricsHandleV1,
+            *mut NeoPopulationCounters,
+        ) -> i32 = neoethos_gpu_cuda_population_b_enqueue_metrics_only_v1;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *const RawResidentPopulationMetricsHandleV1,
+            *mut RawTerminalCompactPopulationResultV1,
+        ) -> i32 = neoethos_gpu_cuda_population_consume_terminal_compact_result_v1;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *const NeoPopulationSettings,
+            *mut u64,
+            *mut NeoPopulationCounters,
+        ) -> i32 = neoethos_gpu_cuda_population_b_evaluate;
+        let _: unsafe extern "C" fn(*mut c_void, u64) -> i32 = neoethos_gpu_cuda_population_wait;
+        let _: unsafe extern "C" fn(*mut c_void, *mut RawReadback) -> i32 =
+            neoethos_gpu_cuda_population_read_metrics;
+        let _: unsafe extern "C" fn(*mut c_void, *mut RawDiagnosticReadback) -> i32 =
+            neoethos_gpu_cuda_population_read_diagnostics;
+        let _: unsafe extern "C" fn(*mut c_void) = neoethos_gpu_cuda_population_destroy;
+
+        const HEADER: &str = include_str!("../native/neoethos_gpu_cuda.h");
+        const ASSERTS: &str = include_str!("../native/layout_asserts.cpp");
+        let mut missing = Vec::new();
+        for required in [
+            "#define NEOETHOS_GPU_ABI_VERSION 4u",
+            "double long_threshold;",
+            "double short_threshold;",
+            "double stop_vol_multiplier;",
+        ] {
+            if !HEADER.contains(required) {
+                missing.push(format!("header: {required}"));
+            }
+        }
+        for required in [
+            "static_assert(sizeof(NeoGeneDescriptor) == 72);",
+            "static_assert(alignof(NeoGeneDescriptor) == 8);",
+            "static_assert(offsetof(NeoGeneDescriptor, long_threshold) == 16);",
+            "static_assert(offsetof(NeoGeneDescriptor, short_threshold) == 24);",
+            "static_assert(offsetof(NeoGeneDescriptor, stop_ticks) == 32);",
+            "static_assert(offsetof(NeoGeneDescriptor, target_ticks) == 40);",
+            "static_assert(offsetof(NeoGeneDescriptor, stop_vol_multiplier) == 48);",
+            "static_assert(offsetof(NeoGeneDescriptor, flags) == 56);",
+            "static_assert(offsetof(NeoGeneDescriptor, reserved) == 64);",
+            "static_assert(sizeof(NeoPopulationDatasetView) == 232);",
+            "static_assert(sizeof(NeoPopulationParentDatasetV1) == 216);",
+            "static_assert(sizeof(NeoPopulationResidentFeatureStoreV3) == 216);",
+            "static_assert(sizeof(NeoPopulationEvaluationViewV1) == 72);",
+            "static_assert(sizeof(NeoPopulationResidencyCountersV1) == 144);",
+            "static_assert(sizeof(NeoPopulationDeviceIdentityV1) == 312);",
+            "static_assert(sizeof(NeoPopulationGeneView) == 104);",
+            "static_assert(sizeof(NeoPopulationScenarioView) == 16);",
+            "static_assert(sizeof(NeoPopulationReadback) == 24);",
+            "static_assert(sizeof(NeoPopulationDiagnosticReadback) == 32);",
+        ] {
+            if !ASSERTS.contains(required) {
+                missing.push(format!("native layout proof: {required}"));
+            }
+        }
+        let native_version = crate::native_abi_version();
+        if native_version != ABI_VERSION {
+            missing.push(format!(
+                "native ABI version {native_version}, Rust ABI version {ABI_VERSION}"
+            ));
+        }
+        assert!(missing.is_empty(), "ABI v4 drift:\n{}", missing.join("\n"));
+    }
+
+    #[test]
+    fn abi_v4_contract_preserves_threshold_f64_distinctions() {
+        let lower = f64::from_bits(1.0_f64.to_bits() - 1);
+        let upper = f64::from_bits(1.0_f64.to_bits() + 1);
+        assert_ne!(lower, upper);
+        assert_eq!(lower as f32, upper as f32);
+        let score = f64::from(1.0_f32);
+        assert!(score >= lower);
+        assert!(score < upper);
+
+        const KERNEL: &str = include_str!("../native/prototype_b_population.cu");
+        let kernel = normalize_source(KERNEL);
+        for required in [
+            "const double* long_thresholds;",
+            "const double* short_thresholds;",
+            "double long_threshold;",
+            "double short_threshold;",
+            "double gap;",
+            "double* long_thresholds = nullptr;",
+            "double* short_thresholds = nullptr;",
+            "staging->long_thresholds = new (std::nothrow) double[population];",
+            "staging->short_thresholds = new (std::nothrow) double[population];",
+            "plan.long_threshold *= perturb_factor(",
+            "plan.short_threshold *= perturb_factor(",
+            "double gap = fabs(plan.long_threshold - plan.short_threshold);",
+            "const double margin =",
+            "double* confidence_out",
+            "double signal_confidence_here = 0.0;",
+        ] {
+            assert!(
+                kernel.contains(required),
+                "missing f64 threshold path: {required}"
+            );
+        }
+        for forbidden in [
+            "const float* long_thresholds;",
+            "const float* short_thresholds;",
+            "float* long_thresholds = nullptr;",
+            "float* short_thresholds = nullptr;",
+            "float gap = fabsf(plan.long_threshold - plan.short_threshold);",
+            "static_cast<float>( static_cast<double>(plan.long_threshold)",
+            "static_cast<float>( static_cast<double>(plan.short_threshold)",
+        ] {
+            assert!(
+                !kernel.contains(forbidden),
+                "threshold path still narrows through `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn population_f64_contract_preserves_feature_and_csr_precision() {
+        use core::mem::{offset_of, size_of};
+
+        let lower = f64::from_bits(1.0_f64.to_bits() - 1);
+        let upper = f64::from_bits(1.0_f64.to_bits() + 1);
+        assert_ne!(lower, upper);
+        assert_eq!(lower as f32, upper as f32);
+
+        let long_threshold = 1.0_f64;
+        assert!(
+            lower * 1.0 < long_threshold,
+            "the lower f64 feature must not signal long"
+        );
+        assert!(
+            upper * 1.0 > long_threshold,
+            "the upper f64 feature must signal long"
+        );
+        assert!(
+            1.0 * lower < long_threshold,
+            "the lower f64 CSR weight must not signal long"
+        );
+        assert!(
+            1.0 * upper > long_threshold,
+            "the upper f64 CSR weight must signal long"
+        );
+
+        let indicators = [];
+        let dataset = PopulationDatasetView {
+            close: &[],
+            high: &[],
+            low: &[],
+            indicators: &indicators,
+            feature_count: 0,
+            months: &[],
+            days: &[],
+            timestamps: &[],
+            smc_rows: &[],
+            adaptive_base_pips: None,
+        };
+        assert_eq!(core::any::type_name_of_val(&dataset.indicators), "&[f64]");
+
+        let weights = [];
+        let smc_weights = [0.0; SMC_SLOTS];
+        let genes = PopulationGeneView {
+            descriptors: &[],
+            offsets: &[],
+            indices: &[],
+            weights: &weights,
+            stop_pips: &[],
+            target_pips: &[],
+            stop_vol_multipliers: &[],
+            smc_flags: &[],
+            smc_weights: &smc_weights,
+            gate_threshold: 0.0,
+            smc_gate_disabled: false,
+        };
+        assert_eq!(core::any::type_name_of_val(&genes.weights), "&[f64]");
+
+        assert_eq!(size_of::<RawGeneView>(), 104);
+        assert_eq!(offset_of!(RawGeneView, gate_threshold), 88);
+        assert_eq!(offset_of!(RawGeneView, smc_gate_disabled), 96);
+
+        const HEADER: &str = include_str!("../native/neoethos_gpu_cuda.h");
+        const ASSERTS: &str = include_str!("../native/layout_asserts.cpp");
+        const KERNEL: &str = include_str!("../native/prototype_b_population.cu");
+        let header = normalize_source(HEADER);
+        let asserts = normalize_source(ASSERTS);
+        let kernel = normalize_source(KERNEL);
+
+        for required in ["const double* indicators;", "const double* weights;"] {
+            assert!(
+                header.contains(required),
+                "missing ABI4 f64 population field: {required}"
+            );
+        }
+        for required in [
+            "static_assert(sizeof(NeoPopulationGeneView) == 104);",
+            "static_assert(offsetof(NeoPopulationGeneView, gate_threshold) == 88);",
+            "static_assert(offsetof(NeoPopulationGeneView, smc_gate_disabled) == 96);",
+        ] {
+            assert!(
+                asserts.contains(required),
+                "missing ABI4 population layout proof: {required}"
+            );
+        }
+        for required in [
+            "const double* indicators_bar_major;",
+            "const double* weights;",
+            "__shared__ double tile[kTransposeTile][kTransposeTile + 1];",
+            "double combined = 0.0;",
+            "const double weight = genes.weights[term] * perturb_factor(",
+            "double* indicators_bar_major = nullptr;",
+            "double* gene_weights = nullptr;",
+            "features * bars * sizeof(double)",
+            "terms * sizeof(double)",
+        ] {
+            assert!(
+                kernel.contains(required),
+                "missing f64 population data/math path: {required}"
+            );
+        }
+        for forbidden in [
+            "const float* indicators_bar_major;",
+            "const float* weights;",
+            "__shared__ float tile[kTransposeTile][kTransposeTile + 1];",
+            "float combined = 0.0f;",
+            "const float weight = static_cast<float>(",
+            "float* indicators_bar_major = nullptr;",
+            "float* gene_weights = nullptr;",
+            "features * bars * sizeof(float)",
+            "terms * sizeof(float)",
+        ] {
+            assert!(
+                !kernel.contains(forbidden),
+                "population feature/CSR path still narrows through `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn population_f64_contract_preserves_smc_weight_and_gate_precision() {
+        let lower = f64::from_bits(1.0_f64.to_bits() - 1);
+        let upper = f64::from_bits(1.0_f64.to_bits() + 1);
+        assert_ne!(lower, upper);
+        assert_eq!(lower as f32, upper as f32);
+
+        let gate = 1.0_f64;
+        assert!(lower < gate, "the lower f64 SMC score must fail the gate");
+        assert!(upper > gate, "the upper f64 SMC score must pass the gate");
+        let score = 1.0_f64;
+        assert!(score >= lower, "the lower f64 gate must pass");
+        assert!(score < upper, "the upper f64 gate must fail");
+
+        let weights = [];
+        let smc_weights = [0.0; SMC_SLOTS];
+        let genes = PopulationGeneView {
+            descriptors: &[],
+            offsets: &[],
+            indices: &[],
+            weights: &weights,
+            stop_pips: &[],
+            target_pips: &[],
+            stop_vol_multipliers: &[],
+            smc_flags: &[],
+            smc_weights: &smc_weights,
+            gate_threshold: 0.0,
+            smc_gate_disabled: false,
+        };
+        assert_eq!(
+            core::any::type_name_of_val(&genes.smc_weights),
+            "&[f64; 11]"
+        );
+        assert_eq!(core::any::type_name_of_val(&genes.gate_threshold), "f64");
+
+        const HEADER: &str = include_str!("../native/neoethos_gpu_cuda.h");
+        const KERNEL: &str = include_str!("../native/prototype_b_population.cu");
+        let header = normalize_source(HEADER);
+        let kernel = normalize_source(KERNEL);
+
+        for required in ["const double* smc_weights;", "double gate_threshold;"] {
+            assert!(
+                header.contains(required),
+                "missing ABI4 f64 SMC field: {required}"
+            );
+        }
+        for required in [
+            "const double* smc_weights;",
+            "double gate_threshold;",
+            "double active_sum;",
+            "double gate;",
+            "double active_sum = 0.0;",
+            "plan.gate = fmin(genes.gate_threshold, active_sum);",
+            "double score = 0.0;",
+            "double* smc_weights = nullptr;",
+            "double gate_threshold = 0.0;",
+            "kSmcSlots * sizeof(double)",
+        ] {
+            assert!(
+                kernel.contains(required),
+                "missing f64 SMC data/math path: {required}"
+            );
+        }
+        for forbidden in [
+            "const float* smc_weights;",
+            "float gate_threshold;",
+            "float active_sum;",
+            "float gate;",
+            "float active_sum = 0.0f;",
+            "fminf(genes.gate_threshold, active_sum)",
+            "float score = 0.0f;",
+            "float* smc_weights = nullptr;",
+            "float gate_threshold = 0.0f;",
+            "kSmcSlots * sizeof(float)",
+        ] {
+            assert!(
+                !kernel.contains(forbidden),
+                "population SMC path still narrows through `{forbidden}`"
+            );
+        }
+    }
+
+    fn dataset_slices() -> (Vec<f64>, Vec<f64>, Vec<i64>, Vec<i8>) {
         (
             vec![1.0; 4],
             vec![0.5; 8],
@@ -780,6 +2994,19 @@ mod tests {
     }
 
     #[test]
+    fn metrics_only_default_month_plan_is_exactly_4000_bytes_per_scenario() {
+        let plan = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(1, 240)
+            .expect("one scenario with 240 months has a checked metrics-only plan");
+        assert_eq!(plan.metric_rows_bytes(), 104);
+        assert_eq!(plan.monthly_pnls_bytes(), 1_920);
+        assert_eq!(plan.month_start_equities_bytes(), 1_920);
+        assert_eq!(plan.scenario_descriptor_bytes(), 56);
+        assert_eq!(plan.total_device_bytes(), 4_000);
+        assert_eq!(plan.outcome_bytes(), 0);
+        assert_eq!(plan.accepted_trade_total_bytes(), 0);
+    }
+
+    #[test]
     fn trade_slots_match_the_kernel() {
         // Read from the source the kernel actually compiles, so the two cannot
         // drift. A mismatch means the host budgets for a different array than
@@ -793,7 +3020,12 @@ mod tests {
         let value: u64 = declaration
             .rsplit('=')
             .next()
-            .and_then(|tail| tail.trim().trim_end_matches(&[';', 'u', 'l'][..]).parse().ok())
+            .and_then(|tail| {
+                tail.trim()
+                    .trim_end_matches(&[';', 'u', 'l'][..])
+                    .parse()
+                    .ok()
+            })
             .unwrap_or_else(|| panic!("cannot read the slot count from: {declaration}"));
         assert_eq!(
             value, MAX_TRADES_PER_CANDIDATE,
@@ -836,6 +3068,10 @@ mod tests {
             STATUS_SYNC_FAILED,
             STATUS_UNKNOWN_EVENT,
             STATUS_DATASET_REUPLOAD,
+            STATUS_WORKSPACE_MODE_MISMATCH,
+            STATUS_WORKSPACE_PLAN_MISMATCH,
+            STATUS_STRICT_RESIDENT_IN_FLIGHT,
+            STATUS_STRICT_RESIDENT_POISONED,
         ] {
             assert_ne!(population_status_message(status), "unknown native status");
         }
@@ -888,7 +3124,7 @@ mod tests {
     fn gene_csr_and_feature_bounds_are_validated_before_ffi() {
         let descriptors = vec![GeneDescriptor::default(); 2];
         let smc_flags = vec![0_i8; 2 * SMC_SLOTS];
-        let smc_weights = [0.0_f32; SMC_SLOTS];
+        let smc_weights = [0.0_f64; SMC_SLOTS];
         let genes = PopulationGeneView {
             descriptors: &descriptors,
             offsets: &[0, 1, 2],

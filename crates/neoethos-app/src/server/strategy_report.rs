@@ -89,7 +89,12 @@ fn auto_loop_dirs(cache: &Path) -> Vec<PathBuf> {
     if let Ok(rd) = std::fs::read_dir(cache) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() && p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("auto_loop")).unwrap_or(false) {
+            if p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("auto_loop"))
+                    .unwrap_or(false)
+            {
                 out.push(p);
             }
         }
@@ -118,7 +123,9 @@ fn file_modified_ms(p: &Path) -> Option<i64> {
 }
 
 fn read_json(p: &Path) -> Option<serde_json::Value> {
-    std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(&t).ok())
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
 }
 
 fn month_of(ms: i64) -> String {
@@ -149,7 +156,11 @@ fn best_gene(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
 }
 
 /// Build a strategy entry (+ optional monthly/yearly rows) from one base.
-fn build(dir: &Path, base: &str, with_monthly: bool) -> Option<(StrategyEntry, Vec<MonthRow>, Vec<MonthRow>)> {
+fn build(
+    dir: &Path,
+    base: &str,
+    with_monthly: bool,
+) -> Option<(StrategyEntry, Vec<MonthRow>, Vec<MonthRow>)> {
     let trades_v = read_json(&dir.join(format!("{base}.json.trades.json")))?;
     let gene = best_gene(&trades_v)?;
     // chronological (entry_time)
@@ -218,7 +229,11 @@ fn build(dir: &Path, base: &str, with_monthly: bool) -> Option<(StrategyEntry, V
 
     // profile (validation flags)
     let prof = read_json(&dir.join(format!("{base}.json.profile.json")));
-    let pf = |k: &str| prof.as_ref().and_then(|p| p.get(k)).and_then(|v| v.as_bool());
+    let pf = |k: &str| {
+        prof.as_ref()
+            .and_then(|p| p.get(k))
+            .and_then(|v| v.as_bool())
+    };
     let cpcv = pf("cpcv_passed");
     let wf = pf("walkforward_passed");
     let complete = pf("validation_evidence_complete");
@@ -227,8 +242,14 @@ fn build(dir: &Path, base: &str, with_monthly: bool) -> Option<(StrategyEntry, V
     let qual = read_json(&dir.join(format!("{base}.json.quality.json")));
     let qbest = qual.as_ref().and_then(|q| q.as_array()).and_then(|a| {
         a.iter().max_by(|x, y| {
-            let tx = x.get("total_trades").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let ty = y.get("total_trades").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let tx = x
+                .get("total_trades")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let ty = y
+                .get("total_trades")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             tx.partial_cmp(&ty).unwrap_or(std::cmp::Ordering::Equal)
         })
     });
@@ -254,7 +275,11 @@ fn build(dir: &Path, base: &str, with_monthly: bool) -> Option<(StrategyEntry, V
 
     let head = StrategyEntry {
         mode: mode_of(dir),
-        dir: dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string(),
+        dir: dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string(),
         symbol: sym.to_string(),
         timeframe: tf.to_string(),
         base: base.to_string(),
@@ -268,7 +293,11 @@ fn build(dir: &Path, base: &str, with_monthly: bool) -> Option<(StrategyEntry, V
         span_start: Some(span_start),
         span_end: Some(span_end),
         years: round2(years),
-        cagr_pct: if cagr_pct.is_finite() { round2(cagr_pct) } else { 0.0 },
+        cagr_pct: if cagr_pct.is_finite() {
+            round2(cagr_pct)
+        } else {
+            0.0
+        },
         final_from_1000: if eq.is_finite() { round2(eq) } else { 0.0 },
         max_dd_pct: round2(max_dd * 100.0),
         flags,
@@ -282,7 +311,12 @@ fn build(dir: &Path, base: &str, with_monthly: bool) -> Option<(StrategyEntry, V
         for m in &monthly {
             let y = m.month[..4].to_string();
             if y != last_year {
-                yr.push(MonthRow { month: y.clone(), balance: m.balance, return_pct: 0.0, trades: 0 });
+                yr.push(MonthRow {
+                    month: y.clone(),
+                    balance: m.balance,
+                    return_pct: 0.0,
+                    trades: 0,
+                });
                 last_year = y;
             } else if let Some(l) = yr.last_mut() {
                 l.balance = m.balance;
@@ -293,7 +327,11 @@ fn build(dir: &Path, base: &str, with_monthly: bool) -> Option<(StrategyEntry, V
         Vec::new()
     };
 
-    Some((head, if with_monthly { monthly } else { Vec::new() }, yearly))
+    Some((
+        head,
+        if with_monthly { monthly } else { Vec::new() },
+        yearly,
+    ))
 }
 
 fn round2(v: f64) -> f64 {
@@ -326,7 +364,10 @@ pub async fn list(State(state): State<AppApiState>) -> Json<StrategyListDto> {
         }
     }
     strategies.sort_by(|a, b| b.trades.cmp(&a.trades));
-    Json(StrategyListDto { count: strategies.len(), strategies })
+    Json(StrategyListDto {
+        count: strategies.len(),
+        strategies,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +390,11 @@ pub async fn report(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
     let dir = cache.join(&q.dir);
-    let (head, monthly, yearly) = build(&dir, &q.base, true).ok_or(axum::http::StatusCode::NOT_FOUND)?;
-    Ok(Json(StrategyReportDto { head, monthly, yearly }))
+    let (head, monthly, yearly) =
+        build(&dir, &q.base, true).ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    Ok(Json(StrategyReportDto {
+        head,
+        monthly,
+        yearly,
+    }))
 }

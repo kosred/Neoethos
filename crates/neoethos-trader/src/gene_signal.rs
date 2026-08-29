@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use anyhow::{Context, Result, ensure};
 use neoethos_data::{FeatureFrame, Ohlcv};
 use neoethos_search::genetic::signals_and_confidence_for_gene_full;
 use neoethos_search::{EvaluationConfig, Gene, signals_for_gene, signals_for_gene_full};
@@ -48,7 +49,7 @@ pub fn combine_gene_signals(
     genes: &[Gene],
     aligned_features: &FeatureFrame,
     base_ohlcv: &Ohlcv,
-) -> Vec<Direction> {
+) -> Result<Vec<Direction>> {
     let n = aligned_features.n_samples();
     let cfg = EvaluationConfig::default();
     let mut net = vec![0i32; n];
@@ -57,14 +58,24 @@ pub fn combine_gene_signals(
             signals_for_gene_full(aligned_features, base_ohlcv, gene, &cfg)
         } else {
             signals_for_gene(aligned_features, gene)
-        };
+        }
+        .with_context(|| {
+            format!(
+                "failed to synthesize signals for gene `{}`",
+                gene.strategy_id
+            )
+        })?;
+        ensure!(
+            sigs.len() == n,
+            "gene `{}` returned {} signals for {n} feature rows",
+            gene.strategy_id,
+            sigs.len()
+        );
         for (i, s) in sigs.iter().enumerate() {
-            if i < n {
-                net[i] += *s as i32;
-            }
+            net[i] += *s as i32;
         }
     }
-    net.into_iter().map(dir_from_net).collect()
+    Ok(net.into_iter().map(dir_from_net).collect())
 }
 
 /// Like [`combine_gene_signals`] but ALSO returns, per bar, the average
@@ -78,7 +89,7 @@ pub fn combine_gene_signals_with_brackets(
     aligned_features: &FeatureFrame,
     base_ohlcv: &Ohlcv,
     pip_size: f64,
-) -> (Vec<Direction>, Vec<f64>, Vec<f64>) {
+) -> Result<(Vec<Direction>, Vec<f64>, Vec<f64>)> {
     let n = aligned_features.n_samples();
     let cfg = EvaluationConfig::default();
     let mut net = vec![0i32; n];
@@ -94,41 +105,41 @@ pub fn combine_gene_signals_with_brackets(
     // so a promoted adaptive gene places the exact volatility-scaled bracket it
     // was scored on. `stop_vol_mult == 0` genes keep their fixed pips.
     let adaptive_base: Option<Vec<f64>> = if genes.iter().any(|g| g.stop_vol_mult > 0.0) {
-        match neoethos_search::adaptive_base_pips_series(
-            &base_ohlcv.high,
-            &base_ohlcv.low,
-            &base_ohlcv.close,
-            pip_size,
-        ) {
-            Ok(base) => Some(base),
-            // The live loop must not abort on a bad bar, so this is loud rather
-            // than fatal — but it is LOUD. Falling through to the gene's fixed
-            // `sl_pips` places a bracket the gene was never scored on, and the
-            // old code did that with no message at all.
-            Err(e) => {
-                tracing::error!(
-                    target: "neoethos_trader::gene_signal",
-                    bars = base_ohlcv.close.len(), error = %e,
-                    "adaptive stop base series unavailable — LIVE brackets fall back to each \
-                     gene's fixed sl_pips, which is NOT the stop it was scored on"
-                );
-                None
-            }
-        }
+        Some(
+            neoethos_search::adaptive_base_pips_series(
+                &base_ohlcv.high,
+                &base_ohlcv.low,
+                &base_ohlcv.close,
+                pip_size,
+            )
+            .context("adaptive stop base series unavailable")?,
+        )
     } else {
         None
     };
+    if let Some(base) = &adaptive_base {
+        ensure!(
+            base.len() == n,
+            "adaptive stop base has {} rows for {n} feature rows",
+            base.len()
+        );
+    }
     let adaptive_rr = neoethos_search::adaptive_stops_rr();
-    let gene_sl_tp_at = |gene: &Gene, i: usize| -> (f64, f64) {
+    let gene_sl_tp_at = |gene: &Gene, i: usize| -> Result<(f64, f64)> {
         if gene.stop_vol_mult > 0.0 {
-            if let Some(&d) = adaptive_base.as_ref().and_then(|b| b.get(i)) {
-                if d.is_finite() && d > 0.0 {
-                    let sl = gene.stop_vol_mult * d;
-                    return (sl, adaptive_rr * sl);
-                }
-            }
+            let d = adaptive_base
+                .as_ref()
+                .and_then(|base| base.get(i))
+                .copied()
+                .context("adaptive stop base is missing an aligned bar")?;
+            ensure!(
+                d.is_finite() && d > 0.0,
+                "adaptive stop base is invalid at bar {i}: {d}"
+            );
+            let sl = gene.stop_vol_mult * d;
+            return Ok((sl, adaptive_rr * sl));
         }
-        (gene.sl_pips, gene.tp_pips)
+        Ok((gene.sl_pips, gene.tp_pips))
     };
 
     for gene in genes {
@@ -136,13 +147,22 @@ pub fn combine_gene_signals_with_brackets(
             signals_for_gene_full(aligned_features, base_ohlcv, gene, &cfg)
         } else {
             signals_for_gene(aligned_features, gene)
-        };
+        }
+        .with_context(|| {
+            format!(
+                "failed to synthesize bracket signals for gene `{}`",
+                gene.strategy_id
+            )
+        })?;
+        ensure!(
+            sigs.len() == n,
+            "gene `{}` returned {} bracket signals for {n} feature rows",
+            gene.strategy_id,
+            sigs.len()
+        );
         for (i, s) in sigs.iter().enumerate() {
-            if i >= n {
-                break;
-            }
             net[i] += *s as i32;
-            let (g_sl, g_tp) = gene_sl_tp_at(gene, i);
+            let (g_sl, g_tp) = gene_sl_tp_at(gene, i)?;
             if *s > 0 {
                 sl_long[i] += g_sl;
                 tp_long[i] += g_tp;
@@ -175,7 +195,7 @@ pub fn combine_gene_signals_with_brackets(
         sl_out.push(sl);
         tp_out.push(tp);
     }
-    (dirs, sl_out, tp_out)
+    Ok((dirs, sl_out, tp_out))
 }
 
 /// Like [`combine_gene_signals`] but ALSO returns the netted per-bar gene
@@ -190,7 +210,7 @@ pub fn combine_gene_signals_with_confidence(
     genes: &[Gene],
     aligned_features: &FeatureFrame,
     base_ohlcv: &Ohlcv,
-) -> (Vec<Direction>, Vec<f64>) {
+) -> Result<(Vec<Direction>, Vec<f64>)> {
     let n = aligned_features.n_samples();
     let cfg = EvaluationConfig::default();
     let mut net = vec![0i32; n];
@@ -202,10 +222,23 @@ pub fn combine_gene_signals_with_confidence(
 
     for gene in genes {
         let (sigs, confs) =
-            signals_and_confidence_for_gene_full(aligned_features, base_ohlcv, gene, &cfg);
+            signals_and_confidence_for_gene_full(aligned_features, base_ohlcv, gene, &cfg)
+                .with_context(|| {
+                    format!(
+                        "failed to synthesize signals and confidence for gene `{}`",
+                        gene.strategy_id
+                    )
+                })?;
+        ensure!(
+            sigs.len() == n && confs.len() == n,
+            "gene `{}` returned {} signals and {} confidences for {n} feature rows",
+            gene.strategy_id,
+            sigs.len(),
+            confs.len()
+        );
         for i in 0..n {
-            let s = sigs.get(i).copied().unwrap_or(0);
-            let c = confs.get(i).copied().unwrap_or(0.0) as f64;
+            let s = sigs[i];
+            let c = confs[i];
             net[i] += s as i32;
             if s > 0 {
                 conf_long[i] += c;
@@ -233,7 +266,7 @@ pub fn combine_gene_signals_with_confidence(
         dirs.push(dir);
         out_conf.push(conf);
     }
-    (dirs, out_conf)
+    Ok((dirs, out_conf))
 }
 
 /// A `SignalEngine` that serves a precomputed per-bar direction vector by cursor.
@@ -276,12 +309,8 @@ impl PrecomputedSignalEngine {
         tp_pips: Vec<f64>,
     ) -> Self {
         let mut engine = Self::new(symbol, signals);
-        engine
-            .per_symbol_sl
-            .insert(symbol.to_string(), sl_pips);
-        engine
-            .per_symbol_tp
-            .insert(symbol.to_string(), tp_pips);
+        engine.per_symbol_sl.insert(symbol.to_string(), sl_pips);
+        engine.per_symbol_tp.insert(symbol.to_string(), tp_pips);
         engine
     }
 
@@ -334,42 +363,131 @@ impl SignalEngine for PrecomputedSignalEngine {
 mod tests {
     use super::*;
 
+    fn feature_frame(data: ndarray::Array2<f64>, names: &[&str]) -> FeatureFrame {
+        let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(data.nrows());
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+            timestamps,
+            names.iter().map(|name| (*name).to_string()).collect(),
+            data,
+        )
+        .expect("valid f64 trader test feature frame")
+    }
+
+    fn flat_ohlcv(rows: usize) -> Ohlcv {
+        Ohlcv {
+            timestamp: Some(neoethos_data::test_fixtures::canonical_test_timestamps(
+                rows,
+            )),
+            open: vec![1.0; rows],
+            high: vec![1.0; rows],
+            low: vec![1.0; rows],
+            close: vec![1.0; rows],
+            volume: None,
+        }
+    }
+
+    fn gene_with_invalid_feature_index() -> Gene {
+        let mut gene = Gene::default();
+        gene.indices = vec![1];
+        gene.weights = vec![1.0];
+        gene
+    }
+
+    fn assert_error_chain_contains(error: &anyhow::Error, expected: &str) {
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains(expected)),
+            "expected `{expected}` in error chain: {error:#}"
+        );
+    }
+
+    #[test]
+    fn combine_gene_signals_rejects_invalid_gene_feature_index() {
+        let features = feature_frame(ndarray::array![[1.0_f64]], &["f0"]);
+        let error = combine_gene_signals(
+            &[gene_with_invalid_feature_index()],
+            &features,
+            &flat_ohlcv(1),
+        )
+        .expect_err("invalid gene input must fail closed");
+
+        assert_error_chain_contains(&error, "gene feature index 1");
+    }
+
+    #[test]
+    fn combine_gene_signals_with_brackets_rejects_invalid_gene_feature_index() {
+        let features = feature_frame(ndarray::array![[1.0_f64]], &["f0"]);
+        let error = combine_gene_signals_with_brackets(
+            &[gene_with_invalid_feature_index()],
+            &features,
+            &flat_ohlcv(1),
+            0.0001,
+        )
+        .expect_err("invalid gene input must fail closed");
+
+        assert_error_chain_contains(&error, "gene feature index 1");
+    }
+
+    #[test]
+    fn combine_gene_signals_with_confidence_rejects_invalid_gene_feature_index() {
+        let features = feature_frame(ndarray::array![[1.0_f64]], &["f0"]);
+        let error = combine_gene_signals_with_confidence(
+            &[gene_with_invalid_feature_index()],
+            &features,
+            &flat_ohlcv(1),
+        )
+        .expect_err("invalid gene input must fail closed");
+
+        assert_error_chain_contains(&error, "gene feature index 1");
+    }
+
+    #[test]
+    fn adaptive_bracket_base_failure_is_propagated() {
+        let features = feature_frame(ndarray::array![[1.0_f64]], &["f0"]);
+        let mut gene = Gene::default();
+        gene.indices = vec![0];
+        gene.weights = vec![1.0];
+        gene.stop_vol_mult = 1.0;
+
+        let error = combine_gene_signals_with_brackets(&[gene], &features, &flat_ohlcv(1), 0.0)
+            .expect_err("invalid adaptive-stop inputs must fail closed");
+
+        assert!(error.to_string().contains("adaptive stop base"));
+    }
+
     #[test]
     fn combine_single_gene_matches_ga_signals_exactly() {
         // 4 bars, 2 features; gene reads feature 0 with weight 1.0.
         let data = ndarray::array![
-            [1.0_f32, 0.0], // combined 1.0 >= 0.5 → Long
+            [1.0_f64, 0.0], // combined 1.0 >= 0.5 → Long
             [-1.0, 0.0],    // -1.0 <= -0.5 → Short
             [0.0, 0.0],     // 0.0 → Flat
             [0.8, 0.0],     // 0.8 >= 0.5 → Long
         ];
-        let features = FeatureFrame {
-            timestamps: vec![0, 1, 2, 3],
-            names: vec!["f0".to_string(), "f1".to_string()],
-            data: neoethos_data::FeatureData::InMemory(data),
-        };
-        let ohlcv = Ohlcv {
-            timestamp: Some(vec![0, 1, 2, 3]),
-            open: vec![1.0; 4],
-            high: vec![1.0; 4],
-            low: vec![1.0; 4],
-            close: vec![1.0; 4],
-            volume: None,
-        };
+        let features = feature_frame(data, &["f0", "f1"]);
+        let ohlcv = flat_ohlcv(4);
         let mut gene = Gene::default();
         gene.indices = vec![0];
         gene.weights = vec![1.0];
         gene.long_threshold = 0.5;
         gene.short_threshold = -0.5;
 
-        let directions = combine_gene_signals(std::slice::from_ref(&gene), &features, &ohlcv);
+        let directions = combine_gene_signals(std::slice::from_ref(&gene), &features, &ohlcv)
+            .expect("valid gene signals");
         assert_eq!(
             directions,
-            vec![Direction::Long, Direction::Short, Direction::Flat, Direction::Long]
+            vec![
+                Direction::Long,
+                Direction::Short,
+                Direction::Flat,
+                Direction::Long
+            ]
         );
 
         // PARITY: must equal the GA's own signal function mapped to Direction.
-        let direct = neoethos_search::signals_for_gene(&features, &gene);
+        let direct =
+            neoethos_search::signals_for_gene(&features, &gene).expect("valid direct GA signals");
         let mapped: Vec<Direction> = direct
             .iter()
             .map(|s| match s {
@@ -378,25 +496,17 @@ mod tests {
                 _ => Direction::Flat,
             })
             .collect();
-        assert_eq!(directions, mapped, "combine must match the GA's signals_for_gene");
+        assert_eq!(
+            directions, mapped,
+            "combine must match the GA's signals_for_gene"
+        );
     }
 
     #[test]
     fn two_genes_net_to_flat_when_opposed() {
-        let data = ndarray::array![[1.0_f32], [1.0]];
-        let features = FeatureFrame {
-            timestamps: vec![0, 1],
-            names: vec!["f0".to_string()],
-            data: neoethos_data::FeatureData::InMemory(data),
-        };
-        let ohlcv = Ohlcv {
-            timestamp: Some(vec![0, 1]),
-            open: vec![1.0; 2],
-            high: vec![1.0; 2],
-            low: vec![1.0; 2],
-            close: vec![1.0; 2],
-            volume: None,
-        };
+        let data = ndarray::array![[1.0_f64], [1.0]];
+        let features = feature_frame(data, &["f0"]);
+        let ohlcv = flat_ohlcv(2);
         // Long gene: weight +1, long_thr 0.5 → Long on feat 1.0.
         let mut long_gene = Gene::default();
         long_gene.indices = vec![0];
@@ -410,8 +520,13 @@ mod tests {
         short_gene.long_threshold = 0.5;
         short_gene.short_threshold = -0.5;
 
-        let net = combine_gene_signals(&[long_gene, short_gene], &features, &ohlcv);
-        assert_eq!(net, vec![Direction::Flat, Direction::Flat], "opposed genes net to flat");
+        let net = combine_gene_signals(&[long_gene, short_gene], &features, &ohlcv)
+            .expect("valid opposed gene signals");
+        assert_eq!(
+            net,
+            vec![Direction::Flat, Direction::Flat],
+            "opposed genes net to flat"
+        );
     }
 
     #[test]
@@ -424,7 +539,9 @@ mod tests {
             symbol: "EURGBP".to_string(),
             base_tf: "D1".to_string(),
             higher_tfs: Vec::new(),
-            source: crate::contracts::StrategySource::Gene { id: "x".to_string() },
+            source: crate::contracts::StrategySource::Gene {
+                id: "x".to_string(),
+            },
             mode: crate::contracts::TradeMode::PropFirm,
         };
         assert_eq!(engine.evaluate(&entry, &[]).dir, Direction::Long);

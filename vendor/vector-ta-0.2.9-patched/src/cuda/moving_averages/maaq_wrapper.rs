@@ -1,18 +1,18 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
-use crate::indicators::moving_averages::maaq::{expand_grid, MaaqBatchRange, MaaqParams};
+use crate::indicators::moving_averages::maaq::{MaaqBatchRange, MaaqParams, expand_grid};
 use cust::context::Context;
 use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug)]
@@ -204,12 +204,6 @@ impl CudaMaaq {
         let context = Context::new(device)?;
         let context = Arc::new(context);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/maaq_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("maaq_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

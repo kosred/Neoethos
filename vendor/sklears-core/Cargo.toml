@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.89"
 name = "sklears-core"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 build = false
 autolib = false
@@ -107,7 +107,11 @@ full = [
     "preprocessing",
     "model_selection",
 ]
-gpu_support = []
+gpu_support = [
+    "dep:oxicuda-backend",
+    "dep:oxicuda-memory",
+    "dep:oxicuda-blas",
+]
 linear_models = []
 messagepack = [
     "dep:rmp-serde",
@@ -142,16 +146,16 @@ path = "src/lib.rs"
 version = "0.5"
 
 [dependencies.arrow]
-version = "58.1"
+version = "59.0"
 optional = true
 default-features = false
 
 [dependencies.arrow-csv]
-version = "58"
+version = "59"
 optional = true
 
 [dependencies.arrow-ipc]
-version = "58"
+version = "59"
 optional = true
 
 [dependencies.async-trait]
@@ -183,16 +187,28 @@ optional = true
 version = "1.17"
 
 [dependencies.oxiarc-deflate]
-version = "0.2.6"
+version = "0.3.3"
 optional = true
 
 [dependencies.oxiarc-zstd]
-version = "0.2.7"
+version = "0.3.3"
 optional = true
 default-features = false
 
 [dependencies.oxicode]
-version = "0.2"
+version = "0.2.4"
+optional = true
+
+[dependencies.oxicuda-backend]
+version = "0.3"
+optional = true
+
+[dependencies.oxicuda-blas]
+version = "0.3"
+optional = true
+
+[dependencies.oxicuda-memory]
+version = "0.3"
 optional = true
 
 [dependencies.proc-macro2]
@@ -209,7 +225,7 @@ version = "1.3"
 optional = true
 
 [dependencies.scirs2-core]
-version = "0.4.2"
+version = "0.5.1"
 features = [
     "random",
     "linalg",
@@ -218,7 +234,7 @@ features = [
 default-features = false
 
 [dependencies.scirs2-linalg]
-version = "0.4.2"
+version = "0.5.1"
 default-features = false
 
 [dependencies.serde]
@@ -269,8 +285,14 @@ version = "0.3"
 [target.'cfg(target_os = "windows")'.dependencies.winapi]
 version = "0.3"
 features = [
+    "basetsd",
     "handleapi",
     "memoryapi",
+    "minwinbase",
+    "minwindef",
+    "processthreadsapi",
+    "psapi",
+    "sysinfoapi",
     "winnt",
 ]
 

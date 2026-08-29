@@ -40,9 +40,9 @@ use serde::Serialize;
 // is therefore not ignored quietly — it is reported at ERROR, by name, with the
 // value that was found and the thing that decides instead.
 //
-// The names ALSO still appear in `raw_env(...)` captures below, on purpose: the
-// run profile records what was ambient so a post-hoc reader can see the same
-// stale export the startup banner shouted about.
+// Retired names that still have a useful raw recorder appear in `raw_env(...)`
+// captures below. Arithmetic switches that were deleted outright are reported
+// at startup but do not retain a misleading active profile field.
 
 /// `(env var, what decides it now)`. Production names only — test-gating names
 /// (`NEOETHOS_REQUIRE_GPU` inside `#[cfg(test)]`, `FUSED_TEST_NSAMPLES`) are
@@ -60,7 +60,7 @@ pub(crate) const RETIRED_ENV_VARS: &[(&str, &str)] = &[
     // ── cubecl lane selection ──
     (
         "NEOETHOS_BOT_SEARCH_EVAL_PRECISION",
-        "the compiled lane (f32 cubecl / f64 prototype B); config field routed to config.rs",
+        "the compiled search lanes are f64; no runtime precision switch remains",
     ),
     (
         "NEOETHOS_BOT_TRAIN_PRECISION",
@@ -72,7 +72,7 @@ pub(crate) const RETIRED_ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "NEOETHOS_GPU_F64",
-        "the compiled lane; config field routed to config.rs",
+        "CubeCL search arithmetic is unconditionally f64",
     ),
     (
         "NEOETHOS_BOT_SEARCH_EVAL_CUDA_KERNEL",
@@ -398,10 +398,7 @@ pub(crate) const RETIRED_SEARCH_ENV_VARS: &[(&str, &str)] = &[
         "NEOETHOS_BOT_REJECT_PIP_FALLBACK",
         "models.eval_runtime.reject_pip_fallback",
     ),
-    (
-        "NEOETHOS_BOT_PROP_SMC_W_OB",
-        "models.eval_runtime.smc_w_ob",
-    ),
+    ("NEOETHOS_BOT_PROP_SMC_W_OB", "models.eval_runtime.smc_w_ob"),
     (
         "NEOETHOS_BOT_PROP_SMC_W_FVG",
         "models.eval_runtime.smc_w_fvg",
@@ -507,8 +504,6 @@ pub struct GpuLaneProfile {
     /// Raw `NEOETHOS_REQUIRE_GPU` as seen by this process (escalates the
     /// backend to GPU_REQUIRED and disables the CPU fallback lane).
     pub require_gpu_env: Option<String>,
-    /// f64 GPU backtest lane (`NEOETHOS_GPU_F64`); `None` on non-GPU builds.
-    pub gpu_f64_backtest: Option<bool>,
     /// The fused VRAM-resident eval decision this process actually made.
     /// `Some(x)` = decided (env override or auto-probe); `None` = never
     /// consulted (or non-GPU build), so it cannot have influenced the run.
@@ -621,7 +616,6 @@ impl ExecutionEnvironmentProfile {
                 backend_fallback: format!("{:?}", backend.fallback),
                 backend_accelerator: format!("{:?}", backend.accelerator_hint),
                 require_gpu_env: raw_env("NEOETHOS_REQUIRE_GPU"),
-                gpu_f64_backtest: gpu_f64_backtest(),
                 fused_eval_decision: fused_eval_decision(),
                 cuda_precision: cuda_knobs().map(|k| k.0),
                 cuda_eval_kernel_enabled: cuda_knobs().map(|k| k.1),
@@ -658,16 +652,6 @@ impl ExecutionEnvironmentProfile {
 /// what the `discovery_tests.rs` env census matches its table against.
 fn raw_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
-}
-
-#[cfg(feature = "gpu")]
-fn gpu_f64_backtest() -> Option<bool> {
-    Some(crate::cubecl_eval::gpu_f64_backtest_enabled())
-}
-
-#[cfg(not(feature = "gpu"))]
-fn gpu_f64_backtest() -> Option<bool> {
-    None
 }
 
 #[cfg(feature = "gpu")]
@@ -755,7 +739,6 @@ mod tests {
         let profile = ExecutionEnvironmentProfile::capture();
         let json = serde_json::to_value(&profile).expect("profile must serialize");
         for pointer in [
-            "/gpu/gpu_f64_backtest",
             "/gpu/fused_eval_decision",
             "/gpu/cuda_precision",
             "/gpu/vram_budget_mb",

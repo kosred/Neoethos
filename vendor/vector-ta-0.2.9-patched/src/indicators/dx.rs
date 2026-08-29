@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -13,22 +13,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum DxData<'a> {
@@ -48,10 +32,6 @@ pub struct DxOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DxParams {
     pub period: Option<usize>,
 }
@@ -276,7 +256,6 @@ pub fn dx_with_kernel(input: &DxInput, kernel: Kernel) -> Result<DxOutput, DxErr
     Ok(DxOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn dx_into(input: &DxInput, out: &mut [f64]) -> Result<(), DxError> {
     dx_into_slice(out, input, Kernel::Auto)
@@ -1317,42 +1296,16 @@ pub fn expand_grid_dx(r: &DxBatchRange) -> Vec<DxParams> {
     expand_grid_checked(r).unwrap_or_else(|_| vec![])
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dx_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = dx_js(high, low, close, period)?;
-    crate::write_wasm_f64_output("dx_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dx_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dx_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("dx_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_dx_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = DxParams { period: None };
         let input = DxInput::from_candles(&candles, default_params);
@@ -1361,7 +1314,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_dx_into_matches_api() -> Result<(), Box<dyn Error>> {
         let n = 512usize;
@@ -1410,8 +1362,8 @@ mod tests {
 
     fn check_dx_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DxInput::from_candles(&candles, DxParams::default());
         let result = dx_with_kernel(&input, kernel)?;
@@ -1440,8 +1392,8 @@ mod tests {
 
     fn check_dx_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DxInput::with_default_candles(&candles);
         match input.data {
@@ -1506,8 +1458,8 @@ mod tests {
 
     fn check_dx_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = DxParams { period: Some(14) };
         let first_input = DxInput::from_candles(&candles, first_params);
@@ -1535,8 +1487,8 @@ mod tests {
 
     fn check_dx_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DxInput::from_candles(&candles, DxParams { period: Some(14) });
         let res = dx_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -1555,8 +1507,8 @@ mod tests {
 
     fn check_dx_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let high = source_type(&candles, "high");
         let low = source_type(&candles, "low");
         let close = source_type(&candles, "close");
@@ -1627,8 +1579,8 @@ mod tests {
     fn check_dx_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DxParams::default(),
@@ -1957,8 +1909,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = DxBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -2007,8 +1959,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = DxBatchBuilder::new()
             .kernel(kernel)
@@ -2027,8 +1979,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2117,298 +2069,6 @@ mod tests {
     gen_batch_tests!(check_batch_no_poison);
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "dx")]
-#[pyo3(signature = (high, low, close, period, kernel=None))]
-pub fn dx_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<f64>,
-    low: PyReadonlyArray1<f64>,
-    close: PyReadonlyArray1<f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = DxParams {
-        period: Some(period),
-    };
-    let inp = DxInput::from_hlc_slices(h, l, c, params);
-    let vec_out: Vec<f64> = py
-        .allow_threads(|| dx_with_kernel(&inp, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(vec_out.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dx_batch")]
-#[pyo3(signature = (high, low, close, period_range, kernel=None))]
-pub fn dx_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<f64>,
-    low: PyReadonlyArray1<f64>,
-    close: PyReadonlyArray1<f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods};
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let sweep = DxBatchRange::from_tuple(period_range);
-    let combos = expand_grid_checked(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-
-    let cols = h.len().min(l.len()).min(c.len());
-    let kern = validate_kernel(kernel, true)?;
-    let DxBatchOutput { values, .. } = py
-        .allow_threads(|| dx_batch_with_kernel(h, l, c, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let out_arr = PyArray1::from_vec(py, values);
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::dx_wrapper::CudaDx;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32 as DeviceArrayF32Cuda;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context as CudaContext;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dx_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, period_range, device_id=0))]
-pub fn dx_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DxDeviceArrayF32Py, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = DxBatchRange::from_tuple(period_range);
-    let (inner, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDx::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.dx_batch_dev(h, l, c, &sweep)
-            .map(|(arr, combos)| (arr, combos, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok((
-        DxDeviceArrayF32Py {
-            inner,
-            _ctx: ctx,
-            device_id: dev_id,
-        },
-        dict,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dx_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, period, device_id=0))]
-pub fn dx_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DxDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDx::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.dx_many_series_one_param_time_major_dev(h, l, c, cols, rows, period)
-            .map(|arr| (arr, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DxDeviceArrayF32Py {
-        inner,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DxDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32Cuda,
-    pub(crate) _ctx: Arc<CudaContext>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DxDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner;
-        let d = PyDict::new(py);
-
-        d.set_item("shape", (inner.rows, inner.cols))?;
-
-        d.set_item("typestr", "<f4")?;
-
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let size = inner.rows.saturating_mul(inner.cols);
-        let ptr = if size == 0 {
-            0usize
-        } else {
-            inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        unsafe {
-            use cust::sys::cuPointerGetAttribute;
-            let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-            let mut dev_ordinal: i32 = -1;
-            let res = cuPointerGetAttribute(
-                &mut dev_ordinal as *mut _ as *mut std::ffi::c_void,
-                attr,
-                self.inner.device_ptr(),
-            );
-            if res == cust::sys::CUresult::CUDA_SUCCESS && dev_ordinal >= 0 {
-                return Ok((2, dev_ordinal));
-            }
-            Ok((2, self.device_id as i32))
-        }
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy = cust::memory::DeviceBuffer::<f32>::from_slice(&[])
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Cuda {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d(
-            py,
-            buf,
-            rows,
-            cols,
-            alloc_dev,
-            max_version_bound,
-        )
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DxStream")]
-pub struct DxStreamPy {
-    inner: DxStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DxStreamPy {
-    #[new]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let params = DxParams {
-            period: Some(period),
-        };
-        let inner = DxStream::try_new(params)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.inner.update(high, low, close)
-    }
-}
-
 #[inline]
 pub fn dx_into_slice(dst: &mut [f64], input: &DxInput, kern: Kernel) -> Result<(), DxError> {
     let (h, l, c, len, first, chosen) = dx_prepare(input, kern)?;
@@ -2437,230 +2097,4 @@ pub fn dx_into_slice(dst: &mut [f64], input: &DxInput, kern: Kernel) -> Result<(
         *v = f64::NAN;
     }
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dx_js(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let input = DxInput::from_hlc_slices(
-        high,
-        low,
-        close,
-        DxParams {
-            period: Some(period),
-        },
-    );
-    let mut out = vec![0.0; high.len().min(low.len()).min(close.len())];
-    dx_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dx_into(
-    h_ptr: *const f64,
-    l_ptr: *const f64,
-    c_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if [
-        h_ptr as usize,
-        l_ptr as usize,
-        c_ptr as usize,
-        out_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let h = core::slice::from_raw_parts(h_ptr, len);
-        let l = core::slice::from_raw_parts(l_ptr, len);
-        let c = core::slice::from_raw_parts(c_ptr, len);
-        let inp = DxInput::from_hlc_slices(
-            h,
-            l,
-            c,
-            DxParams {
-                period: Some(period),
-            },
-        );
-
-        if out_ptr == h_ptr as *mut f64
-            || out_ptr == l_ptr as *mut f64
-            || out_ptr == c_ptr as *mut f64
-        {
-            let mut tmp = vec![0.0; len];
-            dx_into_slice(&mut tmp, &inp, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let dst = core::slice::from_raw_parts_mut(out_ptr, len);
-            dst.copy_from_slice(&tmp);
-        } else {
-            let out = core::slice::from_raw_parts_mut(out_ptr, len);
-            dx_into_slice(out, &inp, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dx_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dx_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DxBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DxBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<DxParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "dx_batch")]
-pub fn dx_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: DxBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = DxBatchRange::from_tuple(cfg.period_range);
-
-    let rows = expand_grid_checked(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let cols = high.len().min(low.len()).min(close.len());
-    let mut buf_mu = make_uninit_matrix(rows, cols);
-
-    let first = (0..cols)
-        .find(|&i| !high[i].is_nan() && !low[i].is_nan() && !close[i].is_nan())
-        .ok_or_else(|| JsValue::from_str("AllValuesNaN"))?;
-    let warm: Vec<usize> = expand_grid_checked(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .iter()
-        .map(|p| first + p.period.unwrap() - 1)
-        .collect();
-    init_matrix_prefixes(&mut buf_mu, cols, &warm);
-
-    let mut guard = core::mem::ManuallyDrop::new(buf_mu);
-    let out_slice: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
-    let combos = dx_batch_inner_into(
-        high,
-        low,
-        close,
-        &sweep,
-        detect_best_batch_kernel(),
-        false,
-        out_slice,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let values = unsafe {
-        Vec::from_raw_parts(
-            guard.as_mut_ptr() as *mut f64,
-            guard.len(),
-            guard.capacity(),
-        )
-    };
-    let js = DxBatchJsOutput {
-        values,
-        combos,
-        rows,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dx_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let batch_range = DxBatchRange::from_tuple((period_start, period_end, period_step));
-        let combos = DxParams::generate_batch_params((period_start, period_end, period_step));
-        let n_combos = combos.len();
-
-        if high_ptr == out_ptr || low_ptr == out_ptr || close_ptr == out_ptr {
-            let result = dx_batch_with_kernel(high, low, close, &batch_range, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len * n_combos);
-            out.copy_from_slice(&result.values);
-        } else {
-            let params = combos;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len * n_combos);
-
-            let first = high
-                .iter()
-                .zip(low)
-                .zip(close)
-                .position(|((&h, &l), &c)| !h.is_nan() && !l.is_nan() && !c.is_nan())
-                .ok_or_else(|| JsValue::from_str("All values are NaN"))?;
-
-            let mut buf_uninit = make_uninit_matrix(params.len(), len);
-            let warmup_periods: Vec<usize> = params
-                .iter()
-                .map(|p| first + p.period.unwrap() - 1)
-                .collect();
-            init_matrix_prefixes(&mut buf_uninit, len, &warmup_periods);
-
-            let buf_ptr = buf_uninit.as_mut_ptr() as *mut f64;
-            std::mem::forget(buf_uninit);
-            let slice_out = std::slice::from_raw_parts_mut(buf_ptr, params.len() * len);
-
-            for (i, param) in params.iter().enumerate() {
-                let row_offset = i * len;
-                let row = &mut slice_out[row_offset..row_offset + len];
-
-                let warmup = first + param.period.unwrap() - 1;
-                dx_scalar(high, low, close, param.period.unwrap(), first, row);
-            }
-
-            out.copy_from_slice(slice_out);
-        }
-        Ok(())
-    }
 }

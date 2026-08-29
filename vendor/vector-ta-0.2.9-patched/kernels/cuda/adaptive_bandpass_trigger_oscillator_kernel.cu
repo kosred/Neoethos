@@ -1,6 +1,111 @@
 #include <cmath>
 #include <cstdint>
 
+/* FreeBSD msun k_cos/k_sin and the small-argument s_cos reduction.
+ *
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ * Developed at SunPro/SunSoft. Permission to use, copy, modify, and
+ * distribute this software is freely granted, provided this notice is
+ * preserved.
+ *
+ * Adaptive Bandpass only calls cos with finite positive arguments below
+ * 2*pi/3 because length >= 6 and 0 < delta < 1. The Rust scalar carries the
+ * same bounded routine. Keeping the exact constants, reduction and
+ * parenthesisation avoids a host-libm versus CUDA-libdevice ULP split inside
+ * the recursive state.
+ */
+static __device__ __forceinline__ double abto_ms_k_cos(double x, double y) {
+    const double c1 = 0x1.555555555554cp-5;
+    const double c2 = -0x1.6c16c16c15177p-10;
+    const double c3 = 0x1.a01a019cb1590p-16;
+    const double c4 = -0x1.27e4f809c52adp-22;
+    const double c5 = 0x1.1ee9ebdb4b1c4p-29;
+    const double c6 = -0x1.8fae9be8838d4p-37;
+    const double z = x * x;
+    const double w2 = z * z;
+    const double r = z * (c1 + z * (c2 + z * c3))
+        + w2 * w2 * (c4 + z * (c5 + z * c6));
+    const double hz = 0.5 * z;
+    const double w = 1.0 - hz;
+    return w + (((1.0 - w) - hz) + (z * r - x * y));
+}
+
+static __device__ __forceinline__ double abto_ms_k_sin(double x, double y) {
+    const double s1 = -0x1.5555555555549p-3;
+    const double s2 = 0x1.111111110f8a6p-7;
+    const double s3 = -0x1.a01a019c161d5p-13;
+    const double s4 = 0x1.71de357b1fe7dp-19;
+    const double s5 = -0x1.ae5e68a2b9cebp-26;
+    const double s6 = 0x1.5d93a5acfd57cp-33;
+    const double z = x * x;
+    const double w = z * z;
+    const double r = s2 + z * (s3 + z * s4) + z * w * (s5 + z * s6);
+    const double v = z * x;
+    return x - ((z * (0.5 * y - v * r) - y) - v * s1);
+}
+
+static __device__ __forceinline__ void abto_reduce_pio2_near_half_pi(
+    double x,
+    unsigned int high,
+    double* y0_out,
+    double* y1_out) {
+    const double inv_pio2 = 0x1.45f306dc9c883p-1;
+    const double to_int = 0x1.8p+52;
+    const double pio2_1 = 0x1.921fb54400000p+0;
+    const double pio2_1t = 0x1.0b4611a626331p-34;
+    const double pio2_2 = 0x1.0b4611a600000p-34;
+    const double pio2_2t = 0x1.3198a2e037073p-69;
+    const double pio2_3 = 0x1.3198a2e000000p-69;
+    const double pio2_3t = 0x1.b839a252049c1p-104;
+
+    const double tmp = x * inv_pio2 + to_int;
+    const double f_n = tmp - to_int;
+    double r = x - f_n * pio2_1;
+    double w = f_n * pio2_1t;
+    double y0 = r - w;
+    const int ex = static_cast<int>(high >> 20);
+    int ey = static_cast<int>(
+        (static_cast<unsigned long long>(__double_as_longlong(y0)) >> 52) & 0x7ffULL);
+    if (ex - ey > 16) {
+        const double t = r;
+        w = f_n * pio2_2;
+        r = t - w;
+        w = f_n * pio2_2t - ((t - r) - w);
+        y0 = r - w;
+        ey = static_cast<int>(
+            (static_cast<unsigned long long>(__double_as_longlong(y0)) >> 52) & 0x7ffULL);
+        if (ex - ey > 49) {
+            const double t2 = r;
+            w = f_n * pio2_3;
+            r = t2 - w;
+            w = f_n * pio2_3t - ((t2 - r) - w);
+            y0 = r - w;
+        }
+    }
+    *y0_out = y0;
+    *y1_out = (r - y0) - w;
+}
+
+static __device__ __forceinline__ double abto_deterministic_cos(double x) {
+    const unsigned long long bits = static_cast<unsigned long long>(__double_as_longlong(x));
+    const unsigned int high = static_cast<unsigned int>((bits >> 32) & 0x7fffffffULL);
+    if (high <= 0x3fe921fbU) {
+        return abto_ms_k_cos(x, 0.0);
+    }
+    double y0;
+    double y1;
+    if ((high & 0x000fffffU) == 0x000921fbU) {
+        abto_reduce_pio2_near_half_pi(x, high, &y0, &y1);
+    } else {
+        const double pio2_1 = 0x1.921fb54400000p+0;
+        const double pio2_1t = 0x1.0b4611a626331p-34;
+        const double z = x - pio2_1;
+        y0 = z - pio2_1t;
+        y1 = (z - y0) - pio2_1t;
+    }
+    return -abto_ms_k_sin(y0, y1);
+}
+
 static __device__ inline double abto_median3(double x, double y, double z) {
     double min_xy = x < y ? x : y;
     double min_v = min_xy < z ? min_xy : z;
@@ -128,8 +233,8 @@ extern "C" __global__ void adaptive_bandpass_trigger_oscillator_batch_f64(
         double lead = nan;
         if (index >= in_phase_warmup) {
             double length = fmax(p, 6.0);
-            double beta = cos(2.0 * pi / length);
-            double cos_angle = cos(4.0 * pi * delta / length);
+            double beta = abto_deterministic_cos(2.0 * pi / length);
+            double cos_angle = abto_deterministic_cos(4.0 * pi * delta / length);
             double denom = fabs(cos_angle) < float_tol
                                ? (cos_angle < 0.0 ? -float_tol : float_tol)
                                : cos_angle;
@@ -206,6 +311,11 @@ extern "C" __global__ void adaptive_bandpass_trigger_oscillator_batch_f64(
  * denominators (q1, the dp denominator, and cos_angle). Carried across
  * unchanged - it is not an f32 machine epsilon and re-deriving it would move
  * the branch points relative to the CPU.
+ *
+ * TRANSCENDENTAL PARITY: both beta and cos_angle use the bounded msun cosine
+ * above, exactly matching the scalar's bounded msun implementation. Calling
+ * CUDA device `cos` here is forbidden: its valid 1-ULP difference from host
+ * libm is carried recursively and becomes a larger output mismatch.
  *
  * NaN SEMANTICS: `p.max(6.0)` and `(gamma*gamma - 1.0).max(0.0)` are
  * `f64::max`, which returns the NON-NaN operand. `fmax` matches; an if-chain
@@ -337,8 +447,9 @@ void adaptive_bandpass_trigger_oscillator_neo_batch_f64(
         double in_phase = NEO_F64_NAN;
         if (index >= IN_PHASE_WARMUP) {
             const double length    = fmax(p, 6.0);
-            const double beta      = cos(2.0 * PI_F64 / length);
-            const double cos_angle = cos(4.0 * PI_F64 * DELTA / length);
+            const double beta = abto_deterministic_cos(2.0 * PI_F64 / length);
+            const double cos_angle =
+                abto_deterministic_cos(4.0 * PI_F64 * DELTA / length);
             double denom;
             if (fabs(cos_angle) < FLOAT_TOL) {
                 denom = signbit(cos_angle) ? -FLOAT_TOL : FLOAT_TOL;

@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -27,8 +11,8 @@ use core::arch::x86_64::*;
 use rayon::prelude::*;
 use thiserror::Error;
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaAdosc;
+// External formula/edge authority (audit oracle only; never a runtime backend):
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_ADOSC.c
 
 #[derive(Debug, Clone)]
 pub enum AdoscData<'a> {
@@ -49,10 +33,6 @@ pub struct AdoscOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdoscParams {
     pub short_period: Option<usize>,
     pub long_period: Option<usize>,
@@ -201,7 +181,9 @@ pub enum AdoscError {
     },
     #[error("adosc: short_period must be less than long_period: short={short}, long={long}")]
     ShortPeriodGreaterThanLong { short: usize, long: usize },
-    #[error("adosc: At least one slice is empty: high={high}, low={low}, close={close}, volume={volume}")]
+    #[error(
+        "adosc: At least one slice is empty: high={high}, low={low}, close={close}, volume={volume}"
+    )]
     EmptySlices {
         high: usize,
         low: usize,
@@ -350,7 +332,6 @@ pub fn adosc_with_kernel(input: &AdoscInput, kernel: Kernel) -> Result<AdoscOutp
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn adosc_into(input: &AdoscInput, out: &mut [f64]) -> Result<(), AdoscError> {
     adosc_into_slice(out, input, Kernel::Auto)
@@ -391,7 +372,7 @@ pub unsafe fn adosc_scalar(
     let c0 = *cp;
     let v0 = *vp;
     let hl0 = h0 - l0;
-    let mfm0 = if hl0 != 0.0 {
+    let mfm0 = if hl0 > 0.0 {
         ((c0 - l0) - (h0 - c0)) / hl0
     } else {
         0.0
@@ -410,7 +391,7 @@ pub unsafe fn adosc_scalar(
         let v = *vp.add(i);
 
         let hl = h - l;
-        let mfm = if hl != 0.0 {
+        let mfm = if hl > 0.0 {
             ((c - l) - (h - c)) / hl
         } else {
             0.0
@@ -448,7 +429,7 @@ unsafe fn adosc_scalar_3_10(
     let c0 = *cp;
     let v0 = *vp;
     let hl0 = h0 - l0;
-    let mfm0 = if hl0 != 0.0 {
+    let mfm0 = if hl0 > 0.0 {
         ((c0 - l0) - (h0 - c0)) / hl0
     } else {
         0.0
@@ -470,7 +451,7 @@ unsafe fn adosc_scalar_3_10(
         let v = *vp.add(i);
 
         let hl = h - l;
-        let mfm = if hl != 0.0 {
+        let mfm = if hl > 0.0 {
             ((c - l) - (h - c)) / hl
         } else {
             0.0
@@ -781,7 +762,7 @@ fn adosc_batch_inner(
         let c0 = *cp;
         let v0 = *vp;
         let hl0 = h0 - l0;
-        let mfm0 = if hl0 != 0.0 {
+        let mfm0 = if hl0 > 0.0 {
             ((c0 - l0) - (h0 - c0)) / hl0
         } else {
             0.0
@@ -797,7 +778,7 @@ fn adosc_batch_inner(
             let v = *vp.add(i);
             let prev = *ap.add(i - 1);
             let hl = h - l;
-            let mfm = if hl != 0.0 {
+            let mfm = if hl > 0.0 {
                 ((c - l) - (h - c)) / hl
             } else {
                 0.0
@@ -919,7 +900,7 @@ pub fn adosc_batch_inner_into(
         let c0 = *cp;
         let v0 = *vp;
         let hl0 = h0 - l0;
-        let mfm0 = if hl0 != 0.0 {
+        let mfm0 = if hl0 > 0.0 {
             ((c0 - l0) - (h0 - c0)) / hl0
         } else {
             0.0
@@ -935,7 +916,7 @@ pub fn adosc_batch_inner_into(
             let v = *vp.add(i);
             let prev = *ap.add(i - 1);
             let hl = h - l;
-            let mfm = if hl != 0.0 {
+            let mfm = if hl > 0.0 {
                 ((c - l) - (h - c)) / hl
             } else {
                 0.0
@@ -1025,7 +1006,7 @@ pub unsafe fn adosc_row_scalar(
     let c0 = *cp;
     let v0 = *vp;
     let hl0 = h0 - l0;
-    let mfm0 = if hl0 != 0.0 {
+    let mfm0 = if hl0 > 0.0 {
         ((c0 - l0) - (h0 - c0)) / hl0
     } else {
         0.0
@@ -1044,7 +1025,7 @@ pub unsafe fn adosc_row_scalar(
         let v = *vp.add(i);
 
         let hl = h - l;
-        let mfm = if hl != 0.0 {
+        let mfm = if hl > 0.0 {
             ((c - l) - (h - c)) / hl
         } else {
             0.0
@@ -1172,7 +1153,7 @@ impl AdoscStream {
     pub fn update(&mut self, high: f64, low: f64, close: f64, volume: f64) -> f64 {
         if volume != 0.0 {
             let hl = high - low;
-            if hl != 0.0 {
+            if hl > 0.0 {
                 let mfm = ((close - low) - (high - close)) / hl;
                 self.sum_ad += mfm * volume;
             }
@@ -1193,78 +1174,19 @@ impl AdoscStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    short_period: usize,
-    long_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = adosc_js(high, low, close, volume, short_period, long_period)?;
-    crate::write_wasm_f64_output("adosc_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    short_period_start: usize,
-    short_period_end: usize,
-    short_period_step: usize,
-    long_period_start: usize,
-    long_period_end: usize,
-    long_period_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = adosc_batch_js(
-        high,
-        low,
-        close,
-        volume,
-        short_period_start,
-        short_period_end,
-        short_period_step,
-        long_period_start,
-        long_period_end,
-        long_period_step,
-    )?;
-    crate::write_wasm_f64_output("adosc_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adosc_batch_unified_js(high, low, close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs("adosc_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_adosc_accuracy(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdoscInput::with_default_candles(&candles);
         let result = adosc_with_kernel(&input, kernel)?;
         assert_eq!(result.values.len(), candles.close.len());
@@ -1297,8 +1219,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = AdoscParams {
             short_period: Some(2),
             long_period: None,
@@ -1321,8 +1243,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdoscInput::with_default_candles(&candles);
         match input.data {
             AdoscData::Candles { .. } => {}
@@ -1402,8 +1324,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = AdoscParams {
             short_period: Some(3),
             long_period: Some(10),
@@ -1432,8 +1354,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdoscInput::from_candles(&candles, AdoscParams::default());
         let result = adosc_with_kernel(&input, kernel)?;
         assert_eq!(result.values.len(), candles.close.len());
@@ -1455,8 +1377,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = AdoscParams {
             short_period: Some(3),
             long_period: Some(10),
@@ -1494,8 +1416,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let batch = AdoscBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&candles)?;
@@ -1528,8 +1450,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let len = candles.close.len();
         let mut high = AVec::<f64>::with_capacity(CACHELINE_ALIGN, len);
@@ -1586,8 +1508,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let slice_end = candles.close.len().min(1000);
         let high_slice = &candles.high[..slice_end];
@@ -1799,7 +1721,7 @@ mod tests {
                         let l = low[i];
                         let c = close[i];
                         let hl = h - l;
-                        if hl != 0.0 {
+                        if hl > 0.0 {
                             let mfm = ((c - l) - (h - c)) / hl;
                             prop_assert!(
                                 mfm >= -1.0 - 1e-10 && mfm <= 1.0 + 1e-10,
@@ -1837,7 +1759,7 @@ mod tests {
                         let c0 = close[0];
                         let v0 = volume[0];
                         let hl0 = h0 - l0;
-                        let mfm0 = if hl0 != 0.0 {
+                        let mfm0 = if hl0 > 0.0 {
                             ((c0 - l0) - (h0 - c0)) / hl0
                         } else {
                             0.0
@@ -1857,7 +1779,7 @@ mod tests {
                         let c1 = close[1];
                         let v1 = volume[1];
                         let hl1 = h1 - l1;
-                        let mfm1 = if hl1 != 0.0 {
+                        let mfm1 = if hl1 > 0.0 {
                             ((c1 - l1) - (h1 - c1)) / hl1
                         } else {
                             0.0
@@ -1951,7 +1873,6 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_adosc_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let len = 512usize;
@@ -2033,598 +1954,4 @@ pub fn adosc_into_slice(
         }
     }
     Ok(())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adosc")]
-#[pyo3(signature = (high, low, close, volume, short_period, long_period, kernel=None))]
-pub fn adosc_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    short_period: usize,
-    long_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-
-    let len = close_slice.len();
-    if high_slice.len() != len || low_slice.len() != len || volume_slice.len() != len {
-        return Err(PyValueError::new_err(format!(
-            "All input arrays must have the same length. Got high={}, low={}, close={}, volume={}",
-            high_slice.len(),
-            low_slice.len(),
-            close_slice.len(),
-            volume_slice.len()
-        )));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = AdoscParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-    };
-    let adosc_in =
-        AdoscInput::from_slices(high_slice, low_slice, close_slice, volume_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| adosc_with_kernel(&adosc_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdoscStream")]
-pub struct AdoscStreamPy {
-    stream: AdoscStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdoscStreamPy {
-    #[new]
-    fn new(short_period: usize, long_period: usize) -> PyResult<Self> {
-        let params = AdoscParams {
-            short_period: Some(short_period),
-            long_period: Some(long_period),
-        };
-        let stream =
-            AdoscStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AdoscStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64, volume: f64) -> f64 {
-        self.stream.update(high, low, close, volume)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32AdoscPy {
-    pub(crate) inner: Option<crate::cuda::oscillators::adosc_wrapper::DeviceArrayF32Adosc>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32AdoscPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-
-        Ok((2, inner.device_id as i32))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        if let Some(obj) = &stream {
-            if let Ok(i) = obj.extract::<i64>(py) {
-                if i == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__: stream 0 is disallowed for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let device_id = inner.device_id as i32;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, device_id, max_version_bound)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adosc_batch")]
-#[pyo3(signature = (high, low, close, volume, short_period_range, long_period_range, kernel=None))]
-pub fn adosc_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    short_period_range: (usize, usize, usize),
-    long_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-
-    let len = close_slice.len();
-    if high_slice.len() != len || low_slice.len() != len || volume_slice.len() != len {
-        return Err(PyValueError::new_err(format!(
-            "All input arrays must have the same length. Got high={}, low={}, close={}, volume={}",
-            high_slice.len(),
-            low_slice.len(),
-            close_slice.len(),
-            volume_slice.len()
-        )));
-    }
-
-    let sweep = AdoscBatchRange {
-        short_period: short_period_range,
-        long_period: long_period_range,
-    };
-
-    let combos = expand_grid_checked(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = len;
-
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [expected], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| -> Result<Vec<AdoscParams>, AdoscError> {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-
-            adosc_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                volume_slice,
-                &sweep,
-                simd,
-                true,
-                slice_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "shorts",
-        combos
-            .iter()
-            .map(|p| p.short_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "longs",
-        combos
-            .iter()
-            .map(|p| p.long_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "adosc_cuda_batch_dev")]
-#[pyo3(signature = (high, low, close, volume, short_period_range, long_period_range, device_id=0))]
-pub fn adosc_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: numpy::PyReadonlyArray1<'_, f32>,
-    low: numpy::PyReadonlyArray1<'_, f32>,
-    close: numpy::PyReadonlyArray1<'_, f32>,
-    volume: numpy::PyReadonlyArray1<'_, f32>,
-    short_period_range: (usize, usize, usize),
-    long_period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32AdoscPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let len = close_slice.len();
-    if high_slice.len() != len || low_slice.len() != len || volume_slice.len() != len {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-    let sweep = AdoscBatchRange {
-        short_period: short_period_range,
-        long_period: long_period_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaAdosc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.adosc_batch_dev(high_slice, low_slice, close_slice, volume_slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32AdoscPy { inner: Some(inner) })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "adosc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, close_tm, volume_tm, cols, rows, short_period, long_period, device_id=0))]
-pub fn adosc_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm: numpy::PyReadonlyArray1<'_, f32>,
-    volume_tm: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    short_period: usize,
-    long_period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32AdoscPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high_slice = high_tm.as_slice()?;
-    let low_slice = low_tm.as_slice()?;
-    let close_slice = close_tm.as_slice()?;
-    let volume_slice = volume_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if high_slice.len() != expected
-        || low_slice.len() != expected
-        || close_slice.len() != expected
-        || volume_slice.len() != expected
-    {
-        return Err(PyValueError::new_err("time-major input lengths mismatch"));
-    }
-    let inner = py.allow_threads(|| {
-        let cuda = CudaAdosc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.adosc_many_series_one_param_time_major_dev(
-            high_slice,
-            low_slice,
-            close_slice,
-            volume_slice,
-            cols,
-            rows,
-            short_period,
-            long_period,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32AdoscPy { inner: Some(inner) })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    short_period: usize,
-    long_period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = AdoscParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-    };
-    let input = AdoscInput::from_slices(high, low, close, volume, params);
-
-    let mut output = vec![0.0; high.len()];
-    adosc_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    short_period_start: usize,
-    short_period_end: usize,
-    short_period_step: usize,
-    long_period_start: usize,
-    long_period_end: usize,
-    long_period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AdoscBatchRange {
-        short_period: (short_period_start, short_period_end, short_period_step),
-        long_period: (long_period_start, long_period_end, long_period_step),
-    };
-
-    adosc_batch_inner(high, low, close, volume, &sweep, Kernel::Scalar, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_batch_metadata_js(
-    short_period_start: usize,
-    short_period_end: usize,
-    short_period_step: usize,
-    long_period_start: usize,
-    long_period_end: usize,
-    long_period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AdoscBatchRange {
-        short_period: (short_period_start, short_period_end, short_period_step),
-        long_period: (long_period_start, long_period_end, long_period_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let mut metadata = Vec::with_capacity(combos.len() * 2);
-
-    for combo in combos {
-        metadata.push(combo.short_period.unwrap() as f64);
-        metadata.push(combo.long_period.unwrap() as f64);
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdoscBatchConfig {
-    pub short_period_range: (usize, usize, usize),
-    pub long_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdoscBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AdoscParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adosc_batch)]
-pub fn adosc_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: AdoscBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AdoscBatchRange {
-        short_period: config.short_period_range,
-        long_period: config.long_period_range,
-    };
-
-    let output = adosc_batch_inner(high, low, close, volume, &sweep, Kernel::Scalar, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = AdoscBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period: usize,
-    long_period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        let params = AdoscParams {
-            short_period: Some(short_period),
-            long_period: Some(long_period),
-        };
-        let input = AdoscInput::from_slices(high, low, close, volume, params);
-
-        if out_ptr as *const f64 == high_ptr
-            || out_ptr as *const f64 == low_ptr
-            || out_ptr as *const f64 == close_ptr
-            || out_ptr as *const f64 == volume_ptr
-        {
-            let mut temp = vec![0.0; len];
-            adosc_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            adosc_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adosc_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period_start: usize,
-    short_period_end: usize,
-    short_period_step: usize,
-    long_period_start: usize,
-    long_period_end: usize,
-    long_period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer passed to adosc_batch_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        let sweep = AdoscBatchRange {
-            short_period: (short_period_start, short_period_end, short_period_step),
-            long_period: (long_period_start, long_period_end, long_period_step),
-        };
-
-        let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let expected = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, expected);
-
-        adosc_batch_inner_into(high, low, close, volume, &sweep, Kernel::Scalar, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

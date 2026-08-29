@@ -16,10 +16,12 @@
 //! this example is minutes to build and exercises exactly the path in question.
 //!
 //! Usage:
-//!   gpu_discovery_probe --root <store> --symbol EURUSD --base M3 \
+//!   gpu_discovery_probe --root <store> --identity <d1...> \
 //!       [--higher M15,H1,H4] [--population 512] [--generations 3]
 
 use anyhow::{Context, Result};
+use neoethos_data::{CanonicalDatasetIdentity, CanonicalTimeframe};
+use neoethos_search::data_selection::ExactCanonicalSeries;
 use std::time::Instant;
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -27,6 +29,26 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+fn exact_identity(args: &[String]) -> Result<CanonicalDatasetIdentity> {
+    let encoded = flag(args, "--identity").context(
+        "--identity <d1...> is required; display symbol/timeframe fields are not an identity",
+    )?;
+    CanonicalDatasetIdentity::from_path_component(&encoded)
+        .with_context(|| format!("invalid canonical dataset identity {encoded:?}"))
+}
+
+fn direct_timeframes(csv: &str) -> Result<Vec<CanonicalTimeframe>> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<CanonicalTimeframe>()
+                .with_context(|| format!("unsupported direct canonical timeframe {value:?}"))
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -39,15 +61,11 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let root = flag(&args, "--root").unwrap_or_else(|| "data".to_string());
-    let symbol = flag(&args, "--symbol").unwrap_or_else(|| "EURUSD".to_string());
-    let base = flag(&args, "--base").unwrap_or_else(|| "M3".to_string());
+    let identity = exact_identity(&args)?;
+    let symbol = identity.symbol_name().to_owned();
+    let base = identity.timeframe();
     let higher = flag(&args, "--higher").unwrap_or_else(|| "M15,H1,H4".to_string());
-    let higher_list: Vec<String> = higher
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
+    let higher_timeframes = direct_timeframes(&higher)?;
 
     let mut settings = neoethos_core::Settings::load()
         .context("loading config.yaml — the probe uses the same settings as a real run")?;
@@ -85,7 +103,8 @@ fn main() -> Result<()> {
     neoethos_search::install_search_runtime_overrides_from_settings(&settings);
 
     let mut config = neoethos_search::DiscoveryConfig::try_from_settings(&settings)?;
-    if let Some(min_trades) = flag(&args, "--min-trades-per-day").and_then(|v| v.parse::<f64>().ok())
+    if let Some(min_trades) =
+        flag(&args, "--min-trades-per-day").and_then(|v| v.parse::<f64>().ok())
     {
         config.min_trades_per_day = min_trades;
     }
@@ -130,24 +149,25 @@ fn main() -> Result<()> {
     }
     // The FX resolver needs the store this probe was pointed at, not the one
     // config.yaml happens to name.
-    neoethos_search::fx_rates::set_store_root(&root);
+    neoethos_search::fx_rates::set_store_selection(&root, identity.clone())
+        .context("installing the exact source/account selection for FX conversion")?;
 
-    tracing::info!(root, symbol, base, higher, "loading dataset");
+    tracing::info!(
+        root,
+        symbol,
+        base = %base,
+        higher,
+        identity = %identity.to_path_component(),
+        "loading exact canonical dataset series"
+    );
     let loaded = Instant::now();
-    // Only the timeframes this run uses. The unrestricted loader pulls every
-    // series in the store, and M1 alone is 5.27 M bars — minutes of load time
-    // and gigabytes of RAM for data the probe never reads.
-    let wanted: Vec<&str> = std::iter::once(base.as_str())
-        .chain(higher_refs.iter().copied())
-        .collect();
-    let dataset = neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &wanted)
-        .with_context(|| format!("loading {symbol} {wanted:?} from {root}"))?;
-    let features = neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)
-        .context("building multi-timeframe features")?;
-    let base_ohlcv = dataset
-        .frames
-        .get(&base)
-        .with_context(|| format!("{symbol} has no {base} series in this store"))?;
+    let series = ExactCanonicalSeries::open(&root, identity)
+        .context("opening the exact current canonical dataset generation")?;
+    let input = series
+        .load_search_input(&higher_timeframes)
+        .context("loading direct base/higher timeframes and building their feature cube")?;
+    let features = input.features();
+    let run_input = input.as_run_input()?;
     let bars = features.n_samples();
     tracing::info!(
         bars,
@@ -159,7 +179,7 @@ fn main() -> Result<()> {
     let population = config.population;
     let generations = config.generations;
     let started = Instant::now();
-    let result = neoethos_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
+    let result = neoethos_search::run_discovery_cycle(&run_input, &config)?;
     let elapsed = started.elapsed().as_secs_f64();
 
     // Deliberately NOT a throughput figure comparable to the bench.

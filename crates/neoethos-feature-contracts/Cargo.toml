@@ -1,0 +1,12 @@
+[package]
+name = "neoethos-feature-contracts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Canonical feature-plan identity and dataset provenance contracts for NeoEthos"
+build = "build.rs"
+
+[dependencies]
+neoethos-dataset-contracts.workspace = true
+sha2 = "0.10"
+

@@ -4,7 +4,8 @@ use crfmnes::{CrfmnesOptimizer as CrfmnesBackendOptimizer, rec_lamb};
 #[cfg(feature = "neuro-evolution")]
 use nalgebra::DVector;
 use ndarray::Array2;
-use polars::prelude::{DataFrame, Series};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use rand::SeedableRng;
 use rand_xoshiro::Xoroshiro128PlusPlus;
 use serde::{Deserialize, Serialize};
@@ -14,11 +15,13 @@ use std::path::Path;
 use neoethos_core::BackendKind;
 
 #[cfg(feature = "neuro-evolution-gpu")]
-use super::crfmnes_gpu::{neuro_evo_cuda_kernel_enabled, try_selection_losses_cuda};
+use super::crfmnes_gpu::try_selection_losses_cuda;
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, three_class_runtime_confidence,
     try_build_runtime_artifact_metadata,
 };
+#[cfg(feature = "neuro-evolution-gpu")]
+use crate::common::ResolvedCudaDevicePolicy;
 use crate::runtime::artifacts::{
     RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
 };
@@ -28,7 +31,7 @@ use crate::runtime::capabilities::{
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_dataframe,
+    FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_frame,
     read_json, remap_three_class_labels, softmax_rows, write_json,
 };
 
@@ -41,6 +44,33 @@ const FALLBACK_DEGRADED_REASON: &str = "crfmnes_backend_degraded_to_simple_es";
 const DEFAULT_MAX_NEURO_EVO_EVALUATIONS: usize = 30_000;
 
 type NeuroEvoParams = (Array2<f32>, Vec<f32>, Array2<f32>, Vec<f32>);
+
+/// Checked, backend-local narrowing for the f32 evolutionary kernels. The
+/// shared typed frame and scaler remain f64; values that cannot survive this
+/// explicit backend boundary fail closed instead of being silently rounded to
+/// infinity or zero.
+fn neuro_evo_backend_f32_matrix(features: &Array2<f64>) -> Result<Array2<f32>> {
+    let mut narrowed = Vec::with_capacity(features.len());
+    for ((row, column), value) in features.indexed_iter() {
+        if value.abs() > f32::MAX as f64 {
+            bail!(
+                "neuro-evo f32 backend cannot represent feature row {row} column {column}: {value}"
+            );
+        }
+        let converted = *value as f32;
+        if !converted.is_finite() {
+            bail!("neuro-evo f32 backend produced non-finite feature row {row} column {column}");
+        }
+        if *value != 0.0 && converted == 0.0 {
+            bail!(
+                "neuro-evo f32 backend underflowed non-zero feature row {row} column {column}: {value}"
+            );
+        }
+        narrowed.push(converted);
+    }
+    Array2::from_shape_vec(features.dim(), narrowed)
+        .context("shape neuro-evo f32 backend feature matrix")
+}
 
 fn default_neuro_evo_requested_device_policy() -> String {
     "auto".to_string()
@@ -395,6 +425,7 @@ struct NeuroEvoArtifact {
     runtime_backend_kind: Option<BackendKind>,
     #[serde(default = "default_neuro_evo_requested_device_policy")]
     requested_device_policy: String,
+    effective_device_policy: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_degraded_reason: Option<String>,
     #[serde(default)]
@@ -423,6 +454,7 @@ impl Default for NeuroEvoArtifact {
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
             runtime_backend_kind: Some(neuro_evo_runtime_backend_kind(FALLBACK_BACKEND_NAME)),
             requested_device_policy: default_neuro_evo_requested_device_policy(),
+            effective_device_policy: "unresolved".to_string(),
             runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
             runtime_metadata: None,
             fitted: false,
@@ -445,6 +477,7 @@ pub struct NeuroEvoExpert {
     params: Vec<f32>,
     search_backend: String,
     requested_device_policy: String,
+    effective_device_policy: String,
     runtime_degraded_reason: Option<String>,
     fitted: bool,
 }
@@ -504,6 +537,7 @@ impl NeuroEvoExpert {
             params: vec![0.0; param_dim],
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
             requested_device_policy: default_neuro_evo_requested_device_policy(),
+            effective_device_policy: "unresolved".to_string(),
             runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
             fitted: false,
         }
@@ -516,7 +550,13 @@ impl NeuroEvoExpert {
     }
 
     pub fn with_device_policy(mut self, policy: impl AsRef<str>) -> Self {
-        self.requested_device_policy = normalize_runtime_device_policy(policy.as_ref());
+        let policy = policy.as_ref().trim();
+        self.requested_device_policy = if policy.is_empty() {
+            "auto".to_string()
+        } else {
+            policy.to_ascii_lowercase()
+        };
+        self.effective_device_policy = "unresolved".to_string();
         self
     }
 
@@ -525,7 +565,7 @@ impl NeuroEvoExpert {
             return ((0..rows).collect(), Vec::new());
         }
 
-        let val_rows = ((rows as f32) * 0.2).round() as usize;
+        let val_rows = ((rows as f64) * 0.2).round() as usize;
         let val_rows = val_rows.clamp(1, rows.saturating_sub(1));
         let train_rows = rows - val_rows;
 
@@ -719,9 +759,74 @@ impl NeuroEvoExpert {
                 );
             }
         }
-        if artifact.requested_device_policy.trim().is_empty() {
-            bail!("neuro-evo artifact requested_device_policy must not be blank");
+        let requested_device =
+            crate::common::parse_cuda_device_policy(&artifact.requested_device_policy)
+                .context("validate neuro-evo artifact requested CUDA policy")?;
+        let effective_label = artifact.effective_device_policy.trim().to_ascii_lowercase();
+        let effective_device =
+            crate::common::parse_cuda_device_policy(&artifact.effective_device_policy)
+                .context("validate neuro-evo artifact effective CUDA policy")?;
+        let effective_cuda_ordinal = match effective_device {
+            crate::common::CudaDevicePolicy::Cpu if effective_label == "cpu" => None,
+            crate::common::CudaDevicePolicy::Gpu { ordinal }
+                if effective_label == format!("gpu:{ordinal}") =>
+            {
+                Some(ordinal)
+            }
+            _ => bail!(
+                "neuro-evo artifact effective device must be `cpu` or exact `gpu:<ordinal>`, got `{}`",
+                artifact.effective_device_policy
+            ),
+        };
+        match (requested_device, effective_cuda_ordinal) {
+            (crate::common::CudaDevicePolicy::Cpu, Some(_)) => {
+                bail!("neuro-evo artifact requested CPU but recorded CUDA fitness")
+            }
+            (crate::common::CudaDevicePolicy::Gpu { .. }, None) => {
+                bail!("neuro-evo artifact requested explicit CUDA but recorded CPU fitness")
+            }
+            (crate::common::CudaDevicePolicy::Gpu { ordinal: requested }, Some(recorded))
+                if requested != recorded =>
+            {
+                bail!(
+                    "neuro-evo artifact CUDA ordinal mismatch: requested {requested}, recorded {recorded}"
+                )
+            }
+            (crate::common::CudaDevicePolicy::Auto, Some(recorded)) if recorded != 0 => {
+                bail!("neuro-evo Auto artifact must record CUDA ordinal 0, got {recorded}")
+            }
+            _ => {}
         }
+        if artifact.search_backend.contains("cuda") != effective_cuda_ordinal.is_some() {
+            bail!(
+                "neuro-evo runtime backend `{}` is inconsistent with effective device `{}`",
+                artifact.search_backend,
+                artifact.effective_device_policy
+            );
+        }
+        let current_device = crate::common::resolve_cuda_device_policy(
+            &artifact.requested_device_policy,
+            crate::tree_models::config::nvidia_gpu_count(),
+        )?;
+        if matches!(requested_device, crate::common::CudaDevicePolicy::Auto)
+            && matches!(
+                current_device,
+                crate::common::ResolvedCudaDevicePolicy::Cuda { .. }
+            )
+            && effective_cuda_ordinal.is_none()
+        {
+            bail!(
+                "neuro-evo Auto artifact recorded CPU fitness, but NVIDIA is now visible; retrain the artifact on CUDA"
+            );
+        }
+        #[cfg(not(feature = "neuro-evolution-gpu"))]
+        if let crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } = current_device {
+            bail!(
+                "neuro-evo artifact resolves CUDA ordinal {ordinal}, but this build lacks `neuro-evolution-gpu`"
+            );
+        }
+        #[cfg(feature = "neuro-evolution-gpu")]
+        let _ = current_device;
 
         if metadata.feature_columns != artifact.feature_columns {
             bail!("neuro-evo artifact feature columns do not match runtime metadata");
@@ -784,11 +889,12 @@ impl NeuroEvoExpert {
         features: &Array2<f32>,
         labels: &[usize],
     ) -> Result<f64> {
-        let probabilities = softmax_rows(&self.logits_from_params(params, features)?);
+        let logits = self.logits_from_params(params, features)?.mapv(f64::from);
+        let probabilities = softmax_rows(&logits)?;
         let mut loss = 0.0_f64;
         for row in 0..probabilities.nrows() {
             let class_idx = labels[row];
-            let probability = probabilities[(row, class_idx)].clamp(1e-6, 1.0 - 1e-6) as f64;
+            let probability = probabilities[(row, class_idx)].clamp(1e-6, 1.0 - 1e-6);
             loss -= probability.ln();
         }
         loss /= probabilities.nrows().max(1) as f64;
@@ -912,9 +1018,13 @@ impl NeuroEvoExpert {
         Ok(())
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
         self.ensure_runtime_state_ready()?;
-        let probabilities = self.predict_proba(x)?;
+        let probabilities = self.predict_proba(x, lease)?;
         let (execution_backend, degraded_reason) = self.runtime_details();
         let mut predictions = Vec::with_capacity(probabilities.nrows());
         for row in probabilities.outer_iter() {
@@ -942,10 +1052,11 @@ impl Default for NeuroEvoExpert {
 }
 
 impl ExpertModel for NeuroEvoExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| {
+        let (features, feature_columns) = feature_matrix_from_frame(x)?;
         let scaler = FeatureScaler::fit(&features)?;
-        let scaled = scaler.transform(&features)?;
+        let scaled = neuro_evo_backend_f32_matrix(&scaler.transform(&features)?)?;
         let labels = remap_three_class_labels(y)?;
         if scaled.nrows() < 32 {
             bail!(
@@ -971,11 +1082,34 @@ impl ExpertModel for NeuroEvoExpert {
         let effective_generations = self.effective_generation_count();
         let mut selected_backend = FALLBACK_BACKEND_NAME.to_string();
         let mut selected_degraded_reason = Some(FALLBACK_DEGRADED_REASON.to_string());
+        let resolved_cuda_device = crate::common::resolve_cuda_device_policy(
+            &self.requested_device_policy,
+            crate::tree_models::config::nvidia_gpu_count(),
+        )?;
+        self.effective_device_policy = match resolved_cuda_device {
+            crate::common::ResolvedCudaDevicePolicy::Cpu => "cpu".to_string(),
+            crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } => {
+                format!("gpu:{ordinal}")
+            }
+        };
         #[cfg(feature = "neuro-evolution-gpu")]
         let mut used_cuda_fitness = false;
         #[cfg(feature = "neuro-evolution-gpu")]
-        let mut cuda_fitness_disabled = false;
-
+        let resolved_cuda_policy = match resolved_cuda_device {
+            ResolvedCudaDevicePolicy::Cpu => None,
+            ResolvedCudaDevicePolicy::Cuda { ordinal } => Some(format!("gpu:{ordinal}")),
+        };
+        #[cfg(feature = "neuro-evolution-gpu")]
+        let _cubecl_training_residency_scope = resolved_cuda_policy
+            .as_ref()
+            .map(|_| crate::cubecl_lifecycle::cubecl_residency_scope());
+        #[cfg(not(feature = "neuro-evolution-gpu"))]
+        if let crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } = resolved_cuda_device {
+            bail!(
+                "CR-FM-NES resolved CUDA ordinal {ordinal} from policy `{}`, but this binary was built without `neuro-evolution-gpu`",
+                self.requested_device_policy
+            );
+        }
         if effective_generations < self.generations {
             tracing::info!(
                 "neuro-evo budget capped generations from {} to {} (population={}, islands={}, max_evals={})",
@@ -995,10 +1129,8 @@ impl ExpertModel for NeuroEvoExpert {
             for _ in 0..effective_generations {
                 let _ = optimizer.run_generation_batch(|candidates| {
                     #[cfg(feature = "neuro-evolution-gpu")]
-                    if !cuda_fitness_disabled
-                        && neuro_evo_cuda_kernel_enabled(&self.requested_device_policy)
-                    {
-                        match try_selection_losses_cuda(
+                    if let Some(cuda_policy) = resolved_cuda_policy.as_deref() {
+                        let losses = try_selection_losses_cuda(
                             candidates,
                             &train_features,
                             &train_labels,
@@ -1007,30 +1139,29 @@ impl ExpertModel for NeuroEvoExpert {
                             self.input_dim,
                             self.hidden_dim,
                             param_dim,
-                            &self.requested_device_policy,
-                        ) {
-                            Ok(losses) => {
-                                used_cuda_fitness = true;
-                                let mut selection_losses = Vec::with_capacity(losses.len());
-                                for (candidate, (selection_loss, _train_loss, _val_loss)) in
-                                    candidates.iter().zip(losses)
-                                {
-                                    if selection_loss < best_selection_loss {
-                                        best_selection_loss = selection_loss;
-                                        best_params =
-                                            candidate.iter().map(|value| *value as f32).collect();
-                                    }
-                                    selection_losses.push(selection_loss);
-                                }
-                                return Ok(selection_losses);
-                            }
-                            Err(err) => {
-                                cuda_fitness_disabled = true;
-                                tracing::warn!(
-                                    "neuro-evo cuda fitness kernel unavailable, falling back to cpu fitness evaluation: {err}"
-                                );
-                            }
+                            cuda_policy,
+                        )
+                        .context("execute requested CR-FM-NES cuda fitness kernel")?;
+                        if losses.len() != candidates.len() {
+                            bail!(
+                                "CR-FM-NES cuda fitness kernel returned {} losses for {} candidates",
+                                losses.len(),
+                                candidates.len()
+                            );
                         }
+                        used_cuda_fitness = true;
+                        let mut selection_losses = Vec::with_capacity(losses.len());
+                        for (candidate, (selection_loss, _train_loss, _val_loss)) in
+                            candidates.iter().zip(losses)
+                        {
+                            if selection_loss < best_selection_loss {
+                                best_selection_loss = selection_loss;
+                                best_params =
+                                    candidate.iter().map(|value| *value as f32).collect();
+                            }
+                            selection_losses.push(selection_loss);
+                        }
+                        return Ok(selection_losses);
                     }
 
                     candidates
@@ -1079,17 +1210,21 @@ impl ExpertModel for NeuroEvoExpert {
         self.runtime_degraded_reason = selected_degraded_reason;
         self.fitted = true;
         Ok(())
+        })
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        self.ensure_runtime_state_ready()?;
-        ensure_feature_columns_match(&self.feature_columns, x)?;
-        let (features, _) = feature_matrix_from_dataframe(x)?;
-        let scaler = self.scaler.as_ref().context("neuro-evo scaler missing")?;
-        let scaled = scaler.transform(&features)?;
-        Ok(softmax_rows(
-            &self.logits_from_params(&self.params, &scaled)?,
-        ))
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| {
+            self.ensure_runtime_state_ready()?;
+            ensure_feature_columns_match(&self.feature_columns, x)?;
+            let (features, _) = feature_matrix_from_frame(x)?;
+            let scaler = self.scaler.as_ref().context("neuro-evo scaler missing")?;
+            let scaled = neuro_evo_backend_f32_matrix(&scaler.transform(&features)?)?;
+            let logits = self
+                .logits_from_params(&self.params, &scaled)?
+                .mapv(f64::from);
+            softmax_rows(&logits)
+        })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -1123,6 +1258,7 @@ impl ExpertModel for NeuroEvoExpert {
                 search_backend: self.search_backend.clone(),
                 runtime_backend_kind: Some(neuro_evo_runtime_backend_kind(&self.search_backend)),
                 requested_device_policy: self.requested_device_policy.clone(),
+                effective_device_policy: self.effective_device_policy.clone(),
                 runtime_degraded_reason: self.runtime_degraded_reason.clone(),
                 runtime_metadata: Some(runtime_metadata),
                 fitted: self.fitted,
@@ -1149,7 +1285,8 @@ impl ExpertModel for NeuroEvoExpert {
         let next_params = artifact.params;
         let next_search_backend = artifact.search_backend;
         let next_requested_device_policy =
-            normalize_runtime_device_policy(&artifact.requested_device_policy);
+            artifact.requested_device_policy.trim().to_ascii_lowercase();
+        let next_effective_device_policy = artifact.effective_device_policy;
         let next_runtime_degraded_reason = artifact.runtime_degraded_reason;
         let next_fitted = artifact.fitted;
 
@@ -1167,6 +1304,7 @@ impl ExpertModel for NeuroEvoExpert {
         self.params = next_params;
         self.search_backend = next_search_backend;
         self.requested_device_policy = next_requested_device_policy;
+        self.effective_device_policy = next_effective_device_policy;
         self.runtime_degraded_reason = next_runtime_degraded_reason;
         self.fitted = next_fitted;
         Ok(())
@@ -1255,8 +1393,30 @@ impl NeuroEvoExpert {
 mod tests {
     use super::*;
     use crate::base::build_runtime_artifact_metadata;
-    use polars::prelude::{DataFrame, NamedFrom, Series};
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+    use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn typed_frame(columns: Vec<(&str, Vec<f64>)>) -> Result<FeatureFrame> {
+        let rows = columns.first().map_or(0, |(_, values)| values.len());
+        let columns = columns
+            .into_iter()
+            .map(|(name, values)| {
+                FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+    }
+
+    fn one_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker is valid");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("isolated neuro-evo test lease")
+    }
 
     fn expected_training_backend() -> (&'static str, Option<&'static str>) {
         #[cfg(feature = "neuro-evolution")]
@@ -1294,31 +1454,23 @@ mod tests {
 
     #[test]
     fn neuro_evo_save_records_training_rows() -> Result<()> {
-        let features = DataFrame::new(vec![
-            Series::new(
-                "f1".into(),
-                (0..32).map(|idx| idx as f64).collect::<Vec<_>>(),
-            )
-            .into(),
-            Series::new(
-                "f2".into(),
+        let features = typed_frame(vec![
+            ("f1", (0..32).map(|idx| idx as f64).collect::<Vec<_>>()),
+            (
+                "f2",
                 (0..32).map(|idx| (idx as f64) * 0.5).collect::<Vec<_>>(),
-            )
-            .into(),
+            ),
         ])?;
-        let labels = Series::new(
-            "target".into(),
-            (0..32)
-                .map(|idx| match idx % 3 {
-                    0 => -1,
-                    1 => 0,
-                    _ => 1,
-                })
-                .collect::<Vec<_>>(),
-        );
+        let labels = (0..32)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
 
         let mut expert = NeuroEvoExpert::with_config(2, 8, 0.25, 4).with_search_topology(4, 1);
-        expert.fit(&features, &labels)?;
+        expert.fit(&features, &labels, &one_worker_lease())?;
 
         let path = temp_model_dir("neuro_evo");
         expert.save(&path)?;
@@ -1359,12 +1511,9 @@ mod tests {
         expert.val_rows = 6;
         expert.fitted = true;
 
-        let df = DataFrame::new(vec![
-            Series::new("f1".into(), vec![1.0_f64, 2.0]).into(),
-            Series::new("f2".into(), vec![0.5_f64, 1.5]).into(),
-        ])?;
+        let frame = typed_frame(vec![("f1", vec![1.0, 2.0]), ("f2", vec![0.5, 1.5])])?;
 
-        let proba = expert.predict_proba(&df)?;
+        let proba = expert.predict_proba(&frame, &one_worker_lease())?;
         assert_eq!(proba.nrows(), 2);
         assert_eq!(proba.ncols(), 3);
         Ok(())
@@ -1387,12 +1536,9 @@ mod tests {
         expert.runtime_degraded_reason = Some(FALLBACK_DEGRADED_REASON.to_string());
         expert.fitted = true;
 
-        let df = DataFrame::new(vec![
-            Series::new("f1".into(), vec![1.0_f64, 2.0]).into(),
-            Series::new("f2".into(), vec![0.5_f64, 1.5]).into(),
-        ])?;
+        let frame = typed_frame(vec![("f1", vec![1.0, 2.0]), ("f2", vec![0.5, 1.5])])?;
 
-        let predictions = expert.predict_runtime(&df)?;
+        let predictions = expert.predict_runtime(&frame, &one_worker_lease())?;
         assert_eq!(predictions.len(), 2);
         assert_eq!(
             predictions[0].metadata().execution_backend.as_deref(),
@@ -1441,7 +1587,8 @@ mod tests {
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
             runtime_backend_kind: Some(neuro_evo_runtime_backend_kind(FALLBACK_BACKEND_NAME)),
-            requested_device_policy: default_neuro_evo_requested_device_policy(),
+            requested_device_policy: "cpu".to_string(),
+            effective_device_policy: "cpu".to_string(),
             runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
             runtime_metadata: None,
             fitted: true,
@@ -1481,7 +1628,8 @@ mod tests {
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
             runtime_backend_kind: Some(neuro_evo_runtime_backend_kind(FALLBACK_BACKEND_NAME)),
-            requested_device_policy: default_neuro_evo_requested_device_policy(),
+            requested_device_policy: "cpu".to_string(),
+            effective_device_policy: "cpu".to_string(),
             runtime_degraded_reason: None,
             runtime_metadata: None,
             fitted: true,
@@ -1521,7 +1669,8 @@ mod tests {
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: "crfmnes_cpu".to_string(),
             runtime_backend_kind: Some(neuro_evo_runtime_backend_kind("crfmnes_cpu")),
-            requested_device_policy: default_neuro_evo_requested_device_policy(),
+            requested_device_policy: "cpu".to_string(),
+            effective_device_policy: "cpu".to_string(),
             runtime_degraded_reason: Some("stale_degraded_reason".to_string()),
             runtime_metadata: None,
             fitted: true,
@@ -1539,32 +1688,24 @@ mod tests {
     #[test]
     fn neuro_evo_load_falls_back_to_embedded_metadata_when_sidecar_missing() -> Result<()> {
         let (features, labels) = {
-            let features = DataFrame::new(vec![
-                Series::new(
-                    "f1".into(),
-                    (0..32).map(|idx| idx as f64).collect::<Vec<_>>(),
-                )
-                .into(),
-                Series::new(
-                    "f2".into(),
+            let features = typed_frame(vec![
+                ("f1", (0..32).map(|idx| idx as f64).collect::<Vec<_>>()),
+                (
+                    "f2",
                     (0..32).map(|idx| (idx as f64) * 0.5).collect::<Vec<_>>(),
-                )
-                .into(),
+                ),
             ])?;
-            let labels = Series::new(
-                "target".into(),
-                (0..32)
-                    .map(|idx| match idx % 3 {
-                        0 => -1,
-                        1 => 0,
-                        _ => 1,
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            let labels = (0..32)
+                .map(|idx| match idx % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>();
             (features, labels)
         };
         let mut expert = NeuroEvoExpert::with_config(2, 8, 0.25, 4).with_search_topology(4, 1);
-        expert.fit(&features, &labels)?;
+        expert.fit(&features, &labels, &one_worker_lease())?;
         let path = temp_model_dir("neuro_evo_sidecar_missing");
         expert.save(&path)?;
         std::fs::remove_file(path.join(METADATA_FILE_NAME))?;
@@ -1579,32 +1720,24 @@ mod tests {
     #[test]
     fn neuro_evo_load_rejects_sidecar_drift_against_embedded() -> Result<()> {
         let (features, labels) = {
-            let features = DataFrame::new(vec![
-                Series::new(
-                    "f1".into(),
-                    (0..32).map(|idx| idx as f64).collect::<Vec<_>>(),
-                )
-                .into(),
-                Series::new(
-                    "f2".into(),
+            let features = typed_frame(vec![
+                ("f1", (0..32).map(|idx| idx as f64).collect::<Vec<_>>()),
+                (
+                    "f2",
                     (0..32).map(|idx| (idx as f64) * 0.5).collect::<Vec<_>>(),
-                )
-                .into(),
+                ),
             ])?;
-            let labels = Series::new(
-                "target".into(),
-                (0..32)
-                    .map(|idx| match idx % 3 {
-                        0 => -1,
-                        1 => 0,
-                        _ => 1,
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            let labels = (0..32)
+                .map(|idx| match idx % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>();
             (features, labels)
         };
         let mut expert = NeuroEvoExpert::with_config(2, 8, 0.25, 4).with_search_topology(4, 1);
-        expert.fit(&features, &labels)?;
+        expert.fit(&features, &labels, &one_worker_lease())?;
         let path = temp_model_dir("neuro_evo_sidecar_drift");
         expert.save(&path)?;
 
@@ -1631,14 +1764,11 @@ mod tests {
     #[test]
     fn predict_proba_rejects_incomplete_runtime_state() {
         let expert = NeuroEvoExpert::with_config(2, 8, 0.25, 4);
-        let df = DataFrame::new(vec![
-            Series::new("f1".into(), vec![1.0_f64, 2.0]).into(),
-            Series::new("f2".into(), vec![0.5_f64, 1.5]).into(),
-        ])
-        .expect("valid dataframe");
+        let frame = typed_frame(vec![("f1", vec![1.0, 2.0]), ("f2", vec![0.5, 1.5])])
+            .expect("valid typed frame");
 
         let err = expert
-            .predict_proba(&df)
+            .predict_proba(&frame, &one_worker_lease())
             .expect_err("incomplete runtime state should fail early");
         assert!(err.to_string().contains("not been fitted"));
     }

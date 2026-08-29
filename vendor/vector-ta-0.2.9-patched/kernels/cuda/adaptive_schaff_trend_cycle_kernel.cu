@@ -377,10 +377,10 @@ extern "C" __global__ void adaptive_schaff_trend_cycle_batch_f64(
 // ---------------------------------------------------------------------------
 // NEOETHOS f64 LANE  --  closer 3
 //
-// CPU reference: src/indicators/adaptive_schaff_trend_cycle.rs:807
-// (adaptive_schaff_trend_cycle_with_kernel). The column this emits is stc,
-// which is what output_id == "value" resolves to
-// (dispatch/cpu_batch.rs:12627-12629).
+// LEGACY PRIMARY-ONLY ABI. The canonical CPU identities are `stc` and
+// `histogram`; production uses adaptive_schaff_trend_cycle_batch_f64 above,
+// which emits both from one state machine. This entry point remains only for
+// the generic primary-kernel registry and emits canonical `stc`.
 //
 // SHAPE: one thread per combo, bars ascending. FORCED sequential, five deep:
 // a rolling time-correlation whose sums are maintained incrementally, a
@@ -389,14 +389,12 @@ extern "C" __global__ void adaptive_schaff_trend_cycle_batch_f64(
 // min/max windows, and two chained one-pole smoothers. Every stage reads the
 // previous bar's output of the stage before it.
 //
-// PERIOD-INVARIANT. compute_adaptive_schaff_trend_cycle_batch
-// (cpu_batch.rs:12645-12658) reads adaptive_length, stc_length,
-// smoothing_factor, fast_length and slow_length and NEVER period, so five
-// swept periods give five identical CPU columns and this kernel emits five
-// identical rows. All five CPU defaults are pinned below.
+// NO GENERIC PERIOD ABI. The CPU reads adaptive_length, stc_length,
+// smoothing_factor, fast_length and slow_length. This legacy entry point pins
+// their defaults; canonical parameter sweeps use the typed full entry point.
 //
-// WHAT IS DELIBERATELY ABSENT: the histogram column and the EMA that feeds
-// it. It consumes the MACD, it does not produce the STC.
+// The histogram column is deliberately absent only from this legacy primary
+// ABI. The full production entry point above carries its EMA and output.
 //
 // THE WORKING ARRAYS ARE PER-THREAD, so their bounds are properties of THIS
 // COMPILED KERNEL. The correlation keeps adaptive_length values; each monotone

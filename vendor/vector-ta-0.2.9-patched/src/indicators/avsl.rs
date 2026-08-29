@@ -1,21 +1,9 @@
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
-    make_uninit_matrix,
+    make_uninit_matrix, runtime_supports_kernel,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -30,9 +18,9 @@ use std::mem::MaybeUninit;
 use thiserror::Error;
 
 use crate::indicators::moving_averages::vwma::{
-    vwma_into_slice, vwma_with_kernel, VwmaInput, VwmaParams,
+    VwmaInput, VwmaParams, vwma_into_slice, vwma_with_kernel,
 };
-use crate::indicators::sma::{sma_into_slice, sma_with_kernel, SmaInput, SmaParams};
+use crate::indicators::sma::{SmaInput, SmaParams, sma_into_slice, sma_with_kernel};
 
 #[inline(always)]
 fn avsl_source<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
@@ -66,10 +54,6 @@ pub struct AvslOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AvslParams {
     pub fast_period: Option<usize>,
     pub slow_period: Option<usize>,
@@ -265,6 +249,9 @@ pub enum AvslError {
     #[error("avsl: Invalid kernel for batch path: {0:?}")]
     InvalidKernelForBatch(Kernel),
 
+    #[error("avsl: Requested kernel {0:?} is unsupported by this CPU")]
+    UnsupportedKernel(Kernel),
+
     #[error("avsl: {0}")]
     ComputationError(String),
 }
@@ -411,6 +398,9 @@ fn avsl_prepare<'a>(
         Kernel::Auto => Kernel::Scalar,
         k => k,
     };
+    if !runtime_supports_kernel(chosen) {
+        return Err(AvslError::UnsupportedKernel(chosen));
+    }
     Ok((
         close,
         low,
@@ -1836,6 +1826,9 @@ pub fn avsl_batch_with_kernel(
         other if other.is_batch() => other,
         other => return Err(AvslError::InvalidKernelForBatch(other)),
     };
+    if !runtime_supports_kernel(kernel) {
+        return Err(AvslError::UnsupportedKernel(kernel));
+    }
 
     let simd = match kernel {
         Kernel::Avx512Batch => Kernel::Avx512,
@@ -1934,6 +1927,9 @@ fn avsl_batch_inner(
         other if other.is_batch() => other,
         other => return Err(AvslError::InvalidKernelForBatch(other)),
     };
+    if !runtime_supports_kernel(kernel) {
+        return Err(AvslError::UnsupportedKernel(kernel));
+    }
 
     let simd = match kernel {
         Kernel::Avx512Batch => Kernel::Avx512,
@@ -2057,802 +2053,80 @@ fn avsl_batch_inner_into(
     }
 }
 
-#[cfg(feature = "python")]
-#[pyclass(name = "AvslStream")]
-pub struct AvslStreamPy {
-    stream: AvslStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AvslStreamPy {
-    #[new]
-    fn new(fast_period: usize, slow_period: usize, multiplier: f64) -> PyResult<Self> {
-        let params = AvslParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            multiplier: Some(multiplier),
-        };
-        let stream =
-            AvslStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AvslStreamPy { stream })
-    }
-
-    fn update(&mut self, close: f64, low: f64, volume: f64) -> Option<f64> {
-        self.stream.update(close, low, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "avsl")]
-#[pyo3(signature = (close, low, volume, fast_period=None, slow_period=None, multiplier=None, kernel=None))]
-pub fn avsl_py<'py>(
-    py: Python<'py>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    fast_period: Option<usize>,
-    slow_period: Option<usize>,
-    multiplier: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let close_slice = close.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = AvslParams {
-        fast_period,
-        slow_period,
-        multiplier,
-    };
-    let input = AvslInput::from_slices(close_slice, low_slice, volume_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| avsl_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "avsl_batch")]
-#[pyo3(signature = (close, low, volume, fast_range, slow_range, mult_range, kernel=None))]
-pub fn avsl_batch_py<'py>(
-    py: Python<'py>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    fast_range: (usize, usize, usize),
-    slow_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let close = close.as_slice()?;
-    let low = low.as_slice()?;
-    let volume = volume.as_slice()?;
-
-    let sweep = AvslBatchRange {
-        fast_period: fast_range,
-        slow_period: slow_range,
-        multiplier: mult_range,
-    };
-
-    let combos = expand_grid_avsl(&sweep);
-    if combos.is_empty() {
-        return Err(PyValueError::new_err(
-            AvslError::InvalidRange {
-                start: sweep.fast_period.0,
-                end: sweep.fast_period.1,
-                step: sweep.fast_period.2,
-            }
-            .to_string(),
-        ));
-    }
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        PyValueError::new_err(
-            AvslError::InvalidRange {
-                start: sweep.fast_period.0,
-                end: sweep.fast_period.1,
-                step: sweep.fast_period.2,
-            }
-            .to_string(),
-        )
-    })?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            avsl_batch_inner_into(close, low, volume, &combos, simd, slice_out).map(|_| combos)
-        })
-        .map_err(|e: AvslError| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "multipliers",
-        combos
-            .iter()
-            .map(|p| p.multiplier.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::avsl_wrapper::CudaAvsl;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Avsl", unsendable)]
-pub struct DeviceArrayF32AvslPy {
-    pub(crate) inner: crate::cuda::moving_averages::DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32AvslPy {
-    #[new]
-    fn py_new() -> PyResult<Self> {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "use factory functions (avsl_cuda_*_dev) to create this type",
-        ))
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let inner = &self.inner;
-        let d = pyo3::types::PyDict::new(py);
-        let item = std::mem::size_of::<f32>();
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (inner.cols * item, item))?;
-        let size = inner.rows.saturating_mul(inner.cols);
-        let ptr_val: usize = if size == 0 {
-            0
-        } else {
-            inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        Ok((2, self._device_id as i32))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            crate::cuda::moving_averages::DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32AvslPy {
-    pub fn new(
-        inner: crate::cuda::moving_averages::DeviceArrayF32,
-        ctx_guard: Arc<Context>,
-        device_id: u32,
-    ) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "avsl_cuda_batch_dev")]
-#[pyo3(signature = (close_f32, low_f32, volume_f32, fast_range, slow_range, mult_range, device_id=0))]
-pub fn avsl_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    volume_f32: numpy::PyReadonlyArray1<'py, f32>,
-    fast_range: (usize, usize, usize),
-    slow_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32AvslPy, Bound<'py, pyo3::types::PyDict>)> {
-    use crate::cuda::cuda_available;
-    use numpy::IntoPyArray;
-    use pyo3::types::PyDict;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let close = close_f32.as_slice()?;
-    let low = low_f32.as_slice()?;
-    let vol = volume_f32.as_slice()?;
-    let sweep = AvslBatchRange {
-        fast_period: fast_range,
-        slow_period: slow_range,
-        multiplier: mult_range,
-    };
-    let (inner, ctx, dev_id, combos) = py.allow_threads(|| {
-        let cuda = CudaAvsl::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let (arr, combos) = cuda
-            .avsl_batch_dev(close, low, vol, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id, combos))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "multipliers",
-        combos
-            .iter()
-            .map(|p| p.multiplier.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok((DeviceArrayF32AvslPy::new(inner, ctx, dev_id), dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "avsl_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (close_tm_f32, low_tm_f32, volume_tm_f32, cols, rows, fast_period, slow_period, multiplier, device_id=0))]
-pub fn avsl_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    close_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    volume_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    fast_period: usize,
-    slow_period: usize,
-    multiplier: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32AvslPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let c = close_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let v = volume_tm_f32.as_slice()?;
-    let params = AvslParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        multiplier: Some(multiplier),
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAvsl::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .avsl_many_series_one_param_time_major_dev(c, l, v, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(DeviceArrayF32AvslPy::new(inner, ctx, dev_id))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn avsl_js(
-    close: &[f64],
-    low: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    multiplier: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let len = close.len();
-    if len == 0 {
-        return Err(JsValue::from_str("empty input"));
-    }
-    if close.len() != low.len() || close.len() != volume.len() {
-        return Err(JsValue::from_str("data length mismatch"));
-    }
-    let first = first_valid_max3(close, low, volume)
-        .ok_or_else(|| JsValue::from_str("All values are NaN"))?;
-    if fast_period == 0 || fast_period > len {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-    if slow_period == 0 || slow_period > len {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-    if !(multiplier.is_finite()) || multiplier <= 0.0 {
-        return Err(JsValue::from_str("Invalid multiplier"));
-    }
-    if len - first < slow_period {
-        return Err(JsValue::from_str("Not enough valid data"));
-    }
-
-    let sweep = AvslBatchRange {
-        fast_period: (fast_period, fast_period, 0),
-        slow_period: (slow_period, slow_period, 0),
-        multiplier: (multiplier, multiplier, 0.0),
-    };
-    let out = avsl_batch_with_kernel(close, low, volume, &sweep, detect_best_batch_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out.values)
-}
-
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn avsl_into(input: &AvslInput, out: &mut [f64]) -> Result<(), AvslError> {
     avsl_into_slice(out, input, Kernel::Auto)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn avsl_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn avsl_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn avsl_into(
-    close_ptr: *const f64,
-    low_ptr: *const f64,
-    vol_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_period: usize,
-    slow_period: usize,
-    multiplier: f64,
-) -> Result<(), JsValue> {
-    if close_ptr.is_null() || low_ptr.is_null() || vol_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer"));
-    }
-    unsafe {
-        let close = core::slice::from_raw_parts(close_ptr, len);
-        let low = core::slice::from_raw_parts(low_ptr, len);
-        let vol = core::slice::from_raw_parts(vol_ptr, len);
-        let out = core::slice::from_raw_parts_mut(out_ptr, len);
-
-        let n = close.len();
-        if n == 0 {
-            return Err(JsValue::from_str("empty input"));
-        }
-        if close.len() != low.len() || close.len() != vol.len() {
-            return Err(JsValue::from_str("data length mismatch"));
-        }
-        let first = match first_valid_max3(close, low, vol) {
-            Some(i) => i,
-            None => return Err(JsValue::from_str("All values are NaN")),
-        };
-        if fast_period == 0 || fast_period > n || slow_period == 0 || slow_period > n {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-        if !(multiplier.is_finite()) || multiplier <= 0.0 {
-            return Err(JsValue::from_str("Invalid multiplier"));
-        }
-        if n - first < slow_period {
-            return Err(JsValue::from_str("Not enough valid data"));
-        }
-
-        let params = AvslParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            multiplier: Some(multiplier),
-        };
-
-        if out_ptr as *const f64 == close_ptr as *const f64
-            || out_ptr as *const f64 == low_ptr as *const f64
-            || out_ptr as *const f64 == vol_ptr as *const f64
-        {
-            let mut temp = vec![0.0; len];
-            let combos = vec![params];
-            avsl_batch_inner_into(
-                close,
-                low,
-                vol,
-                &combos,
-                detect_best_batch_kernel(),
-                &mut temp,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            out.copy_from_slice(&temp);
-        } else {
-            let combos = vec![params];
-            avsl_batch_inner_into(close, low, vol, &combos, detect_best_batch_kernel(), out)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AvslBatchConfig {
-    pub fast_range: (usize, usize, usize),
-    pub slow_range: (usize, usize, usize),
-    pub mult_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AvslBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AvslParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = avsl_batch)]
-pub fn avsl_batch_unified_js(
-    close: &[f64],
-    low: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: AvslBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AvslBatchRange {
-        fast_period: cfg.fast_range,
-        slow_period: cfg.slow_range,
-        multiplier: cfg.mult_range,
-    };
-
-    let out = avsl_batch_with_kernel(close, low, volume, &sweep, detect_best_batch_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = AvslBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct AvslContext {
-    fast_period: usize,
-    slow_period: usize,
-    multiplier: f64,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl AvslContext {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        fast_period: usize,
-        slow_period: usize,
-        multiplier: f64,
-    ) -> Result<AvslContext, JsValue> {
-        if fast_period == 0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid fast period: {}",
-                fast_period
-            )));
-        }
-        if slow_period == 0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid slow period: {}",
-                slow_period
-            )));
-        }
-        if multiplier <= 0.0 || multiplier.is_nan() || multiplier.is_infinite() {
-            return Err(JsValue::from_str(&format!(
-                "Invalid multiplier: {}",
-                multiplier
-            )));
-        }
-
-        Ok(AvslContext {
-            fast_period,
-            slow_period,
-            multiplier,
-            kernel: Kernel::Auto,
-        })
-    }
-
-    pub fn update_into(
-        &self,
-        close_ptr: *const f64,
-        low_ptr: *const f64,
-        vol_ptr: *const f64,
-        out_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if len < self.slow_period {
-            return Err(JsValue::from_str("Data length less than slow period"));
-        }
-
-        if close_ptr.is_null() || low_ptr.is_null() || vol_ptr.is_null() || out_ptr.is_null() {
-            return Err(JsValue::from_str("Null pointer passed"));
-        }
-
-        unsafe {
-            let close = std::slice::from_raw_parts(close_ptr, len);
-            let low = std::slice::from_raw_parts(low_ptr, len);
-            let volume = std::slice::from_raw_parts(vol_ptr, len);
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-            let first = first_valid_max3(close, low, volume).unwrap_or(0);
-
-            if out_ptr as *const f64 == close_ptr
-                || out_ptr as *const f64 == low_ptr
-                || out_ptr as *const f64 == vol_ptr
-            {
-                let mut temp = vec![0.0; len];
-                avsl_scalar(
-                    close,
-                    low,
-                    volume,
-                    self.fast_period,
-                    self.slow_period,
-                    self.multiplier,
-                    first,
-                    &mut temp,
-                )
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                out.copy_from_slice(&temp);
-            } else {
-                avsl_scalar(
-                    close,
-                    low,
-                    volume,
-                    self.fast_period,
-                    self.slow_period,
-                    self.multiplier,
-                    first,
-                    out,
-                )
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn get_warmup_period(&self) -> usize {
-        self.slow_period - 1
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn avsl_batch_into(
-    close_ptr: *const f64,
-    low_ptr: *const f64,
-    vol_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_start: usize,
-    fast_end: usize,
-    fast_step: usize,
-    slow_start: usize,
-    slow_end: usize,
-    slow_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-) -> Result<usize, JsValue> {
-    if close_ptr.is_null() || low_ptr.is_null() || vol_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to avsl_batch_into"));
-    }
-    unsafe {
-        let close = core::slice::from_raw_parts(close_ptr, len);
-        let low = core::slice::from_raw_parts(low_ptr, len);
-        let vol = core::slice::from_raw_parts(vol_ptr, len);
-        let sweep = AvslBatchRange {
-            fast_period: (fast_start, fast_end, fast_step),
-            slow_period: (slow_start, slow_end, slow_step),
-            multiplier: (mult_start, mult_end, mult_step),
-        };
-
-        let combos = expand_grid_avsl(&sweep);
-        if combos.is_empty() {
-            return Err(JsValue::from_str(
-                &AvslError::InvalidRange {
-                    start: sweep.fast_period.0,
-                    end: sweep.fast_period.1,
-                    step: sweep.fast_period.2,
-                }
-                .to_string(),
-            ));
-        }
-        let rows = combos.len();
-        let cols = len;
-        let total = rows.checked_mul(cols).ok_or_else(|| {
-            JsValue::from_str(
-                &AvslError::InvalidRange {
-                    start: sweep.fast_period.0,
-                    end: sweep.fast_period.1,
-                    step: sweep.fast_period.2,
-                }
-                .to_string(),
-            )
-        })?;
-        let out = core::slice::from_raw_parts_mut(out_ptr, total);
-
-        avsl_batch_inner_into(close, low, vol, &combos, detect_best_batch_kernel(), out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn avsl_output_into_js(
-    close: &[f64],
-    low: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    multiplier: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = avsl_js(close, low, volume, fast_period, slow_period, multiplier)?;
-    crate::write_wasm_f64_output("avsl_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn avsl_batch_unified_output_into_js(
-    close: &[f64],
-    low: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = avsl_batch_unified_js(close, low, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs("avsl_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_vortex;
+    use crate::utilities::helpers::runtime_supports_kernel;
     use paste::paste;
     use std::error::Error;
 
-    macro_rules! skip_if_unsupported {
-        ($kernel:expr, $test_name:expr) => {
-            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-            {
-                if matches!(
-                    $kernel,
-                    Kernel::Avx2 | Kernel::Avx512 | Kernel::Avx2Batch | Kernel::Avx512Batch
-                ) {
-                    eprintln!("Skipping {} - AVX not supported", $test_name);
-                    return Ok(());
-                }
-            }
-        };
+    fn valid_avsl_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let close: Vec<f64> = (1..=64).map(|value| value as f64).collect();
+        let low: Vec<f64> = close.iter().map(|value| value - 1.0).collect();
+        let volume = vec![1_000.0; close.len()];
+        (close, low, volume)
+    }
+
+    fn one_avsl_batch_tuple() -> AvslBatchRange {
+        AvslBatchRange {
+            fast_period: (12, 12, 0),
+            slow_period: (26, 26, 0),
+            multiplier: (2.0, 2.0, 0.0),
+        }
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    #[test]
+    fn explicit_unsupported_avx512_is_refused_before_target_feature_execution() {
+        if runtime_supports_kernel(Kernel::Avx512) {
+            return;
+        }
+
+        let (close, low, volume) = valid_avsl_fixture();
+        let input = AvslInput::from_slices(&close, &low, &volume, AvslParams::default());
+        let error = avsl_with_kernel(&input, Kernel::Avx512)
+            .expect_err("unsupported explicit AVX-512 must fail before execution");
+        assert!(matches!(
+            error,
+            AvslError::UnsupportedKernel(Kernel::Avx512)
+        ));
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    #[test]
+    fn explicit_unsupported_avx512_batches_are_refused_before_target_feature_execution() {
+        if runtime_supports_kernel(Kernel::Avx512Batch) {
+            return;
+        }
+
+        let (close, low, volume) = valid_avsl_fixture();
+        let sweep = one_avsl_batch_tuple();
+        for result in [
+            avsl_batch_with_kernel(&close, &low, &volume, &sweep, Kernel::Avx512Batch),
+            avsl_batch_slice(&close, &low, &volume, &sweep, Kernel::Avx512Batch),
+            avsl_batch_par_slice(&close, &low, &volume, &sweep, Kernel::Avx512Batch),
+        ] {
+            let error =
+                result.expect_err("unsupported explicit AVX-512 batch must fail before execution");
+            assert!(
+                matches!(&error, AvslError::UnsupportedKernel(Kernel::Avx512Batch)),
+                "unexpected batch refusal: {error:?}"
+            );
+        }
     }
 
     fn check_avsl_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AvslInput::from_candles(&candles, "close", "low", AvslParams::default());
         let result = avsl_with_kernel(&input, kernel)?;
@@ -2958,26 +2232,30 @@ mod tests {
             paste::paste! {
                 $(
                     #[test]
-                    fn [<$test_fn _scalar>]() {
-                        let _ = $test_fn(stringify!([<$test_fn _scalar>]), Kernel::Scalar);
+                    fn [<$test_fn _scalar>]() -> Result<(), Box<dyn Error>> {
+                        let test_name = stringify!([<$test_fn _scalar>]);
+                        $test_fn(test_name, Kernel::Scalar)
                     }
                 )*
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
                 $(
                     #[test]
-                    fn [<$test_fn _avx2>]() {
-                        let _ = $test_fn(stringify!([<$test_fn _avx2>]), Kernel::Avx2);
+                    fn [<$test_fn _avx2>]() -> Result<(), Box<dyn Error>> {
+                        let test_name = stringify!([<$test_fn _avx2>]);
+                        $test_fn(test_name, Kernel::Avx2)
                     }
                     #[test]
-                    fn [<$test_fn _avx512>]() {
-                        let _ = $test_fn(stringify!([<$test_fn _avx512>]), Kernel::Avx512);
+                    fn [<$test_fn _avx512>]() -> Result<(), Box<dyn Error>> {
+                        let test_name = stringify!([<$test_fn _avx512>]);
+                        $test_fn(test_name, Kernel::Avx512)
                     }
                 )*
                 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
                 $(
                     #[test]
-                    fn [<$test_fn _simd128>]() {
-                        let _ = $test_fn(stringify!([<$test_fn _simd128>]), Kernel::Scalar);
+                    fn [<$test_fn _simd128>]() -> Result<(), Box<dyn Error>> {
+                        let test_name = stringify!([<$test_fn _simd128>]);
+                        $test_fn(test_name, Kernel::Scalar)
                     }
                 )*
             }
@@ -2995,8 +2273,8 @@ mod tests {
     fn check_avsl_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = AvslBatchBuilder::new()
             .kernel(kernel)
@@ -3035,8 +2313,8 @@ mod tests {
     fn check_avsl_batch_range(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = AvslBatchBuilder::new()
             .kernel(kernel)
@@ -3057,22 +2335,26 @@ mod tests {
         ($fn_name:ident) => {
             paste::paste! {
                 #[test]
-                fn [<$fn_name _scalar>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                fn [<$fn_name _scalar>]() -> Result<(), Box<dyn Error>> {
+                    let test_name = stringify!([<$fn_name _scalar>]);
+                    $fn_name(test_name, Kernel::ScalarBatch)
                 }
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
                 #[test]
-                fn [<$fn_name _avx2>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                fn [<$fn_name _avx2>]() -> Result<(), Box<dyn Error>> {
+                    let test_name = stringify!([<$fn_name _avx2>]);
+                    $fn_name(test_name, Kernel::Avx2Batch)
                 }
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
                 #[test]
-                fn [<$fn_name _avx512>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                fn [<$fn_name _avx512>]() -> Result<(), Box<dyn Error>> {
+                    let test_name = stringify!([<$fn_name _avx512>]);
+                    $fn_name(test_name, Kernel::Avx512Batch)
                 }
                 #[test]
-                fn [<$fn_name _auto_detect>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                fn [<$fn_name _auto_detect>]() -> Result<(), Box<dyn Error>> {
+                    let test_name = stringify!([<$fn_name _auto_detect>]);
+                    $fn_name(test_name, Kernel::Auto)
                 }
             }
         };
@@ -3083,8 +2365,8 @@ mod tests {
 
     #[test]
     fn test_avsl_streaming() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = AvslParams::default();
         let input = AvslInput::from_candles(&candles, "close", "low", params.clone());
@@ -3125,8 +2407,8 @@ mod tests {
 
     #[test]
     fn test_avsl_batch_helpers() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = AvslBatchBuilder::with_default_candles(&candles).map_err(|e| {
             eprintln!("Error: {:?}", e);
@@ -3170,15 +2452,14 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_avsl_into_matches_api() -> Result<(), Box<dyn Error>> {
         fn eq_or_both_nan(a: f64, b: f64) -> bool {
             (a.is_nan() && b.is_nan()) || (a == b)
         }
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AvslInput::from_candles(&candles, "close", "low", AvslParams::default());
 
         let baseline = avsl(&input)?;

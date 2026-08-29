@@ -8,7 +8,7 @@ real captured ticks / candles used by `#[ignore]`d round-trip tests.
 - `EURUSD_M5_real.csv` — TODO(real-data): drop a captured cTrader M5
   CSV here. Headers must include at least:
   `time,open,high,low,close,volume`. Timestamps in UTC, monotonic.
-  Used by `to_vortex::tests::csv_to_vortex_round_trip_real_data`.
+  Used by the explicit import-service contract tests.
 
 ### Running the ignored tests
 

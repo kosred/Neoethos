@@ -1,44 +1,195 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
-    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
-    make_uninit_matrix,
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
 };
-use aligned_vec::{AVec, CACHELINE_ALIGN};
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
 use thiserror::Error;
 
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 const N_LEVELS: usize = 9;
+const MAX_PIVOT_MODE: usize = 4;
 
 #[inline(always)]
-fn first_valid_ohlc(high: &[f64], low: &[f64], close: &[f64]) -> Option<usize> {
-    let len = high.len();
-    for i in 0..len {
-        if !(high[i].is_nan() || low[i].is_nan() || close[i].is_nan()) {
-            return Some(i);
-        }
+fn validate_pivot_mode(mode: usize) -> Result<(), PivotError> {
+    if mode <= MAX_PIVOT_MODE {
+        Ok(())
+    } else {
+        Err(PivotError::InvalidMode { mode })
     }
-    None
+}
+
+/// Whether output bar `index` has every source value required by its exact
+/// published pivot formula. Pivot levels belong to the current period but are
+/// derived from the previous period. Woodie alone additionally consumes the
+/// current period's open.
+#[inline(always)]
+fn pivot_inputs_valid_at(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    index: usize,
+) -> bool {
+    if index == 0 || index >= high.len() {
+        return false;
+    }
+    let previous = index - 1;
+    match mode {
+        0 | 1 | 3 => {
+            high[previous].is_finite() && low[previous].is_finite() && close[previous].is_finite()
+        }
+        2 => {
+            high[previous].is_finite()
+                && low[previous].is_finite()
+                && close[previous].is_finite()
+                && open[previous].is_finite()
+        }
+        4 => high[previous].is_finite() && low[previous].is_finite() && open[index].is_finite(),
+        _ => false,
+    }
+}
+
+#[inline]
+fn first_valid_pivot_output(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+) -> Option<usize> {
+    (1..high.len()).find(|&index| pivot_inputs_valid_at(high, low, close, open, mode, index))
+}
+
+#[inline(always)]
+fn pivot_levels_at(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    open: &[f64],
+    mode: usize,
+    index: usize,
+) -> Option<[f64; N_LEVELS]> {
+    if !pivot_inputs_valid_at(high, low, close, open, mode, index) {
+        return None;
+    }
+    let previous = index - 1;
+    pivot_levels_from_period(
+        high[previous],
+        low[previous],
+        close[previous],
+        open[previous],
+        open[index],
+        mode,
+    )
+}
+
+/// Published Pivot Points Standard formulas. The returned order is
+/// `[R4, R3, R2, R1, P, S1, S2, S3, S4]`.
+#[inline(always)]
+fn pivot_levels_from_period(
+    previous_high: f64,
+    previous_low: f64,
+    previous_close: f64,
+    previous_open: f64,
+    current_open: f64,
+    mode: usize,
+) -> Option<[f64; N_LEVELS]> {
+    let nan = f64::NAN;
+    let h = previous_high;
+    let l = previous_low;
+    let c = previous_close;
+    let d = h - l;
+
+    match mode {
+        // Traditional. Unlike the old implementation, all four published
+        // resistance/support levels are preserved.
+        0 if h.is_finite() && l.is_finite() && c.is_finite() => {
+            let p = (h + l + c) / 3.0;
+            let two_p = 2.0 * p;
+            let three_p = 3.0 * p;
+            Some([
+                three_p + h - 3.0 * l,
+                two_p + h - 2.0 * l,
+                p + d,
+                two_p - l,
+                p,
+                two_p - h,
+                p - d,
+                two_p - 2.0 * h + l,
+                three_p - 3.0 * h + l,
+            ])
+        }
+        // Fibonacci.
+        1 if h.is_finite() && l.is_finite() && c.is_finite() => {
+            let p = (h + l + c) / 3.0;
+            Some([
+                nan,
+                p + d,
+                p + 0.618 * d,
+                p + 0.382 * d,
+                p,
+                p - 0.382 * d,
+                p - 0.618 * d,
+                p - d,
+                nan,
+            ])
+        }
+        // DeMark. The branch is selected by the previous period's open/close.
+        2 if h.is_finite() && l.is_finite() && c.is_finite() && previous_open.is_finite() => {
+            let x = if c < previous_open {
+                h + 2.0 * l + c
+            } else if c > previous_open {
+                2.0 * h + l + c
+            } else {
+                h + l + 2.0 * c
+            };
+            let p = x / 4.0;
+            Some([nan, nan, nan, x / 2.0 - l, p, x / 2.0 - h, nan, nan, nan])
+        }
+        // Camarilla. Keep the published 1.1/12, 1.1/6, 1.1/4 and
+        // 1.1/2 ratios instead of decimal truncations.
+        3 if h.is_finite() && l.is_finite() && c.is_finite() => {
+            let p = (h + l + c) / 3.0;
+            let scaled_range = 1.1 * d;
+            let d1 = scaled_range / 12.0;
+            let d2 = scaled_range / 6.0;
+            let d3 = scaled_range / 4.0;
+            let d4 = scaled_range / 2.0;
+            Some([
+                c + d4,
+                c + d3,
+                c + d2,
+                c + d1,
+                p,
+                c - d1,
+                c - d2,
+                c - d3,
+                c - d4,
+            ])
+        }
+        // Woodie uses previous H/L and the current period's open.
+        4 if h.is_finite() && l.is_finite() && current_open.is_finite() => {
+            let p = (h + l + 2.0 * current_open) / 4.0;
+            let two_p = 2.0 * p;
+            let r3 = h + 2.0 * (p - l);
+            let s3 = l - 2.0 * (h - p);
+            Some([
+                r3 + d,
+                r3,
+                p + d,
+                two_p - l,
+                p,
+                two_p - h,
+                p - d,
+                s3,
+                s3 - d,
+            ])
+        }
+        _ => None,
+    }
 }
 
 #[inline(always)]
@@ -60,27 +211,28 @@ fn pivot_compute_into(
     s3: &mut [f64],
     s4: &mut [f64],
 ) {
-    unsafe {
-        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-        {
-            let _ = k;
-            pivot_scalar(
-                high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-            );
-        }
+    match k {
+        Kernel::Scalar | Kernel::ScalarBatch => pivot_scalar(
+            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+        ),
         #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        match k {
-            Kernel::Scalar | Kernel::ScalarBatch => pivot_scalar(
+        Kernel::Avx2 | Kernel::Avx2Batch => unsafe {
+            pivot_avx2(
                 high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-            ),
-            Kernel::Avx2 | Kernel::Avx2Batch => pivot_avx2(
+            )
+        },
+        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+        Kernel::Avx512 | Kernel::Avx512Batch => unsafe {
+            pivot_avx512(
                 high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-            ),
-            Kernel::Avx512 | Kernel::Avx512Batch => pivot_avx512(
-                high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-            ),
-            _ => unreachable!(),
-        }
+            )
+        },
+        // A requested SIMD kernel that is not compiled for this target uses
+        // the same reviewed portable implementation; no alternate formula is
+        // retained.
+        _ => pivot_scalar(
+            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+        ),
     }
 }
 
@@ -186,6 +338,8 @@ pub enum PivotError {
     },
     #[error("pivot: Invalid kernel for batch path: {0:?}.")]
     InvalidKernelForBatch(Kernel),
+    #[error("pivot: Invalid formula mode {mode}; expected 0..={MAX_PIVOT_MODE}.")]
+    InvalidMode { mode: usize },
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -269,24 +423,13 @@ pub fn pivot_with_kernel(input: &PivotInput, kernel: Kernel) -> Result<PivotOutp
         return Err(PivotError::EmptyData);
     }
     let mode = input.get_mode();
+    validate_pivot_mode(mode)?;
 
-    let mut first_valid_idx = None;
-    for i in 0..len {
-        let h = high[i];
-        let l = low[i];
-        let c = close[i];
-        if !(h.is_nan() || l.is_nan() || c.is_nan()) {
-            first_valid_idx = Some(i);
-            break;
-        }
-    }
-    let first_valid_idx = match first_valid_idx {
-        Some(idx) => idx,
-        None => return Err(PivotError::AllValuesNaN),
-    };
-    if first_valid_idx >= len {
+    if len < 2 {
         return Err(PivotError::NotEnoughValidData);
     }
+    let first_valid_idx =
+        first_valid_pivot_output(high, low, close, open, mode).ok_or(PivotError::AllValuesNaN)?;
 
     let mut r4 = alloc_with_nan_prefix(len, first_valid_idx);
     let mut r3 = alloc_with_nan_prefix(len, first_valid_idx);
@@ -339,7 +482,6 @@ pub fn pivot_with_kernel(input: &PivotInput, kernel: Kernel) -> Result<PivotOutp
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn pivot_into(
     input: &PivotInput,
@@ -381,11 +523,13 @@ pub fn pivot_into(
     }
 
     let mode = input.get_mode();
+    validate_pivot_mode(mode)?;
 
-    let first_valid_idx = first_valid_ohlc(high, low, close).ok_or(PivotError::AllValuesNaN)?;
-    if first_valid_idx >= len {
+    if len < 2 {
         return Err(PivotError::NotEnoughValidData);
     }
+    let first_valid_idx =
+        first_valid_pivot_output(high, low, close, open, mode).ok_or(PivotError::AllValuesNaN)?;
 
     let qnan = f64::from_bits(0x7ff8_0000_0000_0000);
     for i in 0..first_valid_idx {
@@ -468,24 +612,13 @@ pub fn pivot_into_slices(
     }
 
     let mode = input.get_mode();
+    validate_pivot_mode(mode)?;
 
-    let mut first_valid_idx = None;
-    for i in 0..len {
-        let h = high[i];
-        let l = low[i];
-        let c = close[i];
-        if !(h.is_nan() || l.is_nan() || c.is_nan()) {
-            first_valid_idx = Some(i);
-            break;
-        }
-    }
-    let first_valid_idx = match first_valid_idx {
-        Some(idx) => idx,
-        None => return Err(PivotError::AllValuesNaN),
-    };
-    if first_valid_idx >= len {
+    if len < 2 {
         return Err(PivotError::NotEnoughValidData);
     }
+    let first_valid_idx =
+        first_valid_pivot_output(high, low, close, open, mode).ok_or(PivotError::AllValuesNaN)?;
 
     #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
     let chosen = match kern {
@@ -533,7 +666,7 @@ pub fn pivot_into_slices(
 }
 
 #[inline]
-pub unsafe fn pivot_scalar(
+pub fn pivot_scalar(
     high: &[f64],
     low: &[f64],
     close: &[f64],
@@ -555,210 +688,18 @@ pub unsafe fn pivot_scalar(
         return;
     }
 
-    let nan = f64::NAN;
-
-    match mode {
-        0 => {
-            for i in first..len {
-                let h = high[i];
-                let l = low[i];
-                let c = close[i];
-                if h.is_nan() || l.is_nan() || c.is_nan() {
-                    r4[i] = nan;
-                    r3[i] = nan;
-                    r2[i] = nan;
-                    r1[i] = nan;
-                    pp[i] = nan;
-                    s1[i] = nan;
-                    s2[i] = nan;
-                    s3[i] = nan;
-                    s4[i] = nan;
-                    continue;
-                }
-                let d = h - l;
-                let p = (h + l + c) * (1.0 / 3.0);
-                let t2 = p + p;
-                pp[i] = p;
-                r1[i] = t2 - l;
-                r2[i] = p + d;
-                s1[i] = t2 - h;
-                s2[i] = p - d;
-                r3[i] = nan;
-                r4[i] = nan;
-                s3[i] = nan;
-                s4[i] = nan;
-            }
-        }
-
-        1 => {
-            for i in first..len {
-                let h = high[i];
-                let l = low[i];
-                let c = close[i];
-                if h.is_nan() || l.is_nan() || c.is_nan() {
-                    r4[i] = nan;
-                    r3[i] = nan;
-                    r2[i] = nan;
-                    r1[i] = nan;
-                    pp[i] = nan;
-                    s1[i] = nan;
-                    s2[i] = nan;
-                    s3[i] = nan;
-                    s4[i] = nan;
-                    continue;
-                }
-                let d = h - l;
-                let p = (h + l + c) * (1.0 / 3.0);
-                let d38 = d * 0.382_f64;
-                let d62 = d * 0.618_f64;
-                pp[i] = p;
-                r1[i] = p + d38;
-                r2[i] = p + d62;
-                r3[i] = p + d;
-                s1[i] = p - d38;
-                s2[i] = p - d62;
-                s3[i] = p - d;
-                r4[i] = nan;
-                s4[i] = nan;
-            }
-        }
-
-        2 => {
-            for i in first..len {
-                let h = high[i];
-                let l = low[i];
-                let c = close[i];
-                let o = open[i];
-                if h.is_nan() || l.is_nan() || c.is_nan() {
-                    r4[i] = nan;
-                    r3[i] = nan;
-                    r2[i] = nan;
-                    r1[i] = nan;
-                    pp[i] = nan;
-                    s1[i] = nan;
-                    s2[i] = nan;
-                    s3[i] = nan;
-                    s4[i] = nan;
-                    continue;
-                }
-                let p = if c < o {
-                    (h + (l + l) + c) * 0.25
-                } else if c > o {
-                    ((h + h) + l + c) * 0.25
-                } else {
-                    (h + l + (c + c)) * 0.25
-                };
-                pp[i] = p;
-                let num = if c < o {
-                    (h + (l + l) + c) * 0.5
-                } else if c > o {
-                    ((h + h) + l + c) * 0.5
-                } else {
-                    (h + l + (c + c)) * 0.5
-                };
-                r1[i] = num - l;
-                s1[i] = num - h;
-                r2[i] = nan;
-                r3[i] = nan;
-                r4[i] = nan;
-                s2[i] = nan;
-                s3[i] = nan;
-                s4[i] = nan;
-            }
-        }
-
-        3 => {
-            const C1: f64 = 0.0916_f64;
-            const C2: f64 = 0.183_f64;
-            const C3: f64 = 0.275_f64;
-            const C4: f64 = 0.55_f64;
-            let hp = high.as_ptr();
-            let lp = low.as_ptr();
-            let cp = close.as_ptr();
-            let r4p = r4.as_mut_ptr();
-            let r3p = r3.as_mut_ptr();
-            let r2p = r2.as_mut_ptr();
-            let r1p = r1.as_mut_ptr();
-            let ppp = pp.as_mut_ptr();
-            let s1p = s1.as_mut_ptr();
-            let s2p = s2.as_mut_ptr();
-            let s3p = s3.as_mut_ptr();
-            let s4p = s4.as_mut_ptr();
-            let mut i = first;
-            while i < len {
-                let h = *hp.add(i);
-                let l = *lp.add(i);
-                let c = *cp.add(i);
-                if h.is_nan() || l.is_nan() || c.is_nan() {
-                    *r4p.add(i) = nan;
-                    *r3p.add(i) = nan;
-                    *r2p.add(i) = nan;
-                    *r1p.add(i) = nan;
-                    *ppp.add(i) = nan;
-                    *s1p.add(i) = nan;
-                    *s2p.add(i) = nan;
-                    *s3p.add(i) = nan;
-                    *s4p.add(i) = nan;
-                    i += 1;
-                    continue;
-                }
-                let d = h - l;
-                let p = (h + l + c) * (1.0 / 3.0);
-                *ppp.add(i) = p;
-                let d1 = d * C1;
-                let d2 = d * C2;
-                let d3 = d * C3;
-                let d4 = d * C4;
-                *r1p.add(i) = d1 + c;
-                *r2p.add(i) = d2 + c;
-                *r3p.add(i) = d3 + c;
-                *r4p.add(i) = d4 + c;
-                *s1p.add(i) = c - d1;
-                *s2p.add(i) = c - d2;
-                *s3p.add(i) = c - d3;
-                *s4p.add(i) = c - d4;
-                i += 1;
-            }
-        }
-
-        4 => {
-            for i in first..len {
-                let h = high[i];
-                let l = low[i];
-                let c = close[i];
-                let o = open[i];
-                if h.is_nan() || l.is_nan() || c.is_nan() {
-                    r4[i] = nan;
-                    r3[i] = nan;
-                    r2[i] = nan;
-                    r1[i] = nan;
-                    pp[i] = nan;
-                    s1[i] = nan;
-                    s2[i] = nan;
-                    s3[i] = nan;
-                    s4[i] = nan;
-                    continue;
-                }
-                let d = h - l;
-                let p = (h + l + (o + o)) * 0.25;
-                pp[i] = p;
-                let t2p = p + p;
-                let t2l = l + l;
-                let t2h = h + h;
-                let r3v = (t2p - t2l) + h;
-                r3[i] = r3v;
-                r4[i] = r3v + d;
-                r2[i] = p + d;
-                r1[i] = t2p - l;
-                s1[i] = t2p - h;
-                s2[i] = p - d;
-                let s3v = (l + t2p) - t2h;
-                s3[i] = s3v;
-                s4[i] = s3v - d;
-            }
-        }
-
-        _ => {}
+    for i in first.max(1)..len {
+        let levels =
+            pivot_levels_at(high, low, close, open, mode, i).unwrap_or([f64::NAN; N_LEVELS]);
+        r4[i] = levels[0];
+        r3[i] = levels[1];
+        r2[i] = levels[2];
+        r1[i] = levels[3];
+        pp[i] = levels[4];
+        s1[i] = levels[5];
+        s2[i] = levels[6];
+        s3[i] = levels[7];
+        s4[i] = levels[8];
     }
 }
 
@@ -782,267 +723,16 @@ pub unsafe fn pivot_avx2(
     s3: &mut [f64],
     s4: &mut [f64],
 ) {
-    use core::arch::x86_64::*;
-
-    let len = high.len();
-    if first >= len {
-        return;
-    }
-
-    let hp = high.as_ptr();
-    let lp = low.as_ptr();
-    let cp = close.as_ptr();
-    let op = open.as_ptr();
-
-    let r4p = r4.as_mut_ptr();
-    let r3p = r3.as_mut_ptr();
-    let r2p = r2.as_mut_ptr();
-    let r1p = r1.as_mut_ptr();
-    let ppp = pp.as_mut_ptr();
-    let s1p = s1.as_mut_ptr();
-    let s2p = s2.as_mut_ptr();
-    let s3p = s3.as_mut_ptr();
-    let s4p = s4.as_mut_ptr();
-
-    let v_nan = _mm256_set1_pd(f64::NAN);
-    let v_third = _mm256_set1_pd(1.0 / 3.0);
-    let v_quart = _mm256_set1_pd(0.25);
-    let v_half = _mm256_set1_pd(0.5);
-    let v_one = _mm256_set1_pd(1.0);
-    let v_c0916 = _mm256_set1_pd(0.0916);
-    let v_c0183 = _mm256_set1_pd(0.183);
-    let v_c0275 = _mm256_set1_pd(0.275);
-    let v_c0550 = _mm256_set1_pd(0.55);
-    let v_c0382 = _mm256_set1_pd(0.382);
-    let v_c0618 = _mm256_set1_pd(0.618);
-    let v_neg1 = _mm256_set1_pd(-1.0);
-    let v_n0382 = _mm256_set1_pd(-0.382);
-    let v_n0618 = _mm256_set1_pd(-0.618);
-
-    let mut i = first;
-    let end4 = first + ((len - first) & !3);
-
-    #[inline(always)]
-    unsafe fn valid_mask_avx2(h: __m256d, l: __m256d, c: __m256d) -> __m256d {
-        let ord_h = _mm256_cmp_pd(h, h, _CMP_ORD_Q);
-        let ord_l = _mm256_cmp_pd(l, l, _CMP_ORD_Q);
-        let ord_c = _mm256_cmp_pd(c, c, _CMP_ORD_Q);
-        _mm256_and_pd(_mm256_and_pd(ord_h, ord_l), ord_c)
-    }
-
-    #[inline(always)]
-    unsafe fn blendv(a: __m256d, b: __m256d, mask: __m256d) -> __m256d {
-        _mm256_blendv_pd(a, b, mask)
-    }
-
-    match mode {
-        0 => {
-            while i < end4 {
-                let h = _mm256_loadu_pd(hp.add(i));
-                let l = _mm256_loadu_pd(lp.add(i));
-                let c = _mm256_loadu_pd(cp.add(i));
-                let vld = valid_mask_avx2(h, l, c);
-
-                let p = _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(h, l), c), v_third);
-                let d = _mm256_sub_pd(h, l);
-                let t2 = _mm256_add_pd(p, p);
-
-                let r1v = _mm256_sub_pd(t2, l);
-                let r2v = _mm256_fmadd_pd(d, v_one, p);
-                let s1v = _mm256_sub_pd(t2, h);
-                let s2v = _mm256_fmadd_pd(d, v_neg1, p);
-
-                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
-                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
-                _mm256_storeu_pd(r2p.add(i), blendv(v_nan, r2v, vld));
-                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
-                _mm256_storeu_pd(s2p.add(i), blendv(v_nan, s2v, vld));
-                _mm256_storeu_pd(r3p.add(i), v_nan);
-                _mm256_storeu_pd(r4p.add(i), v_nan);
-                _mm256_storeu_pd(s3p.add(i), v_nan);
-                _mm256_storeu_pd(s4p.add(i), v_nan);
-
-                i += 4;
-            }
-        }
-        1 => {
-            while i < end4 {
-                let h = _mm256_loadu_pd(hp.add(i));
-                let l = _mm256_loadu_pd(lp.add(i));
-                let c = _mm256_loadu_pd(cp.add(i));
-                let vld = valid_mask_avx2(h, l, c);
-
-                let p = _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(h, l), c), v_third);
-                let d = _mm256_sub_pd(h, l);
-                let r1v = _mm256_fmadd_pd(d, v_c0382, p);
-                let r2v = _mm256_fmadd_pd(d, v_c0618, p);
-                let r3v = _mm256_fmadd_pd(d, v_one, p);
-                let s1v = _mm256_fmadd_pd(d, v_n0382, p);
-                let s2v = _mm256_fmadd_pd(d, v_n0618, p);
-                let s3v = _mm256_fmadd_pd(d, v_neg1, p);
-
-                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
-                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
-                _mm256_storeu_pd(r2p.add(i), blendv(v_nan, r2v, vld));
-                _mm256_storeu_pd(r3p.add(i), blendv(v_nan, r3v, vld));
-                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
-                _mm256_storeu_pd(s2p.add(i), blendv(v_nan, s2v, vld));
-                _mm256_storeu_pd(s3p.add(i), blendv(v_nan, s3v, vld));
-                _mm256_storeu_pd(r4p.add(i), v_nan);
-                _mm256_storeu_pd(s4p.add(i), v_nan);
-
-                i += 4;
-            }
-        }
-        2 => {
-            while i < end4 {
-                let h = _mm256_loadu_pd(hp.add(i));
-                let l = _mm256_loadu_pd(lp.add(i));
-                let c = _mm256_loadu_pd(cp.add(i));
-                let o = _mm256_loadu_pd(op.add(i));
-                let vld = valid_mask_avx2(h, l, c);
-
-                let mlt = _mm256_cmp_pd(c, o, _CMP_LT_OQ);
-                let mgt = _mm256_cmp_pd(c, o, _CMP_GT_OQ);
-
-                let p_lt = _mm256_mul_pd(
-                    _mm256_add_pd(_mm256_add_pd(h, _mm256_add_pd(l, l)), c),
-                    v_quart,
-                );
-                let p_gt = _mm256_mul_pd(
-                    _mm256_add_pd(_mm256_add_pd(_mm256_add_pd(h, h), l), c),
-                    v_quart,
-                );
-                let p_eq = _mm256_mul_pd(
-                    _mm256_add_pd(_mm256_add_pd(h, l), _mm256_add_pd(c, c)),
-                    v_quart,
-                );
-
-                let mut p = blendv(p_eq, p_gt, mgt);
-                p = blendv(p, p_lt, mlt);
-                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
-
-                let n_lt = _mm256_mul_pd(
-                    _mm256_add_pd(_mm256_add_pd(h, _mm256_add_pd(l, l)), c),
-                    v_half,
-                );
-                let n_gt = _mm256_mul_pd(
-                    _mm256_add_pd(_mm256_add_pd(_mm256_add_pd(h, h), l), c),
-                    v_half,
-                );
-                let n_eq = _mm256_mul_pd(
-                    _mm256_add_pd(_mm256_add_pd(h, l), _mm256_add_pd(c, c)),
-                    v_half,
-                );
-
-                let mut n = blendv(n_eq, n_gt, mgt);
-                n = blendv(n, n_lt, mlt);
-
-                let r1v = _mm256_sub_pd(n, l);
-                let s1v = _mm256_sub_pd(n, h);
-
-                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
-                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
-                _mm256_storeu_pd(r2p.add(i), v_nan);
-                _mm256_storeu_pd(r3p.add(i), v_nan);
-                _mm256_storeu_pd(r4p.add(i), v_nan);
-                _mm256_storeu_pd(s2p.add(i), v_nan);
-                _mm256_storeu_pd(s3p.add(i), v_nan);
-                _mm256_storeu_pd(s4p.add(i), v_nan);
-
-                i += 4;
-            }
-        }
-        3 => {
-            while i < end4 {
-                let h = _mm256_loadu_pd(hp.add(i));
-                let l = _mm256_loadu_pd(lp.add(i));
-                let c = _mm256_loadu_pd(cp.add(i));
-                let vld = valid_mask_avx2(h, l, c);
-
-                let p = _mm256_mul_pd(_mm256_add_pd(_mm256_add_pd(h, l), c), v_third);
-                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
-
-                let d = _mm256_sub_pd(h, l);
-                let d1 = _mm256_mul_pd(d, v_c0916);
-                let d2 = _mm256_mul_pd(d, v_c0183);
-                let d3 = _mm256_mul_pd(d, v_c0275);
-                let d4 = _mm256_mul_pd(d, v_c0550);
-
-                let r1v = _mm256_fmadd_pd(d, v_c0916, c);
-                let r2v = _mm256_fmadd_pd(d, v_c0183, c);
-                let r3v = _mm256_fmadd_pd(d, v_c0275, c);
-                let r4v = _mm256_fmadd_pd(d, v_c0550, c);
-
-                let s1v = _mm256_fmadd_pd(d, _mm256_sub_pd(_mm256_setzero_pd(), v_c0916), c);
-                let s2v = _mm256_fmadd_pd(d, _mm256_sub_pd(_mm256_setzero_pd(), v_c0183), c);
-                let s3v = _mm256_fmadd_pd(d, _mm256_sub_pd(_mm256_setzero_pd(), v_c0275), c);
-                let s4v = _mm256_fmadd_pd(d, _mm256_sub_pd(_mm256_setzero_pd(), v_c0550), c);
-
-                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
-                _mm256_storeu_pd(r2p.add(i), blendv(v_nan, r2v, vld));
-                _mm256_storeu_pd(r3p.add(i), blendv(v_nan, r3v, vld));
-                _mm256_storeu_pd(r4p.add(i), blendv(v_nan, r4v, vld));
-                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
-                _mm256_storeu_pd(s2p.add(i), blendv(v_nan, s2v, vld));
-                _mm256_storeu_pd(s3p.add(i), blendv(v_nan, s3v, vld));
-                _mm256_storeu_pd(s4p.add(i), blendv(v_nan, s4v, vld));
-
-                i += 4;
-            }
-        }
-        4 => {
-            while i < end4 {
-                let h = _mm256_loadu_pd(hp.add(i));
-                let l = _mm256_loadu_pd(lp.add(i));
-                let c = _mm256_loadu_pd(cp.add(i));
-                let o = _mm256_loadu_pd(op.add(i));
-                let vld = valid_mask_avx2(h, l, c);
-
-                let p = _mm256_mul_pd(
-                    _mm256_add_pd(_mm256_add_pd(h, l), _mm256_add_pd(o, o)),
-                    v_quart,
-                );
-                let t2p = _mm256_add_pd(p, p);
-                let t2l = _mm256_add_pd(l, l);
-                let t2h = _mm256_add_pd(h, h);
-                let d = _mm256_sub_pd(h, l);
-
-                let r3v = _mm256_add_pd(_mm256_sub_pd(t2p, t2l), h);
-                let r4v = _mm256_fmadd_pd(d, v_one, r3v);
-                let r2v = _mm256_fmadd_pd(d, v_one, p);
-                let r1v = _mm256_sub_pd(t2p, l);
-
-                let s1v = _mm256_sub_pd(t2p, h);
-                let s2v = _mm256_fmadd_pd(d, v_neg1, p);
-                let s3v = _mm256_sub_pd(_mm256_add_pd(l, t2p), t2h);
-                let s4v = _mm256_fmadd_pd(d, v_neg1, s3v);
-
-                _mm256_storeu_pd(ppp.add(i), blendv(v_nan, p, vld));
-                _mm256_storeu_pd(r1p.add(i), blendv(v_nan, r1v, vld));
-                _mm256_storeu_pd(r2p.add(i), blendv(v_nan, r2v, vld));
-                _mm256_storeu_pd(r3p.add(i), blendv(v_nan, r3v, vld));
-                _mm256_storeu_pd(r4p.add(i), blendv(v_nan, r4v, vld));
-                _mm256_storeu_pd(s1p.add(i), blendv(v_nan, s1v, vld));
-                _mm256_storeu_pd(s2p.add(i), blendv(v_nan, s2v, vld));
-                _mm256_storeu_pd(s3p.add(i), blendv(v_nan, s3v, vld));
-                _mm256_storeu_pd(s4p.add(i), blendv(v_nan, s4v, vld));
-
-                i += 4;
-            }
-        }
-        _ => {}
-    }
-
-    if i < len {
-        pivot_scalar(
-            high, low, close, open, mode, i, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-        );
-    }
+    // The target-feature wrapper lets LLVM vectorize the single reviewed
+    // formula body. There is no second handwritten mathematical authority.
+    pivot_scalar(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    );
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 #[inline]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
 pub unsafe fn pivot_avx512(
     high: &[f64],
     low: &[f64],
@@ -1060,19 +750,16 @@ pub unsafe fn pivot_avx512(
     s3: &mut [f64],
     s4: &mut [f64],
 ) {
-    if high.len() <= 32 {
-        pivot_avx512_short(
-            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-        )
-    } else {
-        pivot_avx512_long(
-            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-        )
-    }
+    // The target-feature wrapper lets LLVM vectorize the single reviewed
+    // formula body. There is no second handwritten mathematical authority.
+    pivot_scalar(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    );
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 #[inline]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
 pub unsafe fn pivot_avx512_short(
     high: &[f64],
     low: &[f64],
@@ -1090,13 +777,16 @@ pub unsafe fn pivot_avx512_short(
     s3: &mut [f64],
     s4: &mut [f64],
 ) {
-    pivot_avx512_long(
+    // The target-feature wrapper lets LLVM vectorize the single reviewed
+    // formula body. There is no second handwritten mathematical authority.
+    pivot_scalar(
         high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-    )
+    );
 }
+
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 #[inline]
-#[target_feature(enable = "avx512f,fma")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
 pub unsafe fn pivot_avx512_long(
     high: &[f64],
     low: &[f64],
@@ -1114,263 +804,12 @@ pub unsafe fn pivot_avx512_long(
     s3: &mut [f64],
     s4: &mut [f64],
 ) {
-    use core::arch::x86_64::*;
-
-    let len = high.len();
-    if first >= len {
-        return;
-    }
-
-    let hp = high.as_ptr();
-    let lp = low.as_ptr();
-    let cp = close.as_ptr();
-    let op = open.as_ptr();
-
-    let r4p = r4.as_mut_ptr();
-    let r3p = r3.as_mut_ptr();
-    let r2p = r2.as_mut_ptr();
-    let r1p = r1.as_mut_ptr();
-    let ppp = pp.as_mut_ptr();
-    let s1p = s1.as_mut_ptr();
-    let s2p = s2.as_mut_ptr();
-    let s3p = s3.as_mut_ptr();
-    let s4p = s4.as_mut_ptr();
-
-    let v_nan = _mm512_set1_pd(f64::NAN);
-    let v_third = _mm512_set1_pd(1.0 / 3.0);
-    let v_quart = _mm512_set1_pd(0.25);
-    let v_half = _mm512_set1_pd(0.5);
-    let v_one = _mm512_set1_pd(1.0);
-    let v_c0916 = _mm512_set1_pd(0.0916);
-    let v_c0183 = _mm512_set1_pd(0.183);
-    let v_c0275 = _mm512_set1_pd(0.275);
-    let v_c0550 = _mm512_set1_pd(0.55);
-    let v_c0382 = _mm512_set1_pd(0.382);
-    let v_c0618 = _mm512_set1_pd(0.618);
-    let v_neg1 = _mm512_set1_pd(-1.0);
-    let v_n0382 = _mm512_set1_pd(-0.382);
-    let v_n0618 = _mm512_set1_pd(-0.618);
-
-    let mut i = first;
-    let step = 8;
-
-    #[inline(always)]
-    unsafe fn valid_mask_avx512(h: __m512d, l: __m512d, c: __m512d) -> u8 {
-        let mh = _mm512_cmp_pd_mask(h, h, _CMP_ORD_Q);
-        let ml = _mm512_cmp_pd_mask(l, l, _CMP_ORD_Q);
-        let mc = _mm512_cmp_pd_mask(c, c, _CMP_ORD_Q);
-        mh & ml & mc
-    }
-
-    match mode {
-        0 => {
-            while i + step <= len {
-                let h = _mm512_loadu_pd(hp.add(i));
-                let l = _mm512_loadu_pd(lp.add(i));
-                let c = _mm512_loadu_pd(cp.add(i));
-                let mk = valid_mask_avx512(h, l, c);
-
-                let p = _mm512_mul_pd(_mm512_add_pd(_mm512_add_pd(h, l), c), v_third);
-                let d = _mm512_sub_pd(h, l);
-                let t2 = _mm512_add_pd(p, p);
-
-                let r1v = _mm512_sub_pd(t2, l);
-                let r2v = _mm512_fmadd_pd(d, v_one, p);
-                let s1v = _mm512_sub_pd(t2, h);
-                let s2v = _mm512_fmadd_pd(d, v_neg1, p);
-
-                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
-                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
-                _mm512_storeu_pd(r2p.add(i), _mm512_mask_blend_pd(mk, v_nan, r2v));
-                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
-                _mm512_storeu_pd(s2p.add(i), _mm512_mask_blend_pd(mk, v_nan, s2v));
-                _mm512_storeu_pd(r3p.add(i), v_nan);
-                _mm512_storeu_pd(r4p.add(i), v_nan);
-                _mm512_storeu_pd(s3p.add(i), v_nan);
-                _mm512_storeu_pd(s4p.add(i), v_nan);
-
-                i += step;
-            }
-        }
-        1 => {
-            while i + step <= len {
-                let h = _mm512_loadu_pd(hp.add(i));
-                let l = _mm512_loadu_pd(lp.add(i));
-                let c = _mm512_loadu_pd(cp.add(i));
-                let mk = valid_mask_avx512(h, l, c);
-
-                let p = _mm512_mul_pd(_mm512_add_pd(_mm512_add_pd(h, l), c), v_third);
-                let d = _mm512_sub_pd(h, l);
-                let r1v = _mm512_fmadd_pd(d, v_c0382, p);
-                let r2v = _mm512_fmadd_pd(d, v_c0618, p);
-                let r3v = _mm512_fmadd_pd(d, v_one, p);
-                let s1v = _mm512_fmadd_pd(d, v_n0382, p);
-                let s2v = _mm512_fmadd_pd(d, v_n0618, p);
-                let s3v = _mm512_fmadd_pd(d, v_neg1, p);
-
-                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
-                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
-                _mm512_storeu_pd(r2p.add(i), _mm512_mask_blend_pd(mk, v_nan, r2v));
-                _mm512_storeu_pd(r3p.add(i), _mm512_mask_blend_pd(mk, v_nan, r3v));
-                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
-                _mm512_storeu_pd(s2p.add(i), _mm512_mask_blend_pd(mk, v_nan, s2v));
-                _mm512_storeu_pd(s3p.add(i), _mm512_mask_blend_pd(mk, v_nan, s3v));
-                _mm512_storeu_pd(r4p.add(i), v_nan);
-                _mm512_storeu_pd(s4p.add(i), v_nan);
-
-                i += step;
-            }
-        }
-        2 => {
-            while i + step <= len {
-                let h = _mm512_loadu_pd(hp.add(i));
-                let l = _mm512_loadu_pd(lp.add(i));
-                let c = _mm512_loadu_pd(cp.add(i));
-                let o = _mm512_loadu_pd(op.add(i));
-                let mk = valid_mask_avx512(h, l, c);
-
-                let mlt = _mm512_cmp_pd_mask(c, o, _CMP_LT_OQ);
-                let mgt = _mm512_cmp_pd_mask(c, o, _CMP_GT_OQ);
-                let meq = (!mlt) & (!mgt);
-
-                let p_lt = _mm512_mul_pd(
-                    _mm512_add_pd(_mm512_add_pd(h, _mm512_add_pd(l, l)), c),
-                    v_quart,
-                );
-                let p_gt = _mm512_mul_pd(
-                    _mm512_add_pd(_mm512_add_pd(_mm512_add_pd(h, h), l), c),
-                    v_quart,
-                );
-                let p_eq = _mm512_mul_pd(
-                    _mm512_add_pd(_mm512_add_pd(h, l), _mm512_add_pd(c, c)),
-                    v_quart,
-                );
-
-                let mut p = p_eq;
-                p = _mm512_mask_blend_pd(mgt, p, p_gt);
-                p = _mm512_mask_blend_pd(mlt, p, p_lt);
-                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
-
-                let n_lt = _mm512_mul_pd(
-                    _mm512_add_pd(_mm512_add_pd(h, _mm512_add_pd(l, l)), c),
-                    v_half,
-                );
-                let n_gt = _mm512_mul_pd(
-                    _mm512_add_pd(_mm512_add_pd(_mm512_add_pd(h, h), l), c),
-                    v_half,
-                );
-                let n_eq = _mm512_mul_pd(
-                    _mm512_add_pd(_mm512_add_pd(h, l), _mm512_add_pd(c, c)),
-                    v_half,
-                );
-
-                let mut n = n_eq;
-                n = _mm512_mask_blend_pd(mgt, n, n_gt);
-                n = _mm512_mask_blend_pd(mlt, n, n_lt);
-
-                let r1v = _mm512_sub_pd(n, l);
-                let s1v = _mm512_sub_pd(n, h);
-
-                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
-                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
-                _mm512_storeu_pd(r2p.add(i), v_nan);
-                _mm512_storeu_pd(r3p.add(i), v_nan);
-                _mm512_storeu_pd(r4p.add(i), v_nan);
-                _mm512_storeu_pd(s2p.add(i), v_nan);
-                _mm512_storeu_pd(s3p.add(i), v_nan);
-                _mm512_storeu_pd(s4p.add(i), v_nan);
-
-                i += step;
-            }
-        }
-        3 => {
-            while i + step <= len {
-                let h = _mm512_loadu_pd(hp.add(i));
-                let l = _mm512_loadu_pd(lp.add(i));
-                let c = _mm512_loadu_pd(cp.add(i));
-                let mk = valid_mask_avx512(h, l, c);
-
-                let p = _mm512_mul_pd(_mm512_add_pd(_mm512_add_pd(h, l), c), v_third);
-                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
-
-                let d = _mm512_sub_pd(h, l);
-                let d1 = _mm512_mul_pd(d, v_c0916);
-                let d2 = _mm512_mul_pd(d, v_c0183);
-                let d3 = _mm512_mul_pd(d, v_c0275);
-                let d4 = _mm512_mul_pd(d, v_c0550);
-
-                let r1v = _mm512_fmadd_pd(d, v_c0916, c);
-                let r2v = _mm512_fmadd_pd(d, v_c0183, c);
-                let r3v = _mm512_fmadd_pd(d, v_c0275, c);
-                let r4v = _mm512_fmadd_pd(d, v_c0550, c);
-
-                let s1v = _mm512_fmadd_pd(d, _mm512_sub_pd(_mm512_setzero_pd(), v_c0916), c);
-                let s2v = _mm512_fmadd_pd(d, _mm512_sub_pd(_mm512_setzero_pd(), v_c0183), c);
-                let s3v = _mm512_fmadd_pd(d, _mm512_sub_pd(_mm512_setzero_pd(), v_c0275), c);
-                let s4v = _mm512_fmadd_pd(d, _mm512_sub_pd(_mm512_setzero_pd(), v_c0550), c);
-
-                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
-                _mm512_storeu_pd(r2p.add(i), _mm512_mask_blend_pd(mk, v_nan, r2v));
-                _mm512_storeu_pd(r3p.add(i), _mm512_mask_blend_pd(mk, v_nan, r3v));
-                _mm512_storeu_pd(r4p.add(i), _mm512_mask_blend_pd(mk, v_nan, r4v));
-                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
-                _mm512_storeu_pd(s2p.add(i), _mm512_mask_blend_pd(mk, v_nan, s2v));
-                _mm512_storeu_pd(s3p.add(i), _mm512_mask_blend_pd(mk, v_nan, s3v));
-                _mm512_storeu_pd(s4p.add(i), _mm512_mask_blend_pd(mk, v_nan, s4v));
-
-                i += step;
-            }
-        }
-        4 => {
-            while i + step <= len {
-                let h = _mm512_loadu_pd(hp.add(i));
-                let l = _mm512_loadu_pd(lp.add(i));
-                let c = _mm512_loadu_pd(cp.add(i));
-                let o = _mm512_loadu_pd(op.add(i));
-                let mk = valid_mask_avx512(h, l, c);
-
-                let p = _mm512_mul_pd(
-                    _mm512_add_pd(_mm512_add_pd(h, l), _mm512_add_pd(o, o)),
-                    v_quart,
-                );
-                let t2p = _mm512_add_pd(p, p);
-                let t2l = _mm512_add_pd(l, l);
-                let t2h = _mm512_add_pd(h, h);
-                let d = _mm512_sub_pd(h, l);
-
-                let r3v = _mm512_add_pd(_mm512_sub_pd(t2p, t2l), h);
-                let r4v = _mm512_fmadd_pd(d, v_one, r3v);
-                let r2v = _mm512_fmadd_pd(d, v_one, p);
-                let r1v = _mm512_sub_pd(t2p, l);
-
-                let s1v = _mm512_sub_pd(t2p, h);
-                let s2v = _mm512_fmadd_pd(d, v_neg1, p);
-                let s3v = _mm512_sub_pd(_mm512_add_pd(l, t2p), t2h);
-                let s4v = _mm512_fmadd_pd(d, v_neg1, s3v);
-
-                _mm512_storeu_pd(ppp.add(i), _mm512_mask_blend_pd(mk, v_nan, p));
-                _mm512_storeu_pd(r1p.add(i), _mm512_mask_blend_pd(mk, v_nan, r1v));
-                _mm512_storeu_pd(r2p.add(i), _mm512_mask_blend_pd(mk, v_nan, r2v));
-                _mm512_storeu_pd(r3p.add(i), _mm512_mask_blend_pd(mk, v_nan, r3v));
-                _mm512_storeu_pd(r4p.add(i), _mm512_mask_blend_pd(mk, v_nan, r4v));
-                _mm512_storeu_pd(s1p.add(i), _mm512_mask_blend_pd(mk, v_nan, s1v));
-                _mm512_storeu_pd(s2p.add(i), _mm512_mask_blend_pd(mk, v_nan, s2v));
-                _mm512_storeu_pd(s3p.add(i), _mm512_mask_blend_pd(mk, v_nan, s3v));
-                _mm512_storeu_pd(s4p.add(i), _mm512_mask_blend_pd(mk, v_nan, s4v));
-
-                i += step;
-            }
-        }
-        _ => {}
-    }
-
-    if i < len {
-        pivot_scalar(
-            high, low, close, open, mode, i, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-        );
-    }
+    // The target-feature wrapper lets LLVM vectorize the single reviewed
+    // formula body. There is no second handwritten mathematical authority.
+    pivot_scalar(
+        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+    );
 }
-
 #[inline(always)]
 pub unsafe fn pivot_row_scalar(
     high: &[f64],
@@ -1487,7 +926,7 @@ pub unsafe fn pivot_row_avx512_long(
 }
 
 #[inline(always)]
-unsafe fn pivot_rows_scalar_into(
+fn pivot_rows_scalar_into(
     high: &[f64],
     low: &[f64],
     close: &[f64],
@@ -1530,9 +969,13 @@ fn pivot_batch_inner_into(
         return Err(PivotError::EmptyData);
     }
 
-    let first = first_valid_ohlc(high, low, close).ok_or(PivotError::AllValuesNaN)?;
-    if first >= cols {
+    if cols < 2 {
         return Err(PivotError::NotEnoughValidData);
+    }
+    if !combos.iter().any(|params| {
+        first_valid_pivot_output(high, low, close, open, params.mode.unwrap_or(3)).is_some()
+    }) {
+        return Err(PivotError::AllValuesNaN);
     }
 
     let rows = combos
@@ -1555,153 +998,70 @@ fn pivot_batch_inner_into(
         });
     }
 
-    let warm: Vec<usize> = vec![first; rows];
-
-    let out_mu = unsafe {
-        let mu = std::slice::from_raw_parts_mut(
-            out.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>,
-            out.len(),
-        );
-        init_matrix_prefixes(mu, cols, &warm);
-        mu
-    };
-
-    let chosen = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        k => k,
-    };
+    // Every cell is initialized before parallel work. Invalid source periods
+    // remain explicitly undefined rather than retaining uninitialized poison
+    // or bridging over gaps.
+    out.fill(f64::NAN);
+    let _ = kern;
+    let row_width = N_LEVELS * cols;
 
     if parallel {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            use rayon::prelude::*;
-            use std::sync::atomic::{AtomicPtr, Ordering};
-
-            let out_ptr = AtomicPtr::new(out.as_mut_ptr());
-            let out_len = out.len();
-
-            (0..combos.len()).into_par_iter().for_each(|ci| {
-                let mode = combos[ci].mode.unwrap_or(3);
-
-                let base = ci * N_LEVELS * cols;
-                unsafe {
-                    let ptr = out_ptr.load(Ordering::Relaxed);
-                    let mu = std::slice::from_raw_parts_mut(
-                        ptr as *mut std::mem::MaybeUninit<f64>,
-                        out_len,
+            out.par_chunks_mut(row_width)
+                .zip(combos.par_iter())
+                .for_each(|(chunk, params)| {
+                    let mode = params.mode.unwrap_or(3);
+                    let mut level_rows = chunk.chunks_mut(cols);
+                    let r4 = level_rows.next().unwrap();
+                    let r3 = level_rows.next().unwrap();
+                    let r2 = level_rows.next().unwrap();
+                    let r1 = level_rows.next().unwrap();
+                    let pp = level_rows.next().unwrap();
+                    let s1 = level_rows.next().unwrap();
+                    let s2 = level_rows.next().unwrap();
+                    let s3 = level_rows.next().unwrap();
+                    let s4 = level_rows.next().unwrap();
+                    pivot_rows_scalar_into(
+                        high, low, close, open, mode, 1, r4, r3, r2, r1, pp, s1, s2, s3, s4,
                     );
-                    let mut rows_mu = mu[base..base + N_LEVELS * cols].chunks_mut(cols);
-                    let mut cast = |mu: &mut [std::mem::MaybeUninit<f64>]| {
-                        std::slice::from_raw_parts_mut(mu.as_mut_ptr() as *mut f64, mu.len())
-                    };
-                    let r4_mu = rows_mu.next().unwrap();
-                    let r3_mu = rows_mu.next().unwrap();
-                    let r2_mu = rows_mu.next().unwrap();
-                    let r1_mu = rows_mu.next().unwrap();
-                    let pp_mu = rows_mu.next().unwrap();
-                    let s1_mu = rows_mu.next().unwrap();
-                    let s2_mu = rows_mu.next().unwrap();
-                    let s3_mu = rows_mu.next().unwrap();
-                    let s4_mu = rows_mu.next().unwrap();
-
-                    let r4 = cast(r4_mu);
-                    let r3 = cast(r3_mu);
-                    let r2 = cast(r2_mu);
-                    let r1 = cast(r1_mu);
-                    let pp = cast(pp_mu);
-                    let s1 = cast(s1_mu);
-                    let s2 = cast(s2_mu);
-                    let s3 = cast(s3_mu);
-                    let s4 = cast(s4_mu);
-
-                    match chosen {
-                        Kernel::Scalar | Kernel::ScalarBatch => pivot_rows_scalar_into(
-                            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-                        ),
-                        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                        Kernel::Avx2 | Kernel::Avx2Batch => pivot_row_avx2(
-                            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-                        ),
-                        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                        Kernel::Avx512 | Kernel::Avx512Batch => pivot_row_avx512(
-                            high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-                        ),
-                        _ => unreachable!(),
-                    }
-                }
-            });
+                });
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let mut row_chunks = out_mu.chunks_mut(cols);
-            for p in &combos {
-                let mode = p.mode.unwrap_or(3);
-                unsafe {
-                    let r4_mu = row_chunks.next().unwrap();
-                    let r3_mu = row_chunks.next().unwrap();
-                    let r2_mu = row_chunks.next().unwrap();
-                    let r1_mu = row_chunks.next().unwrap();
-                    let pp_mu = row_chunks.next().unwrap();
-                    let s1_mu = row_chunks.next().unwrap();
-                    let s2_mu = row_chunks.next().unwrap();
-                    let s3_mu = row_chunks.next().unwrap();
-                    let s4_mu = row_chunks.next().unwrap();
-
-                    let mut cast = |mu: &mut [std::mem::MaybeUninit<f64>]| {
-                        std::slice::from_raw_parts_mut(mu.as_mut_ptr() as *mut f64, mu.len())
-                    };
-                    let (r4, r3, r2, r1, pp, s1, s2, s3, s4) = (
-                        cast(r4_mu),
-                        cast(r3_mu),
-                        cast(r2_mu),
-                        cast(r1_mu),
-                        cast(pp_mu),
-                        cast(s1_mu),
-                        cast(s2_mu),
-                        cast(s3_mu),
-                        cast(s4_mu),
-                    );
-
-                    pivot_rows_scalar_into(
-                        high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-                    );
-                }
+            for (chunk, params) in out.chunks_mut(row_width).zip(combos.iter()) {
+                let mode = params.mode.unwrap_or(3);
+                let mut level_rows = chunk.chunks_mut(cols);
+                let r4 = level_rows.next().unwrap();
+                let r3 = level_rows.next().unwrap();
+                let r2 = level_rows.next().unwrap();
+                let r1 = level_rows.next().unwrap();
+                let pp = level_rows.next().unwrap();
+                let s1 = level_rows.next().unwrap();
+                let s2 = level_rows.next().unwrap();
+                let s3 = level_rows.next().unwrap();
+                let s4 = level_rows.next().unwrap();
+                pivot_rows_scalar_into(
+                    high, low, close, open, mode, 1, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+                );
             }
         }
     } else {
-        let mut row_chunks = out_mu.chunks_mut(cols);
-        for p in &combos {
-            let mode = p.mode.unwrap_or(3);
-            unsafe {
-                let r4_mu = row_chunks.next().unwrap();
-                let r3_mu = row_chunks.next().unwrap();
-                let r2_mu = row_chunks.next().unwrap();
-                let r1_mu = row_chunks.next().unwrap();
-                let pp_mu = row_chunks.next().unwrap();
-                let s1_mu = row_chunks.next().unwrap();
-                let s2_mu = row_chunks.next().unwrap();
-                let s3_mu = row_chunks.next().unwrap();
-                let s4_mu = row_chunks.next().unwrap();
-
-                let mut cast = |mu: &mut [std::mem::MaybeUninit<f64>]| {
-                    std::slice::from_raw_parts_mut(mu.as_mut_ptr() as *mut f64, mu.len())
-                };
-                let (r4, r3, r2, r1, pp, s1, s2, s3, s4) = (
-                    cast(r4_mu),
-                    cast(r3_mu),
-                    cast(r2_mu),
-                    cast(r1_mu),
-                    cast(pp_mu),
-                    cast(s1_mu),
-                    cast(s2_mu),
-                    cast(s3_mu),
-                    cast(s4_mu),
-                );
-
-                pivot_rows_scalar_into(
-                    high, low, close, open, mode, first, r4, r3, r2, r1, pp, s1, s2, s3, s4,
-                );
-            }
+        for (chunk, params) in out.chunks_mut(row_width).zip(combos.iter()) {
+            let mode = params.mode.unwrap_or(3);
+            let mut level_rows = chunk.chunks_mut(cols);
+            let r4 = level_rows.next().unwrap();
+            let r3 = level_rows.next().unwrap();
+            let r2 = level_rows.next().unwrap();
+            let r1 = level_rows.next().unwrap();
+            let pp = level_rows.next().unwrap();
+            let s1 = level_rows.next().unwrap();
+            let s2 = level_rows.next().unwrap();
+            let s3 = level_rows.next().unwrap();
+            let s4 = level_rows.next().unwrap();
+            pivot_rows_scalar_into(
+                high, low, close, open, mode, 1, r4, r3, r2, r1, pp, s1, s2, s3, s4,
+            );
         }
     }
     Ok(combos)
@@ -1827,24 +1187,8 @@ pub fn pivot_batch_flat_with_kernel(
         step: 0,
     })?;
 
-    let mut buf_mu = make_uninit_matrix(rows, cols);
-    let warm: Vec<usize> =
-        vec![first_valid_ohlc(high, low, close).ok_or(PivotError::AllValuesNaN)?; rows];
-    init_matrix_prefixes(&mut buf_mu, cols, &warm);
-
-    let mut guard = core::mem::ManuallyDrop::new(buf_mu);
-    let out: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
-
-    pivot_batch_inner_into(high, low, close, open, sweep, kernel, true, out)?;
-
-    let values = unsafe {
-        Vec::from_raw_parts(
-            guard.as_mut_ptr() as *mut f64,
-            guard.len(),
-            guard.capacity(),
-        )
-    };
+    let mut values = vec![f64::NAN; rows * cols];
+    pivot_batch_inner_into(high, low, close, open, sweep, kernel, true, &mut values)?;
     Ok(PivotBatchFlatOutput {
         values,
         combos,
@@ -1898,6 +1242,7 @@ fn expand_grid(r: &PivotBatchRange) -> Result<Vec<PivotParams>, PivotError> {
     let modes = axis_usize(r.mode)?;
     let mut v = Vec::with_capacity(modes.len());
     for m in modes {
+        validate_pivot_mode(m)?;
         v.push(PivotParams { mode: Some(m) });
     }
     Ok(v)
@@ -1916,46 +1261,34 @@ fn pivot_batch_inner(
         return Err(PivotError::InvalidRange { start, end, step });
     }
     let len = high.len();
+    if len == 0 || low.len() != len || close.len() != len || open.len() != len {
+        return Err(PivotError::EmptyData);
+    }
+    if len < 2 {
+        return Err(PivotError::NotEnoughValidData);
+    }
+    if !combos.iter().any(|params| {
+        first_valid_pivot_output(high, low, close, open, params.mode.unwrap_or(3)).is_some()
+    }) {
+        return Err(PivotError::AllValuesNaN);
+    }
     let mut levels = Vec::with_capacity(combos.len());
     for p in &combos {
         let mode = p.mode.unwrap_or(3);
-        let mut first = None;
-        for i in 0..len {
-            if !(high[i].is_nan() || low[i].is_nan() || close[i].is_nan()) {
-                first = Some(i);
-                break;
-            }
-        }
-        let first = first.unwrap_or(len);
-
-        let mut r4 = alloc_with_nan_prefix(len, first);
-        let mut r3 = alloc_with_nan_prefix(len, first);
-        let mut r2 = alloc_with_nan_prefix(len, first);
-        let mut r1 = alloc_with_nan_prefix(len, first);
-        let mut pp = alloc_with_nan_prefix(len, first);
-        let mut s1 = alloc_with_nan_prefix(len, first);
-        let mut s2 = alloc_with_nan_prefix(len, first);
-        let mut s3 = alloc_with_nan_prefix(len, first);
-        let mut s4 = alloc_with_nan_prefix(len, first);
-        unsafe {
-            match kernel {
-                Kernel::Scalar | Kernel::ScalarBatch => pivot_row_scalar(
-                    high, low, close, open, mode, first, &mut r4, &mut r3, &mut r2, &mut r1,
-                    &mut pp, &mut s1, &mut s2, &mut s3, &mut s4,
-                ),
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx2 | Kernel::Avx2Batch => pivot_row_avx2(
-                    high, low, close, open, mode, first, &mut r4, &mut r3, &mut r2, &mut r1,
-                    &mut pp, &mut s1, &mut s2, &mut s3, &mut s4,
-                ),
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx512 | Kernel::Avx512Batch => pivot_row_avx512(
-                    high, low, close, open, mode, first, &mut r4, &mut r3, &mut r2, &mut r1,
-                    &mut pp, &mut s1, &mut s2, &mut s3, &mut s4,
-                ),
-                _ => unreachable!(),
-            }
-        }
+        let mut r4 = vec![f64::NAN; len];
+        let mut r3 = vec![f64::NAN; len];
+        let mut r2 = vec![f64::NAN; len];
+        let mut r1 = vec![f64::NAN; len];
+        let mut pp = vec![f64::NAN; len];
+        let mut s1 = vec![f64::NAN; len];
+        let mut s2 = vec![f64::NAN; len];
+        let mut s3 = vec![f64::NAN; len];
+        let mut s4 = vec![f64::NAN; len];
+        let _ = kernel;
+        pivot_rows_scalar_into(
+            high, low, close, open, mode, 1, &mut r4, &mut r3, &mut r2, &mut r1, &mut pp, &mut s1,
+            &mut s2, &mut s3, &mut s4,
+        );
         levels.push([r4, r3, r2, r1, pp, s1, s2, s3, s4]);
     }
     let rows = combos.len();
@@ -1970,19 +1303,21 @@ fn pivot_batch_inner(
 
 pub struct PivotStream {
     mode: usize,
+    previous: Option<[f64; 4]>,
 }
 
 impl PivotStream {
-    pub fn new(mode: usize) -> Self {
-        Self { mode }
+    pub fn new(mode: usize) -> Result<Self, PivotError> {
+        validate_pivot_mode(mode)?;
+        Ok(Self {
+            mode,
+            previous: None,
+        })
     }
 
     pub fn try_new(params: PivotParams) -> Result<Self, PivotError> {
         let mode = params.mode.unwrap_or(3);
-        if mode > 4 {
-            return Err(PivotError::EmptyData);
-        }
-        Ok(Self { mode })
+        Self::new(mode)
     }
 
     #[inline(always)]
@@ -1993,628 +1328,275 @@ impl PivotStream {
         close: f64,
         open: f64,
     ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
-        const C1: f64 = 0.0916;
-        const C2: f64 = 0.183;
-        const C3: f64 = 0.275;
-        const C4: f64 = 0.55;
-
-        const INV3: f64 = 1.0 / 3.0;
-        const INV4: f64 = 0.25;
-        const INV2: f64 = 0.5;
-
-        match self.mode {
-            0 => {
-                if high.is_nan() || low.is_nan() || close.is_nan() {
-                    return None;
-                }
-                let d = high - low;
-                let p = (high + low + close) * INV3;
-                let t2 = p + p;
-
-                let r1 = t2 - low;
-                let r2 = d.mul_add(1.0, p);
-                let s1 = t2 - high;
-                let s2 = (-d).mul_add(1.0, p);
-
-                Some((f64::NAN, f64::NAN, r2, r1, p, s1, s2, f64::NAN, f64::NAN))
-            }
-
-            1 => {
-                if high.is_nan() || low.is_nan() || close.is_nan() {
-                    return None;
-                }
-                let d = high - low;
-                let p = (high + low + close) * INV3;
-
-                let r1 = d.mul_add(0.382, p);
-                let r2 = d.mul_add(0.618, p);
-                let r3 = d.mul_add(1.000, p);
-                let s1 = d.mul_add(-0.382, p);
-                let s2 = d.mul_add(-0.618, p);
-                let s3 = d.mul_add(-1.000, p);
-
-                Some((f64::NAN, r3, r2, r1, p, s1, s2, s3, f64::NAN))
-            }
-
-            2 => {
-                if high.is_nan() || low.is_nan() || close.is_nan() || open.is_nan() {
-                    return None;
-                }
-
-                let x_lt = high + low + low + close;
-                let x_gt = high + high + low + close;
-                let x_eq = high + low + close + close;
-
-                let lt: f64 = if close < open { 1.0 } else { 0.0 };
-                let gt: f64 = if close > open { 1.0 } else { 0.0 };
-                let eq: f64 = 1.0 - lt - gt;
-
-                let x = lt.mul_add(x_lt, gt.mul_add(x_gt, eq * x_eq));
-                let pp = x * INV4;
-                let half = x * INV2;
-
-                let r1 = half - low;
-                let s1 = half - high;
-
-                Some((
-                    f64::NAN,
-                    f64::NAN,
-                    f64::NAN,
-                    r1,
-                    pp,
-                    s1,
-                    f64::NAN,
-                    f64::NAN,
-                    f64::NAN,
-                ))
-            }
-
-            3 => {
-                if high.is_nan() || low.is_nan() || close.is_nan() {
-                    return None;
-                }
-                let d = high - low;
-                let p = (high + low + close) * INV3;
-
-                let r1 = d.mul_add(C1, close);
-                let r2 = d.mul_add(C2, close);
-                let r3 = d.mul_add(C3, close);
-                let r4 = d.mul_add(C4, close);
-                let s1 = (-C1).mul_add(d, close);
-                let s2 = (-C2).mul_add(d, close);
-                let s3 = (-C3).mul_add(d, close);
-                let s4 = (-C4).mul_add(d, close);
-
-                Some((r4, r3, r2, r1, p, s1, s2, s3, s4))
-            }
-
-            4 => {
-                if high.is_nan() || low.is_nan() || close.is_nan() || open.is_nan() {
-                    return None;
-                }
-                let d = high - low;
-                let p = (high + low + open + open) * INV4;
-                let t2 = p + p;
-
-                let r1 = t2 - low;
-                let r2 = d.mul_add(1.0, p);
-                let r3 = high + (p - low) * 2.0;
-                let r4 = (high - low).mul_add(1.0, r3);
-
-                let s1 = t2 - high;
-                let s2 = (-d).mul_add(1.0, p);
-                let s3 = low - (high - p) * 2.0;
-                let s4 = (-(high - low)).mul_add(1.0, s3);
-
-                Some((r4, r3, r2, r1, p, s1, s2, s3, s4))
-            }
-
-            _ => None,
-        }
+        let current = [high, low, close, open];
+        let previous = self.previous.replace(current)?;
+        let levels = pivot_levels_from_period(
+            previous[0],
+            previous[1],
+            previous[2],
+            previous[3],
+            open,
+            self.mode,
+        )?;
+        Some((
+            levels[0], levels[1], levels[2], levels[3], levels[4], levels[5], levels[6], levels[7],
+            levels[8],
+        ))
     }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "pivot")]
-#[pyo3(signature = (high, low, close, open, mode=3, kernel=None))]
-pub fn pivot_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    open: PyReadonlyArray1<'py, f64>,
-    mode: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let open_slice = open.as_slice()?;
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = PivotParams { mode: Some(mode) };
-    let input = PivotInput::from_slices(high_slice, low_slice, close_slice, open_slice, params);
-
-    let result = py
-        .allow_threads(|| pivot_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        result.r4.into_pyarray(py),
-        result.r3.into_pyarray(py),
-        result.r2.into_pyarray(py),
-        result.r1.into_pyarray(py),
-        result.pp.into_pyarray(py),
-        result.s1.into_pyarray(py),
-        result.s2.into_pyarray(py),
-        result.s3.into_pyarray(py),
-        result.s4.into_pyarray(py),
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::pivot_wrapper::CudaPivot;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pivot_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, open_f32, mode_range, device_id=0))]
-pub fn pivot_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    open_f32: numpy::PyReadonlyArray1<'py, f32>,
-    mode_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let o = open_f32.as_slice()?;
-    let sweep = PivotBatchRange { mode: mode_range };
-    let (inner, combos) = py.allow_threads(|| {
-        let cuda = CudaPivot::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.pivot_batch_dev(h, l, c, o, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "modes",
-        combos
-            .iter()
-            .map(|p| p.mode.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok((handle, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pivot_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, open_tm_f32, cols, rows, mode, device_id=0))]
-pub fn pivot_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    open_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    mode: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let o = open_tm_f32.as_slice()?;
-    let inner = py.allow_threads(|| {
-        let cuda = CudaPivot::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.pivot_many_series_one_param_time_major_dev(h, l, c, o, cols, rows, mode)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "PivotStream")]
-pub struct PivotStreamPy {
-    inner: PivotStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PivotStreamPy {
-    #[new]
-    fn new(mode: Option<usize>) -> PyResult<Self> {
-        let params = PivotParams { mode };
-        let inner =
-            PivotStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PivotStreamPy { inner })
-    }
-
-    fn update(
-        &mut self,
-        high: f64,
-        low: f64,
-        close: f64,
-        open: f64,
-    ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
-        self.inner.update(high, low, close, open)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "pivot_batch")]
-#[pyo3(signature = (high, low, close, open, mode_range, kernel=None))]
-pub fn pivot_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    open: PyReadonlyArray1<'py, f64>,
-    mode_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let (h, l, c, o) = (
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        open.as_slice()?,
-    );
-    let sweep = PivotBatchRange { mode: mode_range };
-    let kern = validate_kernel(kernel, true)?;
-
-    let flat = py
-        .allow_threads(|| pivot_batch_flat_with_kernel(h, l, c, o, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let combos = flat.combos.len();
-    let cols = flat.cols;
-    let vals = flat.values;
-
-    let arr = unsafe { PyArray1::<f64>::new(py, [vals.len()], false) };
-    unsafe {
-        arr.as_slice_mut()?.copy_from_slice(&vals);
-    }
-
-    let dict = PyDict::new(py);
-    let names = ["r4", "r3", "r2", "r1", "pp", "s1", "s2", "s3", "s4"];
-
-    for (li, name) in names.iter().enumerate() {
-        let level_arr = unsafe { PyArray1::<f64>::new(py, [combos * cols], false) };
-        let level_slice = unsafe { level_arr.as_slice_mut()? };
-
-        for combo_idx in 0..combos {
-            let base_idx = combo_idx * N_LEVELS * cols;
-            let level_base = li * cols;
-            for col_idx in 0..cols {
-                level_slice[combo_idx * cols + col_idx] = vals[base_idx + level_base + col_idx];
-            }
-        }
-
-        dict.set_item(*name, level_arr.reshape((combos, cols))?)?;
-    }
-
-    dict.set_item(
-        "modes",
-        flat.combos
-            .iter()
-            .map(|p| p.mode.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows_per_level", combos)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pivot_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    open: &[f64],
-    mode: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let len = high.len();
-    if low.len() != len || close.len() != len || open.len() != len {
-        return Err(JsValue::from_str(
-            "pivot: Input arrays must have the same length",
-        ));
-    }
-
-    let params = PivotParams { mode: Some(mode) };
-    let input = PivotInput::from_slices(high, low, close, open, params);
-    let out =
-        pivot_with_kernel(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let cols = high.len();
-    let mut values = Vec::with_capacity(N_LEVELS * cols);
-    values.extend_from_slice(&out.r4);
-    values.extend_from_slice(&out.r3);
-    values.extend_from_slice(&out.r2);
-    values.extend_from_slice(&out.r1);
-    values.extend_from_slice(&out.pp);
-    values.extend_from_slice(&out.s1);
-    values.extend_from_slice(&out.s2);
-    values.extend_from_slice(&out.s3);
-    values.extend_from_slice(&out.s4);
-    Ok(values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pivot_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    open_ptr: *const f64,
-    r4_ptr: *mut f64,
-    r3_ptr: *mut f64,
-    r2_ptr: *mut f64,
-    r1_ptr: *mut f64,
-    pp_ptr: *mut f64,
-    s1_ptr: *mut f64,
-    s2_ptr: *mut f64,
-    s3_ptr: *mut f64,
-    s4_ptr: *mut f64,
-    len: usize,
-    mode: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || open_ptr.is_null() {
-        return Err(JsValue::from_str("Null input pointer provided"));
-    }
-
-    if r4_ptr.is_null()
-        || r3_ptr.is_null()
-        || r2_ptr.is_null()
-        || r1_ptr.is_null()
-        || pp_ptr.is_null()
-        || s1_ptr.is_null()
-        || s2_ptr.is_null()
-        || s3_ptr.is_null()
-        || s4_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null output pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let open = std::slice::from_raw_parts(open_ptr, len);
-
-        let params = PivotParams { mode: Some(mode) };
-        let input = PivotInput::from_slices(high, low, close, open, params);
-
-        let input_ptrs = [
-            high_ptr as *const u8,
-            low_ptr as *const u8,
-            close_ptr as *const u8,
-            open_ptr as *const u8,
-        ];
-        let output_ptrs = [
-            r4_ptr as *const u8,
-            r3_ptr as *const u8,
-            r2_ptr as *const u8,
-            r1_ptr as *const u8,
-            pp_ptr as *const u8,
-            s1_ptr as *const u8,
-            s2_ptr as *const u8,
-            s3_ptr as *const u8,
-            s4_ptr as *const u8,
-        ];
-
-        let has_aliasing = input_ptrs
-            .iter()
-            .any(|&inp| output_ptrs.iter().any(|&out| inp == out));
-
-        if has_aliasing {
-            let mut temp = vec![0.0; len * 9];
-
-            let (r4_temp, rest) = temp.split_at_mut(len);
-            let (r3_temp, rest) = rest.split_at_mut(len);
-            let (r2_temp, rest) = rest.split_at_mut(len);
-            let (r1_temp, rest) = rest.split_at_mut(len);
-            let (pp_temp, rest) = rest.split_at_mut(len);
-            let (s1_temp, rest) = rest.split_at_mut(len);
-            let (s2_temp, rest) = rest.split_at_mut(len);
-            let (s3_temp, s4_temp) = rest.split_at_mut(len);
-
-            pivot_into_slices(
-                r4_temp,
-                r3_temp,
-                r2_temp,
-                r1_temp,
-                pp_temp,
-                s1_temp,
-                s2_temp,
-                s3_temp,
-                s4_temp,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let r4_out = std::slice::from_raw_parts_mut(r4_ptr, len);
-            let r3_out = std::slice::from_raw_parts_mut(r3_ptr, len);
-            let r2_out = std::slice::from_raw_parts_mut(r2_ptr, len);
-            let r1_out = std::slice::from_raw_parts_mut(r1_ptr, len);
-            let pp_out = std::slice::from_raw_parts_mut(pp_ptr, len);
-            let s1_out = std::slice::from_raw_parts_mut(s1_ptr, len);
-            let s2_out = std::slice::from_raw_parts_mut(s2_ptr, len);
-            let s3_out = std::slice::from_raw_parts_mut(s3_ptr, len);
-            let s4_out = std::slice::from_raw_parts_mut(s4_ptr, len);
-
-            r4_out.copy_from_slice(r4_temp);
-            r3_out.copy_from_slice(r3_temp);
-            r2_out.copy_from_slice(r2_temp);
-            r1_out.copy_from_slice(r1_temp);
-            pp_out.copy_from_slice(pp_temp);
-            s1_out.copy_from_slice(s1_temp);
-            s2_out.copy_from_slice(s2_temp);
-            s3_out.copy_from_slice(s3_temp);
-            s4_out.copy_from_slice(s4_temp);
-        } else {
-            let r4_out = std::slice::from_raw_parts_mut(r4_ptr, len);
-            let r3_out = std::slice::from_raw_parts_mut(r3_ptr, len);
-            let r2_out = std::slice::from_raw_parts_mut(r2_ptr, len);
-            let r1_out = std::slice::from_raw_parts_mut(r1_ptr, len);
-            let pp_out = std::slice::from_raw_parts_mut(pp_ptr, len);
-            let s1_out = std::slice::from_raw_parts_mut(s1_ptr, len);
-            let s2_out = std::slice::from_raw_parts_mut(s2_ptr, len);
-            let s3_out = std::slice::from_raw_parts_mut(s3_ptr, len);
-            let s4_out = std::slice::from_raw_parts_mut(s4_ptr, len);
-
-            pivot_into_slices(
-                r4_out,
-                r3_out,
-                r2_out,
-                r1_out,
-                pp_out,
-                s1_out,
-                s2_out,
-                s3_out,
-                s4_out,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pivot_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pivot_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PivotBatchConfig {
-    pub mode_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PivotBatchFlatJsOutput {
-    pub values: Vec<f64>,
-    pub modes: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = pivot_batch)]
-pub fn pivot_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    open: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: PivotBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let sweep = PivotBatchRange {
-        mode: cfg.mode_range,
-    };
-    let flat = pivot_batch_flat_with_kernel(high, low, close, open, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let modes = flat.combos.iter().map(|p| p.mode.unwrap()).collect();
-    let out = PivotBatchFlatJsOutput {
-        values: flat.values,
-        modes,
-        rows: flat.rows,
-        cols: flat.cols,
-    };
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pivot_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    open: &[f64],
-    mode: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = pivot_js(high, low, close, open, mode)?;
-    crate::write_wasm_f64_output("pivot_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pivot_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    open: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = pivot_batch_js(high, low, close, open, config)?;
-    crate::write_wasm_selected_object_f64_outputs("pivot_batch_output_into_js", &value, out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
     use crate::utilities::enums::Kernel;
     use paste::paste;
+
+    fn test_candles() -> Candles {
+        let len = 512usize;
+        let mut timestamp = Vec::with_capacity(len);
+        let mut open = Vec::with_capacity(len);
+        let mut high = Vec::with_capacity(len);
+        let mut low = Vec::with_capacity(len);
+        let mut close = Vec::with_capacity(len);
+        let mut volume = Vec::with_capacity(len);
+        for i in 0..len {
+            let base = 100.0 + i as f64 * 0.25;
+            let o = base + (i % 7) as f64 * 0.01;
+            let c = base + (i % 5) as f64 * 0.015 - 0.02;
+            timestamp.push(i as i64 * 300_000);
+            open.push(o);
+            high.push(o.max(c) + 0.75 + (i % 3) as f64 * 0.05);
+            low.push(o.min(c) - 0.65 - (i % 4) as f64 * 0.04);
+            close.push(c);
+            volume.push(1_000.0 + i as f64);
+        }
+        Candles::new(timestamp, open, high, low, close, volume)
+    }
+
+    fn pivot_from_rows(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        open: &[f64],
+        mode: usize,
+    ) -> Result<PivotOutput, PivotError> {
+        pivot(&PivotInput::from_slices(
+            high,
+            low,
+            close,
+            open,
+            PivotParams { mode: Some(mode) },
+        ))
+    }
+
+    #[test]
+    fn pivot_standard_uses_the_previous_period_and_emits_all_four_levels() {
+        let output = pivot_from_rows(
+            &[10.0, 20.0, 30.0],
+            &[6.0, 12.0, 18.0],
+            &[8.0, 16.0, 24.0],
+            &[7.0, 15.0, 21.0],
+            0,
+        )
+        .unwrap();
+
+        for value in [
+            output.r4[0],
+            output.r3[0],
+            output.r2[0],
+            output.r1[0],
+            output.pp[0],
+            output.s1[0],
+            output.s2[0],
+            output.s3[0],
+            output.s4[0],
+        ] {
+            assert!(value.is_nan(), "the first period has no prior OHLC source");
+        }
+
+        // Official Traditional pivot formulas over the PREVIOUS bar:
+        // H=10, L=6, C=8 -> P=8 and range=4.
+        assert_eq!(output.pp[1], 8.0);
+        assert_eq!(output.r1[1], 10.0);
+        assert_eq!(output.r2[1], 12.0);
+        assert_eq!(output.r3[1], 14.0);
+        assert_eq!(output.r4[1], 16.0);
+        assert_eq!(output.s1[1], 6.0);
+        assert_eq!(output.s2[1], 4.0);
+        assert_eq!(output.s3[1], 2.0);
+        assert_eq!(output.s4[1], 0.0);
+    }
+
+    #[test]
+    fn pivot_camarilla_uses_the_published_one_point_one_ratios() {
+        let output =
+            pivot_from_rows(&[1.7, 9.0], &[0.2, 8.0], &[1.1, 8.5], &[0.8, 8.25], 3).unwrap();
+        let range: f64 = 1.7 - 0.2;
+        let close: f64 = 1.1;
+
+        assert_eq!(
+            output.r1[1].to_bits(),
+            (close + 1.1 * range / 12.0).to_bits()
+        );
+        assert_eq!(
+            output.r2[1].to_bits(),
+            (close + 1.1 * range / 6.0).to_bits()
+        );
+        assert_eq!(
+            output.r3[1].to_bits(),
+            (close + 1.1 * range / 4.0).to_bits()
+        );
+        assert_eq!(
+            output.r4[1].to_bits(),
+            (close + 1.1 * range / 2.0).to_bits()
+        );
+        assert_eq!(
+            output.s1[1].to_bits(),
+            (close - 1.1 * range / 12.0).to_bits()
+        );
+        assert_eq!(
+            output.s2[1].to_bits(),
+            (close - 1.1 * range / 6.0).to_bits()
+        );
+        assert_eq!(
+            output.s3[1].to_bits(),
+            (close - 1.1 * range / 4.0).to_bits()
+        );
+        assert_eq!(
+            output.s4[1].to_bits(),
+            (close - 1.1 * range / 2.0).to_bits()
+        );
+    }
+
+    #[test]
+    fn pivot_woodie_uses_previous_high_low_and_current_open() {
+        let output =
+            pivot_from_rows(&[10.0, 200.0], &[6.0, 120.0], &[8.0, 160.0], &[7.0, 9.0], 4).unwrap();
+        let expected_pp = (10.0 + 6.0 + 2.0 * 9.0) / 4.0;
+        assert_eq!(output.pp[1], expected_pp);
+        assert_eq!(output.r1[1], 2.0 * expected_pp - 6.0);
+        assert_eq!(output.s1[1], 2.0 * expected_pp - 10.0);
+    }
+
+    #[test]
+    fn pivot_demark_uses_the_previous_period_branch() {
+        let output = pivot_from_rows(
+            &[10.0, 200.0],
+            &[6.0, 120.0],
+            &[8.0, 160.0],
+            &[9.0, 90.0],
+            2,
+        )
+        .unwrap();
+        let x = 10.0 + 2.0 * 6.0 + 8.0;
+        assert_eq!(output.pp[1], x / 4.0);
+        assert_eq!(output.r1[1], x / 2.0 - 6.0);
+        assert_eq!(output.s1[1], x / 2.0 - 10.0);
+    }
+
+    #[test]
+    fn pivot_rejects_an_unknown_formula_mode() {
+        let result = pivot_from_rows(&[10.0, 11.0], &[6.0, 7.0], &[8.0, 9.0], &[7.0, 8.0], 5);
+        assert!(
+            result.is_err(),
+            "an unknown mode must not return plausible all-NaN data"
+        );
+    }
+
+    #[test]
+    fn pivot_validity_is_bound_to_the_exact_previous_period_inputs() {
+        let output = pivot_from_rows(
+            &[10.0, f64::NAN, 30.0],
+            &[6.0, 12.0, 18.0],
+            &[8.0, 16.0, 24.0],
+            &[7.0, 15.0, 21.0],
+            0,
+        )
+        .unwrap();
+
+        assert!(output.pp[0].is_nan());
+        assert_eq!(
+            output.pp[1], 8.0,
+            "current HLC is not a previous-period input yet"
+        );
+        assert!(
+            output.pp[2].is_nan(),
+            "an invalid previous period must not be bridged"
+        );
+    }
+
+    #[test]
+    fn pivot_stream_waits_for_the_previous_period_and_matches_the_slice_api() {
+        let mut stream = PivotStream::try_new(PivotParams { mode: Some(0) }).unwrap();
+        assert!(stream.update(10.0, 6.0, 8.0, 7.0).is_none());
+
+        let streamed = stream.update(20.0, 12.0, 16.0, 15.0).unwrap();
+        let batch =
+            pivot_from_rows(&[10.0, 20.0], &[6.0, 12.0], &[8.0, 16.0], &[7.0, 15.0], 0).unwrap();
+        let expected = (
+            batch.r4[1],
+            batch.r3[1],
+            batch.r2[1],
+            batch.r1[1],
+            batch.pp[1],
+            batch.s1[1],
+            batch.s2[1],
+            batch.s3[1],
+            batch.s4[1],
+        );
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn pivot_batch_matches_each_mode_specific_slice_oracle() {
+        let high = [10.0, 20.0, 30.0];
+        let low = [6.0, 12.0, 18.0];
+        let close = [8.0, 16.0, 24.0];
+        let open = [9.0, 15.0, 21.0];
+        let batch = PivotBatchBuilder::new()
+            .kernel(Kernel::ScalarBatch)
+            .mode_range(0, MAX_PIVOT_MODE, 1)
+            .apply_slice(&high, &low, &close, &open)
+            .unwrap();
+
+        for (row, params) in batch.combos.iter().enumerate() {
+            let mode = params.mode.unwrap();
+            let expected = pivot_from_rows(&high, &low, &close, &open, mode).unwrap();
+            let expected_levels = [
+                expected.r4,
+                expected.r3,
+                expected.r2,
+                expected.r1,
+                expected.pp,
+                expected.s1,
+                expected.s2,
+                expected.s3,
+                expected.s4,
+            ];
+            for (actual, expected) in batch.levels[row].iter().zip(expected_levels.iter()) {
+                for (actual, expected) in actual.iter().zip(expected.iter()) {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "mode {mode}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pivot_batch_rejects_an_unknown_formula_mode() {
+        let result = PivotBatchBuilder::new()
+            .kernel(Kernel::ScalarBatch)
+            .mode_static(MAX_PIVOT_MODE + 1)
+            .apply_slice(&[10.0, 11.0], &[6.0, 7.0], &[8.0, 9.0], &[7.0, 8.0]);
+        assert!(matches!(result, Err(PivotError::InvalidMode { mode: 5 })));
+    }
 
     fn check_pivot_default_mode_camarilla(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let candles = test_candles();
 
         let params = PivotParams { mode: None };
         let input = PivotInput::from_candles(&candles, params);
@@ -2630,16 +1612,14 @@ mod tests {
         assert_eq!(result.s3.len(), candles.close.len());
         assert_eq!(result.s4.len(), candles.close.len());
 
-        let last_five_r4 = &result.r4[result.r4.len().saturating_sub(5)..];
-        let expected_r4 = [59466.5, 59357.55, 59243.6, 59334.85, 59170.35];
-        for (i, &val) in last_five_r4.iter().enumerate() {
-            let exp = expected_r4[i];
-            assert!(
-                (val - exp).abs() < 1e-1,
-                "Camarilla r4 mismatch at index {}, expected {}, got {}",
-                i,
-                exp,
-                val
+        let start = result.r4.len().saturating_sub(5).max(1);
+        for i in start..result.r4.len() {
+            let range = candles.high[i - 1] - candles.low[i - 1];
+            let expected = candles.close[i - 1] + 1.1 * range / 2.0;
+            assert_eq!(
+                result.r4[i].to_bits(),
+                expected.to_bits(),
+                "Camarilla R4 must be sourced from the previous period at index {i}"
             );
         }
         Ok(())
@@ -2713,8 +1693,7 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let candles = test_candles();
         let params = PivotParams { mode: Some(1) };
         let input = PivotInput::from_candles(&candles, params);
         let output = pivot_with_kernel(&input, kernel)?;
@@ -2727,8 +1706,7 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let candles = test_candles();
         let params = PivotParams { mode: Some(0) };
         let input = PivotInput::from_candles(&candles, params);
         let output = pivot_with_kernel(&input, kernel)?;
@@ -2741,8 +1719,7 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let candles = test_candles();
         let params = PivotParams { mode: Some(2) };
         let input = PivotInput::from_candles(&candles, params);
         let output = pivot_with_kernel(&input, kernel)?;
@@ -2755,8 +1732,7 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let candles = test_candles();
         let params = PivotParams { mode: Some(4) };
         let input = PivotInput::from_candles(&candles, params);
         let output = pivot_with_kernel(&input, kernel)?;
@@ -2837,454 +1813,83 @@ mod tests {
             ]
         });
 
-        proptest::test_runner::TestRunner::default().run(
-            &strat,
-            |(high, low, close, open, mode)| {
-                let params = PivotParams { mode: Some(mode) };
-                let input = PivotInput::from_slices(&high, &low, &close, &open, params);
+        let mut runner = proptest::test_runner::TestRunner::new(proptest::test_runner::Config {
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        });
+        runner.run(&strat, |(high, low, close, open, mode)| {
+            let params = PivotParams { mode: Some(mode) };
+            let input = PivotInput::from_slices(&high, &low, &close, &open, params);
 
-                let output = pivot_with_kernel(&input, kernel)?;
-                let ref_output = pivot_with_kernel(&input, Kernel::Scalar)?;
+            let output = pivot_with_kernel(&input, kernel)?;
+            let ref_output = pivot_with_kernel(&input, Kernel::Scalar)?;
 
-                prop_assert_eq!(output.pp.len(), high.len());
-                prop_assert_eq!(output.r1.len(), high.len());
-                prop_assert_eq!(output.s1.len(), high.len());
+            prop_assert_eq!(output.pp.len(), high.len());
+            prop_assert_eq!(output.r1.len(), high.len());
+            prop_assert_eq!(output.s1.len(), high.len());
 
-                for i in 0..high.len() {
-                    let h = high[i];
-                    let l = low[i];
-                    let c = close[i];
-                    let o = open[i];
+            let output_levels = [
+                &output.r4, &output.r3, &output.r2, &output.r1, &output.pp, &output.s1, &output.s2,
+                &output.s3, &output.s4,
+            ];
+            let reference_levels = [
+                &ref_output.r4,
+                &ref_output.r3,
+                &ref_output.r2,
+                &ref_output.r1,
+                &ref_output.pp,
+                &ref_output.s1,
+                &ref_output.s2,
+                &ref_output.s3,
+                &ref_output.s4,
+            ];
+            let defined = match mode {
+                0 | 3 | 4 => [true; N_LEVELS],
+                1 => [false, true, true, true, true, true, true, true, false],
+                2 => [false, false, false, true, true, true, false, false, false],
+                _ => unreachable!(),
+            };
 
-                    if h.is_nan() || l.is_nan() || c.is_nan() || o.is_nan() {
-                        continue;
+            for i in 0..high.len() {
+                let valid = pivot_inputs_valid_at(&high, &low, &close, &open, mode, i);
+                for level in 0..N_LEVELS {
+                    let actual = output_levels[level][i];
+                    let reference = reference_levels[level][i];
+                    prop_assert_eq!(
+                        actual.to_bits(),
+                        reference.to_bits(),
+                        "kernel mismatch at output {}, index {}",
+                        level,
+                        i
+                    );
+                    if valid && defined[level] {
+                        prop_assert!(
+                            actual.is_finite(),
+                            "defined output {} is non-finite at index {}",
+                            level,
+                            i
+                        );
+                    } else {
+                        prop_assert!(
+                            actual.is_nan(),
+                            "undefined output {} became numeric at index {}",
+                            level,
+                            i
+                        );
                     }
-
-                    let pp = output.pp[i];
-                    let r4 = output.r4[i];
-                    let r3 = output.r3[i];
-                    let r2 = output.r2[i];
-                    let r1 = output.r1[i];
-                    let s1 = output.s1[i];
-                    let s2 = output.s2[i];
-                    let s3 = output.s3[i];
-                    let s4 = output.s4[i];
-
-                    let tolerance = 1e-9;
-                    let range = h - l;
-
-                    match mode {
-                        0 => {
-                            let expected_pp = (h + l + c) / 3.0;
-                            prop_assert!(
-                                (pp - expected_pp).abs() < tolerance,
-                                "Standard PP at {}: {} vs {}",
-                                i,
-                                pp,
-                                expected_pp
-                            );
-
-                            let expected_r1 = 2.0 * pp - l;
-                            prop_assert!(
-                                (r1 - expected_r1).abs() < tolerance,
-                                "Standard R1 at {}: {} vs {}",
-                                i,
-                                r1,
-                                expected_r1
-                            );
-
-                            let expected_r2 = pp + range;
-                            prop_assert!(
-                                (r2 - expected_r2).abs() < tolerance,
-                                "Standard R2 at {}: {} vs {}",
-                                i,
-                                r2,
-                                expected_r2
-                            );
-
-                            let expected_s1 = 2.0 * pp - h;
-                            prop_assert!(
-                                (s1 - expected_s1).abs() < tolerance,
-                                "Standard S1 at {}: {} vs {}",
-                                i,
-                                s1,
-                                expected_s1
-                            );
-
-                            let expected_s2 = pp - range;
-                            prop_assert!(
-                                (s2 - expected_s2).abs() < tolerance,
-                                "Standard S2 at {}: {} vs {}",
-                                i,
-                                s2,
-                                expected_s2
-                            );
-
-                            prop_assert!(r3.is_nan(), "Standard R3 should be NaN at {}", i);
-                            prop_assert!(r4.is_nan(), "Standard R4 should be NaN at {}", i);
-                            prop_assert!(s3.is_nan(), "Standard S3 should be NaN at {}", i);
-                            prop_assert!(s4.is_nan(), "Standard S4 should be NaN at {}", i);
-
-                            prop_assert!(s2 <= s1 + tolerance, "S2 > S1 at {}", i);
-                            prop_assert!(s1 <= pp + tolerance, "S1 > PP at {}", i);
-                            prop_assert!(pp <= r1 + tolerance, "PP > R1 at {}", i);
-                            prop_assert!(r1 <= r2 + tolerance, "R1 > R2 at {}", i);
-                        }
-                        1 => {
-                            let expected_pp = (h + l + c) / 3.0;
-                            prop_assert!(
-                                (pp - expected_pp).abs() < tolerance,
-                                "Fibonacci PP at {}: {} vs {}",
-                                i,
-                                pp,
-                                expected_pp
-                            );
-
-                            let expected_r1 = pp + 0.382 * range;
-                            let expected_r2 = pp + 0.618 * range;
-                            let expected_r3 = pp + 1.0 * range;
-                            let expected_s1 = pp - 0.382 * range;
-                            let expected_s2 = pp - 0.618 * range;
-                            let expected_s3 = pp - 1.0 * range;
-
-                            prop_assert!(
-                                (r1 - expected_r1).abs() < tolerance,
-                                "Fibonacci R1 at {}: {} vs {}",
-                                i,
-                                r1,
-                                expected_r1
-                            );
-                            prop_assert!(
-                                (r2 - expected_r2).abs() < tolerance,
-                                "Fibonacci R2 at {}: {} vs {}",
-                                i,
-                                r2,
-                                expected_r2
-                            );
-                            prop_assert!(
-                                (r3 - expected_r3).abs() < tolerance,
-                                "Fibonacci R3 at {}: {} vs {}",
-                                i,
-                                r3,
-                                expected_r3
-                            );
-                            prop_assert!(
-                                (s1 - expected_s1).abs() < tolerance,
-                                "Fibonacci S1 at {}: {} vs {}",
-                                i,
-                                s1,
-                                expected_s1
-                            );
-                            prop_assert!(
-                                (s2 - expected_s2).abs() < tolerance,
-                                "Fibonacci S2 at {}: {} vs {}",
-                                i,
-                                s2,
-                                expected_s2
-                            );
-                            prop_assert!(
-                                (s3 - expected_s3).abs() < tolerance,
-                                "Fibonacci S3 at {}: {} vs {}",
-                                i,
-                                s3,
-                                expected_s3
-                            );
-
-                            prop_assert!(r4.is_nan(), "Fibonacci R4 should be NaN at {}", i);
-                            prop_assert!(s4.is_nan(), "Fibonacci S4 should be NaN at {}", i);
-
-                            prop_assert!(s3 <= s2 + tolerance, "S3 > S2 at {}", i);
-                            prop_assert!(s2 <= s1 + tolerance, "S2 > S1 at {}", i);
-                            prop_assert!(s1 <= pp + tolerance, "S1 > PP at {}", i);
-                            prop_assert!(pp <= r1 + tolerance, "PP > R1 at {}", i);
-                            prop_assert!(r1 <= r2 + tolerance, "R1 > R2 at {}", i);
-                            prop_assert!(r2 <= r3 + tolerance, "R2 > R3 at {}", i);
-                        }
-                        2 => {
-                            let expected_pp = if c < o {
-                                (h + 2.0 * l + c) / 4.0
-                            } else if c > o {
-                                (2.0 * h + l + c) / 4.0
-                            } else {
-                                (h + l + 2.0 * c) / 4.0
-                            };
-                            prop_assert!(
-                                (pp - expected_pp).abs() < tolerance,
-                                "Demark PP at {}: {} vs {}",
-                                i,
-                                pp,
-                                expected_pp
-                            );
-
-                            let expected_r1 = if c < o {
-                                (h + 2.0 * l + c) / 2.0 - l
-                            } else if c > o {
-                                (2.0 * h + l + c) / 2.0 - l
-                            } else {
-                                (h + l + 2.0 * c) / 2.0 - l
-                            };
-                            let expected_s1 = if c < o {
-                                (h + 2.0 * l + c) / 2.0 - h
-                            } else if c > o {
-                                (2.0 * h + l + c) / 2.0 - h
-                            } else {
-                                (h + l + 2.0 * c) / 2.0 - h
-                            };
-
-                            prop_assert!(
-                                (r1 - expected_r1).abs() < tolerance,
-                                "Demark R1 at {}: {} vs {}",
-                                i,
-                                r1,
-                                expected_r1
-                            );
-                            prop_assert!(
-                                (s1 - expected_s1).abs() < tolerance,
-                                "Demark S1 at {}: {} vs {}",
-                                i,
-                                s1,
-                                expected_s1
-                            );
-
-                            prop_assert!(r2.is_nan(), "Demark R2 should be NaN at {}", i);
-                            prop_assert!(r3.is_nan(), "Demark R3 should be NaN at {}", i);
-                            prop_assert!(r4.is_nan(), "Demark R4 should be NaN at {}", i);
-                            prop_assert!(s2.is_nan(), "Demark S2 should be NaN at {}", i);
-                            prop_assert!(s3.is_nan(), "Demark S3 should be NaN at {}", i);
-                            prop_assert!(s4.is_nan(), "Demark S4 should be NaN at {}", i);
-                        }
-                        3 => {
-                            let expected_pp = (h + l + c) / 3.0;
-                            prop_assert!(
-                                (pp - expected_pp).abs() < tolerance,
-                                "Camarilla PP at {}: {} vs {}",
-                                i,
-                                pp,
-                                expected_pp
-                            );
-
-                            let expected_r4 = 0.55 * range + c;
-                            let expected_r3 = 0.275 * range + c;
-                            let expected_r2 = 0.183 * range + c;
-                            let expected_r1 = 0.0916 * range + c;
-                            let expected_s1 = c - 0.0916 * range;
-                            let expected_s2 = c - 0.183 * range;
-                            let expected_s3 = c - 0.275 * range;
-                            let expected_s4 = c - 0.55 * range;
-
-                            prop_assert!(
-                                (r4 - expected_r4).abs() < tolerance,
-                                "Camarilla R4 at {}: {} vs {}",
-                                i,
-                                r4,
-                                expected_r4
-                            );
-                            prop_assert!(
-                                (r3 - expected_r3).abs() < tolerance,
-                                "Camarilla R3 at {}: {} vs {}",
-                                i,
-                                r3,
-                                expected_r3
-                            );
-                            prop_assert!(
-                                (r2 - expected_r2).abs() < tolerance,
-                                "Camarilla R2 at {}: {} vs {}",
-                                i,
-                                r2,
-                                expected_r2
-                            );
-                            prop_assert!(
-                                (r1 - expected_r1).abs() < tolerance,
-                                "Camarilla R1 at {}: {} vs {}",
-                                i,
-                                r1,
-                                expected_r1
-                            );
-                            prop_assert!(
-                                (s1 - expected_s1).abs() < tolerance,
-                                "Camarilla S1 at {}: {} vs {}",
-                                i,
-                                s1,
-                                expected_s1
-                            );
-                            prop_assert!(
-                                (s2 - expected_s2).abs() < tolerance,
-                                "Camarilla S2 at {}: {} vs {}",
-                                i,
-                                s2,
-                                expected_s2
-                            );
-                            prop_assert!(
-                                (s3 - expected_s3).abs() < tolerance,
-                                "Camarilla S3 at {}: {} vs {}",
-                                i,
-                                s3,
-                                expected_s3
-                            );
-                            prop_assert!(
-                                (s4 - expected_s4).abs() < tolerance,
-                                "Camarilla S4 at {}: {} vs {}",
-                                i,
-                                s4,
-                                expected_s4
-                            );
-
-                            prop_assert!(s4 <= s3 + tolerance, "S4 > S3 at {}", i);
-                            prop_assert!(s3 <= s2 + tolerance, "S3 > S2 at {}", i);
-                            prop_assert!(s2 <= s1 + tolerance, "S2 > S1 at {}", i);
-                            prop_assert!(r1 <= r2 + tolerance, "R1 > R2 at {}", i);
-                            prop_assert!(r2 <= r3 + tolerance, "R2 > R3 at {}", i);
-                            prop_assert!(r3 <= r4 + tolerance, "R3 > R4 at {}", i);
-                        }
-                        4 => {
-                            let expected_pp = (h + l + 2.0 * o) / 4.0;
-                            prop_assert!(
-                                (pp - expected_pp).abs() < tolerance,
-                                "Woodie PP at {}: {} vs {}",
-                                i,
-                                pp,
-                                expected_pp
-                            );
-
-                            let expected_r1 = 2.0 * pp - l;
-                            let expected_r2 = pp + range;
-                            let expected_r3 = h + 2.0 * (pp - l);
-                            let expected_r4 = expected_r3 + range;
-                            let expected_s1 = 2.0 * pp - h;
-                            let expected_s2 = pp - range;
-                            let expected_s3 = l - 2.0 * (h - pp);
-                            let expected_s4 = expected_s3 - range;
-
-                            prop_assert!(
-                                (r1 - expected_r1).abs() < tolerance,
-                                "Woodie R1 at {}: {} vs {}",
-                                i,
-                                r1,
-                                expected_r1
-                            );
-                            prop_assert!(
-                                (r2 - expected_r2).abs() < tolerance,
-                                "Woodie R2 at {}: {} vs {}",
-                                i,
-                                r2,
-                                expected_r2
-                            );
-                            prop_assert!(
-                                (r3 - expected_r3).abs() < tolerance,
-                                "Woodie R3 at {}: {} vs {}",
-                                i,
-                                r3,
-                                expected_r3
-                            );
-                            prop_assert!(
-                                (r4 - expected_r4).abs() < tolerance,
-                                "Woodie R4 at {}: {} vs {}",
-                                i,
-                                r4,
-                                expected_r4
-                            );
-                            prop_assert!(
-                                (s1 - expected_s1).abs() < tolerance,
-                                "Woodie S1 at {}: {} vs {}",
-                                i,
-                                s1,
-                                expected_s1
-                            );
-                            prop_assert!(
-                                (s2 - expected_s2).abs() < tolerance,
-                                "Woodie S2 at {}: {} vs {}",
-                                i,
-                                s2,
-                                expected_s2
-                            );
-                            prop_assert!(
-                                (s3 - expected_s3).abs() < tolerance,
-                                "Woodie S3 at {}: {} vs {}",
-                                i,
-                                s3,
-                                expected_s3
-                            );
-                            prop_assert!(
-                                (s4 - expected_s4).abs() < tolerance,
-                                "Woodie S4 at {}: {} vs {}",
-                                i,
-                                s4,
-                                expected_s4
-                            );
-
-                            prop_assert!(s4 <= s3 + tolerance, "S4 > S3 at {}", i);
-                            prop_assert!(s3 <= s2 + tolerance, "S3 > S2 at {}", i);
-                            prop_assert!(s2 <= s1 + tolerance, "S2 > S1 at {}", i);
-                            prop_assert!(r1 <= r2 + tolerance, "R1 > R2 at {}", i);
-                            prop_assert!(r2 <= r3 + tolerance, "R2 > R3 at {}", i);
-                            prop_assert!(r3 <= r4 + tolerance, "R3 > R4 at {}", i);
-                        }
-                        _ => {}
-                    }
-
-                    prop_assert!(
-                        (pp - ref_output.pp[i]).abs() < tolerance,
-                        "PP kernel mismatch at {}",
-                        i
-                    );
-                    prop_assert!(
-                        (r1 - ref_output.r1[i]).abs() < tolerance
-                            || (r1.is_nan() && ref_output.r1[i].is_nan()),
-                        "R1 kernel mismatch at {}",
-                        i
-                    );
-                    prop_assert!(
-                        (s1 - ref_output.s1[i]).abs() < tolerance
-                            || (s1.is_nan() && ref_output.s1[i].is_nan()),
-                        "S1 kernel mismatch at {}",
-                        i
-                    );
 
                     #[cfg(debug_assertions)]
-                    {
-                        let check_poison = |val: f64, name: &str| {
-                            if !val.is_nan() {
-                                let bits = val.to_bits();
-                                prop_assert_ne!(
-                                    bits,
-                                    0x11111111_11111111,
-                                    "{} poison at {}",
-                                    name,
-                                    i
-                                );
-                                prop_assert_ne!(
-                                    bits,
-                                    0x22222222_22222222,
-                                    "{} poison at {}",
-                                    name,
-                                    i
-                                );
-                                prop_assert_ne!(
-                                    bits,
-                                    0x33333333_33333333,
-                                    "{} poison at {}",
-                                    name,
-                                    i
-                                );
-                            }
-                            Ok(())
-                        };
-
-                        check_poison(pp, "PP")?;
-                        check_poison(r4, "R4")?;
-                        check_poison(r3, "R3")?;
-                        check_poison(r2, "R2")?;
-                        check_poison(r1, "R1")?;
-                        check_poison(s1, "S1")?;
-                        check_poison(s2, "S2")?;
-                        check_poison(s3, "S3")?;
-                        check_poison(s4, "S4")?;
+                    if !actual.is_nan() {
+                        let bits = actual.to_bits();
+                        prop_assert_ne!(bits, 0x11111111_11111111);
+                        prop_assert_ne!(bits, 0x22222222_22222222);
+                        prop_assert_ne!(bits, 0x33333333_33333333);
                     }
                 }
+            }
 
-                Ok(())
-            },
-        )?;
+            Ok(())
+        })?;
 
         Ok(())
     }
@@ -3296,8 +1901,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let candles = test_candles();
 
         let test_params = vec![
             PivotParams::default(),
@@ -3334,26 +1938,26 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
 							 in array {} with params: {:?} (param set {})",
-							test_name, val, bits, i, array_name, params, param_idx
-						);
+                            test_name, val, bits, i, array_name, params, param_idx
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
 							 in array {} with params: {:?} (param set {})",
-							test_name, val, bits, i, array_name, params, param_idx
-						);
+                            test_name, val, bits, i, array_name, params, param_idx
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
 							 in array {} with params: {:?} (param set {})",
-							test_name, val, bits, i, array_name, params, param_idx
-						);
+                            test_name, val, bits, i, array_name, params, param_idx
+                        );
                     }
                 }
             }
@@ -3370,45 +1974,23 @@ mod tests {
         Ok(())
     }
 
-    fn check_pivot_batch_default_row(
-        test_name: &str,
-        kernel: Kernel,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
-        let output = PivotBatchBuilder::new()
-            .kernel(kernel)
-            .apply_candles(&candles)?;
-        let default = PivotParams::default();
-        let def_idx = output
-            .combos
-            .iter()
-            .position(|p| p.mode == default.mode)
-            .expect("default row missing");
-        for arr in &output.levels[def_idx] {
-            assert_eq!(arr.len(), candles.close.len());
-        }
-        Ok(())
-    }
-
     macro_rules! generate_all_pivot_tests {
         ($($test_fn:ident),*) => {
             paste! {
                 $(
                     #[test]
-                    fn [<$test_fn _scalar>]() { let _ = $test_fn(stringify!([<$test_fn _scalar>]), Kernel::Scalar); }
+                    fn [<$test_fn _scalar>]() { $test_fn(stringify!([<$test_fn _scalar>]), Kernel::Scalar).unwrap(); }
                 )*
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
                 $(
                     #[test]
-                    fn [<$test_fn _avx2>]() { let _ = $test_fn(stringify!([<$test_fn _avx2>]), Kernel::Avx2); }
+                    fn [<$test_fn _avx2>]() { $test_fn(stringify!([<$test_fn _avx2>]), Kernel::Avx2).unwrap(); }
                     #[test]
-                    fn [<$test_fn _avx512>]() { let _ = $test_fn(stringify!([<$test_fn _avx512>]), Kernel::Avx512); }
+                    fn [<$test_fn _avx512>]() { $test_fn(stringify!([<$test_fn _avx512>]), Kernel::Avx512).unwrap(); }
                 )*
                 $(
                     #[test]
-                    fn [<$test_fn _auto_detect>]() { let _ = $test_fn(stringify!([<$test_fn _auto_detect>]), Kernel::Auto); }
+                    fn [<$test_fn _auto_detect>]() { $test_fn(stringify!([<$test_fn _auto_detect>]), Kernel::Auto).unwrap(); }
                 )*
             }
         }
@@ -3423,7 +2005,6 @@ mod tests {
         check_pivot_standard_mode,
         check_pivot_demark_mode,
         check_pivot_woodie_mode,
-        check_pivot_batch_default_row,
         check_pivot_no_poison
     );
 
@@ -3436,8 +2017,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let candles = test_candles();
 
         let output = PivotBatchBuilder::new()
             .kernel(kernel)
@@ -3455,14 +2035,15 @@ mod tests {
             assert_eq!(arr.len(), candles.close.len());
         }
 
-        let expected_r4 = [59466.5, 59357.55, 59243.6, 59334.85, 59170.35];
         let r4 = &levels[0];
-        let last_five_r4 = &r4[r4.len().saturating_sub(5)..];
-        for (i, &val) in last_five_r4.iter().enumerate() {
-            let exp = expected_r4[i];
-            assert!(
-                (val - exp).abs() < 1e-1,
-                "[{test}] Camarilla r4 mismatch at idx {i}: {val} vs {exp:?}"
+        let start = r4.len().saturating_sub(5).max(1);
+        for i in start..r4.len() {
+            let range = candles.high[i - 1] - candles.low[i - 1];
+            let expected = candles.close[i - 1] + 1.1 * range / 2.0;
+            assert_eq!(
+                r4[i].to_bits(),
+                expected.to_bits(),
+                "[{test}] Camarilla R4 must use the previous period at index {i}"
             );
         }
         Ok(())
@@ -3472,8 +2053,7 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let c = test_candles();
 
         let test_configs = vec![
             (0, 2, 1),
@@ -3517,26 +2097,26 @@ mod tests {
 
                         if bits == 0x11111111_11111111 {
                             panic!(
-								"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                                "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 								 at row {} col {} in array {} with params: {:?}",
-								test, cfg_idx, val, bits, row_idx, col, level_name, combo
-							);
+                                test, cfg_idx, val, bits, row_idx, col, level_name, combo
+                            );
                         }
 
                         if bits == 0x22222222_22222222 {
                             panic!(
-								"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                                "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 								 at row {} col {} in array {} with params: {:?}",
-								test, cfg_idx, val, bits, row_idx, col, level_name, combo
-							);
+                                test, cfg_idx, val, bits, row_idx, col, level_name, combo
+                            );
                         }
 
                         if bits == 0x33333333_33333333 {
                             panic!(
-								"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                                "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 								 at row {} col {} in array {} with params: {:?}",
-								test, cfg_idx, val, bits, row_idx, col, level_name, combo
-							);
+                                test, cfg_idx, val, bits, row_idx, col, level_name, combo
+                            );
                         }
                     }
                 }
@@ -3558,18 +2138,18 @@ mod tests {
         ($fn_name:ident) => {
             paste! {
                 #[test] fn [<$fn_name _scalar>]()      {
-                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                    $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch).unwrap();
                 }
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
                 #[test] fn [<$fn_name _avx2>]()        {
-                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                    $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch).unwrap();
                 }
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
                 #[test] fn [<$fn_name _avx512>]()      {
-                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                    $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch).unwrap();
                 }
                 #[test] fn [<$fn_name _auto_detect>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                    $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto).unwrap();
                 }
             }
         };
@@ -3580,8 +2160,7 @@ mod tests {
 
     #[test]
     fn test_pivot_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let candles = test_candles();
         let params = PivotParams::default();
         let input = PivotInput::from_candles(&candles, params);
 
@@ -3599,7 +2178,6 @@ mod tests {
         let mut s3 = vec![0.0; len];
         let mut s4 = vec![0.0; len];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             pivot_into(
                 &input, &mut r4, &mut r3, &mut r2, &mut r1, &mut pp, &mut s1, &mut s2, &mut s3,

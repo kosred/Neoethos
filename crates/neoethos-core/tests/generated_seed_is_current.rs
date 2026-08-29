@@ -113,8 +113,15 @@ fn flatten(prefix: &str, v: &serde_yaml_ng::Value, out: &mut Vec<(String, String
     match v {
         serde_yaml_ng::Value::Mapping(m) if !m.is_empty() => {
             for (k, val) in m {
-                let key = k.as_str().map(str::to_owned).unwrap_or_else(|| format!("{k:?}"));
-                let path = if prefix.is_empty() { key } else { format!("{prefix}.{key}") };
+                let key = k
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{k:?}"));
+                let path = if prefix.is_empty() {
+                    key
+                } else {
+                    format!("{prefix}.{key}")
+                };
                 flatten(&path, val, out);
             }
         }
@@ -156,7 +163,9 @@ fn describe_change(old: &str, new: &str) -> String {
                 i += 1;
             }
             (Some(_), Some((kb, vb))) => {
-                lines.push(format!("  ADDED    {kb}: {vb} — was taking this default silently"));
+                lines.push(format!(
+                    "  ADDED    {kb}: {vb} — was taking this default silently"
+                ));
                 j += 1;
             }
             (Some((ka, va)), None) => {
@@ -228,9 +237,7 @@ fn the_generated_body_carries_the_marker_the_migration_tool_requires() {
     );
     // And it must be a real marker line, not a substring of prose.
     assert!(
-        generated
-            .lines()
-            .any(|l| l.trim_end() == GENERATED_MARKER),
+        generated.lines().any(|l| l.trim_end() == GENERATED_MARKER),
         "the marker must be a line of its own"
     );
 }

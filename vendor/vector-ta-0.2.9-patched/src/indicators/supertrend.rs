@@ -1,37 +1,17 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaSupertrend};
-use crate::indicators::atr::{atr, AtrData, AtrError, AtrInput, AtrOutput, AtrParams};
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::indicators::atr::{AtrData, AtrError, AtrInput, AtrOutput, AtrParams, atr};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(feature = "python")]
-use pyo3::exceptions::{PyBufferError, PyValueError};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::AsRef;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum SuperTrendData<'a> {
@@ -406,7 +386,6 @@ pub fn supertrend_with_kernel(
     Ok(SuperTrendOutput { trend, changed })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn supertrend_into(
     input: &SuperTrendInput,
@@ -1151,244 +1130,6 @@ impl SuperTrendBatchOutput {
     }
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct SupertrendDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl SupertrendDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let d = pyo3::types::PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        use cust::memory::DeviceBuffer;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyBufferError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyBufferError::new_err(
-                            "__dlpack__: requested device does not match producer buffer",
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        if let Some(copy_obj) = copy.as_ref() {
-            let do_copy: bool = copy_obj.extract(py)?;
-            if do_copy {
-                return Err(PyBufferError::new_err(
-                    "__dlpack__(copy=True) not supported for supertrend CUDA buffers",
-                ));
-            }
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let rows = self.inner.rows;
-        let cols = self.inner.cols;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, inner.buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "supertrend_cuda_batch_dev")]
-#[pyo3(signature = (high, low, close, period_range, factor_range, device_id=0))]
-pub fn supertrend_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    factor_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let sweep = SuperTrendBatchRange {
-        period: period_range,
-        factor: factor_range,
-    };
-    let (trend, changed, combos, ctx_arc, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda =
-            CudaSupertrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
-        let l32: Vec<f32> = l.iter().map(|&v| v as f32).collect();
-        let c32: Vec<f32> = c.iter().map(|&v| v as f32).collect();
-        let (trend, changed, combos) = cuda
-            .supertrend_batch_dev(&h32, &l32, &c32, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_arc = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        Ok((trend, changed, combos, ctx_arc, dev_id))
-    })?;
-
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "trend",
-        Py::new(
-            py,
-            SupertrendDeviceArrayF32Py {
-                inner: trend,
-                _ctx: ctx_arc.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "changed",
-        Py::new(
-            py,
-            SupertrendDeviceArrayF32Py {
-                inner: changed,
-                _ctx: ctx_arc,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    let periods: Vec<usize> = combos.iter().map(|p| p.period.unwrap()).collect();
-    let factors: Vec<f64> = combos.iter().map(|p| p.factor.unwrap()).collect();
-    dict.set_item("periods", periods.into_pyarray(py))?;
-    dict.set_item("factors", factors.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "supertrend_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, close_tm, cols, rows, period, factor, device_id=0))]
-pub fn supertrend_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm: numpy::PyReadonlyArray1<'py, f64>,
-    low_tm: numpy::PyReadonlyArray1<'py, f64>,
-    close_tm: numpy::PyReadonlyArray1<'py, f64>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    factor: f64,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm.as_slice()?;
-    let l = low_tm.as_slice()?;
-    let c = close_tm.as_slice()?;
-    if h.len() != l.len() || l.len() != c.len() {
-        return Err(PyValueError::new_err("length mismatch"));
-    }
-    let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
-    let l32: Vec<f32> = l.iter().map(|&v| v as f32).collect();
-    let c32: Vec<f32> = c.iter().map(|&v| v as f32).collect();
-    let (out, ctx_arc, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda =
-            CudaSupertrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .supertrend_many_series_one_param_time_major_dev(
-                &h32,
-                &l32,
-                &c32,
-                cols,
-                rows,
-                period,
-                factor as f32,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_arc = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        Ok((out, ctx_arc, dev_id))
-    })?;
-
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "trend",
-        Py::new(
-            py,
-            SupertrendDeviceArrayF32Py {
-                inner: out.plus,
-                _ctx: ctx_arc.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "changed",
-        Py::new(
-            py,
-            SupertrendDeviceArrayF32Py {
-                inner: out.minus,
-                _ctx: ctx_arc,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("rows", rows)?;
-    Ok(dict)
-}
-
 #[inline(always)]
 fn expand_grid(r: &SuperTrendBatchRange) -> Result<Vec<SuperTrendParams>, SuperTrendError> {
     fn axis_usize(
@@ -1935,592 +1676,17 @@ unsafe fn supertrend_row_avx512_long(
     );
 }
 
-#[cfg(feature = "python")]
-#[inline(always)]
-pub fn supertrend_batch_inner_into(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    sweep: &SuperTrendBatchRange,
-    simd: Kernel,
-    parallel: bool,
-    trend_out: &mut [f64],
-    changed_out: &mut [f64],
-) -> Result<Vec<SuperTrendParams>, SuperTrendError> {
-    let combos = expand_grid(sweep)?;
-    if combos.is_empty() {
-        return Err(SuperTrendError::InvalidRange {
-            start: sweep.period.0,
-            end: sweep.period.1,
-            step: sweep.period.2,
-        });
-    }
-    let len = high.len();
-    let mut first_valid_idx = None;
-    for i in 0..len {
-        if !high[i].is_nan() && !low[i].is_nan() && !close[i].is_nan() {
-            first_valid_idx = Some(i);
-            break;
-        }
-    }
-    let first_valid_idx = match first_valid_idx {
-        Some(idx) => idx,
-        None => return Err(SuperTrendError::AllValuesNaN),
-    };
-    let max_p = combos.iter().map(|c| c.period.unwrap_or(10)).max().unwrap();
-    if len - first_valid_idx < max_p {
-        return Err(SuperTrendError::NotEnoughValidData {
-            needed: max_p,
-            valid: len - first_valid_idx,
-        });
-    }
-    let rows = combos.len();
-    let cols = len;
-
-    let expected_len = rows
-        .checked_mul(cols)
-        .ok_or(SuperTrendError::InvalidRange {
-            start: sweep.period.0,
-            end: sweep.period.1,
-            step: sweep.period.2,
-        })?;
-    if trend_out.len() != expected_len {
-        return Err(SuperTrendError::OutputLengthMismatch {
-            expected: expected_len,
-            got: trend_out.len(),
-        });
-    }
-    if changed_out.len() != expected_len {
-        return Err(SuperTrendError::OutputLengthMismatch {
-            expected: expected_len,
-            got: changed_out.len(),
-        });
-    }
-
-    for (row, combo) in combos.iter().enumerate() {
-        let warmup = first_valid_idx + combo.period.unwrap_or(10) - 1;
-        let row_start = row * cols;
-        for i in 0..warmup.min(cols) {
-            trend_out[row_start + i] = f64::NAN;
-            changed_out[row_start + i] = f64::NAN;
-        }
-    }
-
-    let hl2: Vec<f64> = (0..len).map(|i| 0.5 * (high[i] + low[i])).collect();
-
-    let do_row = |row: usize, trend_row: &mut [f64], changed_row: &mut [f64]| unsafe {
-        let period = combos[row].period.unwrap();
-        let factor = combos[row].factor.unwrap();
-        let atr_input = AtrInput::from_slices(
-            &high[first_valid_idx..],
-            &low[first_valid_idx..],
-            &close[first_valid_idx..],
-            AtrParams {
-                length: Some(period),
-            },
-        );
-        let AtrOutput { values: atr_values } = atr(&atr_input).unwrap();
-        match simd {
-            Kernel::Scalar => supertrend_row_scalar_from_hl(
-                &hl2,
-                close,
-                period,
-                factor,
-                first_valid_idx,
-                &atr_values,
-                trend_row,
-                changed_row,
-            ),
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2 => supertrend_row_avx2(
-                high,
-                low,
-                close,
-                period,
-                factor,
-                first_valid_idx,
-                &atr_values,
-                trend_row,
-                changed_row,
-            ),
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512 => supertrend_row_avx512(
-                high,
-                low,
-                close,
-                period,
-                factor,
-                first_valid_idx,
-                &atr_values,
-                trend_row,
-                changed_row,
-            ),
-            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-            Kernel::Avx2 | Kernel::Avx512 => supertrend_row_scalar_from_hl(
-                &hl2,
-                close,
-                period,
-                factor,
-                first_valid_idx,
-                &atr_values,
-                trend_row,
-                changed_row,
-            ),
-            _ => unreachable!(),
-        }
-    };
-    if parallel {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            trend_out
-                .par_chunks_mut(cols)
-                .zip(changed_out.par_chunks_mut(cols))
-                .enumerate()
-                .for_each(|(row, (tr, ch))| do_row(row, tr, ch));
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            for (row, (tr, ch)) in trend_out
-                .chunks_mut(cols)
-                .zip(changed_out.chunks_mut(cols))
-                .enumerate()
-            {
-                do_row(row, tr, ch);
-            }
-        }
-    } else {
-        for (row, (tr, ch)) in trend_out
-            .chunks_mut(cols)
-            .zip(changed_out.chunks_mut(cols))
-            .enumerate()
-        {
-            do_row(row, tr, ch);
-        }
-    }
-    Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "supertrend")]
-#[pyo3(signature = (high, low, close, period, factor, kernel=None))]
-pub fn supertrend_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    factor: f64,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = SuperTrendParams {
-        period: Some(period),
-        factor: Some(factor),
-    };
-    let input = SuperTrendInput::from_slices(high_slice, low_slice, close_slice, params);
-
-    let (trend_vec, changed_vec) = py
-        .allow_threads(|| supertrend_with_kernel(&input, kern).map(|o| (o.trend, o.changed)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((trend_vec.into_pyarray(py), changed_vec.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "supertrend_batch")]
-#[pyo3(signature = (high, low, close, period_range, factor_range, kernel=None))]
-pub fn supertrend_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    factor_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = SuperTrendBatchRange {
-        period: period_range,
-        factor: factor_range,
-    };
-
-    let grid_combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    if grid_combos.is_empty() {
-        return Err(PyValueError::new_err(format!(
-            "supertrend: Invalid range: start={}, end={}, step={}",
-            sweep.period.0, sweep.period.1, sweep.period.2
-        )));
-    }
-    let rows = grid_combos.len();
-    let cols = high_slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("supertrend: rows*cols overflow"))?;
-
-    let trend_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let trend_out = unsafe { trend_arr.as_slice_mut()? };
-    let changed_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let changed_out = unsafe { changed_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            supertrend_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &sweep,
-                simd,
-                true,
-                trend_out,
-                changed_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("trend", trend_arr.reshape((rows, cols))?)?;
-    dict.set_item("changed", changed_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "factors",
-        combos
-            .iter()
-            .map(|p| p.factor.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "SuperTrendStream")]
-pub struct SuperTrendStreamPy {
-    stream: SuperTrendStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl SuperTrendStreamPy {
-    #[new]
-    fn new(period: usize, factor: f64) -> PyResult<Self> {
-        let params = SuperTrendParams {
-            period: Some(period),
-            factor: Some(factor),
-        };
-        let stream =
-            SuperTrendStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(SuperTrendStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[inline]
-pub fn supertrend_into_slice(
-    trend_dst: &mut [f64],
-    changed_dst: &mut [f64],
-    input: &SuperTrendInput,
-    kern: Kernel,
-) -> Result<(), SuperTrendError> {
-    let (high, low, close, period, factor, first_valid_idx, chosen) =
-        supertrend_prepare(input, kern)?;
-
-    let len = high.len();
-    if trend_dst.len() != len {
-        return Err(SuperTrendError::OutputLengthMismatch {
-            expected: len,
-            got: trend_dst.len(),
-        });
-    }
-    if changed_dst.len() != len {
-        return Err(SuperTrendError::OutputLengthMismatch {
-            expected: len,
-            got: changed_dst.len(),
-        });
-    }
-
-    let warmup_end = first_valid_idx + period - 1;
-    fill_supertrend_prefixes(trend_dst, changed_dst, warmup_end);
-
-    supertrend_compute_direct_into(
-        high,
-        low,
-        close,
-        period,
-        factor,
-        first_valid_idx,
-        chosen,
-        trend_dst,
-        changed_dst,
-    );
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SuperTrendJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = supertrend)]
-pub fn supertrend_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    factor: f64,
-) -> Result<JsValue, JsValue> {
-    let len = high.len();
-    let params = SuperTrendParams {
-        period: Some(period),
-        factor: Some(factor),
-    };
-    let input = SuperTrendInput::from_slices(high, low, close, params);
-
-    let mut values = vec![0.0; len * 2];
-    let (trend_slice, changed_slice) = values.split_at_mut(len);
-    supertrend_into_slice(trend_slice, changed_slice, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let out = SuperTrendJsResult {
-        values,
-        rows: 2,
-        cols: len,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supertrend_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    trend_ptr: *mut f64,
-    changed_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    factor: f64,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || trend_ptr.is_null()
-        || changed_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let params = SuperTrendParams {
-            period: Some(period),
-            factor: Some(factor),
-        };
-        let input = SuperTrendInput::from_slices(high, low, close, params);
-
-        let input_ptrs = [
-            high_ptr as *const u8,
-            low_ptr as *const u8,
-            close_ptr as *const u8,
-        ];
-        let output_ptrs = [trend_ptr as *const u8, changed_ptr as *const u8];
-
-        let has_aliasing = input_ptrs
-            .iter()
-            .any(|&inp| output_ptrs.iter().any(|&out| inp == out));
-
-        if has_aliasing {
-            let output = supertrend_with_kernel(&input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let trend_out = std::slice::from_raw_parts_mut(trend_ptr, len);
-            let changed_out = std::slice::from_raw_parts_mut(changed_ptr, len);
-
-            trend_out.copy_from_slice(&output.trend);
-            changed_out.copy_from_slice(&output.changed);
-        } else {
-            let trend_out = std::slice::from_raw_parts_mut(trend_ptr, len);
-            let changed_out = std::slice::from_raw_parts_mut(changed_ptr, len);
-
-            supertrend_into_slice(trend_out, changed_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supertrend_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supertrend_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SuperTrendBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub factor_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SuperTrendBatchJsOutput {
-    pub values: Vec<f64>,
-    pub periods: Vec<usize>,
-    pub factors: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = supertrend_batch)]
-pub fn supertrend_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: SuperTrendBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = SuperTrendBatchRange {
-        period: cfg.period_range,
-        factor: cfg.factor_range,
-    };
-
-    let batch = supertrend_batch_with_kernel(high, low, close, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(batch.rows * 2 * batch.cols);
-    for r in 0..batch.rows {
-        let rs = r * batch.cols;
-        values.extend_from_slice(&batch.trend[rs..rs + batch.cols]);
-        values.extend_from_slice(&batch.changed[rs..rs + batch.cols]);
-    }
-
-    let periods: Vec<usize> = batch
-        .combos
-        .iter()
-        .map(|c| c.period.unwrap_or(10))
-        .collect();
-    let factors: Vec<f64> = batch
-        .combos
-        .iter()
-        .map(|c| c.factor.unwrap_or(3.0))
-        .collect();
-
-    let out = SuperTrendBatchJsOutput {
-        values,
-        periods,
-        factors,
-        rows: batch.rows * 2,
-        cols: batch.cols,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supertrend_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    factor: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = supertrend_js(high, low, close, period, factor)?;
-    crate::write_wasm_object_f64_outputs("supertrend_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supertrend_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = supertrend_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("supertrend_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     #[test]
     fn test_supertrend_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = SuperTrendParams {
             period: Some(10),
@@ -2534,7 +1700,6 @@ mod tests {
         let mut trend_out = vec![0.0; n];
         let mut changed_out = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             supertrend_into(&input, &mut trend_out, &mut changed_out)?;
         }
@@ -2574,8 +1739,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = SuperTrendParams {
             period: None,
@@ -2594,8 +1759,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = SuperTrendParams {
             period: Some(10),
@@ -2650,8 +1815,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = SuperTrendInput::with_default_candles(&candles);
         let output = supertrend_with_kernel(&input, kernel)?;
@@ -2727,8 +1892,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = SuperTrendParams {
             period: Some(10),
@@ -2758,8 +1923,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = SuperTrendParams {
             period: Some(10),
@@ -2785,8 +1950,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 10;
         let factor = 3.0;
@@ -2867,8 +2032,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             SuperTrendParams::default(),
@@ -2931,35 +2096,44 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in trend \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in trend \
 						 with params: period={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(10),
-						params.factor.unwrap_or(3.0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        params.factor.unwrap_or(3.0),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in trend \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in trend \
 						 with params: period={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(10),
-						params.factor.unwrap_or(3.0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        params.factor.unwrap_or(3.0),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in trend \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in trend \
 						 with params: period={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(10),
-						params.factor.unwrap_or(3.0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        params.factor.unwrap_or(3.0),
+                        param_idx
+                    );
                 }
             }
 
@@ -2972,35 +2146,44 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in changed \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in changed \
 						 with params: period={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(10),
-						params.factor.unwrap_or(3.0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        params.factor.unwrap_or(3.0),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in changed \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in changed \
 						 with params: period={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(10),
-						params.factor.unwrap_or(3.0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        params.factor.unwrap_or(3.0),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in changed \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in changed \
 						 with params: period={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(10),
-						params.factor.unwrap_or(3.0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(10),
+                        params.factor.unwrap_or(3.0),
+                        param_idx
+                    );
                 }
             }
         }
@@ -3277,8 +2460,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = SuperTrendBatchBuilder::new()
             .kernel(kernel)
@@ -3310,8 +2493,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 1.0, 3.0, 0.5),

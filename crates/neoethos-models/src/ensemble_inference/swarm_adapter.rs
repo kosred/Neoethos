@@ -12,8 +12,8 @@
 //!    require an O(n) walk-forward refit per row (unusable) or forecasting
 //!    from the full series for early rows (LOOKAHEAD). The live ML gate
 //!    reads exactly one row — the latest bar — so live it votes every bar;
-//!    on historical/batch frames every row before the last gets the
-//!    neutral abstain `[1/3, 1/3, 1/3]`. No fake history, no lookahead.
+//!    on historical/batch frames every row before the last is explicitly
+//!    invalid with `Warmup`. No fake probability, no lookahead.
 //! 2. **It is stateless per `predict` call.** `forecast` needs `&mut self`;
 //!    instead of interior mutability, each call constructs a fresh
 //!    forecaster, restores the trained artifact (configuration: horizon,
@@ -31,39 +31,20 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
-use polars::prelude::{DataFrame, DataType};
+use anyhow::{Context, Result, bail};
+use neoethos_data::{FeatureCellValidity, FeatureFrame};
+use neoethos_execution_budget::CpuLease;
 
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, project_expert_frame};
 use crate::forecasting::swarm_impl::SwarmForecaster;
 use crate::runtime::capabilities::ModelFamily;
 
-/// Price columns the forecaster can drive from, in preference order.
-/// Mirrors the (private) list `SwarmForecaster::fit_from_frame` trains
-/// with, so live prediction reads the SAME series family as training.
-const PRICE_COLUMNS: &[&str] = &[
-    "close",
-    "base_close",
-    "mid",
-    "price",
-    "bid",
-    "ask",
-    "last",
-    "target_price",
-    "future_close",
-    "next_close",
-    "close_M1",
-    "close_m1",
-];
+const SWARM_PRICE_COLUMN: &str = "quant_close";
 
 /// [`ExpertModel`] adapter for [`SwarmForecaster`]. See the module doc for
 /// the last-row-only voting contract.
 pub struct SwarmForecasterAdapter {
     artifact_dir: PathBuf,
-    /// Always empty: the ensemble's shared column contract skips experts
-    /// with no declared columns; this adapter self-selects its price
-    /// column from whatever frame the contract produced (which contains
-    /// the close series — training consumed the same frame family).
     feature_columns: Vec<String>,
 }
 
@@ -71,65 +52,57 @@ impl SwarmForecasterAdapter {
     pub fn new(artifact_dir: PathBuf) -> Self {
         Self {
             artifact_dir,
-            feature_columns: Vec::new(),
+            feature_columns: vec![SWARM_PRICE_COLUMN.to_string()],
         }
-    }
-
-    /// Extract the price series (f32) from the frame, preferring the same
-    /// columns training used.
-    fn price_series(df: &DataFrame) -> Result<Vec<f32>> {
-        for name in PRICE_COLUMNS {
-            if let Ok(col) = df.column(name) {
-                let casted = col
-                    .cast(&DataType::Float64)
-                    .with_context(|| format!("cast price column {name} to f64"))?;
-                let vals = casted
-                    .f64()
-                    .with_context(|| format!("read price column {name} as f64"))?;
-                let mut out = Vec::with_capacity(vals.len());
-                for (idx, v) in vals.into_iter().enumerate() {
-                    let v = v.ok_or_else(|| {
-                        anyhow!("price column {name} has a null at row {idx}")
-                    })?;
-                    if !v.is_finite() {
-                        bail!("price column {name} has non-finite value at row {idx}");
-                    }
-                    out.push(v as f32);
-                }
-                return Ok(out);
-            }
-        }
-        bail!(
-            "no price column found in the ensemble frame (looked for {:?}) — \
-             swarm_forecaster abstains",
-            PRICE_COLUMNS
-        )
     }
 
     /// Map a forecast vs the last price into a modest 3-class lean.
-    fn lean_probs(last_price: f32, result: &crate::forecasting::swarm_impl::SwarmForecastResult) -> [f32; 3] {
-        let n = result.point_forecast.len().max(1) as f32;
-        let mean_forecast: f32 = result.point_forecast.iter().sum::<f32>() / n;
+    fn lean_probs(
+        last_price: f64,
+        result: &crate::forecasting::swarm_impl::SwarmForecastResult,
+    ) -> Result<[f64; 3]> {
+        if result.point_forecast.is_empty()
+            || result.level_80_upper.len() != result.point_forecast.len()
+            || result.level_80_lower.len() != result.point_forecast.len()
+        {
+            bail!("swarm forecast returned inconsistent or empty interval arrays");
+        }
+        let n = result.point_forecast.len() as f64;
+        let mean_forecast = result
+            .point_forecast
+            .iter()
+            .copied()
+            .map(f64::from)
+            .sum::<f64>()
+            / n;
         if !mean_forecast.is_finite() || last_price <= 0.0 {
-            return [1.0 / 3.0; 3];
+            bail!("swarm forecast or last price is invalid");
         }
         let rel = (mean_forecast - last_price) / last_price;
         // Uncertainty scale: mean 80% band half-width, relative to price.
         // Wider bands ⇒ larger scale ⇒ smaller lean for the same move.
-        let half_widths: f32 = result
+        let half_widths = result
             .level_80_upper
             .iter()
             .zip(result.level_80_lower.iter())
-            .map(|(u, l)| (u - l).abs() * 0.5)
-            .sum::<f32>()
+            .map(|(u, l)| f64::from((u - l).abs()) * 0.5)
+            .sum::<f64>()
             / n;
         let scale = (half_widths / last_price).max(1e-6);
         let lean = (rel / scale).clamp(-1.0, 1.0);
         let s = lean.abs();
         if lean >= 0.0 {
-            [1.0 / 3.0 - s / 6.0, 1.0 / 3.0 + s / 3.0, 1.0 / 3.0 - s / 6.0]
+            Ok([
+                1.0 / 3.0 - s / 6.0,
+                1.0 / 3.0 + s / 3.0,
+                1.0 / 3.0 - s / 6.0,
+            ])
         } else {
-            [1.0 / 3.0 - s / 6.0, 1.0 / 3.0 - s / 6.0, 1.0 / 3.0 + s / 3.0]
+            Ok([
+                1.0 / 3.0 - s / 6.0,
+                1.0 / 3.0 - s / 6.0,
+                1.0 / 3.0 + s / 3.0,
+            ])
         }
     }
 }
@@ -147,44 +120,74 @@ impl ExpertModel for SwarmForecasterAdapter {
     fn feature_columns(&self) -> &[String] {
         &self.feature_columns
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
-        let n_rows = df.height();
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
+        let n_rows = projected.n_samples();
         if n_rows == 0 {
             return Ok(Vec::new());
         }
-        let neutral = ExpertPrediction {
-            kind: ExpertOutputKind::Classification3,
-            values: vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
-        };
-        // Rows before the last: honest abstain (see module doc).
-        let mut out = vec![neutral.clone(); n_rows];
-
-        let series = Self::price_series(df)?;
-        // A forecast needs history to condition on; a 1-row live frame can't
-        // feed the snapshot builder (min 8 points) — abstain gracefully.
-        if series.len() < 16 {
+        let mut out = (0..n_rows)
+            .map(|_| {
+                ExpertPrediction::invalid(
+                    ExpertOutputKind::Classification3,
+                    FeatureCellValidity::Warmup,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if n_rows < 16 {
             return Ok(out);
         }
-        let last_price = *series.last().expect("non-empty checked above");
+        let column = projected.feature_column(0)?;
+        if let Some(reason) = column
+            .validity
+            .iter()
+            .copied()
+            .find(|reason| !reason.is_valid())
+        {
+            out[n_rows - 1] = ExpertPrediction::invalid(ExpertOutputKind::Classification3, reason)?;
+            return Ok(out);
+        }
+        let series = column
+            .values
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(row, value)| {
+                if !value.is_finite() || value <= 0.0 || value > f32::MAX as f64 {
+                    bail!("swarm f64-to-f32 adapter rejected price row {row}: {value}");
+                }
+                let narrowed = value as f32;
+                if !narrowed.is_finite() || narrowed <= 0.0 {
+                    bail!("swarm f64-to-f32 adapter produced invalid price row {row}");
+                }
+                Ok(narrowed)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let last_price = *column.values.last().expect("non-empty frame checked above");
 
         // Fresh forecaster per call (stateless): restore the trained
         // configuration, refit on the CURRENT series, forecast.
-        let mut model = SwarmForecaster::new(256.0);
-        model
-            .load(&self.artifact_dir)
-            .with_context(|| format!("SwarmForecaster::load({})", self.artifact_dir.display()))?;
-        let horizon = model.config.horizon.max(1);
-        let timestamps: Vec<f64> = (0..series.len()).map(|i| i as f64).collect();
-        model
-            .fit_series(&series, &timestamps, "live")
-            .context("swarm refit on the live price series")?;
-        let result = model.forecast(horizon).context("swarm forecast")?;
+        let result = lease.scope(|| {
+            let mut model = SwarmForecaster::new(256.0);
+            model.load(&self.artifact_dir).with_context(|| {
+                format!("SwarmForecaster::load({})", self.artifact_dir.display())
+            })?;
+            let horizon = model.config.horizon.max(1);
+            let timestamps = projected
+                .timestamps
+                .iter()
+                .copied()
+                .map(|timestamp| timestamp as f64)
+                .collect::<Vec<_>>();
+            model
+                .fit_series(&series, &timestamps, "live")
+                .context("swarm refit on the live price series")?;
+            model.forecast(horizon).context("swarm forecast")
+        })?;
 
-        let probs = Self::lean_probs(last_price, &result);
-        out[n_rows - 1] = ExpertPrediction {
-            kind: ExpertOutputKind::Classification3,
-            values: probs.to_vec(),
-        };
+        let probs = Self::lean_probs(last_price, &result)?;
+        out[n_rows - 1] =
+            ExpertPrediction::valid(ExpertOutputKind::Classification3, probs.to_vec())?;
         Ok(out)
     }
 }
@@ -200,9 +203,9 @@ impl ExpertLoader for SwarmForecasterAdapterLoader {
     }
     fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
         let mut probe = SwarmForecaster::new(256.0);
-        probe.load(artifact_dir).with_context(|| {
-            format!("SwarmForecaster::load({}) failed", artifact_dir.display())
-        })?;
+        probe
+            .load(artifact_dir)
+            .with_context(|| format!("SwarmForecaster::load({}) failed", artifact_dir.display()))?;
         Ok(Box::new(SwarmForecasterAdapter::new(
             artifact_dir.to_path_buf(),
         )))
@@ -225,7 +228,7 @@ mod tests {
         assert_eq!(a.name(), "swarm_forecaster");
         assert_eq!(a.family(), ModelFamily::Forecasting);
         assert_eq!(a.output_kind(), ExpertOutputKind::Classification3);
-        assert!(a.feature_columns().is_empty());
+        assert_eq!(a.feature_columns(), &[SWARM_PRICE_COLUMN.to_string()]);
     }
 
     #[test]
@@ -251,8 +254,8 @@ mod tests {
             runtime_mode: None,
             runtime_degraded_reason: None,
         };
-        let p = SwarmForecasterAdapter::lean_probs(100.0, &res);
-        let sum: f32 = p.iter().sum();
+        let p = SwarmForecasterAdapter::lean_probs(100.0, &res).expect("valid lean");
+        let sum: f64 = p.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "probs must sum to 1, got {sum}");
         assert!(p.iter().all(|&x| (0.0..=1.0).contains(&x)));
         assert!(p[1] > p[2], "upward forecast must lean buy");

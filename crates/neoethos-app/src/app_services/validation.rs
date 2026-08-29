@@ -14,7 +14,7 @@
 
 use crate::app_services::{
     ServiceEvent,
-    discovery::{DiscoveryRequest, start_discovery_job},
+    discovery::{DiscoveryRequest, pin_current_discovery_input, start_discovery_job},
     jobs::JobState,
 };
 use crate::app_state::AppRuntimeConfig;
@@ -104,9 +104,11 @@ impl TfOutcome {
 /// itself diagnostic — see #211.
 const CSV_HEADER: &str = "tf,status,duration_secs,candidate_count,portfolio_count,top_sharpe_is,top_sharpe_oos,top_max_dd_pct,error_message\n";
 
-/// Run a multi-TF Discovery sweep on the first locally-discoverable
-/// symbol (falls back to AUDUSD if none). Returns the exit code the
-/// caller should propagate: 0 if at least one TF succeeded, 1 otherwise.
+/// Run a multi-TF Discovery sweep for the explicitly configured symbol.
+/// Each requested base timeframe must resolve to exactly one canonical
+/// source/account identity; zero or multiple matches fail that row closed.
+/// Returns the exit code the caller should propagate: 0 if at least one TF
+/// succeeded, 1 otherwise.
 ///
 /// `min_generations` is the GA generation floor applied per TF —
 /// `DiscoveryConfig.generations` is bumped up to this value when the
@@ -118,7 +120,11 @@ pub async fn run_validation_sweep(
     tf_timeout_secs: u64,
     min_generations: usize,
 ) -> Result<i32> {
-    let symbol = resolve_symbol(runtime);
+    let symbol = settings.system.resolve_symbol();
+    anyhow::ensure!(
+        !symbol.trim().is_empty(),
+        "validation-mode requires an explicit configured symbol; refusing a first/default dataset selection"
+    );
     let tfs = parse_tfs(tfs_csv);
     if tfs.is_empty() {
         anyhow::bail!("validation-mode received an empty --validation-tfs list");
@@ -224,24 +230,6 @@ fn parse_tfs(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn resolve_symbol(runtime: &AppRuntimeConfig) -> String {
-    match neoethos_data::discover_symbols(&runtime.data_dir) {
-        Ok(symbols) => symbols
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "AUDUSD".to_string()),
-        Err(err) => {
-            warn!(
-                target: "neoethos_app::validation",
-                data_dir = %runtime.data_dir.display(),
-                error = %err,
-                "validation-mode: discover_symbols failed; falling back to AUDUSD"
-            );
-            "AUDUSD".to_string()
-        }
-    }
-}
-
 fn build_run_dir() -> Result<PathBuf> {
     // Windows-safe ISO timestamp: drop `:` from `2026-05-24T12:34:56Z`
     // so `validation-runs\2026-05-24T12-34-56Z` is a legal path on every
@@ -277,6 +265,27 @@ async fn run_one_tf(
     min_generations: usize,
 ) -> TfOutcome {
     let started = Instant::now();
+    let dataset_identity =
+        match crate::app_services::discovery::resolve_unique_background_dataset_identity(
+            &runtime.data_dir,
+            symbol,
+            base_tf,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return TfOutcome {
+                    tf: base_tf.to_string(),
+                    status: "DatasetSelectionFailed".to_string(),
+                    duration_secs: started.elapsed().as_secs_f64(),
+                    candidate_count: 0,
+                    portfolio_count: 0,
+                    top_sharpe_is: None,
+                    top_sharpe_oos: None,
+                    top_max_dd_pct: None,
+                    error_message: format!("{error:#}"),
+                };
+            }
+        };
     // Honor the operator's config.yaml — defaults in code are smaller
     // than what we need for a meaningful validation signal.
     let mut config = match DiscoveryConfig::try_from_settings(settings) {
@@ -295,20 +304,9 @@ async fn run_one_tf(
             };
         }
     };
-    // #214 + F-304: bind the *actual* sweep symbol into the discovery
-    // config so the cost-model lookup sees a real cTrader symbol
-    // instead of the empty-string fallback. The settings
-    // `system.symbol` may differ from the sweep symbol — `discover_symbols`
-    // chose the latter from on-disk Parquet, and that's the symbol whose
-    // data the GA actually backtests.
-    //
-    // F-304 (2026-05-28): `SystemConfig.account_currency` now exists
-    // as a typed channel. `from_settings` above already populates
-    // `evaluation_account_currency`; we no longer need the hardcoded
-    // "USD" patch (which would override operator's GBP/EUR account
-    // setting). If the operator hasn't configured a currency, the
-    // value stays empty and the cost-model NaN guard fires loud.
-    config.evaluation_symbol = symbol.to_string();
+    // `start_discovery_job` binds evaluation_symbol, timeframe_label and the
+    // temporal higher-timeframe policy from `dataset_identity` + this exact
+    // request. Do not maintain a second symbol/timeframe copy here.
     // #215: floor the GA generation count so short-data TFs (D1/H4) can't
     // smoke-test through the sweep with a 0.2s run that produces a tiny
     // archive. The floor is applied per-TF — `min_generations = 0` skips
@@ -324,10 +322,26 @@ async fn run_one_tf(
         config.generations = min_generations;
     }
     let higher_tfs = higher_tfs_for(base_tf);
+    let pinned_input =
+        match pin_current_discovery_input(&runtime.data_dir, &dataset_identity, &higher_tfs) {
+            Ok(pinned) => std::sync::Arc::new(pinned),
+            Err(error) => {
+                return TfOutcome {
+                    tf: base_tf.to_string(),
+                    status: "DatasetAcquisitionRequired".to_string(),
+                    duration_secs: started.elapsed().as_secs_f64(),
+                    candidate_count: 0,
+                    portfolio_count: 0,
+                    top_sharpe_is: None,
+                    top_sharpe_oos: None,
+                    top_max_dd_pct: None,
+                    error_message: format!("{error:#}"),
+                };
+            }
+        };
     let request = DiscoveryRequest {
         data_root: runtime.data_dir.clone(),
-        symbol: symbol.to_string(),
-        base_tf: base_tf.to_string(),
+        pinned_input,
         higher_tfs,
         config,
         prop_firm_rules: PropFirmRiskRules::default(),

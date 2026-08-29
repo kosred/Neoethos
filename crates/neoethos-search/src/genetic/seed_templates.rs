@@ -57,15 +57,15 @@ struct RoleSpec {
     /// Suggested weight for this indicator. Sign indicates direction
     /// (positive = bullish on raise; negative = bearish on raise; the
     /// GA will discover the right sign through mutation regardless).
-    weight: f32,
+    weight: f64,
 }
 
 /// One named template (e.g. "Trend Pullback Long"). Roles are tried in
 /// order; templates with fewer than 2 resolvable roles are skipped.
 struct Template {
     name: &'static str,
-    long_threshold: f32,
-    short_threshold: f32,
+    long_threshold: f64,
+    short_threshold: f64,
     roles: [RoleSpec; 5],
     /// SMC flag preset: (use_ob, use_fvg, use_liq_sweep, mtf, premium,
     /// inducement, bos, choch, eqh, eql, displacement).
@@ -80,13 +80,40 @@ const TEMPLATES: &[Template] = &[
         long_threshold: 0.20,
         short_threshold: -0.20,
         roles: [
-            RoleSpec { tf: "d1", primary: "ema_50", family: "ema", weight: 0.25 },
-            RoleSpec { tf: "h4", primary: "ema_21", family: "ema", weight: 0.20 },
-            RoleSpec { tf: "h1", primary: "ema_50", family: "ema", weight: 0.20 },
-            RoleSpec { tf: "m15", primary: "rsi", family: "rsi", weight: 0.20 },
-            RoleSpec { tf: "m5", primary: "vwap", family: "ma", weight: 0.15 },
+            RoleSpec {
+                tf: "d1",
+                primary: "ema_50",
+                family: "ema",
+                weight: 0.25,
+            },
+            RoleSpec {
+                tf: "h4",
+                primary: "ema_21",
+                family: "ema",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "h1",
+                primary: "ema_50",
+                family: "ema",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m15",
+                primary: "rsi",
+                family: "rsi",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m5",
+                primary: "vwap",
+                family: "ma",
+                weight: 0.15,
+            },
         ],
-        smc_flags: [false, false, false, true, false, false, false, false, false, false, false],
+        smc_flags: [
+            false, false, false, true, false, false, false, false, false, false, false,
+        ],
     },
     // Template 2 — Mean Reversion: D1 ATR expansion + H4 BBands upper +
     // H1 RSI overbought + M15 RSI divergence + M5 bearish.
@@ -95,13 +122,40 @@ const TEMPLATES: &[Template] = &[
         long_threshold: 0.25,
         short_threshold: -0.25,
         roles: [
-            RoleSpec { tf: "d1", primary: "atr", family: "atr", weight: 0.15 },
-            RoleSpec { tf: "h4", primary: "bbands", family: "bollinger", weight: 0.25 },
-            RoleSpec { tf: "h1", primary: "rsi", family: "rsi", weight: 0.25 },
-            RoleSpec { tf: "m15", primary: "rsi", family: "rsi", weight: 0.20 },
-            RoleSpec { tf: "m5", primary: "cci", family: "cci", weight: 0.15 },
+            RoleSpec {
+                tf: "d1",
+                primary: "atr",
+                family: "atr",
+                weight: 0.15,
+            },
+            RoleSpec {
+                tf: "h4",
+                primary: "bbands",
+                family: "bollinger",
+                weight: 0.25,
+            },
+            RoleSpec {
+                tf: "h1",
+                primary: "rsi",
+                family: "rsi",
+                weight: 0.25,
+            },
+            RoleSpec {
+                tf: "m15",
+                primary: "rsi",
+                family: "rsi",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m5",
+                primary: "cci",
+                family: "cci",
+                weight: 0.15,
+            },
         ],
-        smc_flags: [false, false, true, true, true, false, false, false, false, false, false],
+        smc_flags: [
+            false, false, true, true, true, false, false, false, false, false, false,
+        ],
     },
     // Template 3 — Breakout: D1 low ATR (compression) + H4 range close +
     // H1 volume increasing + M15 near range high + M5 break.
@@ -110,13 +164,40 @@ const TEMPLATES: &[Template] = &[
         long_threshold: 0.30,
         short_threshold: -0.30,
         roles: [
-            RoleSpec { tf: "d1", primary: "atr", family: "atr", weight: -0.20 },
-            RoleSpec { tf: "h4", primary: "donchian", family: "donchian", weight: 0.20 },
-            RoleSpec { tf: "h1", primary: "obv", family: "volume", weight: 0.20 },
-            RoleSpec { tf: "m15", primary: "donchian", family: "donchian", weight: 0.20 },
-            RoleSpec { tf: "m5", primary: "atr", family: "atr", weight: 0.20 },
+            RoleSpec {
+                tf: "d1",
+                primary: "atr",
+                family: "atr",
+                weight: -0.20,
+            },
+            RoleSpec {
+                tf: "h4",
+                primary: "donchian",
+                family: "donchian",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "h1",
+                primary: "obv",
+                family: "volume",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m15",
+                primary: "donchian",
+                family: "donchian",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m5",
+                primary: "atr",
+                family: "atr",
+                weight: 0.20,
+            },
         ],
-        smc_flags: [true, false, false, true, false, false, true, false, false, false, true],
+        smc_flags: [
+            true, false, false, true, false, false, true, false, false, false, true,
+        ],
     },
     // Template 4 — Momentum: D1 EMA20 slope + H4 MACD hist + H1 MACD
     // cross + M15 ADX>20 + M5 EMA8/EMA21 cross.
@@ -125,13 +206,40 @@ const TEMPLATES: &[Template] = &[
         long_threshold: 0.20,
         short_threshold: -0.20,
         roles: [
-            RoleSpec { tf: "d1", primary: "ema_20", family: "ema", weight: 0.20 },
-            RoleSpec { tf: "h4", primary: "macd", family: "macd", weight: 0.20 },
-            RoleSpec { tf: "h1", primary: "macd", family: "macd", weight: 0.20 },
-            RoleSpec { tf: "m15", primary: "adx", family: "adx", weight: 0.20 },
-            RoleSpec { tf: "m5", primary: "ema_8", family: "ema", weight: 0.20 },
+            RoleSpec {
+                tf: "d1",
+                primary: "ema_20",
+                family: "ema",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "h4",
+                primary: "macd",
+                family: "macd",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "h1",
+                primary: "macd",
+                family: "macd",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m15",
+                primary: "adx",
+                family: "adx",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m5",
+                primary: "ema_8",
+                family: "ema",
+                weight: 0.20,
+            },
         ],
-        smc_flags: [false, false, false, true, false, false, true, false, false, false, false],
+        smc_flags: [
+            false, false, false, true, false, false, true, false, false, false, false,
+        ],
     },
     // Template 5 — Counter-Trend: D1 EMA200 slope < 0 + H4 close <
     // EMA50 + H1 RSI > 70 + M15 bearish divergence + M5 bearish.
@@ -140,13 +248,40 @@ const TEMPLATES: &[Template] = &[
         long_threshold: 0.25,
         short_threshold: -0.25,
         roles: [
-            RoleSpec { tf: "d1", primary: "ema_200", family: "ema", weight: -0.25 },
-            RoleSpec { tf: "h4", primary: "ema_50", family: "ema", weight: -0.20 },
-            RoleSpec { tf: "h1", primary: "rsi", family: "rsi", weight: 0.20 },
-            RoleSpec { tf: "m15", primary: "rsi", family: "rsi", weight: 0.20 },
-            RoleSpec { tf: "m5", primary: "stoch", family: "stoch", weight: 0.15 },
+            RoleSpec {
+                tf: "d1",
+                primary: "ema_200",
+                family: "ema",
+                weight: -0.25,
+            },
+            RoleSpec {
+                tf: "h4",
+                primary: "ema_50",
+                family: "ema",
+                weight: -0.20,
+            },
+            RoleSpec {
+                tf: "h1",
+                primary: "rsi",
+                family: "rsi",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m15",
+                primary: "rsi",
+                family: "rsi",
+                weight: 0.20,
+            },
+            RoleSpec {
+                tf: "m5",
+                primary: "stoch",
+                family: "stoch",
+                weight: 0.15,
+            },
         ],
-        smc_flags: [false, true, false, true, false, false, false, true, false, false, false],
+        smc_flags: [
+            false, true, false, true, false, false, false, true, false, false, false,
+        ],
     },
 ];
 
@@ -157,11 +292,7 @@ const VARIANTS_PER_TEMPLATE: usize = 10;
 
 /// Find the feature index whose lowercased name contains both `tf` and
 /// `primary`. Returns `None` if no match exists.
-fn find_feature(
-    feature_names: &[String],
-    tf: &str,
-    primary: &str,
-) -> Option<usize> {
+fn find_feature(feature_names: &[String], tf: &str, primary: &str) -> Option<usize> {
     feature_names
         .iter()
         .enumerate()
@@ -193,13 +324,13 @@ fn build_variant(
 ) -> Option<Gene> {
     // Resolve roles in declaration order. Skip roles we can't find.
     let mut indices: Vec<usize> = Vec::with_capacity(5);
-    let mut weights: Vec<f32> = Vec::with_capacity(5);
+    let mut weights: Vec<f64> = Vec::with_capacity(5);
     let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for role in template.roles.iter() {
         if let Some(idx) = resolve_role(feature_names, role) {
             if idx < n_features && seen.insert(idx) {
                 // Variant rotation: ±10% weight perturbation.
-                let perturb = 0.9 + (variant as f32) * 0.02; // 0.9..1.1 across variants
+                let perturb = 0.9 + (variant as f64) * 0.02; // 0.9..1.1 across variants
                 weights.push(role.weight * perturb);
                 indices.push(idx);
             }
@@ -225,7 +356,7 @@ fn build_variant(
     // indicators — for the COMBINED signal that's still too aggressive.
     // The new low-end (0.08) captures genes that fire often + the high-end
     // (0.30) covers the picky regime, matching task #273.
-    let thr_levels = [0.08_f32, 0.15, 0.22, 0.30];
+    let thr_levels = [0.08_f64, 0.15, 0.22, 0.30];
     let thr_idx = variant % thr_levels.len();
     let scale = thr_levels[thr_idx] / 0.25;
     let long_threshold = template.long_threshold * scale;
@@ -382,14 +513,42 @@ mod tests {
         // Construct a feature-name set that matches several template
         // roles across all 5 TFs.
         let names: Vec<String> = vec![
-            "ema_50", "ema_21", "ema_20", "ema_200", "ema_8", "rsi", "atr",
-            "macd", "adx", "cci", "stoch", "vwap", "donchian", "obv",
+            "ema_50",
+            "ema_21",
+            "ema_20",
+            "ema_200",
+            "ema_8",
+            "rsi",
+            "atr",
+            "macd",
+            "adx",
+            "cci",
+            "stoch",
+            "vwap",
+            "donchian",
+            "obv",
             "bollinger_bands",
-            "d1_ema_50", "d1_ema_20", "d1_ema_200", "d1_atr",
-            "h4_ema_21", "h4_ema_50", "h4_bbands", "h4_macd", "h4_donchian",
-            "h1_ema_50", "h1_rsi", "h1_macd", "h1_obv",
-            "m15_rsi", "m15_adx", "m15_donchian",
-            "m5_vwap", "m5_cci", "m5_ema_8", "m5_stoch", "m5_atr",
+            "d1_ema_50",
+            "d1_ema_20",
+            "d1_ema_200",
+            "d1_atr",
+            "h4_ema_21",
+            "h4_ema_50",
+            "h4_bbands",
+            "h4_macd",
+            "h4_donchian",
+            "h1_ema_50",
+            "h1_rsi",
+            "h1_macd",
+            "h1_obv",
+            "m15_rsi",
+            "m15_adx",
+            "m15_donchian",
+            "m5_vwap",
+            "m5_cci",
+            "m5_ema_8",
+            "m5_stoch",
+            "m5_atr",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -440,10 +599,15 @@ mod tests {
     fn template_feature_indices_resolves_referenced_features() {
         // The prefilter force-keeps these so the warm-start can resolve.
         let names: Vec<String> = vec![
-            "ema_50", "rsi", "atr",
-            "h4_ema_21", "h4_macd",
-            "h1_rsi", "h1_macd",
-            "m15_rsi", "m15_adx",
+            "ema_50",
+            "rsi",
+            "atr",
+            "h4_ema_21",
+            "h4_macd",
+            "h1_rsi",
+            "h1_macd",
+            "m15_rsi",
+            "m15_adx",
             // A column the templates never reference — must NOT be returned.
             "h4_returns_zscore",
         ]

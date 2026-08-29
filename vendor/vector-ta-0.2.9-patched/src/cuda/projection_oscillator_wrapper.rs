@@ -1,13 +1,13 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::projection_oscillator::{
-    expand_grid_projection_oscillator, ProjectionOscillatorBatchRange, ProjectionOscillatorParams,
+    ProjectionOscillatorBatchRange, ProjectionOscillatorParams, expand_grid_projection_oscillator,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};

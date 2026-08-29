@@ -3,7 +3,7 @@
 //!
 //! Usage:
 //!   cargo run -p neoethos-search --release --example htf_prefilter_probe -- \
-//!       <data-root> [--symbol EURUSD] [--base M5] [--higher H1,H4] \
+//!       <data-root> --identity <d1...> [--higher H1,H4] \
 //!       [--top-k 240] [--min-per-tf 6] [--normalize true|false] [--max-bars N]
 //!
 //! It REPLICATES `discovery::prefilter_features` verbatim (that function is
@@ -26,8 +26,10 @@
 //! seed-template force-keep) and attributes every kept column to the FIRST
 //! mechanism that would have kept it.
 
+use anyhow::Context;
 use neoethos_data::core::stats_f64::pearson_pairwise_f32;
-use neoethos_data::{FeatureFrame, Ohlcv};
+use neoethos_data::{CanonicalDatasetIdentity, CanonicalTimeframe, Ohlcv};
+use neoethos_search::data_selection::ExactCanonicalSeries;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -76,7 +78,11 @@ fn rolling_atr_f64(ohlcv: &Ohlcv, period: usize) -> Vec<f64> {
     for i in 0..n {
         let hi = ohlcv.high[i];
         let lo = ohlcv.low[i];
-        let prev_close = if i > 0 { ohlcv.close[i - 1] } else { ohlcv.close[i] };
+        let prev_close = if i > 0 {
+            ohlcv.close[i - 1]
+        } else {
+            ohlcv.close[i]
+        };
         if !hi.is_finite() || !lo.is_finite() || !prev_close.is_finite() {
             tr[i] = f64::NAN;
             continue;
@@ -233,7 +239,11 @@ fn first_passage_labels(ohlcv: &Ohlcv, spec: &PrefilterSpec) -> (Vec<f32>, Vec<f
 /// `discovery::prefilter_fit_windows`, verbatim.
 fn prefilter_fit_windows(n_rows: usize, spec: &PrefilterSpec) -> (Vec<Vec<usize>>, usize) {
     if let Some((n_splits, n_test_groups, embargo_pct, purge_pct, max_rows)) = spec.cpcv {
-        let capped = if max_rows > 0 { max_rows.min(n_rows) } else { n_rows };
+        let capped = if max_rows > 0 {
+            max_rows.min(n_rows)
+        } else {
+            n_rows
+        };
         let offset = n_rows.saturating_sub(capped);
         let cv = neoethos_search::validation::CombinatorialPurgedCV::new(
             n_splits,
@@ -306,7 +316,9 @@ impl Variant {
             Variant::NewCpcv => "new_cpcv      (repaired corr | triple-barrier | 8 CPCV folds)",
             Variant::LegacyCpcv => "legacy_cpcv   (OLD f32 corr | triple-barrier | 8 CPCV folds)",
             Variant::NewPrefix => "new_prefix    (repaired corr | 1-bar fwd ret | 80% prefix)",
-            Variant::LegacyPrefix => "legacy_prefix (OLD f32 corr | 1-bar fwd ret | 80% prefix) <- the historical regime",
+            Variant::LegacyPrefix => {
+                "legacy_prefix (OLD f32 corr | 1-bar fwd ret | 80% prefix) <- the historical regime"
+            }
         }
     }
 }
@@ -424,7 +436,16 @@ fn quantiles(mut v: Vec<f64>) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)
         v[idx]
     };
     let mean = v.iter().sum::<f64>() / v.len() as f64;
-    Some((v[0], q(0.10), q(0.25), q(0.50), q(0.75), q(0.90), v[v.len() - 1], mean))
+    Some((
+        v[0],
+        q(0.10),
+        q(0.25),
+        q(0.50),
+        q(0.75),
+        q(0.90),
+        v[v.len() - 1],
+        mean,
+    ))
 }
 
 fn tf_of(name: &str) -> String {
@@ -440,6 +461,26 @@ fn flag(args: &[String], key: &str) -> Option<String> {
         .cloned()
 }
 
+fn exact_identity(args: &[String]) -> anyhow::Result<CanonicalDatasetIdentity> {
+    let encoded = flag(args, "--identity").context(
+        "--identity <d1...> is required; display symbol/timeframe fields are not an identity",
+    )?;
+    CanonicalDatasetIdentity::from_path_component(&encoded)
+        .with_context(|| format!("invalid canonical dataset identity {encoded:?}"))
+}
+
+fn direct_timeframes(csv: &str) -> anyhow::Result<Vec<CanonicalTimeframe>> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<CanonicalTimeframe>()
+                .with_context(|| format!("unsupported direct canonical timeframe {value:?}"))
+        })
+        .collect()
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -453,9 +494,10 @@ fn main() -> anyhow::Result<()> {
         .first()
         .cloned()
         .filter(|a| !a.starts_with("--"))
-        .expect("usage: htf_prefilter_probe <data-root> [--symbol EURUSD] ...");
-    let symbol = flag(&args, "--symbol").unwrap_or_else(|| "EURUSD".to_string());
-    let base_tf = flag(&args, "--base").unwrap_or_else(|| "M5".to_string());
+        .expect("usage: htf_prefilter_probe <data-root> --identity <d1...> ...");
+    let identity = exact_identity(&args)?;
+    let symbol = identity.symbol_name().to_owned();
+    let base_tf = identity.timeframe();
     let higher_csv = flag(&args, "--higher").unwrap_or_else(|| "H1,H4".to_string());
     let top_k: usize = flag(&args, "--top-k")
         .and_then(|v| v.parse().ok())
@@ -472,65 +514,51 @@ fn main() -> anyhow::Result<()> {
     let spread_pips: f64 = flag(&args, "--spread-pips")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1.5);
-    let pip: f64 = flag(&args, "--pip").and_then(|v| v.parse().ok()).unwrap_or(0.0001);
+    let pip: f64 = flag(&args, "--pip")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0001);
 
-    let higher: Vec<String> = higher_csv
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim().to_string())
-        .collect();
-    let higher_refs: Vec<&str> = higher.iter().map(|s| s.as_str()).collect();
+    let higher = direct_timeframes(&higher_csv)?;
 
     // `normalize_features` is the operator's shipped `models.data_runtime`
     // setting. It DECIDES whether the higher-TF alignment NaN survives to the
     // prefilter or is turned into 0.0 upstream, so it is the single most
     // important switch in this measurement and it is printed, not assumed.
-    neoethos_data::install_data_runtime_overrides(normalize, false);
+    neoethos_data::install_data_runtime_overrides(normalize);
 
     println!("═══ SETUP ═══");
     println!("root            {root}");
     println!("symbol          {symbol}   base {base_tf}   higher {higher:?}");
+    println!("identity        {}", identity.to_path_component());
     println!("prefilter       top_k={top_k}  min_per_tf={min_per_tf}");
     println!("normalize_feats {normalize}   (true = NaN cells become 0.0 BEFORE the prefilter)");
 
     let t0 = std::time::Instant::now();
-    let mut tfs: Vec<&str> = vec![base_tf.as_str()];
-    tfs.extend(higher_refs.iter().copied());
-    let mut dataset = neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &tfs)?;
-    for (tf, o) in &dataset.frames {
-        println!("loaded          {tf:<4} rows={}", o.close.len());
+    let series = ExactCanonicalSeries::open(&root, identity)
+        .context("opening the exact current canonical dataset generation")?;
+    let input = series
+        .load_search_input(&higher)
+        .context("loading direct base/higher timeframes and building their feature cube")?;
+    let full_ohlcv = input.base_frame().ohlcv();
+    let full_features = input.features();
+    let rows = full_ohlcv.close.len();
+    let tail_start = if max_bars > 0 && rows > max_bars {
+        rows - max_bars
+    } else {
+        0
+    };
+    let sliced_ohlcv =
+        (tail_start > 0).then(|| neoethos_data::slice_ohlcv(full_ohlcv, tail_start, rows, None));
+    let sliced_features = if tail_start > 0 {
+        Some(full_features.row_slice(tail_start, rows)?)
+    } else {
+        None
+    };
+    let ohlcv = sliced_ohlcv.as_ref().unwrap_or(full_ohlcv);
+    let features = sliced_features.as_ref().unwrap_or(full_features);
+    if tail_start > 0 {
+        println!("TRUNCATED exact base/features to the last {max_bars} rows (--max-bars)");
     }
-
-    if max_bars > 0 {
-        // Truncate the BASE only, keeping the tail. The higher frames stay whole
-        // so the alignment still has bars to bind to.
-        if let Some(o) = dataset.frames.get_mut(base_tf.as_str()) {
-            let n = o.close.len();
-            if n > max_bars {
-                let start = n - max_bars;
-                o.open = o.open[start..].to_vec();
-                o.high = o.high[start..].to_vec();
-                o.low = o.low[start..].to_vec();
-                o.close = o.close[start..].to_vec();
-                if let Some(v) = o.volume.as_mut() {
-                    *v = v[start..].to_vec();
-                }
-                if let Some(ts) = o.timestamp.as_mut() {
-                    *ts = ts[start..].to_vec();
-                }
-                println!("TRUNCATED base to the last {max_bars} bars (--max-bars)");
-            }
-        }
-    }
-
-    let ohlcv = dataset
-        .frames
-        .get(base_tf.as_str())
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("base timeframe {base_tf} missing"))?;
-
-    let features: FeatureFrame =
-        neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs)?;
     println!(
         "feature cube    rows={} cols={}  built in {:.1}s",
         features.n_samples(),
@@ -645,7 +673,14 @@ fn main() -> anyhow::Result<()> {
         .map(|col_idx| {
             let name = &names[col_idx];
             let is_regime = name.starts_with("regime_");
-            let col: Vec<f32> = features.feature_column(col_idx).iter().copied().collect();
+            // Narrow only inside this historical f32-vs-f64 diagnostic.
+            let col: Vec<f32> = features
+                .feature_column(col_idx)
+                .expect("feature projection succeeds")
+                .values
+                .iter()
+                .map(|&value| value as f32)
+                .collect();
 
             let mut ev = RowEvidence {
                 used_min: u64::MAX,
@@ -730,7 +765,11 @@ fn main() -> anyhow::Result<()> {
                     rankable: is_regime || new_rankable,
                 },
                 legacy_cpcv: ColumnScore {
-                    score: if is_regime { f64::INFINITY } else { legacy_worst },
+                    score: if is_regime {
+                        f64::INFINITY
+                    } else {
+                        legacy_worst
+                    },
                     rankable: true,
                 },
                 new_prefix: ColumnScore {
@@ -744,7 +783,11 @@ fn main() -> anyhow::Result<()> {
                     rankable: is_regime || o.is_rankable(),
                 },
                 legacy_prefix: ColumnScore {
-                    score: if is_regime { f64::INFINITY } else { legacy_prefix_score },
+                    score: if is_regime {
+                        f64::INFINITY
+                    } else {
+                        legacy_prefix_score
+                    },
                     rankable: true,
                 },
                 evidence: ev,
@@ -752,7 +795,10 @@ fn main() -> anyhow::Result<()> {
             }
         })
         .collect();
-    println!("scored          {n_cols} columns x 4 variants in {:.1}s\n", t2.elapsed().as_secs_f64());
+    println!(
+        "scored          {n_cols} columns x 4 variants in {:.1}s\n",
+        t2.elapsed().as_secs_f64()
+    );
 
     // ── ROW EVIDENCE per timeframe ───────────────────────────────────────────
     println!("═══ ROW EVIDENCE — how many rows each timeframe actually contributes ═══");
@@ -766,7 +812,10 @@ fn main() -> anyhow::Result<()> {
     }
     let nw = windows.len().max(1) as f64;
     for (tf, idxs) in &by_tf_rows {
-        let used: f64 = idxs.iter().map(|i| rows[*i].evidence.used_total as f64).sum::<f64>()
+        let used: f64 = idxs
+            .iter()
+            .map(|i| rows[*i].evidence.used_total as f64)
+            .sum::<f64>()
             / idxs.len() as f64
             / nw;
         let skipped: f64 = idxs
@@ -781,16 +830,27 @@ fn main() -> anyhow::Result<()> {
             .sum::<f64>()
             / idxs.len() as f64
             / nw;
-        let used_min: u64 = idxs.iter().map(|i| rows[*i].evidence.used_min).min().unwrap_or(0);
-        let prefix_used: f64 =
-            idxs.iter().map(|i| rows[*i].prefix_used as f64).sum::<f64>() / idxs.len() as f64;
+        let used_min: u64 = idxs
+            .iter()
+            .map(|i| rows[*i].evidence.used_min)
+            .min()
+            .unwrap_or(0);
+        let prefix_used: f64 = idxs
+            .iter()
+            .map(|i| rows[*i].prefix_used as f64)
+            .sum::<f64>()
+            / idxs.len() as f64;
         println!(
             "{:<6} {:>7} {:>14.0} {:>14.0} {:>8.2}% {:>14} {:>12.0}",
             tf,
             idxs.len(),
             used,
             skipped,
-            if offered > 0.0 { 100.0 * used / offered } else { 0.0 },
+            if offered > 0.0 {
+                100.0 * used / offered
+            } else {
+                0.0
+            },
             used_min,
             prefix_used
         );
@@ -847,7 +907,12 @@ fn main() -> anyhow::Result<()> {
                     p90,
                     mx
                 ),
-                None => println!("{:<6} {:>6} {:>7}   (no rankable columns)", tf, idxs.len(), unrank),
+                None => println!(
+                    "{:<6} {:>6} {:>7}   (no rankable columns)",
+                    tf,
+                    idxs.len(),
+                    unrank
+                ),
             }
         }
 
@@ -879,14 +944,20 @@ fn main() -> anyhow::Result<()> {
         }
         let mut median_rank: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         for (tf, idxs) in &by_tf_rows {
-            let mut r: Vec<usize> = idxs.iter().filter_map(|i| rank_of.get(i).copied()).collect();
+            let mut r: Vec<usize> = idxs
+                .iter()
+                .filter_map(|i| rank_of.get(i).copied())
+                .collect();
             if r.is_empty() {
                 continue;
             }
             r.sort_unstable();
             median_rank.insert(tf.clone(), (r[r.len() / 2], r[0]));
         }
-        println!("(median rank, best rank) by TF among {} rankable: {median_rank:?}", ranked.len());
+        println!(
+            "(median rank, best rank) by TF among {} rankable: {median_rank:?}",
+            ranked.len()
+        );
 
         // Selection + mechanism attribution.
         let kept = select_with_mechanisms(&names, &scores, &spec);
@@ -930,7 +1001,13 @@ fn main() -> anyhow::Result<()> {
             let mut earned: Vec<(usize, f64, usize)> = kept
                 .iter()
                 .filter(|(i, m)| **m == Mechanism::Rank && tf_of(&names[**i]) == *tf)
-                .map(|(i, _)| (*i, scores[*i].score, rank_of.get(i).copied().unwrap_or(usize::MAX)))
+                .map(|(i, _)| {
+                    (
+                        *i,
+                        scores[*i].score,
+                        rank_of.get(i).copied().unwrap_or(usize::MAX),
+                    )
+                })
                 .collect();
             earned.sort_by_key(|(_, _, r)| *r);
             println!(

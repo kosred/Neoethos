@@ -1,147 +1,16 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-mod cvi_python_cuda_handle {
-    use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-    use cust::context::Context;
-    use cust::memory::DeviceBuffer;
-    use pyo3::exceptions::PyValueError;
-    use pyo3::prelude::*;
-    use pyo3::types::PyDict;
-    use std::ffi::c_void;
-    use std::sync::Arc;
-
-    #[pyclass(module = "vector_ta", unsendable, name = "DeviceArrayF32Py")]
-    pub struct DeviceArrayF32Py {
-        pub(crate) buf: Option<DeviceBuffer<f32>>,
-        pub(crate) rows: usize,
-        pub(crate) cols: usize,
-        pub(crate) _ctx: Arc<Context>,
-        pub(crate) device_id: u32,
-    }
-
-    #[pymethods]
-    impl DeviceArrayF32Py {
-        #[getter]
-        fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-            let d = PyDict::new(py);
-            d.set_item("shape", (self.rows, self.cols))?;
-            d.set_item("typestr", "<f4")?;
-            d.set_item(
-                "strides",
-                (
-                    self.cols * std::mem::size_of::<f32>(),
-                    std::mem::size_of::<f32>(),
-                ),
-            )?;
-            let ptr = self
-                .buf
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-                .as_device_ptr()
-                .as_raw() as usize;
-            d.set_item("data", (ptr, false))?;
-            d.set_item("version", 3)?;
-            Ok(d)
-        }
-
-        fn __dlpack_device__(&self) -> (i32, i32) {
-            let mut device_ordinal: i32 = self.device_id as i32;
-            unsafe {
-                let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-                let mut value = std::mem::MaybeUninit::<i32>::uninit();
-                let ptr = self
-                    .buf
-                    .as_ref()
-                    .map(|b| b.as_device_ptr().as_raw())
-                    .unwrap_or(0);
-                if ptr != 0 {
-                    let rc = cust::sys::cuPointerGetAttribute(
-                        value.as_mut_ptr() as *mut c_void,
-                        attr,
-                        ptr,
-                    );
-                    if rc == cust::sys::CUresult::CUDA_SUCCESS {
-                        device_ordinal = value.assume_init();
-                    }
-                }
-            }
-            (2, device_ordinal)
-        }
-
-        #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-        fn __dlpack__<'py>(
-            &mut self,
-            py: Python<'py>,
-            stream: Option<pyo3::PyObject>,
-            max_version: Option<pyo3::PyObject>,
-            dl_device: Option<pyo3::PyObject>,
-            copy: Option<pyo3::PyObject>,
-        ) -> PyResult<PyObject> {
-            let (kdl, alloc_dev) = self.__dlpack_device__();
-            if let Some(dev_obj) = dl_device.as_ref() {
-                if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                    if dev_ty != kdl || dev_id != alloc_dev {
-                        let wants_copy = copy
-                            .as_ref()
-                            .and_then(|c| c.extract::<bool>(py).ok())
-                            .unwrap_or(false);
-                        if wants_copy {
-                            return Err(PyValueError::new_err(
-                                "device copy not implemented for __dlpack__",
-                            ));
-                        } else {
-                            return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                        }
-                    }
-                }
-            }
-            let _ = stream;
-
-            let buf = self
-                .buf
-                .take()
-                .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-            let rows = self.rows;
-            let cols = self.cols;
-
-            let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-            export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-        }
-    }
-
-    pub use DeviceArrayF32Py as CviDeviceArrayF32Py;
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use self::cvi_python_cuda_handle::CviDeviceArrayF32Py;
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::mem::MaybeUninit;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum CviData<'a> {
@@ -155,10 +24,6 @@ pub struct CviOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct CviParams {
     pub period: Option<usize>,
 }
@@ -344,7 +209,6 @@ pub fn cvi_with_kernel(input: &CviInput, kernel: Kernel) -> Result<CviOutput, Cv
     Ok(CviOutput { values: cvi_values })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn cvi_into(input: &CviInput, out: &mut [f64]) -> Result<(), CviError> {
     cvi_into_slice(out, input, Kernel::Scalar)
@@ -1168,282 +1032,19 @@ impl CviStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "cvi")]
-#[pyo3(signature = (high, low, period, kernel=None))]
-pub fn cvi_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = CviParams {
-        period: Some(period),
-    };
-    let cvi_in = CviInput::from_slices(high_slice, low_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| cvi_with_kernel(&cvi_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "CviStream")]
-pub struct CviStreamPy {
-    period: usize,
-    alpha: f64,
-    lag_buffer: Vec<f64>,
-    head: usize,
-    warmup_remaining: usize,
-    state_val: f64,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl CviStreamPy {
-    #[new]
-    fn new(period: usize, initial_high: f64, initial_low: f64) -> PyResult<Self> {
-        if period == 0 {
-            return Err(PyValueError::new_err(
-                "cvi: Invalid period: period = 0, data length = 0",
-            ));
-        }
-        let alpha = 2.0 / (period as f64 + 1.0);
-        let ema0 = initial_high - initial_low;
-        let mut lag = vec![0.0; period];
-        lag[0] = ema0;
-        let head = if period > 1 { 1 } else { 0 };
-
-        let warmup_remaining = period.saturating_sub(1);
-        Ok(CviStreamPy {
-            period,
-            alpha,
-            lag_buffer: lag,
-            head,
-            warmup_remaining,
-            state_val: ema0,
-        })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
-        let range = high - low;
-        self.state_val = (range - self.state_val).mul_add(self.alpha, self.state_val);
-
-        if self.warmup_remaining != 0 {
-            self.lag_buffer[self.head] = self.state_val;
-            let next = self.head + 1;
-            self.head = if next == self.period { 0 } else { next };
-            self.warmup_remaining -= 1;
-            return None;
-        }
-
-        let old = self.lag_buffer[self.head];
-        let out = 100.0 * (self.state_val - old) / old;
-        self.lag_buffer[self.head] = self.state_val;
-        let next = self.head + 1;
-        self.head = if next == self.period { 0 } else { next };
-        Some(out)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "cvi_batch")]
-#[pyo3(signature = (high, low, period_range, kernel=None))]
-pub fn cvi_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    let sweep = CviBatchRange {
-        period: period_range,
-    };
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = high_slice.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            cvi_batch_inner_into(high_slice, low_slice, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap_or(10) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "cvi_cuda_batch_dev")]
-#[pyo3(signature = (high, low, period_range, device_id=0))]
-pub fn cvi_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: numpy::PyReadonlyArray1<'_, f32>,
-    low: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<CviDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaCvi;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    if high_slice.len() != low_slice.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-
-    let sweep = CviBatchRange {
-        period: period_range,
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaCvi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .cvi_batch_dev(high_slice, low_slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(CviDeviceArrayF32Py {
-        buf: Some(inner.buf),
-        rows: inner.rows,
-        cols: inner.cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "cvi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, cols, rows, period, device_id=0))]
-pub fn cvi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<CviDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaCvi;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high_slice = high_tm.as_slice()?;
-    let low_slice = low_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if high_slice.len() != expected || low_slice.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaCvi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .cvi_many_series_one_param_time_major_dev(high_slice, low_slice, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(CviDeviceArrayF32Py {
-        buf: Some(inner.buf),
-        rows: inner.rows,
-        cols: inner.cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cvi_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = cvi_js(high, low, period)?;
-    crate::write_wasm_f64_output("cvi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cvi_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = cvi_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs("cvi_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_cvi_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = CviParams { period: None };
         let input_default = CviInput::from_candles(&candles, default_params);
         let output_default = cvi_with_kernel(&input_default, kernel)?;
@@ -1456,8 +1057,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = CviParams { period: Some(5) };
         let input = CviInput::from_candles(&candles, params);
         let cvi_result = cvi_with_kernel(&input, kernel)?;
@@ -1491,8 +1092,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = CviInput::with_default_candles(&candles);
         match input.data {
             CviData::Candles(_) => {}
@@ -1603,8 +1204,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             CviParams::default(),
@@ -1725,8 +1326,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = CviBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
         let def = CviParams::default();
         let row = output.values_for(&def).expect("default row missing");
@@ -1758,7 +1359,6 @@ mod tests {
     gen_batch_tests!(check_batch_no_poison);
 
     #[test]
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     fn test_cvi_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let len = 256usize;
         let mut high = vec![0.0f64; len];
@@ -1810,8 +1410,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2222,159 +1822,4 @@ pub fn cvi_into_slice(
     }
 
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cvi_js(high: &[f64], low: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = CviParams {
-        period: Some(period),
-    };
-    let input = CviInput::from_slices(high, low, params);
-
-    let output = cvi(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output.values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cvi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cvi_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cvi_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to cvi_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = CviParams {
-            period: Some(period),
-        };
-        let input = CviInput::from_slices(high, low, params);
-
-        let aliased = high_ptr == out_ptr || low_ptr == out_ptr;
-
-        if aliased {
-            let result = cvi(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&result.values);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            cvi_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CviBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CviBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<CviParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = cvi_batch)]
-pub fn cvi_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: CviBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = CviBatchRange {
-        period: config.period_range,
-    };
-
-    let kernel = detect_best_kernel();
-    let output = cvi_batch_inner(high, low, &sweep, kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = CviBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cvi_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to cvi_batch_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let sweep = CviBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        cvi_batch_inner_into(high, low, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

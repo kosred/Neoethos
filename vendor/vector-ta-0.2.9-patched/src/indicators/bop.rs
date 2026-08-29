@@ -1,39 +1,12 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaBop;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum BopData<'a> {
@@ -239,7 +212,6 @@ pub fn bop_with_kernel(input: &BopInput, kernel: Kernel) -> Result<BopOutput, Bo
     Ok(BopOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn bop_into(input: &BopInput, out: &mut [f64]) -> Result<(), BopError> {
     let (open, high, low, close): (&[f64], &[f64], &[f64], &[f64]) = match &input.data {
         BopData::Candles { candles } => (
@@ -796,59 +768,19 @@ fn expand_grid(_r: &BopBatchRange) -> Vec<BopParams> {
     vec![BopParams {}]
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = bop_js(open, high, low, close)?;
-    crate::write_wasm_f64_output("bop_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_batch_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = bop_batch_js(open, high, low, close)?;
-    crate::write_wasm_f64_output("bop_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_batch_unified_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    _config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = bop_batch_unified_js(open, high, low, close, _config)?;
-    crate::write_wasm_selected_object_f64_outputs("bop_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_bop_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = BopInput::with_default_candles(&candles);
         let output = bop_with_kernel(&input, kernel)?;
@@ -861,8 +793,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = BopInput::with_default_candles(&candles);
         let bop_result = bop_with_kernel(&input, kernel)?;
@@ -894,8 +826,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = BopInput::with_default_candles(&candles);
         match input.data {
             BopData::Candles { .. } => {}
@@ -965,8 +897,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_input = BopInput::with_default_candles(&candles);
         let first_result = bop_with_kernel(&first_input, kernel)?;
@@ -998,8 +930,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = BopInput::with_default_candles(&candles);
         let bop_result = bop_with_kernel(&input, kernel)?;
         if bop_result.values.len() > 240 {
@@ -1044,8 +976,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = BopInput::with_default_candles(&candles);
         let output = bop_with_kernel(&input, kernel)?;
@@ -1356,8 +1288,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let open = source_type(&c, "open");
         let high = source_type(&c, "high");
@@ -1409,8 +1341,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let open = source_type(&c, "open");
         let high = source_type(&c, "high");
@@ -1432,23 +1364,23 @@ mod tests {
 
             if bits == 0x11111111_11111111 {
                 panic!(
-					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
-					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
-					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
         }
 
@@ -1465,7 +1397,6 @@ mod tests {
 
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_bop_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let n = 256usize;
@@ -1521,208 +1452,6 @@ mod tests {
 
         Ok(())
     }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bop")]
-#[pyo3(signature = (open, high, low, close, *, kernel=None))]
-pub fn bop_py<'py>(
-    py: Python<'py>,
-    open: numpy::PyReadonlyArray1<'py, f64>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let open_slice = open.as_slice()?;
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = BopParams::default();
-    let input = BopInput::from_slices(open_slice, high_slice, low_slice, close_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| bop_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "BopStream")]
-pub struct BopStreamPy {
-    stream: BopStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl BopStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        let stream = BopStream::try_new().map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(BopStreamPy { stream })
-    }
-
-    fn update(&mut self, open: f64, high: f64, low: f64, close: f64) -> f64 {
-        self.stream.update(open, high, low, close)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct BopDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl BopDeviceArrayF32Py {
-    #[inline]
-    fn device_ptr(&self) -> u64 {
-        self.buf
-            .as_ref()
-            .map(|b| b.as_device_ptr().as_raw() as u64)
-            .unwrap_or(0)
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let buf = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let ptr = buf.as_device_ptr().as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bop_batch")]
-#[pyo3(signature = (open, high, low, close, *, kernel=None))]
-pub fn bop_batch_py<'py>(
-    py: Python<'py>,
-    open: numpy::PyReadonlyArray1<'py, f64>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::{PyDict, PyList};
-
-    let open_slice = open.as_slice()?;
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let rows = 1usize;
-    let cols = open_slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("bop_batch: rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let result = py.allow_threads(|| {
-        bop_batch_inner_into(
-            open_slice,
-            high_slice,
-            low_slice,
-            close_slice,
-            kern,
-            slice_out,
-        )
-    });
-    if let Err(e) = result {
-        let msg = match e {
-            BopError::EmptyInputData => "Input data is empty".to_string(),
-            BopError::InputLengthsMismatch { .. } => "Input lengths mismatch".to_string(),
-            _ => e.to_string(),
-        };
-        return Err(PyValueError::new_err(msg));
-    }
-
-    let d = PyDict::new(py);
-    d.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    d.set_item("rows", rows)?;
-    d.set_item("cols", cols)?;
-    d.set_item("params", Vec::<f64>::new().into_pyarray(py))?;
-
-    d.set_item("periods", Vec::<u64>::new().into_pyarray(py))?;
-    d.set_item("offsets", Vec::<f64>::new().into_pyarray(py))?;
-    d.set_item("sigmas", Vec::<f64>::new().into_pyarray(py))?;
-    Ok(d)
 }
 
 pub fn bop_into_slice(
@@ -1784,282 +1513,4 @@ pub fn bop_into_slice(
         *v = f64::NAN;
     }
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_js(open: &[f64], high: &[f64], low: &[f64], close: &[f64]) -> Result<Vec<f64>, JsValue> {
-    let mut output = vec![0.0; open.len()];
-
-    bop_into_slice(&mut output, open, high, low, close, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        if open_ptr == out_ptr || high_ptr == out_ptr || low_ptr == out_ptr || close_ptr == out_ptr
-        {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-            let warmup_period = (0..len)
-                .find(|&i| {
-                    !open[i].is_nan() && !high[i].is_nan() && !low[i].is_nan() && !close[i].is_nan()
-                })
-                .unwrap_or(len);
-
-            for v in &mut out[..warmup_period] {
-                *v = f64::NAN;
-            }
-
-            for i in warmup_period..len {
-                let denom = high[i] - low[i];
-                out[i] = if denom <= 0.0 {
-                    0.0
-                } else {
-                    (close[i] - open[i]) / denom
-                };
-            }
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            bop_into_slice(out, open, high, low, close, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_batch_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-) -> Result<Vec<f64>, JsValue> {
-    let mut output = vec![0.0; open.len()];
-
-    bop_into_slice(&mut output, open, high, low, close, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "bop_cuda_batch_dev")]
-#[pyo3(signature = (open, high, low, close, device_id=0))]
-pub fn bop_cuda_batch_dev_py(
-    py: Python<'_>,
-    open: numpy::PyReadonlyArray1<'_, f32>,
-    high: numpy::PyReadonlyArray1<'_, f32>,
-    low: numpy::PyReadonlyArray1<'_, f32>,
-    close: numpy::PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<Py<BopDeviceArrayF32Py>> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let open_slice = open.as_slice()?;
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    if open_slice.len() == 0
-        || high_slice.len() != open_slice.len()
-        || low_slice.len() != open_slice.len()
-        || close_slice.len() != open_slice.len()
-    {
-        return Err(PyValueError::new_err("empty or mismatched OHLC lengths"));
-    }
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaBop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let dev = cuda
-            .bop_batch_dev(open_slice, high_slice, low_slice, close_slice)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((dev, ctx, dev_id))
-    })?;
-    let handle = BopDeviceArrayF32Py {
-        buf: Some(inner.buf),
-        rows: inner.rows,
-        cols: inner.cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    };
-    let obj = Py::new(py, handle)?;
-    Ok(obj)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "bop_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (open_tm, high_tm, low_tm, close_tm, cols, rows, device_id=0))]
-pub fn bop_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    open_tm: numpy::PyReadonlyArray1<'_, f32>,
-    high_tm: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    device_id: usize,
-) -> PyResult<Py<BopDeviceArrayF32Py>> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let open_slice = open_tm.as_slice()?;
-    let high_slice = high_tm.as_slice()?;
-    let low_slice = low_tm.as_slice()?;
-    let close_slice = close_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if open_slice.len() != expected
-        || high_slice.len() != expected
-        || low_slice.len() != expected
-        || close_slice.len() != expected
-    {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaBop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let dev = cuda
-            .bop_many_series_one_param_time_major_dev(
-                open_slice,
-                high_slice,
-                low_slice,
-                close_slice,
-                cols,
-                rows,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((dev, ctx, dev_id))
-    })?;
-    let handle = BopDeviceArrayF32Py {
-        buf: Some(inner.buf),
-        rows: inner.rows,
-        cols: inner.cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    };
-    let obj = Py::new(py, handle)?;
-    Ok(obj)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-        bop_into_slice(out, open, high, low, close, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(1)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bop_batch_metadata_js() -> Result<Vec<f64>, JsValue> {
-    Ok(Vec::new())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BopBatchConfig {}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BopBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = bop_batch)]
-pub fn bop_batch_unified_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    _config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let out = bop_batch_with_kernel(open, high, low, close, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = BopBatchJsOutput {
-        values: out.values,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }

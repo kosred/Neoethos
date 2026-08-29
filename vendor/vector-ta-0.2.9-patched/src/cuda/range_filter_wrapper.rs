@@ -1,19 +1,19 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::range_filter::{RangeFilterBatchRange, RangeFilterParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug)]
 pub enum CudaRangeFilterError {
@@ -143,11 +143,6 @@ impl CudaRangeFilter {
         let device = Device::get_device(device_id as u32).map_err(CudaRangeFilterError::Cuda)?;
         let context = Arc::new(Context::new(device).map_err(CudaRangeFilterError::Cuda)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/range_filter_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("range_filter_kernel")
             .map_err(CudaRangeFilterError::Cuda)?;
         let stream =

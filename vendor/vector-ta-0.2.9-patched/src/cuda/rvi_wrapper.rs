@@ -1,14 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
-use crate::indicators::rvi as rvi_scalar_mod;
 use crate::indicators::rvi::{RviBatchRange, RviParams};
-use crate::utilities::enums::Kernel;
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -87,11 +85,6 @@ impl CudaRvi {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/rvi_kernel.ptx"));
-        let jit = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("rvi_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {
@@ -257,106 +250,7 @@ impl CudaRvi {
         data: &[f32],
         sweep: &RviBatchRange,
     ) -> Result<(DeviceArrayF32, Vec<RviParams>), CudaRviError> {
-        let (combos, first_valid, len, max_period, max_ma_len) = Self::prepare_batch(data, sweep)?;
-        let rows = combos.len();
-        let rows_len = rows
-            .checked_mul(len)
-            .ok_or_else(|| CudaRviError::InvalidInput("rows * len overflow".into()))?;
-
-        let mut idx_std = Vec::with_capacity(rows);
-        let mut idx_mad = Vec::with_capacity(rows);
-        for (i, c) in combos.iter().enumerate() {
-            match c.devtype.unwrap_or(0) {
-                0 => idx_std.push(i),
-                _ => idx_mad.push(i),
-            }
-        }
-        let rows_std = idx_std.len();
-        let rows_mad = idx_mad.len();
-
-        let mut combos_sorted = Vec::with_capacity(rows);
-        for &i in &idx_std {
-            combos_sorted.push(combos[i].clone());
-        }
-        for &i in &idx_mad {
-            combos_sorted.push(combos[i].clone());
-        }
-
-        let param_i32_bytes = rows
-            .checked_mul(4)
-            .and_then(|x| x.checked_mul(std::mem::size_of::<i32>()))
-            .ok_or_else(|| CudaRviError::InvalidInput("param bytes overflow".into()))?;
-        let prices_bytes = len
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| CudaRviError::InvalidInput("prices bytes overflow".into()))?;
-        let out_bytes = rows_len
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| CudaRviError::InvalidInput("output bytes overflow".into()))?;
-        let mut req = prices_bytes
-            .checked_add(out_bytes)
-            .and_then(|x| x.checked_add(param_i32_bytes))
-            .ok_or_else(|| CudaRviError::InvalidInput("VRAM estimate overflow".into()))?;
-        if rows_std > 0 {
-            let extra = (2usize)
-                .checked_mul(len)
-                .and_then(|x| x.checked_mul(std::mem::size_of::<f32>()))
-                .and_then(|x| x.checked_add(len.saturating_mul(std::mem::size_of::<i32>())))
-                .ok_or_else(|| CudaRviError::InvalidInput("prefix bytes overflow".into()))?;
-            req = req
-                .checked_add(extra)
-                .ok_or_else(|| CudaRviError::InvalidInput("VRAM estimate overflow".into()))?;
-        }
-        let headroom = 64 * 1024 * 1024;
-        if !Self::will_fit(req, headroom) {
-            if let Some((free, _)) = Self::device_mem_info() {
-                return Err(CudaRviError::OutOfMemory {
-                    required: req,
-                    free,
-                    headroom,
-                });
-            } else {
-                return Err(CudaRviError::InvalidInput(
-                    "insufficient device memory".into(),
-                ));
-            }
-        }
-
-        if rows * len <= 2_000_000 {
-            let mut d_out =
-                unsafe { DeviceBuffer::<f32>::uninitialized_async(rows_len, &self.stream)? };
-            let data_f64: Vec<f64> = data.iter().map(|&v| v as f64).collect();
-            // COUNTED, not disguised. A card is present and this branch
-            // computes on the HOST, then uploads the result and returns it
-            // as a DeviceArray — a caller holding that pointer cannot tell
-            // the device never ran. That is the exact shape the f64 lane
-            // exists to make impossible, and it survived the conversion in
-            // four wrappers because nothing was counting.
-            //
-            // The rule is not "never compute on the host". It is: card
-            // present and a kernel exists -> the card runs it; card present
-            // and no kernel -> the host may compute it, but the call is
-            // RECORDED by indicator id so it appears as work still owed.
-            // host_fallback::total() is meant to reach zero by achievement,
-            // and it was returning zero by construction because record()
-            // had no call sites in the entire crate.
-            crate::cuda::host_fallback::record("rvi");
-            let cpu = rvi_scalar_mod::rvi_batch_with_kernel(&data_f64, sweep, Kernel::ScalarBatch)
-                .map_err(|e| CudaRviError::InvalidInput(format!("CPU fallback failed: {:?}", e)))?;
-
-            let vals_f32: Vec<f32> = cpu.values.iter().map(|&v| v as f32).collect();
-            unsafe {
-                d_out.async_copy_from(vals_f32.as_slice(), &self.stream)?;
-            }
-            self.stream.synchronize().map_err(CudaRviError::from)?;
-            return Ok((
-                DeviceArrayF32 {
-                    buf: d_out,
-                    rows,
-                    cols: len,
-                },
-                cpu.combos,
-            ));
-        }
+        let (_, first_valid, len, _, _) = Self::prepare_batch(data, sweep)?;
 
         let h_data = LockedBuffer::from_slice(data)?;
         let mut d_data = unsafe { DeviceBuffer::<f32>::uninitialized_async(len, &self.stream)? };
@@ -950,7 +844,10 @@ impl CudaRvi {
             ManySeriesKernelPolicy::OneD { block_x } => block_x.max(32),
         };
         if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") && !self.debug_many_logged {
-            eprintln!("[rvi] many-series kernel: block_x={} cols={} rows={} period={} ma_len={} matype={} devtype= {}", block_x, cols, rows, period, ma_len, matype, devtype);
+            eprintln!(
+                "[rvi] many-series kernel: block_x={} cols={} rows={} period={} ma_len={} matype={} devtype= {}",
+                block_x, cols, rows, period, ma_len, matype, devtype
+            );
             unsafe {
                 (*(self as *const _ as *mut CudaRvi)).debug_many_logged = true;
             }

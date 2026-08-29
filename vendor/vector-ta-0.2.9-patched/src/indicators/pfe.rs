@@ -1,20 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -23,19 +12,6 @@ use rayon::prelude::*;
 use std::convert::AsRef;
 use std::error::Error;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::pfe_wrapper::CudaPfe;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 
 impl<'a> AsRef<[f64]> for PfeInput<'a> {
     #[inline(always)]
@@ -65,10 +41,6 @@ pub struct PfeOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct PfeParams {
     pub period: Option<usize>,
     pub smoothing: Option<usize>,
@@ -435,7 +407,6 @@ pub fn pfe_with_kernel(input: &PfeInput, kernel: Kernel) -> Result<PfeOutput, Pf
     Ok(PfeOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn pfe_into(input: &PfeInput, out: &mut [f64]) -> Result<(), PfeError> {
     let (data, period, smoothing, first, chosen) = pfe_prepare(input, Kernel::Auto)?;
@@ -1357,450 +1328,16 @@ impl PfeStream {
     }
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "PfeDeviceArrayF32", unsendable)]
-pub struct PfeDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl PfeDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner;
-        let d = PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (inner.cols * itemsize, itemsize))?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl PfeDeviceArrayF32Py {
-    pub fn new_from_rust(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "pfe")]
-#[pyo3(signature = (data, period, smoothing, kernel=None))]
-pub fn pfe_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    smoothing: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = PfeParams {
-        period: Some(period),
-        smoothing: Some(smoothing),
-    };
-    let pfe_in = PfeInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| pfe_with_kernel(&pfe_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "pfe_batch")]
-#[pyo3(signature = (data, period_range, smoothing_range, kernel=None))]
-pub fn pfe_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    smoothing_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-
-    let sweep = PfeBatchRange {
-        period: period_range,
-        smoothing: smoothing_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("pfe_batch: rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            pfe_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smoothings",
-        combos
-            .iter()
-            .map(|p| p.smoothing.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pfe_cuda_batch_dev")]
-#[pyo3(signature = (data, period_range, smoothing_range, device_id=0))]
-pub fn pfe_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    smoothing_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<PfeDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data.as_slice()?;
-    let sweep = PfeBatchRange {
-        period: period_range,
-        smoothing: smoothing_range,
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaPfe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev = cuda
-            .pfe_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((dev, cuda.context_arc(), cuda.device_id()))
-    })?;
-    Ok(PfeDeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pfe_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm, cols, rows, period, smoothing, device_id=0))]
-pub fn pfe_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    smoothing: usize,
-    device_id: usize,
-) -> PyResult<PfeDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let tm_slice = data_tm.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaPfe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev = cuda
-            .pfe_many_series_one_param_time_major_dev(tm_slice, cols, rows, period, smoothing)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((dev, cuda.context_arc(), cuda.device_id()))
-    })?;
-    Ok(PfeDeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "PfeStream")]
-pub struct PfeStreamPy {
-    stream: PfeStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PfeStreamPy {
-    #[new]
-    fn new(period: usize, smoothing: usize) -> PyResult<Self> {
-        let params = PfeParams {
-            period: Some(period),
-            smoothing: Some(smoothing),
-        };
-        let stream =
-            PfeStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PfeStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pfe_js(data: &[f64], period: usize, smoothing: usize) -> Result<Vec<f64>, JsValue> {
-    let params = PfeParams {
-        period: Some(period),
-        smoothing: Some(smoothing),
-    };
-    let input = PfeInput::from_slice(data, params);
-    let mut out = vec![0.0; data.len()];
-    pfe_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pfe_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pfe_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pfe_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    smoothing: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = PfeParams {
-            period: Some(period),
-            smoothing: Some(smoothing),
-        };
-        let input = PfeInput::from_slice(data, params);
-        if in_ptr == out_ptr {
-            let mut tmp = vec![0.0; len];
-            pfe_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            pfe_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PfeBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub smoothing_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PfeBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<PfeParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = pfe_batch)]
-pub fn pfe_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: PfeBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = PfeBatchRange {
-        period: cfg.period_range,
-        smoothing: cfg.smoothing_range,
-    };
-    let out = pfe_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = PfeBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pfe_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    p_start: usize,
-    p_end: usize,
-    p_step: usize,
-    s_start: usize,
-    s_end: usize,
-    s_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = PfeBatchRange {
-            period: (p_start, p_end, p_step),
-            smoothing: (s_start, s_end, s_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = len
-            .checked_mul(rows)
-            .ok_or_else(|| JsValue::from_str("pfe_batch_into: rows*cols overflow"))?;
-        let combos = pfe_batch_inner_into(
-            data,
-            &sweep,
-            detect_best_kernel(),
-            false,
-            std::slice::from_raw_parts_mut(out_ptr, total),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(combos.len())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pfe_output_into_js(
-    data: &[f64],
-    period: usize,
-    smoothing: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = pfe_js(data, period, smoothing)?;
-    crate::write_wasm_f64_output("pfe_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pfe_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = pfe_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("pfe_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_pfe_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = PfeParams {
             period: None,
@@ -1815,8 +1352,8 @@ mod tests {
 
     fn check_pfe_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_prices = &candles.close;
 
         let params = PfeParams {
@@ -1858,8 +1395,8 @@ mod tests {
 
     fn check_pfe_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = PfeInput::with_default_candles(&candles);
         match input.data {
@@ -1928,8 +1465,8 @@ mod tests {
 
     fn check_pfe_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = PfeParams {
             period: Some(10),
@@ -1959,8 +1496,8 @@ mod tests {
 
     fn check_pfe_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = PfeInput::from_candles(
             &candles,
@@ -1988,8 +1525,8 @@ mod tests {
     fn check_pfe_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 10;
         let smoothing = 5;
@@ -2070,8 +1607,8 @@ mod tests {
     fn check_pfe_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             PfeParams::default(),
@@ -2483,8 +2020,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = PfeBatchBuilder::new()
             .kernel(kernel)
@@ -2516,8 +2053,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 1, 5, 1),

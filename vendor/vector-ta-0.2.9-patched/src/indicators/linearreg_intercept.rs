@@ -1,27 +1,17 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::convert::AsRef;
 use std::error::Error;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for LinearRegInterceptInput<'a> {
     #[inline(always)]
@@ -66,10 +56,6 @@ pub struct LinearRegInterceptOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct LinearRegInterceptParams {
     pub period: Option<usize>,
 }
@@ -268,7 +254,6 @@ pub fn linearreg_intercept_with_kernel(
     Ok(LinearRegInterceptOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn linearreg_intercept_into(
     input: &LinearRegInterceptInput,
@@ -1051,223 +1036,18 @@ fn expand_grid_reg(r: &LinearRegInterceptBatchRange) -> Vec<LinearRegInterceptPa
     expand_grid(r).unwrap_or_else(|_| Vec::new())
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct LinearRegInterceptDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl LinearRegInterceptDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let d = pyo3::types::PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "linearreg_intercept_cuda_batch_dev")]
-#[pyo3(signature = (data, period_range, device_id=0))]
-pub fn linearreg_intercept_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<LinearRegInterceptDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaLinregIntercept;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data.as_slice()?;
-    let sweep = LinearRegInterceptBatchRange {
-        period: period_range,
-    };
-    let (dev, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaLinregIntercept::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (dev, _combos) = cuda
-            .linearreg_intercept_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        Ok::<_, pyo3::PyErr>((dev, ctx, cuda.device_id()))
-    })?;
-    let DeviceArrayF32 { buf, rows, cols } = dev;
-    Ok(LinearRegInterceptDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "linearreg_intercept_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm, cols, rows, period, device_id=0))]
-pub fn linearreg_intercept_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<LinearRegInterceptDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaLinregIntercept;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if slice.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let params = LinearRegInterceptParams {
-        period: Some(period),
-    };
-    let (dev, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaLinregIntercept::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev = cuda
-            .linearreg_intercept_many_series_one_param_time_major_dev(slice, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        Ok::<_, pyo3::PyErr>((dev, ctx, cuda.device_id()))
-    })?;
-    Ok(LinearRegInterceptDeviceArrayF32Py {
-        buf: Some(dev.buf),
-        rows: dev.rows,
-        cols: dev.cols,
-        ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_intercept_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = linearreg_intercept_js(data, period)?;
-    crate::write_wasm_f64_output("linearreg_intercept_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_intercept_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = linearreg_intercept_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "linearreg_intercept_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_linreg_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = LinearRegInterceptParams { period: None };
         let input = LinearRegInterceptInput::from_candles(&candles, "close", default_params);
         let output = linearreg_intercept_with_kernel(&input, kernel)?;
@@ -1277,8 +1057,8 @@ mod tests {
 
     fn check_linreg_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = LinearRegInterceptInput::from_candles(
             &candles,
             "close",
@@ -1310,8 +1090,8 @@ mod tests {
 
     fn check_linreg_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = LinearRegInterceptInput::with_default_candles(&candles);
         match input.data {
             LinearRegInterceptData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1372,8 +1152,8 @@ mod tests {
 
     fn check_linreg_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = LinearRegInterceptParams { period: Some(14) };
         let first_input = LinearRegInterceptInput::from_candles(&candles, "close", first_params);
         let first_result = linearreg_intercept_with_kernel(&first_input, kernel)?;
@@ -1401,8 +1181,8 @@ mod tests {
 
     fn check_linreg_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = LinearRegInterceptInput::from_candles(
             &candles,
             "close",
@@ -1427,8 +1207,8 @@ mod tests {
     fn check_linreg_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             LinearRegInterceptParams::default(),
@@ -1771,13 +1551,8 @@ mod tests {
         let mut out = vec![0.0; data.len()];
         #[allow(unused_variables)]
         {
-            #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
             {
                 linearreg_intercept_into(&input, &mut out)?;
-            }
-            #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-            {
-                linearreg_intercept_into_slice(&mut out, &input, Kernel::Auto)?;
             }
         }
 
@@ -1803,8 +1578,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = LinearRegInterceptBatchBuilder::new()
             .kernel(kernel)
@@ -1836,8 +1611,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -1943,286 +1718,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "linearreg_intercept")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn linearreg_intercept_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = LinearRegInterceptParams {
-        period: Some(period),
-    };
-    let input = LinearRegInterceptInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| linearreg_intercept_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "LinearRegInterceptStream")]
-pub struct LinearRegInterceptStreamPy {
-    stream: LinearRegInterceptStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl LinearRegInterceptStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = LinearRegInterceptParams {
-            period: Some(period),
-        };
-        let stream = LinearRegInterceptStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(LinearRegInterceptStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "linearreg_intercept_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn linearreg_intercept_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let sweep = LinearRegInterceptBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("linearreg_intercept_batch: rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    if !combos.is_empty() && cols > 0 {
-        let first = slice_in.iter().position(|x| !x.is_nan()).unwrap_or(0);
-        for (r, prm) in combos.iter().enumerate() {
-            let warm = (first + prm.period.unwrap() - 1).min(cols);
-            for v in &mut slice_out[r * cols..r * cols + warm] {
-                *v = f64::NAN;
-            }
-        }
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            linearreg_intercept_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_intercept_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = LinearRegInterceptParams {
-        period: Some(period),
-    };
-    let input = LinearRegInterceptInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    linearreg_intercept_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_intercept_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_intercept_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_intercept_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = LinearRegInterceptParams {
-            period: Some(period),
-        };
-        let input = LinearRegInterceptInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            linearreg_intercept_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            linearreg_intercept_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LinearRegInterceptBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LinearRegInterceptBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<LinearRegInterceptParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = linearreg_intercept_batch)]
-pub fn linearreg_intercept_batch_unified_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: LinearRegInterceptBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = LinearRegInterceptBatchRange {
-        period: config.period_range,
-    };
-
-    let batch_output = linearreg_intercept_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let rows = batch_output.values.len() / data.len();
-    let result = LinearRegInterceptBatchJsOutput {
-        values: batch_output.values,
-        combos: batch_output.combos,
-        rows,
-        cols: data.len(),
-    };
-
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_intercept_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = LinearRegInterceptBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows.checked_mul(cols).ok_or_else(|| {
-            JsValue::from_str("linearreg_intercept_batch_into: rows*cols overflow")
-        })?;
-
-        let first = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; total];
-
-            for (r, prm) in combos.iter().enumerate() {
-                let warm = (first + prm.period.unwrap() - 1).min(cols);
-                temp[r * cols..r * cols + warm].fill(f64::NAN);
-            }
-
-            linearreg_intercept_batch_inner_into(data, &sweep, Kernel::Auto, true, &mut temp)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, total);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-            for (r, prm) in combos.iter().enumerate() {
-                let warm = (first + prm.period.unwrap() - 1).min(cols);
-                out[r * cols..r * cols + warm].fill(f64::NAN);
-            }
-
-            linearreg_intercept_batch_inner_into(data, &sweep, Kernel::Auto, true, out)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(rows)
-    }
 }

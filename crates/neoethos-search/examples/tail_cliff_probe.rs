@@ -1,7 +1,8 @@
 //! Measures the 300 000-bar expected-shortfall cliff on REAL bars.
 //!
 //! Usage:
-//!   cargo run -p neoethos-search --release --example tail_cliff_probe -- <vortex-file> [pip_size]
+//!   cargo run -p neoethos-search --release --example tail_cliff_probe -- \
+//!       <data-root> --identity <d1...> --pip-size <broker-pip-size>
 //!
 //! Prints the median adaptive base stop (pips) for a sweep of series lengths,
 //! under BOTH the old hardcoded `tail_max_bars = 300_000` and the new default
@@ -10,7 +11,25 @@
 //! ~1 000 (live `warmup_bars`), ~70 000 (a walk-forward window at
 //! `walkforward_splits = 15`), and the full series (discovery scoring).
 
+use anyhow::Context;
+use neoethos_data::CanonicalDatasetIdentity;
+use neoethos_search::data_selection::ExactCanonicalSeries;
 use neoethos_search::{StopTargetSettings, compute_stop_distance_series};
+
+fn flag(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|value| value == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+fn exact_identity(args: &[String]) -> anyhow::Result<CanonicalDatasetIdentity> {
+    let encoded = flag(args, "--identity").context(
+        "--identity <d1...> is required; a Vortex path or display symbol is not an identity",
+    )?;
+    CanonicalDatasetIdentity::from_path_component(&encoded)
+        .with_context(|| format!("invalid canonical dataset identity {encoded:?}"))
+}
 
 fn median(v: &[f64]) -> f64 {
     let mut w: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
@@ -71,14 +90,31 @@ fn base_pips_step(
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let path = args
-        .next()
-        .expect("usage: tail_cliff_probe <vortex-file> [pip_size]");
-    let pip: f64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(0.0001);
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let root = args
+        .first()
+        .filter(|value| !value.starts_with("--"))
+        .context("usage: tail_cliff_probe <data-root> --identity <d1...> --pip-size <value>")?;
+    let identity = exact_identity(&args)?;
+    let pip: f64 = flag(&args, "--pip-size")
+        .context("--pip-size is required and must come from broker symbol metadata")?
+        .parse()
+        .context("--pip-size must be a finite positive number")?;
+    anyhow::ensure!(
+        pip.is_finite() && pip > 0.0,
+        "--pip-size must be a finite positive number"
+    );
 
-    let o = neoethos_data::load_vortex(&path)?;
-    println!("file      : {path}");
+    let series = ExactCanonicalSeries::open(root, identity)
+        .context("opening the exact current canonical dataset generation")?;
+    let frame = neoethos_data::load_canonical_timeframe(series.root(), series.anchor_identity())
+        .context("loading the verified canonical Vortex generation")?;
+    let o = frame.ohlcv();
+    println!("root      : {root}");
+    println!(
+        "identity  : {}",
+        series.anchor_identity().to_path_component()
+    );
     println!("bars      : {}", o.close.len());
     println!("pip_size  : {pip}");
     println!();

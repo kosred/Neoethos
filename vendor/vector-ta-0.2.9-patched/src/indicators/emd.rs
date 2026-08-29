@@ -1,25 +1,11 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaEmd, CudaEmdBatchResult, DeviceArrayF32Triple};
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -33,6 +19,7 @@ impl<'a> AsRef<[f64]> for EmdInput<'a> {
         match &self.data {
             EmdData::Candles { candles } => &candles.close,
             EmdData::Slices { close, .. } => close,
+            EmdData::HighLow { high, .. } => high,
         }
     }
 }
@@ -48,6 +35,10 @@ pub enum EmdData<'a> {
         close: &'a [f64],
         volume: &'a [f64],
     },
+    HighLow {
+        high: &'a [f64],
+        low: &'a [f64],
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -58,14 +49,53 @@ pub struct EmdOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EmdParams {
     pub period: Option<usize>,
     pub delta: Option<f64>,
     pub fraction: Option<f64>,
+}
+
+/// Immutable parameter-only arithmetic shared by the scalar CPU authority and
+/// the resident f64 CUDA route. No price or output value enters this payload.
+/// CUDA receives these exact host-computed bits instead of independently
+/// calling libdevice `cos`/`sqrt` and hoping their rounding matches Rust.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EmdExactCoefficients {
+    pub(crate) inv_up_low: f64,
+    pub(crate) inv_mid: f64,
+    pub(crate) alpha: f64,
+    pub(crate) half_one_minus_alpha: f64,
+    pub(crate) beta_times_one_plus_alpha: f64,
+    pub(crate) fraction: f64,
+}
+
+/// Build the exact immutable EMD coefficient payload in the scalar CPU's
+/// historical operation order. Keeping this as one authority makes the
+/// resident production launch independent of platform/libdevice trig drift.
+#[inline]
+pub(crate) fn emd_exact_coefficients(
+    period: usize,
+    delta: f64,
+    fraction: f64,
+) -> EmdExactCoefficients {
+    let per_up_low = 50usize;
+    let per_mid = 2 * period;
+    let inv_up_low = 1.0 / (per_up_low as f64);
+    let inv_mid = 1.0 / (per_mid as f64);
+    let two_pi = core::f64::consts::PI * 2.0;
+    let beta = (two_pi / (period as f64)).cos();
+    let gamma = 1.0 / ((two_pi * 2.0 * delta / (period as f64)).cos());
+    let alpha = gamma - (gamma * gamma - 1.0).sqrt();
+    let half_one_minus_alpha = 0.5 * (1.0 - alpha);
+    let beta_times_one_plus_alpha = beta * (1.0 + alpha);
+    EmdExactCoefficients {
+        inv_up_low,
+        inv_mid,
+        alpha,
+        half_one_minus_alpha,
+        beta_times_one_plus_alpha,
+        fraction,
+    }
 }
 
 impl Default for EmdParams {
@@ -108,6 +138,17 @@ impl<'a> EmdInput<'a> {
                 close,
                 volume,
             },
+            params,
+        }
+    }
+
+    /// Exact scalar input contract.  EMD reads high/low only; the historical
+    /// four-slice constructor remains for API compatibility but close and
+    /// volume must not be required by dispatch or feature validity.
+    #[inline]
+    pub fn from_high_low_slices(high: &'a [f64], low: &'a [f64], params: EmdParams) -> Self {
+        Self {
+            data: EmdData::HighLow { high, low },
             params,
         }
     }
@@ -310,6 +351,7 @@ fn emd_prepare<'a>(
     let (high, low) = match &input.data {
         EmdData::Candles { candles } => (&candles.high[..], &candles.low[..]),
         EmdData::Slices { high, low, .. } => (*high, *low),
+        EmdData::HighLow { high, low } => (*high, *low),
     };
 
     let len = high.len();
@@ -445,7 +487,6 @@ pub fn emd_with_kernel(input: &EmdInput, kernel: Kernel) -> Result<EmdOutput, Em
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn emd_into(
     input: &EmdInput,
     upperband_out: &mut [f64],
@@ -534,15 +575,13 @@ pub unsafe fn emd_scalar_into(
 
     let per_up_low = 50usize;
     let per_mid = 2 * period;
-    let inv_up_low = 1.0 / (per_up_low as f64);
-    let inv_mid = 1.0 / (per_mid as f64);
-
-    let two_pi = core::f64::consts::PI * 2.0;
-    let beta = (two_pi / (period as f64)).cos();
-    let gamma = 1.0 / ((two_pi * 2.0 * delta / (period as f64)).cos());
-    let alpha = gamma - (gamma * gamma - 1.0).sqrt();
-    let half_one_minus_alpha = 0.5 * (1.0 - alpha);
-    let beta_times_one_plus_alpha = beta * (1.0 + alpha);
+    let exact = emd_exact_coefficients(period, delta, fraction);
+    let inv_up_low = exact.inv_up_low;
+    let inv_mid = exact.inv_mid;
+    let alpha = exact.alpha;
+    let half_one_minus_alpha = exact.half_one_minus_alpha;
+    let beta_times_one_plus_alpha = exact.beta_times_one_plus_alpha;
+    let fraction = exact.fraction;
 
     let mut sp_ring = vec![0.0f64; per_up_low];
     let mut sv_ring = vec![0.0f64; per_up_low];
@@ -732,15 +771,13 @@ unsafe fn emd_scalar_prices_into(
 
     let per_up_low = 50usize;
     let per_mid = 2 * period;
-    let inv_up_low = 1.0 / (per_up_low as f64);
-    let inv_mid = 1.0 / (per_mid as f64);
-
-    let two_pi = core::f64::consts::PI * 2.0;
-    let beta = (two_pi / (period as f64)).cos();
-    let gamma = 1.0 / ((two_pi * 2.0 * delta / (period as f64)).cos());
-    let alpha = gamma - (gamma * gamma - 1.0).sqrt();
-    let half_one_minus_alpha = 0.5 * (1.0 - alpha);
-    let beta_times_one_plus_alpha = beta * (1.0 + alpha);
+    let exact = emd_exact_coefficients(period, delta, fraction);
+    let inv_up_low = exact.inv_up_low;
+    let inv_mid = exact.inv_mid;
+    let alpha = exact.alpha;
+    let half_one_minus_alpha = exact.half_one_minus_alpha;
+    let beta_times_one_plus_alpha = exact.beta_times_one_plus_alpha;
+    let fraction = exact.fraction;
 
     let mut sp_ring = vec![0.0f64; per_up_low];
     let mut sv_ring = vec![0.0f64; per_up_low];
@@ -1788,44 +1825,13 @@ impl EmdBatchOutput {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn emd_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    _close: &[f64],
-    _volume: &[f64],
-    period: usize,
-    delta: f64,
-    fraction: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = emd_js(high, low, _close, _volume, period, delta, fraction)?;
-    crate::write_wasm_object_f64_outputs("emd_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn emd_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    _close: &[f64],
-    _volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = emd_batch_unified_js(high, low, _close, _volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs("emd_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     fn test_emd_into_matches_api() -> Result<(), Box<dyn Error>> {
         let n = 256usize;
         let mut high = Vec::with_capacity(n);
@@ -1884,8 +1890,8 @@ mod tests {
 
     fn check_emd_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = EmdParams::default();
         let input = EmdInput::from_candles(&candles, params);
@@ -1996,8 +2002,8 @@ mod tests {
 
     fn check_emd_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EmdInput::with_default_candles(&candles);
         let result = emd_with_kernel(&input, kernel);
         assert!(
@@ -2477,8 +2483,8 @@ mod tests {
     fn check_emd_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             EmdParams::default(),
@@ -2562,38 +2568,47 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in upperband \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in upperband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in upperband \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in upperband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in upperband \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in upperband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
             }
 
@@ -2606,38 +2621,47 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in middleband \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in middleband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in middleband \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in middleband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in middleband \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in middleband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
             }
 
@@ -2650,38 +2674,47 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in lowerband \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in lowerband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in lowerband \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in lowerband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in lowerband \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in lowerband \
 						 with params: period={}, delta={}, fraction={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(20),
-						params.delta.unwrap_or(0.5),
-						params.fraction.unwrap_or(0.1),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(20),
+                        params.delta.unwrap_or(0.5),
+                        params.fraction.unwrap_or(0.1),
+                        param_idx
+                    );
                 }
             }
         }
@@ -2711,13 +2744,13 @@ mod tests {
     mod batch_tests {
         use super::*;
         use crate::skip_if_unsupported;
-        use crate::utilities::data_loader::read_candles_from_csv;
+        use crate::utilities::data_loader::read_candles_from_vortex;
 
         fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
             skip_if_unsupported!(kernel, test);
 
-            let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-            let c = read_candles_from_csv(file)?;
+            let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+            let c = read_candles_from_vortex(file)?;
 
             let output = EmdBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -2777,8 +2810,8 @@ mod tests {
         fn check_batch_param_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
             skip_if_unsupported!(kernel, test);
 
-            let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-            let c = read_candles_from_csv(file)?;
+            let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+            let c = read_candles_from_vortex(file)?;
 
             let output = EmdBatchBuilder::new()
                 .kernel(kernel)
@@ -2831,8 +2864,8 @@ mod tests {
         fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
             skip_if_unsupported!(kernel, test);
 
-            let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-            let c = read_candles_from_csv(file)?;
+            let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+            let c = read_candles_from_vortex(file)?;
 
             let test_configs = vec![
                 (5, 15, 5, 0.1, 0.5, 0.2, 0.05, 0.15, 0.05),
@@ -2868,35 +2901,53 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in upperband \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in upperband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in upperband \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in upperband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in upperband \
+                            "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in upperband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
                 }
 
@@ -2912,35 +2963,53 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in middleband \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in middleband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in middleband \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in middleband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in middleband \
+                            "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in middleband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
                 }
 
@@ -2956,35 +3025,53 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in lowerband \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in lowerband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in lowerband \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in lowerband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in lowerband \
+                            "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in lowerband \
 							 at row {} col {} (flat index {}) with params: period={}, delta={}, fraction={}",
-							test, cfg_idx, val, bits, row, col, idx,
-							combo.period.unwrap_or(20),
-							combo.delta.unwrap_or(0.5),
-							combo.fraction.unwrap_or(0.1)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20),
+                            combo.delta.unwrap_or(0.5),
+                            combo.fraction.unwrap_or(0.1)
+                        );
                     }
                 }
             }
@@ -3000,569 +3087,5 @@ mod tests {
         gen_batch_tests!(check_batch_default_row);
         gen_batch_tests!(check_batch_param_sweep);
         gen_batch_tests!(check_batch_no_poison);
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "emd")]
-#[pyo3(signature = (high, low, period, delta, fraction, kernel=None))]
-pub fn emd_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    delta: f64,
-    fraction: f64,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let hi = high.as_slice()?;
-    let lo = low.as_slice()?;
-    if hi.len() != lo.len() {
-        return Err(PyValueError::new_err("high and low must have same length"));
-    }
-
-    let params = EmdParams {
-        period: Some(period),
-        delta: Some(delta),
-        fraction: Some(fraction),
-    };
-    let inp = EmdInput::from_slices(hi, lo, &[], &[], params);
-    let kern = validate_kernel(kernel, false)?;
-
-    let ub = unsafe { PyArray1::<f64>::new(py, [hi.len()], false) };
-    let mb = unsafe { PyArray1::<f64>::new(py, [hi.len()], false) };
-    let lb = unsafe { PyArray1::<f64>::new(py, [hi.len()], false) };
-
-    let ubm = unsafe { ub.as_slice_mut()? };
-    let mbm = unsafe { mb.as_slice_mut()? };
-    let lbm = unsafe { lb.as_slice_mut()? };
-
-    py.allow_threads(|| emd_into_slices(ubm, mbm, lbm, &inp, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((ub, mb, lb))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EmdStream")]
-pub struct EmdStreamPy {
-    stream: EmdStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EmdStreamPy {
-    #[new]
-    fn new(period: usize, delta: f64, fraction: f64) -> PyResult<Self> {
-        let params = EmdParams {
-            period: Some(period),
-            delta: Some(delta),
-            fraction: Some(fraction),
-        };
-        let stream =
-            EmdStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(EmdStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> (Option<f64>, Option<f64>, Option<f64>) {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "emd_batch")]
-#[pyo3(signature = (high, low, period_range, delta_range, fraction_range, kernel=None))]
-pub fn emd_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    delta_range: (f64, f64, f64),
-    fraction_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArrayMethods;
-
-    let hi = high.as_slice()?;
-    let lo = low.as_slice()?;
-    if hi.len() != lo.len() {
-        return Err(PyValueError::new_err("high and low must have same length"));
-    }
-
-    let sweep = EmdBatchRange {
-        period: period_range,
-        delta: delta_range,
-        fraction: fraction_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = hi.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow in emd_batch_py"))?;
-
-    let ub = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let mb = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let lb = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let ubm = unsafe { ub.as_slice_mut()? };
-    let mbm = unsafe { mb.as_slice_mut()? };
-    let lbm = unsafe { lb.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match k {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            emd_batch_inner_into(hi, lo, &sweep, simd, true, ubm, mbm, lbm)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("upper", ub.reshape((rows, cols))?)?;
-    d.set_item("middle", mb.reshape((rows, cols))?)?;
-    d.set_item("lower", lb.reshape((rows, cols))?)?;
-    d.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "deltas",
-        combos
-            .iter()
-            .map(|p| p.delta.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "fractions",
-        combos
-            .iter()
-            .map(|p| p.fraction.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "emd_cuda_batch_dev")]
-#[pyo3(signature = (high, low, period_range, delta_range, fraction_range, device_id=0))]
-pub fn emd_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f32>,
-    low: PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    delta_range: (f64, f64, f64),
-    fraction_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let hi = high.as_slice()?;
-    let lo = low.as_slice()?;
-    if hi.len() != lo.len() {
-        return Err(PyValueError::new_err("high and low must have same length"));
-    }
-    let sweep = EmdBatchRange {
-        period: period_range,
-        delta: delta_range,
-        fraction: fraction_range,
-    };
-    let (outputs, combos, dev_id) = py.allow_threads(|| {
-        let cuda = CudaEmd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let res = cuda
-            .emd_batch_dev(hi, lo, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()));
-        res.map(|r| (r.outputs, r.combos, dev_id))
-    })?;
-    let DeviceArrayF32Triple {
-        upper,
-        middle,
-        lower,
-    } = outputs;
-    let dict = pyo3::types::PyDict::new(py);
-    let upper_dev = make_device_array_py(dev_id as usize, upper)?;
-    dict.set_item("upperband", Py::new(py, upper_dev)?)?;
-    let middle_dev = make_device_array_py(dev_id as usize, middle)?;
-    dict.set_item("middleband", Py::new(py, middle_dev)?)?;
-    let lower_dev = make_device_array_py(dev_id as usize, lower)?;
-    dict.set_item("lowerband", Py::new(py, lower_dev)?)?;
-
-    let periods: Vec<usize> = combos.iter().map(|c| c.period.unwrap()).collect();
-    let deltas: Vec<f64> = combos.iter().map(|c| c.delta.unwrap()).collect();
-    let fractions: Vec<f64> = combos.iter().map(|c| c.fraction.unwrap()).collect();
-    dict.set_item("periods", periods.into_pyarray(py))?;
-    dict.set_item("deltas", deltas.into_pyarray(py))?;
-    dict.set_item("fractions", fractions.into_pyarray(py))?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", hi.len())?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "emd_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, delta, fraction, device_id=0))]
-pub fn emd_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    period: usize,
-    delta: f64,
-    fraction: f64,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-
-    let mut first_valids = vec![0i32; cols];
-    for s in 0..cols {
-        let mut fv: Option<i32> = None;
-        for t in 0..rows {
-            let v = flat[t * cols + s];
-            if v.is_finite() {
-                fv = Some(t as i32);
-                break;
-            }
-        }
-        first_valids[s] =
-            fv.ok_or_else(|| PyValueError::new_err(format!("series {} has no finite values", s)))?;
-    }
-
-    let params = EmdParams {
-        period: Some(period),
-        delta: Some(delta),
-        fraction: Some(fraction),
-    };
-    let (outputs, dev_id) = py.allow_threads(|| {
-        let cuda = CudaEmd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        cuda.emd_many_series_one_param_time_major_dev(flat, cols, rows, &params, &first_valids)
-            .map(|o| (o, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let DeviceArrayF32Triple {
-        upper,
-        middle,
-        lower,
-    } = outputs;
-    let dict = pyo3::types::PyDict::new(py);
-    let upper_dev = make_device_array_py(dev_id as usize, upper)?;
-    dict.set_item("upperband", Py::new(py, upper_dev)?)?;
-    let middle_dev = make_device_array_py(dev_id as usize, middle)?;
-    dict.set_item("middleband", Py::new(py, middle_dev)?)?;
-    let lower_dev = make_device_array_py(dev_id as usize, lower)?;
-    dict.set_item("lowerband", Py::new(py, lower_dev)?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("period", period)?;
-    dict.set_item("delta", delta)?;
-    dict.set_item("fraction", fraction)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EmdJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "emd_js")]
-pub fn emd_js(
-    high: &[f64],
-    low: &[f64],
-    _close: &[f64],
-    _volume: &[f64],
-    period: usize,
-    delta: f64,
-    fraction: f64,
-) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str("high and low must have same length"));
-    }
-    let params = EmdParams {
-        period: Some(period),
-        delta: Some(delta),
-        fraction: Some(fraction),
-    };
-    let input = EmdInput::from_slices(high, low, &[], &[], params);
-
-    let mut values = vec![f64::NAN; 3 * high.len()];
-    let (ub, rest) = values.split_at_mut(high.len());
-    let (mb, lb) = rest.split_at_mut(high.len());
-
-    emd_into_slices(ub, mb, lb, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let output = EmdJsOutput {
-        values,
-        rows: 3,
-        cols: high.len(),
-    };
-    serde_wasm_bindgen::to_value(&output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn emd_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn emd_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn emd_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    _close_ptr: *const f64,
-    _volume_ptr: *const f64,
-    upper_ptr: *mut f64,
-    middle_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    delta: f64,
-    fraction: f64,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || upper_ptr.is_null()
-        || middle_ptr.is_null()
-        || lower_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let hi_aliased = high_ptr as *const f64 == upper_ptr as *const f64;
-        let lo_aliased = low_ptr as *const f64 == upper_ptr as *const f64
-            || low_ptr as *const f64 == middle_ptr as *const f64
-            || low_ptr as *const f64 == lower_ptr as *const f64;
-
-        if hi_aliased || lo_aliased {
-            let hi = std::slice::from_raw_parts(high_ptr, len);
-            let lo = std::slice::from_raw_parts(low_ptr, len);
-
-            let params = EmdParams {
-                period: Some(period),
-                delta: Some(delta),
-                fraction: Some(fraction),
-            };
-            let input = EmdInput::from_slices(hi, lo, &[], &[], params);
-            let output = emd_with_kernel(&input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let ub = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let mb = std::slice::from_raw_parts_mut(middle_ptr, len);
-            let lb = std::slice::from_raw_parts_mut(lower_ptr, len);
-            ub.copy_from_slice(&output.upperband);
-            mb.copy_from_slice(&output.middleband);
-            lb.copy_from_slice(&output.lowerband);
-        } else {
-            let hi = std::slice::from_raw_parts(high_ptr, len);
-            let lo = std::slice::from_raw_parts(low_ptr, len);
-            let ub = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let mb = std::slice::from_raw_parts_mut(middle_ptr, len);
-            let lb = std::slice::from_raw_parts_mut(lower_ptr, len);
-            let params = EmdParams {
-                period: Some(period),
-                delta: Some(delta),
-                fraction: Some(fraction),
-            };
-            let input = EmdInput::from_slices(hi, lo, &[], &[], params);
-            emd_into_slices(ub, mb, lb, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EmdBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub delta_range: (f64, f64, f64),
-    pub fraction_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EmdBatchJsOutput {
-    pub upperband: Vec<f64>,
-    pub middleband: Vec<f64>,
-    pub lowerband: Vec<f64>,
-    pub combos: Vec<EmdParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "emd_batch")]
-pub fn emd_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    _close: &[f64],
-    _volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str("high and low must have same length"));
-    }
-
-    let cfg: EmdBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = EmdBatchRange {
-        period: cfg.period_range,
-        delta: cfg.delta_range,
-        fraction: cfg.fraction_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows_p = combos.len();
-    let cols = high.len();
-    let total = rows_p
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows * cols overflow in emd_batch_unified_js"))?;
-
-    let mut ub = vec![f64::NAN; total];
-    let mut mb = vec![f64::NAN; total];
-    let mut lb = vec![f64::NAN; total];
-
-    emd_batch_inner_into(
-        high,
-        low,
-        &sweep,
-        detect_best_kernel(),
-        false,
-        &mut ub,
-        &mut mb,
-        &mut lb,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let out = EmdBatchJsOutput {
-        upperband: ub,
-        middleband: mb,
-        lowerband: lb,
-        combos,
-        rows: rows_p,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn emd_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    upper_ptr: *mut f64,
-    middle_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    delta_start: f64,
-    delta_end: f64,
-    delta_step: f64,
-    fraction_start: f64,
-    fraction_end: f64,
-    fraction_step: f64,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || upper_ptr.is_null()
-        || middle_ptr.is_null()
-        || lower_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer passed to emd_batch_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let sweep = EmdBatchRange {
-            period: (period_start, period_end, period_step),
-            delta: (delta_start, delta_end, delta_step),
-            fraction: (fraction_start, fraction_end, fraction_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total_len = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows * cols overflow in emd_batch_into"))?;
-
-        let upper_slice = std::slice::from_raw_parts_mut(upper_ptr, total_len);
-        let middle_slice = std::slice::from_raw_parts_mut(middle_ptr, total_len);
-        let lower_slice = std::slice::from_raw_parts_mut(lower_ptr, total_len);
-
-        emd_batch_inner_into(
-            high,
-            low,
-            &sweep,
-            detect_best_kernel(),
-            false,
-            upper_slice,
-            middle_slice,
-            lower_slice,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
     }
 }

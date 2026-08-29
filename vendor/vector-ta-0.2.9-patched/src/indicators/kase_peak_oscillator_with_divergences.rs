@@ -1,24 +1,6 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{alloc_uninit_f64, detect_best_batch_kernel, detect_best_kernel};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use thiserror::Error;
@@ -67,10 +49,6 @@ pub struct KasePeakOscillatorWithDivergencesOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct KasePeakOscillatorWithDivergencesParams {
     pub deviations: Option<f64>,
     pub short_cycle: Option<usize>,
@@ -362,11 +340,17 @@ pub enum KasePeakOscillatorWithDivergencesError {
     AllValuesNaN,
     #[error("kase_peak_oscillator_with_divergences: Invalid deviations: {deviations}")]
     InvalidDeviations { deviations: f64 },
-    #[error("kase_peak_oscillator_with_divergences: Invalid short_cycle: short_cycle = {short_cycle}, data length = {data_len}")]
+    #[error(
+        "kase_peak_oscillator_with_divergences: Invalid short_cycle: short_cycle = {short_cycle}, data length = {data_len}"
+    )]
     InvalidShortCycle { short_cycle: usize, data_len: usize },
-    #[error("kase_peak_oscillator_with_divergences: Invalid long_cycle: long_cycle = {long_cycle}, data length = {data_len}")]
+    #[error(
+        "kase_peak_oscillator_with_divergences: Invalid long_cycle: long_cycle = {long_cycle}, data length = {data_len}"
+    )]
     InvalidLongCycle { long_cycle: usize, data_len: usize },
-    #[error("kase_peak_oscillator_with_divergences: Invalid cycle order: short_cycle = {short_cycle}, long_cycle = {long_cycle}")]
+    #[error(
+        "kase_peak_oscillator_with_divergences: Invalid cycle order: short_cycle = {short_cycle}, long_cycle = {long_cycle}"
+    )]
     InvalidCycleOrder {
         short_cycle: usize,
         long_cycle: usize,
@@ -381,20 +365,28 @@ pub enum KasePeakOscillatorWithDivergencesError {
     InvalidRangeUpper { range_upper: usize },
     #[error("kase_peak_oscillator_with_divergences: Invalid range_lower: {range_lower}")]
     InvalidRangeLower { range_lower: usize },
-    #[error("kase_peak_oscillator_with_divergences: Invalid divergence range: range_lower = {range_lower}, range_upper = {range_upper}")]
+    #[error(
+        "kase_peak_oscillator_with_divergences: Invalid divergence range: range_lower = {range_lower}, range_upper = {range_upper}"
+    )]
     InvalidDivergenceRange {
         range_lower: usize,
         range_upper: usize,
     },
-    #[error("kase_peak_oscillator_with_divergences: Inconsistent slice lengths: high={high_len}, low={low_len}, close={close_len}")]
+    #[error(
+        "kase_peak_oscillator_with_divergences: Inconsistent slice lengths: high={high_len}, low={low_len}, close={close_len}"
+    )]
     InconsistentSliceLengths {
         high_len: usize,
         low_len: usize,
         close_len: usize,
     },
-    #[error("kase_peak_oscillator_with_divergences: Not enough valid data: needed = {needed}, valid = {valid}")]
+    #[error(
+        "kase_peak_oscillator_with_divergences: Not enough valid data: needed = {needed}, valid = {valid}"
+    )]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("kase_peak_oscillator_with_divergences: Output length mismatch: expected = {expected}, oscillator = {oscillator_got}, histogram = {histogram_got}, max_peak_value = {max_peak_got}, min_peak_value = {min_peak_got}, market_extreme = {market_extreme_got}, regular_bullish = {regular_bullish_got}, hidden_bullish = {hidden_bullish_got}, regular_bearish = {regular_bearish_got}, hidden_bearish = {hidden_bearish_got}, go_long = {go_long_got}, go_short = {go_short_got}")]
+    #[error(
+        "kase_peak_oscillator_with_divergences: Output length mismatch: expected = {expected}, oscillator = {oscillator_got}, histogram = {histogram_got}, max_peak_value = {max_peak_got}, min_peak_value = {min_peak_got}, market_extreme = {market_extreme_got}, regular_bullish = {regular_bullish_got}, hidden_bullish = {hidden_bullish_got}, regular_bearish = {regular_bearish_got}, hidden_bearish = {hidden_bearish_got}, go_long = {go_long_got}, go_short = {go_short_got}"
+    )]
     OutputLengthMismatch {
         expected: usize,
         oscillator_got: usize,
@@ -409,7 +401,9 @@ pub enum KasePeakOscillatorWithDivergencesError {
         go_long_got: usize,
         go_short_got: usize,
     },
-    #[error("kase_peak_oscillator_with_divergences: Invalid range: start={start}, end={end}, step={step}")]
+    #[error(
+        "kase_peak_oscillator_with_divergences: Invalid range: start={start}, end={end}, step={step}"
+    )]
     InvalidRange {
         start: String,
         end: String,
@@ -695,15 +689,14 @@ impl KasePeakOscillatorWithDivergencesStream {
             }
         }
 
-        let x1_avg = match self.x1_sma.update(max1 / avg) {
-            Some(value) if value.is_finite() => value,
-            _ => {
-                self.osc_history.push(f64::NAN);
-                return None;
-            }
-        };
-        let xs_avg = match self.xs_sma.update(maxs / avg) {
-            Some(value) if value.is_finite() => value,
+        // These are two branches of the same bar-level formula. Advance both
+        // rolling windows before testing readiness; returning after only the
+        // up branch delayed the down branch by two bars and contradicted the
+        // declared Kase warmup.
+        let x1_avg = self.x1_sma.update(max1 / avg);
+        let xs_avg = self.xs_sma.update(maxs / avg);
+        let (x1_avg, xs_avg) = match (x1_avg, xs_avg) {
+            (Some(x1), Some(xs)) if x1.is_finite() && xs.is_finite() => (x1, xs),
             _ => {
                 self.osc_history.push(f64::NAN);
                 return None;
@@ -1783,756 +1776,6 @@ pub fn kase_peak_oscillator_with_divergences_batch_inner_into(
     expand_grid_kpo(sweep)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "kase_peak_oscillator_with_divergences")]
-#[pyo3(signature = (high, low, close, deviations=None, short_cycle=None, long_cycle=None, sensitivity=None, all_peaks_mode=None, lb_r=None, lb_l=None, range_upper=None, range_lower=None, plot_bull=None, plot_hidden_bull=None, plot_bear=None, plot_hidden_bear=None, kernel=None))]
-pub fn kase_peak_oscillator_with_divergences_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    deviations: Option<f64>,
-    short_cycle: Option<usize>,
-    long_cycle: Option<usize>,
-    sensitivity: Option<f64>,
-    all_peaks_mode: Option<bool>,
-    lb_r: Option<usize>,
-    lb_l: Option<usize>,
-    range_upper: Option<usize>,
-    range_lower: Option<usize>,
-    plot_bull: Option<bool>,
-    plot_hidden_bull: Option<bool>,
-    plot_bear: Option<bool>,
-    plot_hidden_bear: Option<bool>,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = KasePeakOscillatorWithDivergencesInput::from_slices(
-        high,
-        low,
-        close,
-        KasePeakOscillatorWithDivergencesParams {
-            deviations,
-            short_cycle,
-            long_cycle,
-            sensitivity,
-            all_peaks_mode,
-            lb_r,
-            lb_l,
-            range_upper,
-            range_lower,
-            plot_bull,
-            plot_hidden_bull,
-            plot_bear,
-            plot_hidden_bear,
-        },
-    );
-    let out = py
-        .allow_threads(|| kase_peak_oscillator_with_divergences_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.oscillator.into_pyarray(py),
-        out.histogram.into_pyarray(py),
-        out.max_peak_value.into_pyarray(py),
-        out.min_peak_value.into_pyarray(py),
-        out.market_extreme.into_pyarray(py),
-        out.regular_bullish.into_pyarray(py),
-        out.hidden_bullish.into_pyarray(py),
-        out.regular_bearish.into_pyarray(py),
-        out.hidden_bearish.into_pyarray(py),
-        out.go_long.into_pyarray(py),
-        out.go_short.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "KasePeakOscillatorWithDivergencesStream")]
-pub struct KasePeakOscillatorWithDivergencesStreamPy {
-    inner: KasePeakOscillatorWithDivergencesStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl KasePeakOscillatorWithDivergencesStreamPy {
-    #[new]
-    #[pyo3(signature = (deviations=DEFAULT_DEVIATIONS, short_cycle=DEFAULT_SHORT_CYCLE, long_cycle=DEFAULT_LONG_CYCLE, sensitivity=DEFAULT_SENSITIVITY, all_peaks_mode=DEFAULT_ALL_PEAKS_MODE, lb_r=DEFAULT_LB_R, lb_l=DEFAULT_LB_L, range_upper=DEFAULT_RANGE_UPPER, range_lower=DEFAULT_RANGE_LOWER, plot_bull=DEFAULT_PLOT_BULL, plot_hidden_bull=DEFAULT_PLOT_HIDDEN_BULL, plot_bear=DEFAULT_PLOT_BEAR, plot_hidden_bear=DEFAULT_PLOT_HIDDEN_BEAR))]
-    fn new(
-        deviations: f64,
-        short_cycle: usize,
-        long_cycle: usize,
-        sensitivity: f64,
-        all_peaks_mode: bool,
-        lb_r: usize,
-        lb_l: usize,
-        range_upper: usize,
-        range_lower: usize,
-        plot_bull: bool,
-        plot_hidden_bull: bool,
-        plot_bear: bool,
-        plot_hidden_bear: bool,
-    ) -> PyResult<Self> {
-        let inner = KasePeakOscillatorWithDivergencesStream::try_new(
-            KasePeakOscillatorWithDivergencesParams {
-                deviations: Some(deviations),
-                short_cycle: Some(short_cycle),
-                long_cycle: Some(long_cycle),
-                sensitivity: Some(sensitivity),
-                all_peaks_mode: Some(all_peaks_mode),
-                lb_r: Some(lb_r),
-                lb_l: Some(lb_l),
-                range_upper: Some(range_upper),
-                range_lower: Some(range_lower),
-                plot_bull: Some(plot_bull),
-                plot_hidden_bull: Some(plot_hidden_bull),
-                plot_bear: Some(plot_bear),
-                plot_hidden_bear: Some(plot_hidden_bear),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<KpoTuple> {
-        self.inner.update(high, low, close)
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.inner.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kase_peak_oscillator_with_divergences_batch")]
-#[pyo3(signature = (high, low, close, deviations_range=(DEFAULT_DEVIATIONS, DEFAULT_DEVIATIONS, 0.0), short_cycle_range=(DEFAULT_SHORT_CYCLE, DEFAULT_SHORT_CYCLE, 0), long_cycle_range=(DEFAULT_LONG_CYCLE, DEFAULT_LONG_CYCLE, 0), sensitivity_range=(DEFAULT_SENSITIVITY, DEFAULT_SENSITIVITY, 0.0), all_peaks_mode=DEFAULT_ALL_PEAKS_MODE, lb_r=DEFAULT_LB_R, lb_l=DEFAULT_LB_L, range_upper=DEFAULT_RANGE_UPPER, range_lower=DEFAULT_RANGE_LOWER, plot_bull=DEFAULT_PLOT_BULL, plot_hidden_bull=DEFAULT_PLOT_HIDDEN_BULL, plot_bear=DEFAULT_PLOT_BEAR, plot_hidden_bear=DEFAULT_PLOT_HIDDEN_BEAR, kernel=None))]
-pub fn kase_peak_oscillator_with_divergences_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    deviations_range: (f64, f64, f64),
-    short_cycle_range: (usize, usize, usize),
-    long_cycle_range: (usize, usize, usize),
-    sensitivity_range: (f64, f64, f64),
-    all_peaks_mode: bool,
-    lb_r: usize,
-    lb_l: usize,
-    range_upper: usize,
-    range_lower: usize,
-    plot_bull: bool,
-    plot_hidden_bull: bool,
-    plot_bear: bool,
-    plot_hidden_bear: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = KasePeakOscillatorWithDivergencesBatchRange {
-        deviations: deviations_range,
-        short_cycle: short_cycle_range,
-        long_cycle: long_cycle_range,
-        sensitivity: sensitivity_range,
-        all_peaks_mode,
-        lb_r,
-        lb_l,
-        range_upper,
-        range_lower,
-        plot_bull,
-        plot_hidden_bull,
-        plot_bear,
-        plot_hidden_bear,
-    };
-    let combos = expand_grid_kpo(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = high.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let oscillator_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let histogram_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let max_peak_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let min_peak_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let market_extreme_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let regular_bullish_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let hidden_bullish_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let regular_bearish_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let hidden_bearish_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let go_long_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let go_short_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let oscillator_slice = unsafe { oscillator_arr.as_slice_mut()? };
-    let histogram_slice = unsafe { histogram_arr.as_slice_mut()? };
-    let max_peak_slice = unsafe { max_peak_arr.as_slice_mut()? };
-    let min_peak_slice = unsafe { min_peak_arr.as_slice_mut()? };
-    let market_extreme_slice = unsafe { market_extreme_arr.as_slice_mut()? };
-    let regular_bullish_slice = unsafe { regular_bullish_arr.as_slice_mut()? };
-    let hidden_bullish_slice = unsafe { hidden_bullish_arr.as_slice_mut()? };
-    let regular_bearish_slice = unsafe { regular_bearish_arr.as_slice_mut()? };
-    let hidden_bearish_slice = unsafe { hidden_bearish_arr.as_slice_mut()? };
-    let go_long_slice = unsafe { go_long_arr.as_slice_mut()? };
-    let go_short_slice = unsafe { go_short_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            kase_peak_oscillator_with_divergences_batch_inner_into(
-                high,
-                low,
-                close,
-                &sweep,
-                batch.to_non_batch(),
-                oscillator_slice,
-                histogram_slice,
-                max_peak_slice,
-                min_peak_slice,
-                market_extreme_slice,
-                regular_bullish_slice,
-                hidden_bullish_slice,
-                regular_bearish_slice,
-                hidden_bearish_slice,
-                go_long_slice,
-                go_short_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("oscillator", oscillator_arr.reshape((rows, cols))?)?;
-    dict.set_item("histogram", histogram_arr.reshape((rows, cols))?)?;
-    dict.set_item("max_peak_value", max_peak_arr.reshape((rows, cols))?)?;
-    dict.set_item("min_peak_value", min_peak_arr.reshape((rows, cols))?)?;
-    dict.set_item("market_extreme", market_extreme_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "regular_bullish",
-        regular_bullish_arr.reshape((rows, cols))?,
-    )?;
-    dict.set_item("hidden_bullish", hidden_bullish_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "regular_bearish",
-        regular_bearish_arr.reshape((rows, cols))?,
-    )?;
-    dict.set_item("hidden_bearish", hidden_bearish_arr.reshape((rows, cols))?)?;
-    dict.set_item("go_long", go_long_arr.reshape((rows, cols))?)?;
-    dict.set_item("go_short", go_short_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "deviations",
-        combos
-            .iter()
-            .map(|p| p.deviations.unwrap_or(DEFAULT_DEVIATIONS))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "short_cycles",
-        combos
-            .iter()
-            .map(|p| p.short_cycle.unwrap_or(DEFAULT_SHORT_CYCLE) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "long_cycles",
-        combos
-            .iter()
-            .map(|p| p.long_cycle.unwrap_or(DEFAULT_LONG_CYCLE) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "sensitivities",
-        combos
-            .iter()
-            .map(|p| p.sensitivity.unwrap_or(DEFAULT_SENSITIVITY))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_kase_peak_oscillator_with_divergences_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(
-        kase_peak_oscillator_with_divergences_py,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        kase_peak_oscillator_with_divergences_batch_py,
-        module
-    )?)?;
-    module.add_class::<KasePeakOscillatorWithDivergencesStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KasePeakOscillatorWithDivergencesBatchConfig {
-    pub deviations_range: Option<(f64, f64, f64)>,
-    pub short_cycle_range: Option<(usize, usize, usize)>,
-    pub long_cycle_range: Option<(usize, usize, usize)>,
-    pub sensitivity_range: Option<(f64, f64, f64)>,
-    pub all_peaks_mode: Option<bool>,
-    pub lb_r: Option<usize>,
-    pub lb_l: Option<usize>,
-    pub range_upper: Option<usize>,
-    pub range_lower: Option<usize>,
-    pub plot_bull: Option<bool>,
-    pub plot_hidden_bull: Option<bool>,
-    pub plot_bear: Option<bool>,
-    pub plot_hidden_bear: Option<bool>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KasePeakOscillatorWithDivergencesBatchJsOutput {
-    pub oscillator: Vec<f64>,
-    pub histogram: Vec<f64>,
-    pub max_peak_value: Vec<f64>,
-    pub min_peak_value: Vec<f64>,
-    pub market_extreme: Vec<f64>,
-    pub regular_bullish: Vec<f64>,
-    pub hidden_bullish: Vec<f64>,
-    pub regular_bearish: Vec<f64>,
-    pub hidden_bearish: Vec<f64>,
-    pub go_long: Vec<f64>,
-    pub go_short: Vec<f64>,
-    pub deviations: Vec<f64>,
-    pub short_cycles: Vec<usize>,
-    pub long_cycles: Vec<usize>,
-    pub sensitivities: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kase_peak_oscillator_with_divergences_js")]
-pub fn kase_peak_oscillator_with_divergences_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    deviations: f64,
-    short_cycle: usize,
-    long_cycle: usize,
-    sensitivity: f64,
-    all_peaks_mode: bool,
-    lb_r: usize,
-    lb_l: usize,
-    range_upper: usize,
-    range_lower: usize,
-    plot_bull: bool,
-    plot_hidden_bull: bool,
-    plot_bear: bool,
-    plot_hidden_bear: bool,
-) -> Result<JsValue, JsValue> {
-    let input = KasePeakOscillatorWithDivergencesInput::from_slices(
-        high,
-        low,
-        close,
-        KasePeakOscillatorWithDivergencesParams {
-            deviations: Some(deviations),
-            short_cycle: Some(short_cycle),
-            long_cycle: Some(long_cycle),
-            sensitivity: Some(sensitivity),
-            all_peaks_mode: Some(all_peaks_mode),
-            lb_r: Some(lb_r),
-            lb_l: Some(lb_l),
-            range_upper: Some(range_upper),
-            range_lower: Some(range_lower),
-            plot_bull: Some(plot_bull),
-            plot_hidden_bull: Some(plot_hidden_bull),
-            plot_bear: Some(plot_bear),
-            plot_hidden_bear: Some(plot_hidden_bear),
-        },
-    );
-    let out = kase_peak_oscillator_with_divergences(&input)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let result = js_sys::Object::new();
-    macro_rules! set_arr {
-        ($key:literal, $values:expr) => {{
-            let arr = js_sys::Float64Array::new_with_length($values.len() as u32);
-            arr.copy_from(&$values);
-            js_sys::Reflect::set(&result, &JsValue::from_str($key), &arr)?;
-        }};
-    }
-    set_arr!("oscillator", out.oscillator);
-    set_arr!("histogram", out.histogram);
-    set_arr!("max_peak_value", out.max_peak_value);
-    set_arr!("min_peak_value", out.min_peak_value);
-    set_arr!("market_extreme", out.market_extreme);
-    set_arr!("regular_bullish", out.regular_bullish);
-    set_arr!("hidden_bullish", out.hidden_bullish);
-    set_arr!("regular_bearish", out.regular_bearish);
-    set_arr!("hidden_bearish", out.hidden_bearish);
-    set_arr!("go_long", out.go_long);
-    set_arr!("go_short", out.go_short);
-    Ok(JsValue::from(result))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kase_peak_oscillator_with_divergences_alloc(len: usize) -> *mut f64 {
-    let mut buf = Vec::<f64>::with_capacity(len);
-    let ptr = buf.as_mut_ptr();
-    core::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kase_peak_oscillator_with_divergences_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kase_peak_oscillator_with_divergences_into")]
-pub fn kase_peak_oscillator_with_divergences_into_js(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    oscillator_ptr: *mut f64,
-    histogram_ptr: *mut f64,
-    max_peak_ptr: *mut f64,
-    min_peak_ptr: *mut f64,
-    market_extreme_ptr: *mut f64,
-    regular_bullish_ptr: *mut f64,
-    hidden_bullish_ptr: *mut f64,
-    regular_bearish_ptr: *mut f64,
-    hidden_bearish_ptr: *mut f64,
-    go_long_ptr: *mut f64,
-    go_short_ptr: *mut f64,
-    len: usize,
-    deviations: f64,
-    short_cycle: usize,
-    long_cycle: usize,
-    sensitivity: f64,
-    all_peaks_mode: bool,
-    lb_r: usize,
-    lb_l: usize,
-    range_upper: usize,
-    range_lower: usize,
-    plot_bull: bool,
-    plot_hidden_bull: bool,
-    plot_bear: bool,
-    plot_hidden_bear: bool,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || oscillator_ptr.is_null()
-        || histogram_ptr.is_null()
-        || max_peak_ptr.is_null()
-        || min_peak_ptr.is_null()
-        || market_extreme_ptr.is_null()
-        || regular_bullish_ptr.is_null()
-        || hidden_bullish_ptr.is_null()
-        || regular_bearish_ptr.is_null()
-        || hidden_bearish_ptr.is_null()
-        || go_long_ptr.is_null()
-        || go_short_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "kase_peak_oscillator_with_divergences_into: null pointer",
-        ));
-    }
-    unsafe {
-        let input = KasePeakOscillatorWithDivergencesInput::from_slices(
-            std::slice::from_raw_parts(high_ptr, len),
-            std::slice::from_raw_parts(low_ptr, len),
-            std::slice::from_raw_parts(close_ptr, len),
-            KasePeakOscillatorWithDivergencesParams {
-                deviations: Some(deviations),
-                short_cycle: Some(short_cycle),
-                long_cycle: Some(long_cycle),
-                sensitivity: Some(sensitivity),
-                all_peaks_mode: Some(all_peaks_mode),
-                lb_r: Some(lb_r),
-                lb_l: Some(lb_l),
-                range_upper: Some(range_upper),
-                range_lower: Some(range_lower),
-                plot_bull: Some(plot_bull),
-                plot_hidden_bull: Some(plot_hidden_bull),
-                plot_bear: Some(plot_bear),
-                plot_hidden_bear: Some(plot_hidden_bear),
-            },
-        );
-        kase_peak_oscillator_with_divergences_into_slices(
-            &input,
-            Kernel::Auto,
-            std::slice::from_raw_parts_mut(oscillator_ptr, len),
-            std::slice::from_raw_parts_mut(histogram_ptr, len),
-            std::slice::from_raw_parts_mut(max_peak_ptr, len),
-            std::slice::from_raw_parts_mut(min_peak_ptr, len),
-            std::slice::from_raw_parts_mut(market_extreme_ptr, len),
-            std::slice::from_raw_parts_mut(regular_bullish_ptr, len),
-            std::slice::from_raw_parts_mut(hidden_bullish_ptr, len),
-            std::slice::from_raw_parts_mut(regular_bearish_ptr, len),
-            std::slice::from_raw_parts_mut(hidden_bearish_ptr, len),
-            std::slice::from_raw_parts_mut(go_long_ptr, len),
-            std::slice::from_raw_parts_mut(go_short_ptr, len),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kase_peak_oscillator_with_divergences_batch_js")]
-pub fn kase_peak_oscillator_with_divergences_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: KasePeakOscillatorWithDivergencesBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let sweep = KasePeakOscillatorWithDivergencesBatchRange {
-        deviations: cfg
-            .deviations_range
-            .unwrap_or((DEFAULT_DEVIATIONS, DEFAULT_DEVIATIONS, 0.0)),
-        short_cycle: cfg
-            .short_cycle_range
-            .unwrap_or((DEFAULT_SHORT_CYCLE, DEFAULT_SHORT_CYCLE, 0)),
-        long_cycle: cfg
-            .long_cycle_range
-            .unwrap_or((DEFAULT_LONG_CYCLE, DEFAULT_LONG_CYCLE, 0)),
-        sensitivity: cfg.sensitivity_range.unwrap_or((
-            DEFAULT_SENSITIVITY,
-            DEFAULT_SENSITIVITY,
-            0.0,
-        )),
-        all_peaks_mode: cfg.all_peaks_mode.unwrap_or(DEFAULT_ALL_PEAKS_MODE),
-        lb_r: cfg.lb_r.unwrap_or(DEFAULT_LB_R),
-        lb_l: cfg.lb_l.unwrap_or(DEFAULT_LB_L),
-        range_upper: cfg.range_upper.unwrap_or(DEFAULT_RANGE_UPPER),
-        range_lower: cfg.range_lower.unwrap_or(DEFAULT_RANGE_LOWER),
-        plot_bull: cfg.plot_bull.unwrap_or(DEFAULT_PLOT_BULL),
-        plot_hidden_bull: cfg.plot_hidden_bull.unwrap_or(DEFAULT_PLOT_HIDDEN_BULL),
-        plot_bear: cfg.plot_bear.unwrap_or(DEFAULT_PLOT_BEAR),
-        plot_hidden_bear: cfg.plot_hidden_bear.unwrap_or(DEFAULT_PLOT_HIDDEN_BEAR),
-    };
-    let out = kase_peak_oscillator_with_divergences_batch_with_kernel(
-        high,
-        low,
-        close,
-        &sweep,
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&KasePeakOscillatorWithDivergencesBatchJsOutput {
-        oscillator: out.oscillator,
-        histogram: out.histogram,
-        max_peak_value: out.max_peak_value,
-        min_peak_value: out.min_peak_value,
-        market_extreme: out.market_extreme,
-        regular_bullish: out.regular_bullish,
-        hidden_bullish: out.hidden_bullish,
-        regular_bearish: out.regular_bearish,
-        hidden_bearish: out.hidden_bearish,
-        go_long: out.go_long,
-        go_short: out.go_short,
-        deviations: out.deviations,
-        short_cycles: out.short_cycles,
-        long_cycles: out.long_cycles,
-        sensitivities: out.sensitivities,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kase_peak_oscillator_with_divergences_batch_into")]
-pub fn kase_peak_oscillator_with_divergences_batch_into_js(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    oscillator_ptr: *mut f64,
-    histogram_ptr: *mut f64,
-    max_peak_ptr: *mut f64,
-    min_peak_ptr: *mut f64,
-    market_extreme_ptr: *mut f64,
-    regular_bullish_ptr: *mut f64,
-    hidden_bullish_ptr: *mut f64,
-    regular_bearish_ptr: *mut f64,
-    hidden_bearish_ptr: *mut f64,
-    go_long_ptr: *mut f64,
-    go_short_ptr: *mut f64,
-    len: usize,
-    deviations_start: f64,
-    deviations_end: f64,
-    deviations_step: f64,
-    short_cycle_start: usize,
-    short_cycle_end: usize,
-    short_cycle_step: usize,
-    long_cycle_start: usize,
-    long_cycle_end: usize,
-    long_cycle_step: usize,
-    sensitivity_start: f64,
-    sensitivity_end: f64,
-    sensitivity_step: f64,
-    all_peaks_mode: bool,
-    lb_r: usize,
-    lb_l: usize,
-    range_upper: usize,
-    range_lower: usize,
-    plot_bull: bool,
-    plot_hidden_bull: bool,
-    plot_bear: bool,
-    plot_hidden_bear: bool,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || oscillator_ptr.is_null()
-        || histogram_ptr.is_null()
-        || max_peak_ptr.is_null()
-        || min_peak_ptr.is_null()
-        || market_extreme_ptr.is_null()
-        || regular_bullish_ptr.is_null()
-        || hidden_bullish_ptr.is_null()
-        || regular_bearish_ptr.is_null()
-        || hidden_bearish_ptr.is_null()
-        || go_long_ptr.is_null()
-        || go_short_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "kase_peak_oscillator_with_divergences_batch_into: null pointer",
-        ));
-    }
-    let sweep = KasePeakOscillatorWithDivergencesBatchRange {
-        deviations: (deviations_start, deviations_end, deviations_step),
-        short_cycle: (short_cycle_start, short_cycle_end, short_cycle_step),
-        long_cycle: (long_cycle_start, long_cycle_end, long_cycle_step),
-        sensitivity: (sensitivity_start, sensitivity_end, sensitivity_step),
-        all_peaks_mode,
-        lb_r,
-        lb_l,
-        range_upper,
-        range_lower,
-        plot_bull,
-        plot_hidden_bull,
-        plot_bear,
-        plot_hidden_bear,
-    };
-    let rows = expand_grid_kpo(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let total = rows * len;
-    unsafe {
-        kase_peak_oscillator_with_divergences_batch_inner_into(
-            std::slice::from_raw_parts(high_ptr, len),
-            std::slice::from_raw_parts(low_ptr, len),
-            std::slice::from_raw_parts(close_ptr, len),
-            &sweep,
-            Kernel::Auto,
-            std::slice::from_raw_parts_mut(oscillator_ptr, total),
-            std::slice::from_raw_parts_mut(histogram_ptr, total),
-            std::slice::from_raw_parts_mut(max_peak_ptr, total),
-            std::slice::from_raw_parts_mut(min_peak_ptr, total),
-            std::slice::from_raw_parts_mut(market_extreme_ptr, total),
-            std::slice::from_raw_parts_mut(regular_bullish_ptr, total),
-            std::slice::from_raw_parts_mut(hidden_bullish_ptr, total),
-            std::slice::from_raw_parts_mut(regular_bearish_ptr, total),
-            std::slice::from_raw_parts_mut(hidden_bearish_ptr, total),
-            std::slice::from_raw_parts_mut(go_long_ptr, total),
-            std::slice::from_raw_parts_mut(go_short_ptr, total),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kase_peak_oscillator_with_divergences_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    deviations: f64,
-    short_cycle: usize,
-    long_cycle: usize,
-    sensitivity: f64,
-    all_peaks_mode: bool,
-    lb_r: usize,
-    lb_l: usize,
-    range_upper: usize,
-    range_lower: usize,
-    plot_bull: bool,
-    plot_hidden_bull: bool,
-    plot_bear: bool,
-    plot_hidden_bear: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kase_peak_oscillator_with_divergences_js(
-        high,
-        low,
-        close,
-        deviations,
-        short_cycle,
-        long_cycle,
-        sensitivity,
-        all_peaks_mode,
-        lb_r,
-        lb_l,
-        range_upper,
-        range_lower,
-        plot_bull,
-        plot_hidden_bull,
-        plot_bear,
-        plot_hidden_bear,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "kase_peak_oscillator_with_divergences_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kase_peak_oscillator_with_divergences_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kase_peak_oscillator_with_divergences_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "kase_peak_oscillator_with_divergences_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2554,6 +1797,155 @@ mod tests {
 
     fn approx_eq_or_nan(a: f64, b: f64) -> bool {
         (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-10
+    }
+
+    fn direct_population_std(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt()
+    }
+
+    /// Independent, deliberately non-streaming reconstruction of the Kase
+    /// PeakOscillator formula. This does not call the production rolling
+    /// helpers, so parity catches a shared-state/indexing mistake rather than
+    /// merely proving that two entry points reuse the same implementation.
+    fn direct_peak_oscillator(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        short_cycle: usize,
+        long_cycle: usize,
+        sensitivity: f64,
+    ) -> Vec<f64> {
+        let len = close.len();
+        let mut log_return = vec![f64::NAN; len];
+        let mut return_deviation = vec![f64::NAN; len];
+        let mut average_deviation = vec![f64::NAN; len];
+        let mut normalized_up = vec![f64::NAN; len];
+        let mut normalized_down = vec![f64::NAN; len];
+        let mut oscillator = vec![f64::NAN; len];
+
+        for index in 1..len {
+            log_return[index] = (close[index] / close[index - 1]).ln();
+            if index >= 9 {
+                return_deviation[index] = direct_population_std(&log_return[index + 1 - 9..=index]);
+            }
+            if index >= 38 {
+                average_deviation[index] =
+                    return_deviation[index + 1 - 30..=index].iter().sum::<f64>() / 30.0;
+            }
+            if index + 1 < long_cycle || !average_deviation[index].is_finite() {
+                continue;
+            }
+
+            let mut strongest_up = 0.0_f64;
+            let mut strongest_down = 0.0_f64;
+            for cycle in short_cycle..long_cycle {
+                let root = (cycle as f64).sqrt();
+                strongest_up = strongest_up.max((high[index] / low[index - cycle]).ln() / root);
+                strongest_down = strongest_down.max((high[index - cycle] / low[index]).ln() / root);
+            }
+            normalized_up[index] = strongest_up / average_deviation[index];
+            normalized_down[index] = strongest_down / average_deviation[index];
+
+            // The first ratio exists at `long_cycle - 1`; the third sample
+            // therefore completes both concurrent SMA(3) windows at
+            // `long_cycle + 1`.
+            if index >= long_cycle + 1 {
+                let smoothed_up = normalized_up[index - 2..=index].iter().sum::<f64>() / 3.0;
+                let smoothed_down = normalized_down[index - 2..=index].iter().sum::<f64>() / 3.0;
+                oscillator[index] = sensitivity * (smoothed_up - smoothed_down);
+            }
+        }
+        oscillator
+    }
+
+    #[test]
+    fn kpo_scalar_matches_independent_window_formula() {
+        let (high, low, close) = sample_ohlc(256);
+        let params = KasePeakOscillatorWithDivergencesParams::default();
+        let out = kase_peak_oscillator_with_divergences(
+            &KasePeakOscillatorWithDivergencesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                params.clone(),
+            ),
+        )
+        .unwrap();
+        let direct = direct_peak_oscillator(
+            &high,
+            &low,
+            &close,
+            params.short_cycle.unwrap_or(DEFAULT_SHORT_CYCLE),
+            params.long_cycle.unwrap_or(DEFAULT_LONG_CYCLE),
+            params.sensitivity.unwrap_or(DEFAULT_SENSITIVITY),
+        );
+
+        let production_first = out.oscillator.iter().position(|value| value.is_finite());
+        let direct_first = direct.iter().position(|value| value.is_finite());
+        assert_eq!(
+            production_first, direct_first,
+            "the independent formula and production path disagree on warmup semantics"
+        );
+        let first = direct_first.expect("the independent fixture must reach a valid oscillator");
+        for index in [first, first + 1, first + 24, first + 49, first + 93, 255] {
+            assert!(
+                (out.oscillator[index] - direct[index]).abs() <= 1e-9,
+                "independent Kase formula mismatch at {index}: production={} direct={}",
+                out.oscillator[index],
+                direct[index]
+            );
+        }
+
+        let threshold_index = first + 49;
+        let absolute_window = direct[threshold_index + 1 - 50..=threshold_index]
+            .iter()
+            .map(|value| value.abs())
+            .collect::<Vec<_>>();
+        let threshold = absolute_window.iter().sum::<f64>() / 50.0
+            + DEFAULT_DEVIATIONS * direct_population_std(&absolute_window);
+        let sign = direct[threshold_index].signum();
+        assert!((out.max_peak_value[threshold_index] - sign * threshold.max(90.0)).abs() <= 1e-9);
+        assert!((out.min_peak_value[threshold_index] - sign * threshold.min(90.0)).abs() <= 1e-9);
+    }
+
+    #[test]
+    fn kpo_histogram_is_a_display_alias_not_a_distinct_feature() {
+        let (high, low, close) = sample_ohlc(256);
+        let out = kase_peak_oscillator_with_divergences(
+            &KasePeakOscillatorWithDivergencesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                Default::default(),
+            ),
+        )
+        .unwrap();
+
+        for (index, (&oscillator, &histogram)) in
+            out.oscillator.iter().zip(&out.histogram).enumerate()
+        {
+            if oscillator.is_nan() {
+                assert!(
+                    histogram.is_nan(),
+                    "histogram[{index}] lost undefined state"
+                );
+            } else {
+                assert_eq!(
+                    oscillator.to_bits(),
+                    histogram.to_bits(),
+                    "histogram[{index}] is not the exact PeakOscillator display alias"
+                );
+            }
+        }
     }
 
     #[test]

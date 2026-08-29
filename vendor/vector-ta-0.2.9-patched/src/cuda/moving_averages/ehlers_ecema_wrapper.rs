@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::ehlers_ecema::{EhlersEcemaBatchRange, EhlersEcemaParams};
@@ -10,7 +10,7 @@ use cust::memory::{CopyDestination, DeviceBuffer};
 use cust::error::CudaError;
 use cust::memory::mem_get_info;
 use cust::memory::{AsyncCopyDestination, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys as cu;
@@ -27,7 +27,9 @@ pub enum CudaEhlersEcemaError {
     InvalidInput(String),
     #[error("invalid policy: {0}")]
     InvalidPolicy(&'static str),
-    #[error("device out of memory: required={required} bytes, free={free} bytes, headroom={headroom} bytes")]
+    #[error(
+        "device out of memory: required={required} bytes, free={free} bytes, headroom={headroom} bytes"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -121,23 +123,6 @@ impl CudaEhlersEcema {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/ehlers_ecema_kernel.ptx"));
-
-        let opt_level = match Self::env_u32("ECEMA_JIT_OLEVEL") {
-            Some(0) => OptLevel::O0,
-            Some(1) => OptLevel::O1,
-            Some(2) => OptLevel::O2,
-            Some(3) => OptLevel::O3,
-            Some(_) => OptLevel::O2,
-            None => OptLevel::O2,
-        };
-        let mut jit_opts: Vec<ModuleJitOption> = vec![
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(opt_level),
-        ];
-        if let Some(maxr) = Self::env_u32("ECEMA_MAX_REGS") {
-            jit_opts.push(ModuleJitOption::MaxRegisters(maxr));
-        }
         let module = crate::load_cuda_embedded_module!("ehlers_ecema_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

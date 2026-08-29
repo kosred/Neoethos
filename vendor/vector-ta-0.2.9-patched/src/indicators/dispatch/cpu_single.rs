@@ -1,13 +1,13 @@
 use super::{
-    compute_cpu_batch, IndicatorBatchOutput, IndicatorBatchRequest, IndicatorComputeOutput,
-    IndicatorComputeRequest, IndicatorDataRef, IndicatorDispatchError, IndicatorParamSet,
-    IndicatorSeries,
+    IndicatorBatchOutput, IndicatorBatchRequest, IndicatorComputeOutput, IndicatorComputeRequest,
+    IndicatorDataRef, IndicatorDispatchError, IndicatorParamSet, IndicatorSeries,
+    compute_cpu_batch,
 };
 use crate::indicators::pattern_recognition::{
-    pattern_recognition_with_kernel, PatternRecognitionData, PatternRecognitionError,
-    PatternRecognitionInput,
+    PatternRecognitionData, PatternRecognitionError, PatternRecognitionInput,
+    pattern_recognition_with_kernel,
 };
-use crate::indicators::registry::{get_indicator, IndicatorInfo, IndicatorInputKind};
+use crate::indicators::registry::{IndicatorInfo, IndicatorInputKind, get_indicator};
 
 pub fn compute_cpu(
     req: IndicatorComputeRequest<'_>,
@@ -103,7 +103,7 @@ fn compute_pattern_recognition(
 
     Ok(IndicatorComputeOutput {
         output_id: output_id.to_string(),
-        series: IndicatorSeries::Bool(out.values_u8.into_iter().map(|v| v != 0).collect()),
+        series: IndicatorSeries::I32(out.values_i8.into_iter().map(i32::from).collect()),
         warmup: out.warmup,
         rows: out.rows,
         cols: out.cols,
@@ -233,7 +233,7 @@ fn map_pattern_error(indicator: &str, err: PatternRecognitionError) -> Indicator
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indicators::dispatch::{compute_cpu_batch, ParamKV, ParamValue};
+    use crate::indicators::dispatch::{ParamKV, ParamValue, compute_cpu_batch};
     use crate::indicators::pattern_recognition::list_patterns;
     use crate::utilities::enums::Kernel;
 
@@ -251,8 +251,27 @@ mod tests {
         (open, high, low, close)
     }
 
+    fn kicking_direction_ohlc() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let (mut open, mut high, mut low, mut close) = sample_ohlc(192);
+        for i in 0..190 {
+            open[i] = 100.0;
+            high[i] = 102.0;
+            low[i] = 99.0;
+            close[i] = 101.0;
+        }
+        open[190] = 105.0;
+        high[190] = 105.05;
+        low[190] = 100.95;
+        close[190] = 101.0;
+        open[191] = 106.0;
+        high[191] = 109.05;
+        low[191] = 105.95;
+        close[191] = 109.0;
+        (open, high, low, close)
+    }
+
     #[test]
-    fn compute_cpu_pattern_recognition_returns_matrix() {
+    fn compute_cpu_pattern_recognition_returns_signed_matrix() {
         let (open, high, low, close) = sample_ohlc(192);
         let req = IndicatorComputeRequest {
             indicator_id: "pattern_recognition",
@@ -271,11 +290,46 @@ mod tests {
         assert_eq!(out.rows, list_patterns().len());
         assert_eq!(out.cols, close.len());
         match out.series {
-            IndicatorSeries::Bool(v) => assert_eq!(v.len(), out.rows * out.cols),
-            other => panic!("expected Bool matrix series, got {:?}", other),
+            IndicatorSeries::I32(v) => {
+                assert_eq!(v.len(), out.rows * out.cols);
+                assert!(
+                    v.iter()
+                        .all(|value| matches!(*value, -100 | -80 | 0 | 80 | 100))
+                );
+            }
+            other => panic!("expected signed I32 matrix series, got {:?}", other),
         }
         let ids = out.pattern_ids.unwrap();
         assert_eq!(ids.len(), out.rows);
+    }
+
+    #[test]
+    fn semantic_uniqueness_cpu_dispatch_preserves_kicking_direction() {
+        let (open, high, low, close) = kicking_direction_ohlc();
+        let out = compute_cpu(IndicatorComputeRequest {
+            indicator_id: "pattern_recognition",
+            output_id: Some("matrix"),
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            params: &[],
+            kernel: Kernel::Scalar,
+        })
+        .expect("native vector-ta CPU dispatch must accept the pattern matrix");
+        let ids = out.pattern_ids.as_ref().expect("pattern row ids");
+        let signed = match &out.series {
+            IndicatorSeries::I32(values) => values,
+            other => panic!("production dispatch discarded signed pattern magnitude: {other:?}"),
+        };
+        let at = |id: &str| {
+            let row = ids.iter().position(|candidate| candidate == id).unwrap();
+            signed[row * out.cols + 191]
+        };
+        assert_eq!(at("cdlkicking"), 100);
+        assert_eq!(at("cdlkickingbylength"), -100);
     }
 
     #[test]

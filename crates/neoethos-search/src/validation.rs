@@ -1,18 +1,23 @@
-use crate::artifact_io::{read_json, stable_json_hash, write_json_atomic};
+use crate::artifact_io::{stable_json_hash, write_json_atomic};
+use crate::data_selection::{
+    CanonicalSearchArtifactEnvelopeV2, CanonicalSearchArtifactScopeV2, CanonicalSearchWindowRoleV1,
+};
 use crate::eval::{
     BacktestMetrics, BacktestSettings, fast_evaluate_strategy_core, simulate_trades_core,
 };
+use crate::genetic::Gene;
 use crate::quality::Trade;
 use anyhow::{Result, bail};
 use itertools::Itertools;
-use rayon::prelude::*;
 use neoethos_core::contracts::{TemporalFeatureContract, TemporalScopeHashes};
 use neoethos_core::domain::prop_firm::{PropFirmChallengeDefaults, PropFirmConstraints};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct WalkforwardSplitResult {
     pub split: usize,
     pub trades: usize,
@@ -31,7 +36,8 @@ pub struct WalkforwardSplitResult {
     pub prop_compliant: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct WalkforwardSummary {
     pub walk_forward_splits: usize,
     pub avg_pnl: f64,
@@ -47,99 +53,296 @@ pub struct WalkforwardSummary {
     pub splits: Vec<WalkforwardSplitResult>,
 }
 
-pub const WALKFORWARD_VALIDATION_ARTIFACT_KIND: &str = "walkforward_validation_artifact";
-pub const WALKFORWARD_VALIDATION_SCHEMA_VERSION: u32 = 1;
-pub const CANONICAL_BACKTEST_ARTIFACT_KIND: &str = "canonical_strategy_backtest_artifact";
-pub const CANONICAL_BACKTEST_SCHEMA_VERSION: u32 = 1;
-pub const FORWARD_TEST_VALIDATION_ARTIFACT_KIND: &str = "forward_test_validation_artifact";
-pub const FORWARD_TEST_VALIDATION_SCHEMA_VERSION: u32 = 1;
-pub const LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND: &str = "live_execution_simulation_artifact";
-pub const LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION: u32 = 1;
-pub const PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND: &str = "prop_firm_risk_validation_artifact";
-pub const PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION: u32 = 1;
+pub const WALKFORWARD_VALIDATION_ARTIFACT_KIND: &str = "neoethos.search.walkforward-validation.v2";
+pub const WALKFORWARD_VALIDATION_SCHEMA_VERSION: u32 = 2;
+pub const CANONICAL_BACKTEST_ARTIFACT_KIND: &str =
+    "neoethos.search.canonical-backtest-validation.v3";
+pub const CANONICAL_BACKTEST_SCHEMA_VERSION: u32 = 3;
+pub const FORWARD_TEST_VALIDATION_ARTIFACT_KIND: &str =
+    "neoethos.search.forward-test-validation.v3";
+pub const FORWARD_TEST_VALIDATION_SCHEMA_VERSION: u32 = 3;
+pub const LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND: &str =
+    "neoethos.search.live-execution-simulation.v2";
+pub const LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION: u32 = 2;
+pub const PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND: &str =
+    "neoethos.search.prop-firm-risk-validation.v2";
+pub const PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CanonicalBacktestScope {
-    pub dataset_hash: String,
-    pub evaluation_config_hash: String,
-    pub strategy_hash: String,
-    pub temporal_scope: TemporalScopeHashes,
+#[serde(deny_unknown_fields)]
+pub struct ValidationStrategyIdentityV2 {
+    strategy_id: String,
+    exact_gene_hash: String,
 }
 
-impl CanonicalBacktestScope {
-    pub fn new(
-        dataset_hash: impl Into<String>,
-        evaluation_config_hash: impl Into<String>,
-        strategy_hash: impl Into<String>,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Self {
-        Self {
-            dataset_hash: dataset_hash.into(),
-            evaluation_config_hash: evaluation_config_hash.into(),
-            strategy_hash: strategy_hash.into(),
-            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
+impl ValidationStrategyIdentityV2 {
+    pub fn from_gene(gene: &Gene) -> Result<Self> {
+        let identity = Self {
+            strategy_id: gene.strategy_id.clone(),
+            exact_gene_hash: stable_json_hash(gene)?,
+        };
+        identity.validate_shape()?;
+        Ok(identity)
+    }
+
+    pub fn strategy_id(&self) -> &str {
+        &self.strategy_id
+    }
+
+    pub fn exact_gene_hash(&self) -> &str {
+        &self.exact_gene_hash
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_shape()
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        if self.strategy_id.trim().is_empty() {
+            bail!("validation strategy identity has an empty strategy_id");
         }
+        validate_fnv64_hash("validation exact_gene_hash", &self.exact_gene_hash)
     }
 
-    pub fn from_parts<T: Serialize, U: Serialize, V: Serialize>(
-        dataset: &T,
-        evaluation_config: &U,
-        strategy: &V,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Result<Self> {
-        Ok(Self::new(
-            stable_json_hash(dataset)?,
-            stable_json_hash(evaluation_config)?,
-            stable_json_hash(strategy)?,
-            temporal_contract,
-        ))
+    pub fn validate_against(&self, gene: &Gene) -> Result<()> {
+        self.validate_shape()?;
+        if self.strategy_id != gene.strategy_id {
+            bail!(
+                "validation strategy_id `{}` does not match expected `{}`",
+                self.strategy_id,
+                gene.strategy_id
+            );
+        }
+        let expected_hash = stable_json_hash(gene)?;
+        if self.exact_gene_hash != expected_hash {
+            bail!(
+                "validation exact_gene_hash `{}` does not match expected `{expected_hash}`",
+                self.exact_gene_hash
+            );
+        }
+        Ok(())
     }
+}
 
-    pub fn validate_temporal_contract(
-        &self,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Result<()> {
-        self.temporal_scope
-            .validate_contract(temporal_contract)
-            .map_err(|err| anyhow::anyhow!("canonical backtest {err}"))
+pub(crate) fn validate_fnv64_hash(field: &str, value: &str) -> Result<()> {
+    let Some(hex) = value.strip_prefix("fnv64:") else {
+        bail!("{field} must use canonical fnv64:<16 lowercase hex> form");
+    };
+    if hex.len() != 16
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{field} must use canonical fnv64:<16 lowercase hex> form");
     }
+    Ok(())
+}
+
+fn validate_selection_scope(scope: &CanonicalSearchArtifactScopeV2, label: &str) -> Result<()> {
+    scope.validate().map_err(anyhow::Error::new)?;
+    match scope.evaluated_window().role() {
+        CanonicalSearchWindowRoleV1::DiscoveryInput | CanonicalSearchWindowRoleV1::InSample => {
+            Ok(())
+        }
+        role => bail!(
+            "{label} requires the exact stored discovery-input/in-sample selection scope, found {role:?}"
+        ),
+    }
+}
+
+fn validate_holdout_scope(scope: &CanonicalSearchArtifactScopeV2, label: &str) -> Result<()> {
+    scope.validate().map_err(anyhow::Error::new)?;
+    if scope.evaluated_window().role() != CanonicalSearchWindowRoleV1::Holdout {
+        bail!(
+            "{label} requires the exact stored holdout scope, found {:?}",
+            scope.evaluated_window().role()
+        );
+    }
+    Ok(())
+}
+
+fn reject_legacy_weak_validation_json(bytes: &[u8], label: &str) -> Result<()> {
+    let wire: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| anyhow::anyhow!("parse {label} validation artifact JSON: {error}"))?;
+    let legacy_version = wire
+        .get("artifact_schema_version")
+        .and_then(serde_json::Value::as_u64);
+    let weak_scope = wire
+        .get("scope")
+        .and_then(|scope| scope.get("dataset_hash"))
+        .is_some();
+    if legacy_version.is_some() || weak_scope {
+        bail!(
+            "legacy {label} validation artifact version {} is unsupported because it lacks the exact search receipt/window/config authority; regenerate it from the original canonical search input",
+            legacy_version.unwrap_or(1)
+        );
+    }
+    Ok(())
+}
+
+fn reject_legacy_metric_artifact_payload_v1(
+    bytes: &[u8],
+    label: &str,
+    expected_schema_version: u32,
+) -> Result<()> {
+    let wire: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| anyhow::anyhow!("parse {label} validation artifact JSON: {error}"))?;
+    let actual = wire
+        .get("payload")
+        .and_then(|payload| payload.get("schema_version"))
+        .and_then(serde_json::Value::as_u64);
+    match actual {
+        Some(actual) if actual == u64::from(expected_schema_version) => {}
+        Some(actual) if actual < u64::from(expected_schema_version) => bail!(
+            "unsupported {label} metric payload schema version {actual}; expected {expected_schema_version}; legacy metric artifacts omitted monthly_target_hit_rate and cannot be loaded"
+        ),
+        Some(actual) => bail!(
+            "unsupported {label} metric payload schema version {actual}; expected {expected_schema_version}"
+        ),
+        None => bail!(
+            "missing {label} metric payload schema version; expected {expected_schema_version}; unversioned metric artifacts cannot be loaded"
+        ),
+    }
+    Ok(())
+}
+
+fn reject_legacy_live_execution_simulation_v1(
+    bytes: &[u8],
+    expected_schema_version: u32,
+) -> Result<()> {
+    let wire: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        anyhow::anyhow!("parse live execution simulation artifact JSON: {error}")
+    })?;
+    let actual = wire
+        .get("artifact_schema_version")
+        .and_then(serde_json::Value::as_u64);
+    match actual {
+        Some(actual) if actual == u64::from(expected_schema_version) => {}
+        Some(actual) if actual < u64::from(expected_schema_version) => bail!(
+            "unsupported live execution simulation metric schema version {actual}; expected {expected_schema_version}; legacy artifacts omitted monthly_target_hit_rate and cannot be loaded"
+        ),
+        Some(actual) => bail!(
+            "unsupported live execution simulation metric schema version {actual}; expected {expected_schema_version}"
+        ),
+        None => bail!(
+            "missing live execution simulation metric schema version; expected {expected_schema_version}; unversioned metric artifacts cannot be loaded"
+        ),
+    }
+    Ok(())
+}
+
+fn read_artifact_bytes(path: impl AsRef<Path>, label: &str) -> Result<Vec<u8>> {
+    let path = path.as_ref();
+    std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("read {label} artifact {}: {error}", path.display()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalBacktestPayloadV3 {
+    schema_version: u32,
+    strategy_identity: ValidationStrategyIdentityV2,
+    metrics: BacktestMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CanonicalBacktestArtifactFile {
-    pub artifact_kind: String,
-    pub artifact_schema_version: u32,
-    pub scope: CanonicalBacktestScope,
-    pub metrics: BacktestMetrics,
+    envelope: CanonicalSearchArtifactEnvelopeV2<CanonicalBacktestPayloadV3>,
 }
 
 impl CanonicalBacktestArtifactFile {
-    pub fn new(scope: CanonicalBacktestScope, metrics: BacktestMetrics) -> Self {
-        Self {
-            artifact_kind: CANONICAL_BACKTEST_ARTIFACT_KIND.to_string(),
-            artifact_schema_version: CANONICAL_BACKTEST_SCHEMA_VERSION,
-            scope,
-            metrics,
-        }
+    pub fn new(
+        scope: CanonicalSearchArtifactScopeV2,
+        search_config_hash: impl Into<String>,
+        gene: &Gene,
+        metrics: BacktestMetrics,
+    ) -> Result<Self> {
+        validate_selection_scope(&scope, "canonical backtest")?;
+        let artifact = Self {
+            envelope: CanonicalSearchArtifactEnvelopeV2::new(
+                CANONICAL_BACKTEST_ARTIFACT_KIND,
+                scope,
+                search_config_hash,
+                CanonicalBacktestPayloadV3 {
+                    schema_version: CANONICAL_BACKTEST_SCHEMA_VERSION,
+                    strategy_identity: ValidationStrategyIdentityV2::from_gene(gene)?,
+                    metrics,
+                },
+            )
+            .map_err(anyhow::Error::new)?,
+        };
+        artifact.validate_internal()?;
+        Ok(artifact)
     }
 
-    pub fn validate_for_temporal_contract(
+    fn validate_internal(&self) -> Result<()> {
+        self.envelope.validate().map_err(anyhow::Error::new)?;
+        if self.envelope.artifact_kind() != CANONICAL_BACKTEST_ARTIFACT_KIND {
+            bail!(
+                "wrong canonical backtest artifact kind `{}`",
+                self.envelope.artifact_kind()
+            );
+        }
+        if self.envelope.payload().schema_version != CANONICAL_BACKTEST_SCHEMA_VERSION {
+            bail!(
+                "unsupported canonical backtest payload schema version {}",
+                self.envelope.payload().schema_version
+            );
+        }
+        validate_selection_scope(self.scope(), "canonical backtest")?;
+        self.strategy_identity().validate_shape()
+    }
+
+    pub fn validate_against(
         &self,
-        temporal_contract: &TemporalFeatureContract,
+        expected_scope: &CanonicalSearchArtifactScopeV2,
+        expected_search_config_hash: &str,
+        expected_gene: &Gene,
     ) -> Result<()> {
-        if self.artifact_kind != CANONICAL_BACKTEST_ARTIFACT_KIND {
-            bail!(
-                "artifact kind {} cannot be used as a canonical backtest artifact",
-                self.artifact_kind
-            );
-        }
-        if self.artifact_schema_version != CANONICAL_BACKTEST_SCHEMA_VERSION {
-            bail!(
-                "unsupported canonical backtest schema version {}",
-                self.artifact_schema_version
-            );
-        }
-        self.scope.validate_temporal_contract(temporal_contract)
+        self.validate_internal()?;
+        validate_selection_scope(expected_scope, "expected canonical backtest")?;
+        self.envelope
+            .validate_against(
+                CANONICAL_BACKTEST_ARTIFACT_KIND,
+                expected_search_config_hash,
+                expected_scope.receipt(),
+                expected_scope.evaluated_window(),
+            )
+            .map_err(anyhow::Error::new)?;
+        self.strategy_identity().validate_against(expected_gene)
+    }
+
+    pub fn scope(&self) -> &CanonicalSearchArtifactScopeV2 {
+        self.envelope.scope()
+    }
+
+    pub fn search_config_hash(&self) -> &str {
+        self.envelope.search_config_hash()
+    }
+
+    pub fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        &self.envelope.payload().strategy_identity
+    }
+
+    pub fn metrics(&self) -> &BacktestMetrics {
+        &self.envelope.payload().metrics
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        self.validate_internal()?;
+        self.envelope.to_json_bytes().map_err(anyhow::Error::new)
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        reject_legacy_metric_artifact_payload_v1(bytes, "canonical backtest", 3)?;
+        reject_legacy_weak_validation_json(bytes, "canonical backtest")?;
+        let artifact = Self {
+            envelope: CanonicalSearchArtifactEnvelopeV2::from_json_bytes(bytes)
+                .map_err(anyhow::Error::new)?,
+        };
+        artifact.validate_internal()?;
+        Ok(artifact)
     }
 }
 
@@ -147,112 +350,127 @@ pub fn write_canonical_backtest_artifact_atomic(
     path: impl AsRef<Path>,
     artifact: &CanonicalBacktestArtifactFile,
 ) -> Result<()> {
+    artifact.validate_internal()?;
     write_json_atomic(path, artifact)
 }
 
 pub fn read_canonical_backtest_artifact(
     path: impl AsRef<Path>,
-    temporal_contract: &TemporalFeatureContract,
+    expected_scope: &CanonicalSearchArtifactScopeV2,
+    expected_search_config_hash: &str,
+    expected_gene: &Gene,
 ) -> Result<CanonicalBacktestArtifactFile> {
-    let artifact: CanonicalBacktestArtifactFile = read_json(path, "canonical backtest")?;
-    artifact.validate_for_temporal_contract(temporal_contract)?;
+    let bytes = read_artifact_bytes(path, "canonical backtest")?;
+    let artifact = CanonicalBacktestArtifactFile::from_json_bytes(&bytes)?;
+    artifact.validate_against(expected_scope, expected_search_config_hash, expected_gene)?;
     Ok(artifact)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WalkforwardValidationScope {
-    pub dataset_hash: String,
-    pub evaluation_config_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy_hash: Option<String>,
-    pub temporal_scope: TemporalScopeHashes,
-}
-
-impl WalkforwardValidationScope {
-    pub fn new(
-        dataset_hash: impl Into<String>,
-        evaluation_config_hash: impl Into<String>,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Self {
-        Self {
-            dataset_hash: dataset_hash.into(),
-            evaluation_config_hash: evaluation_config_hash.into(),
-            strategy_hash: None,
-            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
-        }
-    }
-
-    pub fn for_strategy(
-        dataset_hash: impl Into<String>,
-        evaluation_config_hash: impl Into<String>,
-        strategy_hash: impl Into<String>,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Self {
-        Self {
-            dataset_hash: dataset_hash.into(),
-            evaluation_config_hash: evaluation_config_hash.into(),
-            strategy_hash: Some(strategy_hash.into()),
-            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
-        }
-    }
-
-    pub fn from_parts<T: Serialize, U: Serialize>(
-        dataset: &T,
-        evaluation_config: &U,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Result<Self> {
-        Ok(Self::new(
-            stable_json_hash(dataset)?,
-            stable_json_hash(evaluation_config)?,
-            temporal_contract,
-        ))
-    }
-
-    pub fn validate_temporal_contract(
-        &self,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Result<()> {
-        self.temporal_scope
-            .validate_contract(temporal_contract)
-            .map_err(|err| anyhow::anyhow!("walk-forward validation {err}"))
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalkforwardValidationPayloadV2 {
+    schema_version: u32,
+    strategy_identity: ValidationStrategyIdentityV2,
+    summary: WalkforwardSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct WalkforwardValidationArtifactFile {
-    pub artifact_kind: String,
-    pub artifact_schema_version: u32,
-    pub scope: WalkforwardValidationScope,
-    pub summary: WalkforwardSummary,
+    envelope: CanonicalSearchArtifactEnvelopeV2<WalkforwardValidationPayloadV2>,
 }
 
 impl WalkforwardValidationArtifactFile {
-    pub fn new(scope: WalkforwardValidationScope, summary: WalkforwardSummary) -> Self {
-        Self {
-            artifact_kind: WALKFORWARD_VALIDATION_ARTIFACT_KIND.to_string(),
-            artifact_schema_version: WALKFORWARD_VALIDATION_SCHEMA_VERSION,
-            scope,
-            summary,
-        }
+    pub fn new(
+        scope: CanonicalSearchArtifactScopeV2,
+        search_config_hash: impl Into<String>,
+        gene: &Gene,
+        summary: WalkforwardSummary,
+    ) -> Result<Self> {
+        validate_selection_scope(&scope, "walk-forward validation")?;
+        let artifact = Self {
+            envelope: CanonicalSearchArtifactEnvelopeV2::new(
+                WALKFORWARD_VALIDATION_ARTIFACT_KIND,
+                scope,
+                search_config_hash,
+                WalkforwardValidationPayloadV2 {
+                    schema_version: WALKFORWARD_VALIDATION_SCHEMA_VERSION,
+                    strategy_identity: ValidationStrategyIdentityV2::from_gene(gene)?,
+                    summary,
+                },
+            )
+            .map_err(anyhow::Error::new)?,
+        };
+        artifact.validate_internal()?;
+        Ok(artifact)
     }
 
-    pub fn validate_for_temporal_contract(
+    fn validate_internal(&self) -> Result<()> {
+        self.envelope.validate().map_err(anyhow::Error::new)?;
+        if self.envelope.artifact_kind() != WALKFORWARD_VALIDATION_ARTIFACT_KIND {
+            bail!(
+                "wrong walk-forward validation artifact kind `{}`",
+                self.envelope.artifact_kind()
+            );
+        }
+        if self.envelope.payload().schema_version != WALKFORWARD_VALIDATION_SCHEMA_VERSION {
+            bail!(
+                "unsupported walk-forward validation payload schema version {}",
+                self.envelope.payload().schema_version
+            );
+        }
+        validate_selection_scope(self.scope(), "walk-forward validation")?;
+        self.strategy_identity().validate_shape()
+    }
+
+    pub fn validate_against(
         &self,
-        temporal_contract: &TemporalFeatureContract,
+        expected_scope: &CanonicalSearchArtifactScopeV2,
+        expected_search_config_hash: &str,
+        expected_gene: &Gene,
     ) -> Result<()> {
-        if self.artifact_kind != WALKFORWARD_VALIDATION_ARTIFACT_KIND {
-            bail!(
-                "artifact kind {} cannot be used as a walk-forward validation artifact",
-                self.artifact_kind
-            );
-        }
-        if self.artifact_schema_version != WALKFORWARD_VALIDATION_SCHEMA_VERSION {
-            bail!(
-                "unsupported walk-forward validation schema version {}",
-                self.artifact_schema_version
-            );
-        }
-        self.scope.validate_temporal_contract(temporal_contract)
+        self.validate_internal()?;
+        validate_selection_scope(expected_scope, "expected walk-forward validation")?;
+        self.envelope
+            .validate_against(
+                WALKFORWARD_VALIDATION_ARTIFACT_KIND,
+                expected_search_config_hash,
+                expected_scope.receipt(),
+                expected_scope.evaluated_window(),
+            )
+            .map_err(anyhow::Error::new)?;
+        self.strategy_identity().validate_against(expected_gene)
+    }
+
+    pub fn scope(&self) -> &CanonicalSearchArtifactScopeV2 {
+        self.envelope.scope()
+    }
+
+    pub fn search_config_hash(&self) -> &str {
+        self.envelope.search_config_hash()
+    }
+
+    pub fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        &self.envelope.payload().strategy_identity
+    }
+
+    pub fn summary(&self) -> &WalkforwardSummary {
+        &self.envelope.payload().summary
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        self.validate_internal()?;
+        self.envelope.to_json_bytes().map_err(anyhow::Error::new)
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        reject_legacy_weak_validation_json(bytes, "walk-forward")?;
+        let artifact = Self {
+            envelope: CanonicalSearchArtifactEnvelopeV2::from_json_bytes(bytes)
+                .map_err(anyhow::Error::new)?,
+        };
+        artifact.validate_internal()?;
+        Ok(artifact)
     }
 }
 
@@ -260,15 +478,19 @@ pub fn write_walkforward_validation_artifact_atomic(
     path: impl AsRef<Path>,
     artifact: &WalkforwardValidationArtifactFile,
 ) -> Result<()> {
+    artifact.validate_internal()?;
     write_json_atomic(path, artifact)
 }
 
 pub fn read_walkforward_validation_artifact(
     path: impl AsRef<Path>,
-    temporal_contract: &TemporalFeatureContract,
+    expected_scope: &CanonicalSearchArtifactScopeV2,
+    expected_search_config_hash: &str,
+    expected_gene: &Gene,
 ) -> Result<WalkforwardValidationArtifactFile> {
-    let artifact: WalkforwardValidationArtifactFile = read_json(path, "walk-forward validation")?;
-    artifact.validate_for_temporal_contract(temporal_contract)?;
+    let bytes = read_artifact_bytes(path, "walk-forward validation")?;
+    let artifact = WalkforwardValidationArtifactFile::from_json_bytes(&bytes)?;
+    artifact.validate_against(expected_scope, expected_search_config_hash, expected_gene)?;
     Ok(artifact)
 }
 
@@ -276,7 +498,8 @@ pub fn read_walkforward_validation_artifact(
 /// window that was withheld from both training and walk-forward CV. The
 /// summary is intentionally flat (no `splits`) because forward testing
 /// produces one unbiased OOS estimate, not a folded distribution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ForwardTestSummary {
     /// Number of bars in the held-out tail window.
     pub bars: usize,
@@ -287,91 +510,128 @@ pub struct ForwardTestSummary {
     pub span_days: f64,
 }
 
-/// Forward-test validation scope. The dataset hash binds the *tail*
-/// dataset (not the full discovery dataset) so the artifact cannot be
-/// confused with a canonical backtest produced from in-sample data.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ForwardTestValidationScope {
-    pub dataset_hash: String,
-    pub evaluation_config_hash: String,
-    pub strategy_hash: String,
-    pub temporal_scope: TemporalScopeHashes,
-}
-
-impl ForwardTestValidationScope {
-    pub fn new(
-        dataset_hash: impl Into<String>,
-        evaluation_config_hash: impl Into<String>,
-        strategy_hash: impl Into<String>,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Self {
-        Self {
-            dataset_hash: dataset_hash.into(),
-            evaluation_config_hash: evaluation_config_hash.into(),
-            strategy_hash: strategy_hash.into(),
-            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
-        }
-    }
-
-    pub fn from_parts<T: Serialize, U: Serialize, V: Serialize>(
-        dataset: &T,
-        evaluation_config: &U,
-        strategy: &V,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Result<Self> {
-        Ok(Self::new(
-            stable_json_hash(dataset)?,
-            stable_json_hash(evaluation_config)?,
-            stable_json_hash(strategy)?,
-            temporal_contract,
-        ))
-    }
-
-    pub fn validate_temporal_contract(
-        &self,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Result<()> {
-        self.temporal_scope
-            .validate_contract(temporal_contract)
-            .map_err(|err| anyhow::anyhow!("forward test {err}"))
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardTestValidationPayloadV3 {
+    schema_version: u32,
+    strategy_identity: ValidationStrategyIdentityV2,
+    summary: ForwardTestSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ForwardTestValidationArtifactFile {
-    pub artifact_kind: String,
-    pub artifact_schema_version: u32,
-    pub scope: ForwardTestValidationScope,
-    pub summary: ForwardTestSummary,
+    envelope: CanonicalSearchArtifactEnvelopeV2<ForwardTestValidationPayloadV3>,
 }
 
 impl ForwardTestValidationArtifactFile {
-    pub fn new(scope: ForwardTestValidationScope, summary: ForwardTestSummary) -> Self {
-        Self {
-            artifact_kind: FORWARD_TEST_VALIDATION_ARTIFACT_KIND.to_string(),
-            artifact_schema_version: FORWARD_TEST_VALIDATION_SCHEMA_VERSION,
-            scope,
-            summary,
+    pub fn new(
+        scope: CanonicalSearchArtifactScopeV2,
+        search_config_hash: impl Into<String>,
+        gene: &Gene,
+        summary: ForwardTestSummary,
+    ) -> Result<Self> {
+        validate_holdout_scope(&scope, "forward-test validation")?;
+        let expected_bars =
+            (scope.evaluated_window().row_end() - scope.evaluated_window().row_start()) as usize;
+        if summary.bars != expected_bars {
+            bail!(
+                "forward-test summary bars {} do not match exact holdout rows {expected_bars}",
+                summary.bars
+            );
         }
+        let artifact = Self {
+            envelope: CanonicalSearchArtifactEnvelopeV2::new(
+                FORWARD_TEST_VALIDATION_ARTIFACT_KIND,
+                scope,
+                search_config_hash,
+                ForwardTestValidationPayloadV3 {
+                    schema_version: FORWARD_TEST_VALIDATION_SCHEMA_VERSION,
+                    strategy_identity: ValidationStrategyIdentityV2::from_gene(gene)?,
+                    summary,
+                },
+            )
+            .map_err(anyhow::Error::new)?,
+        };
+        artifact.validate_internal()?;
+        Ok(artifact)
     }
 
-    pub fn validate_for_temporal_contract(
+    fn validate_internal(&self) -> Result<()> {
+        self.envelope.validate().map_err(anyhow::Error::new)?;
+        if self.envelope.artifact_kind() != FORWARD_TEST_VALIDATION_ARTIFACT_KIND {
+            bail!(
+                "wrong forward-test validation artifact kind `{}`",
+                self.envelope.artifact_kind()
+            );
+        }
+        if self.envelope.payload().schema_version != FORWARD_TEST_VALIDATION_SCHEMA_VERSION {
+            bail!(
+                "unsupported forward-test validation payload schema version {}",
+                self.envelope.payload().schema_version
+            );
+        }
+        validate_holdout_scope(self.scope(), "forward-test validation")?;
+        let expected_bars = (self.scope().evaluated_window().row_end()
+            - self.scope().evaluated_window().row_start()) as usize;
+        if self.summary().bars != expected_bars {
+            bail!(
+                "forward-test summary bars {} do not match exact holdout rows {expected_bars}",
+                self.summary().bars
+            );
+        }
+        self.strategy_identity().validate_shape()
+    }
+
+    pub fn validate_against(
         &self,
-        temporal_contract: &TemporalFeatureContract,
+        expected_scope: &CanonicalSearchArtifactScopeV2,
+        expected_search_config_hash: &str,
+        expected_gene: &Gene,
     ) -> Result<()> {
-        if self.artifact_kind != FORWARD_TEST_VALIDATION_ARTIFACT_KIND {
-            bail!(
-                "artifact kind {} cannot be used as a forward-test validation artifact",
-                self.artifact_kind
-            );
-        }
-        if self.artifact_schema_version != FORWARD_TEST_VALIDATION_SCHEMA_VERSION {
-            bail!(
-                "unsupported forward-test validation schema version {}",
-                self.artifact_schema_version
-            );
-        }
-        self.scope.validate_temporal_contract(temporal_contract)
+        self.validate_internal()?;
+        validate_holdout_scope(expected_scope, "expected forward-test validation")?;
+        self.envelope
+            .validate_against(
+                FORWARD_TEST_VALIDATION_ARTIFACT_KIND,
+                expected_search_config_hash,
+                expected_scope.receipt(),
+                expected_scope.evaluated_window(),
+            )
+            .map_err(anyhow::Error::new)?;
+        self.strategy_identity().validate_against(expected_gene)
+    }
+
+    pub fn scope(&self) -> &CanonicalSearchArtifactScopeV2 {
+        self.envelope.scope()
+    }
+
+    pub fn search_config_hash(&self) -> &str {
+        self.envelope.search_config_hash()
+    }
+
+    pub fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        &self.envelope.payload().strategy_identity
+    }
+
+    pub fn summary(&self) -> &ForwardTestSummary {
+        &self.envelope.payload().summary
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        self.validate_internal()?;
+        self.envelope.to_json_bytes().map_err(anyhow::Error::new)
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        reject_legacy_metric_artifact_payload_v1(bytes, "forward test", 3)?;
+        reject_legacy_weak_validation_json(bytes, "forward-test")?;
+        let artifact = Self {
+            envelope: CanonicalSearchArtifactEnvelopeV2::from_json_bytes(bytes)
+                .map_err(anyhow::Error::new)?,
+        };
+        artifact.validate_internal()?;
+        Ok(artifact)
     }
 }
 
@@ -379,15 +639,19 @@ pub fn write_forward_test_validation_artifact_atomic(
     path: impl AsRef<Path>,
     artifact: &ForwardTestValidationArtifactFile,
 ) -> Result<()> {
+    artifact.validate_internal()?;
     write_json_atomic(path, artifact)
 }
 
 pub fn read_forward_test_validation_artifact(
     path: impl AsRef<Path>,
-    temporal_contract: &TemporalFeatureContract,
+    expected_scope: &CanonicalSearchArtifactScopeV2,
+    expected_search_config_hash: &str,
+    expected_gene: &Gene,
 ) -> Result<ForwardTestValidationArtifactFile> {
-    let artifact: ForwardTestValidationArtifactFile = read_json(path, "forward-test validation")?;
-    artifact.validate_for_temporal_contract(temporal_contract)?;
+    let bytes = read_artifact_bytes(path, "forward-test validation")?;
+    let artifact = ForwardTestValidationArtifactFile::from_json_bytes(&bytes)?;
+    artifact.validate_against(expected_scope, expected_search_config_hash, expected_gene)?;
     Ok(artifact)
 }
 
@@ -577,8 +841,10 @@ pub fn read_live_execution_simulation_artifact(
     path: impl AsRef<Path>,
     temporal_contract: &TemporalFeatureContract,
 ) -> Result<LiveExecutionSimulationArtifactFile> {
-    let artifact: LiveExecutionSimulationArtifactFile =
-        read_json(path, "live execution simulation")?;
+    let bytes = read_artifact_bytes(path, "live execution simulation")?;
+    reject_legacy_live_execution_simulation_v1(&bytes, 2)?;
+    let artifact: LiveExecutionSimulationArtifactFile = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("parse live execution simulation artifact: {error}"))?;
     artifact.validate_for_temporal_contract(temporal_contract)?;
     Ok(artifact)
 }
@@ -587,6 +853,7 @@ pub fn read_live_execution_simulation_artifact(
 /// field is a pass threshold (`<= 0.0` means "rule disabled" so callers
 /// can opt out per-field); booleans toggle structural rules.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PropFirmRiskRules {
     pub max_daily_loss_pct: f64,
     pub max_overall_drawdown_pct: f64,
@@ -621,7 +888,8 @@ impl Default for PropFirmRiskRules {
 /// Prop-firm validation summary — explicit per-rule pass/fail flags plus
 /// the worst observed values, so a downstream challenge gate can reject
 /// the artifact without re-running the simulation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PropFirmRiskValidationSummary {
     pub rules: PropFirmRiskRules,
     pub trades_observed: usize,
@@ -640,77 +908,127 @@ pub struct PropFirmRiskValidationSummary {
     pub all_rules_passed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PropFirmRiskValidationScope {
-    pub dataset_hash: String,
-    pub evaluation_config_hash: String,
-    pub strategy_hash: String,
-    pub rules_hash: String,
-    pub temporal_scope: TemporalScopeHashes,
-}
-
-impl PropFirmRiskValidationScope {
-    pub fn new(
-        dataset_hash: impl Into<String>,
-        evaluation_config_hash: impl Into<String>,
-        strategy_hash: impl Into<String>,
-        rules: &PropFirmRiskRules,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Result<Self> {
-        Ok(Self {
-            dataset_hash: dataset_hash.into(),
-            evaluation_config_hash: evaluation_config_hash.into(),
-            strategy_hash: strategy_hash.into(),
-            rules_hash: stable_json_hash(rules)?,
-            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
-        })
-    }
-
-    pub fn validate_temporal_contract(
-        &self,
-        temporal_contract: &TemporalFeatureContract,
-    ) -> Result<()> {
-        self.temporal_scope
-            .validate_contract(temporal_contract)
-            .map_err(|err| anyhow::anyhow!("prop firm risk validation {err}"))
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PropFirmRiskValidationPayloadV2 {
+    schema_version: u32,
+    strategy_identity: ValidationStrategyIdentityV2,
+    rules_hash: String,
+    summary: PropFirmRiskValidationSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct PropFirmRiskValidationArtifactFile {
-    pub artifact_kind: String,
-    pub artifact_schema_version: u32,
-    pub scope: PropFirmRiskValidationScope,
-    pub summary: PropFirmRiskValidationSummary,
+    envelope: CanonicalSearchArtifactEnvelopeV2<PropFirmRiskValidationPayloadV2>,
 }
 
 impl PropFirmRiskValidationArtifactFile {
-    pub fn new(scope: PropFirmRiskValidationScope, summary: PropFirmRiskValidationSummary) -> Self {
-        Self {
-            artifact_kind: PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND.to_string(),
-            artifact_schema_version: PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION,
-            scope,
-            summary,
-        }
+    pub fn new(
+        scope: CanonicalSearchArtifactScopeV2,
+        search_config_hash: impl Into<String>,
+        gene: &Gene,
+        summary: PropFirmRiskValidationSummary,
+    ) -> Result<Self> {
+        validate_holdout_scope(&scope, "prop-firm risk validation")?;
+        let rules_hash = stable_json_hash(&summary.rules)?;
+        let artifact = Self {
+            envelope: CanonicalSearchArtifactEnvelopeV2::new(
+                PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND,
+                scope,
+                search_config_hash,
+                PropFirmRiskValidationPayloadV2 {
+                    schema_version: PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION,
+                    strategy_identity: ValidationStrategyIdentityV2::from_gene(gene)?,
+                    rules_hash,
+                    summary,
+                },
+            )
+            .map_err(anyhow::Error::new)?,
+        };
+        artifact.validate_internal()?;
+        Ok(artifact)
     }
 
-    pub fn validate_for_temporal_contract(
+    fn validate_internal(&self) -> Result<()> {
+        self.envelope.validate().map_err(anyhow::Error::new)?;
+        if self.envelope.artifact_kind() != PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND {
+            bail!(
+                "wrong prop-firm risk validation artifact kind `{}`",
+                self.envelope.artifact_kind()
+            );
+        }
+        if self.envelope.payload().schema_version != PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION {
+            bail!(
+                "unsupported prop-firm risk validation payload schema version {}",
+                self.envelope.payload().schema_version
+            );
+        }
+        validate_holdout_scope(self.scope(), "prop-firm risk validation")?;
+        self.strategy_identity().validate_shape()?;
+        validate_fnv64_hash("prop-firm rules_hash", &self.envelope.payload().rules_hash)?;
+        let expected_rules_hash = stable_json_hash(&self.summary().rules)?;
+        if self.envelope.payload().rules_hash != expected_rules_hash {
+            bail!(
+                "prop-firm rules_hash `{}` does not match embedded summary rules `{expected_rules_hash}`",
+                self.envelope.payload().rules_hash
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
         &self,
-        temporal_contract: &TemporalFeatureContract,
+        expected_scope: &CanonicalSearchArtifactScopeV2,
+        expected_search_config_hash: &str,
+        expected_gene: &Gene,
     ) -> Result<()> {
-        if self.artifact_kind != PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND {
-            bail!(
-                "artifact kind {} cannot be used as a prop-firm risk validation artifact",
-                self.artifact_kind
-            );
-        }
-        if self.artifact_schema_version != PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION {
-            bail!(
-                "unsupported prop-firm risk validation schema version {}",
-                self.artifact_schema_version
-            );
-        }
-        self.scope.validate_temporal_contract(temporal_contract)
+        self.validate_internal()?;
+        validate_holdout_scope(expected_scope, "expected prop-firm risk validation")?;
+        self.envelope
+            .validate_against(
+                PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND,
+                expected_search_config_hash,
+                expected_scope.receipt(),
+                expected_scope.evaluated_window(),
+            )
+            .map_err(anyhow::Error::new)?;
+        self.strategy_identity().validate_against(expected_gene)
+    }
+
+    pub fn scope(&self) -> &CanonicalSearchArtifactScopeV2 {
+        self.envelope.scope()
+    }
+
+    pub fn search_config_hash(&self) -> &str {
+        self.envelope.search_config_hash()
+    }
+
+    pub fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        &self.envelope.payload().strategy_identity
+    }
+
+    pub fn summary(&self) -> &PropFirmRiskValidationSummary {
+        &self.envelope.payload().summary
+    }
+
+    pub fn rules_hash(&self) -> &str {
+        &self.envelope.payload().rules_hash
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        self.validate_internal()?;
+        self.envelope.to_json_bytes().map_err(anyhow::Error::new)
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        reject_legacy_weak_validation_json(bytes, "prop-firm risk")?;
+        let artifact = Self {
+            envelope: CanonicalSearchArtifactEnvelopeV2::from_json_bytes(bytes)
+                .map_err(anyhow::Error::new)?,
+        };
+        artifact.validate_internal()?;
+        Ok(artifact)
     }
 }
 
@@ -718,16 +1036,19 @@ pub fn write_prop_firm_risk_validation_artifact_atomic(
     path: impl AsRef<Path>,
     artifact: &PropFirmRiskValidationArtifactFile,
 ) -> Result<()> {
+    artifact.validate_internal()?;
     write_json_atomic(path, artifact)
 }
 
 pub fn read_prop_firm_risk_validation_artifact(
     path: impl AsRef<Path>,
-    temporal_contract: &TemporalFeatureContract,
+    expected_scope: &CanonicalSearchArtifactScopeV2,
+    expected_search_config_hash: &str,
+    expected_gene: &Gene,
 ) -> Result<PropFirmRiskValidationArtifactFile> {
-    let artifact: PropFirmRiskValidationArtifactFile =
-        read_json(path, "prop-firm risk validation")?;
-    artifact.validate_for_temporal_contract(temporal_contract)?;
+    let bytes = read_artifact_bytes(path, "prop-firm risk validation")?;
+    let artifact = PropFirmRiskValidationArtifactFile::from_json_bytes(&bytes)?;
+    artifact.validate_against(expected_scope, expected_search_config_hash, expected_gene)?;
     Ok(artifact)
 }
 
@@ -1089,9 +1410,7 @@ fn walkforward_risk_diagnostics_from_trades(
 pub fn embargoed_walkforward_backtest(
     input: WalkforwardBacktestInput<'_>,
 ) -> Result<WalkforwardSummary> {
-    neoethos_core::current_broker_financial_truth_capability_v1()
-        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
-        .map_err(anyhow::Error::new)?;
+    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
     let _scope = crate::eval_telemetry::CallerScope::enter("walkforward");
     let WalkforwardBacktestInput {
         close,
@@ -1393,7 +1712,10 @@ pub struct WindowEvaluation {
 
 impl From<Vec<[f64; 11]>> for WindowEvaluation {
     fn from(metrics: Vec<[f64; 11]>) -> Self {
-        Self { metrics, trades: None }
+        Self {
+            metrics,
+            trades: None,
+        }
     }
 }
 
@@ -1822,6 +2144,49 @@ mod tests {
         std::env::temp_dir().join(format!("forex-validation-{name}-{unique}.json"))
     }
 
+    const STRICT_SEARCH_CONFIG_HASH: &str = "fnv64:0123456789abcdef";
+
+    fn strict_gene() -> Gene {
+        Gene {
+            strategy_id: "strict-validation-gene".to_owned(),
+            indices: vec![0],
+            weights: vec![1.0],
+            ..Gene::default()
+        }
+    }
+
+    fn strict_validation_scopes() -> (
+        CanonicalSearchArtifactScopeV2,
+        CanonicalSearchArtifactScopeV2,
+    ) {
+        let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+        let anchor = features.provenance().bindings()[0]
+            .dataset_identity()
+            .clone();
+        let receipt = crate::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(
+            &anchor, &features,
+        )
+        .expect("strict validation test receipt");
+        let input = crate::data_selection::CanonicalSearchRunInputV2::new_for_test_values(
+            receipt, &features, &ohlcv,
+        )
+        .expect("strict validation test input");
+        let selection = CanonicalSearchArtifactScopeV2::from_run_input_range(
+            CanonicalSearchWindowRoleV1::InSample,
+            &input,
+            0..80,
+        )
+        .expect("strict selection scope");
+        let holdout = CanonicalSearchArtifactScopeV2::from_run_input_range(
+            CanonicalSearchWindowRoleV1::Holdout,
+            &input,
+            80..100,
+        )
+        .expect("strict holdout scope");
+        (selection, holdout)
+    }
+
     fn flat_settings() -> BacktestSettings {
         BacktestSettings {
             sl_pips: 1_000_000.0,
@@ -1893,55 +2258,65 @@ mod tests {
     }
 
     #[test]
-    fn walkforward_validation_artifact_binds_temporal_scope() {
-        let contract = temporal_contract("label-policy-v1");
-        let scope = WalkforwardValidationScope::new("dataset-a", "eval-a", &contract);
-        let artifact = WalkforwardValidationArtifactFile::new(scope.clone(), sample_summary());
+    fn walkforward_validation_artifact_binds_exact_search_authority() {
+        let (scope, _) = strict_validation_scopes();
+        let gene = strict_gene();
+        let artifact = WalkforwardValidationArtifactFile::new(
+            scope.clone(),
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+            sample_summary(),
+        )
+        .expect("strict walk-forward artifact");
 
-        assert_eq!(artifact.artifact_kind, WALKFORWARD_VALIDATION_ARTIFACT_KIND);
-        assert_eq!(artifact.scope, scope);
+        assert_eq!(artifact.scope(), &scope);
         artifact
-            .validate_for_temporal_contract(&contract)
-            .expect("matching temporal contract should validate");
+            .validate_against(&scope, STRICT_SEARCH_CONFIG_HASH, &gene)
+            .expect("matching exact authority should validate");
     }
 
     #[test]
-    fn walkforward_validation_artifact_rejects_temporal_drift_and_wrong_kind() {
-        let contract = temporal_contract("label-policy-v1");
-        let changed_contract = temporal_contract("label-policy-v2");
-        let scope = WalkforwardValidationScope::new("dataset-a", "eval-a", &contract);
-        let mut artifact = WalkforwardValidationArtifactFile::new(scope, sample_summary());
-
-        let err = artifact
-            .validate_for_temporal_contract(&changed_contract)
-            .expect_err("changed temporal contract must not validate");
-        assert!(err.to_string().contains("temporal_contract_hash"));
-
-        artifact.artifact_kind = "search_checkpoint_artifact".to_string();
-        let err = artifact
-            .validate_for_temporal_contract(&contract)
-            .expect_err("wrong artifact kind must not validate");
-        assert!(err.to_string().contains("cannot be used as a walk-forward"));
+    fn walkforward_validation_artifact_rejects_wrong_kind_on_the_wire() {
+        let (scope, _) = strict_validation_scopes();
+        let gene = strict_gene();
+        let artifact = WalkforwardValidationArtifactFile::new(
+            scope,
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+            sample_summary(),
+        )
+        .expect("strict walk-forward artifact");
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&artifact.to_json_bytes().expect("artifact JSON"))
+                .expect("parse artifact JSON");
+        wire["artifact_kind"] = serde_json::json!("search_checkpoint_artifact");
+        assert!(
+            WalkforwardValidationArtifactFile::from_json_bytes(
+                &serde_json::to_vec(&wire).expect("changed JSON")
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn walkforward_validation_artifact_uses_shared_atomic_io() {
-        let contract = temporal_contract("label-policy-v1");
-        let scope = WalkforwardValidationScope::new("dataset-a", "eval-a", &contract);
-        let artifact = WalkforwardValidationArtifactFile::new(scope, sample_summary());
+        let (scope, _) = strict_validation_scopes();
+        let gene = strict_gene();
+        let artifact = WalkforwardValidationArtifactFile::new(
+            scope.clone(),
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+            sample_summary(),
+        )
+        .expect("strict walk-forward artifact");
         let path = temp_path("artifact");
 
         write_walkforward_validation_artifact_atomic(&path, &artifact)
             .expect("atomic validation artifact write should succeed");
-        let loaded = read_walkforward_validation_artifact(&path, &contract)
-            .expect("matching validation artifact should load");
-        assert_eq!(loaded.artifact_kind, WALKFORWARD_VALIDATION_ARTIFACT_KIND);
-        assert_eq!(loaded.summary.walk_forward_splits, 1);
-
-        let changed_contract = temporal_contract("label-policy-v2");
-        let err = read_walkforward_validation_artifact(&path, &changed_contract)
-            .expect_err("temporal drift must reject persisted validation artifact");
-        assert!(err.to_string().contains("temporal_contract_hash"));
+        let loaded =
+            read_walkforward_validation_artifact(&path, &scope, STRICT_SEARCH_CONFIG_HASH, &gene)
+                .expect("matching validation artifact should load");
+        assert_eq!(loaded.summary().walk_forward_splits, 1);
 
         let _ = std::fs::remove_file(path);
     }
@@ -1960,35 +2335,57 @@ mod tests {
     }
 
     #[test]
-    fn canonical_backtest_artifact_uses_shared_atomic_io_and_temporal_scope() {
-        let contract = temporal_contract("label-policy-v1");
-        let scope = CanonicalBacktestScope::new("dataset-a", "eval-a", "strategy-a", &contract);
+    fn canonical_backtest_artifact_uses_shared_atomic_io_and_exact_scope() {
+        let (scope, holdout_scope) = strict_validation_scopes();
+        let gene = strict_gene();
         let artifact = CanonicalBacktestArtifactFile::new(
-            scope,
+            scope.clone(),
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
             BacktestMetrics::from_metric_array([
                 12.0, 1.5, 100_012.0, 0.02, 0.60, 1.8, 4.0, 0.0, 7.0, 0.9, 0.01,
             ]),
-        );
+        )
+        .expect("strict canonical artifact");
         let path = temp_path("canonical-backtest");
 
         write_canonical_backtest_artifact_atomic(&path, &artifact)
             .expect("atomic canonical backtest artifact write should succeed");
-        let loaded = read_canonical_backtest_artifact(&path, &contract)
-            .expect("matching canonical backtest artifact should load");
-        assert_eq!(loaded.artifact_kind, CANONICAL_BACKTEST_ARTIFACT_KIND);
-        assert_eq!(loaded.metrics.trade_count, 7);
+        let loaded =
+            read_canonical_backtest_artifact(&path, &scope, STRICT_SEARCH_CONFIG_HASH, &gene)
+                .expect("matching canonical backtest artifact should load");
+        assert_eq!(loaded.metrics().trade_count, 7);
 
-        let changed_contract = temporal_contract("label-policy-v2");
-        let err = read_canonical_backtest_artifact(&path, &changed_contract)
-            .expect_err("temporal drift must reject persisted backtest artifact");
-        assert!(err.to_string().contains("temporal_contract_hash"));
+        let mut legacy_wire: serde_json::Value =
+            serde_json::from_slice(&artifact.to_json_bytes().expect("artifact JSON"))
+                .expect("parse artifact JSON");
+        legacy_wire["payload"]["schema_version"] = serde_json::json!(2);
+        let legacy_error = CanonicalBacktestArtifactFile::from_json_bytes(
+            &serde_json::to_vec(&legacy_wire).expect("legacy JSON"),
+        )
+        .expect_err("legacy canonical metric persistence must fail closed");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("legacy metric artifacts omitted monthly_target_hit_rate")
+        );
+
+        assert!(
+            read_canonical_backtest_artifact(
+                &path,
+                &holdout_scope,
+                STRICT_SEARCH_CONFIG_HASH,
+                &gene,
+            )
+            .is_err()
+        );
 
         let _ = std::fs::remove_file(path);
     }
 
     fn sample_forward_test_summary() -> ForwardTestSummary {
         ForwardTestSummary {
-            bars: 5,
+            bars: 20,
             metrics: BacktestMetrics::from_metric_array([
                 25.0, 1.6, 100_025.0, 0.015, 0.62, 1.9, 5.0, 0.0, 5.0, 0.85, 0.008,
             ]),
@@ -1997,58 +2394,92 @@ mod tests {
     }
 
     #[test]
-    fn forward_test_artifact_binds_temporal_scope_and_rejects_drift() {
-        let contract = temporal_contract("label-policy-v1");
-        let scope =
-            ForwardTestValidationScope::new("dataset-tail", "eval-config", "strategy", &contract);
-        let artifact = ForwardTestValidationArtifactFile::new(scope, sample_forward_test_summary());
+    fn forward_test_artifact_binds_holdout_scope_and_rejects_selection_scope() {
+        let (selection_scope, holdout_scope) = strict_validation_scopes();
+        let gene = strict_gene();
+        let artifact = ForwardTestValidationArtifactFile::new(
+            holdout_scope.clone(),
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+            sample_forward_test_summary(),
+        )
+        .expect("strict forward-test artifact");
 
         artifact
-            .validate_for_temporal_contract(&contract)
-            .expect("matching contract should accept the forward-test artifact");
-
-        let drifted = temporal_contract("label-policy-v2");
-        let err = artifact
-            .validate_for_temporal_contract(&drifted)
-            .expect_err("temporal drift must reject the forward-test artifact");
-        assert!(err.to_string().contains("forward test"));
+            .validate_against(&holdout_scope, STRICT_SEARCH_CONFIG_HASH, &gene)
+            .expect("matching holdout authority should validate");
+        assert!(
+            ForwardTestValidationArtifactFile::new(
+                selection_scope,
+                STRICT_SEARCH_CONFIG_HASH,
+                &gene,
+                sample_forward_test_summary(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn forward_test_artifact_rejects_wrong_kind_and_unsupported_schema() {
-        let contract = temporal_contract("label-policy-v1");
-        let scope =
-            ForwardTestValidationScope::new("dataset-tail", "eval-config", "strategy", &contract);
-        let mut artifact =
-            ForwardTestValidationArtifactFile::new(scope, sample_forward_test_summary());
-        artifact.artifact_kind = "canonical_strategy_backtest_artifact".to_string();
-        let err = artifact
-            .validate_for_temporal_contract(&contract)
-            .expect_err("wrong artifact_kind must reject the forward-test load");
-        assert!(err.to_string().contains("forward-test validation artifact"));
-
-        artifact.artifact_kind = FORWARD_TEST_VALIDATION_ARTIFACT_KIND.to_string();
-        artifact.artifact_schema_version = FORWARD_TEST_VALIDATION_SCHEMA_VERSION + 1;
-        let err = artifact
-            .validate_for_temporal_contract(&contract)
-            .expect_err("unsupported schema must reject the forward-test load");
-        assert!(err.to_string().contains("forward-test validation schema"));
+        let (_, scope) = strict_validation_scopes();
+        let gene = strict_gene();
+        let artifact = ForwardTestValidationArtifactFile::new(
+            scope,
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+            sample_forward_test_summary(),
+        )
+        .expect("strict forward-test artifact");
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&artifact.to_json_bytes().expect("artifact JSON"))
+                .expect("parse artifact JSON");
+        wire["artifact_kind"] = serde_json::json!("canonical_strategy_backtest_artifact");
+        assert!(
+            ForwardTestValidationArtifactFile::from_json_bytes(
+                &serde_json::to_vec(&wire).expect("changed JSON")
+            )
+            .is_err()
+        );
+        wire["payload"]["schema_version"] = serde_json::json!(2);
+        let legacy_error = ForwardTestValidationArtifactFile::from_json_bytes(
+            &serde_json::to_vec(&wire).expect("legacy JSON"),
+        )
+        .expect_err("legacy forward metric persistence must fail closed");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("legacy metric artifacts omitted monthly_target_hit_rate")
+        );
+        wire["artifact_kind"] = serde_json::json!(FORWARD_TEST_VALIDATION_ARTIFACT_KIND);
+        wire["payload"]["schema_version"] =
+            serde_json::json!(FORWARD_TEST_VALIDATION_SCHEMA_VERSION + 1);
+        assert!(
+            ForwardTestValidationArtifactFile::from_json_bytes(
+                &serde_json::to_vec(&wire).expect("changed JSON")
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn forward_test_artifact_round_trips_through_atomic_io() {
-        let contract = temporal_contract("label-policy-v1");
-        let scope =
-            ForwardTestValidationScope::new("dataset-tail", "eval-config", "strategy", &contract);
-        let artifact = ForwardTestValidationArtifactFile::new(scope, sample_forward_test_summary());
+        let (_, scope) = strict_validation_scopes();
+        let gene = strict_gene();
+        let artifact = ForwardTestValidationArtifactFile::new(
+            scope.clone(),
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+            sample_forward_test_summary(),
+        )
+        .expect("strict forward-test artifact");
         let path = temp_path("forward-test");
 
         write_forward_test_validation_artifact_atomic(&path, &artifact)
             .expect("atomic forward-test artifact write should succeed");
-        let loaded = read_forward_test_validation_artifact(&path, &contract)
-            .expect("matching forward-test artifact should load");
-        assert_eq!(loaded.artifact_kind, FORWARD_TEST_VALIDATION_ARTIFACT_KIND);
-        assert_eq!(loaded.summary.bars, 5);
+        let loaded =
+            read_forward_test_validation_artifact(&path, &scope, STRICT_SEARCH_CONFIG_HASH, &gene)
+                .expect("matching forward-test artifact should load");
+        assert_eq!(loaded.summary().bars, 20);
 
         let _ = std::fs::remove_file(path);
     }
@@ -2192,6 +2623,21 @@ mod tests {
         );
         assert_eq!(loaded.summary.trades_simulated, 42);
 
+        let mut legacy_wire = serde_json::to_value(&artifact).expect("live artifact JSON");
+        legacy_wire["artifact_schema_version"] = serde_json::json!(1);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&legacy_wire).expect("legacy live JSON"),
+        )
+        .expect("write legacy live artifact");
+        let legacy_error = read_live_execution_simulation_artifact(&path, &contract)
+            .expect_err("legacy live metric persistence must fail closed");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("legacy artifacts omitted monthly_target_hit_rate")
+        );
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -2310,74 +2756,83 @@ mod tests {
 
     #[test]
     fn prop_firm_risk_artifact_round_trips_and_rejects_drift() {
-        let contract = temporal_contract("label-policy-v1");
+        let (selection_scope, scope) = strict_validation_scopes();
+        let gene = strict_gene();
         let rules = PropFirmRiskRules::default();
-        let scope = PropFirmRiskValidationScope::new(
-            "dataset",
-            "eval-config",
-            "strategy",
-            &rules,
-            &contract,
-        )
-        .expect("prop-firm scope construction should succeed");
         let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
             trades: &sample_prop_firm_trades(),
             initial_balance: 100_000.0,
             rules,
         });
-        let artifact = PropFirmRiskValidationArtifactFile::new(scope, summary);
+        let artifact = PropFirmRiskValidationArtifactFile::new(
+            scope.clone(),
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+            summary,
+        )
+        .expect("strict prop-firm artifact");
         let path = temp_path("prop-firm-risk-validation");
 
         write_prop_firm_risk_validation_artifact_atomic(&path, &artifact)
             .expect("atomic prop-firm artifact write should succeed");
-        let loaded = read_prop_firm_risk_validation_artifact(&path, &contract)
-            .expect("matching prop-firm artifact should load");
-        assert_eq!(
-            loaded.artifact_kind,
-            PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND
-        );
+        let loaded = read_prop_firm_risk_validation_artifact(
+            &path,
+            &scope,
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+        )
+        .expect("matching prop-firm artifact should load");
+        assert_eq!(loaded.strategy_identity().strategy_id(), gene.strategy_id);
 
-        let drifted = temporal_contract("label-policy-v2");
-        let err = read_prop_firm_risk_validation_artifact(&path, &drifted)
-            .expect_err("temporal drift must reject the prop-firm artifact load");
-        assert!(err.to_string().contains("temporal_contract_hash"));
+        assert!(
+            read_prop_firm_risk_validation_artifact(
+                &path,
+                &selection_scope,
+                STRICT_SEARCH_CONFIG_HASH,
+                &gene,
+            )
+            .is_err()
+        );
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn prop_firm_risk_artifact_rejects_wrong_kind_and_unsupported_schema() {
-        let contract = temporal_contract("label-policy-v1");
+        let (_, scope) = strict_validation_scopes();
+        let gene = strict_gene();
         let rules = PropFirmRiskRules::default();
-        let scope = PropFirmRiskValidationScope::new(
-            "dataset",
-            "eval-config",
-            "strategy",
-            &rules,
-            &contract,
-        )
-        .expect("scope construction should succeed");
         let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
             trades: &sample_prop_firm_trades(),
             initial_balance: 100_000.0,
             rules,
         });
-        let mut artifact = PropFirmRiskValidationArtifactFile::new(scope, summary);
-        artifact.artifact_kind = "live_execution_simulation_artifact".to_string();
-        let err = artifact
-            .validate_for_temporal_contract(&contract)
-            .expect_err("wrong artifact_kind must reject the prop-firm load");
+        let artifact = PropFirmRiskValidationArtifactFile::new(
+            scope,
+            STRICT_SEARCH_CONFIG_HASH,
+            &gene,
+            summary,
+        )
+        .expect("strict prop-firm artifact");
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&artifact.to_json_bytes().expect("artifact JSON"))
+                .expect("parse artifact JSON");
+        wire["artifact_kind"] = serde_json::json!("live_execution_simulation_artifact");
         assert!(
-            err.to_string()
-                .contains("prop-firm risk validation artifact")
+            PropFirmRiskValidationArtifactFile::from_json_bytes(
+                &serde_json::to_vec(&wire).expect("changed JSON")
+            )
+            .is_err()
         );
-
-        artifact.artifact_kind = PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND.to_string();
-        artifact.artifact_schema_version = PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION + 1;
-        let err = artifact
-            .validate_for_temporal_contract(&contract)
-            .expect_err("unsupported schema must reject the prop-firm load");
-        assert!(err.to_string().contains("prop-firm risk validation schema"));
+        wire["artifact_kind"] = serde_json::json!(PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND);
+        wire["payload"]["schema_version"] =
+            serde_json::json!(PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION + 1);
+        assert!(
+            PropFirmRiskValidationArtifactFile::from_json_bytes(
+                &serde_json::to_vec(&wire).expect("changed JSON")
+            )
+            .is_err()
+        );
     }
 }
 
@@ -2425,14 +2880,28 @@ mod risk_diagnostics_split_tests {
 
         // An empty list is "nothing measured", not "a perfect run".
         let empty = walkforward_risk_diagnostics_from_trades(
-            &[], &days, 0.05, 0.05, 0.10, 1, 10, 100_000.0,
+            &[],
+            &days,
+            0.05,
+            0.05,
+            0.10,
+            1,
+            10,
+            100_000.0,
         );
         assert_eq!(empty.max_consec_losses, 0);
 
         // And no day index means there is nothing to bucket by, so the result
         // is the default rather than an invented one.
         let no_days = walkforward_risk_diagnostics_from_trades(
-            &trades, &[], 0.05, 0.05, 0.10, 1, 10, 100_000.0,
+            &trades,
+            &[],
+            0.05,
+            0.05,
+            0.10,
+            1,
+            10,
+            100_000.0,
         );
         assert_eq!(no_days.max_consec_losses, 0);
     }
@@ -2481,7 +2950,14 @@ mod window_evaluation_tests {
             &trades, &days, 0.04, 0.05, 0.10, 1, 8, 100_000.0,
         );
         let b = walkforward_risk_diagnostics_from_trades(
-            &trades.clone(), &days, 0.04, 0.05, 0.10, 1, 8, 100_000.0,
+            &trades.clone(),
+            &days,
+            0.04,
+            0.05,
+            0.10,
+            1,
+            8,
+            100_000.0,
         );
         assert_eq!(a.max_consec_losses, b.max_consec_losses);
         assert_eq!(a.prop_compliant, b.prop_compliant);

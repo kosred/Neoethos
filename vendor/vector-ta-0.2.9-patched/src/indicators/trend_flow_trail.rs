@@ -1,29 +1,11 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde_wasm_bindgen;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::indicators::moving_averages::ema::{EmaParams, EmaStream};
 use crate::indicators::moving_averages::hma::{HmaParams, HmaStream};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use thiserror::Error;
 
@@ -68,10 +50,6 @@ pub enum TrendFlowTrailData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TrendFlowTrailOutput {
     pub alpha_trail: Vec<f64>,
     pub alpha_trail_bullish: Vec<f64>,
@@ -93,10 +71,6 @@ pub struct TrendFlowTrailOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TrendFlowTrailParams {
     pub alpha_length: Option<usize>,
     pub alpha_multiplier: Option<f64>,
@@ -294,7 +268,9 @@ pub enum TrendFlowTrailError {
     EmptyInputData,
     #[error("trend_flow_trail: all values are NaN.")]
     AllValuesNaN,
-    #[error("trend_flow_trail: inconsistent slice lengths: open={open_len}, high={high_len}, low={low_len}, close={close_len}, volume={volume_len}")]
+    #[error(
+        "trend_flow_trail: inconsistent slice lengths: open={open_len}, high={high_len}, low={low_len}, close={close_len}, volume={volume_len}"
+    )]
     InconsistentSliceLengths {
         open_len: usize,
         high_len: usize,
@@ -554,11 +530,7 @@ impl TrendFlowTrailState {
         let alpha_dir = if prev_trail.is_none() {
             1.0
         } else if prev_trail == Some(prev_upper) {
-            if close > upper {
-                -1.0
-            } else {
-                1.0
-            }
+            if close > upper { -1.0 } else { 1.0 }
         } else if close < lower {
             1.0
         } else {
@@ -1018,7 +990,6 @@ pub fn trend_flow_trail_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[allow(clippy::too_many_arguments)]
 pub fn trend_flow_trail_into(
     alpha_trail_out: &mut [f64],
@@ -1171,10 +1142,6 @@ impl TrendFlowTrailBatchBuilder {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TrendFlowTrailBatchOutput {
     pub rows: usize,
     pub cols: usize,
@@ -1520,511 +1487,6 @@ pub fn trend_flow_trail_batch_par_slice(
     trend_flow_trail_batch_with_kernel(open, high, low, close, volume, sweep, kernel)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "trend_flow_trail")]
-#[pyo3(signature = (open, high, low, close, volume, alpha_length=DEFAULT_ALPHA_LENGTH, alpha_multiplier=DEFAULT_ALPHA_MULTIPLIER, mfi_length=DEFAULT_MFI_LENGTH, kernel=None))]
-pub fn trend_flow_trail_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    alpha_length: usize,
-    alpha_multiplier: f64,
-    mfi_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let kernel = validate_kernel(kernel, false)?;
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let volume = volume.as_slice()?;
-    let input = TrendFlowTrailInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        TrendFlowTrailParams {
-            alpha_length: Some(alpha_length),
-            alpha_multiplier: Some(alpha_multiplier),
-            mfi_length: Some(mfi_length),
-        },
-    );
-    let out = py
-        .allow_threads(|| trend_flow_trail_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("alpha_trail", out.alpha_trail.into_pyarray(py))?;
-    dict.set_item(
-        "alpha_trail_bullish",
-        out.alpha_trail_bullish.into_pyarray(py),
-    )?;
-    dict.set_item(
-        "alpha_trail_bearish",
-        out.alpha_trail_bearish.into_pyarray(py),
-    )?;
-    dict.set_item("alpha_dir", out.alpha_dir.into_pyarray(py))?;
-    dict.set_item("mfi", out.mfi.into_pyarray(py))?;
-    dict.set_item("tp_upper", out.tp_upper.into_pyarray(py))?;
-    dict.set_item("tp_lower", out.tp_lower.into_pyarray(py))?;
-    dict.set_item(
-        "alpha_trail_bullish_switch",
-        out.alpha_trail_bullish_switch.into_pyarray(py),
-    )?;
-    dict.set_item(
-        "alpha_trail_bearish_switch",
-        out.alpha_trail_bearish_switch.into_pyarray(py),
-    )?;
-    dict.set_item("mfi_overbought", out.mfi_overbought.into_pyarray(py))?;
-    dict.set_item("mfi_oversold", out.mfi_oversold.into_pyarray(py))?;
-    dict.set_item("mfi_cross_up_mid", out.mfi_cross_up_mid.into_pyarray(py))?;
-    dict.set_item(
-        "mfi_cross_down_mid",
-        out.mfi_cross_down_mid.into_pyarray(py),
-    )?;
-    dict.set_item(
-        "price_cross_alpha_trail_up",
-        out.price_cross_alpha_trail_up.into_pyarray(py),
-    )?;
-    dict.set_item(
-        "price_cross_alpha_trail_down",
-        out.price_cross_alpha_trail_down.into_pyarray(py),
-    )?;
-    dict.set_item("mfi_above_90", out.mfi_above_90.into_pyarray(py))?;
-    dict.set_item("mfi_below_10", out.mfi_below_10.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "trend_flow_trail_batch")]
-#[pyo3(signature = (open, high, low, close, volume, alpha_length_range=(DEFAULT_ALPHA_LENGTH, DEFAULT_ALPHA_LENGTH, 0), alpha_multiplier_range=(DEFAULT_ALPHA_MULTIPLIER, DEFAULT_ALPHA_MULTIPLIER, 0.0), mfi_length_range=(DEFAULT_MFI_LENGTH, DEFAULT_MFI_LENGTH, 0), kernel=None))]
-pub fn trend_flow_trail_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    alpha_length_range: (usize, usize, usize),
-    alpha_multiplier_range: (f64, f64, f64),
-    mfi_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let kernel = validate_kernel(kernel, true)?;
-    let out = trend_flow_trail_batch_with_kernel(
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        volume.as_slice()?,
-        &TrendFlowTrailBatchRange {
-            alpha_length: alpha_length_range,
-            alpha_multiplier: alpha_multiplier_range,
-            mfi_length: mfi_length_range,
-        },
-        kernel,
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("rows", out.rows)?;
-    dict.set_item("cols", out.cols)?;
-    dict.set_item(
-        "alpha_trail",
-        out.alpha_trail
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "alpha_trail_bullish",
-        out.alpha_trail_bullish
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "alpha_trail_bearish",
-        out.alpha_trail_bearish
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "alpha_dir",
-        out.alpha_dir
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mfi",
-        out.mfi.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "tp_upper",
-        out.tp_upper
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "tp_lower",
-        out.tp_lower
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "alpha_trail_bullish_switch",
-        out.alpha_trail_bullish_switch
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "alpha_trail_bearish_switch",
-        out.alpha_trail_bearish_switch
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mfi_overbought",
-        out.mfi_overbought
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mfi_oversold",
-        out.mfi_oversold
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mfi_cross_up_mid",
-        out.mfi_cross_up_mid
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mfi_cross_down_mid",
-        out.mfi_cross_down_mid
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "price_cross_alpha_trail_up",
-        out.price_cross_alpha_trail_up
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "price_cross_alpha_trail_down",
-        out.price_cross_alpha_trail_down
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mfi_above_90",
-        out.mfi_above_90
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mfi_below_10",
-        out.mfi_below_10
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "TrendFlowTrailStream")]
-pub struct TrendFlowTrailStreamPy {
-    inner: TrendFlowTrailStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl TrendFlowTrailStreamPy {
-    #[new]
-    #[pyo3(signature = (alpha_length=None, alpha_multiplier=None, mfi_length=None))]
-    pub fn new(
-        alpha_length: Option<usize>,
-        alpha_multiplier: Option<f64>,
-        mfi_length: Option<usize>,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            inner: TrendFlowTrailStream::try_new(TrendFlowTrailParams {
-                alpha_length,
-                alpha_multiplier,
-                mfi_length,
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-
-    pub fn update(
-        &mut self,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: f64,
-    ) -> Option<Vec<f64>> {
-        self.inner
-            .update(open, high, low, close, volume)
-            .map(|row| {
-                vec![
-                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
-                    row.11, row.12, row.13, row.14, row.15, row.16,
-                ]
-            })
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_flow_trail_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    alpha_length: usize,
-    alpha_multiplier: f64,
-    mfi_length: usize,
-) -> Result<JsValue, JsValue> {
-    let out = trend_flow_trail_with_kernel(
-        &TrendFlowTrailInput::from_slices(
-            open,
-            high,
-            low,
-            close,
-            volume,
-            TrendFlowTrailParams {
-                alpha_length: Some(alpha_length),
-                alpha_multiplier: Some(alpha_multiplier),
-                mfi_length: Some(mfi_length),
-            },
-        ),
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_flow_trail_alloc(len: usize) -> *mut f64 {
-    let mut values = Vec::<f64>::with_capacity(len);
-    let ptr = values.as_mut_ptr();
-    std::mem::forget(values);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_flow_trail_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn trend_flow_trail_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    alpha_trail_ptr: *mut f64,
-    alpha_trail_bullish_ptr: *mut f64,
-    alpha_trail_bearish_ptr: *mut f64,
-    alpha_dir_ptr: *mut f64,
-    mfi_ptr: *mut f64,
-    tp_upper_ptr: *mut f64,
-    tp_lower_ptr: *mut f64,
-    alpha_trail_bullish_switch_ptr: *mut f64,
-    alpha_trail_bearish_switch_ptr: *mut f64,
-    mfi_overbought_ptr: *mut f64,
-    mfi_oversold_ptr: *mut f64,
-    mfi_cross_up_mid_ptr: *mut f64,
-    mfi_cross_down_mid_ptr: *mut f64,
-    price_cross_alpha_trail_up_ptr: *mut f64,
-    price_cross_alpha_trail_down_ptr: *mut f64,
-    mfi_above_90_ptr: *mut f64,
-    mfi_below_10_ptr: *mut f64,
-    len: usize,
-    alpha_length: usize,
-    alpha_multiplier: f64,
-    mfi_length: usize,
-) -> Result<(), JsValue> {
-    unsafe {
-        trend_flow_trail_into_slice(
-            std::slice::from_raw_parts_mut(alpha_trail_ptr, len),
-            std::slice::from_raw_parts_mut(alpha_trail_bullish_ptr, len),
-            std::slice::from_raw_parts_mut(alpha_trail_bearish_ptr, len),
-            std::slice::from_raw_parts_mut(alpha_dir_ptr, len),
-            std::slice::from_raw_parts_mut(mfi_ptr, len),
-            std::slice::from_raw_parts_mut(tp_upper_ptr, len),
-            std::slice::from_raw_parts_mut(tp_lower_ptr, len),
-            std::slice::from_raw_parts_mut(alpha_trail_bullish_switch_ptr, len),
-            std::slice::from_raw_parts_mut(alpha_trail_bearish_switch_ptr, len),
-            std::slice::from_raw_parts_mut(mfi_overbought_ptr, len),
-            std::slice::from_raw_parts_mut(mfi_oversold_ptr, len),
-            std::slice::from_raw_parts_mut(mfi_cross_up_mid_ptr, len),
-            std::slice::from_raw_parts_mut(mfi_cross_down_mid_ptr, len),
-            std::slice::from_raw_parts_mut(price_cross_alpha_trail_up_ptr, len),
-            std::slice::from_raw_parts_mut(price_cross_alpha_trail_down_ptr, len),
-            std::slice::from_raw_parts_mut(mfi_above_90_ptr, len),
-            std::slice::from_raw_parts_mut(mfi_below_10_ptr, len),
-            &TrendFlowTrailInput::from_slices(
-                std::slice::from_raw_parts(open_ptr, len),
-                std::slice::from_raw_parts(high_ptr, len),
-                std::slice::from_raw_parts(low_ptr, len),
-                std::slice::from_raw_parts(close_ptr, len),
-                std::slice::from_raw_parts(volume_ptr, len),
-                TrendFlowTrailParams {
-                    alpha_length: Some(alpha_length),
-                    alpha_multiplier: Some(alpha_multiplier),
-                    mfi_length: Some(mfi_length),
-                },
-            ),
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TrendFlowTrailBatchConfig {
-    pub alpha_length_range: (usize, usize, usize),
-    pub alpha_multiplier_range: (f64, f64, f64),
-    pub mfi_length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = trend_flow_trail_batch)]
-pub fn trend_flow_trail_batch_unified_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: TrendFlowTrailBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let out = trend_flow_trail_batch_with_kernel(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        &TrendFlowTrailBatchRange {
-            alpha_length: config.alpha_length_range,
-            alpha_multiplier: config.alpha_multiplier_range,
-            mfi_length: config.mfi_length_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct TrendFlowTrailStreamWasm {
-    inner: TrendFlowTrailStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl TrendFlowTrailStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        alpha_length: Option<usize>,
-        alpha_multiplier: Option<f64>,
-        mfi_length: Option<usize>,
-    ) -> Result<Self, JsValue> {
-        Ok(Self {
-            inner: TrendFlowTrailStream::try_new(TrendFlowTrailParams {
-                alpha_length,
-                alpha_multiplier,
-                mfi_length,
-            })
-            .map_err(|e| JsValue::from_str(&e.to_string()))?,
-        })
-    }
-
-    pub fn update(
-        &mut self,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: f64,
-    ) -> Result<JsValue, JsValue> {
-        let value = self
-            .inner
-            .update(open, high, low, close, volume)
-            .map(|row| {
-                vec![
-                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
-                    row.11, row.12, row.13, row.14, row.15, row.16,
-                ]
-            });
-        serde_wasm_bindgen::to_value(&value).map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_flow_trail_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    alpha_length: usize,
-    alpha_multiplier: f64,
-    mfi_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = trend_flow_trail_js(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        alpha_length,
-        alpha_multiplier,
-        mfi_length,
-    )?;
-    crate::write_wasm_object_f64_outputs("trend_flow_trail_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_flow_trail_batch_unified_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = trend_flow_trail_batch_unified_js(open, high, low, close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "trend_flow_trail_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2099,6 +1561,89 @@ mod tests {
             }
         }
         assert_series_eq(&alpha_trail, &out.alpha_trail);
+        Ok(())
+    }
+
+    #[test]
+    fn trend_flow_trail_matches_hand_derived_minimal_vector() -> Result<(), TrendFlowTrailError> {
+        // Independent arithmetic fixture, intentionally not built from the
+        // production HMA/EMA helpers. With alpha_length=1 the price basis is
+        // CLOSE and the constant high-low range 2.0 makes spread exactly 0.2.
+        // With mfi_length=1, alternating price changes make raw MFI alternate
+        // 100/0 after the initial undefined 0/0. HMA(7) therefore yields:
+        //   row 8: (1600/21 + 2*(500/21)) / 3 = 2600/63
+        //   row 9: ( 500/21 + 2*(1600/21)) / 3 = 3700/63
+        // This exercises the first valid row, both direction transitions and
+        // the corresponding MFI/price crossing flags without accepting the
+        // current implementation as its own oracle.
+        let close = vec![
+            100.0, 101.0, 100.0, 101.0, 100.0, 101.0, 100.0, 101.0, 100.0, 101.0, 100.0, 101.0,
+        ];
+        let open = close.clone();
+        let high: Vec<f64> = close.iter().map(|value| value + 1.0).collect();
+        let low: Vec<f64> = close.iter().map(|value| value - 1.0).collect();
+        let volume = vec![1.0; close.len()];
+        let input = TrendFlowTrailInput::from_slices(
+            &open,
+            &high,
+            &low,
+            &close,
+            &volume,
+            TrendFlowTrailParams {
+                alpha_length: Some(1),
+                alpha_multiplier: Some(0.1),
+                mfi_length: Some(1),
+            },
+        );
+
+        let out = trend_flow_trail_with_kernel(&input, Kernel::Scalar)?;
+        for index in 0..8 {
+            assert!(
+                out.alpha_trail[index].is_nan(),
+                "row {index} must be warmup"
+            );
+            assert!(out.mfi[index].is_nan(), "row {index} MFI must be warmup");
+        }
+
+        let expected_mfi = [2600.0 / 63.0, 3700.0 / 63.0, 2600.0 / 63.0];
+        for (offset, expected) in expected_mfi.into_iter().enumerate() {
+            let index = 8 + offset;
+            assert!(
+                (out.mfi[index] - expected).abs() <= 1.0e-12,
+                "row {index}: expected hand-derived MFI {expected:.17}, got {:.17}",
+                out.mfi[index]
+            );
+        }
+
+        assert!((out.alpha_trail[8] - 100.2).abs() <= 1.0e-12);
+        assert_eq!(out.alpha_dir[8], 1.0);
+        assert!(out.alpha_trail_bullish[8].is_nan());
+        assert!((out.alpha_trail_bearish[8] - 100.2).abs() <= 1.0e-12);
+
+        assert!((out.alpha_trail[9] - 100.8).abs() <= 1.0e-12);
+        assert_eq!(out.alpha_dir[9], -1.0);
+        assert!((out.alpha_trail_bullish[9] - 100.8).abs() <= 1.0e-12);
+        assert!(out.alpha_trail_bearish[9].is_nan());
+        assert_eq!(out.alpha_trail_bearish_switch[9], 1.0);
+        assert_eq!(out.mfi_cross_up_mid[9], 1.0);
+        assert_eq!(out.price_cross_alpha_trail_up[9], 1.0);
+
+        assert!((out.alpha_trail[10] - 100.2).abs() <= 1.0e-12);
+        assert_eq!(out.alpha_dir[10], 1.0);
+        assert_eq!(out.alpha_trail_bullish_switch[10], 1.0);
+        assert_eq!(out.mfi_cross_down_mid[10], 1.0);
+        assert_eq!(out.price_cross_alpha_trail_down[10], 1.0);
+
+        for output in [
+            &out.tp_upper,
+            &out.tp_lower,
+            &out.mfi_overbought,
+            &out.mfi_oversold,
+            &out.mfi_above_90,
+            &out.mfi_below_10,
+        ] {
+            assert!(output[8].is_nan() && output[9].is_nan() && output[10].is_nan());
+        }
         Ok(())
     }
 }

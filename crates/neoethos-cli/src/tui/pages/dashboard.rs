@@ -11,6 +11,15 @@ use crate::tui::app::AppShared;
 use crate::tui::theme;
 use crate::tui::widgets::kpi::Kpi;
 
+#[derive(Clone, Debug, Default)]
+struct DatasetSummary {
+    symbol_count: usize,
+    max_timeframes: usize,
+    exact_entries: Vec<String>,
+    rejections: Vec<String>,
+    scan_error: Option<String>,
+}
+
 pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
     // Top row: 4 KPI cards.
     let rows = Layout::default()
@@ -33,9 +42,13 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
         .spacing(1)
         .split(rows[0]);
 
-    let (sym_count, tf_count) = dataset_summary(shared);
-    Kpi::new("Symbols", sym_count.to_string())
-        .sub(format!("{tf_count} timeframes each"))
+    let dataset = dataset_summary(shared);
+    Kpi::new("Symbols", dataset.symbol_count.to_string())
+        .sub(format!(
+            "{} max TF · {} exact IDs",
+            dataset.max_timeframes,
+            dataset.exact_entries.len()
+        ))
         .value_style(theme::accent_style())
         .render(kpi_cols[0], buf);
 
@@ -68,16 +81,21 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
         .spacing(1)
         .split(rows[1]);
 
-    render_recent_activity(bottom_cols[0], buf, shared);
+    render_recent_activity(bottom_cols[0], buf, shared, &dataset);
     render_quick_start(bottom_cols[1], buf);
 }
 
-fn render_recent_activity(area: Rect, buf: &mut Buffer, shared: &AppShared) {
+fn render_recent_activity(
+    area: Rect,
+    buf: &mut Buffer,
+    shared: &AppShared,
+    dataset: &DatasetSummary,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::BORDER))
         .title(Span::styled(
-            " RECENT ACTIVITY ",
+            " DATASET INVENTORY / RECENT ACTIVITY ",
             theme::caption_style().add_modifier(Modifier::BOLD),
         ))
         .style(theme::panel_block_style())
@@ -85,7 +103,8 @@ fn render_recent_activity(area: Rect, buf: &mut Buffer, shared: &AppShared) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let lines = recent_activity_lines(shared);
+    let mut lines = dataset_inventory_lines(dataset);
+    lines.extend(recent_activity_lines(shared));
     let body = if lines.is_empty() {
         vec![Line::styled(
             "No recent runs. Tab to Discover (2) or Train (5) to start one.",
@@ -165,31 +184,111 @@ fn render_quick_start(area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn dataset_summary(shared: &AppShared) -> (usize, usize) {
-    let mut symbols = 0usize;
-    let mut max_tfs = 0usize;
-    if let Ok(read) = std::fs::read_dir(&shared.data_root) {
-        for entry in read.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("symbol=") {
-                continue;
-            }
-            symbols += 1;
-            let tfs = std::fs::read_dir(entry.path())
-                .map(|inner| {
-                    inner
-                        .flatten()
-                        .filter(|e| e.file_name().to_string_lossy().starts_with("timeframe="))
-                        .count()
-                })
-                .unwrap_or(0);
-            if tfs > max_tfs {
-                max_tfs = tfs;
-            }
+fn dataset_summary(shared: &AppShared) -> DatasetSummary {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    type InventoryCache = Option<(Instant, std::path::PathBuf, DatasetSummary)>;
+    static CACHE: Mutex<InventoryCache> = Mutex::new(None);
+    {
+        let guard = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((updated_at, cached_root, cached)) = guard.as_ref()
+            && cached_root == &shared.data_root
+            && updated_at.elapsed() < Duration::from_secs(2)
+        {
+            return cached.clone();
         }
     }
-    (symbols, max_tfs)
+    let summary = build_dataset_summary(&shared.data_root);
+    *CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((Instant::now(), shared.data_root.clone(), summary.clone()));
+    summary
+}
+
+fn build_dataset_summary(data_root: &std::path::Path) -> DatasetSummary {
+    let mut summary = DatasetSummary::default();
+    let report = match neoethos_data::DatasetDiscovery::scan_metadata(data_root) {
+        Ok(report) => report,
+        Err(error) => {
+            summary.scan_error = Some(format!("root={} detail={error:#}", data_root.display()));
+            return summary;
+        }
+    };
+    let mut timeframes_by_symbol =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for entry in report.entries {
+        let (Some(symbol), Some(timeframe)) = (entry.symbol, entry.timeframe) else {
+            summary.rejections.push(format!(
+                "path={} category=invalid_inventory_entry detail=missing symbol/timeframe for identity={} generation={} manifest_binding_sha256={} verification={:?}",
+                entry.path.display(),
+                entry.dataset_identity,
+                entry.generation,
+                entry.manifest_binding_sha256,
+                entry.verification
+            ));
+            continue;
+        };
+        timeframes_by_symbol
+            .entry(symbol.clone())
+            .or_default()
+            .insert(timeframe.clone());
+        summary.exact_entries.push(format!(
+            "{symbol} {timeframe} identity={} generation={} manifest_binding_sha256={} verification={:?}",
+            entry.dataset_identity,
+            entry.generation,
+            entry.manifest_binding_sha256,
+            entry.verification
+        ));
+    }
+    summary.symbol_count = timeframes_by_symbol.len();
+    summary.max_timeframes = timeframes_by_symbol
+        .values()
+        .map(std::collections::BTreeSet::len)
+        .max()
+        .unwrap_or(0);
+    summary
+        .rejections
+        .extend(report.skipped.into_iter().map(|skipped| {
+            format!(
+                "path={} category={} detail={:?}",
+                skipped.path.display(),
+                skipped.reason.category(),
+                skipped.reason
+            )
+        }));
+    summary
+}
+
+fn dataset_inventory_lines(summary: &DatasetSummary) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(error) = &summary.scan_error {
+        lines.push(Line::styled(
+            format!("  INVENTORY ERROR {error}"),
+            theme::sell_style(),
+        ));
+    }
+    lines.extend(
+        summary
+            .exact_entries
+            .iter()
+            .map(|entry| Line::styled(format!("  DATASET {entry}"), theme::caption_style())),
+    );
+    lines.extend(
+        summary
+            .rejections
+            .iter()
+            .map(|rejected| Line::styled(format!("  REJECTED {rejected}"), theme::warn_style())),
+    );
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "  INVENTORY: no canonical manifest entries",
+            theme::warn_style(),
+        ));
+    }
+    lines
 }
 
 fn portfolio_count(shared: &AppShared) -> usize {

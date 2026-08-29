@@ -1,25 +1,11 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{alloc_with_nan_prefix, init_matrix_prefixes, make_uninit_matrix};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::convert::AsRef;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[inline(always)]
 fn edcf_source<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
@@ -32,11 +18,6 @@ fn edcf_source<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
         _ => source_type(candles, source),
     }
 }
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
 
 #[derive(Debug, Clone)]
 pub enum EdcfData<'a> {
@@ -58,10 +39,6 @@ impl<'a> AsRef<[f64]> for EdcfInput<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 
 pub struct EdcfParams {
     pub period: Option<usize>,
@@ -275,7 +252,6 @@ pub fn edcf_with_kernel(input: &EdcfInput, kernel: Kernel) -> Result<EdcfOutput,
     Ok(EdcfOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn edcf_into(input: &EdcfInput, out: &mut [f64]) -> Result<(), EdcfError> {
     let (data, period, first, warm, chosen) = edcf_prepare(input, Kernel::Auto)?;
@@ -556,10 +532,6 @@ fn fast_div(num: f64, den: f64) -> f64 {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EdcfBatchRange {
     pub period: (usize, usize, usize),
 }
@@ -861,63 +833,14 @@ unsafe fn edcf_row_avx512(data: &[f64], first: usize, period: usize, out: &mut [
     edcf_avx512(data, period, first, out);
 }
 
-#[cfg(feature = "python")]
-pub fn register_edcf_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(edcf_py, m)?)?;
-    m.add_function(wrap_pyfunction!(edcf_batch_py, m)?)?;
-    m.add_class::<EdcfStreamPy>()?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(edcf_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(edcf_cuda_many_series_one_param_dev_py, m)?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = edcf_js(data, period)?;
-    crate::write_wasm_f64_output("edcf_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = edcf_batch_js(data, period_start, period_end, period_step)?;
-    crate::write_wasm_f64_output("edcf_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = edcf_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("edcf_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use proptest::prelude::*;
     use std::error::Error;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_edcf_into_matches_api() -> Result<(), Box<dyn Error>> {
         let mut data: Vec<f64> = Vec::new();
@@ -958,8 +881,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EdcfInput::from_candles(&candles, "close", EdcfParams { period: None });
         let result = edcf_with_kernel(&input, kernel)?;
         assert_eq!(result.values.len(), candles.close.len());
@@ -971,8 +894,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EdcfInput::from_candles(&candles, "hl2", EdcfParams { period: Some(15) });
         let result = edcf_with_kernel(&input, kernel)?;
         let expected = [
@@ -1002,8 +925,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EdcfInput::with_default_candles(&candles);
         match input.data {
             EdcfData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1067,8 +990,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_input =
             EdcfInput::from_candles(&candles, "close", EdcfParams { period: Some(15) });
         let first_result = edcf_with_kernel(&first_input, kernel)?;
@@ -1093,8 +1016,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 15;
         let input = EdcfInput::from_candles(
             &candles,
@@ -1119,8 +1042,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EdcfInput::from_candles(&candles, "close", EdcfParams { period: Some(15) });
         let _batch = edcf_with_kernel(&input, kernel)?;
@@ -1140,8 +1063,8 @@ mod tests {
     fn check_edcf_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_periods = vec![3, 5, 10, 15, 30, 50, 100, 200];
         let test_sources = vec!["open", "high", "low", "close", "hl2", "hlc3", "ohlc4"];
@@ -1308,21 +1231,27 @@ mod tests {
         })?;
 
         assert!(edcf(&EdcfInput::from_slice(&[], EdcfParams::default())).is_err());
-        assert!(edcf(&EdcfInput::from_slice(
-            &[f64::NAN; 12],
-            EdcfParams::default()
-        ))
-        .is_err());
-        assert!(edcf(&EdcfInput::from_slice(
-            &[1.0; 5],
-            EdcfParams { period: Some(8) }
-        ))
-        .is_err());
-        assert!(edcf(&EdcfInput::from_slice(
-            &[1.0; 5],
-            EdcfParams { period: Some(0) }
-        ))
-        .is_err());
+        assert!(
+            edcf(&EdcfInput::from_slice(
+                &[f64::NAN; 12],
+                EdcfParams::default()
+            ))
+            .is_err()
+        );
+        assert!(
+            edcf(&EdcfInput::from_slice(
+                &[1.0; 5],
+                EdcfParams { period: Some(8) }
+            ))
+            .is_err()
+        );
+        assert!(
+            edcf(&EdcfInput::from_slice(
+                &[1.0; 5],
+                EdcfParams { period: Some(0) }
+            ))
+            .is_err()
+        );
 
         Ok(())
     }
@@ -1386,8 +1315,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = EdcfBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1401,8 +1330,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_sources = vec!["open", "high", "low", "close", "hl2", "hlc3", "ohlc4"];
 
@@ -1465,9 +1394,9 @@ mod tests {
                     || bits == 0x33333333_33333333
                 {
                     panic!(
-						"[{}] Found poison value {} (0x{:016X}) at row {} col {} with range ({},{},{})",
-						test, val, bits, row, col, start, end, step
-					);
+                        "[{}] Found poison value {} (0x{:016X}) at row {} col {} with range ({},{},{})",
+                        test, val, bits, row, col, start, end, step
+                    );
                 }
             }
         }
@@ -1507,421 +1436,4 @@ mod tests {
 
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "edcf")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn edcf_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = EdcfParams {
-        period: Some(period),
-    };
-    let edcf_in = EdcfInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| edcf_with_kernel(&edcf_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EdcfStream")]
-pub struct EdcfStreamPy {
-    stream: EdcfStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EdcfStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = EdcfParams {
-            period: Some(period),
-        };
-        let stream =
-            EdcfStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(EdcfStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "edcf_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn edcf_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-
-    let sweep = EdcfBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("edcf_batch: rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    if !slice_in.is_empty() && rows > 0 {
-        if let Some(first) = slice_in.iter().position(|x| !x.is_nan()) {
-            let warm: Vec<usize> = combos
-                .iter()
-                .map(|c| {
-                    let period = c.period.unwrap_or(15);
-                    let w = first + 2 * period;
-                    if w > cols {
-                        cols
-                    } else {
-                        w
-                    }
-                })
-                .collect();
-
-            let buf_mu: &mut [MaybeUninit<f64>] = unsafe {
-                core::slice::from_raw_parts_mut(
-                    slice_out.as_mut_ptr() as *mut MaybeUninit<f64>,
-                    slice_out.len(),
-                )
-            };
-            init_matrix_prefixes(buf_mu, cols, &warm);
-        }
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => Kernel::ScalarBatch,
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            edcf_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "edcf_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn edcf_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::CudaEdcf;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = EdcfBatchRange {
-        period: period_range,
-    };
-
-    let (inner, dev_id) = py.allow_threads(|| {
-        let cuda = CudaEdcf::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let out = cuda
-            .edcf_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out, dev_id))
-    })?;
-
-    make_device_array_py(dev_id as usize, inner)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "edcf_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn edcf_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::CudaEdcf;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in: &[f32] = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = EdcfParams {
-        period: Some(period),
-    };
-
-    let (inner, dev_id) = py.allow_threads(|| {
-        let mut cuda =
-            CudaEdcf::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let out = cuda
-            .edcf_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out, dev_id))
-    })?;
-
-    make_device_array_py(dev_id as usize, inner)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = EdcfParams {
-        period: Some(period),
-    };
-    let input = EdcfInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    edcf_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = EdcfBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    edcf_batch_inner(data, &sweep, Kernel::Scalar, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = EdcfBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let metadata: Vec<f64> = combos
-        .iter()
-        .map(|combo| combo.period.unwrap() as f64)
-        .collect();
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to edcf_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = EdcfParams {
-            period: Some(period),
-        };
-        let input = EdcfInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            edcf_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            edcf_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EdcfBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EdcfBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<EdcfParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = edcf_batch)]
-pub fn edcf_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: EdcfBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = EdcfBatchRange {
-        period: config.period_range,
-    };
-
-    let output = edcf_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = EdcfBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn edcf_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to edcf_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = EdcfBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("edcf_batch_into: rows*cols overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        if !data.is_empty() && rows > 0 {
-            if let Some(first) = data.iter().position(|x| !x.is_nan()) {
-                let warm: Vec<usize> = combos
-                    .iter()
-                    .map(|c| {
-                        let period = c.period.unwrap_or(15);
-                        let w = first + 2 * period;
-                        if w > cols {
-                            cols
-                        } else {
-                            w
-                        }
-                    })
-                    .collect();
-
-                let buf_mu: &mut [MaybeUninit<f64>] = core::slice::from_raw_parts_mut(
-                    out.as_mut_ptr() as *mut MaybeUninit<f64>,
-                    out.len(),
-                );
-                init_matrix_prefixes(buf_mu, cols, &warm);
-            }
-        }
-
-        edcf_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

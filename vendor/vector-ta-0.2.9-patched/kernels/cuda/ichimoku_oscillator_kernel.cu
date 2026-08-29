@@ -88,12 +88,6 @@ __device__ __forceinline__ double ich_diff(double a, double b) {
     return (isfinite(a) && isfinite(b)) ? a - b : ich_qnan();
 }
 
-// gaussian_value (:585)
-__device__ __forceinline__ double ich_gaussian(double x, double bandwidth) {
-    double ratio = x / bandwidth;
-    return exp(-(ratio * ratio) * 0.5) / sqrt(2.0 * M_PI);
-}
-
 // rolling_midpoint (:589). `maxq`/`minq` are index rings of `length + 1`.
 __device__ void ich_rolling_midpoint(
     const double* high, const double* low, int n, int length, int first,
@@ -171,13 +165,11 @@ __device__ void ich_rolling_midpoint(
     }
 }
 
-// chebyshev_series (:638) with the CPU's fixed ripple of 0.5.
-__device__ void ich_chebyshev(const double* data, int n, int length, double* out) {
-    double inv_len = 1.0 / static_cast<double>(length);
-    double a = cosh(inv_len * acosh(1.0 / (1.0 - 0.5)));
-    double b = sinh(inv_len * asinh(1.0 / 0.5));
-    double c = (a - b) / (a + b);
-    double one_minus_c = 1.0 - c;
+// chebyshev_series (:638) with coefficients prepared by the exact scalar
+// formula. CUDA libdevice transcendental results are not bit-identical to the
+// Rust scalar runtime, while the bar-dependent recurrence remains here.
+__device__ void ich_chebyshev(
+    const double* data, int n, double c, double one_minus_c, double* out) {
     for (int i = 0; i < n; ++i) {
         out[i] = ich_qnan();
     }
@@ -190,14 +182,15 @@ __device__ void ich_chebyshev(const double* data, int n, int length, double* out
     }
 }
 
-// gaussian_kernel_series (:657) with the CPU's fixed size=4, h=2.0, r=1.0.
-__device__ void ich_gaussian_series(const double* data, int n, double* out) {
+// gaussian_kernel_series (:657) with scalar-prepared fixed weights. As with
+// the Chebyshev coefficient, host preparation avoids libdevice `exp` drift;
+// the whole per-bar convolution remains device-side.
+__device__ void ich_gaussian_series(
+    const double* data, int n, const double* prepared_weights, double* out) {
     const int size = 4;
-    const double h = 2.0;
-    const double r = 1.0;
     double weights[size + 1];
     for (int i = 0; i <= size; ++i) {
-        weights[i] = ich_gaussian(static_cast<double>(i * i) / (h * h * r), r);
+        weights[i] = prepared_weights[i];
     }
     for (int i = 0; i < n; ++i) {
         out[i] = ich_qnan();
@@ -223,12 +216,13 @@ __device__ void ich_gaussian_series(const double* data, int n, double* out) {
 
 // smooth_series (:682). `cheb` is scratch; `dst` receives the answer.
 __device__ void ich_smooth(
-    const double* data, int n, int length, int extra, double* cheb, double* dst) {
+    const double* data, int n, int extra, double c, double one_minus_c,
+    const double* gaussian_weights, double* cheb, double* dst) {
     if (extra) {
-        ich_chebyshev(data, n, length, cheb);
-        ich_gaussian_series(cheb, n, dst);
+        ich_chebyshev(data, n, c, one_minus_c, cheb);
+        ich_gaussian_series(cheb, n, gaussian_weights, dst);
     } else {
-        ich_chebyshev(data, n, length, dst);
+        ich_chebyshev(data, n, c, one_minus_c, dst);
     }
 }
 
@@ -287,10 +281,12 @@ extern "C" __global__ void ichimoku_oscillator_batch_f64(
     const int* __restrict__ lagging_span_periods,
     const int* __restrict__ displacements,
     const int* __restrict__ ma_lengths,
-    const int* __restrict__ smoothing_lengths,
     const int* __restrict__ window_sizes,
     const double* __restrict__ top_bands,
     const double* __restrict__ mid_bands,
+    const double* __restrict__ chebyshev_c,
+    const double* __restrict__ chebyshev_one_minus_c,
+    const double* __restrict__ gaussian_weights,
     int extra_smoothing,
     int normalize_mode,
     int clamp_flag,
@@ -346,10 +342,11 @@ extern "C" __global__ void ichimoku_oscillator_batch_f64(
         int lag_p = lagging_span_periods[row];
         int displacement = displacements[row];
         int ma_length = ma_lengths[row];
-        int smoothing = smoothing_lengths[row];
         int window = window_sizes[row];
         double top_band = top_bands[row];
         double mid_band = mid_bands[row];
+        double c = chebyshev_c[row];
+        double one_minus_c = chebyshev_one_minus_c[row];
         int shift = displacement > 0 ? displacement - 1 : 0;
 
         ich_rolling_midpoint(high, low, len, conv_p, first, maxq, minq, deque_cap, conv_raw);
@@ -359,8 +356,10 @@ extern "C" __global__ void ichimoku_oscillator_batch_f64(
         for (int i = 0; i < len; ++i) {
             tmp_in[i] = ich_avg(conv_raw[i], base_raw[i]);
         }
-        ich_smooth(tmp_in, len, smoothing, extra_smoothing, tmp_cheb, kumo_a);
-        ich_smooth(spanb_raw, len, smoothing, extra_smoothing, tmp_cheb, kumo_b);
+        ich_smooth(
+            tmp_in, len, extra_smoothing, c, one_minus_c, gaussian_weights, tmp_cheb, kumo_a);
+        ich_smooth(
+            spanb_raw, len, extra_smoothing, c, one_minus_c, gaussian_weights, tmp_cheb, kumo_b);
 
         for (int i = 0; i < len; ++i) {
             kumo_center[i] = ich_avg(kumo_a[i], kumo_b[i]);
@@ -372,25 +371,29 @@ extern "C" __global__ void ichimoku_oscillator_batch_f64(
             double shifted = (i >= chikou_shift) ? source[i - chikou_shift] : nan_value;
             tmp_in[i] = ich_diff(source[i], shifted);
         }
-        ich_smooth(tmp_in, len, smoothing, extra_smoothing, tmp_cheb, chikou);
+        ich_smooth(
+            tmp_in, len, extra_smoothing, c, one_minus_c, gaussian_weights, tmp_cheb, chikou);
 
         for (int i = 0; i < len; ++i) {
             double centre_offset = (i >= shift) ? kumo_center[i - shift] : nan_value;
             tmp_in[i] = ich_diff(source[i], centre_offset);
         }
-        ich_smooth(tmp_in, len, smoothing, extra_smoothing, tmp_cheb, signal);
+        ich_smooth(
+            tmp_in, len, extra_smoothing, c, one_minus_c, gaussian_weights, tmp_cheb, signal);
 
         for (int i = 0; i < len; ++i) {
             double centre_offset = (i >= shift) ? kumo_center[i - shift] : nan_value;
             tmp_in[i] = ich_diff(conv_raw[i], centre_offset);
         }
-        ich_smooth(tmp_in, len, smoothing, extra_smoothing, tmp_cheb, conversion);
+        ich_smooth(
+            tmp_in, len, extra_smoothing, c, one_minus_c, gaussian_weights, tmp_cheb, conversion);
 
         for (int i = 0; i < len; ++i) {
             double centre_offset = (i >= shift) ? kumo_center[i - shift] : nan_value;
             tmp_in[i] = ich_diff(base_raw[i], centre_offset);
         }
-        ich_smooth(tmp_in, len, smoothing, extra_smoothing, tmp_cheb, base_series);
+        ich_smooth(
+            tmp_in, len, extra_smoothing, c, one_minus_c, gaussian_weights, tmp_cheb, base_series);
 
         ich_wma(signal, len, ma_length, ma);
 

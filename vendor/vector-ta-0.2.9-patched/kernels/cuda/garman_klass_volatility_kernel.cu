@@ -380,8 +380,10 @@ extern "C" __global__ void garman_klass_volatility_many_series_one_param_f64(
  *
  * Column: output_id "value" (cpu_batch.rs:8373).
  *
- * PERIOD-INVARIANT: `compute_garman_klass_volatility_batch` (cpu_batch.rs:8357)
- *   reads `lookback` (default 14) and NEVER `period`.
+ * WINDOW-ANCHORED: the NeoEthos scalar ABI carries the exact `lookback` that
+ * the CPU authority request reads.  Every combo therefore consumes
+ * `periods[combo]`; the registry default 14 is only the base request, not a
+ * compiled device constant.
  *
  * Input: open / high / low / close — F64InputKind::Ohlc4. `open` is a genuine
  *   input (gk_term takes ln(close/open)), so an Hlc triple would compute a
@@ -392,16 +394,24 @@ extern "C" __global__ void garman_klass_volatility_many_series_one_param_f64(
  *   A window with one such bar emits NaN, it does not average the survivors.
  *
  * GK_COEFF = 2*ln(2) - 1 (:31), spelled out to full double precision rather
- *   than as an f32-era literal.
+ *   than as an f32-era literal.  The output row temporarily stores the global
+ *   prefix sum.  A descending conversion reads prefix[t+1] and prefix[start]
+ *   before either lower cell is overwritten, so arbitrary lookbacks need no
+ *   fixed-size per-thread ring and retain the CPU accumulation/subtraction
+ *   order exactly.
  * =========================================================================== */
 
 #ifndef NEO_F64_NAN
 #define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
 #endif
 
-/* Default lookback (cpu_batch.rs:8357). The prefix rings are per-thread
- * arrays, so the bound belongs to the compiled kernel. */
-#define NEO_GK_LOOKBACK 14
+__device__ __forceinline__ bool gk_neo_valid_bar(double op,
+                                                  double hi,
+                                                  double lo,
+                                                  double cl) {
+    return isfinite(op) && isfinite(hi) && isfinite(lo) && isfinite(cl)
+        && op > 0.0 && hi > 0.0 && lo > 0.0 && cl > 0.0;
+}
 
 extern "C" __global__
 void garman_klass_volatility_neo_batch_f64(const double* __restrict__ open,
@@ -416,12 +426,12 @@ void garman_klass_volatility_neo_batch_f64(const double* __restrict__ open,
 {
     const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (combo >= n_combos || n <= 0) return;
-    (void)periods;
 
     double* __restrict__ o = out + (size_t)combo * (size_t)n;
     for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
 
-    const int LB = NEO_GK_LOOKBACK;
+    const int LB = periods[combo];
+    if (LB <= 0 || LB > n) return;
 
     /* `first` is DERIVED here, not taken from the caller. `validity_summary`
      * (:346) scans for the first bar at which all FOUR prices are finite AND
@@ -435,47 +445,62 @@ void garman_klass_volatility_neo_batch_f64(const double* __restrict__ open,
     int first = n;
     for (int i = 0; i < n; ++i) {
         const double op = open[i], hi = high[i], lo = low[i], cl = close[i];
-        if (isfinite(op) && isfinite(hi) && isfinite(lo) && isfinite(cl)
-            && op > 0.0 && hi > 0.0 && lo > 0.0 && cl > 0.0) { first = i; break; }
+        if (gk_neo_valid_bar(op, hi, lo, cl)) { first = i; break; }
     }
-    if (first >= n) return;
+    if (first >= n || first > n - LB) return;
 
     const int warmup = first + (LB - 1);
     const double inv_lb = 1.0 / (double)LB;
     const double GK_COEFF = 2.0 * 0.69314718055994530942 - 1.0;
 
-    /* prefix_valid / prefix_sum over the last LB + 1 bars. Only those entries
-     * are ever read, so a ring of that size reproduces the global prefix
-     * exactly -- including its accumulation order, which starts at index 0. */
-    int    pv_ring[NEO_GK_LOOKBACK + 1];
-    double ps_ring[NEO_GK_LOOKBACK + 1];
-    for (int i = 0; i <= LB; ++i) { pv_ring[i] = 0; ps_ring[i] = 0.0; }
-    int    pv_running = 0;
+    /* Pass 1: CPU build_prefix_terms' global prefix_sum, accumulated from 0.
+     * o[i] is prefix_sum[i + 1].
+     */
     double ps_running = 0.0;
-    pv_ring[0] = 0; ps_ring[0] = 0.0;             /* prefix[0] */
-
     for (int i = 0; i < n; ++i) {
         const double op = open[i], hi = high[i], lo = low[i], cl = close[i];
-        const bool ok = isfinite(op) && isfinite(hi) && isfinite(lo) && isfinite(cl)
-                        && op > 0.0 && hi > 0.0 && lo > 0.0 && cl > 0.0;
+        const bool ok = gk_neo_valid_bar(op, hi, lo, cl);
         if (ok) {
             const double hl = log(hi / lo);
             const double co = log(cl / op);
-            pv_running += 1;
             ps_running += 0.5 * hl * hl - GK_COEFF * co * co;
         }
-        pv_ring[(i + 1) % (NEO_GK_LOOKBACK + 1)] = pv_running;
-        ps_ring[(i + 1) % (NEO_GK_LOOKBACK + 1)] = ps_running;
-
-        if (i < warmup) continue;
-
-        const int ws = i + 1 - LB;
-        const int    pv_ws = pv_ring[ws % (NEO_GK_LOOKBACK + 1)];
-        const double ps_ws = ps_ring[ws % (NEO_GK_LOOKBACK + 1)];
-        if (pv_running - pv_ws != LB) continue;
-
-        double variance = (ps_running - ps_ws) * inv_lb;
-        if (variance < 0.0) variance = 0.0;
-        o[i] = sqrt(variance);
+        o[i] = ps_running;
     }
+
+    /* Pass 2 descends so both prefix cells are still scratch. Validity rolls
+     * backwards in O(N): the next window removes its current right edge and
+     * adds the preceding left edge. This is equivalent to the CPU's validity
+     * prefix subtraction without requiring a second output-sized scratch.
+     */
+    int invalid_count = 0;
+    for (int j = n - LB; j < n; ++j) {
+        if (!gk_neo_valid_bar(open[j], high[j], low[j], close[j])) {
+            invalid_count += 1;
+        }
+    }
+    for (int i = n - 1; i >= warmup; --i) {
+        const int ws = i + 1 - LB;
+        if (invalid_count == 0) {
+            const double prefix_sum_end = o[i];
+            const double prefix_sum_ws = ws == 0 ? 0.0 : o[ws - 1];
+            double variance = (prefix_sum_end - prefix_sum_ws) * inv_lb;
+            if (variance < 0.0) variance = 0.0;
+            o[i] = sqrt(variance);
+        } else {
+            o[i] = NEO_F64_NAN;
+        }
+
+        if (i > warmup) {
+            if (!gk_neo_valid_bar(open[i], high[i], low[i], close[i])) {
+                invalid_count -= 1;
+            }
+            const int entering = ws - 1;
+            if (!gk_neo_valid_bar(
+                    open[entering], high[entering], low[entering], close[entering])) {
+                invalid_count += 1;
+            }
+        }
+    }
+    for (int i = 0; i < warmup; ++i) o[i] = NEO_F64_NAN;
 }

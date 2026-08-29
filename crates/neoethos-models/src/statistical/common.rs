@@ -1,15 +1,16 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use ndarray::Array2;
 use neoethos_core::storage::json::{
     JsonBackupWriteConfig, read_json as read_json_artifact,
     write_json_with_backup as write_json_artifact_with_backup,
 };
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::Path;
 
 use crate::base::{
-    dataframe_to_float32_array, feature_columns_from_dataframe, try_build_runtime_artifact_metadata,
+    feature_columns_from_frame, feature_frame_to_f64_array, try_build_runtime_artifact_metadata,
+    validate_model_labels,
 };
 use crate::runtime::artifacts::{
     RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
@@ -20,7 +21,15 @@ pub const METADATA_FILE_NAME: &str = "metadata.json";
 pub const MODEL_FILE_NAME: &str = "model.json";
 
 pub fn normalize_statistical_device_policy(policy: &str) -> String {
-    crate::common::normalize_vendor_device_policy(policy, &[])
+    match crate::common::parse_cuda_device_policy(policy) {
+        Ok(crate::common::CudaDevicePolicy::Auto) => "auto".to_string(),
+        Ok(crate::common::CudaDevicePolicy::Cpu) => "cpu".to_string(),
+        Ok(crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }) if !policy.trim().contains(':') => {
+            "gpu".to_string()
+        }
+        Ok(crate::common::CudaDevicePolicy::Gpu { ordinal }) => format!("gpu:{ordinal}"),
+        Err(_) => policy.trim().to_ascii_lowercase(),
+    }
 }
 
 /// Process-wide device policy for the statistical models, installed once at
@@ -64,8 +73,11 @@ pub fn configured_statistical_device() -> &'static str {
     STATISTICAL_DEVICE.get_or_init(|| "cpu".to_string())
 }
 
-/// The device policy for one statistical model: `models.statistical_device`,
-/// and nothing else.
+/// The device policy for one statistical model. An explicit
+/// `models.model_param_overrides.<model>.device` wins; otherwise the shared
+/// `models.statistical_device` policy applies. This lets CUDA-capable linear
+/// models run on the card while a deliberately CPU-only statistical model is
+/// pinned to CPU without any fallback at the execution boundary.
 ///
 /// ## 2026-08-10 — the two env overrides are deleted
 ///
@@ -77,46 +89,30 @@ pub fn configured_statistical_device() -> &'static str {
 /// whose fitted weights differ from the CPU path, and the artifact would record
 /// `cpu`.
 ///
-/// `model_name` is retained in the signature: the callers pass it, the log
-/// lines want it, and a future per-model field belongs on `ModelsConfig` rather
-/// than in a second resolution chain here.
 pub fn statistical_device_policy(model_name: &str) -> String {
-    let _ = model_name;
+    let overrides = crate::runtime::capabilities::current_model_device_overrides();
+    if overrides.per_model.contains_key(model_name) {
+        return crate::runtime::capabilities::requested_runtime_device_policy(model_name);
+    }
     configured_statistical_device().to_string()
 }
 
-pub fn runtime_backend_with_gpu_fallback(
-    model_name: &str,
-    cpu_backend: &str,
-) -> (Option<String>, Option<String>) {
-    runtime_backend_with_gpu_fallback_for_policy(
-        &statistical_device_policy(model_name),
-        cpu_backend,
+/// Select the CPU implementation only for an explicitly CPU-resolved request.
+/// A GPU or unresolved automatic request must be handled by its own complete
+/// execution lane and may never degrade into this backend.
+pub fn cpu_backend_for_policy(requested: &str, cpu_backend: &str) -> Result<String> {
+    if matches!(
+        crate::common::parse_cuda_device_policy(requested)?,
+        crate::common::CudaDevicePolicy::Cpu
+    ) {
+        return Ok(cpu_backend.to_string());
+    }
+    bail!(
+        "GpuOnly statistical request `{requested}` has no permission to execute CPU backend `{cpu_backend}`"
     )
 }
 
-/// The policy-in, report-out half of [`runtime_backend_with_gpu_fallback`].
-///
-/// Split out 2026-08-10 so the "you asked for GPU and got CPU" report can be
-/// tested against an explicit policy string. It used to be tested by exporting
-/// `NEOETHOS_BOT_META_DEVICE`, which only worked because the env var was a real
-/// input — the test was pinning the defect.
-pub fn runtime_backend_with_gpu_fallback_for_policy(
-    requested: &str,
-    cpu_backend: &str,
-) -> (Option<String>, Option<String>) {
-    let normalized = normalize_statistical_device_policy(requested);
-    let degraded_reason = if normalized == "gpu" || normalized.starts_with("gpu:") {
-        Some(format!(
-            "requested device policy `{normalized}`; statistical backend currently executes on CPU"
-        ))
-    } else {
-        None
-    };
-    (Some(cpu_backend.to_string()), degraded_reason)
-}
-
-fn ensure_finite_matrix(values: &Array2<f32>, context: &str) -> Result<()> {
+fn ensure_finite_matrix(values: &Array2<f64>, context: &str) -> Result<()> {
     if values.iter().any(|value| !value.is_finite()) {
         bail!("{context} contains non-finite values");
     }
@@ -125,12 +121,12 @@ fn ensure_finite_matrix(values: &Array2<f32>, context: &str) -> Result<()> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureScaler {
-    pub means: Vec<f32>,
-    pub stds: Vec<f32>,
+    pub means: Vec<f64>,
+    pub stds: Vec<f64>,
 }
 
 impl FeatureScaler {
-    pub fn fit(features: &Array2<f32>) -> Result<Self> {
+    pub fn fit(features: &Array2<f64>) -> Result<Self> {
         if features.nrows() == 0 || features.ncols() == 0 {
             bail!("feature scaler requires a non-empty feature matrix");
         }
@@ -142,20 +138,20 @@ impl FeatureScaler {
         let mut stds = vec![1.0; cols];
 
         for col in 0..cols {
-            let mut sum = 0.0_f32;
+            let mut sum = 0.0_f64;
             for row in 0..features.nrows() {
                 sum += features[(row, col)];
             }
-            let mean = sum / rows as f32;
+            let mean = sum / rows as f64;
             means[col] = mean;
 
-            let mut variance = 0.0_f32;
+            let mut variance = 0.0_f64;
             for row in 0..features.nrows() {
                 let centered = features[(row, col)] - mean;
                 variance += centered * centered;
             }
-            let std = (variance / rows as f32).sqrt();
-            stds[col] = if std.is_finite() && std > 1e-8 {
+            let std = (variance / rows as f64).sqrt();
+            stds[col] = if std.is_finite() && std > 1e-12 {
                 std
             } else {
                 1.0
@@ -165,7 +161,7 @@ impl FeatureScaler {
         Ok(Self { means, stds })
     }
 
-    pub fn transform(&self, features: &Array2<f32>) -> Result<Array2<f32>> {
+    pub fn transform(&self, features: &Array2<f64>) -> Result<Array2<f64>> {
         if features.ncols() != self.means.len() || features.ncols() != self.stds.len() {
             bail!(
                 "feature scaler dimension mismatch: {} cols vs means {} / stds {}",
@@ -187,38 +183,34 @@ impl FeatureScaler {
     }
 }
 
-pub fn feature_matrix_from_dataframe(df: &DataFrame) -> Result<(Array2<f32>, Vec<String>)> {
-    let features = dataframe_to_float32_array(df)?;
-    let columns = feature_columns_from_dataframe(df);
+pub fn feature_matrix_from_frame(frame: &FeatureFrame) -> Result<(Array2<f64>, Vec<String>)> {
+    let features = feature_frame_to_f64_array(frame)?;
+    let columns = feature_columns_from_frame(frame);
     Ok((features, columns))
 }
 
-pub fn remap_three_class_labels(y: &Series) -> Result<Vec<usize>> {
-    let labels = y
-        .cast(&DataType::Int32)
-        .context("cast statistical labels to Int32")?;
+pub fn remap_three_class_labels(labels: &[i32]) -> Result<Vec<usize>> {
+    validate_model_labels(labels, labels.len())?;
     labels
-        .i32()
-        .context("access statistical labels as Int32")?
-        .into_iter()
+        .iter()
+        .copied()
         .map(|value| match value {
-            Some(-1) => Ok(2usize),
-            Some(0) => Ok(0usize),
-            Some(1) => Ok(1usize),
-            Some(other) => {
+            -1 => Ok(2usize),
+            0 => Ok(0usize),
+            1 => Ok(1usize),
+            other => {
                 bail!("unsupported statistical-model label: {other}; expected one of -1, 0, 1")
             }
-            None => bail!("statistical-model labels may not contain nulls"),
         })
         .collect()
 }
 
-pub fn ensure_feature_columns_match(expected: &[String], df: &DataFrame) -> Result<()> {
+pub fn ensure_feature_columns_match(expected: &[String], frame: &FeatureFrame) -> Result<()> {
     if expected.is_empty() {
         bail!("persisted statistical model is missing feature columns");
     }
 
-    let actual = feature_columns_from_dataframe(df);
+    let actual = feature_columns_from_frame(frame);
     if expected != actual {
         bail!(
             "feature column mismatch for persisted statistical model; expected {:?}, got {:?}",
@@ -230,49 +222,34 @@ pub fn ensure_feature_columns_match(expected: &[String], df: &DataFrame) -> Resu
     Ok(())
 }
 
-pub fn softmax_rows(logits: &Array2<f32>) -> Array2<f32> {
+pub fn softmax_rows(logits: &Array2<f64>) -> Result<Array2<f64>> {
     let mut probabilities = logits.clone();
     for row in 0..probabilities.nrows() {
-        let mut max_logit = f32::NEG_INFINITY;
-        let mut row_is_valid = true;
+        let mut max_logit = f64::NEG_INFINITY;
         for col in 0..probabilities.ncols() {
             let value = probabilities[(row, col)];
             if !value.is_finite() {
-                row_is_valid = false;
-                break;
+                bail!("softmax row {row} contains non-finite logit at column {col}");
             }
             max_logit = max_logit.max(value);
         }
 
-        if !row_is_valid || !max_logit.is_finite() {
-            for col in 0..probabilities.ncols() {
-                probabilities[(row, col)] = 0.0;
-            }
-            if probabilities.ncols() > 0 {
-                probabilities[(row, 0)] = 1.0;
-            }
-            continue;
+        if !max_logit.is_finite() {
+            bail!("softmax row {row} has no finite maximum logit");
         }
 
-        let mut normalizer = 0.0_f32;
+        let mut normalizer = 0.0_f64;
         for col in 0..probabilities.ncols() {
             let value = (probabilities[(row, col)] - max_logit).exp();
             if !value.is_finite() {
-                row_is_valid = false;
-                break;
+                bail!("softmax row {row} overflowed at column {col}");
             }
             probabilities[(row, col)] = value;
             normalizer += value;
         }
 
-        if !row_is_valid || !normalizer.is_finite() || normalizer <= f32::EPSILON {
-            for col in 0..probabilities.ncols() {
-                probabilities[(row, col)] = 0.0;
-            }
-            if probabilities.ncols() > 0 {
-                probabilities[(row, 0)] = 1.0;
-            }
-            continue;
+        if !normalizer.is_finite() || normalizer <= f64::EPSILON {
+            bail!("softmax row {row} has invalid normalization mass {normalizer}");
         }
 
         for col in 0..probabilities.ncols() {
@@ -280,7 +257,7 @@ pub fn softmax_rows(logits: &Array2<f32>) -> Array2<f32> {
         }
     }
 
-    probabilities
+    Ok(probabilities)
 }
 
 pub fn meta_runtime_metadata(
@@ -317,10 +294,11 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        configured_statistical_device, install_statistical_runtime_from_settings,
-        normalize_statistical_device_policy, runtime_backend_with_gpu_fallback_for_policy,
-        statistical_device_policy,
+        configured_statistical_device, cpu_backend_for_policy,
+        install_statistical_runtime_from_settings, normalize_statistical_device_policy,
+        softmax_rows, statistical_device_policy,
     };
+    use ndarray::Array2;
 
     /// The default keeps the statistical models on the CPU.
     ///
@@ -338,26 +316,41 @@ mod tests {
     }
 
     #[test]
-    fn normalize_statistical_device_policy_accepts_vendor_aliases() {
+    fn normalize_statistical_device_policy_preserves_rejected_vendor_input() {
         assert_eq!(normalize_statistical_device_policy("cuda:1"), "gpu:1");
-        assert_eq!(normalize_statistical_device_policy("rocm:2"), "gpu:2");
-        assert_eq!(normalize_statistical_device_policy("metal"), "gpu");
-        assert_eq!(normalize_statistical_device_policy("vulkan:0"), "gpu:0");
+        assert_eq!(normalize_statistical_device_policy("rocm:2"), "rocm:2");
+        assert_eq!(normalize_statistical_device_policy("metal"), "metal");
+        assert_eq!(normalize_statistical_device_policy("vulkan:0"), "vulkan:0");
+        for rejected in ["rocm:2", "metal", "vulkan:0"] {
+            assert!(
+                crate::common::parse_cuda_device_policy(&normalize_statistical_device_policy(
+                    rejected
+                ))
+                .is_err(),
+                "non-CUDA vendor policy `{rejected}` must remain fail-closed"
+            );
+        }
     }
 
     #[test]
-    fn runtime_backend_marks_gpu_request_as_cpu_fallback() {
-        let (backend, degraded_reason) =
-            runtime_backend_with_gpu_fallback_for_policy("cuda:0", "cpu_backend");
-        assert_eq!(backend.as_deref(), Some("cpu_backend"));
-        assert!(
-            degraded_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("currently executes on CPU"))
-        );
+    fn cpu_backend_rejects_gpu_policy_instead_of_falling_back() {
+        let error = cpu_backend_for_policy("cuda:0", "cpu_backend")
+            .expect_err("a GPU request must never execute the CPU statistical backend");
+        assert!(error.to_string().contains("GpuOnly"));
 
-        let (_, no_reason) = runtime_backend_with_gpu_fallback_for_policy("cpu", "cpu_backend");
-        assert!(no_reason.is_none());
+        assert_eq!(
+            cpu_backend_for_policy("cpu", "cpu_backend").expect("CpuOnly backend"),
+            "cpu_backend"
+        );
+    }
+
+    #[test]
+    fn softmax_rejects_non_finite_logits_instead_of_fabricating_neutral() {
+        let logits =
+            Array2::from_shape_vec((1, 3), vec![0.0_f64, f64::NAN, 1.0]).expect("shape logits");
+        let error = softmax_rows(&logits)
+            .expect_err("non-finite logits must not become a synthetic probability row");
+        assert!(error.to_string().contains("non-finite"));
     }
 
     /// The retired per-model / subsystem device env vars must not move the

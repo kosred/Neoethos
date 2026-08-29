@@ -1,20 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 use thiserror::Error;
@@ -38,6 +26,26 @@ pub struct NviOutput {
 
 #[derive(Debug, Clone, Default)]
 pub struct NviParams;
+
+#[inline(always)]
+fn nvi_step(
+    previous_nvi: f64,
+    close: f64,
+    previous_close: f64,
+    volume: f64,
+    previous_volume: f64,
+) -> f64 {
+    if volume < previous_volume && previous_close != 0.0 {
+        // Keep TA-Lib's compound-assignment operation order.  The candidate is
+        // committed only when it remains representable.
+        let mut candidate = previous_nvi;
+        candidate += (close - previous_close) / previous_close * candidate;
+        if candidate.is_finite() {
+            return candidate;
+        }
+    }
+    previous_nvi
+}
 
 #[derive(Debug, Clone)]
 pub struct NviInput<'a> {
@@ -170,11 +178,13 @@ impl NviStream {
             return Some(self.nvi_val);
         }
 
-        let mut nvi = self.nvi_val;
-        if volume < self.prev_volume {
-            let pct = (close - self.prev_close) / self.prev_close;
-            nvi += nvi * pct;
-        }
+        let nvi = nvi_step(
+            self.nvi_val,
+            close,
+            self.prev_close,
+            volume,
+            self.prev_volume,
+        );
 
         self.nvi_val = nvi;
         self.prev_close = close;
@@ -227,12 +237,6 @@ pub fn nvi_with_kernel(input: &NviInput, kernel: Kernel) -> Result<NviOutput, Nv
                 NviError::AllVolumeValuesNaN
             }
         })?;
-    if close.len() - first < 2 {
-        return Err(NviError::NotEnoughValidData {
-            needed: 2,
-            valid: close.len() - first,
-        });
-    }
     let mut out = alloc_with_nan_prefix(close.len(), first);
     let _chosen = match kernel {
         Kernel::Auto
@@ -247,7 +251,6 @@ pub fn nvi_with_kernel(input: &NviInput, kernel: Kernel) -> Result<NviOutput, Nv
     Ok(NviOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn nvi_into(input: &NviInput, out: &mut [f64]) -> Result<(), NviError> {
     let (close, volume): (&[f64], &[f64]) = match &input.data {
@@ -299,13 +302,6 @@ pub fn nvi_into_slice(
             }
         })?;
 
-    if close.len() - first < 2 {
-        return Err(NviError::NotEnoughValidData {
-            needed: 2,
-            valid: close.len() - first,
-        });
-    }
-
     let _chosen = match kern {
         Kernel::Auto
         | Kernel::Scalar
@@ -356,10 +352,7 @@ pub fn nvi_scalar(close: &[f64], volume: &[f64], first_valid: usize, out: &mut [
             let c = *close_ptr.add(i);
             let v = *vol_ptr.add(i);
 
-            if v < prev_volume {
-                let pct = (c - prev_close) / prev_close;
-                nvi_val += nvi_val * pct;
-            }
+            nvi_val = nvi_step(nvi_val, c, prev_close, v, prev_volume);
 
             *out_ptr.add(i) = nvi_val;
 
@@ -397,26 +390,25 @@ pub unsafe fn nvi_avx2(close: &[f64], volume: &[f64], first_valid: usize, out: &
         let curr_v = _mm256_loadu_pd(vol_ptr.add(i) as *const f64);
         let prev_v = _mm256_loadu_pd(vol_ptr.add(i - 1) as *const f64);
 
-        let delta = _mm256_sub_pd(curr_c, prev_c);
-        let pct_raw = _mm256_div_pd(delta, prev_c);
+        let mut closes = [0.0; 4];
+        let mut previous_closes = [0.0; 4];
+        let mut volumes = [0.0; 4];
+        let mut previous_volumes = [0.0; 4];
+        _mm256_storeu_pd(closes.as_mut_ptr(), curr_c);
+        _mm256_storeu_pd(previous_closes.as_mut_ptr(), prev_c);
+        _mm256_storeu_pd(volumes.as_mut_ptr(), curr_v);
+        _mm256_storeu_pd(previous_volumes.as_mut_ptr(), prev_v);
 
-        let mask = _mm256_cmp_pd(curr_v, prev_v, _CMP_LT_OQ);
-        let pct_masked = _mm256_and_pd(pct_raw, mask);
-
-        let mut pcts: [f64; 4] = [0.0; 4];
-        _mm256_storeu_pd(pcts.as_mut_ptr(), pct_masked);
-
-        nvi_val += nvi_val * pcts[0];
-        *out_ptr.add(i) = nvi_val;
-
-        nvi_val += nvi_val * pcts[1];
-        *out_ptr.add(i + 1) = nvi_val;
-
-        nvi_val += nvi_val * pcts[2];
-        *out_ptr.add(i + 2) = nvi_val;
-
-        nvi_val += nvi_val * pcts[3];
-        *out_ptr.add(i + 3) = nvi_val;
+        for offset in 0..4 {
+            nvi_val = nvi_step(
+                nvi_val,
+                closes[offset],
+                previous_closes[offset],
+                volumes[offset],
+                previous_volumes[offset],
+            );
+            *out_ptr.add(i + offset) = nvi_val;
+        }
 
         i += 4;
     }
@@ -425,10 +417,7 @@ pub unsafe fn nvi_avx2(close: &[f64], volume: &[f64], first_valid: usize, out: &
         let c = *close_ptr.add(i);
         let v = *vol_ptr.add(i);
 
-        if v < *vol_ptr.add(i - 1) {
-            let pct = (c - *close_ptr.add(i - 1)) / *close_ptr.add(i - 1);
-            nvi_val += nvi_val * pct;
-        }
+        nvi_val = nvi_step(nvi_val, c, *close_ptr.add(i - 1), v, *vol_ptr.add(i - 1));
         *out_ptr.add(i) = nvi_val;
         i += 1;
     }
@@ -461,31 +450,25 @@ pub unsafe fn nvi_avx512(close: &[f64], volume: &[f64], first_valid: usize, out:
         let curr_v = _mm512_loadu_pd(vol_ptr.add(i) as *const f64);
         let prev_v = _mm512_loadu_pd(vol_ptr.add(i - 1) as *const f64);
 
-        let delta = _mm512_sub_pd(curr_c, prev_c);
-        let pct_raw = _mm512_div_pd(delta, prev_c);
+        let mut closes = [0.0; 8];
+        let mut previous_closes = [0.0; 8];
+        let mut volumes = [0.0; 8];
+        let mut previous_volumes = [0.0; 8];
+        _mm512_storeu_pd(closes.as_mut_ptr(), curr_c);
+        _mm512_storeu_pd(previous_closes.as_mut_ptr(), prev_c);
+        _mm512_storeu_pd(volumes.as_mut_ptr(), curr_v);
+        _mm512_storeu_pd(previous_volumes.as_mut_ptr(), prev_v);
 
-        let m = _mm512_cmp_pd_mask(curr_v, prev_v, _CMP_LT_OQ);
-        let pct_masked = _mm512_maskz_mov_pd(m, pct_raw);
-
-        let mut pcts: [f64; 8] = [0.0; 8];
-        _mm512_storeu_pd(pcts.as_mut_ptr(), pct_masked);
-
-        nvi_val += nvi_val * pcts[0];
-        *out_ptr.add(i) = nvi_val;
-        nvi_val += nvi_val * pcts[1];
-        *out_ptr.add(i + 1) = nvi_val;
-        nvi_val += nvi_val * pcts[2];
-        *out_ptr.add(i + 2) = nvi_val;
-        nvi_val += nvi_val * pcts[3];
-        *out_ptr.add(i + 3) = nvi_val;
-        nvi_val += nvi_val * pcts[4];
-        *out_ptr.add(i + 4) = nvi_val;
-        nvi_val += nvi_val * pcts[5];
-        *out_ptr.add(i + 5) = nvi_val;
-        nvi_val += nvi_val * pcts[6];
-        *out_ptr.add(i + 6) = nvi_val;
-        nvi_val += nvi_val * pcts[7];
-        *out_ptr.add(i + 7) = nvi_val;
+        for offset in 0..8 {
+            nvi_val = nvi_step(
+                nvi_val,
+                closes[offset],
+                previous_closes[offset],
+                volumes[offset],
+                previous_volumes[offset],
+            );
+            *out_ptr.add(i + offset) = nvi_val;
+        }
 
         i += 8;
     }
@@ -494,10 +477,7 @@ pub unsafe fn nvi_avx512(close: &[f64], volume: &[f64], first_valid: usize, out:
         let c = *close_ptr.add(i);
         let v = *vol_ptr.add(i);
 
-        if v < *vol_ptr.add(i - 1) {
-            let pct = (c - *close_ptr.add(i - 1)) / *close_ptr.add(i - 1);
-            nvi_val += nvi_val * pct;
-        }
+        nvi_val = nvi_step(nvi_val, c, *close_ptr.add(i - 1), v, *vol_ptr.add(i - 1));
         *out_ptr.add(i) = nvi_val;
         i += 1;
     }
@@ -541,13 +521,6 @@ pub fn nvi_batch_with_kernel(
                 NviError::AllVolumeValuesNaN
             }
         })?;
-    if cols - first < 2 {
-        return Err(NviError::NotEnoughValidData {
-            needed: 2,
-            valid: cols - first,
-        });
-    }
-
     let mut buf_mu = make_uninit_matrix(1, cols);
     init_matrix_prefixes(&mut buf_mu, cols, &[first]);
 
@@ -596,40 +569,26 @@ unsafe fn nvi_row_scalar(close: &[f64], volume: &[f64], first: usize, row_out_fl
     let mut prev_volume = volume[first];
 
     for i in (first + 1)..len {
-        if volume[i] < prev_volume {
-            let pct = (close[i] - prev_close) / prev_close;
-            nvi_val += nvi_val * pct;
-        }
+        nvi_val = nvi_step(nvi_val, close[i], prev_close, volume[i], prev_volume);
         out[i] = nvi_val;
         prev_close = close[i];
         prev_volume = volume[i];
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nvi_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = nvi_js(close, volume)?;
-    crate::write_wasm_f64_output("nvi_output_into_js", &values, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_nvi_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = NviInput::with_default_candles(&candles);
         let output = nvi_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -641,8 +600,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = NviInput::with_default_candles(&candles);
         let result = nvi_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -707,8 +666,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close = candles.select_candle_field("close")?;
         let volume = candles.select_candle_field("volume")?;
         let input = NviInput::from_slices(close, volume, NviParams);
@@ -754,8 +713,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_scenarios = vec![
             ("default_candles", NviInput::with_default_candles(&candles)),
@@ -1071,6 +1030,61 @@ mod tests {
     generate_all_nvi_tests!(check_nvi_property);
 
     #[test]
+    fn talib_nvi_carries_across_zero_previous_close() {
+        let close = [0.0, 5.0, 10.0];
+        let volume = [100.0, 50.0, 25.0];
+        let input = NviInput::from_slices(&close, &volume, NviParams);
+
+        let values = nvi_with_kernel(&input, Kernel::Scalar)
+            .expect("TA-Lib-authoritative NVI fixture must evaluate")
+            .values;
+
+        assert_eq!(values[0].to_bits(), 1000.0f64.to_bits());
+        assert_eq!(values[1].to_bits(), 1000.0f64.to_bits());
+        assert_eq!(values[2].to_bits(), 2000.0f64.to_bits());
+    }
+
+    #[test]
+    fn talib_nvi_zero_lookback_emits_single_seed_bar() {
+        let close = [42.0];
+        let volume = [7.0];
+        let input = NviInput::from_slices(&close, &volume, NviParams);
+
+        let values = nvi_with_kernel(&input, Kernel::Scalar)
+            .expect("TA-Lib NVI has zero lookback")
+            .values;
+        assert_eq!(values, vec![1000.0]);
+
+        let batch = nvi_batch_with_kernel(&close, &volume, Kernel::ScalarBatch)
+            .expect("batch route must preserve the zero-lookback seed");
+        assert_eq!(batch.values, values);
+    }
+
+    #[test]
+    fn talib_nvi_keeps_last_representable_value_on_nonfinite_update() {
+        let close = [1.0, f64::MAX, f64::MAX];
+        let volume = [3.0, 2.0, 1.0];
+        let input = NviInput::from_slices(&close, &volume, NviParams);
+
+        let values = nvi_with_kernel(&input, Kernel::Scalar)
+            .expect("overflow fixture must remain representable")
+            .values;
+        assert_eq!(values, vec![1000.0, 1000.0, 1000.0]);
+
+        let mut stream = NviStream::try_new().expect("stream construction");
+        let streamed: Vec<f64> = close
+            .iter()
+            .zip(&volume)
+            .map(|(&c, &v)| stream.update(c, v).expect("valid stream bar"))
+            .collect();
+        assert_eq!(streamed, values);
+
+        let batch = nvi_batch_with_kernel(&close, &volume, Kernel::ScalarBatch)
+            .expect("batch overflow fixture must remain representable");
+        assert_eq!(batch.values, values);
+    }
+
+    #[test]
     fn test_nvi_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let len = 256usize;
         let mut close = vec![f64::NAN; len];
@@ -1089,13 +1103,8 @@ mod tests {
         let baseline = nvi(&input)?.values;
 
         let mut out = vec![0.0; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             nvi_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            nvi_into_slice(&mut out, &close, &volume, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1109,277 +1118,4 @@ mod tests {
         }
         Ok(())
     }
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "NviStream")]
-pub struct NviStreamPy {
-    stream: NviStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl NviStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        let stream = NviStream::try_new().map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(NviStreamPy { stream })
-    }
-
-    fn update(&mut self, close: f64, volume: f64) -> Option<f64> {
-        self.stream.update(close, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "nvi")]
-#[pyo3(signature = (close, volume, kernel=None))]
-pub fn nvi_py<'py>(
-    py: Python<'py>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let input = NviInput::from_slices(close_slice, volume_slice, NviParams);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| nvi_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "nvi_batch")]
-#[pyo3(signature = (close, volume, kernel=None))]
-pub fn nvi_batch_py<'py>(
-    py: Python<'py>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let rows = 1usize;
-    let cols = close_slice.len();
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| -> Result<(), NviError> {
-        if close_slice.len() != volume_slice.len() {
-            return Err(NviError::MismatchedLength {
-                close_len: close_slice.len(),
-                volume_len: volume_slice.len(),
-            });
-        }
-        let first = close_slice
-            .iter()
-            .zip(volume_slice)
-            .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
-            .ok_or_else(|| {
-                if close_slice.iter().all(|&c| c.is_nan()) {
-                    NviError::AllCloseValuesNaN
-                } else {
-                    NviError::AllVolumeValuesNaN
-                }
-            })?;
-        if cols - first < 2 {
-            return Err(NviError::NotEnoughValidData {
-                needed: 2,
-                valid: cols - first,
-            });
-        }
-
-        for v in &mut out_slice[..first] {
-            *v = f64::NAN;
-        }
-
-        unsafe { nvi_row_scalar(close_slice, volume_slice, first, out_slice) };
-        Ok(())
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("values", out_arr.reshape((rows, cols))?)?;
-    d.set_item("rows", rows)?;
-    d.set_item("cols", cols)?;
-    Ok(d)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nvi_js(close: &[f64], volume: &[f64]) -> Result<Vec<f64>, JsValue> {
-    let mut output = vec![0.0; close.len()];
-
-    nvi_into_slice(&mut output, close, volume, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nvi_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if close_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        if close_ptr == out_ptr as *const f64 || volume_ptr == out_ptr as *const f64 {
-            let mut temp = vec![0.0; len];
-            nvi_into_slice(&mut temp, close, volume, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            nvi_into_slice(out, close, volume, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nvi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nvi_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nvi_batch_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if close_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    unsafe {
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-        if close.len() != volume.len() {
-            return Err(JsValue::from_str("Length mismatch"));
-        }
-        let first = close
-            .iter()
-            .zip(volume)
-            .position(|(&c, &v)| !c.is_nan() && !v.is_nan())
-            .ok_or_else(|| JsValue::from_str("All values NaN in one or both inputs"))?;
-        if len - first < 2 {
-            return Err(JsValue::from_str("Not enough valid data"));
-        }
-
-        for v in &mut out[..first] {
-            *v = f64::NAN;
-        }
-        nvi_row_scalar(close, volume, first, out);
-        Ok(1)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaNvi;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "nvi_cuda_batch_dev")]
-#[pyo3(signature = (close, volume, device_id=0))]
-pub fn nvi_cuda_batch_dev_py(
-    py: Python<'_>,
-    close: PyReadonlyArray1<'_, f32>,
-    volume: PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    if close_slice.len() != volume_slice.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaNvi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .nvi_batch_dev(close_slice, volume_slice)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "nvi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (close_tm, volume_tm, cols, rows, device_id=0))]
-pub fn nvi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    close_tm: PyReadonlyArray1<'_, f32>,
-    volume_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let close_slice = close_tm.as_slice()?;
-    let volume_slice = volume_tm.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaNvi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .nvi_many_series_one_param_time_major_dev(close_slice, volume_slice, cols, rows)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
 }

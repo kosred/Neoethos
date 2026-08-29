@@ -276,12 +276,15 @@ pub fn aggregate_portfolio(entries: &[PromotionMetrics]) -> Option<PromotionMetr
         // healthy siblings (the mean fields propagate NaN on their own).
         // Propagate NaN explicitly; `evaluate_promotion` then rejects it
         // loudly as non-finite evidence.
-        max_drawdown_pct: entries.iter().map(|e| e.max_drawdown_pct).fold(
-            0.0_f64,
-            |acc, dd| {
-                if dd.is_nan() { f64::NAN } else { acc.max(dd) }
-            },
-        ),
+        max_drawdown_pct: entries
+            .iter()
+            .map(|e| e.max_drawdown_pct)
+            .fold(
+                0.0_f64,
+                |acc, dd| {
+                    if dd.is_nan() { f64::NAN } else { acc.max(dd) }
+                },
+            ),
         trades: entries.iter().map(|e| e.trades).sum(),
     })
 }
@@ -314,7 +317,11 @@ mod tests {
         m.sharpe = 0.4; // below default 1.0
         let d = evaluate_promotion(&m, &PromotionGateConfig::default());
         assert!(!d.promoted);
-        let sharpe = d.criteria.iter().find(|c| c.name == "Sharpe ratio").unwrap();
+        let sharpe = d
+            .criteria
+            .iter()
+            .find(|c| c.name == "Sharpe ratio")
+            .unwrap();
         assert!(!sharpe.passed);
         assert_eq!(sharpe.comparison, ">=");
         assert!(d.summary.contains("Sharpe ratio"));
@@ -326,7 +333,11 @@ mod tests {
         m.max_drawdown_pct = 40.0; // above default 25%
         let d = evaluate_promotion(&m, &PromotionGateConfig::default());
         assert!(!d.promoted);
-        let dd = d.criteria.iter().find(|c| c.name == "Max drawdown %").unwrap();
+        let dd = d
+            .criteria
+            .iter()
+            .find(|c| c.name == "Max drawdown %")
+            .unwrap();
         assert!(!dd.passed);
         assert_eq!(dd.comparison, "<=");
     }
@@ -527,6 +538,9 @@ promotion_gate:
         let mut catastrophic = strong();
         catastrophic.sharpe = -3.0;
         let d = evaluate_promotion(&catastrophic, &models.promotion_gate);
-        assert!(d.promoted, "operator's `enabled: false` must reach the gate");
+        assert!(
+            d.promoted,
+            "operator's `enabled: false` must reach the gate"
+        );
     }
 }

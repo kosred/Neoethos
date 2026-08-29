@@ -1,40 +1,15 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaMarketefi};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::DeviceArrayF32Py as SharedDeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum MarketefiData<'a> {
@@ -52,10 +27,6 @@ pub enum MarketefiData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MarketefiParams;
 
 impl Default for MarketefiParams {
@@ -172,13 +143,6 @@ pub enum MarketefiError {
     InvalidKernelForBatch(Kernel),
     #[error("marketefi: Zero or NaN volume at a valid index.")]
     ZeroOrNaNVolume,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-impl From<MarketefiError> for JsValue {
-    fn from(err: MarketefiError) -> Self {
-        JsValue::from_str(&err.to_string())
-    }
 }
 
 #[inline]
@@ -356,7 +320,6 @@ pub fn marketefi_with_kernel(
     Ok(MarketefiOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn marketefi_into(input: &MarketefiInput, out: &mut [f64]) -> Result<(), MarketefiError> {
     let (h, l, v, first, chosen) = marketefi_prepare(input, Kernel::Auto)?;
@@ -1086,242 +1049,11 @@ fn approx_recip_nr2_f64(x: f64) -> f64 {
     y
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "marketefi")]
-#[pyo3(signature = (high, low, volume, kernel=None))]
-pub fn marketefi_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let input = MarketefiInput::from_slices(
-        high_slice,
-        low_slice,
-        volume_slice,
-        MarketefiParams::default(),
-    );
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| marketefi_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MarketefiStream")]
-pub struct MarketefiStreamPy {
-    stream: MarketefiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MarketefiStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        Ok(MarketefiStreamPy {
-            stream: MarketefiStream::new(),
-        })
-    }
-
-    fn update(&mut self, high: f64, low: f64, volume: f64) -> Option<f64> {
-        self.stream.update(high, low, volume)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "MarketefiDeviceArrayF32", unsendable)]
-pub struct MarketefiDeviceArrayF32Py {
-    pub(crate) inner: SharedDeviceArrayF32Py,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl MarketefiDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        self.inner.__cuda_array_interface__(py)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        self.inner.__dlpack_device__()
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        self.inner
-            .__dlpack__(py, stream, max_version, dl_device, copy)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl MarketefiDeviceArrayF32Py {
-    fn new_from_rust(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        let shared = SharedDeviceArrayF32Py {
-            inner,
-            _ctx: Some(ctx_guard),
-            device_id: Some(device_id),
-        };
-        Self { inner: shared }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "marketefi_batch")]
-#[pyo3(signature = (high, low, volume, kernel=None))]
-pub fn marketefi_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let v = volume.as_slice()?;
-    let k = validate_kernel(kernel, true)?;
-
-    let rows = 1usize;
-    let cols = h.len();
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| marketefi_batch_inner_into(h, l, v, k, true, out_slice))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "marketefi_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, volume_f32, device_id=0))]
-pub fn marketefi_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    volume_f32: numpy::PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<MarketefiDeviceArrayF32Py> {
-    use numpy::PyArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let v = volume_f32.as_slice()?;
-    if h.len() != l.len() || l.len() != v.len() {
-        return Err(PyValueError::new_err(
-            "high, low, volume must have same length",
-        ));
-    }
-    let (inner, ctx_guard, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda =
-            CudaMarketefi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        let inner = cuda
-            .marketefi_batch_dev(h, l, v)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((inner, ctx, dev))
-    })?;
-    Ok(MarketefiDeviceArrayF32Py::new_from_rust(
-        inner, ctx_guard, dev_id,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "marketefi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, volume_tm_f32, device_id=0))]
-pub fn marketefi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    volume_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    device_id: usize,
-) -> PyResult<MarketefiDeviceArrayF32Py> {
-    use numpy::{PyArrayMethods, PyUntypedArrayMethods};
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let v = volume_tm_f32.as_slice()?;
-    let shp_h = high_tm_f32.shape();
-    let shp_l = low_tm_f32.shape();
-    let shp_v = volume_tm_f32.shape();
-    if shp_h.len() != 2 || shp_h != shp_l || shp_h != shp_v {
-        return Err(PyValueError::new_err(
-            "high_tm, low_tm, volume_tm must have same 2D shape",
-        ));
-    }
-    let rows = shp_h[0];
-    let cols = shp_h[1];
-    let (inner, ctx_guard, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda =
-            CudaMarketefi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        let inner = cuda
-            .marketefi_many_series_one_param_time_major_dev(h, l, v, cols, rows)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((inner, ctx, dev))
-    })?;
-    Ok(MarketefiDeviceArrayF32Py::new_from_rust(
-        inner, ctx_guard, dev_id,
-    ))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn marketefi_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    volume: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = marketefi_js(high, low, volume)?;
-    crate::write_wasm_f64_output("marketefi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn marketefi_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    volume: &[f64],
-    _config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = marketefi_batch_js(high, low, volume, _config)?;
-    crate::write_wasm_selected_object_f64_outputs("marketefi_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
@@ -1350,13 +1082,8 @@ mod tests {
         let baseline = marketefi_with_kernel(&input, Kernel::Auto)?;
 
         let mut out = vec![0.0; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             marketefi_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            marketefi_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(out.len(), baseline.values.len());
@@ -1369,8 +1096,8 @@ mod tests {
 
     fn check_marketefi_accuracy(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MarketefiInput::with_default_candles(&candles);
         let res = marketefi_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -1773,8 +1500,8 @@ mod tests {
     fn check_marketefi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = MarketefiParams::default();
         let input = MarketefiInput::from_candles(&candles, "high", "low", "volume", params.clone());
@@ -1819,8 +1546,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let out = MarketefiBatchBuilder::new().kernel(kernel).apply_slices(
             source_type(&candles, "high"),
             source_type(&candles, "low"),
@@ -1849,8 +1576,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = MarketefiBatchBuilder::new().kernel(kernel).apply_slices(
             source_type(&c, "high"),
@@ -1922,133 +1649,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn marketefi_js(high: &[f64], low: &[f64], volume: &[f64]) -> Result<Vec<f64>, JsValue> {
-    let input = MarketefiInput::from_slices(high, low, volume, MarketefiParams::default());
-
-    let mut output = vec![0.0; high.len()];
-
-    marketefi_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn marketefi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn marketefi_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn marketefi_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to marketefi_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        let input = MarketefiInput::from_slices(high, low, volume, MarketefiParams::default());
-
-        if high_ptr == out_ptr || low_ptr == out_ptr || volume_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            marketefi_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            marketefi_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MarketefiBatchConfig {}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MarketefiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<MarketefiParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = marketefi_batch)]
-pub fn marketefi_batch_js(
-    high: &[f64],
-    low: &[f64],
-    volume: &[f64],
-    _config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let result = marketefi_batch_with_kernel(high, low, volume, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let output = MarketefiBatchJsOutput {
-        values: result.values,
-        combos: result.combos,
-        rows: result.rows,
-        cols: result.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn marketefi_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to marketefi_batch_into",
-        ));
-    }
-    unsafe {
-        let h = core::slice::from_raw_parts(high_ptr, len);
-        let l = core::slice::from_raw_parts(low_ptr, len);
-        let v = core::slice::from_raw_parts(volume_ptr, len);
-        let out = core::slice::from_raw_parts_mut(out_ptr, len);
-
-        marketefi_batch_inner_into(h, l, v, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(1)
-    }
 }

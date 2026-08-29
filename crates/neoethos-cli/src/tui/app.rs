@@ -121,8 +121,9 @@ pub struct AppShared {
     /// Editable Config page form — loaded from the on-disk Settings, saved
     /// back to config.yaml so the user can change core settings from the TUI.
     pub config_form: FormState,
-    /// Single-field form on the Symbols page: a source path to import data from
-    /// (CSV/Parquet/Vortex/… → canonical data/ layout) without leaving the TUI.
+    /// Explicit import contract on the Symbols page. Every value that affects
+    /// source interpretation or dataset identity is operator-visible; the TUI
+    /// never guesses from a filename and never calls a second importer.
     pub import_form: FormState,
     /// Selected row on the Strategies page (index into the scanned portfolio
     /// list), so the user can browse a portfolio's per-strategy metrics.
@@ -152,11 +153,38 @@ impl AppShared {
             train_form: make_train_form(&root_str),
             chart_state,
             config_form: crate::tui::pages::config_view::make_config_form(),
-            import_form: FormState::new(vec![crate::tui::form::Field::new(
-                "Import source",
-                "",
-                "Folder/file to import (CSV/TSV/JSON/Parquet/Vortex) → data/ layout",
-            )]),
+            import_form: FormState::new(vec![
+                crate::tui::form::Field::new(
+                    "Import source",
+                    "",
+                    "One source file; publication always reopens canonical Vortex",
+                ),
+                crate::tui::form::Field::new(
+                    "Source format",
+                    "",
+                    "csv|tsv|json-array|json-lines|parquet|arrow-ipc-file|arrow-ipc-stream|vortex",
+                ),
+                crate::tui::form::Field::new(
+                    "Source namespace",
+                    "",
+                    "Stable external provenance namespace, for example dukascopy-2026",
+                ),
+                crate::tui::form::Field::new(
+                    "Symbol",
+                    "",
+                    "Exact broker/source symbol; punctuation and suffixes are preserved",
+                ),
+                crate::tui::form::Field::new(
+                    "Timeframe",
+                    "",
+                    "Exact canonical cTrader timeframe, for example M1 or H4",
+                ),
+                crate::tui::form::Field::new(
+                    "Bar timestamps",
+                    "",
+                    "Only explicitly evidenced bar_open is canonical",
+                ),
+            ]),
             strategies_selected: 0,
             logs_scroll: 0,
             pending_confirmation: None,

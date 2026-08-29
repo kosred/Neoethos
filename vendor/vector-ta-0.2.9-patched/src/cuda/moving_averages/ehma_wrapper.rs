@@ -1,21 +1,21 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
-use crate::indicators::moving_averages::ehma::{expand_grid, EhmaBatchRange, EhmaParams};
+use crate::indicators::moving_averages::ehma::{EhmaBatchRange, EhmaParams, expand_grid};
 use cust::context::Context;
 use cust::context::{CacheConfig, SharedMemoryConfig};
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
 use cust::memory::AsyncCopyDestination;
-use cust::memory::{mem_get_info, DeviceBuffer, LockedBuffer};
+use cust::memory::{DeviceBuffer, LockedBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys as cu;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -28,7 +28,9 @@ pub enum CudaEhmaError {
     InvalidPolicy(&'static str),
     #[error("Missing kernel symbol: {name}")]
     MissingKernelSymbol { name: &'static str },
-    #[error("Out of memory on device: required={required} bytes (including headroom={headroom}), free={free} bytes")]
+    #[error(
+        "Out of memory on device: required={required} bytes (including headroom={headroom}), free={free} bytes"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -118,12 +120,6 @@ impl CudaEhma {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/ehma_kernel.ptx"));
-
-        let jit_opts = &[
-            cust::module::ModuleJitOption::DetermineTargetFromContext,
-            cust::module::ModuleJitOption::OptLevel(cust::module::OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("ehma_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -395,7 +391,7 @@ impl CudaEhma {
                 return Err(CudaEhmaError::InvalidInput(format!(
                     "unsupported 2D tile tx={}, ty={}",
                     tx, ty
-                )))
+                )));
             }
         };
         Ok(if self.module.get_function(a).is_ok() {

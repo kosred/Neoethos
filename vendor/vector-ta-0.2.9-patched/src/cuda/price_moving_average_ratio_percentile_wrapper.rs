@@ -1,15 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::price_moving_average_ratio_percentile::{
-    expand_grid, PriceMovingAverageRatioPercentileBatchRange,
-    PriceMovingAverageRatioPercentileLineMode, PriceMovingAverageRatioPercentileMaType,
-    PriceMovingAverageRatioPercentileParams,
+    PriceMovingAverageRatioPercentileBatchRange, PriceMovingAverageRatioPercentileLineMode,
+    PriceMovingAverageRatioPercentileMaType, PriceMovingAverageRatioPercentileParams, expand_grid,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
@@ -279,8 +278,8 @@ impl CudaPriceMovingAverageRatioPercentile {
             if signal_ma_length > cols {
                 return Err(CudaPriceMovingAverageRatioPercentileError::InvalidInput(
                     format!(
-                    "invalid signal_ma_length: signal_ma_length={signal_ma_length}, data_len={cols}"
-                ),
+                        "invalid signal_ma_length: signal_ma_length={signal_ma_length}, data_len={cols}"
+                    ),
                 ));
             }
 

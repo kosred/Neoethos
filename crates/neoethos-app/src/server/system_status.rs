@@ -15,6 +15,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
+use neoethos_data::{CanonicalDatasetIdentity, DatasetDiscovery};
 
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::jobs::JobKind;
@@ -53,24 +54,19 @@ pub struct EnginesDto {
     /// Total / currently-available physical RAM, in GB.
     pub ram_total_gb: f64,
     pub ram_available_gb: f64,
-    /// On-disk size of the feature-store temp dir (MB) — the multi-TF cubes
-    /// discovery streams to disk; 0 when everything fits in RAM. Reclaimed
-    /// per-TF as each unit finishes.
+    /// On-disk size of active Vortex feature-run scratch data (MB). This is 0
+    /// when every feature block fits in RAM. Each run owns a lease-backed
+    /// directory that is reclaimed after the final consumer releases it.
     pub feature_store_mb: u64,
 }
 
-/// Sum the on-disk `.fstore` cubes discovery is currently holding (MB).
+/// Sum regular files under the only production feature scratch root without
+/// following symlinks. Vortex is the sole shared feature format, so the status
+/// endpoint reads the same lease-backed root as the production writer.
 fn feature_store_disk_mb() -> u64 {
-    let dir = std::env::temp_dir().join("neoethos_feature_store");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0;
-    };
-    let bytes: u64 = entries
-        .flatten()
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("fstore"))
-        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
-        .sum();
-    bytes / (1 << 20)
+    super::feature_store_disk::vortex_feature_store_disk_mb(
+        &neoethos_data::vortex_feature_run_root(),
+    )
 }
 
 /// F-340 (Feature #14): one live counter from a running engine's
@@ -194,14 +190,41 @@ pub struct DataBootstrapDto {
     pub data_dir: String,
     /// Whether the configured data dir actually exists on disk.
     pub data_dir_exists: bool,
-    /// First-level symbol directories discovered, sorted alphabetically.
+    /// Symbols represented by canonical manifest-backed datasets.
     pub symbols: Vec<String>,
-    /// Total file count under data_dir (1-level walk). Gives the
-    /// operator a one-glance read on "do I have any history at all".
-    pub file_count: usize,
+    /// Number of canonical dataset identities, not a filesystem file count.
+    pub dataset_count: usize,
     /// mtime of the most-recently-touched file in data_dir, as a
     /// Unix-millis stamp. `None` if the dir is empty or doesn't exist.
     pub last_touched_unix_ms: Option<u64>,
+    /// Authoritative, reversible canonical identities. The desktop must send
+    /// one of these exact values back; symbol/timeframe text is not an identity.
+    pub datasets: Vec<CanonicalDatasetInventoryDto>,
+    /// Raw/import-required/retired/corrupt entries are visible rather than
+    /// disappearing into an empty-success inventory.
+    pub skipped: Vec<SkippedDatasetInventoryDto>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalDatasetInventoryDto {
+    pub dataset_identity: String,
+    pub generation: String,
+    pub manifest_binding_sha256: String,
+    /// Authoritative source classification so the desktop never decodes the
+    /// opaque identity merely to decide whether broker refresh is valid.
+    pub source_kind: &'static str,
+    pub symbol: Option<String>,
+    pub timeframe: Option<String>,
+    pub verification: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedDatasetInventoryDto {
+    pub path: String,
+    pub category: String,
+    pub detail: String,
 }
 
 pub async fn data_bootstrap(State(state): State<AppApiState>) -> Response {
@@ -233,60 +256,70 @@ fn scan_data_dir(dir: PathBuf) -> anyhow::Result<DataBootstrapDto> {
             data_dir: data_dir_str,
             data_dir_exists: false,
             symbols: Vec::new(),
-            file_count: 0,
+            dataset_count: 0,
             last_touched_unix_ms: None,
+            datasets: Vec::new(),
+            skipped: Vec::new(),
         });
     }
 
-    let mut symbols = Vec::new();
-    let mut file_count = 0usize;
-    let mut latest_mtime: Option<SystemTime> = None;
+    let discovery = DatasetDiscovery::scan_metadata(&dir)?;
+    let mut symbols = discovery
+        .entries
+        .iter()
+        .filter_map(|entry| entry.symbol.clone())
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
 
-    if let Ok(read_dir) = std::fs::read_dir(&dir) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Only the `symbol=XXX` directories are actual
-                    // market-data symbols. Co-located dirs (`forex-ai`,
-                    // `neoethos`, `news`, `symbol_metadata`, ...) are
-                    // produced by other modules and must not be
-                    // surfaced as tradeable symbols.
-                    if let Some(symbol) = name.strip_prefix("symbol=") {
-                        symbols.push(symbol.to_string());
-                    }
-                }
-                // 1-level deep file count + mtime sweep so we don't
-                // walk the whole tree on every request.
-                if let Ok(sub) = std::fs::read_dir(&path) {
-                    for inner in sub.flatten() {
-                        if let Ok(meta) = inner.metadata() {
-                            if meta.is_file() {
-                                file_count += 1;
-                            }
-                            if let Ok(mtime) = meta.modified() {
-                                latest_mtime = Some(match latest_mtime {
-                                    Some(prev) if prev > mtime => prev,
-                                    _ => mtime,
-                                });
-                            }
-                        }
-                    }
-                }
-            } else if path.is_file() {
-                file_count += 1;
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        latest_mtime = Some(match latest_mtime {
-                            Some(prev) if prev > mtime => prev,
-                            _ => mtime,
-                        });
-                    }
-                }
-            }
+    let mut latest_mtime: Option<SystemTime> = None;
+    for entry in &discovery.entries {
+        if let Ok(mtime) = entry
+            .path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+        {
+            latest_mtime = Some(match latest_mtime {
+                Some(previous) if previous > mtime => previous,
+                _ => mtime,
+            });
         }
     }
-    symbols.sort();
+    let datasets = discovery
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let identity = CanonicalDatasetIdentity::from_path_component(&entry.dataset_identity)
+                .map_err(|error| {
+                anyhow::anyhow!(
+                    "validated inventory identity {} no longer decodes: {error}",
+                    entry.dataset_identity
+                )
+            })?;
+            Ok(CanonicalDatasetInventoryDto {
+                dataset_identity: entry.dataset_identity,
+                generation: entry.generation,
+                manifest_binding_sha256: entry.manifest_binding_sha256,
+                source_kind: if identity.is_broker_real() {
+                    "ctrader"
+                } else {
+                    "external"
+                },
+                symbol: entry.symbol,
+                timeframe: entry.timeframe,
+                verification: entry.verification.as_str().to_owned(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let skipped = discovery
+        .skipped
+        .into_iter()
+        .map(|entry| SkippedDatasetInventoryDto {
+            path: entry.path.display().to_string(),
+            category: entry.reason.category().to_owned(),
+            detail: entry.reason.detail().to_owned(),
+        })
+        .collect::<Vec<_>>();
 
     let last_touched_unix_ms = latest_mtime
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -296,7 +329,9 @@ fn scan_data_dir(dir: PathBuf) -> anyhow::Result<DataBootstrapDto> {
         data_dir: data_dir_str,
         data_dir_exists: true,
         symbols,
-        file_count,
+        dataset_count: datasets.len(),
         last_touched_unix_ms,
+        datasets,
+        skipped,
     })
 }

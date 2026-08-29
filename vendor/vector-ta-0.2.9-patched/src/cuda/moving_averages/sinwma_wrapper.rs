@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::sinwma::{SinWmaBatchRange, SinWmaParams};
@@ -6,19 +6,19 @@ use cust::context::{CacheConfig, Context, SharedMemoryConfig};
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, Function, GridSize};
 use cust::memory::{
-    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info,
 };
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
-use cust::sys::{cuFuncSetAttribute, CUfunction_attribute_enum as CUfuncAttr};
+use cust::sys::{CUfunction_attribute_enum as CUfuncAttr, cuFuncSetAttribute};
 
 #[derive(Debug, Error)]
 pub enum CudaSinwmaError {
@@ -118,11 +118,6 @@ impl CudaSinwma {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/sinwma_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("sinwma_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

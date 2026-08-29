@@ -361,8 +361,8 @@ pub fn normalize_training_precision_policy(policy: &str) -> String {
 /// is added it belongs on `ModelsConfig` and this function takes the model back
 /// as an argument then, not before.
 pub fn requested_training_precision_policy() -> String {
-    let Some(configured) = neoethos_core::system::current_hardware_runtime_overrides()
-        .training_precision
+    let Some(configured) =
+        neoethos_core::system::current_hardware_runtime_overrides().training_precision
     else {
         return "auto".to_string();
     };

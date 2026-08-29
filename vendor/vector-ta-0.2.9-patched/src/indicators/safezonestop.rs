@@ -1,24 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
@@ -59,10 +44,6 @@ pub struct SafeZoneStopOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct SafeZoneStopParams {
     pub period: Option<usize>,
     pub mult: Option<f64>,
@@ -447,7 +428,6 @@ pub fn safezonestop_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn safezonestop_into(
     input: &SafeZoneStopInput,
@@ -492,20 +472,12 @@ pub unsafe fn safezonestop_scalar(
     if max_lookback > LB_DEQUE_THRESHOLD {
         #[inline(always)]
         fn ring_dec(x: usize, cap: usize) -> usize {
-            if x == 0 {
-                cap - 1
-            } else {
-                x - 1
-            }
+            if x == 0 { cap - 1 } else { x - 1 }
         }
         #[inline(always)]
         fn ring_inc(x: usize, cap: usize) -> usize {
             let y = x + 1;
-            if y == cap {
-                0
-            } else {
-                y
-            }
+            if y == cap { 0 } else { y }
         }
 
         let cap = max_lookback.max(1) + 1;
@@ -531,17 +503,9 @@ pub unsafe fn safezonestop_scalar(
             let up_pos = if up > 0.0 { up } else { 0.0 };
             let dn_pos = if dn > 0.0 { dn } else { 0.0 };
             let dm_raw = if dir_long {
-                if dn_pos > up_pos {
-                    dn_pos
-                } else {
-                    0.0
-                }
+                if dn_pos > up_pos { dn_pos } else { 0.0 }
             } else {
-                if up_pos > dn_pos {
-                    up_pos
-                } else {
-                    0.0
-                }
+                if up_pos > dn_pos { up_pos } else { 0.0 }
             };
 
             if !dm_ready {
@@ -618,17 +582,9 @@ pub unsafe fn safezonestop_scalar(
             let up_pos = if up > 0.0 { up } else { 0.0 };
             let dn_pos = if dn > 0.0 { dn } else { 0.0 };
             let dm = if dir_long {
-                if dn_pos > up_pos {
-                    dn_pos
-                } else {
-                    0.0
-                }
+                if dn_pos > up_pos { dn_pos } else { 0.0 }
             } else {
-                if up_pos > dn_pos {
-                    up_pos
-                } else {
-                    0.0
-                }
+                if up_pos > dn_pos { up_pos } else { 0.0 }
             };
             sum += dm;
             prev_h = h;
@@ -645,17 +601,9 @@ pub unsafe fn safezonestop_scalar(
             let up_pos = if up > 0.0 { up } else { 0.0 };
             let dn_pos = if dn > 0.0 { dn } else { 0.0 };
             let dm = if dir_long {
-                if dn_pos > up_pos {
-                    dn_pos
-                } else {
-                    0.0
-                }
+                if dn_pos > up_pos { dn_pos } else { 0.0 }
             } else {
-                if up_pos > dn_pos {
-                    up_pos
-                } else {
-                    0.0
-                }
+                if up_pos > dn_pos { up_pos } else { 0.0 }
             };
             let prev = *dm_smooth.get_unchecked(i - 1);
             *dm_smooth.get_unchecked_mut(i) = alpha.mul_add(prev, dm);
@@ -800,19 +748,11 @@ impl SafeZoneStopStream {
     #[inline]
     fn ring_inc(&self, x: usize) -> usize {
         let y = x + 1;
-        if y == self.cap {
-            0
-        } else {
-            y
-        }
+        if y == self.cap { 0 } else { y }
     }
     #[inline]
     fn ring_dec(&self, x: usize) -> usize {
-        if x == 0 {
-            self.cap - 1
-        } else {
-            x - 1
-        }
+        if x == 0 { self.cap - 1 } else { x - 1 }
     }
 
     pub fn try_new(params: SafeZoneStopParams, direction: &str) -> Result<Self, SafeZoneStopError> {
@@ -935,17 +875,9 @@ impl SafeZoneStopStream {
         let up_pos = if up > 0.0 { up } else { 0.0 };
         let dn_pos = if dn > 0.0 { dn } else { 0.0 };
         let dm_raw = if self.dir_long {
-            if dn_pos > up_pos {
-                dn_pos
-            } else {
-                0.0
-            }
+            if dn_pos > up_pos { dn_pos } else { 0.0 }
         } else {
-            if up_pos > dn_pos {
-                up_pos
-            } else {
-                0.0
-            }
+            if up_pos > dn_pos { up_pos } else { 0.0 }
         };
 
         let j = self.i + 1;
@@ -1293,17 +1225,9 @@ fn safezonestop_batch_inner(
             let up_pos = if up > 0.0 { up } else { 0.0 };
             let dn_pos = if dn > 0.0 { dn } else { 0.0 };
             let v = if dir_long {
-                if dn_pos > up_pos {
-                    dn_pos
-                } else {
-                    0.0
-                }
+                if dn_pos > up_pos { dn_pos } else { 0.0 }
             } else {
-                if up_pos > dn_pos {
-                    up_pos
-                } else {
-                    0.0
-                }
+                if up_pos > dn_pos { up_pos } else { 0.0 }
             };
             dm_raw[i] = v;
             prev_h = h;
@@ -1453,17 +1377,9 @@ pub fn safezonestop_batch_inner_into(
             let up_pos = if up > 0.0 { up } else { 0.0 };
             let dn_pos = if dn > 0.0 { dn } else { 0.0 };
             let v = if dir_long {
-                if dn_pos > up_pos {
-                    dn_pos
-                } else {
-                    0.0
-                }
+                if dn_pos > up_pos { dn_pos } else { 0.0 }
             } else {
-                if up_pos > dn_pos {
-                    up_pos
-                } else {
-                    0.0
-                }
+                if up_pos > dn_pos { up_pos } else { 0.0 }
             };
             dm_raw[i] = v;
             prev_h = h;
@@ -1560,20 +1476,12 @@ unsafe fn safezonestop_row_scalar_with_dmraw(
         if max_lookback > LB_DEQUE_THRESHOLD {
             #[inline(always)]
             fn ring_dec(x: usize, cap: usize) -> usize {
-                if x == 0 {
-                    cap - 1
-                } else {
-                    x - 1
-                }
+                if x == 0 { cap - 1 } else { x - 1 }
             }
             #[inline(always)]
             fn ring_inc(x: usize, cap: usize) -> usize {
                 let y = x + 1;
-                if y == cap {
-                    0
-                } else {
-                    y
-                }
+                if y == cap { 0 } else { y }
             }
             let cap = max_lookback.max(1) + 1;
             let mut q_idx = vec![0usize; cap];
@@ -1766,244 +1674,19 @@ pub unsafe fn safezonestop_row_avx512_long(
     safezonestop_scalar(high, low, period, mult, max_lookback, direction, first, out)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn safezonestop_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    mult: f64,
-    max_lookback: usize,
-    direction: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let params = SafeZoneStopParams {
-        period: Some(period),
-        mult: Some(mult),
-        max_lookback: Some(max_lookback),
-    };
-    let input = SafeZoneStopInput::from_slices(high, low, direction, params);
-
-    let mut output = vec![0.0; high.len()];
-
-    safezonestop_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn safezonestop_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    mult: f64,
-    max_lookback: usize,
-    direction: &str,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let params = SafeZoneStopParams {
-            period: Some(period),
-            mult: Some(mult),
-            max_lookback: Some(max_lookback),
-        };
-        let input = SafeZoneStopInput::from_slices(high, low, direction, params);
-
-        if high_ptr == out_ptr || low_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            safezonestop_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            safezonestop_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn safezonestop_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn safezonestop_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SafeZoneStopBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub mult_range: (f64, f64, f64),
-    pub max_lookback_range: (usize, usize, usize),
-    pub direction: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SafeZoneStopBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<SafeZoneStopParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = safezonestop_batch)]
-pub fn safezonestop_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: SafeZoneStopBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = SafeZoneStopBatchRange {
-        period: config.period_range,
-        mult: config.mult_range,
-        max_lookback: config.max_lookback_range,
-    };
-
-    let row_kernel = match detect_best_batch_kernel() {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        _ => Kernel::Scalar,
-    };
-
-    let output = safezonestop_batch_inner(high, low, &sweep, &config.direction, row_kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = SafeZoneStopBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn safezonestop_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-    max_lookback_start: usize,
-    max_lookback_end: usize,
-    max_lookback_step: usize,
-    direction: &str,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to safezonestop_batch_into",
-        ));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let sweep = SafeZoneStopBatchRange {
-            period: (period_start, period_end, period_step),
-            mult: (mult_start, mult_end, mult_step),
-            max_lookback: (max_lookback_start, max_lookback_end, max_lookback_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let total_size = combos
-            .len()
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("safezonestop_batch_into: rows * cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
-
-        let row_kernel = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-
-        safezonestop_batch_inner_into(high, low, &sweep, direction, row_kernel, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(combos.len())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn safezonestop_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    mult: f64,
-    max_lookback: usize,
-    direction: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = safezonestop_js(high, low, period, mult, max_lookback, direction)?;
-    crate::write_wasm_f64_output("safezonestop_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn safezonestop_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = safezonestop_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "safezonestop_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_safezonestop_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = SafeZoneStopParams {
             period: Some(14),
             mult: None,
@@ -2017,8 +1700,8 @@ mod tests {
 
     fn check_safezonestop_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = SafeZoneStopParams {
             period: Some(22),
             mult: Some(2.5),
@@ -2054,8 +1737,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = SafeZoneStopInput::with_default_candles(&candles);
         let output = safezonestop_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -2107,8 +1790,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = SafeZoneStopInput::with_default_candles(&candles);
         let res = safezonestop_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -2129,8 +1812,8 @@ mod tests {
     fn check_safezonestop_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             (SafeZoneStopParams::default(), "long"),
@@ -2591,20 +2274,15 @@ mod tests {
 
     #[test]
     fn test_safezonestop_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = SafeZoneStopInput::with_default_candles(&candles);
 
         let baseline = safezonestop(&input)?.values;
 
         let mut out = vec![0.0f64; candles.close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             safezonestop_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            return Ok(());
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -2630,8 +2308,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let high = source_type(&c, "high");
         let low = source_type(&c, "low");
@@ -2666,8 +2344,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let high = source_type(&c, "high");
         let low = source_type(&c, "low");
@@ -2707,38 +2385,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) with params: period={}, mult={}, max_lookback={}, direction='{}'",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(22),
-						combo.mult.unwrap_or(2.5),
-						combo.max_lookback.unwrap_or(3),
-						direction
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(22),
+                        combo.mult.unwrap_or(2.5),
+                        combo.max_lookback.unwrap_or(3),
+                        direction
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) with params: period={}, mult={}, max_lookback={}, direction='{}'",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(22),
-						combo.mult.unwrap_or(2.5),
-						combo.max_lookback.unwrap_or(3),
-						direction
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(22),
+                        combo.mult.unwrap_or(2.5),
+                        combo.max_lookback.unwrap_or(3),
+                        direction
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) with params: period={}, mult={}, max_lookback={}, direction='{}'",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(22),
-						combo.mult.unwrap_or(2.5),
-						combo.max_lookback.unwrap_or(3),
-						direction
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(22),
+                        combo.mult.unwrap_or(2.5),
+                        combo.max_lookback.unwrap_or(3),
+                        direction
+                    );
                 }
             }
         }
@@ -2773,248 +2469,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "safezonestop")]
-#[pyo3(signature = (high, low, period, mult, max_lookback, direction, kernel=None))]
-pub fn safezonestop_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    mult: f64,
-    max_lookback: usize,
-    direction: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = SafeZoneStopParams {
-        period: Some(period),
-        mult: Some(mult),
-        max_lookback: Some(max_lookback),
-    };
-    let input = SafeZoneStopInput::from_slices(high_slice, low_slice, direction, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| safezonestop_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "SafeZoneStopStream")]
-pub struct SafeZoneStopStreamPy {
-    stream: SafeZoneStopStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl SafeZoneStopStreamPy {
-    #[new]
-    fn new(period: usize, mult: f64, max_lookback: usize, direction: &str) -> PyResult<Self> {
-        let params = SafeZoneStopParams {
-            period: Some(period),
-            mult: Some(mult),
-            max_lookback: Some(max_lookback),
-        };
-        let stream = SafeZoneStopStream::try_new(params, direction)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(SafeZoneStopStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "safezonestop_batch")]
-#[pyo3(signature = (high, low, period_range, mult_range, max_lookback_range, direction, kernel=None))]
-pub fn safezonestop_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    max_lookback_range: (usize, usize, usize),
-    direction: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    let sweep = SafeZoneStopBatchRange {
-        period: period_range,
-        mult: mult_range,
-        max_lookback: max_lookback_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = high_slice.len();
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        PyValueError::new_err(
-            SafeZoneStopError::InvalidRange {
-                start: period_range.0 as f64,
-                end: period_range.1 as f64,
-                step: period_range.2 as f64,
-            }
-            .to_string(),
-        )
-    })?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-
-            safezonestop_batch_inner_into(
-                high_slice, low_slice, &sweep, direction, simd, true, slice_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "mults",
-        combos
-            .iter()
-            .map(|p| p.mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "max_lookbacks",
-        combos
-            .iter()
-            .map(|p| p.max_lookback.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaSafeZoneStop;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "safezonestop_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, period_range, mult_range, max_lookback_range, direction, device_id=0))]
-pub fn safezonestop_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    max_lookback_range: (usize, usize, usize),
-    direction: &str,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high = high_f32.as_slice()?;
-    let low = low_f32.as_slice()?;
-    let sweep = SafeZoneStopBatchRange {
-        period: period_range,
-        mult: mult_range,
-        max_lookback: max_lookback_range,
-    };
-    let (inner, combos) = py.allow_threads(|| {
-        let cuda =
-            CudaSafeZoneStop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.safezonestop_batch_dev(high, low, direction, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = PyDict::new(py);
-    let periods: Vec<u64> = combos.iter().map(|p| p.period.unwrap() as u64).collect();
-    let mults: Vec<f64> = combos.iter().map(|p| p.mult.unwrap()).collect();
-    let looks: Vec<u64> = combos
-        .iter()
-        .map(|p| p.max_lookback.unwrap() as u64)
-        .collect();
-    dict.set_item("periods", periods.into_pyarray(py))?;
-    dict.set_item("mults", mults.into_pyarray(py))?;
-    dict.set_item("max_lookbacks", looks.into_pyarray(py))?;
-
-    let handle = make_device_array_py(device_id, inner)?;
-
-    Ok((handle, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "safezonestop_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, cols, rows, period, mult, max_lookback, direction, device_id=0))]
-pub fn safezonestop_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    mult: f32,
-    max_lookback: usize,
-    direction: &str,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high = high_tm_f32.as_slice()?;
-    let low = low_tm_f32.as_slice()?;
-    let inner = py.allow_threads(|| {
-        let cuda =
-            CudaSafeZoneStop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.safezonestop_many_series_one_param_time_major_dev(
-            high,
-            low,
-            cols,
-            rows,
-            period,
-            mult,
-            max_lookback,
-            direction,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    make_device_array_py(device_id, inner)
 }

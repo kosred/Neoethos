@@ -9,13 +9,21 @@
 //! pull the access token, materialise the Spotware host. Keeping that
 //! in one place keeps the route modules thin.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
 
-use crate::app_services::bootstrap_writer::write_bootstrap_vortex;
 use crate::app_services::broker_config::CTraderBrokerEnvironment;
+use crate::app_services::broker_deal_economics::BrokerSymbolVolumeScaleEvidenceV1;
 use crate::app_services::broker_persistence::load_broker_settings;
-use crate::app_services::ctrader_bootstrap::NormalizedBar;
+use crate::app_services::ctrader_account::{
+    CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderCashFlowBundle,
+    CTraderCtidProfileSnapshot, CTraderExpectedMarginBundle, CTraderOrderHistoryBundle,
+    CTraderServerVersionSnapshot, ensure_success_payload_type, load_account_runtime,
+    parse_cash_flow_history_response, parse_ctid_profile_response, parse_expected_margin_response,
+    parse_order_list_response, parse_reconcile_response, parse_trader_response,
+    parse_version_response,
+};
+use crate::app_services::ctrader_auth::CTraderTokenBundle;
 use crate::app_services::ctrader_data::{
     CTraderChartHistoryRequest, CTraderHistoricalBarsFetchResult, CTraderLightSymbolInfo,
     CTraderResolvedSymbol, CTraderSymbolLookupRequest, CTraderSymbolsListResult, HistoricalBar,
@@ -26,18 +34,9 @@ use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
     CTraderExecutionRuntimeRequest, ProductionCTraderExecutionBackend,
 };
-use crate::app_services::ctrader_messages::{
-    CTraderAmendOrderRequest, CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest,
-    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderType, CTraderTimeInForce,
-    CTraderTradeSide,
-};
-use crate::app_services::ctrader_account::{
-    CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderCashFlowBundle,
-    CTraderCtidProfileSnapshot, CTraderExpectedMarginBundle, CTraderOrderHistoryBundle,
-    CTraderServerVersionSnapshot, ensure_success_payload_type, load_account_runtime,
-    parse_cash_flow_history_response, parse_ctid_profile_response, parse_expected_margin_response,
-    parse_order_list_response, parse_reconcile_response, parse_trader_response,
-    parse_version_response,
+use crate::app_services::ctrader_live_auth::{
+    CTraderEnvironment, CTraderLiveAuthBackend, CTraderTokenRefreshRequest,
+    ProductionCTraderLiveAuthBackend,
 };
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
@@ -46,11 +45,11 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE,
-    CTraderMarginCallListSnapshot, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
-    build_account_auth_request, build_application_auth_request, build_asset_class_list_request,
+    CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE, CTraderMarginCallListSnapshot,
+    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
+    build_application_auth_request, build_asset_class_list_request,
     build_cash_flow_history_list_request, build_expected_margin_request,
     build_get_ctid_profile_by_token_request, build_get_position_unrealized_pnl_request,
     build_margin_call_list_request, build_order_list_request, build_reconcile_request,
@@ -58,12 +57,12 @@ use crate::app_services::ctrader_messages::{
     build_version_request, parse_get_position_unrealized_pnl_response,
     parse_margin_call_list_response,
 };
-use crate::app_services::secure_store::production_ctrader_token_store;
-use crate::app_services::ctrader_live_auth::{
-    CTraderEnvironment, CTraderLiveAuthBackend, CTraderTokenRefreshRequest,
-    ProductionCTraderLiveAuthBackend,
+use crate::app_services::ctrader_messages::{
+    CTraderAmendOrderRequest, CTraderAmendPositionSltpRequest, CTraderCancelOrderRequest,
+    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderType, CTraderTimeInForce,
+    CTraderTradeSide,
 };
-use crate::app_services::ctrader_auth::CTraderTokenBundle;
+use crate::app_services::secure_store::production_ctrader_token_store;
 
 /// What `/broker/symbols` ultimately returns over the wire — kept here
 /// so the server module just shovels it to JSON.
@@ -116,6 +115,9 @@ pub struct HistoricalDownloadOutcome {
     /// Unix-millis of the oldest bar the broker actually returned across all
     /// chunks (None when 0 bars came back). Lets the UI show real depth.
     pub oldest_ms: Option<i64>,
+    pub dataset_identity: String,
+    pub generation: String,
+    pub durable_commit_id: String,
 }
 
 /// Resolve broker credentials + token bundle into the four primitives
@@ -516,208 +518,59 @@ fn canonical_asset_bucket(class_name: &str) -> &'static str {
     }
 }
 
-/// Download historical bars for [from_ms, to_ms] and write the result
-/// into the local data dir. Auto-chunked: cTrader caps each
-/// ProtoOAGetTrendbarsReq at ~5000 bars, so for wide windows we loop
-/// — sliding `to_ms` backwards by the timeframe's natural span until
-/// we cover the requested range. Accumulated bars are deduped and
-/// sorted by timestamp before the single vortex write.
-///
-/// Blocking; callers must wrap in `spawn_blocking`.
+/// Download and publish one exact cTrader historical generation through the
+/// shared model-free broker-history service. The shared service owns the
+/// persistent authenticated socket, bounded one-page spool, exact identity/CAS
+/// checks, cancellation gate and receipt derived directly from publication.
 pub fn download_history_blocking(
     symbol: &str,
     timeframe: &str,
     from_ms: i64,
     to_ms: i64,
     data_root: &std::path::Path,
+    dataset_selection: Option<&neoethos_data::SelectedDatasetGenerationV1>,
+    active_fetch: &neoethos_broker_history::ProcessHistoricalCapture,
 ) -> Result<HistoricalDownloadOutcome> {
-    if to_ms <= from_ms {
-        return Err(anyhow!(
-            "invalid range: from_ms ({from_ms}) must be < to_ms ({to_ms})"
-        ));
-    }
-
-    let creds = resolve_creds()?;
-    let chunk_ms = timeframe_chunk_ms(timeframe);
-
-    // Walk the window in `chunk_ms`-wide slices, latest first. Stops
-    // either when we cross from_ms or when a slice returns 0 bars
-    // (broker has nothing earlier — markets weren't trading, etc).
-    let mut all_bars: Vec<HistoricalBar> = Vec::new();
-    let mut cursor_to = to_ms;
-    let mut has_more_overall = false;
-    // Adaptive cap (2026-06-01): a flat 100 capped low-TF pulls far below the
-    // requested span (M1 3-day chunks × 100 = ~0.82y) — the loop died before
-    // the broker's own empty-response terminator ever fired. Size the cap to
-    // the actual requested range so deep history isn't silently truncated,
-    // with a generous ceiling so a pathological range still can't loop forever.
-    const CHUNK_CEILING: i64 = 20_000;
-    let span_ms = to_ms - from_ms; // > 0, guarded at fn entry
-    // Manual ceil-div — `i64::div_ceil` is unstable (int_roundings). Both
-    // operands are > 0 here, so (a + b − 1) / b is exact.
-    let needed_chunks =
-        (span_ms.saturating_add(chunk_ms).saturating_sub(1) / chunk_ms).saturating_add(2);
-    let max_chunks = needed_chunks.clamp(1, CHUNK_CEILING) as usize;
-    let mut chunk_count: usize = 0;
-    while cursor_to > from_ms && chunk_count < max_chunks {
-        let cursor_from = (cursor_to - chunk_ms).max(from_ms);
-        let request = CTraderChartHistoryRequest {
-            client_id: creds.client_id.clone(),
-            client_secret: creds.client_secret.clone(),
-            access_token: creds.access_token.clone(),
-            environment: creds.environment,
-            account_id: creds.account_id_str.clone(),
-            symbol_name: symbol.to_string(),
-            timeframe: timeframe.to_string(),
-            from_timestamp_ms: cursor_from,
-            to_timestamp_ms: cursor_to,
-            count: None,
-        };
-        let CTraderHistoricalBarsFetchResult { bars, has_more, .. } =
-            load_historical_bars_only(&request)?;
-        if bars.is_empty() {
-            // No more data going further back in time — stop.
-            break;
-        }
-        if has_more {
-            // The broker still has more inside this chunk than fit
-            // in the response. Carry that flag through so the UI can
-            // hint the user to widen their range or split it further.
-            has_more_overall = true;
-        }
-        all_bars.extend(bars);
-        cursor_to = cursor_from;
-        chunk_count += 1;
-    }
-
-    // Dedupe + sort. Multiple chunks can overlap by 1 bar at the
-    // boundary; dedupe on timestamp keeps the dataset clean.
-    all_bars.sort_by_key(|b| b.timestamp_ms);
-    all_bars.dedup_by_key(|b| b.timestamp_ms);
-
-    // ── Integrity guards on the ONLY path that writes broker history to the
-    // local store (2026-08-09) ───────────────────────────────────────────────
-    //
-    // Neither of these existed. `bars_to_normalized` and
-    // `bootstrap_writer::normalized_bars_to_ohlcv` are plain field copies with
-    // no validation, so whatever the broker returned was written verbatim.
-    // The only out-of-window filter that ever existed in this repo lived in
-    // `ctrader_history.rs`, which was never on this path and was deleted in
-    // batch D2 — so the tree had zero implementations of either guard at the
-    // moment a 14-year, 28-symbol M1 re-download is about to run through here.
-    //
-    // 1. WINDOW. A broker page can carry bars outside [from_ms, to_ms].
-    let before_window = all_bars.len();
-    all_bars.retain(|b| b.timestamp_ms >= from_ms && b.timestamp_ms <= to_ms);
-    let dropped_out_of_window = before_window - all_bars.len();
-    if dropped_out_of_window > 0 {
-        tracing::warn!(
-            target: "neoethos_app::broker_api",
-            symbol, timeframe, from_ms, to_ms,
-            dropped = dropped_out_of_window,
-            "broker returned bars outside the requested window; dropped before write"
-        );
-    }
-
-    // 2. PRICE SANITY. On 2026-07-30 a single zero-price bar was attributed
-    //    GBP 77,211 of P&L; 14,240 corrupt bars were found in the store. Those
-    //    came from the broker and were written here unchallenged.
-    //
-    //    These bars are DROPPED, not written, and the drop is logged at ERROR
-    //    with the count and the first/last bad timestamp — never silent. It is
-    //    deliberately not a hard abort: broker history is known to contain such
-    //    bars (2014-12-08 onward), so aborting would make those symbols
-    //    permanently un-importable, trading one failure mode for a worse one.
-    //    Poisoning the store is the outcome being prevented, and dropping
-    //    prevents it.
-    let bad_bar = |b: &HistoricalBar| {
-        [b.open, b.high, b.low, b.close]
-            .iter()
-            .any(|v| !v.is_finite() || *v <= 0.0)
+    let timeframe = parse_canonical_timeframe(timeframe)?;
+    let target = dataset_selection.map_or(
+        neoethos_broker_history::HistoricalCaptureTarget::NewIdentity,
+        |selected| {
+            neoethos_broker_history::HistoricalCaptureTarget::SelectedGeneration(selected.clone())
+        },
+    );
+    let request = neoethos_broker_history::HistoricalCaptureRequest {
+        symbol: symbol.to_owned(),
+        timeframe,
+        from_ms,
+        to_ms,
+        data_root: data_root.to_path_buf(),
+        target,
     };
-    let bad: Vec<i64> = all_bars
-        .iter()
-        .filter(|b| bad_bar(b))
-        .map(|b| b.timestamp_ms)
-        .collect();
-    if !bad.is_empty() {
-        tracing::error!(
-            target: "neoethos_app::broker_api",
-            symbol, timeframe,
-            dropped = bad.len(),
-            first_bad_ts_ms = bad.first().copied(),
-            last_bad_ts_ms = bad.last().copied(),
-            kept = all_bars.len() - bad.len(),
-            "REFUSED to write bars with a non-finite or non-positive price — the broker \
-             returned corrupt OHLC. These bars are DROPPED, not stored. A zero price in \
-             the store produces fabricated P&L (2026-07-30: GBP 77,211 on one bar)."
-        );
-        all_bars.retain(|b| !bad_bar(b));
-    }
-    if all_bars.is_empty() && before_window > 0 {
-        return Err(anyhow!(
-            "every bar the broker returned for {symbol} {timeframe} was outside the \
-             requested window or had a corrupt price ({before_window} received, 0 usable). \
-             Refusing to write an empty dataset over the existing one."
-        ));
-    }
-
-    // Oldest bar actually returned (sorted ascending above) — surfaced so the UI
-    // can show how deep the broker really went vs the requested range.
-    let oldest_ms = all_bars.first().map(|b| b.timestamp_ms);
-
-    let normalized = bars_to_normalized(&all_bars);
-    let written_path = write_bootstrap_vortex(data_root, symbol, timeframe, &normalized)?;
+    let credentials = neoethos_broker_history::load_production_historical_credentials()?;
+    let outcome =
+        neoethos_broker_history::capture_historical_generation(request, credentials, active_fetch)?;
+    let dataset_identity = outcome.selected_generation.identity().to_path_component();
+    let generation = outcome.selected_generation.generation_id().to_owned();
 
     Ok(HistoricalDownloadOutcome {
-        symbol: symbol.to_string(),
-        timeframe: timeframe.to_string(),
-        bar_count: all_bars.len(),
-        has_more: has_more_overall,
-        written_path,
-        oldest_ms,
+        symbol: outcome.symbol,
+        timeframe: outcome.timeframe.to_string(),
+        bar_count: outcome.bar_count,
+        has_more: false,
+        written_path: outcome.written_path,
+        oldest_ms: Some(outcome.oldest_ms),
+        dataset_identity,
+        generation,
+        durable_commit_id: outcome.durable_commit_id,
     })
 }
-
-/// How wide a single ProtoOAGetTrendbarsReq slice should be for the
-/// given timeframe. cTrader caps each response at ~5000 bars; we
-/// stay below that with the values below so we never bump the cap.
-///
-///   M1  →  3 days   (4320 bars)
-///   M3  →  9 days   (4320 bars)
-///   M5  →  15 days  (4320 bars)
-///   M15 →  45 days  (4320 bars)
-///   M30 →  90 days
-///   H1  →  180 days (4320 bars)
-///   H4  →  720 days
-///   H12 →  6 years
-///   D1  →  12 years
-///   W1/MN1 → no chunking needed in practice (one shot covers
-///            available history)
-fn timeframe_chunk_ms(tf: &str) -> i64 {
-    let day_ms: i64 = 24 * 60 * 60 * 1000;
-    match tf.trim().to_ascii_uppercase().as_str() {
-        "M1" => 3 * day_ms,
-        "M3" => 9 * day_ms,
-        "M5" => 15 * day_ms,
-        "M15" => 45 * day_ms,
-        "M30" => 90 * day_ms,
-        "H1" => 180 * day_ms,
-        "H4" => 720 * day_ms,
-        "H12" => 6 * 365 * day_ms,
-        "D1" => 12 * 365 * day_ms,
-        // For W1 / MN1 the broker's full coverage is usually <500
-        // bars, so one big slice covers everything.
-        _ => 50 * 365 * day_ms,
-    }
-}
-
 /// Fetch the most recent `limit` OHLCV bars for `symbol`/`timeframe`
 /// straight from the cTrader broker (`ProtoOAGetTrendbarsReq`) with NO
 /// disk write — the chart's broker-passthrough path (the authoritative,
 /// *current* source). Returns bars sorted oldest→newest, trimmed to the
-/// trailing `limit`. Opens a fresh WSS connection + re-auths, same as the
-/// history-download path, so callers must run it on a blocking task.
+/// trailing `limit`. This one-page chart call owns one authenticated socket;
+/// the full download path instead keeps one such socket across every page.
+/// Callers must run either synchronous path on a blocking task.
 pub fn fetch_recent_chart_bars_blocking(
     symbol: &str,
     timeframe: &str,
@@ -731,17 +584,12 @@ pub fn fetch_recent_chart_bars_blocking(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let step_ms = chart_bar_step_ms(timeframe);
+    let from_ms = chart_fetch_from_ms(timeframe, now_ms, limit)?;
     // Window wide enough to contain `limit` bars with generous headroom
     // for weekends / holidays / illiquid gaps (markets aren't open 24/7,
     // so a tight window would starve the requested count). cTrader caps a
     // single response at ~5000 bars and `count` bounds the result, so one
     // request covers a chart (limit ≤ MAX_LIMIT = 2000).
-    let span_ms = step_ms
-        .saturating_mul(limit as i64)
-        .saturating_mul(3)
-        .max(step_ms);
-    let from_ms = now_ms.saturating_sub(span_ms);
     let request = CTraderChartHistoryRequest {
         client_id: creds.client_id.clone(),
         client_secret: creds.client_secret.clone(),
@@ -754,10 +602,15 @@ pub fn fetch_recent_chart_bars_blocking(
         to_timestamp_ms: now_ms,
         count: Some(limit as u32),
     };
-    let CTraderHistoricalBarsFetchResult { mut bars, .. } =
-        load_historical_bars_only(&request)?;
-    bars.sort_by_key(|b| b.timestamp_ms);
-    bars.dedup_by_key(|b| b.timestamp_ms);
+    let CTraderHistoricalBarsFetchResult {
+        mut bars, has_more, ..
+    } = load_historical_bars_only(&request)?;
+    if has_more {
+        return Err(anyhow!(
+            "cTrader reported hasMore for the bounded recent-chart request"
+        ));
+    }
+    validate_broker_bar_order(&bars, "recent cTrader chart response")?;
     // The broker may return a few more than requested — keep trailing N.
     if bars.len() > limit {
         bars.drain(0..bars.len() - limit);
@@ -789,16 +642,11 @@ pub fn fetch_chart_bars_before_blocking(
         return Ok(Vec::new());
     }
     let creds = resolve_creds()?;
-    let step_ms = chart_bar_step_ms(timeframe);
+    let from_ms = chart_fetch_from_ms(timeframe, before_ms, limit)?;
     // Same generous headroom as the recent-bars path: markets aren't open
     // 24/7, so the wall-clock window must be wider than `limit × step` to
     // actually contain `limit` bars. `count` bounds the response so the
     // wide window never over-fetches.
-    let span_ms = step_ms
-        .saturating_mul(limit as i64)
-        .saturating_mul(3)
-        .max(step_ms);
-    let from_ms = before_ms.saturating_sub(span_ms).max(0);
     let request = CTraderChartHistoryRequest {
         client_id: creds.client_id.clone(),
         client_secret: creds.client_secret.clone(),
@@ -811,12 +659,21 @@ pub fn fetch_chart_bars_before_blocking(
         to_timestamp_ms: before_ms,
         count: Some(limit as u32),
     };
-    let CTraderHistoricalBarsFetchResult { mut bars, .. } =
-        load_historical_bars_only(&request)?;
-    bars.sort_by_key(|b| b.timestamp_ms);
-    bars.dedup_by_key(|b| b.timestamp_ms);
-    // Drop any bar at/after the cursor so the page is strictly older.
-    bars.retain(|b| b.timestamp_ms < before_ms);
+    let CTraderHistoricalBarsFetchResult {
+        mut bars, has_more, ..
+    } = load_historical_bars_only(&request)?;
+    if has_more {
+        return Err(anyhow!(
+            "cTrader reported hasMore for the bounded historical-chart request"
+        ));
+    }
+    validate_broker_bar_order(&bars, "historical cTrader chart response")?;
+    if let Some(bar) = bars.iter().find(|bar| bar.timestamp_ms >= before_ms) {
+        return Err(anyhow!(
+            "cTrader returned chart bar {} at/after exclusive cursor {before_ms}",
+            bar.timestamp_ms
+        ));
+    }
     if bars.len() > limit {
         let cut = bars.len() - limit;
         bars.drain(0..cut);
@@ -827,22 +684,42 @@ pub fn fetch_chart_bars_before_blocking(
 /// Duration of a single bar for the canonical timeframe, in ms. Used to
 /// size the broker fetch window in [`fetch_recent_chart_bars_blocking`]
 /// and [`fetch_chart_bars_before_blocking`].
-fn chart_bar_step_ms(tf: &str) -> i64 {
-    let m: i64 = 60 * 1000;
-    match tf.trim().to_ascii_uppercase().as_str() {
-        "M1" => m,
-        "M3" => 3 * m,
-        "M5" => 5 * m,
-        "M15" => 15 * m,
-        "M30" => 30 * m,
-        "H1" => 60 * m,
-        "H4" => 240 * m,
-        "H12" => 720 * m,
-        "D1" => 1440 * m,
-        "W1" => 7 * 1440 * m,
-        "MN1" => 30 * 1440 * m,
-        _ => m,
+fn chart_fetch_from_ms(tf: &str, to_ms: i64, limit: usize) -> Result<i64> {
+    let timeframe = parse_canonical_timeframe(tf)?;
+    let Some(step_ms) = timeframe.fixed_duration_ms() else {
+        // The official `count` field asks for the trailing N bars back from
+        // `toTimestamp`. An epoch lower bound avoids inventing fixed D1/W1/MN1
+        // durations while `count` still bounds the response.
+        return Ok(0);
+    };
+    let limit = i64::try_from(limit).context("chart bar limit exceeds i64")?;
+    let span_ms = step_ms
+        .checked_mul(limit)
+        .and_then(|value| value.checked_mul(3))
+        .context("chart fetch window overflows i64 milliseconds")?;
+    Ok(to_ms.saturating_sub(span_ms.max(step_ms)).max(0))
+}
+
+fn parse_canonical_timeframe(tf: &str) -> Result<neoethos_core::CanonicalTimeframe> {
+    tf.trim()
+        .to_ascii_uppercase()
+        .parse()
+        .map_err(|_| anyhow!("unsupported cTrader timeframe {tf:?}"))
+}
+
+fn validate_broker_bar_order(bars: &[HistoricalBar], context: &str) -> Result<()> {
+    for (row, pair) in bars.windows(2).enumerate() {
+        if pair[1].timestamp_ms <= pair[0].timestamp_ms {
+            return Err(anyhow!(
+                "{context} is not strictly increasing at rows {row}/{}: {} -> {}; \
+                 refusing sort/dedup repair",
+                row + 1,
+                pair[0].timestamp_ms,
+                pair[1].timestamp_ms
+            ));
+        }
     }
+    Ok(())
 }
 
 /// Side of a manual market order. Mirrors `CTraderTradeSide` but kept
@@ -888,6 +765,7 @@ struct PreparedNewOrder {
     account_id: i64,
     symbol_id: i64,
     volume_units: i64,
+    volume_scale_evidence: BrokerSymbolVolumeScaleEvidenceV1,
     relative_stop_loss: Option<i64>,
     relative_take_profit: Option<i64>,
 }
@@ -918,13 +796,11 @@ fn wire_volume_from_broker_lot_size(volume_lots: f64, lot_size_cents: i64) -> Re
     Ok(rounded as i64)
 }
 
-fn relative_distance_from_broker_symbol(
-    pips: f64,
-    digits: i32,
-    pip_position: i32,
-) -> Result<i64> {
+fn relative_distance_from_broker_symbol(pips: f64, digits: i32, pip_position: i32) -> Result<i64> {
     if !pips.is_finite() || pips <= 0.0 {
-        return Err(anyhow!("pip distance must be finite and positive (got {pips})"));
+        return Err(anyhow!(
+            "pip distance must be finite and positive (got {pips})"
+        ));
     }
     if !(0..=5).contains(&digits) {
         return Err(anyhow!(
@@ -1063,6 +939,17 @@ fn prepare_new_order(
              the cTrader symbol catalog endpoint."
         )
     })?;
+    let canonical_environment = match creds.environment {
+        CTraderEnvironment::Demo => "demo",
+        CTraderEnvironment::Live => "live",
+    };
+    let volume_scale_evidence = BrokerSymbolVolumeScaleEvidenceV1::new(
+        canonical_environment,
+        resolved.account_id,
+        resolved.light_symbol.symbol_id,
+        resolved.light_symbol.symbol_name.clone(),
+        lot_size,
+    )?;
     let volume_units = wire_volume_from_broker_lot_size(volume_lots, lot_size)?;
     if let Some(min) = resolved.symbol.min_volume {
         if volume_units < min {
@@ -1125,6 +1012,7 @@ fn prepare_new_order(
         account_id: resolved.account_id,
         symbol_id: resolved.light_symbol.symbol_id,
         volume_units,
+        volume_scale_evidence,
         relative_stop_loss,
         relative_take_profit,
     })
@@ -1191,7 +1079,9 @@ pub fn submit_market_order_blocking(
         account_id: prep.creds.account_id_str,
         request: CTraderExecutionRequest::NewOrder(Box::new(new_order)),
     };
-    backend.execute(&runtime_request)
+    let mut outcome = backend.execute(&runtime_request)?;
+    outcome.volume_scale_evidence = Some(prep.volume_scale_evidence);
+    Ok(outcome)
 }
 
 /// Place a PENDING (conditional) order that the broker holds and fills only
@@ -1416,10 +1306,7 @@ pub fn amend_order_blocking(
              change and no order was sent"
         ));
     }
-    if !matches!(
-        order_type,
-        CTraderOrderType::Limit | CTraderOrderType::Stop
-    ) {
+    if !matches!(order_type, CTraderOrderType::Limit | CTraderOrderType::Stop) {
         return Err(anyhow!(
             "amend_order applies to RESTING limit/stop orders only (got {order_type:?}). A \
              filled position's stop and target are changed with amend_position_sltp"
@@ -1430,7 +1317,9 @@ pub fn amend_order_blocking(
         // (WTI settled at -$37.63 on 2020-04-20) and XTIUSD is watchlisted. What
         // is refused is a value that is not a number.
         if !price.is_finite() {
-            return Err(anyhow!("triggerPrice must be a finite number (got {price})"));
+            return Err(anyhow!(
+                "triggerPrice must be a finite number (got {price})"
+            ));
         }
     }
     if let Some(ms) = expiry_unix_ms {
@@ -1517,7 +1406,13 @@ pub fn amend_position_sltp_blocking(
     take_profit: Option<f64>,
     trailing_stop_loss: Option<bool>,
 ) -> Result<CTraderExecutionOutcome> {
-    amend_position_sltp_expecting(position_id, stop_loss, take_profit, trailing_stop_loss, None)
+    amend_position_sltp_expecting(
+        position_id,
+        stop_loss,
+        take_profit,
+        trailing_stop_loss,
+        None,
+    )
 }
 
 /// [`amend_position_sltp_blocking`] bound to the broker environment the caller
@@ -1739,9 +1634,15 @@ pub fn fetch_margin_status_blocking() -> Result<MarginStatus> {
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
-    ensure_success_payload_type(&responses[2], CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[2],
+        CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[3], CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[4], CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(
@@ -1849,7 +1750,10 @@ pub fn fetch_broker_order_history_blocking(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[2], CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE)?;
     parse_order_list_response(&responses[2])
@@ -1879,7 +1783,10 @@ pub fn fetch_broker_cash_flow_history_blocking(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(
         &responses[2],
@@ -1914,9 +1821,15 @@ pub fn fetch_broker_expected_margin_blocking(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
-    ensure_success_payload_type(&responses[2], CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[2],
+        CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
+    )?;
     parse_expected_margin_response(&responses[2])
 }
 
@@ -1935,7 +1848,10 @@ pub fn fetch_broker_ctid_profile_blocking() -> Result<CTraderCtidProfileSnapshot
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(
         &responses[1],
         CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE,
@@ -1958,30 +1874,21 @@ pub fn fetch_broker_version_blocking() -> Result<CTraderServerVersionSnapshot> {
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE)?;
     parse_version_response(&responses[1])
 }
 
-fn bars_to_normalized(bars: &[HistoricalBar]) -> Vec<NormalizedBar> {
-    bars.iter()
-        .map(|b| NormalizedBar {
-            // The vortex writer stores nanosecond timestamps. cTrader
-            // gives us milliseconds, multiply once here so downstream
-            // chart loads don't get confused about units.
-            timestamp_ns: b.timestamp_ms.saturating_mul(1_000_000),
-            open: b.open,
-            high: b.high,
-            low: b.low,
-            close: b.close,
-            volume: b.volume.unwrap_or(0) as f64,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod exact_broker_order_unit_tests {
-    use super::{relative_distance_from_broker_symbol, wire_volume_from_broker_lot_size};
+    use super::{
+        HistoricalBar, chart_fetch_from_ms, relative_distance_from_broker_symbol,
+        validate_broker_bar_order, wire_volume_from_broker_lot_size,
+    };
+    use neoethos_core::CanonicalTimeframe;
 
     #[test]
     fn wire_volume_uses_the_exact_broker_lot_size() {
@@ -2011,5 +1918,35 @@ mod exact_broker_order_unit_tests {
         assert!(relative_distance_from_broker_symbol(0.005, 2, 1).is_err());
         assert!(relative_distance_from_broker_symbol(20.0, 6, 4).is_err());
         assert!(relative_distance_from_broker_symbol(20.0, 2, 3).is_err());
+    }
+
+    #[test]
+    fn every_official_timeframe_uses_the_shared_typed_contract() {
+        const TO_MS: i64 = 1_700_000_040_000;
+        for timeframe in CanonicalTimeframe::ALL {
+            let from = chart_fetch_from_ms(timeframe.as_str(), TO_MS, 2_000)
+                .expect("chart request window");
+            if timeframe.fixed_duration_ms().is_some() {
+                assert!(from < TO_MS);
+            } else {
+                assert_eq!(from, 0, "calendar frames use count, not fake duration");
+            }
+        }
+        assert!(chart_fetch_from_ms("H2", TO_MS, 2_000).is_err());
+    }
+
+    #[test]
+    fn broker_order_validation_rejects_duplicate_and_descending_rows() {
+        let bar = |timestamp_ms| HistoricalBar {
+            timestamp_ms,
+            open: 1.0,
+            high: 1.1,
+            low: 0.9,
+            close: 1.0,
+            volume: None,
+        };
+        assert!(validate_broker_bar_order(&[bar(1), bar(2)], "fixture").is_ok());
+        assert!(validate_broker_bar_order(&[bar(1), bar(1)], "fixture").is_err());
+        assert!(validate_broker_bar_order(&[bar(2), bar(1)], "fixture").is_err());
     }
 }

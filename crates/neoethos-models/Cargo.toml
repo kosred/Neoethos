@@ -8,6 +8,7 @@ license.workspace = true
 neoethos-data = { path = "../neoethos-data" }
 neoethos-core = { path = "../neoethos-core" }
 neoethos-search = { path = "../neoethos-search" }
+neoethos-execution-budget = { path = "../neoethos-execution-budget" }
 ndarray = { version = "0.17.2", features = ["rayon", "serde"] }
 # REMOVED 2026-08-09 (batch D4): `tch` (libtorch) and `ort` (ONNX Runtime).
 #
@@ -47,7 +48,7 @@ xgb = { version = "3.0.5", optional = true, default-features = false, features =
     "local_build",
 ] }
 catboost-rust = { version = "0.3.6", optional = true, features = ["gpu"] }
-sklears = { version = "0.1.1", optional = true, features = ["tree"] }
+sklears = { version = "0.1.2", optional = true, features = ["tree"] }
 # 2026-08-02: 0.9.1 -> 0.10.2. NOT 0.11.0, and the reason matters: burn-candle
 # 0.21.0 and 0.22.0-pre.1 both declare `candle-core ^0.10.2` (checked live on
 # crates.io), so 0.10.2 is the one value that makes the whole workspace agree on
@@ -66,7 +67,15 @@ candle-core = { version = "0.10.2", optional = true }
 # own defaults) decides which runtime to pull. This avoids the
 # wgpu/Naga SPIR-V path that crashes the AMD Vulkan Windows driver
 # (gfx-rs/wgpu issues #6329/#7198/#5733), confirmed 2026-05-26.
-cubecl = { version = "0.10.0", optional = true }
+cubecl = { version = "=0.10.0", optional = true }
+cubecl-common = { version = "=0.10.0", optional = true }
+cudarc = { version = "0.19.0", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "fallback-dynamic-loading",
+    "cuda-version-from-build-system",
+    "fallback-latest",
+] }
 
 # Pure Rust Evolutionary & Reinforcement Learning
 crfmnes = { version = "1.0.0", optional = true }
@@ -120,11 +129,11 @@ burn-ndarray = { version = "0.21" }
 burn-wgpu = { version = "0.21", optional = true }
 # Native CUDA backend for the Burn neural models (TabNet/KAN/N-BEATS/TiDE/
 # TimesNet/transformer). Reuses the SAME cubecl 0.10.0 + cubecl-cuda stack the
-# discovery kernels already build, so there is no version split. Enabled by the
-# `gpu-cuda` aggregate so the NVIDIA build trains neural nets on the card in f32
-# (Ampere-native) instead of falling back to burn-ndarray (CPU).
+# discovery kernels already build, so there is no version split. It is
+# deliberately opt-in and is NOT enabled by `gpu-cuda`; when explicitly enabled
+# it runs Burn neural models on the selected CUDA card in f32 (Ampere-native).
+# That separate CUDA surface requires its own mandatory RTX lifecycle matrix.
 burn-cuda = { version = "0.21", optional = true }
-
 num_cpus = "1.17.0"
 rand = "0.9.2"
 # `small_rng` is NOT in rand 0.8's default features, and
@@ -152,6 +161,9 @@ rayon = "1.11.0"
 chrono = "0.4.44"
 rand_xoshiro = "0.7.0"
 nalgebra = "0.33.0"
+
+[dev-dependencies]
+burn-fusion = { version = "0.21", features = ["test-util"] }
 
 [features]
 default = ["tree-models", "pure-rust-ml"]
@@ -194,7 +206,7 @@ neuro-evolution = ["dep:crfmnes", "dep:rand08"]
 # unified the two. The card therefore compiled these kernels while the feature
 # that names them was broken. Same defect class as the aggregate comment
 # below: naming the dependency instead of the capability.
-neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl", "cubecl/cuda"]
+neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl", "dep:cubecl-common", "cubecl/cuda"]
 reinforcement-learning = ["dep:rlkit", "dep:candle-core"]
 reinforcement-learning-cuda = ["reinforcement-learning", "rlkit/cuda", "candle-core/cuda"]
 adaptive-models = ["dep:irithyll"]
@@ -212,12 +224,18 @@ statistical-models = []
 # alone was never enough to compile it: the runtime feature has to be on too.
 # That, plus the fact that no aggregate enabled `statistical-gpu` at all, is
 # why the file was dead in every shipped configuration.
-statistical-gpu = ["statistical-models", "dep:cubecl", "cubecl/cuda"]
+statistical-gpu = [
+    "statistical-models",
+    "dep:cubecl",
+    "dep:cubecl-common",
+    "dep:cudarc",
+    "cubecl/cuda",
+]
 anomaly-detection = ["dep:extended-isolation-forest"]
 
 # Burn pure-Rust deep learning (production backend)
 burn-wgpu-backend = ["dep:burn-wgpu"]
-burn-cuda-backend = ["dep:burn-cuda"]
+burn-cuda-backend = ["dep:burn-cuda", "dep:cubecl", "dep:cubecl-common", "cubecl/cuda"]
 # REMOVED 2026-08-03: `burn-backend = []`. An empty feature with zero
 # `cfg(feature = "burn-backend")` sites anywhere in crates/ or desktop/ — it
 # enabled nothing, gated nothing, and was carried in `pure-rust-ml` below. A
@@ -255,16 +273,12 @@ gpu-cuda = [
     "neoethos-core/gpu-cuda",
     "neuro-evolution",
     "dep:cubecl",
-    # NOTE: `burn-cuda-backend` is deliberately NOT enabled here. Empirically
-    # (2026-06-10, A6000) burn-cuda 0.21 is pathological for our TINY neural
-    # models: cubecl re-autotunes every distinct matmul shape (338 autotune
-    # passes vs 14 real epochs in 74 min on one combo) and hits burn-tensor
-    # dtype panics. These models train in ~17 min TOTAL on burn-ndarray (CPU)
-    # and are stable. The GPU's job in this system is DISCOVERY (large batched
-    # backtests); the tiny per-model matmuls are launch/autotune-bound and
-    # belong on the CPU. The dep + `burn-cuda-backend` feature are kept so a
-    # future build with genuinely large models can opt in via
-    # `--features gpu-cuda,burn-cuda-backend`.
+    # NOTE: `burn-cuda-backend` is deliberately NOT enabled by this aggregate.
+    # It is a separate compiled CUDA surface with its own mandatory real-card
+    # lifecycle matrix and must be selected explicitly with
+    # `--features gpu-cuda,burn-cuda-backend`. When selected, Burn training and
+    # inference are CUDA-only and fail loudly on backend or artifact drift.
+    # CPU operation remains available only when this feature is absent.
     # Was plain `statistical-models`, so `statistical/linear_gpu.rs` — a
     # complete CUDA softmax train + predict kernel — was compiled by nothing
     # and shipped in no binary. Whether a run USES it is config:
@@ -298,6 +312,10 @@ gpu-cuda = [
     # resolves. Whether a run USES it is a config decision, not a build one:
     # see `models.tree_runtime.lightgbm_gpu`.
     "lightgbm-gpu",
+    # Enable this crate's production XGBoost expert as well as the dependency's
+    # CUDA build. `xgb/cuda` alone compiled libxgboost with CUDA while every
+    # `#[cfg(feature = "xgboost")]` call site below was removed.
+    "xgboost",
     "reinforcement-learning",
     "rlkit/cuda",
     # XGBoost on the card. Without this the local build is still CPU-only and

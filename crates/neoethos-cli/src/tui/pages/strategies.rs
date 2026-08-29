@@ -1,5 +1,6 @@
-//! Strategies — portfolio browser. Reads `cache/discovery/*.json`
-//! produced by `batch-discover` and shows them in a sortable table.
+//! Strategies — strict live-portfolio browser. Reads only the exact
+//! `*.live_portfolio.json` artifacts emitted by discovery and shows them in a
+//! sortable table.
 
 use std::path::PathBuf;
 
@@ -39,7 +40,7 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
         }
         KeyCode::Char('P') => {
             let sel = shared.strategies_selected.min(count - 1);
-            launch_promote(shared, &portfolios[sel]);
+            launch_promote(shared, &portfolios[sel].path);
             true
         }
         _ => false,
@@ -47,16 +48,11 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
 }
 
 /// Validate the selected portfolio on real data via `trader-replay`, which
-/// replays the discovery's own genes (the `.live_portfolio.json` artifact) so
+/// replays the discovery's own genes from the selected strict v3 artifact so
 /// the user can confirm a portfolio out-of-sample without leaving the TUI.
 fn launch_validate(shared: &mut AppShared, portfolio_path: &std::path::Path) {
-    let mut sidecar = portfolio_path.to_path_buf().into_os_string();
-    sidecar.push(".live_portfolio.json");
-    let sidecar = PathBuf::from(sidecar);
-    if !sidecar.exists() {
-        shared.status =
-            "No .live_portfolio.json next to this portfolio — re-run discovery (it emits one) to validate"
-                .to_string();
+    if !portfolio_path.exists() {
+        shared.status = "Selected strict v3 live portfolio no longer exists".to_string();
         return;
     }
     if shared.jobs.has_running("validate") {
@@ -68,75 +64,35 @@ fn launch_validate(shared: &mut AppShared, portfolio_path: &std::path::Path) {
         vec![
             "trader-replay".to_string(),
             "--portfolio".to_string(),
-            sidecar.display().to_string(),
+            portfolio_path.display().to_string(),
         ],
     );
     shared.status = "Spawned trader-replay validation — see Logs / status".to_string();
 }
 
 /// Promote the selected portfolio to the live set via `discovery-promote-weekly`
-/// (B3/#4 parity). That CLI command merges this run's discovery ledger for a
-/// given (symbol, tf) into the live portfolio additively (by gene-signature
-/// hash) and prints the promotion verdict ("added N new, carried M, total K").
-/// We derive `--symbol`/`--tf` from the portfolio's `<SYMBOL>_<TF>.json` name
-/// and point `--cache-dir` at the portfolio's own directory so the matching
-/// ledger is found; the verdict streams into the live log like `V` does.
-fn launch_promote(shared: &mut AppShared, p: &PortfolioSummary) {
-    let Some((symbol, tf)) = parse_symbol_tf(&p.name) else {
-        shared.status = format!(
-            "Cannot derive SYMBOL/TF from '{}' — promote needs a <SYMBOL>_<TF>.json portfolio",
-            p.name
-        );
-        return;
-    };
+/// (B3/#4 parity). The selected strict v3 artifact carries the exact search
+/// receipt and config identity; no neighboring path or filename is authority.
+fn launch_promote(shared: &mut AppShared, portfolio_path: &std::path::Path) {
     if shared.jobs.has_running("promote") {
         shared.status = "promotion already running".to_string();
         return;
     }
-    let cache_dir = p
-        .path
-        .parent()
-        .map(|d| d.display().to_string())
-        .unwrap_or_else(|| "cache/discovery".to_string());
-
-    let mut args = vec![
-        "discovery-promote-weekly".to_string(),
-        "--symbol".to_string(),
-        symbol.clone(),
-        "--tf".to_string(),
-        tf.clone(),
-        "--cache-dir".to_string(),
-        cache_dir,
-    ];
-    // If the portfolio has a live_portfolio sidecar, point the command at it so
-    // the carried/added accounting is against the real live set (otherwise the
-    // command falls back to its default cache-dir-relative path).
-    let mut sidecar = p.path.clone().into_os_string();
-    sidecar.push(".live_portfolio.json");
-    let sidecar = PathBuf::from(sidecar);
-    if sidecar.exists() {
-        args.push("--portfolio".to_string());
-        args.push(sidecar.display().to_string());
+    if !portfolio_path.exists() {
+        shared.status = "Selected strict v3 live portfolio no longer exists".to_string();
+        return;
     }
 
-    shared.jobs.spawn("promote", args);
-    shared.status = format!(
-        "Spawned discovery-promote-weekly {symbol} {tf} — see live log for the promotion verdict"
+    shared.jobs.spawn(
+        "promote",
+        vec![
+            "discovery-promote-weekly".to_string(),
+            "--portfolio".to_string(),
+            portfolio_path.display().to_string(),
+        ],
     );
-}
-
-/// Parse `<SYMBOL>_<TF>.json` (e.g. `EURUSD_M30.json`) into `(symbol, tf)`. The
-/// timeframe is the trailing `_`-delimited token before `.json`; everything
-/// before it is the symbol (symbols don't contain `_`, timeframes don't either,
-/// so the last underscore is the split point). Returns `None` for names that
-/// don't match the convention so the caller can surface a clear message.
-fn parse_symbol_tf(name: &str) -> Option<(String, String)> {
-    let stem = name.strip_suffix(".json")?;
-    let (sym, tf) = stem.rsplit_once('_')?;
-    if sym.is_empty() || tf.is_empty() {
-        return None;
-    }
-    Some((sym.to_string(), tf.to_string()))
+    shared.status =
+        "Spawned exact discovery-promote-weekly — see live log for the verdict".to_string();
 }
 
 pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
@@ -172,7 +128,7 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
             ),
             Line::raw(""),
             Line::styled(
-                "  Results land under  cache/discovery/<SYMBOL>_<TF>.json",
+                "  Selectable artifacts end in  .live_portfolio.json",
                 theme::caption_style(),
             ),
         ];
@@ -295,9 +251,15 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
     if area.height == 0 {
         return;
     }
-    let mut sidecar = p.path.clone().into_os_string();
-    sidecar.push(".quality.json");
-    let (initial, metrics) = load_quality(&PathBuf::from(sidecar));
+    let quality_path = p
+        .path
+        .to_string_lossy()
+        .strip_suffix(".live_portfolio.json")
+        .map(|stem| PathBuf::from(format!("{stem}.quality.json")));
+    let (initial, metrics) = quality_path
+        .as_deref()
+        .map(load_quality)
+        .unwrap_or_else(|| (0.0, Vec::new()));
     let total_net: f64 = metrics.iter().map(|m| m.net_profit).sum();
 
     // Header carries the money view: starting capital + Σ net € across the
@@ -460,18 +422,7 @@ fn scan_portfolios() -> Vec<PortfolioSummary> {
         for entry in read.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().to_string();
-            if !name_str.ends_with(".json") {
-                continue;
-            }
-            // Skip the profile/quality/trades sidecars produced by
-            // the orchestrator — they are not portfolios.
-            if name_str.contains("_profile")
-                || name_str.contains("_quality")
-                || name_str.contains("_trade_logs")
-                || name_str.ends_with(".trades.json")
-                || name_str.ends_with(".quality.json")
-                || name_str.ends_with(".profile.json")
-            {
+            if !name_str.ends_with(".live_portfolio.json") {
                 continue;
             }
             let path = entry.path();
@@ -506,11 +457,13 @@ fn scan_portfolios() -> Vec<PortfolioSummary> {
 /// Array fields, in preference order, that hold the strategy objects in
 /// the various portfolio shapes we write:
 ///   - `portfolio`  — the curated set (modern `discovery.rs` output)
-///   - `best_genes` — talib-knowledge files
+///   - `best_genes` — legacy knowledge-artifact files
 ///   - `genes`      — GA checkpoints / `strategy_gene` dumps
 ///   - `candidates` / `survivors` / `strategies` — other writers
 /// A bare `[...]` array (no wrapper object) is also handled.
 const STRATEGY_ARRAY_KEYS: &[&str] = &[
+    // CanonicalSearchArtifactEnvelopeV2 owns the portfolio array here.
+    "payload",
     "portfolio",
     "best_genes",
     "genes",
@@ -651,7 +604,7 @@ mod tests {
 
     #[test]
     fn counts_wrapped_best_genes_object() {
-        // The talib-knowledge shape that used to report 0 — an object
+        // The legacy knowledge-artifact shape that used to report 0 — an object
         // whose strategies live in a `best_genes` array.
         let json = r#"{
             "generated_at": "2026-02-16T19:59:16Z",
@@ -670,6 +623,24 @@ mod tests {
     fn counts_bare_array() {
         let json = r#"[ {"a":1}, {"b":2} ]"#;
         assert_eq!(count_objects_in_array(json), 2);
+    }
+
+    #[test]
+    fn counts_receipt_bound_portfolio_envelope_payload() {
+        let json = r#"{
+            "schema_version": 1,
+            "artifact_kind": "neoethos.search-portfolio.v1",
+            "scope": {"opaque": true},
+            "payload": [ {"strategy_id":"a"}, {"strategy_id":"b"} ]
+        }"#;
+        let key = STRATEGY_ARRAY_KEYS
+            .iter()
+            .find(|key| json.contains(&format!("\"{key}\"")))
+            .expect("envelope payload key");
+        assert_eq!(*key, "payload");
+        let key_pos = json.find("\"payload\"").unwrap();
+        let start = key_pos + json[key_pos..].find('[').unwrap();
+        assert_eq!(count_objects_in_array(&json[start..]), 2);
     }
 
     #[test]

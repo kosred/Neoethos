@@ -77,9 +77,16 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
     // form if the CWD is somehow unreadable.
     let models_dir_str = std::fs::canonicalize(&models_dir)
         .ok()
-        .map(|p| p.display().to_string().trim_start_matches(r"\\?\").to_string())
+        .map(|p| {
+            p.display()
+                .to_string()
+                .trim_start_matches(r"\\?\")
+                .to_string()
+        })
         .or_else(|| {
-            std::env::current_dir().ok().map(|c| c.join("models").display().to_string())
+            std::env::current_dir()
+                .ok()
+                .map(|c| c.join("models").display().to_string())
         })
         .unwrap_or_else(|| models_dir.display().to_string());
     if !models_dir.exists() {

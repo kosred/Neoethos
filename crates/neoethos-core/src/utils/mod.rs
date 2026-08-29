@@ -13,7 +13,10 @@ pub mod stats;
 pub use clock::now_unix_ms;
 
 pub use hashing::{fnv1a64, fnv1a64_update};
-pub use numeric::{clamp_unit_f32, clamp_unit_f64, finite_or, finite_or_f32, stable_sigmoid_f32};
+pub use numeric::{
+    clamp_unit_f32, clamp_unit_f64, finite_or, finite_or_f32, stable_sigmoid_f32,
+    stable_sigmoid_f64,
+};
 pub use series::{
     ewma_f32, median_ignore_nan, median_sorted_f32, moving_average_f32, percentile_sorted_f32,
     rolling_mean_f64,

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use cust::context::Context;
 use cust::memory::{DeviceBuffer, DeviceCopy};

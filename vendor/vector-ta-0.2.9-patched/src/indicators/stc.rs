@@ -1,35 +1,17 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaStc;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
     init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::convert::AsRef;
 use std::error::Error;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum StcData<'a> {
@@ -57,10 +39,6 @@ pub struct StcOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct StcParams {
     pub fast_period: Option<usize>,
     pub slow_period: Option<usize>,
@@ -469,7 +447,6 @@ pub fn stc_into_slice(dst: &mut [f64], input: &StcInput, kern: Kernel) -> Result
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn stc_into(input: &StcInput, out: &mut [f64]) -> Result<(), StcError> {
     stc_into_slice(out, input, Kernel::Auto)
@@ -496,8 +473,8 @@ pub fn stc_scalar(
         return unsafe { stc_scalar_classic_sma(data, fast, slow, k, d, first, out) };
     }
 
-    use crate::indicators::ema::{ema, EmaInput, EmaParams};
-    use crate::indicators::moving_averages::ma::{ma, MaData};
+    use crate::indicators::ema::{EmaInput, EmaParams, ema};
+    use crate::indicators::moving_averages::ma::{MaData, ma};
     use crate::indicators::utility_functions::{max_rolling, min_rolling};
     use crate::utilities::helpers::alloc_with_nan_prefix;
 
@@ -2087,277 +2064,6 @@ impl StcStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "stc")]
-#[pyo3(signature = (data, fast_period=23, slow_period=50, k_period=10, d_period=3, fast_ma_type="ema", slow_ma_type="ema", kernel=None))]
-pub fn stc_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    fast_period: usize,
-    slow_period: usize,
-    k_period: usize,
-    d_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = StcParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        k_period: Some(k_period),
-        d_period: Some(d_period),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-    };
-    let stc_in = StcInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| stc_with_kernel(&stc_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "StcStream")]
-pub struct StcStreamPy {
-    stream: StcStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl StcStreamPy {
-    #[new]
-    fn new(
-        fast_period: usize,
-        slow_period: usize,
-        k_period: usize,
-        d_period: usize,
-    ) -> PyResult<Self> {
-        let params = StcParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            k_period: Some(k_period),
-            d_period: Some(d_period),
-            fast_ma_type: Some("ema".to_string()),
-            slow_ma_type: Some("ema".to_string()),
-        };
-        let stream =
-            StcStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(StcStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "stc_batch")]
-#[pyo3(signature = (data, fast_period_range, slow_period_range, k_period_range, d_period_range, kernel=None))]
-pub fn stc_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    k_period_range: (usize, usize, usize),
-    d_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-
-    let sweep = StcBatchRange {
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        k_period: k_period_range,
-        d_period: d_period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("stc_batch: rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [expected], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match k {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            stc_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "k_periods",
-        combos
-            .iter()
-            .map(|p| p.k_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "d_periods",
-        combos
-            .iter()
-            .map(|p| p.d_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_stc_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(stc_py, m)?)?;
-    m.add_function(wrap_pyfunction!(stc_batch_py, m)?)?;
-    m.add_class::<StcStreamPy>()?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(stc_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(stc_cuda_many_series_one_param_dev_py, m)?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "stc_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, fast_period_range, slow_period_range, k_period_range, d_period_range, device_id=0))]
-pub fn stc_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    k_period_range: (usize, usize, usize),
-    d_period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, pyo3::types::PyDict>)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = StcBatchRange {
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        k_period: k_period_range,
-        d_period: d_period_range,
-    };
-    let (inner, combos) = py.allow_threads(|| {
-        let cuda = CudaStc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.stc_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|c| c.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|c| c.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "k_periods",
-        combos
-            .iter()
-            .map(|c| c.k_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "d_periods",
-        combos
-            .iter()
-            .map(|c| c.d_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok((handle, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "stc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, fast_period=23, slow_period=50, k_period=10, d_period=3, device_id=0))]
-pub fn stc_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    fast_period: usize,
-    slow_period: usize,
-    k_period: usize,
-    d_period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let tm = data_tm_f32.as_slice()?;
-    let params = StcParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        k_period: Some(k_period),
-        d_period: Some(d_period),
-        fast_ma_type: None,
-        slow_ma_type: None,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaStc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.stc_many_series_one_param_time_major_dev(tm, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    make_device_array_py(device_id, inner)
-}
-
 #[inline(always)]
 fn stc_batch_inner_into(
     data: &[f64],
@@ -2489,188 +2195,16 @@ fn stc_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stc_js(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    k_period: usize,
-    d_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let params = StcParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        k_period: Some(k_period),
-        d_period: Some(d_period),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-    };
-    let input = StcInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    stc_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stc_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stc_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stc_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_period: usize,
-    slow_period: usize,
-    k_period: usize,
-    d_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = StcParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            k_period: Some(k_period),
-            d_period: Some(d_period),
-            fast_ma_type: Some(fast_ma_type.to_string()),
-            slow_ma_type: Some(slow_ma_type.to_string()),
-        };
-        let input = StcInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            stc_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            stc_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct StcBatchConfig {
-    pub fast_period_range: (usize, usize, usize),
-    pub slow_period_range: (usize, usize, usize),
-    pub k_period_range: (usize, usize, usize),
-    pub d_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct StcBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<StcParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = stc_batch)]
-pub fn stc_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: StcBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = StcBatchRange {
-        fast_period: config.fast_period_range,
-        slow_period: config.slow_period_range,
-        k_period: config.k_period_range,
-        d_period: config.d_period_range,
-    };
-
-    let result = stc_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let output = StcBatchJsOutput {
-        values: result.values,
-        combos: result.combos,
-        rows: result.rows,
-        cols: result.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stc_output_into_js(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    k_period: usize,
-    d_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = stc_js(
-        data,
-        fast_period,
-        slow_period,
-        k_period,
-        d_period,
-        fast_ma_type,
-        slow_ma_type,
-    )?;
-    crate::write_wasm_f64_output("stc_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stc_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = stc_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("stc_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_stc_default_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = StcInput::with_default_candles(&candles);
         let output = stc_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -2679,17 +2213,14 @@ mod tests {
 
     #[test]
     fn test_stc_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = StcInput::with_default_candles(&candles);
 
         let baseline = stc(&input)?;
 
         let mut out = vec![0.0f64; baseline.values.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         stc_into(&input, &mut out)?;
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        stc_into_slice(&mut out, &input, Kernel::Auto)?;
 
         assert_eq!(out.len(), baseline.values.len());
 
@@ -2713,8 +2244,8 @@ mod tests {
 
     fn check_stc_last_five(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = StcInput::with_default_candles(&candles);
         let result = stc_with_kernel(&input, kernel)?;
         let expected = [
@@ -2793,8 +2324,8 @@ mod tests {
     fn check_stc_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             StcParams::default(),
@@ -2957,8 +2488,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = StcBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2972,8 +2503,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 3, 15, 3, 2, 8, 2, 1, 3, 1),

@@ -1,37 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaTradjema;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -59,10 +31,6 @@ pub struct TradjemaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TradjemaParams {
     pub length: Option<usize>,
     pub mult: Option<f64>,
@@ -305,7 +273,6 @@ pub fn tradjema_with_kernel(
     Ok(TradjemaOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn tradjema_into(input: &TradjemaInput, out: &mut [f64]) -> Result<(), TradjemaError> {
     let (h, l, c, length, first, mult, chosen) = tradjema_prepare(input, Kernel::Auto)?;
@@ -393,11 +360,7 @@ fn tradjema_compute_into_scalar(
     }
     #[inline(always)]
     fn dec(i: usize, cap: usize) -> usize {
-        if i == 0 {
-            cap - 1
-        } else {
-            i - 1
-        }
+        if i == 0 { cap - 1 } else { i - 1 }
     }
     #[inline(always)]
     fn minq_push(
@@ -459,11 +422,7 @@ fn tradjema_compute_into_scalar(
     #[inline(always)]
     fn max3(a: f64, b: f64, c: f64) -> f64 {
         let m = if a > b { a } else { b };
-        if m > c {
-            m
-        } else {
-            c
-        }
+        if m > c { m } else { c }
     }
 
     let tr0 = unsafe { *high.get_unchecked(first) - *low.get_unchecked(first) };
@@ -605,11 +564,7 @@ fn tradjema_compute_into_scalar_len40(
     }
     #[inline(always)]
     fn dec(i: usize) -> usize {
-        if i == 0 {
-            39
-        } else {
-            i - 1
-        }
+        if i == 0 { 39 } else { i - 1 }
     }
     #[inline(always)]
     fn minq_push(
@@ -662,11 +617,7 @@ fn tradjema_compute_into_scalar_len40(
     #[inline(always)]
     fn max3(a: f64, b: f64, c: f64) -> f64 {
         let m = if a > b { a } else { b };
-        if m > c {
-            m
-        } else {
-            c
-        }
+        if m > c { m } else { c }
     }
 
     let tr0 = unsafe { *high.get_unchecked(first) - *low.get_unchecked(first) };
@@ -907,11 +858,7 @@ impl TradjemaStream {
     }
     #[inline(always)]
     fn dec(i: usize, cap: usize) -> usize {
-        if i == 0 {
-            cap - 1
-        } else {
-            i - 1
-        }
+        if i == 0 { cap - 1 } else { i - 1 }
     }
     #[inline(always)]
     fn minq_push(&mut self, v: f64, idx: usize) {
@@ -957,11 +904,7 @@ impl TradjemaStream {
     #[inline(always)]
     fn max3(a: f64, b: f64, c: f64) -> f64 {
         let m = if a > b { a } else { b };
-        if m > c {
-            m
-        } else {
-            c
-        }
+        if m > c { m } else { c }
     }
 
     #[inline(always)]
@@ -1035,569 +978,6 @@ impl TradjemaStream {
 
         Some(self.tradjema)
     }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "tradjema")]
-#[pyo3(signature = (high, low, close, length, mult, kernel=None))]
-pub fn tradjema_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    mult: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let (h, l, c) = (high.as_slice()?, low.as_slice()?, close.as_slice()?);
-    if h.len() != l.len() || l.len() != c.len() {
-        return Err(PyValueError::new_err(
-            "All OHLC arrays must have the same length",
-        ));
-    }
-    let kern = validate_kernel(kernel, false)?;
-    let input = TradjemaInput::from_slices(
-        h,
-        l,
-        c,
-        TradjemaParams {
-            length: Some(length),
-            mult: Some(mult),
-        },
-    );
-
-    let values = py
-        .allow_threads(|| tradjema_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "tradjema_batch")]
-#[pyo3(signature = (high, low, close, length_range, mult_range, kernel=None))]
-pub fn tradjema_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArray1;
-
-    let (h, l, c) = (high.as_slice()?, low.as_slice()?, close.as_slice()?);
-    if h.len() != l.len() || l.len() != c.len() {
-        return Err(PyValueError::new_err(
-            "All OHLC arrays must have the same length",
-        ));
-    }
-
-    let sweep = TradjemaBatchRange {
-        length: length_range,
-        mult: mult_range,
-    };
-    let combos = expand_grid(&sweep);
-    if combos.is_empty() {
-        return Err(PyValueError::new_err("Empty parameter grid"));
-    }
-    let rows = combos.len();
-    let cols = c.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let first = c
-        .iter()
-        .position(|v| !v.is_nan())
-        .ok_or_else(|| PyValueError::new_err("All values are NaN"))?;
-    for (row, prm) in combos.iter().enumerate() {
-        let length = prm.length.unwrap_or(40);
-        let warm = first + length - 1;
-        let row_slice = &mut slice_out[row * cols..(row + 1) * cols];
-        for v in &mut row_slice[..warm] {
-            *v = f64::NAN;
-        }
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-    let simd = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => Kernel::Scalar,
-    };
-
-    let combos = py
-        .allow_threads(|| tradjema_batch_inner_into(h, l, c, &sweep, simd, true, slice_out))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap_or(40) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "mults",
-        combos
-            .iter()
-            .map(|p| p.mult.unwrap_or(10.0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "tradjema_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, length_range, mult_range, device_id=0))]
-pub fn tradjema_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: PyReadonlyArray1<'_, f32>,
-    low_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    length_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32TradjemaPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high = high_f32.as_slice()?;
-    let low = low_f32.as_slice()?;
-    let close = close_f32.as_slice()?;
-
-    if high.len() != low.len() || low.len() != close.len() {
-        return Err(PyValueError::new_err(
-            "All OHLC arrays must have the same length",
-        ));
-    }
-
-    let sweep = TradjemaBatchRange {
-        length: length_range,
-        mult: mult_range,
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaTradjema::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .tradjema_batch_dev(high, low, close, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32TradjemaPy::new(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "tradjema_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, length, mult, device_id=0))]
-pub fn tradjema_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: PyReadonlyArray2<'_, f32>,
-    low_tm_f32: PyReadonlyArray2<'_, f32>,
-    close_tm_f32: PyReadonlyArray2<'_, f32>,
-    length: usize,
-    mult: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32TradjemaPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let shape = high_tm_f32.shape();
-    if shape != low_tm_f32.shape() || shape != close_tm_f32.shape() {
-        return Err(PyValueError::new_err(
-            "OHLC tensors must share the same shape",
-        ));
-    }
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D arrays (time, series)"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-
-    let high = high_tm_f32.as_slice()?;
-    let low = low_tm_f32.as_slice()?;
-    let close = close_tm_f32.as_slice()?;
-
-    let params = TradjemaParams {
-        length: Some(length),
-        mult: Some(mult),
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaTradjema::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .tradjema_many_series_one_param_time_major_dev(high, low, close, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32TradjemaPy::new(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Tradjema", unsendable)]
-pub struct DeviceArrayF32TradjemaPy {
-    pub(crate) inner: DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32TradjemaPy {
-    #[new]
-    fn py_new() -> PyResult<Self> {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "use factory methods from CUDA functions",
-        ))
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        let size = self.inner.rows.saturating_mul(self.inner.cols);
-        let ptr_val: usize = if size == 0 {
-            0
-        } else {
-            self.inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-        use cust::memory::DeviceBuffer;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32TradjemaPy {
-    pub fn new(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "TradjemaStream")]
-pub struct TradjemaStreamPy {
-    inner: TradjemaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl TradjemaStreamPy {
-    #[new]
-    fn new(length: usize, mult: f64) -> PyResult<Self> {
-        TradjemaStream::try_new(TradjemaParams {
-            length: Some(length),
-            mult: Some(mult),
-        })
-        .map(|inner| Self { inner })
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    }
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.inner.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tradjema_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    mult: f64,
-) -> Result<(), JsValue> {
-    if [high_ptr, low_ptr, close_ptr, out_ptr]
-        .iter()
-        .any(|p| p.is_null())
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-
-        let params = TradjemaParams {
-            length: Some(length),
-            mult: Some(mult),
-        };
-        let input = TradjemaInput::from_slices(h, l, c, params);
-
-        if (out_ptr as *const f64) == close_ptr
-            || (out_ptr as *const f64) == high_ptr
-            || (out_ptr as *const f64) == low_ptr
-        {
-            let mut tmp = vec![f64::NAN; len];
-            tradjema_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            tradjema_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tradjema_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-    out_ptr: *mut f64,
-) -> Result<usize, JsValue> {
-    if [high_ptr, low_ptr, close_ptr].iter().any(|p| p.is_null()) || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer passed"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = TradjemaBatchRange {
-            length: (length_start, length_end, length_step),
-            mult: (mult_start, mult_end, mult_step),
-        };
-        let combos = expand_grid(&sweep);
-        if combos.is_empty() {
-            return Err(JsValue::from_str("Empty parameter grid"));
-        }
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        let first = close
-            .iter()
-            .position(|v| !v.is_nan())
-            .ok_or_else(|| JsValue::from_str("All values are NaN"))?;
-        for (row, prm) in combos.iter().enumerate() {
-            let length = prm.length.unwrap_or(40);
-            let warm = first + length - 1;
-            let row_slice = &mut out[row * cols..(row + 1) * cols];
-            for v in &mut row_slice[..warm] {
-                *v = f64::NAN;
-            }
-        }
-
-        let simd = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-        tradjema_batch_inner_into(high, low, close, &sweep, simd, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tradjema_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tradjema_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tradjema_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    mult: f64,
-) -> Result<Vec<f64>, JsValue> {
-    if close.is_empty() {
-        return Err(JsValue::from_str("Input data slice is empty"));
-    }
-    if high.len() != low.len() || low.len() != close.len() {
-        return Err(JsValue::from_str("length mismatch"));
-    }
-
-    if length < 2 || length > close.len() {
-        return Err(JsValue::from_str("Invalid length"));
-    }
-    if !(mult.is_finite()) || mult <= 0.0 {
-        return Err(JsValue::from_str("Invalid mult"));
-    }
-    let first = close
-        .iter()
-        .position(|v| !v.is_nan())
-        .ok_or_else(|| JsValue::from_str("All values are NaN"))?;
-    if close.len() - first < length {
-        return Err(JsValue::from_str("Not enough valid data"));
-    }
-    let warm = first + length - 1;
-
-    let mut out = alloc_with_nan_prefix(close.len(), warm);
-
-    tradjema_compute_into(
-        high,
-        low,
-        close,
-        length,
-        mult,
-        first,
-        Kernel::Scalar,
-        &mut out,
-    );
-
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TradjemaBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub mult_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TradjemaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<TradjemaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "tradjema_batch")]
-pub fn tradjema_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: TradjemaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = TradjemaBatchRange {
-        length: cfg.length_range,
-        mult: cfg.mult_range,
-    };
-
-    if high.is_empty() || low.is_empty() || close.is_empty() {
-        return Err(JsValue::from_str("Input arrays are empty"));
-    }
-
-    let out = tradjema_batch_with_kernel(high, low, close, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = TradjemaBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
 }
 
 #[derive(Clone, Debug)]
@@ -1932,11 +1312,7 @@ fn tradjema_batch_inner_into(
         }
         #[inline(always)]
         fn dec(i: usize, cap: usize) -> usize {
-            if i == 0 {
-                cap - 1
-            } else {
-                i - 1
-            }
+            if i == 0 { cap - 1 } else { i - 1 }
         }
         #[inline(always)]
         fn minq_push(
@@ -2143,42 +1519,11 @@ fn tradjema_batch_inner(
     })
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tradjema_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    mult: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = tradjema_js(high, low, close, length, mult)?;
-    crate::write_wasm_f64_output("tradjema_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tradjema_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = tradjema_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "tradjema_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
@@ -2188,8 +1533,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let high = candles.select_candle_field("high")?;
         let low = candles.select_candle_field("low")?;
@@ -2208,8 +1553,8 @@ mod tests {
 
     fn check_tradjema_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let high = candles.select_candle_field("high")?;
         let low = candles.select_candle_field("low")?;
@@ -2269,8 +1614,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = TradjemaInput::with_default_candles(&candles);
         let output = tradjema_with_kernel(&input, kernel)?;
@@ -2396,8 +1741,8 @@ mod tests {
 
     fn check_tradjema_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let high = candles.select_candle_field("high")?;
         let low = candles.select_candle_field("low")?;
@@ -2428,8 +1773,8 @@ mod tests {
 
     fn check_tradjema_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let high = candles.select_candle_field("high")?;
         let low = candles.select_candle_field("low")?;
@@ -2463,8 +1808,8 @@ mod tests {
     fn check_tradjema_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let high = candles.select_candle_field("high")?;
         let low = candles.select_candle_field("low")?;
@@ -2520,8 +1865,8 @@ mod tests {
     fn check_tradjema_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let high = candles.select_candle_field("high")?;
         let low = candles.select_candle_field("low")?;
@@ -2714,8 +2059,8 @@ mod tests {
 
     fn check_tradjema_into_slice(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let f = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(f)?;
+        let f = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(f)?;
         let (h, l, cl) = (
             c.select_candle_field("high")?,
             c.select_candle_field("low")?,
@@ -2742,8 +2087,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = TradjemaBatchBuilder::new()
             .kernel(kernel)
@@ -2759,8 +2104,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = TradjemaBatchBuilder::new()
             .kernel(kernel)
@@ -2780,8 +2125,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (10, 30, 10, 5.0, 15.0, 5.0),
@@ -2898,8 +2243,8 @@ mod tests {
 
     #[test]
     fn test_tradjema_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let (h, l, cl) = (
             c.select_candle_field("high")?,
             c.select_candle_field("low")?,

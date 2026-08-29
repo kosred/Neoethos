@@ -50,38 +50,63 @@ struct AtrState {
     }
 };
 
-__device__ inline void push_close(double* ring, int cap, int* head, int* count, double value) {
-    if (*count < cap) {
-        ring[(*head + *count) % cap] = value;
-        *count += 1;
-        return;
-    }
-    ring[*head] = value;
-    *head += 1;
-    if (*head == cap) {
-        *head = 0;
-    }
 }
 
-__device__ inline int back_index(int cap, int head, int count, int offset) {
-    int idx = head + count - 1 - offset;
-    idx %= cap;
-    if (idx < 0) {
-        idx += cap;
-    }
-    return idx;
-}
-}
-
-extern "C" __global__ void range_oscillator_batch_f64(
+// NeoEthos resident pipeline. The structural ATR is common to every parameter
+// row, so computing it once avoids repeating the same 200/2000-bar recurrence
+// in every row. The expensive moving-window work is then flattened over
+// (parameter row, bar), while the tiny sticky-trend pass remains one thread per
+// row. All three kernels run on the same stream and never materialize HLC or an
+// output on the host.
+extern "C" __global__ void range_oscillator_atr_f64(
     const double* high,
     const double* low,
     const double* close,
     int len,
+    double* out_atr
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || len <= 0) {
+        return;
+    }
+
+    AtrState atr_fallback;
+    AtrState atr_primary;
+    atr_fallback.reset();
+    atr_primary.reset();
+    for (int i = 0; i < len; ++i) {
+        out_atr[i] = NAN;
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+        if (!isfinite(h) || !isfinite(l) || !isfinite(c)) {
+            atr_fallback.reset();
+            atr_primary.reset();
+            continue;
+        }
+
+        bool fallback_ready = false;
+        bool primary_ready = false;
+        const double atr200 =
+            atr_fallback.update(ATR_FALLBACK_PERIOD, h, l, c, &fallback_ready);
+        const double atr2000 =
+            atr_primary.update(ATR_PRIMARY_PERIOD, h, l, c, &primary_ready);
+        if (primary_ready) {
+            out_atr[i] = atr2000;
+        } else if (fallback_ready) {
+            out_atr[i] = atr200;
+        }
+    }
+}
+
+extern "C" __global__ void range_oscillator_outputs_f64(
+    const double* high,
+    const double* low,
+    const double* close,
+    const double* atr,
+    int len,
     const int* lengths,
     const double* mults,
     int rows,
-    int storage_cols,
     double* out_oscillator,
     double* out_ma,
     double* out_upper_band,
@@ -90,134 +115,122 @@ extern "C" __global__ void range_oscillator_batch_f64(
     double* out_in_range,
     double* out_trend,
     double* out_break_up,
-    double* out_break_down,
-    double* close_storage
+    double* out_break_down
 ) {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= rows) {
+    const size_t flat = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(len);
+    if (flat >= total || len <= 0 || rows <= 0) {
         return;
     }
 
+    out_oscillator[flat] = NAN;
+    out_ma[flat] = NAN;
+    out_upper_band[flat] = NAN;
+    out_lower_band[flat] = NAN;
+    out_range_width[flat] = NAN;
+    out_in_range[flat] = NAN;
+    out_trend[flat] = NAN;
+    out_break_up[flat] = NAN;
+    out_break_down[flat] = NAN;
+
+    const int row = static_cast<int>(flat / static_cast<size_t>(len));
+    const int bar = static_cast<int>(flat % static_cast<size_t>(len));
     const int length = lengths[row];
     const double mult = mults[row];
-
-    double* row_oscillator = out_oscillator + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_ma = out_ma + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_upper_band =
-        out_upper_band + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_lower_band =
-        out_lower_band + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_range_width =
-        out_range_width + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_in_range = out_in_range + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_trend = out_trend + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_break_up = out_break_up + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_break_down =
-        out_break_down + static_cast<size_t>(row) * static_cast<size_t>(len);
-
-    for (int i = 0; i < len; ++i) {
-        row_oscillator[i] = NAN;
-        row_ma[i] = NAN;
-        row_upper_band[i] = NAN;
-        row_lower_band[i] = NAN;
-        row_range_width[i] = NAN;
-        row_in_range[i] = NAN;
-        row_trend[i] = NAN;
-        row_break_up[i] = NAN;
-        row_break_down[i] = NAN;
-    }
-
-    if (length <= 0 || length + 1 > storage_cols || !isfinite(mult) || mult < 0.1) {
+    if (length <= 0 || length >= len || bar < length || !isfinite(mult) || mult < 0.1 ||
+        !isfinite(atr[bar])) {
         return;
     }
 
-    double* ring = close_storage + static_cast<size_t>(row) * static_cast<size_t>(storage_cols);
-    int ring_head = 0;
-    int ring_count = 0;
+    double sum_weighted = 0.0;
+    double sum_weights = 0.0;
+    for (int offset = 0; offset < length; ++offset) {
+        const int current_index = bar - offset;
+        const int previous_index = current_index - 1;
+        // CPU state resets when any H/L/C component is undefined, even though
+        // the weighted mean itself reads close only. Validate the full window
+        // so a high-only or low-only gap cannot be bridged for length > 199.
+        if (!isfinite(high[current_index]) || !isfinite(low[current_index]) ||
+            !isfinite(close[current_index]) || !isfinite(high[previous_index]) ||
+            !isfinite(low[previous_index]) || !isfinite(close[previous_index])) {
+            return;
+        }
+        const double current = close[current_index];
+        const double previous = close[previous_index];
+        if (fabs(previous) <= ZERO_EPS) {
+            continue;
+        }
+        const double weight = fabs(current - previous) / previous;
+        sum_weighted += current * weight;
+        sum_weights += weight;
+    }
+    if (fabs(sum_weights) <= ZERO_EPS) {
+        return;
+    }
+
+    const double ma = sum_weighted / sum_weights;
+    double max_dist = 0.0;
+    for (int offset = 0; offset < length; ++offset) {
+        const double distance = fabs(close[bar - offset] - ma);
+        if (distance > max_dist) {
+            max_dist = distance;
+        }
+    }
+
+    const double range_width = atr[bar] * mult;
+    const double upper_band = ma + range_width;
+    const double lower_band = ma - range_width;
+    const double current_close = close[bar];
+    const double oscillator = fabs(range_width) <= ZERO_EPS
+        ? NAN
+        : 100.0 * (current_close - ma) / range_width;
+
+    out_oscillator[flat] = oscillator;
+    out_ma[flat] = ma;
+    out_upper_band[flat] = upper_band;
+    out_lower_band[flat] = lower_band;
+    out_range_width[flat] = range_width;
+    out_in_range[flat] = max_dist <= range_width ? 1.0 : 0.0;
+    out_break_up[flat] = current_close > upper_band ? 1.0 : 0.0;
+    out_break_down[flat] = current_close < lower_band ? 1.0 : 0.0;
+}
+
+extern "C" __global__ void range_oscillator_trend_f64(
+    const double* high,
+    const double* low,
+    const double* close,
+    int len,
+    int rows,
+    const double* ma,
+    double* out_trend
+) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows || len <= 0) {
+        return;
+    }
+
+    const size_t base = static_cast<size_t>(row) * static_cast<size_t>(len);
     double trend_state = 0.0;
-
-    AtrState atr_fallback;
-    AtrState atr_primary;
-    atr_fallback.reset();
-    atr_primary.reset();
-
-    for (int i = 0; i < len; ++i) {
-        const double h = high[i];
-        const double l = low[i];
-        const double c = close[i];
-
-        if (!isfinite(h) || !isfinite(l) || !isfinite(c)) {
-            atr_fallback.reset();
-            atr_primary.reset();
-            ring_head = 0;
-            ring_count = 0;
+    for (int bar = 0; bar < len; ++bar) {
+        const size_t index = base + static_cast<size_t>(bar);
+        if (!isfinite(high[bar]) || !isfinite(low[bar]) || !isfinite(close[bar])) {
             trend_state = 0.0;
+            out_trend[index] = NAN;
             continue;
         }
-
-        bool fallback_ready = false;
-        bool primary_ready = false;
-        const double atr200 = atr_fallback.update(ATR_FALLBACK_PERIOD, h, l, c, &fallback_ready);
-        const double atr2000 = atr_primary.update(ATR_PRIMARY_PERIOD, h, l, c, &primary_ready);
-
-        push_close(ring, storage_cols, &ring_head, &ring_count, c);
-
-        const bool atr_ready = primary_ready || fallback_ready;
-        if (!atr_ready || ring_count < length + 1) {
+        const double current_ma = ma[index];
+        if (!isfinite(current_ma)) {
+            // A finite flat window can make the weighted mean undefined. The
+            // scalar implementation does not reset trend state in that case.
+            out_trend[index] = NAN;
             continue;
         }
-
-        const double atr_raw = primary_ready ? atr2000 : atr200;
-        const double range_width = atr_raw * mult;
-
-        double sum_weighted = 0.0;
-        double sum_weights = 0.0;
-        for (int j = 0; j < length; ++j) {
-            const double curr = ring[back_index(storage_cols, ring_head, ring_count, j)];
-            const double prev = ring[back_index(storage_cols, ring_head, ring_count, j + 1)];
-            if (fabs(prev) <= ZERO_EPS) {
-                continue;
-            }
-            const double weight = fabs(curr - prev) / prev;
-            sum_weighted += curr * weight;
-            sum_weights += weight;
-        }
-        if (fabs(sum_weights) <= ZERO_EPS) {
-            continue;
-        }
-
-        const double ma = sum_weighted / sum_weights;
-        double max_dist = 0.0;
-        for (int j = 0; j < length; ++j) {
-            const double value = ring[back_index(storage_cols, ring_head, ring_count, j)];
-            const double dist = fabs(value - ma);
-            if (dist > max_dist) {
-                max_dist = dist;
-            }
-        }
-
-        if (c > ma) {
+        if (close[bar] > current_ma) {
             trend_state = 1.0;
-        } else if (c < ma) {
+        } else if (close[bar] < current_ma) {
             trend_state = -1.0;
         }
-
-        const double upper_band = ma + range_width;
-        const double lower_band = ma - range_width;
-        const double break_up = c > upper_band ? 1.0 : 0.0;
-        const double break_down = c < lower_band ? 1.0 : 0.0;
-        const double oscillator =
-            fabs(range_width) <= ZERO_EPS ? NAN : (100.0 * (c - ma) / range_width);
-
-        row_oscillator[i] = oscillator;
-        row_ma[i] = ma;
-        row_upper_band[i] = upper_band;
-        row_lower_band[i] = lower_band;
-        row_range_width[i] = range_width;
-        row_in_range[i] = max_dist <= range_width ? 1.0 : 0.0;
-        row_trend[i] = trend_state;
-        row_break_up[i] = break_up;
-        row_break_down[i] = break_down;
+        out_trend[index] = trend_state;
     }
 }
 
@@ -234,11 +247,12 @@ extern "C" __global__ void range_oscillator_batch_f64(
  * dispatcher returns for `output_id` "value" as well as "oscillator" and "osc"
  * (:16044-16049).
  *
- * WHY THE EXISTING ENTRY POINT COULD NOT BE REUSED. `range_oscillator_batch_f64`
- * already in this file writes several output matrices and takes its parameters
- * as per-row arrays; the lane launches
- * (high, low, close, n, periods, n_combos, first_valid, out) and allocates one
- * matrix.
+ * WHY A DISTINCT PRIMARY ENTRY POINT REMAINS. The resident all-output route
+ * above is a three-stage pipeline with an ATR scratch vector and nine result
+ * matrices. The registry's generic primary-output ABI launches one symbol into
+ * one matrix. This entry point remains the active primary-only implementation;
+ * the superseded serial all-output entry point and its host wrapper were
+ * deleted after the resident route passed real-card parity.
  *
  * THE CRATE HAS A `length == 50 && mult == 2.0` FAST PATH (:1016-1030) and the
  * sweep can hit it. It is not a second oracle: `compute_default_into_slices`
@@ -247,10 +261,10 @@ extern "C" __global__ void range_oscillator_batch_f64(
  * arm. One transcription therefore serves both, and there is no special case
  * for period 50 here.
  *
- * SEQUENTIAL, one thread per column, three carried recurrences:
+ * SEQUENTIAL, one thread per column, with the state needed by the primary
+ * oscillator only:
  *   * two ATR states, periods 200 and 2000 (:30-31), each a Wilder-style
  *     smoothing whose value depends on every previous bar;
- *   * `trend_state`, which is sticky across bars (:581-585);
  *   * the rolling window of the last `length + 1` VALID closes, which resets
  *     wholesale on a non-finite bar (:1041-1058).
  *
@@ -406,15 +420,12 @@ void range_oscillator_neo_batch_f64(const double* __restrict__ high,
     neo_ro_atr_init(&atr_primary,  NEO_RO_ATR_PRIMARY_PERIOD);
 
     int    valid_run   = 0;      /* the deque's length, capped at length + 1 */
-    double trend_state = 0.0;    /* carried but not emitted by this column */
-
     for (int t = 0; t < n; ++t) {
         const double h = high[t], l = low[t], c = close[t];
         if (!isfinite(h) || !isfinite(l) || !isfinite(c)) {
             neo_ro_atr_reset(&atr_fallback);
             neo_ro_atr_reset(&atr_primary);
             valid_run   = 0;
-            trend_state = 0.0;
             continue;                                  /* row already NaN */
         }
 
@@ -459,14 +470,9 @@ void range_oscillator_neo_batch_f64(const double* __restrict__ high,
         }
         (void)max_dist;   /* feeds the "in_range" column, not this one */
 
-        if (c > ma)      trend_state = 1.0;            /* :581-585 */
-        else if (c < ma) trend_state = -1.0;
-
         /* :591-595 -- the oscillator itself. */
         o[t] = (fabs(range_width) <= NEO_RO_ZERO_EPS)
              ? NEO_F64_NAN
              : (100.0 * (c - ma) / range_width);
     }
-
-    (void)trend_state;
 }

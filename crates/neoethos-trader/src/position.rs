@@ -7,7 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::{CloseReason, Direction, ExecReport, ExecStatus, LiveBar, SignalSource, TradeIntent};
+use crate::contracts::{
+    CloseReason, Direction, ExecReport, ExecStatus, LiveBar, SignalSource, TradeIntent,
+};
 
 /// One open position.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -279,7 +281,11 @@ impl PositionManager {
     /// Snapshot (clones) of the positions for one symbol — handed to the
     /// DecisionEngine so it can reason without holding a borrow on the manager.
     pub fn positions_for(&self, symbol: &str) -> Vec<Position> {
-        self.open.iter().filter(|p| p.symbol == symbol).cloned().collect()
+        self.open
+            .iter()
+            .filter(|p| p.symbol == symbol)
+            .cloned()
+            .collect()
     }
 
     pub fn has_open(&self, symbol: &str) -> bool {
@@ -332,7 +338,10 @@ impl PositionManager {
                 source,
             } => {
                 let price = report.fill_price.unwrap_or(0.0);
-                let id = report.position_id.clone().unwrap_or_else(|| self.alloc_id());
+                let id = report
+                    .position_id
+                    .clone()
+                    .unwrap_or_else(|| self.alloc_id());
                 self.open.push(Position {
                     id,
                     symbol: symbol.clone(),

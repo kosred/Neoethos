@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -65,10 +49,6 @@ pub enum AutocorrelationIndicatorOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AutocorrelationIndicatorParams {
     pub length: Option<usize>,
     pub max_lag: Option<usize>,
@@ -255,9 +235,7 @@ pub enum AutocorrelationIndicatorError {
     InvalidLength { length: usize, data_len: usize },
     #[error("autocorrelation_indicator: Invalid max_lag: {max_lag}")]
     InvalidMaxLag { max_lag: usize },
-    #[error(
-        "autocorrelation_indicator: Not enough valid data: needed = {needed}, valid = {valid}"
-    )]
+    #[error("autocorrelation_indicator: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
     #[error(
         "autocorrelation_indicator: Filtered output length mismatch: expected = {expected}, got = {got}"
@@ -893,7 +871,6 @@ pub fn autocorrelation_indicator_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn autocorrelation_indicator_into(
     input: &AutocorrelationIndicatorInput,
     filtered_out: &mut [f64],
@@ -1138,400 +1115,12 @@ fn autocorrelation_indicator_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "autocorrelation_indicator")]
-#[pyo3(signature = (data, length=DEFAULT_LENGTH, max_lag=DEFAULT_MAX_LAG, use_test_signal=false, kernel=None))]
-pub fn autocorrelation_indicator_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    max_lag: usize,
-    use_test_signal: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let input = AutocorrelationIndicatorInput::from_slice(
-        data,
-        AutocorrelationIndicatorParams {
-            length: Some(length),
-            max_lag: Some(max_lag),
-            use_test_signal: Some(use_test_signal),
-        },
-    );
-    let out = py
-        .allow_threads(|| autocorrelation_indicator_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("filtered", out.filtered.into_pyarray(py))?;
-    dict.set_item(
-        "correlations",
-        out.correlations
-            .into_pyarray(py)
-            .reshape((out.lag_count, out.cols))?,
-    )?;
-    dict.set_item("lag_count", out.lag_count)?;
-    dict.set_item("cols", out.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AutocorrelationIndicatorStream")]
-pub struct AutocorrelationIndicatorStreamPy {
-    stream: AutocorrelationIndicatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AutocorrelationIndicatorStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, max_lag=DEFAULT_MAX_LAG, use_test_signal=false))]
-    fn new(length: usize, max_lag: usize, use_test_signal: bool) -> PyResult<Self> {
-        let stream = AutocorrelationIndicatorStream::try_new(AutocorrelationIndicatorParams {
-            length: Some(length),
-            max_lag: Some(max_lag),
-            use_test_signal: Some(use_test_signal),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, Vec<f64>)> {
-        self.stream
-            .update(value)
-            .map(|point| (point.filtered, point.correlations))
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "autocorrelation_indicator_batch")]
-#[pyo3(signature = (data, length_range=(DEFAULT_LENGTH, DEFAULT_LENGTH, 0), max_lag=DEFAULT_MAX_LAG, use_test_signal=false, kernel=None))]
-pub fn autocorrelation_indicator_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    max_lag: usize,
-    use_test_signal: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            autocorrelation_indicator_batch_with_kernel(
-                data,
-                &AutocorrelationIndicatorBatchRange {
-                    length: length_range,
-                    max_lag: Some(max_lag),
-                    use_test_signal: Some(use_test_signal),
-                },
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "filtered",
-        output
-            .filtered
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "correlations",
-        output.correlations.into_pyarray(py).reshape((
-            output.rows,
-            output.lag_count,
-            output.cols,
-        ))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    dict.set_item("lag_count", output.lag_count)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_autocorrelation_indicator_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(autocorrelation_indicator_py, m)?)?;
-    m.add_function(wrap_pyfunction!(autocorrelation_indicator_batch_py, m)?)?;
-    m.add_class::<AutocorrelationIndicatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutocorrelationIndicatorBatchConfig {
-    pub length_range: Vec<usize>,
-    pub max_lag: usize,
-    pub use_test_signal: bool,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = autocorrelation_indicator_js)]
-pub fn autocorrelation_indicator_js(
-    data: &[f64],
-    length: usize,
-    max_lag: usize,
-    use_test_signal: bool,
-) -> Result<JsValue, JsValue> {
-    let input = AutocorrelationIndicatorInput::from_slice(
-        data,
-        AutocorrelationIndicatorParams {
-            length: Some(length),
-            max_lag: Some(max_lag),
-            use_test_signal: Some(use_test_signal),
-        },
-    );
-    let out = autocorrelation_indicator_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("filtered"),
-        &serde_wasm_bindgen::to_value(&out.filtered).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("correlations"),
-        &serde_wasm_bindgen::to_value(&out.correlations).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("lag_count"),
-        &JsValue::from_f64(out.lag_count as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = autocorrelation_indicator_batch_js)]
-pub fn autocorrelation_indicator_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: AutocorrelationIndicatorBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "length_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let out = autocorrelation_indicator_batch_with_kernel(
-        data,
-        &AutocorrelationIndicatorBatchRange {
-            length: (
-                config.length_range[0],
-                config.length_range[1],
-                config.length_range[2],
-            ),
-            max_lag: Some(config.max_lag),
-            use_test_signal: Some(config.use_test_signal),
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("filtered"),
-        &serde_wasm_bindgen::to_value(&out.filtered).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("correlations"),
-        &serde_wasm_bindgen::to_value(&out.correlations).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("lag_count"),
-        &JsValue::from_f64(out.lag_count as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn autocorrelation_indicator_alloc(len: usize, max_lag: usize) -> *mut f64 {
-    let total = len
-        .checked_mul(max_lag.saturating_add(1))
-        .expect("autocorrelation_indicator_alloc overflow");
-    let mut buf = vec![0.0; total];
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn autocorrelation_indicator_free(ptr: *mut f64, len: usize, max_lag: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    let total = len
-        .checked_mul(max_lag.saturating_add(1))
-        .expect("autocorrelation_indicator_free overflow");
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, total);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn autocorrelation_indicator_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    max_lag: usize,
-    use_test_signal: bool,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to autocorrelation_indicator_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let total = len
-            .checked_mul(max_lag.saturating_add(1))
-            .ok_or_else(|| JsValue::from_str("size overflow in autocorrelation_indicator_into"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let (filtered_out, correlations_out) = out.split_at_mut(len);
-        let input = AutocorrelationIndicatorInput::from_slice(
-            data,
-            AutocorrelationIndicatorParams {
-                length: Some(length),
-                max_lag: Some(max_lag),
-                use_test_signal: Some(use_test_signal),
-            },
-        );
-        autocorrelation_indicator_into_slice(filtered_out, correlations_out, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn autocorrelation_indicator_batch_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    max_lag: usize,
-    use_test_signal: bool,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to autocorrelation_indicator_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let sweep = AutocorrelationIndicatorBatchRange {
-            length: (length_start, length_end, length_step),
-            max_lag: Some(max_lag),
-            use_test_signal: Some(use_test_signal),
-        };
-        let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let filtered_total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let corr_total = filtered_total
-            .checked_mul(max_lag)
-            .ok_or_else(|| JsValue::from_str("rows*lags*cols overflow"))?;
-        let total = filtered_total
-            .checked_add(corr_total)
-            .ok_or_else(|| JsValue::from_str("total output overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let (filtered_out, correlations_out) = out.split_at_mut(filtered_total);
-        autocorrelation_indicator_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Auto,
-            false,
-            filtered_out,
-            correlations_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn autocorrelation_indicator_output_into_js(
-    data: &[f64],
-    length: usize,
-    max_lag: usize,
-    use_test_signal: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = autocorrelation_indicator_js(data, length, max_lag, use_test_signal)?;
-    crate::write_wasm_object_f64_outputs("autocorrelation_indicator_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn autocorrelation_indicator_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = autocorrelation_indicator_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "autocorrelation_indicator_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-        ParamValue,
+        IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+        compute_cpu_batch,
     };
 
     fn sample_data(len: usize) -> Vec<f64> {
@@ -1734,8 +1323,8 @@ mod tests {
     }
 
     #[test]
-    fn autocorrelation_indicator_dispatch_compute_returns_selected_series(
-    ) -> Result<(), Box<dyn Error>> {
+    fn autocorrelation_indicator_dispatch_compute_returns_selected_series()
+    -> Result<(), Box<dyn Error>> {
         let data = sample_data(96);
         let params = [
             ParamKV {

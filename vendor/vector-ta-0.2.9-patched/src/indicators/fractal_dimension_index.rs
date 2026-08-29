@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -49,10 +33,6 @@ pub struct FractalDimensionIndexOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct FractalDimensionIndexParams {
     pub length: Option<usize>,
 }
@@ -172,9 +152,7 @@ pub enum FractalDimensionIndexError {
     EmptyInputData,
     #[error("fractal_dimension_index: All values are NaN.")]
     AllValuesNaN,
-    #[error(
-        "fractal_dimension_index: Invalid length: length = {length}, data length = {data_len}"
-    )]
+    #[error("fractal_dimension_index: Invalid length: length = {length}, data length = {data_len}")]
     InvalidLength { length: usize, data_len: usize },
     #[error("fractal_dimension_index: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
@@ -618,7 +596,6 @@ pub fn fractal_dimension_index_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn fractal_dimension_index_into(
     input: &FractalDimensionIndexInput,
@@ -628,10 +605,6 @@ pub fn fractal_dimension_index_into(
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct FractalDimensionIndexBatchRange {
     pub length: (usize, usize, usize),
 }
@@ -965,280 +938,11 @@ pub fn expand_grid_fractal_dimension_index(
     expand_grid_checked(range).unwrap_or_default()
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "fractal_dimension_index")]
-#[pyo3(signature = (data, length=30, kernel=None))]
-pub fn fractal_dimension_index_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = FractalDimensionIndexInput::from_slice(
-        slice_in,
-        FractalDimensionIndexParams {
-            length: Some(length),
-        },
-    );
-    let out = py
-        .allow_threads(|| fractal_dimension_index_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "FractalDimensionIndexStream")]
-pub struct FractalDimensionIndexStreamPy {
-    stream: FractalDimensionIndexStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl FractalDimensionIndexStreamPy {
-    #[new]
-    fn new(length: usize) -> PyResult<Self> {
-        let stream = FractalDimensionIndexStream::try_new(FractalDimensionIndexParams {
-            length: Some(length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "fractal_dimension_index_batch")]
-#[pyo3(signature = (data, length_range=(30,30,0), kernel=None))]
-pub fn fractal_dimension_index_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = FractalDimensionIndexBatchRange {
-        length: length_range,
-    };
-
-    let output = py
-        .allow_threads(|| fractal_dimension_index_batch_with_kernel(slice_in, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = output.rows;
-    let cols = output.cols;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "values",
-        output.values.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.length.unwrap_or(30) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_fractal_dimension_index_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(fractal_dimension_index_py, m)?)?;
-    m.add_function(wrap_pyfunction!(fractal_dimension_index_batch_py, m)?)?;
-    m.add_class::<FractalDimensionIndexStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = fractal_dimension_index_js)]
-pub fn fractal_dimension_index_js(data: &[f64], length: usize) -> Result<JsValue, JsValue> {
-    let input = FractalDimensionIndexInput::from_slice(
-        data,
-        FractalDimensionIndexParams {
-            length: Some(length),
-        },
-    );
-    let out = fractal_dimension_index_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&out.values).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FractalDimensionIndexBatchConfig {
-    pub length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = fractal_dimension_index_batch_js)]
-pub fn fractal_dimension_index_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: FractalDimensionIndexBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: length_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = FractalDimensionIndexBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-    };
-    let out = fractal_dimension_index_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("values"),
-        &serde_wasm_bindgen::to_value(&out.values).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fractal_dimension_index_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fractal_dimension_index_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fractal_dimension_index_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to fractal_dimension_index_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        let input = FractalDimensionIndexInput::from_slice(
-            data,
-            FractalDimensionIndexParams {
-                length: Some(length),
-            },
-        );
-        fractal_dimension_index_into_slice(out, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fractal_dimension_index_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to fractal_dimension_index_batch_into",
-        ));
-    }
-
-    let sweep = FractalDimensionIndexBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-    let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows.checked_mul(len).ok_or_else(|| {
-        JsValue::from_str("rows*cols overflow in fractal_dimension_index_batch_into")
-    })?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        fractal_dimension_index_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fractal_dimension_index_output_into_js(
-    data: &[f64],
-    length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fractal_dimension_index_js(data, length)?;
-    crate::write_wasm_object_f64_outputs("fractal_dimension_index_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fractal_dimension_index_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fractal_dimension_index_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "fractal_dimension_index_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu, IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue,
+        IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue, compute_cpu,
     };
 
     fn sample_close(len: usize) -> Vec<f64> {

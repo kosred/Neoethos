@@ -177,8 +177,7 @@ pub fn ga_fitness(metrics: &[f64; 11]) -> f64 {
     let ret = (net / 20_000.0).clamp(-2.0, 2.0) * 0.15;
     let sh = sharpe_component(sharpe, conf) * 0.10;
     let cons = consistency_component(consistency) * 0.10;
-    let pf = ga_pf_component(profit_factor)
-        * if profit_factor >= 1.0 { 0.15 } else { 0.25 };
+    let pf = ga_pf_component(profit_factor) * if profit_factor >= 1.0 { 0.15 } else { 0.25 };
     let wr = win_rate_component(win_rate) * 0.10;
     let dd = drawdown_penalty(max_dd);
 
@@ -381,7 +380,17 @@ mod tests {
         consistency: f64,
     ) -> [f64; 11] {
         [
-            net, sharpe, 0.0, max_dd, win_rate, pf, expectancy, 0.0, trades, consistency, 0.0,
+            net,
+            sharpe,
+            0.0,
+            max_dd,
+            win_rate,
+            pf,
+            expectancy,
+            0.0,
+            trades,
+            consistency,
+            0.0,
         ]
     }
 
@@ -478,8 +487,14 @@ mod tests {
         let far = metrics(-2000.0, 0.5, 0.20, 0.40, 0.7, 12.0, 100.0, 0.30);
         let near = metrics(-200.0, 0.8, 0.10, 0.48, 0.95, 12.0, 100.0, 0.40);
         let (f, n) = (ga_fitness_growth(&far), ga_fitness_growth(&near));
-        assert!(f < 0.0 && n < 0.0, "no-edge genes must score negative: {f}, {n}");
-        assert!(n > f, "closer-to-edge must score higher: near {n} vs far {f}");
+        assert!(
+            f < 0.0 && n < 0.0,
+            "no-edge genes must score negative: {f}, {n}"
+        );
+        assert!(
+            n > f,
+            "closer-to-edge must score higher: near {n} vs far {f}"
+        );
     }
 
     #[test]
@@ -496,7 +511,10 @@ mod tests {
         // and a positive (small) growth instead of collapsing to exactly 0.
         let lucky = metrics(300.0, 3.0, 0.0, 1.0, 10.0, 12.0, 3.0, 1.0);
         let s = ga_fitness_growth(&lucky);
-        assert!(s > 0.0 && s.is_finite(), "all-wins gene must score >0, got {s}");
+        assert!(
+            s > 0.0 && s.is_finite(),
+            "all-wins gene must score >0, got {s}"
+        );
     }
 
     #[test]

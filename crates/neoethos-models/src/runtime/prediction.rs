@@ -63,9 +63,9 @@ impl PredictionMetadata {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuntimePredictionError {
-    InvalidClassProbability { index: usize, value: f32 },
-    InvalidProbabilitySum { sum: f32 },
-    InvalidConfidence { value: f32 },
+    InvalidClassProbability { index: usize, value: f64 },
+    InvalidProbabilitySum { sum: f64 },
+    InvalidConfidence { value: f64 },
 }
 
 impl fmt::Display for RuntimePredictionError {
@@ -88,16 +88,16 @@ impl std::error::Error for RuntimePredictionError {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimePrediction {
-    class_probabilities: [f32; 3],
-    confidence: Option<f32>,
+    class_probabilities: [f64; 3],
+    confidence: Option<f64>,
     abstain_recommended: Option<bool>,
     metadata: PredictionMetadata,
 }
 
 impl RuntimePrediction {
     pub fn try_new(
-        class_probabilities: [f32; 3],
-        confidence: Option<f32>,
+        class_probabilities: [f64; 3],
+        confidence: Option<f64>,
         abstain_recommended: Option<bool>,
         metadata: PredictionMetadata,
     ) -> Result<Self, RuntimePredictionError> {
@@ -112,11 +112,11 @@ impl RuntimePrediction {
         })
     }
 
-    pub fn class_probabilities(&self) -> [f32; 3] {
+    pub fn class_probabilities(&self) -> [f64; 3] {
         self.class_probabilities
     }
 
-    pub fn confidence(&self) -> Option<f32> {
+    pub fn confidence(&self) -> Option<f64> {
         self.confidence
     }
 
@@ -128,7 +128,7 @@ impl RuntimePrediction {
         &self.metadata
     }
 
-    pub fn parts(&self) -> ([f32; 3], Option<f32>, Option<bool>, &PredictionMetadata) {
+    pub fn parts(&self) -> ([f64; 3], Option<f64>, Option<bool>, &PredictionMetadata) {
         (
             self.class_probabilities,
             self.confidence,
@@ -138,9 +138,9 @@ impl RuntimePrediction {
     }
 
     fn validate_probabilities(
-        class_probabilities: &[f32; 3],
+        class_probabilities: &[f64; 3],
     ) -> Result<(), RuntimePredictionError> {
-        let mut sum = 0.0_f32;
+        let mut sum = 0.0_f64;
         for (index, value) in class_probabilities.iter().copied().enumerate() {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 return Err(RuntimePredictionError::InvalidClassProbability { index, value });
@@ -155,7 +155,7 @@ impl RuntimePrediction {
         Ok(())
     }
 
-    fn validate_optional_probability(value: Option<f32>) -> Result<(), RuntimePredictionError> {
+    fn validate_optional_probability(value: Option<f64>) -> Result<(), RuntimePredictionError> {
         if let Some(value) = value
             && (!value.is_finite() || !(0.0..=1.0).contains(&value))
         {
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn runtime_prediction_try_new_rejects_nan_probabilities() {
         let error = RuntimePrediction::try_new(
-            [0.1, f32::NAN, 0.2],
+            [0.1, f64::NAN, 0.2],
             Some(0.7),
             Some(false),
             PredictionMetadata::new("lightgbm", ModelFamily::Tree, CapabilityState::Implemented),

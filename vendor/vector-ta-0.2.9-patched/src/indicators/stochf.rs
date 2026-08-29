@@ -1,27 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
     init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -51,10 +33,6 @@ pub struct StochfOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct StochfParams {
     pub fastk_period: Option<usize>,
     pub fastd_period: Option<usize>,
@@ -232,7 +210,6 @@ pub fn stochf(input: &StochfInput) -> Result<StochfOutput, StochfError> {
     stochf_with_kernel(input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn stochf_into(
     input: &StochfInput,
@@ -530,11 +507,7 @@ unsafe fn stochf_scalar_default_5_3_sma(
         let c = *cp.add(i);
         let denom = hh - ll;
         let kv = if denom == 0.0 {
-            if c == hh {
-                100.0
-            } else {
-                0.0
-            }
+            if c == hh { 100.0 } else { 0.0 }
         } else {
             let inv = 100.0 / denom;
             c.mul_add(inv, (-ll) * inv)
@@ -662,11 +635,7 @@ pub unsafe fn stochf_scalar(
             let c = *cp.add(i);
             let denom = hh - ll;
             let kv = if denom == 0.0 {
-                if c == hh {
-                    100.0
-                } else {
-                    0.0
-                }
+                if c == hh { 100.0 } else { 0.0 }
             } else {
                 let inv = 100.0 / denom;
                 c.mul_add(inv, (-ll) * inv)
@@ -787,11 +756,7 @@ pub unsafe fn stochf_scalar(
             let c = *cp.add(i);
             let denom = hh - ll;
             let kv = if denom == 0.0 {
-                if c == hh {
-                    100.0
-                } else {
-                    0.0
-                }
+                if c == hh { 100.0 } else { 0.0 }
             } else {
                 let inv = 100.0 / denom;
                 c.mul_add(inv, (-ll) * inv)
@@ -895,11 +860,7 @@ pub unsafe fn stochf_avx2(
             let c = *close.get_unchecked(i);
             let denom = hh - ll;
             let kv = if denom == 0.0 {
-                if c == hh {
-                    100.0
-                } else {
-                    0.0
-                }
+                if c == hh { 100.0 } else { 0.0 }
             } else {
                 let inv = 100.0 / denom;
                 c.mul_add(inv, (-ll) * inv)
@@ -1220,11 +1181,7 @@ impl StochfStream {
 
         let denom = hh - ll;
         let k = if denom == 0.0 {
-            if close == hh {
-                100.0
-            } else {
-                0.0
-            }
+            if close == hh { 100.0 } else { 0.0 }
         } else {
             let scale = 100.0 / denom;
             close.mul_add(scale, (-ll) * scale)
@@ -1837,11 +1794,7 @@ unsafe fn stochf_row_scalar(
             let c = *cp.add(i);
             let denom = hh - ll;
             let kv = if denom == 0.0 {
-                if c == hh {
-                    100.0
-                } else {
-                    0.0
-                }
+                if c == hh { 100.0 } else { 0.0 }
             } else {
                 let inv = 100.0 / denom;
                 c.mul_add(inv, (-ll) * inv)
@@ -1962,11 +1915,7 @@ unsafe fn stochf_row_scalar(
             let c = *cp.add(i);
             let denom = hh - ll;
             let kv = if denom == 0.0 {
-                if c == hh {
-                    100.0
-                } else {
-                    0.0
-                }
+                if c == hh { 100.0 } else { 0.0 }
             } else {
                 let inv = 100.0 / denom;
                 c.mul_add(inv, (-ll) * inv)
@@ -2117,320 +2066,16 @@ pub unsafe fn stochf_row_avx512_long(
     );
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "stochf")]
-#[pyo3(signature = (high, low, close, fastk_period=None, fastd_period=None, fastd_matype=None, kernel=None))]
-pub fn stochf_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    fastk_period: Option<usize>,
-    fastd_period: Option<usize>,
-    fastd_matype: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    if high_slice.len() != low_slice.len() || high_slice.len() != close_slice.len() {
-        return Err(PyValueError::new_err(
-            "Input arrays must have the same length",
-        ));
-    }
-
-    let params = StochfParams {
-        fastk_period,
-        fastd_period,
-        fastd_matype,
-    };
-    let input = StochfInput::from_slices(high_slice, low_slice, close_slice, params);
-
-    let (k_vec, d_vec) = py
-        .allow_threads(|| stochf_with_kernel(&input, kern).map(|o| (o.k, o.d)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((k_vec.into_pyarray(py), d_vec.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "StochfStream")]
-pub struct StochfStreamPy {
-    stream: StochfStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl StochfStreamPy {
-    #[new]
-    fn new(fastk_period: usize, fastd_period: usize, fastd_matype: usize) -> PyResult<Self> {
-        let params = StochfParams {
-            fastk_period: Some(fastk_period),
-            fastd_period: Some(fastd_period),
-            fastd_matype: Some(fastd_matype),
-        };
-        let stream =
-            StochfStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(StochfStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "stochf_batch")]
-#[pyo3(signature = (high, low, close, fastk_range, fastd_range, kernel=None))]
-pub fn stochf_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    fastk_range: (usize, usize, usize),
-    fastd_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    if high_slice.len() != low_slice.len() || high_slice.len() != close_slice.len() {
-        return Err(PyValueError::new_err(
-            "Input arrays must have the same length",
-        ));
-    }
-
-    let sweep = StochfBatchRange {
-        fastk_period: fastk_range,
-        fastd_period: fastd_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    if rows == 0 {
-        return Err(PyValueError::new_err(
-            "stochf: invalid range (empty expansion)",
-        ));
-    }
-    let cols = high_slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("stochf: rows*cols overflow"))?;
-
-    let k_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let d_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let k_slice = unsafe { k_arr.as_slice_mut()? };
-    let d_slice = unsafe { d_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            stochf_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &sweep,
-                simd,
-                true,
-                k_slice,
-                d_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("k_values", k_arr.reshape((rows, cols))?)?;
-    dict.set_item("d_values", d_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fastk_periods",
-        combos
-            .iter()
-            .map(|p| p.fastk_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "fastd_periods",
-        combos
-            .iter()
-            .map(|p| p.fastd_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaStochf};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyReadonlyArray1;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::exceptions::PyValueError as PyErrValue;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::PyErr;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "stochf_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, fastk_range, fastd_range, device_id=0))]
-pub fn stochf_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: PyReadonlyArray1<'_, f32>,
-    low_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    fastk_range: (usize, usize, usize),
-    fastd_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyErrValue::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    if h.len() != l.len() || h.len() != c.len() {
-        return Err(PyErrValue::new_err("mismatched input lengths"));
-    }
-    let sweep = StochfBatchRange {
-        fastk_period: fastk_range,
-        fastd_period: fastd_range,
-    };
-    let (pair, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaStochf::new(device_id).map_err(|e| PyErrValue::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let (pair, _combos) = cuda
-            .stochf_batch_dev(h, l, c, &sweep)
-            .map_err(|e| PyErrValue::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((pair, ctx, dev_id))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: pair.a,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-        DeviceArrayF32Py {
-            inner: pair.b,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "stochf_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, fastk, fastd, fastd_matype=0, device_id=0))]
-pub fn stochf_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: PyReadonlyArray1<'_, f32>,
-    low_tm_f32: PyReadonlyArray1<'_, f32>,
-    close_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    fastk: usize,
-    fastd: usize,
-    fastd_matype: usize,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyErrValue::new_err("CUDA not available"));
-    }
-    let htm = high_tm_f32.as_slice()?;
-    let ltm = low_tm_f32.as_slice()?;
-    let ctm = close_tm_f32.as_slice()?;
-    let params = StochfParams {
-        fastk_period: Some(fastk),
-        fastd_period: Some(fastd),
-        fastd_matype: Some(fastd_matype),
-    };
-    let (k, d, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaStochf::new(device_id).map_err(|e| PyErrValue::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let (k, d) = cuda
-            .stochf_many_series_one_param_time_major_dev(htm, ltm, ctm, cols, rows, &params)
-            .map_err(|e| PyErrValue::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((k, d, ctx, dev_id))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: k,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-        DeviceArrayF32Py {
-            inner: d,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-    ))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochf_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fastk_period: usize,
-    fastd_period: usize,
-    fastd_matype: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = stochf_js(high, low, close, fastk_period, fastd_period, fastd_matype)?;
-    crate::write_wasm_f64_output("stochf_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochf_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = stochf_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "stochf_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_stochf_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = StochfParams {
             fastk_period: None,
             fastd_period: None,
@@ -2445,8 +2090,8 @@ mod tests {
 
     fn check_stochf_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = StochfParams {
             fastk_period: Some(5),
             fastd_period: Some(3),
@@ -2487,8 +2132,8 @@ mod tests {
 
     fn check_stochf_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = StochfInput::with_default_candles(&candles);
         let output = stochf_with_kernel(&input, kernel)?;
         assert_eq!(output.k.len(), candles.close.len());
@@ -2546,8 +2191,8 @@ mod tests {
 
     fn check_stochf_slice_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = StochfParams {
             fastk_period: Some(5),
             fastd_period: Some(3),
@@ -2566,8 +2211,8 @@ mod tests {
     fn check_stochf_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             StochfParams::default(),
@@ -2631,26 +2276,32 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at K index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at K index {} \
 						 with params: fastk_period={}, fastd_period={}, fastd_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(5),
-						params.fastd_period.unwrap_or(3),
-						params.fastd_matype.unwrap_or(0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(5),
+                        params.fastd_period.unwrap_or(3),
+                        params.fastd_matype.unwrap_or(0),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at K index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at K index {} \
 						 with params: fastk_period={}, fastd_period={}, fastd_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(5),
-						params.fastd_period.unwrap_or(3),
-						params.fastd_matype.unwrap_or(0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(5),
+                        params.fastd_period.unwrap_or(3),
+                        params.fastd_matype.unwrap_or(0),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
@@ -2678,26 +2329,32 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at D index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at D index {} \
 						 with params: fastk_period={}, fastd_period={}, fastd_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(5),
-						params.fastd_period.unwrap_or(3),
-						params.fastd_matype.unwrap_or(0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(5),
+                        params.fastd_period.unwrap_or(3),
+                        params.fastd_matype.unwrap_or(0),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at D index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at D index {} \
 						 with params: fastk_period={}, fastd_period={}, fastd_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(5),
-						params.fastd_period.unwrap_or(3),
-						params.fastd_matype.unwrap_or(0),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(5),
+                        params.fastd_period.unwrap_or(3),
+                        params.fastd_matype.unwrap_or(0),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
@@ -2765,8 +2422,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = StochfBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
         let def = StochfParams::default();
         let krow = output.k_for(&def).expect("default row missing");
@@ -2780,8 +2437,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 1, 5, 1),
@@ -3074,11 +2731,7 @@ mod tests {
                         let ll = window_low.iter().cloned().fold(f64::INFINITY, f64::min);
 
                         let expected_k = if hh == ll {
-                            if close[i] == hh {
-                                100.0
-                            } else {
-                                0.0
-                            }
+                            if close[i] == hh { 100.0 } else { 0.0 }
                         } else {
                             100.0 * (close[i] - ll) / (hh - ll)
                         };
@@ -3241,46 +2894,6 @@ mod tests {
             }
         };
     }
-    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-    #[test]
-    fn test_wasm_batch_warmup_initialization() {
-        let high = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-        let low = vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5];
-        let close = vec![0.8, 1.8, 2.8, 3.8, 4.8, 5.8, 6.8, 7.8, 8.8, 9.8];
-
-        let mut k_out = vec![999.0; 10];
-        let mut d_out = vec![999.0; 10];
-
-        let result = unsafe {
-            stochf_batch_into(
-                high.as_ptr(),
-                low.as_ptr(),
-                close.as_ptr(),
-                k_out.as_mut_ptr(),
-                d_out.as_mut_ptr(),
-                10,
-                3,
-                3,
-                0,
-                2,
-                2,
-                0,
-                0,
-            )
-        };
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 1);
-
-        assert!(k_out[0].is_nan(), "K[0] should be NaN");
-        assert!(k_out[1].is_nan(), "K[1] should be NaN");
-        assert!(!k_out[2].is_nan(), "K[2] should have a value");
-
-        assert!(d_out[0].is_nan(), "D[0] should be NaN");
-        assert!(d_out[1].is_nan(), "D[1] should be NaN");
-        assert!(d_out[2].is_nan(), "D[2] should be NaN");
-        assert!(!d_out[3].is_nan(), "D[3] should have a value");
-    }
 
     #[test]
     fn test_batch_invalid_output_size() {
@@ -3358,8 +2971,8 @@ mod tests {
 
     #[test]
     fn test_stochf_into_matches_api() {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path).expect("failed to read csv");
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path).expect("failed to read Vortex fixture");
         let input = StochfInput::with_default_candles(&candles);
 
         let base = stochf(&input).expect("baseline stochf failed");
@@ -3396,242 +3009,4 @@ mod tests {
 
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochf_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fastk_period: usize,
-    fastd_period: usize,
-    fastd_matype: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = StochfParams {
-        fastk_period: Some(fastk_period),
-        fastd_period: Some(fastd_period),
-        fastd_matype: Some(fastd_matype),
-    };
-    let input = StochfInput::from_slices(high, low, close, params);
-    let out =
-        stochf_with_kernel(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(2 * out.k.len());
-    values.extend_from_slice(&out.k);
-    values.extend_from_slice(&out.d);
-
-    Ok(values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochf_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochf_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochf_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    k_out_ptr: *mut f64,
-    d_out_ptr: *mut f64,
-    len: usize,
-    fastk_period: usize,
-    fastd_period: usize,
-    fastd_matype: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || k_out_ptr.is_null()
-        || d_out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer passed to stochf_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let mut k_out = std::slice::from_raw_parts_mut(k_out_ptr, len);
-        let mut d_out = std::slice::from_raw_parts_mut(d_out_ptr, len);
-
-        let params = StochfParams {
-            fastk_period: Some(fastk_period),
-            fastd_period: Some(fastd_period),
-            fastd_matype: Some(fastd_matype),
-        };
-        let input = StochfInput::from_slices(high, low, close, params);
-        stochf_into_slice(&mut k_out, &mut d_out, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct StochfBatchConfig {
-    pub fastk_range: (usize, usize, usize),
-    pub fastd_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct StochfBatchJsOutput {
-    pub k_values: Vec<f64>,
-    pub d_values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub combos: Vec<StochfParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = stochf_batch)]
-pub fn stochf_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: StochfBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = StochfBatchRange {
-        fastk_period: cfg.fastk_range,
-        fastd_period: cfg.fastd_range,
-    };
-
-    let out = stochf_batch_inner(high, low, close, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = StochfBatchJsOutput {
-        k_values: out.k,
-        d_values: out.d,
-        rows: out.rows,
-        cols: out.cols,
-        combos: out.combos,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochf_batch_into(
-    in_high_ptr: *const f64,
-    in_low_ptr: *const f64,
-    in_close_ptr: *const f64,
-    out_k_ptr: *mut f64,
-    out_d_ptr: *mut f64,
-    len: usize,
-    fastk_start: usize,
-    fastk_end: usize,
-    fastk_step: usize,
-    fastd_start: usize,
-    fastd_end: usize,
-    fastd_step: usize,
-    fastd_matype: usize,
-) -> Result<usize, JsValue> {
-    if in_high_ptr.is_null()
-        || in_low_ptr.is_null()
-        || in_close_ptr.is_null()
-        || out_k_ptr.is_null()
-        || out_d_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(in_high_ptr, len);
-        let low = std::slice::from_raw_parts(in_low_ptr, len);
-        let close = std::slice::from_raw_parts(in_close_ptr, len);
-
-        let sweep = StochfBatchRange {
-            fastk_period: (fastk_start, fastk_end, fastk_step),
-            fastd_period: (fastd_start, fastd_end, fastd_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let aliasing = in_high_ptr == out_k_ptr
-            || in_high_ptr == out_d_ptr
-            || in_low_ptr == out_k_ptr
-            || in_low_ptr == out_d_ptr
-            || in_close_ptr == out_k_ptr
-            || in_close_ptr == out_d_ptr;
-
-        if aliasing {
-            let mut temp_k = vec![0.0; rows * cols];
-            let mut temp_d = vec![0.0; rows * cols];
-
-            let kernel = detect_best_batch_kernel();
-
-            let simd_kernel = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => Kernel::Scalar,
-            };
-
-            stochf_batch_inner_into(
-                high,
-                low,
-                close,
-                &sweep,
-                simd_kernel,
-                false,
-                &mut temp_k,
-                &mut temp_d,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out_k_slice = std::slice::from_raw_parts_mut(out_k_ptr, rows * cols);
-            let out_d_slice = std::slice::from_raw_parts_mut(out_d_ptr, rows * cols);
-
-            out_k_slice.copy_from_slice(&temp_k);
-            out_d_slice.copy_from_slice(&temp_d);
-        } else {
-            let out_k_slice = std::slice::from_raw_parts_mut(out_k_ptr, rows * cols);
-            let out_d_slice = std::slice::from_raw_parts_mut(out_d_ptr, rows * cols);
-
-            let kernel = detect_best_batch_kernel();
-
-            let simd_kernel = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => Kernel::Scalar,
-            };
-            stochf_batch_inner_into(
-                high,
-                low,
-                close,
-                &sweep,
-                simd_kernel,
-                false,
-                out_k_slice,
-                out_d_slice,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(rows)
-    }
 }

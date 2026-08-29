@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -69,10 +51,6 @@ pub struct EhlersLinearExtrapolationPredictorOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersLinearExtrapolationPredictorParams {
     pub high_pass_length: Option<usize>,
     pub low_pass_length: Option<usize>,
@@ -399,6 +377,28 @@ struct ResolvedParams {
     hp_c1: f64,
     hp_c2: f64,
     hp_c3: f64,
+    hann_weights: Vec<f64>,
+    hann_weight_sum: f64,
+}
+
+/// Immutable parameter-only arithmetic prepared by the scalar CPU authority
+/// and uploaded by the NeoEthos resident CUDA route.
+///
+/// No price or output value enters this payload. CUDA receives the exact f64
+/// coefficient and Hann-weight bits already consumed by the CPU row instead
+/// of independently evaluating libdevice `exp`/`cos`.
+#[derive(Debug, Clone)]
+pub(crate) struct EhlersLinearExtrapolationPredictorExactCoefficients {
+    pub(crate) high_pass_length: usize,
+    pub(crate) low_pass_length: usize,
+    pub(crate) gain: f64,
+    pub(crate) bars_forward: usize,
+    pub(crate) signal_mode: i32,
+    pub(crate) hp_c1: f64,
+    pub(crate) hp_c2: f64,
+    pub(crate) hp_c3: f64,
+    pub(crate) hann_weights: Vec<f64>,
+    pub(crate) hann_weight_sum: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -428,8 +428,9 @@ impl EhlersLinearExtrapolationPredictorStream {
     #[inline]
     fn new_resolved(params: ResolvedParams) -> Self {
         let low_pass_length = params.low_pass_length;
-        let (hann_weights, hann_weight_sum) = hann_weights(low_pass_length);
         Self {
+            hann_weights: params.hann_weights.clone(),
+            hann_weight_sum: params.hann_weight_sum,
             params,
             source_count: 0,
             prev_source_1: 0.0,
@@ -437,8 +438,6 @@ impl EhlersLinearExtrapolationPredictorStream {
             hp_prev_1: 0.0,
             hp_prev_2: 0.0,
             hp_history: VecDeque::with_capacity(low_pass_length),
-            hann_weights,
-            hann_weight_sum,
             filter_history: VecDeque::with_capacity(HISTORY_LENGTH),
             prev_prediction: None,
             prev_filter: None,
@@ -533,10 +532,6 @@ impl EhlersLinearExtrapolationPredictorStream {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersLinearExtrapolationPredictorBatchRange {
     pub high_pass_length: (usize, usize, usize),
     pub low_pass_length: (usize, usize, usize),
@@ -708,6 +703,7 @@ fn resolve_params(
     let hp_c2 = b1;
     let hp_c3 = -a1 * a1;
     let hp_c1 = (1.0 + hp_c2 - hp_c3) * 0.25;
+    let (hann_weights, hann_weight_sum) = hann_weights(low_pass_length);
 
     Ok(ResolvedParams {
         high_pass_length,
@@ -718,6 +714,36 @@ fn resolve_params(
         hp_c1,
         hp_c2,
         hp_c3,
+        hann_weights,
+        hann_weight_sum,
+    })
+}
+
+/// Resolve the exact canonical tuple and return the immutable CPU-owned bits
+/// uploaded by the resident f64 production route.
+pub(crate) fn ehlers_linear_extrapolation_predictor_exact_coefficients(
+    params: &EhlersLinearExtrapolationPredictorParams,
+) -> Result<
+    EhlersLinearExtrapolationPredictorExactCoefficients,
+    EhlersLinearExtrapolationPredictorError,
+> {
+    let resolved = resolve_params(params)?;
+    let signal_mode = match resolved.signal_mode {
+        SignalMode::PredictFilterCrosses => 0,
+        SignalMode::PredictMiddleCrosses => 1,
+        SignalMode::FilterMiddleCrosses => 2,
+    };
+    Ok(EhlersLinearExtrapolationPredictorExactCoefficients {
+        high_pass_length: resolved.high_pass_length,
+        low_pass_length: resolved.low_pass_length,
+        gain: resolved.gain,
+        bars_forward: resolved.bars_forward,
+        signal_mode,
+        hp_c1: resolved.hp_c1,
+        hp_c2: resolved.hp_c2,
+        hp_c3: resolved.hp_c3,
+        hann_weights: resolved.hann_weights,
+        hann_weight_sum: resolved.hann_weight_sum,
     })
 }
 
@@ -788,14 +814,9 @@ fn row_from_slice_lowpass12(
     go_long_out: &mut [f64],
     go_short_out: &mut [f64],
 ) {
-    let pix2 = 2.0 * PI / (DEFAULT_LOW_PASS_LENGTH + 1) as f64;
-    let mut weights = [0.0; DEFAULT_LOW_PASS_LENGTH];
-    let mut weight_sum = 0.0;
-    for count in 1..=DEFAULT_LOW_PASS_LENGTH {
-        let coef = 1.0 - (count as f64 * pix2).cos();
-        weights[count - 1] = coef;
-        weight_sum += coef;
-    }
+    debug_assert_eq!(params.hann_weights.len(), DEFAULT_LOW_PASS_LENGTH);
+    let weights = &params.hann_weights;
+    let weight_sum = params.hann_weight_sum;
 
     let mut source_count = 0usize;
     let mut prev_source_1 = 0.0;
@@ -1067,7 +1088,6 @@ pub fn ehlers_linear_extrapolation_predictor_into_slices(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ehlers_linear_extrapolation_predictor_into(
     input: &EhlersLinearExtrapolationPredictorInput,
@@ -1483,583 +1503,6 @@ pub fn ehlers_linear_extrapolation_predictor_batch_inner_into(
     Ok(out.combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_linear_extrapolation_predictor")]
-#[pyo3(signature = (data, high_pass_length=None, low_pass_length=None, gain=None, bars_forward=None, signal_mode=None, kernel=None))]
-pub fn ehlers_linear_extrapolation_predictor_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    high_pass_length: Option<usize>,
-    low_pass_length: Option<usize>,
-    gain: Option<f64>,
-    bars_forward: Option<usize>,
-    signal_mode: Option<&str>,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = EhlersLinearExtrapolationPredictorInput::from_slice(
-        data,
-        EhlersLinearExtrapolationPredictorParams {
-            high_pass_length,
-            low_pass_length,
-            gain,
-            bars_forward,
-            signal_mode: signal_mode.map(|v| v.to_string()),
-        },
-    );
-    let out = py
-        .allow_threads(|| ehlers_linear_extrapolation_predictor_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.prediction.into_pyarray(py),
-        out.filter.into_pyarray(py),
-        out.state.into_pyarray(py),
-        out.go_long.into_pyarray(py),
-        out.go_short.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersLinearExtrapolationPredictorStream")]
-pub struct EhlersLinearExtrapolationPredictorStreamPy {
-    inner: EhlersLinearExtrapolationPredictorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersLinearExtrapolationPredictorStreamPy {
-    #[new]
-    #[pyo3(signature = (high_pass_length=DEFAULT_HIGH_PASS_LENGTH, low_pass_length=DEFAULT_LOW_PASS_LENGTH, gain=DEFAULT_GAIN, bars_forward=DEFAULT_BARS_FORWARD, signal_mode=DEFAULT_SIGNAL_MODE))]
-    fn new(
-        high_pass_length: usize,
-        low_pass_length: usize,
-        gain: f64,
-        bars_forward: usize,
-        signal_mode: &str,
-    ) -> PyResult<Self> {
-        let inner = EhlersLinearExtrapolationPredictorStream::try_new(
-            EhlersLinearExtrapolationPredictorParams {
-                high_pass_length: Some(high_pass_length),
-                low_pass_length: Some(low_pass_length),
-                gain: Some(gain),
-                bars_forward: Some(bars_forward),
-                signal_mode: Some(signal_mode.to_string()),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64, f64, f64)> {
-        self.inner.update(value)
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.inner.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_linear_extrapolation_predictor_batch")]
-#[pyo3(signature = (
-    data,
-    high_pass_length_range=(DEFAULT_HIGH_PASS_LENGTH, DEFAULT_HIGH_PASS_LENGTH, 0),
-    low_pass_length_range=(DEFAULT_LOW_PASS_LENGTH, DEFAULT_LOW_PASS_LENGTH, 0),
-    gain_range=(DEFAULT_GAIN, DEFAULT_GAIN, 0.0),
-    bars_forward_range=(DEFAULT_BARS_FORWARD, DEFAULT_BARS_FORWARD, 0),
-    signal_mode=DEFAULT_SIGNAL_MODE,
-    kernel=None
-))]
-pub fn ehlers_linear_extrapolation_predictor_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    high_pass_length_range: (usize, usize, usize),
-    low_pass_length_range: (usize, usize, usize),
-    gain_range: (f64, f64, f64),
-    bars_forward_range: (usize, usize, usize),
-    signal_mode: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = EhlersLinearExtrapolationPredictorBatchRange {
-        high_pass_length: high_pass_length_range,
-        low_pass_length: low_pass_length_range,
-        gain: gain_range,
-        bars_forward: bars_forward_range,
-        signal_mode: Some(signal_mode.to_string()),
-    };
-    let combos = expand_grid_ehlers_linear_extrapolation_predictor(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let prediction_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let filter_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let state_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let long_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let short_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let prediction_slice = unsafe { prediction_arr.as_slice_mut()? };
-    let filter_slice = unsafe { filter_arr.as_slice_mut()? };
-    let state_slice = unsafe { state_arr.as_slice_mut()? };
-    let long_slice = unsafe { long_arr.as_slice_mut()? };
-    let short_slice = unsafe { short_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            ehlers_linear_extrapolation_predictor_batch_inner_into(
-                data,
-                &sweep,
-                batch.to_non_batch(),
-                prediction_slice,
-                filter_slice,
-                state_slice,
-                long_slice,
-                short_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("prediction", prediction_arr.reshape((rows, cols))?)?;
-    dict.set_item("filter", filter_arr.reshape((rows, cols))?)?;
-    dict.set_item("state", state_arr.reshape((rows, cols))?)?;
-    dict.set_item("go_long", long_arr.reshape((rows, cols))?)?;
-    dict.set_item("go_short", short_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "high_pass_lengths",
-        combos
-            .iter()
-            .map(|p| p.high_pass_length.unwrap_or(DEFAULT_HIGH_PASS_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "low_pass_lengths",
-        combos
-            .iter()
-            .map(|p| p.low_pass_length.unwrap_or(DEFAULT_LOW_PASS_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "gains",
-        combos
-            .iter()
-            .map(|p| p.gain.unwrap_or(DEFAULT_GAIN))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "bars_forwards",
-        combos
-            .iter()
-            .map(|p| p.bars_forward.unwrap_or(DEFAULT_BARS_FORWARD) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signal_modes",
-        combos
-            .iter()
-            .map(|p| {
-                p.signal_mode
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_SIGNAL_MODE.to_string())
-            })
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_ehlers_linear_extrapolation_predictor_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(
-        ehlers_linear_extrapolation_predictor_py,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        ehlers_linear_extrapolation_predictor_batch_py,
-        module
-    )?)?;
-    module.add_class::<EhlersLinearExtrapolationPredictorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_linear_extrapolation_predictor_js")]
-pub fn ehlers_linear_extrapolation_predictor_js(
-    data: &[f64],
-    high_pass_length: usize,
-    low_pass_length: usize,
-    gain: f64,
-    bars_forward: usize,
-    signal_mode: &str,
-) -> Result<JsValue, JsValue> {
-    let input = EhlersLinearExtrapolationPredictorInput::from_slice(
-        data,
-        EhlersLinearExtrapolationPredictorParams {
-            high_pass_length: Some(high_pass_length),
-            low_pass_length: Some(low_pass_length),
-            gain: Some(gain),
-            bars_forward: Some(bars_forward),
-            signal_mode: Some(signal_mode.to_string()),
-        },
-    );
-    let out = ehlers_linear_extrapolation_predictor(&input)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let result = js_sys::Object::new();
-
-    macro_rules! set_arr {
-        ($name:literal, $values:expr) => {{
-            let arr = js_sys::Float64Array::new_with_length($values.len() as u32);
-            arr.copy_from(&$values);
-            js_sys::Reflect::set(&result, &JsValue::from_str($name), &arr)?;
-        }};
-    }
-
-    set_arr!("prediction", out.prediction);
-    set_arr!("filter", out.filter);
-    set_arr!("state", out.state);
-    set_arr!("go_long", out.go_long);
-    set_arr!("go_short", out.go_short);
-    Ok(result.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_linear_extrapolation_predictor_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_linear_extrapolation_predictor_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_linear_extrapolation_predictor_into(
-    data_ptr: *const f64,
-    prediction_ptr: *mut f64,
-    filter_ptr: *mut f64,
-    state_ptr: *mut f64,
-    go_long_ptr: *mut f64,
-    go_short_ptr: *mut f64,
-    len: usize,
-    high_pass_length: usize,
-    low_pass_length: usize,
-    gain: f64,
-    bars_forward: usize,
-    signal_mode: &str,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null()
-        || prediction_ptr.is_null()
-        || filter_ptr.is_null()
-        || state_ptr.is_null()
-        || go_long_ptr.is_null()
-        || go_short_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let input = EhlersLinearExtrapolationPredictorInput::from_slice(
-            data,
-            EhlersLinearExtrapolationPredictorParams {
-                high_pass_length: Some(high_pass_length),
-                low_pass_length: Some(low_pass_length),
-                gain: Some(gain),
-                bars_forward: Some(bars_forward),
-                signal_mode: Some(signal_mode.to_string()),
-            },
-        );
-        let alias = data_ptr == prediction_ptr
-            || data_ptr == filter_ptr
-            || data_ptr == state_ptr
-            || data_ptr == go_long_ptr
-            || data_ptr == go_short_ptr
-            || prediction_ptr == filter_ptr
-            || prediction_ptr == state_ptr
-            || prediction_ptr == go_long_ptr
-            || prediction_ptr == go_short_ptr
-            || filter_ptr == state_ptr
-            || filter_ptr == go_long_ptr
-            || filter_ptr == go_short_ptr
-            || state_ptr == go_long_ptr
-            || state_ptr == go_short_ptr
-            || go_long_ptr == go_short_ptr;
-        if alias {
-            let mut prediction_tmp = vec![0.0; len];
-            let mut filter_tmp = vec![0.0; len];
-            let mut state_tmp = vec![0.0; len];
-            let mut long_tmp = vec![0.0; len];
-            let mut short_tmp = vec![0.0; len];
-            ehlers_linear_extrapolation_predictor_into_slices(
-                &mut prediction_tmp,
-                &mut filter_tmp,
-                &mut state_tmp,
-                &mut long_tmp,
-                &mut short_tmp,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(prediction_ptr, len).copy_from_slice(&prediction_tmp);
-            std::slice::from_raw_parts_mut(filter_ptr, len).copy_from_slice(&filter_tmp);
-            std::slice::from_raw_parts_mut(state_ptr, len).copy_from_slice(&state_tmp);
-            std::slice::from_raw_parts_mut(go_long_ptr, len).copy_from_slice(&long_tmp);
-            std::slice::from_raw_parts_mut(go_short_ptr, len).copy_from_slice(&short_tmp);
-        } else {
-            ehlers_linear_extrapolation_predictor_into_slices(
-                std::slice::from_raw_parts_mut(prediction_ptr, len),
-                std::slice::from_raw_parts_mut(filter_ptr, len),
-                std::slice::from_raw_parts_mut(state_ptr, len),
-                std::slice::from_raw_parts_mut(go_long_ptr, len),
-                std::slice::from_raw_parts_mut(go_short_ptr, len),
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersLinearExtrapolationPredictorBatchConfig {
-    pub high_pass_length_range: (usize, usize, usize),
-    pub low_pass_length_range: (usize, usize, usize),
-    pub gain_range: Option<(f64, f64, f64)>,
-    pub bars_forward_range: Option<(usize, usize, usize)>,
-    pub signal_mode: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersLinearExtrapolationPredictorBatchJsOutput {
-    pub prediction: Vec<f64>,
-    pub filter: Vec<f64>,
-    pub state: Vec<f64>,
-    pub go_long: Vec<f64>,
-    pub go_short: Vec<f64>,
-    pub high_pass_lengths: Vec<usize>,
-    pub low_pass_lengths: Vec<usize>,
-    pub gains: Vec<f64>,
-    pub bars_forwards: Vec<usize>,
-    pub signal_modes: Vec<String>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_linear_extrapolation_predictor_batch_js")]
-pub fn ehlers_linear_extrapolation_predictor_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: EhlersLinearExtrapolationPredictorBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = EhlersLinearExtrapolationPredictorBatchRange {
-        high_pass_length: config.high_pass_length_range,
-        low_pass_length: config.low_pass_length_range,
-        gain: config
-            .gain_range
-            .unwrap_or((DEFAULT_GAIN, DEFAULT_GAIN, 0.0)),
-        bars_forward: config.bars_forward_range.unwrap_or((
-            DEFAULT_BARS_FORWARD,
-            DEFAULT_BARS_FORWARD,
-            0,
-        )),
-        signal_mode: Some(
-            config
-                .signal_mode
-                .unwrap_or_else(|| DEFAULT_SIGNAL_MODE.to_string()),
-        ),
-    };
-    let out = ehlers_linear_extrapolation_predictor_batch_inner(
-        data,
-        &sweep,
-        detect_best_batch_kernel().to_non_batch(),
-        false,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersLinearExtrapolationPredictorBatchJsOutput {
-        high_pass_lengths: out
-            .combos
-            .iter()
-            .map(|p| p.high_pass_length.unwrap_or(DEFAULT_HIGH_PASS_LENGTH))
-            .collect(),
-        low_pass_lengths: out
-            .combos
-            .iter()
-            .map(|p| p.low_pass_length.unwrap_or(DEFAULT_LOW_PASS_LENGTH))
-            .collect(),
-        gains: out
-            .combos
-            .iter()
-            .map(|p| p.gain.unwrap_or(DEFAULT_GAIN))
-            .collect(),
-        bars_forwards: out
-            .combos
-            .iter()
-            .map(|p| p.bars_forward.unwrap_or(DEFAULT_BARS_FORWARD))
-            .collect(),
-        signal_modes: out
-            .combos
-            .iter()
-            .map(|p| {
-                p.signal_mode
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_SIGNAL_MODE.to_string())
-            })
-            .collect(),
-        prediction: out.prediction,
-        filter: out.filter,
-        state: out.state,
-        go_long: out.go_long,
-        go_short: out.go_short,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_linear_extrapolation_predictor_batch_into(
-    data_ptr: *const f64,
-    prediction_ptr: *mut f64,
-    filter_ptr: *mut f64,
-    state_ptr: *mut f64,
-    go_long_ptr: *mut f64,
-    go_short_ptr: *mut f64,
-    len: usize,
-    high_pass_start: usize,
-    high_pass_end: usize,
-    high_pass_step: usize,
-    low_pass_start: usize,
-    low_pass_end: usize,
-    low_pass_step: usize,
-    gain_start: f64,
-    gain_end: f64,
-    gain_step: f64,
-    bars_forward_start: usize,
-    bars_forward_end: usize,
-    bars_forward_step: usize,
-    signal_mode: &str,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null()
-        || prediction_ptr.is_null()
-        || filter_ptr.is_null()
-        || state_ptr.is_null()
-        || go_long_ptr.is_null()
-        || go_short_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    let sweep = EhlersLinearExtrapolationPredictorBatchRange {
-        high_pass_length: (high_pass_start, high_pass_end, high_pass_step),
-        low_pass_length: (low_pass_start, low_pass_end, low_pass_step),
-        gain: (gain_start, gain_end, gain_step),
-        bars_forward: (bars_forward_start, bars_forward_end, bars_forward_step),
-        signal_mode: Some(signal_mode.to_string()),
-    };
-    let combos = expand_grid_ehlers_linear_extrapolation_predictor(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        ehlers_linear_extrapolation_predictor_batch_inner_into(
-            data,
-            &sweep,
-            detect_best_batch_kernel().to_non_batch(),
-            std::slice::from_raw_parts_mut(prediction_ptr, total),
-            std::slice::from_raw_parts_mut(filter_ptr, total),
-            std::slice::from_raw_parts_mut(state_ptr, total),
-            std::slice::from_raw_parts_mut(go_long_ptr, total),
-            std::slice::from_raw_parts_mut(go_short_ptr, total),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_linear_extrapolation_predictor_output_into_js(
-    data: &[f64],
-    high_pass_length: usize,
-    low_pass_length: usize,
-    gain: f64,
-    bars_forward: usize,
-    signal_mode: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_linear_extrapolation_predictor_js(
-        data,
-        high_pass_length,
-        low_pass_length,
-        gain,
-        bars_forward,
-        signal_mode,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "ehlers_linear_extrapolation_predictor_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_linear_extrapolation_predictor_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_linear_extrapolation_predictor_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_linear_extrapolation_predictor_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2112,8 +1555,8 @@ mod tests {
     }
 
     #[test]
-    fn ehlers_linear_extrapolation_predictor_stream_matches_batch_with_reset(
-    ) -> Result<(), Box<dyn Error>> {
+    fn ehlers_linear_extrapolation_predictor_stream_matches_batch_with_reset()
+    -> Result<(), Box<dyn Error>> {
         let data = [
             100.0,
             100.5,

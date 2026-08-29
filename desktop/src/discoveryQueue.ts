@@ -2,14 +2,25 @@
 // survives navigating between screens (the app is single-process, so the
 // window stays open the whole run). The Discovery screen drives it on each
 // `/engines/status` poll tick via `drive()`; the backend still runs ONE
-// discovery at a time, the queue just feeds it the next (symbol, TF).
-import { discoveryStart, discoveryStop, type StartJob } from "./api";
+// discovery at a time, and every item retains the exact inventory receipt.
+import { discoveryStart, discoveryStop } from "./api";
+import {
+  dataOperationErrorText,
+  discoveryStartBody,
+  type DatasetInventoryEntry,
+  type DiscoveryKnobs,
+} from "./apiContracts";
+import {
+  queueTerminalOutcome,
+  type EngineRunState,
+  type QueueTerminalOutcome,
+} from "./discoveryQueueState";
+
+export { queueTerminalOutcome } from "./discoveryQueueState";
 
 export type QStatus = "pending" | "running" | "done" | "failed";
-export type QItem = {
+export type QItem = DatasetInventoryEntry & {
   id: string;
-  symbol: string; // "" = resolve from config
-  tf: string; // "" = resolve from config
   status: QStatus;
   note?: string;
 };
@@ -17,7 +28,7 @@ export type QItem = {
 type State = {
   items: QItem[];
   active: boolean;
-  knobs: Partial<StartJob>; // population/generations/… applied to every item
+  knobs: DiscoveryKnobs; // population/generations/… applied to every item
 };
 
 let state: State = { items: [], active: false, knobs: {} };
@@ -46,18 +57,19 @@ export function getSnapshot(): State {
   return state;
 }
 
-const labelOf = (symbol: string, tf: string) =>
-  `${symbol || "(config)"} · ${tf || "(config)"}`;
+const labelOf = (symbol: string, timeframe: string, generation?: string) =>
+  `${symbol} · ${timeframe}${generation ? ` · ${generation}` : ""}`;
 
-/** Replace the queue with a fresh set of (symbol, TF) items + shared knobs. */
+/** Replace the queue with authoritative inventory entries + shared knobs. */
 export function setQueue(
-  pairs: { symbol: string; tf: string }[],
-  knobs: Partial<StartJob>,
+  selectedDatasets: readonly DatasetInventoryEntry[],
+  knobs: DiscoveryKnobs,
 ): void {
-  const items: QItem[] = pairs.map((p, i) => ({
-    id: `${p.symbol}_${p.tf}_${i}`,
-    symbol: p.symbol,
-    tf: p.tf,
+  const items: QItem[] = selectedDatasets.map((entry, i) => ({
+    ...entry,
+    id: `${entry.datasetIdentity}_${entry.generation}_${i}`,
+    datasetIdentity: entry.datasetIdentity,
+    generation: entry.generation,
     status: "pending",
   }));
   set({ items, knobs, active: false });
@@ -94,39 +106,53 @@ export function clearQueue(): void {
 
 export const labelFor = labelOf;
 
+function finishCurrent(index: number, outcome: QueueTerminalOutcome): void {
+  set({
+    items: state.items.map((item, itemIndex) =>
+      itemIndex === index ? { ...item, ...outcome } : item,
+    ),
+  });
+  phase = "idle";
+}
+
 /** Called every poll tick from the Discovery screen with the live backend
  *  discovery state. Advances the queue: confirms a start, detects completion,
  *  and kicks off the next pending item. Idempotent + guarded so repeated
  *  ticks never double-start. */
 export async function drive(
-  backendRunning: boolean,
+  backendState: EngineRunState,
   summary: string,
 ): Promise<void> {
   if (!state.active) return;
   const curIdx = state.items.findIndex((i) => i.status === "running");
+  const terminal = queueTerminalOutcome(backendState, summary);
 
   if (phase === "starting") {
     // Waiting for the backend to acknowledge the start we issued.
-    if (backendRunning) phase = "running";
+    if (backendState === "Running") {
+      phase = "running";
+    } else if (terminal && curIdx >= 0) {
+      // A short job may reach a terminal state between two poll ticks, so the
+      // queue must not require an observed Running sample first.
+      finishCurrent(curIdx, terminal);
+    }
     return;
   }
 
   if (phase === "running") {
-    if (!backendRunning && curIdx >= 0) {
-      set({
-        items: state.items.map((it, idx) =>
-          idx === curIdx
-            ? { ...it, status: "done", note: summary || "completed" }
-            : it,
-        ),
+    if (terminal && curIdx >= 0) {
+      finishCurrent(curIdx, terminal);
+    } else if (backendState === "Idle" && curIdx >= 0) {
+      finishCurrent(curIdx, {
+        status: "failed",
+        note: summary || "backend lost the terminal discovery outcome",
       });
-      phase = "idle";
     }
     return;
   }
 
   // phase === "idle": start the next pending item if the engine is free.
-  if (backendRunning || issuing) return;
+  if (backendState === "Running" || issuing) return;
   const nextIdx = state.items.findIndex((i) => i.status === "pending");
   if (nextIdx < 0) {
     set({ active: false });
@@ -140,17 +166,13 @@ export async function drive(
     ),
   });
   phase = "starting";
-  const body: StartJob = {
-    symbol: it.symbol || undefined,
-    base_tf: it.tf || undefined,
-    ...state.knobs,
-  };
+  const body = discoveryStartBody(it, state.knobs);
   try {
     await discoveryStart(body);
   } catch (e) {
     set({
       items: state.items.map((x, idx) =>
-        idx === nextIdx ? { ...x, status: "failed", note: String(e) } : x,
+        idx === nextIdx ? { ...x, status: "failed", note: dataOperationErrorText(e) } : x,
       ),
     });
     phase = "idle";

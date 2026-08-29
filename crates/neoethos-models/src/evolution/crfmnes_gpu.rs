@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
-use cubecl::cuda::{CudaDevice, CudaRuntime};
+use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::*;
 use ndarray::Array2;
+
+use crate::cubecl_lifecycle::{cubecl_cuda_client, cubecl_residency_scope};
 
 const CLASS_COUNT: usize = 3;
 const L2_WEIGHT: f32 = 1.0e-4;
@@ -99,11 +101,7 @@ fn candidate_loss_kernel(
     }
 }
 
-pub(crate) fn neuro_evo_cuda_kernel_enabled(policy: &str) -> bool {
-    crate::common::cuda_kernel_enabled(policy)
-}
-
-fn cuda_device_id(policy: &str) -> usize {
+fn cuda_device_id(policy: &str) -> Result<usize> {
     crate::common::cuda_device_id_from_policy(policy)
 }
 
@@ -201,8 +199,8 @@ pub(crate) fn try_selection_losses_cuda(
         return Ok(Vec::new());
     }
     let candidates_flat = flatten_candidates(candidates, param_dim)?;
-    let device = CudaDevice::new(cuda_device_id(policy));
-    let client = CudaRuntime::client(&device);
+    let _cubecl_call_residency = cubecl_residency_scope();
+    let client = cubecl_cuda_client(cuda_device_id(policy)?);
     let train_losses = launch_loss_kernel(
         &client,
         &candidates_flat,
@@ -242,4 +240,51 @@ pub(crate) fn try_selection_losses_cuda(
             (selection_loss, train_loss, val_loss)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use ndarray::array;
+
+    use super::try_selection_losses_cuda;
+
+    #[test]
+    fn crfmnes_cuda_selection_losses_launch_real_kernel() {
+        let input_dim = 2;
+        let hidden_dim = 3;
+        let param_dim = input_dim * hidden_dim + hidden_dim + hidden_dim * 3 + 3;
+        let candidates = vec![
+            vec![0.0_f64; param_dim],
+            (0..param_dim)
+                .map(|index| (index as f64 - 5.0) * 0.01)
+                .collect(),
+        ];
+        let train_features = array![
+            [0.25_f32, -0.5_f32],
+            [0.75_f32, 0.125_f32],
+            [-0.4_f32, 0.9_f32],
+            [0.6_f32, -0.2_f32],
+        ];
+        let train_labels = [0_usize, 1, 2, 1];
+        let val_features = array![[0.1_f32, 0.2_f32], [-0.3_f32, 0.8_f32]];
+        let val_labels = [0_usize, 2];
+
+        let losses = try_selection_losses_cuda(
+            &candidates,
+            &train_features,
+            &train_labels,
+            &val_features,
+            &val_labels,
+            input_dim,
+            hidden_dim,
+            param_dim,
+            "gpu:0",
+        )
+        .expect("mandatory CR-FM-NES CUDA kernel launch");
+
+        assert_eq!(losses.len(), candidates.len());
+        assert!(losses.iter().all(|losses| {
+            losses.0.is_finite() && losses.1.is_finite() && losses.2.is_finite()
+        }));
+    }
 }

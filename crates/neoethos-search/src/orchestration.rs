@@ -5,26 +5,25 @@
 #[path = "batch_ledger.rs"]
 pub mod batch_ledger;
 
+use crate::data_selection::ExactCanonicalSeries;
 use crate::discovery::{
-    DiscoveryConfig, DiscoveryResult, discovery_per_kind_evidence_hashes,
-    ensure_non_empty_portfolio, run_discovery_cycle_with_holdout,
-    save_canonical_backtest_artifacts, save_discovery_profile_json, save_portfolio_json,
-    save_quality_report_json, save_trade_log_json, save_walkforward_validation_artifacts,
+    DiscoveryConfig, DiscoveryResult, ensure_non_empty_portfolio, run_discovery_cycle_with_holdout,
+    save_discovery_profile_json, save_portfolio_json, save_quality_report_json,
+    save_trade_log_json,
 };
 use crate::genetic::Gene;
 use crate::validation::PropFirmRiskRules;
-use anyhow::{Result, bail};
-use neoethos_data::{
-    FeatureFrame, MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
-    prepare_multitimeframe_features,
-};
+use crate::validation_snapshot::save_discovery_validation_snapshot;
+use anyhow::{Context, Result, bail};
+use neoethos_data::{CanonicalDatasetIdentity, CanonicalTimeframe, FeatureFrame};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
 pub use batch_ledger::{
     BatchLedgerEntry, BatchOutcome, CanonicalFeatureIndex, CanonicalSurvivor,
-    STREAMING_RUN_PORTFOLIO_SCHEMA_VERSION, StreamingRunLedger, StreamingRunPortfolio,
+    STREAMING_RUN_PORTFOLIO_SCHEMA_VERSION, StreamingBatchValidationSnapshotRefV1,
+    StreamingPromotionAuthorityV1, StreamingRunLedger, StreamingRunPortfolio,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -83,126 +82,144 @@ impl DiscoveryOrchestrator {
         }
     }
 
-    pub fn run_batch(
-        &self,
-        symbols: &[String],
-        timeframes: &[String],
-    ) -> Result<BatchDiscoverySummary> {
+    /// Run one work unit per exact canonical base identity.
+    ///
+    /// A display symbol/timeframe pair is deliberately insufficient: it cannot
+    /// distinguish external sources or cTrader server/account/symbol IDs.
+    /// Every configured higher timeframe must exist as its own direct canonical
+    /// generation in the same selected series.
+    pub fn run_batch(&self, anchors: &[CanonicalDatasetIdentity]) -> Result<BatchDiscoverySummary> {
         std::fs::create_dir_all(&self.output_dir)?;
         let mut summary = BatchDiscoverySummary::default();
+        let higher_timeframes = self
+            .config
+            .higher_timeframes
+            .iter()
+            .map(|timeframe| {
+                timeframe.parse::<CanonicalTimeframe>().with_context(|| {
+                    format!("configured higher timeframe {timeframe} is not canonical")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        for symbol in symbols {
+        for anchor in anchors {
             summary.symbols_seen += 1;
-            info!("Processing symbol: {}", symbol);
-            let ds = match load_symbol_dataset(&self.data_root, symbol) {
-                Ok(d) => d,
-                Err(e) => {
+            summary.work_units_seen += 1;
+            let symbol = anchor.symbol_name();
+            let timeframe = anchor.timeframe();
+            let anchor_id = anchor.to_path_component();
+            info!(
+                symbol,
+                timeframe = %timeframe,
+                dataset_identity = %anchor_id,
+                "processing exact canonical discovery input"
+            );
+            let selection = match ExactCanonicalSeries::open(&self.data_root, anchor.clone()) {
+                Ok(selection) => selection,
+                Err(error) => {
                     summary.skipped_symbols += 1;
-                    info!("Skipping symbol {}: {}", symbol, e);
+                    info!(
+                        symbol,
+                        timeframe = %timeframe,
+                        dataset_identity = %anchor_id,
+                        error = %error,
+                        "skipping unavailable exact canonical series"
+                    );
                     continue;
                 }
             };
-
-            for tf in timeframes {
-                summary.work_units_seen += 1;
-                info!("  Timeframe: {}", tf);
-                let ds_ready = match ensure_timeframes_with_resample(&ds, tf, MANDATORY_TFS) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        summary.skipped_timeframes += 1;
-                        info!("    Skipping tf {}: {}", tf, e);
-                        continue;
-                    }
-                };
-
-                let htfs: Vec<&str> = self
-                    .config
-                    .higher_timeframes
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                let features = match prepare_multitimeframe_features(&ds_ready, tf, &htfs) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        summary.feature_failures += 1;
-                        info!("    Feature prep failed: {}", e);
-                        continue;
-                    }
-                };
-
-                let base_ohlcv = match ds_ready.frames.get(tf) {
-                    Some(o) => o,
-                    None => {
-                        summary.feature_failures += 1;
-                        info!("    Skipping tf {}: base ohlcv missing", tf);
-                        continue;
-                    }
-                };
-                let mut runtime_config = self.config.clone().apply_mode_overrides();
-                runtime_config.timeframe_label = tf.clone();
-                // Bind the current symbol so the cost-model guard doesn't fire.
-                // The base config carries settings.system.symbol as a default,
-                // which is wrong for every symbol except the one in config.yaml.
-                runtime_config.evaluation_symbol = symbol.clone();
-                // Previously this used `?` and aborted the whole batch on a
-                // single discovery failure, while every other error in the
-                // loop counted toward `summary.skipped_*` and continued.
-                // Audit B02/B03 (2026-07-13): batch discovery used to see the
-                // FULL series; the holdout wrapper withholds the OOS tail.
-                let result = match run_discovery_cycle_with_holdout(
-                    &features,
-                    base_ohlcv,
-                    &runtime_config,
-                    PropFirmRiskRules::default(),
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        summary.discovery_failures += 1;
-                        info!("    Discovery failed for {} {}: {}", symbol, tf, e);
-                        continue;
-                    }
-                };
-                if let Err(err) = ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, tf))
-                {
-                    summary.empty_portfolios += 1;
-                    info!("    {}", err);
+            let input = match selection.load_search_input(&higher_timeframes) {
+                Ok(input) => input,
+                Err(error) => {
+                    summary.skipped_timeframes += 1;
+                    info!(
+                        symbol,
+                        timeframe = %timeframe,
+                        dataset_identity = %anchor_id,
+                        error = %error,
+                        "skipping work unit: a requested direct canonical timeframe/provenance proof failed"
+                    );
                     continue;
                 }
-
-                info!("    Found {} strategies", result.portfolio.len());
-
-                let out_path = Path::new(&self.output_dir).join(format!("{}_{}.json", symbol, tf));
-                save_portfolio_json(&out_path, &result)?;
-                let profile_path =
-                    Path::new(&self.output_dir).join(format!("{}_{}_profile.json", symbol, tf));
-                save_discovery_profile_json(profile_path, &runtime_config, &result)?;
-                if !result.quality_metrics.is_empty() {
-                    let quality_path =
-                        Path::new(&self.output_dir).join(format!("{}_{}_quality.json", symbol, tf));
-                    save_quality_report_json(quality_path, &result)?;
-                }
-                if !result.logged_trades.is_empty() {
-                    let trade_log_path = Path::new(&self.output_dir)
-                        .join(format!("{}_{}_trade_logs.json", symbol, tf));
-                    save_trade_log_json(trade_log_path, &result)?;
-                }
-                if !result.canonical_backtest_artifacts.is_empty() {
-                    let backtest_dir = Path::new(&self.output_dir)
-                        .join(format!("{}_{}_canonical_backtests", symbol, tf));
-                    save_canonical_backtest_artifacts(&backtest_dir, &result)?;
-                }
-                if !result.walkforward_validation_artifacts.is_empty() {
-                    let validation_dir = Path::new(&self.output_dir)
-                        .join(format!("{}_{}_walkforward_validations", symbol, tf));
-                    save_walkforward_validation_artifacts(&validation_dir, &result)?;
-                }
-                if let Ok(hashes) = discovery_per_kind_evidence_hashes(&result)
-                    && !hashes.all_producer_kinds_present()
-                {
-                    summary.portfolios_with_missing_producer_evidence += 1;
-                }
-                summary.portfolios_saved += 1;
+            };
+            if let Err(error) =
+                crate::fx_rates::set_store_selection(&self.data_root, anchor.clone())
+            {
+                summary.feature_failures += 1;
+                info!(
+                    symbol,
+                    timeframe = %timeframe,
+                    dataset_identity = %anchor_id,
+                    error = %error,
+                    "exact FX data selection failed"
+                );
+                continue;
             }
+            let identity_output = Path::new(&self.output_dir).join(&anchor_id);
+            std::fs::create_dir_all(&identity_output)?;
+            let input_receipt = input.receipt()?;
+            crate::artifact_io::write_json_atomic(
+                identity_output.join("dataset_selection.json"),
+                &input_receipt,
+            )?;
+
+            let run_input = input.as_run_input()?;
+            let mut runtime_config = self.config.clone().apply_mode_overrides();
+            runtime_config.timeframe_label = timeframe.as_str().to_owned();
+            // Bind the current symbol so the cost-model guard doesn't fire.
+            // The base config carries settings.system.symbol as a default,
+            // which is wrong for every symbol except the one in config.yaml.
+            runtime_config.evaluation_symbol = symbol.to_owned();
+            // Previously this used `?` and aborted the whole batch on a
+            // single discovery failure, while every other error in the
+            // loop counted toward `summary.skipped_*` and continued.
+            // Audit B02/B03 (2026-07-13): batch discovery used to see the
+            // FULL series; the holdout wrapper withholds the OOS tail.
+            let result = match run_discovery_cycle_with_holdout(
+                &run_input,
+                &runtime_config,
+                PropFirmRiskRules::default(),
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    summary.discovery_failures += 1;
+                    info!(
+                        symbol,
+                        timeframe = %timeframe,
+                        dataset_identity = %anchor_id,
+                        error = %error,
+                        "discovery failed"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) =
+                ensure_non_empty_portfolio(&result, &format!("{symbol} {timeframe} ({anchor_id})"))
+            {
+                summary.empty_portfolios += 1;
+                info!(error = %error, "exact canonical work unit selected no portfolio");
+                continue;
+            }
+
+            info!(strategies = result.portfolio.len(), "portfolio selected");
+
+            save_portfolio_json(identity_output.join("portfolio.json"), &result)?;
+            save_discovery_profile_json(
+                identity_output.join("profile.json"),
+                &runtime_config,
+                &result,
+            )?;
+            if !result.quality_metrics.is_empty() {
+                save_quality_report_json(identity_output.join("quality.json"), &result)?;
+            }
+            if !result.logged_trades.is_empty() {
+                save_trade_log_json(identity_output.join("trade_logs.json"), &result)?;
+            }
+            save_discovery_validation_snapshot(
+                identity_output.join("validation_snapshot"),
+                &result,
+            )?;
+            summary.portfolios_saved += 1;
         }
         summary.finalize()
     }
@@ -421,13 +438,12 @@ fn column_addresses_stem(name_segments: &[&str], stem_segments: &[&str]) -> bool
 /// the `#212` pre-flight emitted as all-NaN under a different name).
 fn assert_working_set_observed(
     batch: &neoethos_data::core::hpc_ta::SweepBatch,
-    features: &FeatureFrame,
+    feature_names: &[String],
 ) -> Result<usize> {
     if batch.pairs.is_empty() {
         return Ok(0);
     }
-    let name_segments: Vec<Vec<&str>> = features
-        .names
+    let name_segments: Vec<Vec<&str>> = feature_names
         .iter()
         .map(|n| n.split('_').collect::<Vec<&str>>())
         .collect();
@@ -461,7 +477,7 @@ fn assert_working_set_observed(
             batch.cursor,
             batch.pairs.len(),
             batch.planned_columns,
-            features.names.len(),
+            feature_names.len(),
             sample
         );
     }
@@ -504,6 +520,109 @@ where
     B: FnMut(Option<Arc<neoethos_data::core::hpc_ta::SweepBatch>>) -> Result<FeatureFrame>,
     C: FnMut(&FeatureFrame) -> Result<R>,
 {
+    run_streaming_working_set_core(
+        plan,
+        budget_rows,
+        |batch| build_features(batch),
+        |features: &FeatureFrame| features.names.as_slice(),
+        |features| run_cycle(&features),
+    )
+}
+
+/// Prepared CPU/native streaming runner. Each iteration asks the dispatcher for
+/// one fresh physical-inventory/CUDA admission before that iteration's selected
+/// CPU or native factory is allowed to materialize data.
+#[cfg(feature = "gpu-cuda")]
+pub fn run_prepared_streaming_working_set_v3<
+    R,
+    Pin,
+    PinFactory,
+    CpuFactory,
+    NativePlanFactory,
+    NativeFactory,
+    RunPrepared,
+>(
+    plan: &StreamingPlan,
+    budget_rows: usize,
+    mut pin_factory: PinFactory,
+    mut cpu_factory: CpuFactory,
+    mut native_workspace_plan_factory: NativePlanFactory,
+    mut native_factory: NativeFactory,
+    mut run_prepared: RunPrepared,
+) -> Result<StreamingRunOutcome<R>>
+where
+    R: BatchSearchResult,
+    PinFactory: FnMut(Option<Arc<neoethos_data::core::hpc_ta::SweepBatch>>) -> Result<Pin>,
+    CpuFactory: FnMut(
+        Option<Arc<neoethos_data::core::hpc_ta::SweepBatch>>,
+        Pin,
+        neoethos_gpu_cuda::run_device_admission_v1::SealedCpuNoPhysicalGpuRunDeviceAdmissionV1,
+    ) -> Result<(
+        crate::data_selection::CanonicalSearchInput,
+        neoethos_gpu_cuda::run_device_admission_v1::SealedCpuNoPhysicalGpuRunDeviceAdmissionV1,
+    )>,
+    NativePlanFactory: FnMut(
+        Option<Arc<neoethos_data::core::hpc_ta::SweepBatch>>,
+    )
+        -> Result<neoethos_gpu_cuda::SealedFullDiscoveryGpuWorkspacePlanV1>,
+    NativeFactory: FnMut(
+        Option<Arc<neoethos_data::core::hpc_ta::SweepBatch>>,
+        Pin,
+        neoethos_gpu_cuda::full_discovery_workspace_plan_v1::AdmittedNativeCudaFullDiscoveryRunV1,
+    ) -> Result<(
+        crate::data_selection::CanonicalSearchInputReceiptV2,
+        neoethos_data::SealedGpuResidentFeatureStoreV3,
+    )>,
+    RunPrepared: FnMut(crate::PreparedCanonicalDiscoveryRunInputV3) -> Result<R>,
+{
+    run_streaming_working_set_core(
+        plan,
+        budget_rows,
+        |batch| {
+            let pin_batch = batch.as_ref().map(Arc::clone);
+            let cpu_batch = batch.as_ref().map(Arc::clone);
+            let native_plan_batch = batch.as_ref().map(Arc::clone);
+            let native_batch = batch;
+            // Pin exact immutable generation leases before probing hardware,
+            // while still decoding no values. The selected factory consumes
+            // the move-only pin after the one batch-local admission.
+            let pin = std::cell::RefCell::new(Some(pin_factory(pin_batch)?));
+            crate::prepare_canonical_discovery_run_input_v3(
+                |no_physical_gpu_admission| {
+                    let pin = pin
+                        .borrow_mut()
+                        .take()
+                        .context("prepared streaming batch pin was already consumed")?;
+                    cpu_factory(cpu_batch, pin, no_physical_gpu_admission)
+                },
+                || native_workspace_plan_factory(native_plan_batch),
+                |admitted_native_run| {
+                    let pin = pin
+                        .borrow_mut()
+                        .take()
+                        .context("prepared streaming batch pin was already consumed")?;
+                    native_factory(native_batch, pin, admitted_native_run)
+                },
+            )
+        },
+        |prepared: &crate::PreparedCanonicalDiscoveryRunInputV3| prepared.feature_names(),
+        |prepared| run_prepared(prepared),
+    )
+}
+
+fn run_streaming_working_set_core<R, Payload, Build, FeatureNames, Run>(
+    plan: &StreamingPlan,
+    budget_rows: usize,
+    mut build_payload: Build,
+    mut feature_names: FeatureNames,
+    mut run: Run,
+) -> Result<StreamingRunOutcome<R>>
+where
+    R: BatchSearchResult,
+    Build: FnMut(Option<Arc<neoethos_data::core::hpc_ta::SweepBatch>>) -> Result<Payload>,
+    FeatureNames: for<'a> FnMut(&'a Payload) -> &'a [String],
+    Run: FnMut(Payload) -> Result<R>,
+{
     let mut canonical = CanonicalFeatureIndex::new();
     let mut ledger = StreamingRunLedger::new();
     let mut batches: Vec<StreamingBatchSurvivor<R>> = Vec::new();
@@ -537,8 +656,8 @@ where
             );
         }
         let rejected_before = crate::discovery::batch_rejection_ledger().batches_rejected;
-        let features = build_features(None)?;
-        let result = run_cycle(&features)?;
+        let payload = build_payload(None)?;
+        let result = run(payload)?;
         let rejected_after = crate::discovery::batch_rejection_ledger().batches_rejected;
         let predicate_fired = rejected_after > rejected_before;
         let canonical_portfolio =
@@ -565,9 +684,7 @@ where
                  neoethos_search::batch_ledger census for the numbers"
                     .to_string()
             }
-            BatchOutcome::EmptyPortfolio => {
-                "the cycle selected no strategies".to_string()
-            }
+            BatchOutcome::EmptyPortfolio => "the cycle selected no strategies".to_string(),
             _ => String::new(),
         };
         ledger.record(BatchLedgerEntry::new(
@@ -652,7 +769,7 @@ where
         ran += 1;
 
         let rejected_before = crate::discovery::batch_rejection_ledger().batches_rejected;
-        let features = match build_features(Some(Arc::clone(&batch))) {
+        let payload = match build_payload(Some(Arc::clone(&batch))) {
             Ok(f) => f,
             Err(err) => {
                 tracing::warn!(
@@ -675,9 +792,9 @@ where
         };
 
         // Fatal by design — see `assert_working_set_observed`.
-        let matched_pairs = assert_working_set_observed(&batch, &features)?;
+        let matched_pairs = assert_working_set_observed(&batch, feature_names(&payload))?;
 
-        let result = match run_cycle(&features) {
+        let result = match run(payload) {
             Ok(r) => r,
             Err(err) => {
                 tracing::warn!(
@@ -807,11 +924,12 @@ mod tests {
     }
 
     fn frame(names: &[&str]) -> FeatureFrame {
-        FeatureFrame::from_array(
-            vec![0i64, 1],
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+            neoethos_data::test_fixtures::canonical_test_timestamps(2),
             names.iter().map(|n| n.to_string()).collect(),
-            ndarray::Array2::<f32>::zeros((2, names.len())),
+            ndarray::Array2::<f64>::zeros((2, names.len())),
         )
+        .expect("valid f64 test frame")
     }
 
     #[test]

@@ -1,15 +1,14 @@
 use super::{
-    CudaOutputTarget, DeviceMatrixF32, IndicatorCudaBitmaskRequest, IndicatorCudaDataRef,
-    IndicatorCudaDeviceBitmaskRequest, IndicatorCudaDeviceDataRef, IndicatorCudaDeviceRequest,
-    IndicatorCudaOutput, IndicatorCudaRequest, IndicatorCudaSeries, IndicatorDispatchError,
-    ParamKV, ParamValue, PatternRecognitionCudaBitmaskOutput,
+    CudaOutputTarget, DeviceMatrixF32, IndicatorCudaDataRef, IndicatorCudaDeviceDataRef,
+    IndicatorCudaDeviceRequest, IndicatorCudaOutput, IndicatorCudaRequest, IndicatorCudaSeries,
+    IndicatorDispatchError, ParamKV, ParamValue,
 };
 use crate::cuda::moving_averages::ma_selector::{CudaMaParamKV, CudaMaParamValue};
 use crate::cuda::moving_averages::{
-    vram_ma::{supports_vram_kernel_ma, VramMaComputer, VramMaInputs},
     CudaCorrelationCycle, CudaDecycler, CudaDema, CudaEma, CudaLinearregSlope, CudaLinreg,
     CudaLinregIntercept, CudaMaData, CudaMaSelector, CudaMaSelectorError, CudaMab, CudaOtt,
     CudaOtto, CudaRsmk, CudaSma, CudaTrix, CudaTsf, CudaVlma, CudaVwap, CudaWma, CudaZlema,
+    vram_ma::{VramMaComputer, VramMaInputs, supports_vram_kernel_ma},
 };
 use crate::cuda::oscillators::{
     CudaAo, CudaAroonOsc, CudaAso, CudaBop, CudaCciCycle, CudaCfo, CudaChop, CudaDpo, CudaFisher,
@@ -26,8 +25,8 @@ use crate::cuda::{
     CudaFvgTs, CudaHalftrend, CudaIftRsi, CudaKaufmanstop, CudaKdj, CudaKeltner, CudaKurtosis,
     CudaKvo, CudaLinearregAngle, CudaLpc, CudaMarketefi, CudaMass, CudaMeanAd, CudaMediumAd,
     CudaMedprice, CudaMfi, CudaMinmax, CudaModGodMode, CudaMsw, CudaNatr, CudaNetMyrsi, CudaNwe,
-    CudaParkinsonVolatility, CudaPercentileNearestRank, CudaPfe, CudaPivot, CudaPpo, CudaPrb,
-    CudaQstick, CudaRangeFilter, CudaReverseRsi, CudaRocr, CudaRuntime, CudaRuntimeError, CudaRvi,
+    CudaParkinsonVolatility, CudaPercentileNearestRank, CudaPfe, CudaPpo, CudaQstick,
+    CudaRangeFilter, CudaReverseRsi, CudaRocr, CudaRuntime, CudaRuntimeError, CudaRvi,
     CudaSafeZoneStop, CudaSar, CudaSqueezeMomentum, CudaStddev, CudaSupertrend, CudaTsi,
     CudaTtmSqueeze, CudaTtmTrend, CudaUi, CudaVar, CudaVi, CudaVidya, CudaVosc, CudaVoss, CudaVpci,
     CudaVpt, CudaVwmacd, CudaWad, CudaWclprice, CudaZscore, DeviceArrayF32,
@@ -57,7 +56,7 @@ use crate::indicators::damiani_volatmeter::DamianiVolatmeterBatchRange;
 use crate::indicators::decycler::DecyclerBatchRange;
 use crate::indicators::deviation::DeviationBatchRange;
 use crate::indicators::devstop::{
-    devstop_with_kernel, DevStopBatchRange, DevStopInput, DevStopParams,
+    DevStopBatchRange, DevStopInput, DevStopParams, devstop_with_kernel,
 };
 use crate::indicators::di::DiBatchRange;
 use crate::indicators::dm::DmBatchRange;
@@ -126,14 +125,12 @@ use crate::indicators::otto::OttoBatchRange;
 use crate::indicators::parkinson_volatility::ParkinsonVolatilityBatchRange;
 use crate::indicators::percentile_nearest_rank::PercentileNearestRankBatchRange;
 use crate::indicators::pfe::PfeBatchRange;
-use crate::indicators::pivot::PivotBatchRange;
 use crate::indicators::pma::PmaBatchRange;
 use crate::indicators::ppo::PpoBatchRange;
-use crate::indicators::prb::PrbBatchRange;
 use crate::indicators::qqe::QqeBatchRange;
 use crate::indicators::qstick::QstickBatchRange;
 use crate::indicators::range_filter::RangeFilterBatchRange;
-use crate::indicators::registry::{get_indicator, IndicatorInfo, IndicatorInputKind};
+use crate::indicators::registry::{IndicatorInfo, IndicatorInputKind, get_indicator};
 use crate::indicators::reverse_rsi::ReverseRsiBatchRange;
 use crate::indicators::rocp::RocpBatchRange;
 use crate::indicators::rsmk::RsmkBatchRange;
@@ -587,9 +584,6 @@ fn dispatch_cuda_device_supported(
     if normalized_id.eq_ignore_ascii_case("lpc") {
         return compute_lpc_cuda_device(req, info);
     }
-    if normalized_id.eq_ignore_ascii_case("prb") {
-        return compute_prb_cuda_device(req, info);
-    }
     if normalized_id.eq_ignore_ascii_case("keltner") {
         return compute_keltner_cuda_device(req, info);
     }
@@ -616,9 +610,6 @@ fn dispatch_cuda_device_supported(
     }
     if normalized_id.eq_ignore_ascii_case("parkinson_volatility") {
         return compute_parkinson_volatility_cuda_device(req, info);
-    }
-    if normalized_id.eq_ignore_ascii_case("pivot") {
-        return compute_pivot_cuda_device(req, info);
     }
     if normalized_id.eq_ignore_ascii_case("mass") {
         return compute_mass_cuda_device(req, info);
@@ -721,9 +712,6 @@ fn dispatch_cuda_device_supported(
     }
     if normalized_id.eq_ignore_ascii_case("er") {
         return compute_er_cuda_device(req, info);
-    }
-    if normalized_id.eq_ignore_ascii_case("acosc") {
-        return compute_acosc_cuda_device(req, info);
     }
     if normalized_id.eq_ignore_ascii_case("macd") {
         return compute_macd_cuda_device(req, info);
@@ -1005,7 +993,6 @@ fn supports_cuda_device_dispatch(indicator_id: &str) -> bool {
             | "stochf"
             | "kdj"
             | "lpc"
-            | "prb"
             | "keltner"
             | "stddev"
             | "msw"
@@ -1015,7 +1002,6 @@ fn supports_cuda_device_dispatch(indicator_id: &str) -> bool {
             | "kurtosis"
             | "correl_hl"
             | "parkinson_volatility"
-            | "pivot"
             | "mass"
             | "mod_god_mode"
             | "devstop"
@@ -1050,7 +1036,6 @@ fn supports_cuda_device_dispatch(indicator_id: &str) -> bool {
             | "lrsi"
             | "dpo"
             | "er"
-            | "acosc"
             | "macd"
             | "kst"
             | "cvi"
@@ -1121,7 +1106,6 @@ fn supports_cuda_device_dispatch(indicator_id: &str) -> bool {
             | "linearreg_slope"
             | "tsf"
             | "rsmk"
-            | "pattern_recognition"
     ) || (is_moving_average(normalized.as_str()) && supports_vram_kernel_ma(normalized.as_str()))
 }
 
@@ -1565,10 +1549,6 @@ fn host_first_valid_for_indicator(
         let (_, low, close) = hlc.expect("avsl requires HLC");
         let volume = volume.expect("avsl requires volume");
         return first_valid_in_low_close_volume(low, close, volume);
-    }
-    if indicator.eq_ignore_ascii_case("pivot") {
-        let (high, low, close) = hlc.expect("pivot requires HLC");
-        return first_valid_in_hlc(high, low, close);
     }
     if indicator.eq_ignore_ascii_case("halftrend") {
         let (high, low, close) = hlc.expect("halftrend requires HLC");
@@ -3842,100 +3822,6 @@ fn compute_lpc_cuda_device(
     finalize_cuda_device_output(output_id, owner, Some(first_valid), req.target, device_id)
 }
 
-fn compute_prb_cuda_device(
-    req: IndicatorCudaDeviceRequest<'_>,
-    info: &IndicatorInfo,
-) -> Result<IndicatorCudaOutput, IndicatorDispatchError> {
-    if !info.capabilities.supports_cuda_batch {
-        return Err(IndicatorDispatchError::UnsupportedCapability {
-            indicator: info.id.to_string(),
-            capability: "cuda_device_batch",
-        });
-    }
-
-    let (output_id, output_index) = match req.output_id.map(|id| id.to_ascii_lowercase()) {
-        None => ("values", 0usize),
-        Some(id) if id == "values" || id == "value" => ("values", 0usize),
-        Some(id) if id == "upper_band" || id == "upper" => ("upper_band", 1usize),
-        Some(id) if id == "lower_band" || id == "lower" => ("lower_band", 2usize),
-        Some(other) => {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: info.id.to_string(),
-                output: other,
-            });
-        }
-    };
-    let prices = cuda_device_prices_from_req(info.id, req.data)?;
-    let device_id = resolve_device_runtime_id(info.id, req.params, prices.device_id())?;
-    let first_valid = resolve_device_first_valid(info.id, req.params)?;
-    let smooth_data = get_bool_param(req.params, "smooth_data", info.id)?.unwrap_or(true);
-    let sweep = PrbBatchRange {
-        smooth_period: resolve_usize_range_param_device(
-            req.params,
-            "smooth_period",
-            (10, 10, 0),
-            info.id,
-        )?,
-        regression_period: resolve_usize_range_param_device(
-            req.params,
-            "regression_period",
-            (100, 100, 0),
-            info.id,
-        )?,
-        polynomial_order: resolve_usize_range_param_device(
-            req.params,
-            "polynomial_order",
-            (2, 2, 0),
-            info.id,
-        )?,
-        regression_offset: resolve_i32_range_param_device(
-            req.params,
-            "regression_offset",
-            (0, 0, 0),
-            info.id,
-        )?,
-    };
-    let prices_buf = unsafe { BorrowedCudaDeviceSeries::from_view(prices) };
-    let cuda = CudaPrb::new(device_id as usize).map_err(|e| {
-        IndicatorDispatchError::KernelUnavailable {
-            details: e.to_string(),
-        }
-    })?;
-    let (main, upper, lower) = cuda
-        .prb_batch_dev_from_device_prices(
-            prices_buf.as_buffer(),
-            prices.len(),
-            first_valid,
-            &sweep,
-            smooth_data,
-        )
-        .map_err(|e| IndicatorDispatchError::ComputeFailed {
-            indicator: info.id.to_string(),
-            details: e.to_string(),
-        })?;
-    if matches!(req.target, CudaOutputTarget::HostF32) {
-        cuda.synchronize()
-            .map_err(|e| IndicatorDispatchError::KernelUnavailable {
-                details: e.to_string(),
-            })?;
-    }
-    let owner = match output_index {
-        0 => main,
-        1 => upper,
-        2 => lower,
-        _ => unreachable!(),
-    };
-    let warmup = Some(
-        first_valid
-            + sweep
-                .regression_period
-                .0
-                .min(sweep.regression_period.1)
-                .saturating_sub(1),
-    );
-    finalize_cuda_device_output(output_id, owner, warmup, req.target, device_id)
-}
-
 fn compute_stddev_cuda_device(
     req: IndicatorCudaDeviceRequest<'_>,
     info: &IndicatorInfo,
@@ -4339,75 +4225,6 @@ fn compute_parkinson_volatility_cuda_device(
         }
     };
     finalize_cuda_device_output(output_id, owner, None, req.target, device_id)
-}
-
-fn compute_pivot_cuda_device(
-    req: IndicatorCudaDeviceRequest<'_>,
-    info: &IndicatorInfo,
-) -> Result<IndicatorCudaOutput, IndicatorDispatchError> {
-    if !info.capabilities.supports_cuda_batch {
-        return Err(IndicatorDispatchError::UnsupportedCapability {
-            indicator: info.id.to_string(),
-            capability: "cuda_device_batch",
-        });
-    }
-
-    let output_id = resolve_output_id(info, req.output_id)?;
-    let output_index = resolve_output_index(info, output_id).unwrap_or(0);
-    let packed_output_index = match output_index {
-        0 => 4,
-        1 => 3,
-        2 => 2,
-        3 => 1,
-        4 => 0,
-        5 => 5,
-        6 => 6,
-        7 => 7,
-        8 => 8,
-        _ => {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: info.id.to_string(),
-                output: output_id.to_string(),
-            });
-        }
-    };
-    let (open, high, low, close, data_device_id) = cuda_device_ohlc_from_req(info.id, req.data)?;
-    let device_id = resolve_device_runtime_id(info.id, req.params, data_device_id)?;
-    let first_valid = resolve_device_first_valid(info.id, req.params)?;
-    let sweep = PivotBatchRange {
-        mode: resolve_usize_range_param_device(req.params, "mode", (3, 3, 0), info.id)?,
-    };
-    let open_buf = unsafe { BorrowedCudaDeviceSeries::from_view(open) };
-    let high_buf = unsafe { BorrowedCudaDeviceSeries::from_view(high) };
-    let low_buf = unsafe { BorrowedCudaDeviceSeries::from_view(low) };
-    let close_buf = unsafe { BorrowedCudaDeviceSeries::from_view(close) };
-    let cuda = CudaPivot::new(device_id as usize).map_err(|e| {
-        IndicatorDispatchError::KernelUnavailable {
-            details: e.to_string(),
-        }
-    })?;
-    let (dev, _) = cuda
-        .pivot_batch_output_dev_from_device_inputs(
-            high_buf.as_buffer(),
-            low_buf.as_buffer(),
-            close_buf.as_buffer(),
-            open_buf.as_buffer(),
-            close.len(),
-            first_valid,
-            &sweep,
-            packed_output_index,
-        )
-        .map_err(|e| IndicatorDispatchError::ComputeFailed {
-            indicator: info.id.to_string(),
-            details: e.to_string(),
-        })?;
-    if matches!(req.target, CudaOutputTarget::HostF32) {
-        cuda.synchronize()
-            .map_err(|e| IndicatorDispatchError::KernelUnavailable {
-                details: e.to_string(),
-            })?;
-    }
-    finalize_cuda_device_output(output_id, dev, Some(first_valid), req.target, device_id)
 }
 
 fn compute_mass_cuda_device(
@@ -4848,7 +4665,7 @@ fn compute_dvdiqqe_cuda_device(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: info.id.to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let device_id = resolve_device_runtime_id(info.id, req.params, data_device_id)?;
@@ -6779,8 +6596,8 @@ fn compute_aso_cuda_device(
 
     let (output_id, output_index) = match req.output_id.map(|id| id.to_ascii_lowercase()) {
         None => ("bulls", 0usize),
-        Some(id) if id == "bulls" || id == "bull" || id == "value" => ("bulls", 0usize),
-        Some(id) if id == "bears" || id == "bear" => ("bears", 1usize),
+        Some(id) if id == "bulls" => ("bulls", 0usize),
+        Some(id) if id == "bears" => ("bears", 1usize),
         Some(other) => {
             return Err(IndicatorDispatchError::UnknownOutput {
                 indicator: info.id.to_string(),
@@ -7402,8 +7219,8 @@ fn compute_aroon_cuda_device(
 
     let (output_id, output_index) = match req.output_id.map(|id| id.to_ascii_lowercase()) {
         None => ("up", 0usize),
-        Some(id) if id == "up" || id == "first" => ("up", 0usize),
-        Some(id) if id == "down" || id == "second" => ("down", 1usize),
+        Some(id) if id == "up" => ("up", 0usize),
+        Some(id) if id == "down" => ("down", 1usize),
         Some(other) => {
             return Err(IndicatorDispatchError::UnknownOutput {
                 indicator: info.id.to_string(),
@@ -8349,82 +8166,6 @@ fn compute_adosc_cuda_device(
         req.target,
         device_id,
     )
-}
-
-fn compute_acosc_cuda_device(
-    req: IndicatorCudaDeviceRequest<'_>,
-    info: &IndicatorInfo,
-) -> Result<IndicatorCudaOutput, IndicatorDispatchError> {
-    if !info.capabilities.supports_cuda_batch {
-        return Err(IndicatorDispatchError::UnsupportedCapability {
-            indicator: info.id.to_string(),
-            capability: "cuda_device_batch",
-        });
-    }
-
-    let output_id = resolve_output_id(info, req.output_id)?;
-    let output_index = resolve_output_index(info, output_id).ok_or_else(|| {
-        IndicatorDispatchError::UnknownOutput {
-            indicator: info.id.to_string(),
-            output: output_id.to_string(),
-        }
-    })?;
-    let (high, low, data_device_id) = cuda_device_high_low_from_req(info.id, req.data)?;
-    let device_id = resolve_device_runtime_id(info.id, req.params, data_device_id)?;
-    let first_valid = resolve_device_first_valid(info.id, req.params)?;
-    let valid = high.len().saturating_sub(first_valid);
-    if valid < 39 {
-        return Err(IndicatorDispatchError::InvalidParam {
-            indicator: info.id.to_string(),
-            key: "first_valid".to_string(),
-            reason: format!("not enough valid data: needed >= 39, valid = {}", valid),
-        });
-    }
-
-    let high_buf = unsafe { BorrowedCudaDeviceSeries::from_view(high) };
-    let low_buf = unsafe { BorrowedCudaDeviceSeries::from_view(low) };
-    let first_valids = [i32::try_from(first_valid).unwrap_or(i32::MAX)];
-    let d_first_valids = DeviceBuffer::from_slice(&first_valids).map_err(|e| {
-        IndicatorDispatchError::KernelUnavailable {
-            details: e.to_string(),
-        }
-    })?;
-    let cuda = crate::cuda::oscillators::CudaAcosc::new(device_id as usize).map_err(|e| {
-        IndicatorDispatchError::KernelUnavailable {
-            details: e.to_string(),
-        }
-    })?;
-    let pair = cuda
-        .acosc_many_series_one_param_time_major_dev_device_inputs(
-            high_buf.as_buffer(),
-            low_buf.as_buffer(),
-            &d_first_valids,
-            1,
-            high.len(),
-        )
-        .map_err(|e| IndicatorDispatchError::ComputeFailed {
-            indicator: info.id.to_string(),
-            details: e.to_string(),
-        })?;
-    let owner = match output_index {
-        0 => DeviceArrayF32 {
-            buf: pair.osc.buf,
-            rows: pair.osc.rows,
-            cols: pair.osc.cols,
-        },
-        1 => DeviceArrayF32 {
-            buf: pair.change.buf,
-            rows: pair.change.rows,
-            cols: pair.change.cols,
-        },
-        _ => {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: info.id.to_string(),
-                output: output_id.to_string(),
-            });
-        }
-    };
-    finalize_cuda_device_output(output_id, owner, Some(38), req.target, device_id)
 }
 
 fn compute_macd_cuda_device(
@@ -14071,134 +13812,6 @@ fn compute_pattern_recognition_cuda_device(
     }
 }
 
-pub fn compute_pattern_recognition_cuda_bitmask(
-    req: IndicatorCudaBitmaskRequest<'_>,
-) -> Result<PatternRecognitionCudaBitmaskOutput, IndicatorDispatchError> {
-    let normalized_id = normalize_cuda_dispatch_id(req.indicator_id);
-    let info = get_indicator(normalized_id.as_str()).ok_or_else(|| {
-        IndicatorDispatchError::UnknownIndicator {
-            id: req.indicator_id.to_string(),
-        }
-    })?;
-    if !info.id.eq_ignore_ascii_case("pattern_recognition") {
-        return Err(IndicatorDispatchError::UnsupportedCapability {
-            indicator: info.id.to_string(),
-            capability: "cuda_pattern_bitmask",
-        });
-    }
-    if !info.capabilities.supports_cuda_single {
-        return Err(IndicatorDispatchError::UnsupportedCapability {
-            indicator: info.id.to_string(),
-            capability: "cuda_single",
-        });
-    }
-
-    let output_id = resolve_output_id(info, req.output_id)?;
-    validate_pattern_params(info.id, req.params)?;
-    let device_id = resolve_device_id(info.id, req.params)? as usize;
-    let (open, high, low, close) = pattern_ohlc_from_req(info.id, req.data)?;
-    if close.is_empty() {
-        return Err(IndicatorDispatchError::DataLengthMismatch {
-            details: "pattern_recognition: empty OHLC input".to_string(),
-        });
-    }
-
-    let cuda = CudaPatternRecognition::new(device_id).map_err(|e| {
-        IndicatorDispatchError::KernelUnavailable {
-            details: e.to_string(),
-        }
-    })?;
-    let native_ids = CudaPatternRecognition::native_supported_pattern_ids();
-    let pattern_ids = native_ids
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>();
-    let series = cuda
-        .compute_native_matrix_bitmask_u64_device_from_host_inputs(open, high, low, close)
-        .map_err(|e| IndicatorDispatchError::KernelUnavailable {
-            details: e.to_string(),
-        })?;
-
-    Ok(PatternRecognitionCudaBitmaskOutput {
-        output_id: output_id.to_string(),
-        rows: series.rows,
-        cols: series.cols,
-        words_per_row: series.words_per_row,
-        series,
-        warmup: None,
-        pattern_ids,
-    })
-}
-
-pub fn compute_pattern_recognition_cuda_device_bitmask(
-    req: IndicatorCudaDeviceBitmaskRequest<'_>,
-) -> Result<PatternRecognitionCudaBitmaskOutput, IndicatorDispatchError> {
-    let normalized_id = normalize_cuda_dispatch_id(req.indicator_id);
-    let info = get_indicator(normalized_id.as_str()).ok_or_else(|| {
-        IndicatorDispatchError::UnknownIndicator {
-            id: req.indicator_id.to_string(),
-        }
-    })?;
-    if !info.id.eq_ignore_ascii_case("pattern_recognition") {
-        return Err(IndicatorDispatchError::UnsupportedCapability {
-            indicator: info.id.to_string(),
-            capability: "cuda_pattern_bitmask",
-        });
-    }
-    if !info.capabilities.supports_cuda_single {
-        return Err(IndicatorDispatchError::UnsupportedCapability {
-            indicator: info.id.to_string(),
-            capability: "cuda_single",
-        });
-    }
-
-    let output_id = resolve_output_id(info, req.output_id)?;
-    validate_pattern_params(info.id, req.params)?;
-    let (open, high, low, close, source_device_id) = cuda_device_ohlc_from_req(info.id, req.data)?;
-    if close.is_empty() {
-        return Err(IndicatorDispatchError::DataLengthMismatch {
-            details: "pattern_recognition: empty OHLC input".to_string(),
-        });
-    }
-    let device_id = resolve_device_runtime_id(info.id, req.params, source_device_id)?;
-
-    let open_buf = unsafe { BorrowedCudaDeviceSeries::from_view(open) };
-    let high_buf = unsafe { BorrowedCudaDeviceSeries::from_view(high) };
-    let low_buf = unsafe { BorrowedCudaDeviceSeries::from_view(low) };
-    let close_buf = unsafe { BorrowedCudaDeviceSeries::from_view(close) };
-    let cuda = CudaPatternRecognition::new(device_id as usize).map_err(|e| {
-        IndicatorDispatchError::KernelUnavailable {
-            details: e.to_string(),
-        }
-    })?;
-    let native_ids = CudaPatternRecognition::native_supported_pattern_ids();
-    let pattern_ids = native_ids
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>();
-    let series = cuda
-        .compute_native_matrix_bitmask_u64_device_from_device_inputs(
-            open_buf.as_buffer(),
-            high_buf.as_buffer(),
-            low_buf.as_buffer(),
-            close_buf.as_buffer(),
-            close.len(),
-        )
-        .map_err(|e| IndicatorDispatchError::KernelUnavailable {
-            details: e.to_string(),
-        })?;
-
-    Ok(PatternRecognitionCudaBitmaskOutput {
-        output_id: output_id.to_string(),
-        rows: series.rows,
-        cols: series.cols,
-        words_per_row: series.words_per_row,
-        series,
-        warmup: None,
-        pattern_ids,
-    })
-}
-
 fn pattern_ohlc_from_req<'a>(
     indicator: &str,
     data: IndicatorCudaDataRef<'a>,
@@ -15068,13 +14681,13 @@ mod tests {
     use super::*;
     use crate::cuda::{CudaDeviceSliceF32Ref, CudaRuntime};
     use crate::indicators::dispatch::{
-        compute_cpu, compute_cpu_batch, IndicatorBatchRequest, IndicatorComputeRequest,
-        IndicatorDataRef, IndicatorParamSet, IndicatorSeries,
+        IndicatorBatchRequest, IndicatorComputeRequest, IndicatorDataRef, IndicatorParamSet,
+        IndicatorSeries, compute_cpu, compute_cpu_batch,
     };
     use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic};
     use crate::utilities::enums::Kernel;
     use cust::memory::CopyDestination;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn sample_series() -> Vec<f32> {
         (1..=128).map(|v| v as f32).collect()
@@ -16457,10 +16070,6 @@ mod tests {
                 "range_filter_batch_dev_from_device_prices",
             ),
             (
-                "src/cuda/acosc_wrapper.rs",
-                "acosc_many_series_one_param_time_major_dev_device_inputs",
-            ),
-            (
                 "src/cuda/moving_averages/trendflex_wrapper.rs",
                 "trendflex_batch_on_device",
             ),
@@ -16715,10 +16324,6 @@ mod tests {
                 "lpc_batch_dev_from_device_inputs",
             ),
             (
-                "src/cuda/prb_wrapper.rs",
-                "prb_batch_dev_from_device_prices",
-            ),
-            (
                 "src/cuda/keltner_wrapper.rs",
                 "keltner_batch_dev_from_device_inputs",
             ),
@@ -16741,10 +16346,6 @@ mod tests {
             (
                 "src/cuda/correl_hl_wrapper.rs",
                 "correl_hl_batch_dev_from_device_inputs",
-            ),
-            (
-                "src/cuda/pivot_wrapper.rs",
-                "pivot_batch_output_dev_from_device_inputs",
             ),
             (
                 "src/cuda/mass_wrapper.rs",
@@ -16945,10 +16546,6 @@ mod tests {
                 "range_filter_batch_dev_from_device_prices",
             ),
             (
-                "src/cuda/acosc_wrapper.rs",
-                "acosc_many_series_one_param_time_major_dev_device_inputs",
-            ),
-            (
                 "src/cuda/moving_averages/trendflex_wrapper.rs",
                 "trendflex_batch_on_device",
             ),
@@ -17203,10 +16800,6 @@ mod tests {
                 "lpc_batch_dev_from_device_inputs",
             ),
             (
-                "src/cuda/prb_wrapper.rs",
-                "prb_batch_dev_from_device_prices",
-            ),
-            (
                 "src/cuda/keltner_wrapper.rs",
                 "keltner_batch_dev_from_device_inputs",
             ),
@@ -17229,10 +16822,6 @@ mod tests {
             (
                 "src/cuda/correl_hl_wrapper.rs",
                 "correl_hl_batch_dev_from_device_inputs",
-            ),
-            (
-                "src/cuda/pivot_wrapper.rs",
-                "pivot_batch_output_dev_from_device_inputs",
             ),
             (
                 "src/cuda/mass_wrapper.rs",
@@ -17656,180 +17245,6 @@ mod tests {
             value: ParamValue::Int(4),
         }];
         assert_device_path_matches_host_cuda_with_output("ehlers_pma", Some("trigger"), &params);
-    }
-
-    #[test]
-    fn acosc_osc_device_path_matches_cpu_when_gpu_available() {
-        if !crate::cuda::cuda_available() {
-            return;
-        }
-
-        let (_open, high_f32, low_f32, _close_f32) = sample_ohlc(128);
-        let high_f64 = to_f64(&high_f32);
-        let low_f64 = to_f64(&low_f32);
-        let runtime = CudaRuntime::new(0).expect("runtime");
-        let device_high = runtime.upload_f32(&high_f32).expect("upload high");
-        let device_low = runtime.upload_f32(&low_f32).expect("upload low");
-        let device_params = [ParamKV {
-            key: "first_valid",
-            value: ParamValue::Int(0),
-        }];
-
-        let cpu_out = compute_cpu(IndicatorComputeRequest {
-            indicator_id: "acosc",
-            output_id: Some("osc"),
-            data: IndicatorDataRef::HighLow {
-                high: &high_f64,
-                low: &low_f64,
-            },
-            params: &[],
-            kernel: Kernel::Auto,
-        })
-        .expect("cpu path");
-        let device_out = compute_cuda_device(IndicatorCudaDeviceRequest {
-            indicator_id: "acosc",
-            output_id: Some("osc"),
-            data: IndicatorCudaDeviceDataRef::HighLow(
-                CudaDeviceHighLowRef::new(device_high.as_view(), device_low.as_view())
-                    .expect("high low ref"),
-            ),
-            params: &device_params,
-            kernel: Kernel::Auto,
-            target: CudaOutputTarget::HostF32,
-        })
-        .expect("device path");
-
-        assert_eq!(cpu_out.rows, device_out.rows);
-        assert_eq!(cpu_out.cols, device_out.cols);
-        let cpu_values = match cpu_out.series {
-            IndicatorSeries::F64(values) => values,
-            other => panic!("expected cpu output, got {other:?}"),
-        };
-        let device_values = match device_out.series {
-            IndicatorCudaSeries::HostF32(values) => values,
-            other => panic!("expected host output, got {other:?}"),
-        };
-        for (lhs, rhs) in cpu_values.iter().zip(device_values.iter()) {
-            if lhs.is_nan() && rhs.is_nan() {
-                continue;
-            }
-            assert!((*lhs as f32 - *rhs).abs() < 1e-3, "lhs={lhs} rhs={rhs}");
-        }
-    }
-
-    #[test]
-    fn acosc_change_device_path_matches_cpu_when_gpu_available() {
-        if !crate::cuda::cuda_available() {
-            return;
-        }
-
-        let (_open, high_f32, low_f32, _close_f32) = sample_ohlc(128);
-        let high_f64 = to_f64(&high_f32);
-        let low_f64 = to_f64(&low_f32);
-        let runtime = CudaRuntime::new(0).expect("runtime");
-        let device_high = runtime.upload_f32(&high_f32).expect("upload high");
-        let device_low = runtime.upload_f32(&low_f32).expect("upload low");
-        let device_params = [ParamKV {
-            key: "first_valid",
-            value: ParamValue::Int(0),
-        }];
-
-        let cpu_out = compute_cpu(IndicatorComputeRequest {
-            indicator_id: "acosc",
-            output_id: Some("change"),
-            data: IndicatorDataRef::HighLow {
-                high: &high_f64,
-                low: &low_f64,
-            },
-            params: &[],
-            kernel: Kernel::Auto,
-        })
-        .expect("cpu path");
-        let device_out = compute_cuda_device(IndicatorCudaDeviceRequest {
-            indicator_id: "acosc",
-            output_id: Some("change"),
-            data: IndicatorCudaDeviceDataRef::HighLow(
-                CudaDeviceHighLowRef::new(device_high.as_view(), device_low.as_view())
-                    .expect("high low ref"),
-            ),
-            params: &device_params,
-            kernel: Kernel::Auto,
-            target: CudaOutputTarget::HostF32,
-        })
-        .expect("device path");
-
-        assert_eq!(cpu_out.rows, device_out.rows);
-        assert_eq!(cpu_out.cols, device_out.cols);
-        let cpu_values = match cpu_out.series {
-            IndicatorSeries::F64(values) => values,
-            other => panic!("expected cpu output, got {other:?}"),
-        };
-        let device_values = match device_out.series {
-            IndicatorCudaSeries::HostF32(values) => values,
-            other => panic!("expected host output, got {other:?}"),
-        };
-        for (lhs, rhs) in cpu_values.iter().zip(device_values.iter()) {
-            if lhs.is_nan() && rhs.is_nan() {
-                continue;
-            }
-            assert!((*lhs as f32 - *rhs).abs() < 5e-4, "lhs={lhs} rhs={rhs}");
-        }
-    }
-
-    #[test]
-    fn acosc_host_path_matches_cpu_when_gpu_available() {
-        if !crate::cuda::cuda_available() {
-            return;
-        }
-
-        let _cuda_dispatch_lock = crate::cuda::cuda_test_lock();
-
-        let (_open, high_f32, low_f32, _close_f32) = sample_ohlc(128);
-        let high_f64 = to_f64(&high_f32);
-        let low_f64 = to_f64(&low_f32);
-
-        for output_id in ["osc", "change"] {
-            let cpu_out = compute_cpu(IndicatorComputeRequest {
-                indicator_id: "acosc",
-                output_id: Some(output_id),
-                data: IndicatorDataRef::HighLow {
-                    high: &high_f64,
-                    low: &low_f64,
-                },
-                params: &[],
-                kernel: Kernel::Auto,
-            })
-            .expect("cpu path");
-            let host_out = compute_cuda(IndicatorCudaRequest {
-                indicator_id: "acosc",
-                output_id: Some(output_id),
-                data: IndicatorCudaDataRef::HighLow {
-                    high: &high_f32,
-                    low: &low_f32,
-                },
-                params: &[],
-                kernel: Kernel::Auto,
-                target: CudaOutputTarget::HostF32,
-            })
-            .expect("host path");
-
-            assert_eq!(cpu_out.rows, host_out.rows);
-            assert_eq!(cpu_out.cols, host_out.cols);
-            let cpu_values = match cpu_out.series {
-                IndicatorSeries::F64(values) => values,
-                other => panic!("expected cpu output, got {other:?}"),
-            };
-            let host_values = match host_out.series {
-                IndicatorCudaSeries::HostF32(values) => values,
-                other => panic!("expected host output, got {other:?}"),
-            };
-            for (lhs, rhs) in cpu_values.iter().zip(host_values.iter()) {
-                if lhs.is_nan() && rhs.is_nan() {
-                    continue;
-                }
-                assert!((*lhs as f32 - *rhs).abs() < 5e-4, "lhs={lhs} rhs={rhs}");
-            }
-        }
     }
 
     #[test]
@@ -21722,62 +21137,6 @@ mod tests {
     }
 
     #[test]
-    fn prb_values_device_path_matches_cpu_when_gpu_available() {
-        let params = [
-            ParamKV {
-                key: "smooth_data",
-                value: ParamValue::Bool(true),
-            },
-            ParamKV {
-                key: "smooth_period",
-                value: ParamValue::Int(10),
-            },
-            ParamKV {
-                key: "regression_period",
-                value: ParamValue::Int(64),
-            },
-            ParamKV {
-                key: "polynomial_order",
-                value: ParamValue::Int(2),
-            },
-            ParamKV {
-                key: "regression_offset",
-                value: ParamValue::Int(0),
-            },
-        ];
-        assert_slice_device_path_matches_cpu_with_output("prb", Some("values"), &params);
-    }
-
-    #[test]
-    fn prb_device_path_matches_host_cuda_when_gpu_available() {
-        let params = [
-            ParamKV {
-                key: "smooth_data",
-                value: ParamValue::Bool(true),
-            },
-            ParamKV {
-                key: "smooth_period",
-                value: ParamValue::Int(10),
-            },
-            ParamKV {
-                key: "regression_period",
-                value: ParamValue::Int(64),
-            },
-            ParamKV {
-                key: "polynomial_order",
-                value: ParamValue::Int(2),
-            },
-            ParamKV {
-                key: "regression_offset",
-                value: ParamValue::Int(0),
-            },
-        ];
-        for output in [Some("values"), Some("upper_band"), Some("lower_band")] {
-            assert_device_path_matches_host_cuda_with_output("prb", output, &params);
-        }
-    }
-
-    #[test]
     fn keltner_device_path_matches_cpu_when_gpu_available() {
         if !crate::cuda::cuda_available() {
             return;
@@ -22127,59 +21486,6 @@ mod tests {
     }
 
     #[test]
-    fn prb_value_alias_resolves_on_cpu_and_cuda_when_gpu_available() {
-        if !crate::cuda::cuda_available() {
-            return;
-        }
-
-        let data_f32 = sample_series();
-        let data_f64 = to_f64(&data_f32);
-        let params = [
-            ParamKV {
-                key: "period",
-                value: ParamValue::Int(14),
-            },
-            ParamKV {
-                key: "deviation",
-                value: ParamValue::Float(2.0),
-            },
-        ];
-
-        let cpu_out = compute_cpu(IndicatorComputeRequest {
-            indicator_id: "prb",
-            output_id: Some("value"),
-            data: IndicatorDataRef::Slice { values: &data_f64 },
-            params: &params,
-            kernel: Kernel::Auto,
-        })
-        .expect("cpu prb value alias");
-        let cuda_out = compute_cuda(IndicatorCudaRequest {
-            indicator_id: "prb",
-            output_id: Some("value"),
-            data: IndicatorCudaDataRef::Slice { values: &data_f32 },
-            params: &params,
-            kernel: Kernel::Auto,
-            target: CudaOutputTarget::HostF32,
-        })
-        .expect("cuda prb value alias");
-
-        let cpu_values = match cpu_out.series {
-            IndicatorSeries::F64(values) => values,
-            other => panic!("expected cpu output, got {other:?}"),
-        };
-        let cuda_values = match cuda_out.series {
-            IndicatorCudaSeries::HostF32(values) => values,
-            other => panic!("expected cuda host output, got {other:?}"),
-        };
-        for (lhs, rhs) in cpu_values.iter().zip(cuda_values.iter()) {
-            if lhs.is_nan() && rhs.is_nan() {
-                continue;
-            }
-            assert!((*lhs as f32 - *rhs).abs() < 1e-3, "lhs={lhs} rhs={rhs}");
-        }
-    }
-
-    #[test]
     fn qqe_fast_device_path_matches_cpu_when_gpu_available() {
         let params = [
             ParamKV {
@@ -22459,36 +21765,6 @@ mod tests {
             Some("variance"),
             &params,
         );
-    }
-
-    #[test]
-    fn pivot_pp_device_path_matches_cpu_when_gpu_available() {
-        let params = [ParamKV {
-            key: "mode",
-            value: ParamValue::Int(4),
-        }];
-        assert_ohlc_device_path_matches_cpu_with_output("pivot", Some("pp"), &params);
-    }
-
-    #[test]
-    fn pivot_device_path_matches_host_cuda_when_gpu_available() {
-        let params = [ParamKV {
-            key: "mode",
-            value: ParamValue::Int(4),
-        }];
-        for output in [
-            Some("pp"),
-            Some("r1"),
-            Some("r2"),
-            Some("r3"),
-            Some("r4"),
-            Some("s1"),
-            Some("s2"),
-            Some("s3"),
-            Some("s4"),
-        ] {
-            assert_ohlc_device_path_matches_host_cuda_with_output("pivot", output, &params);
-        }
     }
 
     #[test]
@@ -26735,7 +26011,7 @@ mod tests {
             key: "length",
             value: ParamValue::Int(14),
         }];
-        for output in ["up", "down", "first", "second"] {
+        for output in ["up", "down"] {
             assert_high_low_device_path_matches_host_cuda_with_output(
                 "aroon",
                 Some(output),
@@ -28362,11 +27638,11 @@ mod tests {
     }
 
     #[test]
-    fn pattern_output_id_is_validated() {
+    fn pattern_recognition_generic_cuda_dispatch_fails_closed_as_unsupported() {
         let (open, high, low, close) = sample_ohlc(128);
         let req = IndicatorCudaRequest {
             indicator_id: "pattern_recognition",
-            output_id: Some("value"),
+            output_id: Some("matrix"),
             data: IndicatorCudaDataRef::Ohlc {
                 open: &open,
                 high: &high,
@@ -28380,11 +27656,14 @@ mod tests {
         };
         let err = compute_cuda(req).unwrap_err();
         match err {
-            IndicatorDispatchError::UnknownOutput { indicator, output } => {
+            IndicatorDispatchError::UnsupportedCapability {
+                indicator,
+                capability,
+            } => {
                 assert_eq!(indicator, "pattern_recognition");
-                assert_eq!(output, "value");
+                assert_eq!(capability, "cuda_batch");
             }
-            other => panic!("expected UnknownOutput, got {other:?}"),
+            other => panic!("expected typed UnsupportedCapability, got {other:?}"),
         }
     }
 
@@ -28744,74 +28023,6 @@ mod tests {
                 assert_eq!(dev.cols, out.cols);
             }
             other => panic!("expected DeviceF32, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pattern_bitmask_device_path_matches_host_cuda_when_gpu_available() {
-        if !crate::cuda::cuda_available() {
-            return;
-        }
-
-        let (open, high, low, close) = sample_ohlc(160);
-        let runtime = CudaRuntime::new(0).expect("runtime");
-        let device_ohlc = runtime
-            .upload_ohlc(&open, &high, &low, &close, None)
-            .expect("upload ohlc");
-
-        let host_out = compute_cuda(IndicatorCudaRequest {
-            indicator_id: "pattern_recognition",
-            output_id: Some("matrix"),
-            data: IndicatorCudaDataRef::Ohlc {
-                open: &open,
-                high: &high,
-                low: &low,
-                close: &close,
-                source: None,
-            },
-            params: &[],
-            kernel: Kernel::Auto,
-            target: CudaOutputTarget::HostF32,
-        })
-        .expect("host path");
-        let bitmask_out =
-            compute_pattern_recognition_cuda_device_bitmask(IndicatorCudaDeviceBitmaskRequest {
-                indicator_id: "pattern_recognition",
-                output_id: Some("matrix"),
-                data: IndicatorCudaDeviceDataRef::Ohlc(device_ohlc.as_view()),
-                params: &[],
-                kernel: Kernel::Auto,
-            })
-            .expect("bitmask device path");
-
-        let dense = match host_out.series {
-            IndicatorCudaSeries::HostF32(values) => values,
-            other => panic!("expected HostF32, got {other:?}"),
-        };
-        assert_eq!(bitmask_out.rows, host_out.rows);
-        assert_eq!(bitmask_out.cols, host_out.cols);
-        assert_eq!(bitmask_out.pattern_ids, host_out.pattern_ids.unwrap());
-        assert_eq!(bitmask_out.words_per_row, bitmask_out.cols.div_ceil(64));
-        assert_ne!(bitmask_out.series.device_ptr(), 0);
-        assert_eq!(
-            bitmask_out.series.len(),
-            bitmask_out.rows * bitmask_out.words_per_row
-        );
-
-        let mut words = vec![0u64; bitmask_out.series.len()];
-        bitmask_out
-            .series
-            .buf
-            .copy_to(words.as_mut_slice())
-            .expect("download words");
-        for row in 0..bitmask_out.rows {
-            for col in 0..bitmask_out.cols {
-                let dense_idx = row * bitmask_out.cols + col;
-                let word = row * bitmask_out.words_per_row + (col / 64);
-                let bit = col % 64;
-                let packed_hit = ((words[word] >> bit) & 1) != 0;
-                assert_eq!(packed_hit, dense[dense_idx] != 0.0, "row={row} col={col}");
-            }
         }
     }
 
@@ -29434,58 +28645,6 @@ mod tests {
                     ParamKV {
                         key: "fast_factor",
                         value: ParamValue::Float(4.236),
-                    },
-                ],
-            ),
-            (
-                "prb",
-                "upper_band",
-                vec![
-                    ParamKV {
-                        key: "smooth_data",
-                        value: ParamValue::Bool(true),
-                    },
-                    ParamKV {
-                        key: "smooth_period",
-                        value: ParamValue::Int(10),
-                    },
-                    ParamKV {
-                        key: "regression_period",
-                        value: ParamValue::Int(64),
-                    },
-                    ParamKV {
-                        key: "polynomial_order",
-                        value: ParamValue::Int(2),
-                    },
-                    ParamKV {
-                        key: "regression_offset",
-                        value: ParamValue::Int(0),
-                    },
-                ],
-            ),
-            (
-                "prb",
-                "lower_band",
-                vec![
-                    ParamKV {
-                        key: "smooth_data",
-                        value: ParamValue::Bool(true),
-                    },
-                    ParamKV {
-                        key: "smooth_period",
-                        value: ParamValue::Int(10),
-                    },
-                    ParamKV {
-                        key: "regression_period",
-                        value: ParamValue::Int(64),
-                    },
-                    ParamKV {
-                        key: "polynomial_order",
-                        value: ParamValue::Int(2),
-                    },
-                    ParamKV {
-                        key: "regression_offset",
-                        value: ParamValue::Int(0),
                     },
                 ],
             ),

@@ -52,7 +52,9 @@ impl AuthorizationRequest {
 
     /// Set the email hint (which account to sign in with).
     pub fn with_login_hint(mut self, email: Option<String>) -> Self {
-        self.login_hint = email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        self.login_hint = email
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty());
         self
     }
 
@@ -312,7 +314,10 @@ mod tests {
     #[test]
     fn url_encoder_handles_known_special_chars() {
         assert_eq!(url_encode("openid profile"), "openid%20profile");
-        assert_eq!(url_encode("http://localhost:1455"), "http%3A%2F%2Flocalhost%3A1455");
+        assert_eq!(
+            url_encode("http://localhost:1455"),
+            "http%3A%2F%2Flocalhost%3A1455"
+        );
         assert_eq!(url_encode("abc-123_xyz.~"), "abc-123_xyz.~");
     }
 }

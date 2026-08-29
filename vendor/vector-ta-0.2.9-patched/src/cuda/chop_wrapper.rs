@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::oscillators::CudaWillr;
 use crate::indicators::chop::{ChopBatchRange, ChopParams};
@@ -7,8 +7,8 @@ use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::sync::Arc;
@@ -93,12 +93,6 @@ impl CudaChop {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/chop_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("chop_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -565,11 +559,7 @@ impl CudaChop {
                     }
                     prev_close = cl;
                     let current_atr = if rel < drift {
-                        if rel == drift - 1 {
-                            rma_atr
-                        } else {
-                            f64::NAN
-                        }
+                        if rel == drift - 1 { rma_atr } else { f64::NAN }
                     } else {
                         rma_atr
                     };
@@ -579,11 +569,7 @@ impl CudaChop {
                         current_atr
                     };
                     let current_atr = if rel < drift {
-                        if rel == drift - 1 {
-                            rma_atr
-                        } else {
-                            f64::NAN
-                        }
+                        if rel == drift - 1 { rma_atr } else { f64::NAN }
                     } else {
                         rma_atr
                     };
@@ -1036,11 +1022,7 @@ pub mod benches {
                 }
                 prev_close = cl;
                 let current_atr = if rel < drift {
-                    if rel == drift - 1 {
-                        rma_atr
-                    } else {
-                        f64::NAN
-                    }
+                    if rel == drift - 1 { rma_atr } else { f64::NAN }
                 } else {
                     rma_atr
                 };

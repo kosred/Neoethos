@@ -1,9 +1,54 @@
-extern crate csv;
-extern crate serde;
-
-use csv::ReaderBuilder;
 use std::error::Error;
-use std::fs::File;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, LazyLock, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_array::ToCanonical;
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_array::dtype::{DType, PType};
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_array::scalar_fn::session::ScalarFnSession;
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_array::session::ArraySession;
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_array::stream::ArrayStreamExt;
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_file::OpenOptionsSessionExt;
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_io::runtime::BlockingRuntime;
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_io::runtime::current::CurrentThreadRuntime;
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_io::session::{RuntimeSession, RuntimeSessionExt};
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_layout::session::LayoutSession;
+#[cfg(not(target_arch = "wasm32"))]
+use vortex_session::VortexSession;
+
+#[cfg(not(target_arch = "wasm32"))]
+static VORTEX_RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRuntime::new);
+
+#[cfg(not(target_arch = "wasm32"))]
+static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let mut session = VortexSession::empty()
+        .with::<ArraySession>()
+        .with::<LayoutSession>()
+        .with::<ScalarFnSession>()
+        .with::<RuntimeSession>()
+        .with_handle(VORTEX_RUNTIME.handle());
+    vortex_file::register_default_encodings(&mut session);
+    session
+});
+
+#[cfg(not(target_arch = "wasm32"))]
+static VORTEX_CANDLE_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Candles>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy)]
 pub struct CandleFieldFlags {
@@ -178,110 +223,126 @@ impl Candles {
     }
 }
 
-pub fn read_candles_from_csv(file_path: &str) -> Result<Candles, Box<dyn Error>> {
-    use std::io;
-
-    let file = File::open(file_path)?;
-    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
-
-    let header_len = rdr.headers().map(|h| h.len()).unwrap_or(0);
-    if header_len < 2 {
-        return Err("CSV must have at least 2 columns: timestamp, close".into());
+/// Read the immutable native test/benchmark dataset directly from Vortex.
+///
+/// VectorTA is a compute library, not an import boundary. User-provided CSV,
+/// TSV, JSON, Parquet, or Arrow data is converted once by NeoEthos' admitted
+/// importer; indicator tests and benchmarks reopen only the resulting Vortex
+/// generation. No source-format parsing or implicit f32 widening happens here.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_candles_from_vortex(file_path: &str) -> Result<Arc<Candles>, Box<dyn Error>> {
+    let key = PathBuf::from(file_path);
+    let mut cache = VORTEX_CANDLE_CACHE.lock().map_err(|_| {
+        io::Error::other("immutable Vortex candle cache was poisoned by a prior panic")
+    })?;
+    if let Some(candles) = cache.get(&key) {
+        return Ok(Arc::clone(candles));
     }
 
-    let (fields, idx_open, idx_close, idx_high, idx_low, idx_volume) = if header_len >= 3 {
-        (
-            CandleFieldFlags {
-                open: true,
-                close: true,
-                high: header_len > 3,
-                low: header_len > 4,
-                volume: header_len > 5,
-            },
-            Some(1usize),
-            2usize,
-            if header_len > 3 { Some(3usize) } else { None },
-            if header_len > 4 { Some(4usize) } else { None },
-            if header_len > 5 { Some(5usize) } else { None },
+    // Hold the small cache lock through the first decode. This is deliberate:
+    // concurrent test workers must not stampede the single Vortex runtime and
+    // decode the same immutable generation dozens of times.
+    let candles = Arc::new(read_candles_from_vortex_uncached(file_path)?);
+    cache.insert(key, Arc::clone(&candles));
+    Ok(candles)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_candles_from_vortex_uncached(file_path: &str) -> Result<Candles, Box<dyn Error>> {
+    let vortex_file =
+        VORTEX_RUNTIME.block_on(VORTEX_SESSION.open_options().open_path(file_path))?;
+    let stream = vortex_file.scan()?.into_array_stream()?;
+    let array = VORTEX_RUNTIME.block_on(stream.read_all())?;
+    if !matches!(array.dtype(), DType::Struct(..)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Vortex candle fixture must be a struct, got {}",
+                array.dtype()
+            ),
         )
-    } else {
-        (
-            CandleFieldFlags {
-                open: false,
-                close: true,
-                high: false,
-                low: false,
-                volume: false,
-            },
-            None,
-            1usize,
-            None,
-            None,
-            None,
-        )
+        .into());
+    }
+    let fields = array.to_struct();
+
+    let field = |name: &str| -> Result<vortex_array::ArrayRef, Box<dyn Error>> {
+        Ok(fields.unmasked_field_by_name(name)?.clone())
+    };
+    let f64_field = |name: &str| -> Result<Vec<f64>, Box<dyn Error>> {
+        let array = field(name)?;
+        if !matches!(array.dtype(), DType::Primitive(PType::F64, _)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Vortex candle column '{name}' must be physical f64, got {}",
+                    array.dtype()
+                ),
+            )
+            .into());
+        }
+        if !array.all_valid()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Vortex candle column '{name}' contains nulls"),
+            )
+            .into());
+        }
+        Ok(array.to_primitive().as_slice::<f64>().to_vec())
     };
 
-    let mut timestamp = Vec::new();
-    let mut open = Vec::new();
-    let mut high = Vec::new();
-    let mut low = Vec::new();
-    let mut close = Vec::new();
-    let mut volume = Vec::new();
-
-    for result in rdr.records() {
-        let record = result?;
-
-        let ts: i64 = record
-            .get(0)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing timestamp column"))?
-            .parse()?;
-        let c: f64 = record
-            .get(idx_close)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing close column"))?
-            .parse()?;
-        timestamp.push(ts);
-        close.push(c);
-
-        let o: f64 = match idx_open {
-            Some(i) => record
-                .get(i)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing open column"))?
-                .parse()?,
-            None => f64::NAN,
-        };
-        open.push(o);
-
-        let h: f64 = match idx_high {
-            Some(i) => record
-                .get(i)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing high column"))?
-                .parse()?,
-            None => f64::NAN,
-        };
-        high.push(h);
-
-        let l: f64 = match idx_low {
-            Some(i) => record
-                .get(i)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing low column"))?
-                .parse()?,
-            None => f64::NAN,
-        };
-        low.push(l);
-
-        let v: f64 = match idx_volume {
-            Some(i) => record
-                .get(i)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing volume column"))?
-                .parse()?,
-            None => f64::NAN,
-        };
-        volume.push(v);
+    let timestamp = field("timestamp")?;
+    if !matches!(timestamp.dtype(), DType::Primitive(PType::I64, _)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Vortex candle timestamp must be physical i64 milliseconds, got {}",
+                timestamp.dtype()
+            ),
+        )
+        .into());
+    }
+    if !timestamp.all_valid()? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Vortex candle timestamp contains nulls",
+        )
+        .into());
     }
 
-    Ok(Candles::new_with_fields(
-        timestamp, open, high, low, close, volume, fields,
-    ))
+    let candles = Candles::new(
+        timestamp.to_primitive().as_slice::<i64>().to_vec(),
+        f64_field("open")?,
+        f64_field("high")?,
+        f64_field("low")?,
+        f64_field("close")?,
+        f64_field("volume")?,
+    );
+    let rows = candles.close.len();
+    if rows == 0
+        || candles.timestamp.len() != rows
+        || candles.open.len() != rows
+        || candles.high.len() != rows
+        || candles.low.len() != rows
+        || candles.volume.len() != rows
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Vortex candle fixture has empty or mismatched column lengths",
+        )
+        .into());
+    }
+    if candles
+        .timestamp
+        .windows(2)
+        .any(|window| window[0] >= window[1])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Vortex candle timestamps must be strictly increasing i64 milliseconds",
+        )
+        .into());
+    }
+    Ok(candles)
 }
 
 pub fn source_type<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
@@ -312,11 +373,65 @@ pub fn source_type<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn test_vortex_fixture_is_decoded_once_across_concurrent_readers() {
+        let source = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        let copy = std::env::temp_dir().join(format!(
+            "vector-ta-vortex-cache-{}-{unique}.vortex",
+            std::process::id()
+        ));
+        std::fs::copy(source, &copy).expect("copy the Vortex fixture for an isolated cache key");
+
+        let readers = 16;
+        let barrier = Arc::new(Barrier::new(readers));
+        let path = copy.to_string_lossy().into_owned();
+        let mut handles = Vec::with_capacity(readers);
+        for _ in 0..readers {
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                read_candles_from_vortex(&path).expect("concurrent Vortex fixture read")
+            }));
+        }
+
+        let first = handles
+            .remove(0)
+            .join()
+            .expect("first fixture reader must not panic");
+        for handle in handles {
+            let candle_handle = handle.join().expect("fixture reader must not panic");
+            assert!(
+                Arc::ptr_eq(&first, &candle_handle),
+                "immutable fixture readers must share one decoded allocation"
+            );
+        }
+        std::fs::remove_file(&copy).expect("remove the isolated Vortex cache fixture");
+    }
+
+    #[test]
+    fn test_vortex_fixture_round_trip() {
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")
+            .expect("load the immutable Vortex candle fixture");
+
+        assert_eq!(candles.timestamp.len(), 15_577);
+        assert_eq!(candles.timestamp.first(), Some(&1_500_854_400_000));
+        assert_eq!(candles.timestamp.last(), Some(&1_725_148_800_000));
+        assert_eq!(candles.close.last(), Some(&58_655.0));
+        assert_eq!(candles.hlcc4.last(), Some(&58_711.25));
+    }
 
     #[test]
     fn test_field_congruency() {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path).expect("Failed to load CSV for testing");
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles =
+            read_candles_from_vortex(file_path).expect("failed to load Vortex test fixture");
 
         let len = candles.timestamp.len();
         assert_eq!(candles.open.len(), len, "Open length mismatch");
@@ -328,8 +443,9 @@ mod tests {
 
     #[test]
     fn test_calculated_fields_accuracy() {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path).expect("Failed to load CSV for testing");
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles =
+            read_candles_from_vortex(file_path).expect("failed to load Vortex test fixture");
 
         let hl2 = candles
             .get_calculated_field("hl2")

@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use ndarray::Array2;
 use neoethos_core::storage::json::{JsonBackupWriteConfig, write_json_with_backup};
-use polars::prelude::DataFrame;
+use neoethos_data::FeatureFrame;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -52,7 +52,7 @@ pub struct OptimizationReport {
     pub trials: Vec<OptimizationTrialRecord>,
 }
 
-pub type HoldoutSplit = (DataFrame, Vec<i32>, DataFrame, Vec<i32>);
+pub type HoldoutSplit = (FeatureFrame, Vec<i32>, FeatureFrame, Vec<i32>);
 
 fn validate_optimization_report(report: &OptimizationReport) -> Result<()> {
     if report.model_name.trim().is_empty() {
@@ -101,21 +101,21 @@ fn label_to_probability_index(label: i32) -> Result<usize> {
 }
 
 pub fn time_series_holdout_split(
-    frame: &DataFrame,
+    frame: &FeatureFrame,
     labels: &[i32],
     holdout_pct: f64,
     embargo_rows: usize,
     min_train_rows: usize,
     min_val_rows: usize,
 ) -> Result<Option<HoldoutSplit>> {
-    if frame.height() != labels.len() {
+    if frame.n_samples() != labels.len() {
         bail!(
             "holdout split row/label mismatch: {} rows vs {} labels",
-            frame.height(),
+            frame.n_samples(),
             labels.len()
         );
     }
-    if frame.height()
+    if frame.n_samples()
         < min_train_rows
             .saturating_add(min_val_rows)
             .saturating_add(embargo_rows)
@@ -124,25 +124,25 @@ pub fn time_series_holdout_split(
     }
 
     let holdout_pct = holdout_pct.clamp(0.05, 0.45);
-    let val_rows = ((frame.height() as f64) * holdout_pct).round() as usize;
+    let val_rows = ((frame.n_samples() as f64) * holdout_pct).round() as usize;
     let val_rows = val_rows
         .max(min_val_rows)
-        .min(frame.height().saturating_sub(min_train_rows));
+        .min(frame.n_samples().saturating_sub(min_train_rows));
     if val_rows == 0 {
         return Ok(None);
     }
 
-    let embargo_adjusted_height = frame.height().saturating_sub(embargo_rows);
+    let embargo_adjusted_height = frame.n_samples().saturating_sub(embargo_rows);
     if embargo_adjusted_height < min_train_rows + min_val_rows {
         tracing::debug!(
             target: "hpo",
             "embargo {embargo_rows} consumes too much of frame {}",
-            frame.height()
+            frame.n_samples()
         );
         return Ok(None);
     }
     let train_end = frame
-        .height()
+        .n_samples()
         .saturating_sub(val_rows)
         .saturating_sub(embargo_rows);
     if train_end < min_train_rows {
@@ -150,14 +150,14 @@ pub fn time_series_holdout_split(
     }
 
     let val_start = train_end.saturating_add(embargo_rows);
-    let val_len = frame.height().saturating_sub(val_start);
+    let val_len = frame.n_samples().saturating_sub(val_start);
     if val_len < min_val_rows {
         return Ok(None);
     }
 
-    let train_frame = frame.slice(0, train_end);
+    let train_frame = frame.row_window(0, train_end)?;
     let train_labels = labels.iter().take(train_end).copied().collect::<Vec<_>>();
-    let val_frame = frame.slice(val_start as i64, val_len);
+    let val_frame = frame.row_window(val_start, val_start + val_len)?;
     let val_labels = labels
         .iter()
         .skip(val_start)
@@ -165,7 +165,7 @@ pub fn time_series_holdout_split(
         .copied()
         .collect::<Vec<_>>();
 
-    if train_frame.height() != train_labels.len() || val_frame.height() != val_labels.len() {
+    if train_frame.n_samples() != train_labels.len() || val_frame.n_samples() != val_labels.len() {
         bail!("holdout split produced inconsistent frame/label sizes");
     }
 
@@ -173,9 +173,9 @@ pub fn time_series_holdout_split(
 }
 
 pub fn evaluate_prediction_quality(
-    probabilities: &Array2<f32>,
+    probabilities: &Array2<f64>,
     labels: &[i32],
-    confidence_threshold: f32,
+    confidence_threshold: f64,
     metric_weight: f64,
     accuracy_weight: f64,
 ) -> Result<ValidationMetrics> {
@@ -206,8 +206,8 @@ pub fn evaluate_prediction_quality(
         let true_idx = label_to_probability_index(label)?;
         let row = probabilities.row(row_idx);
         let mut max_idx = 0_usize;
-        let mut max_prob = f32::NEG_INFINITY;
-        let mut row_sum = 0.0_f32;
+        let mut max_prob = f64::NEG_INFINITY;
+        let mut row_sum = 0.0_f64;
         for (col_idx, value) in row.iter().copied().enumerate() {
             if !value.is_finite() || value < 0.0 {
                 bail!("prediction row {row_idx} contains invalid probability {value}");
@@ -219,19 +219,18 @@ pub fn evaluate_prediction_quality(
             }
         }
 
-        let true_prob = row[true_idx].clamp(1e-6, 1.0);
-        let normalizer = if row_sum.is_finite() && row_sum > 1e-6 {
-            row_sum as f64
-        } else {
-            1.0
-        };
-        log_loss -= ((true_prob as f64) / normalizer).ln();
-        confidence_sum += max_prob.max(0.0) as f64;
+        if !row_sum.is_finite() || row_sum <= f64::EPSILON {
+            bail!("prediction row {row_idx} has no positive finite probability mass");
+        }
+        let true_prob = (row[true_idx] / row_sum).clamp(1e-12, 1.0);
+        let normalized_confidence = (max_prob / row_sum).clamp(0.0, 1.0);
+        log_loss -= true_prob.ln();
+        confidence_sum += normalized_confidence;
 
         if max_idx == true_idx {
             correct += 1;
         }
-        if max_prob >= confidence_threshold {
+        if normalized_confidence >= confidence_threshold {
             confident_rows += 1;
             if max_idx == true_idx {
                 confident_correct += 1;
@@ -378,5 +377,30 @@ mod tests {
             .expect_err("multiple selected trials must fail")
             .to_string();
         assert!(err.contains("exactly one selected"));
+    }
+
+    #[test]
+    fn prediction_quality_rejects_zero_probability_mass() {
+        let probabilities =
+            Array2::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).expect("one probability row");
+        let error = evaluate_prediction_quality(&probabilities, &[0], 0.5, 1.0, 0.1)
+            .expect_err("zero probability mass must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("no positive finite probability mass")
+        );
+    }
+
+    #[test]
+    fn prediction_quality_applies_confidence_threshold_after_normalization() {
+        let probabilities =
+            Array2::from_shape_vec((1, 3), vec![0.8, 0.4, 0.4]).expect("one probability row");
+        let metrics = evaluate_prediction_quality(&probabilities, &[0], 0.6, 1.0, 0.1)
+            .expect("finite positive probability mass");
+
+        assert_eq!(metrics.confident_rows, 0);
+        assert!((metrics.mean_confidence - 0.5).abs() <= 1e-12);
+        assert!((metrics.log_loss - (-0.5_f64.ln())).abs() <= 1e-12);
     }
 }

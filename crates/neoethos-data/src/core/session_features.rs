@@ -4,7 +4,12 @@
 /// and provides key institutional reference levels like session VWAP,
 /// session open gaps, and session range positions.
 use super::super::Ohlcv;
-use crate::core::timestamps::{TimestampUnit, infer_timestamp_unit, timestamp_to_millis};
+use crate::core::features::{FeatureCellValidity, FeatureColumnF64};
+use crate::core::timestamps::{
+    TimestampUnit, infer_timestamp_unit, timestamp_to_millis,
+    validate_canonical_millisecond_timestamps,
+};
+use anyhow::{Result, ensure};
 use chrono::{TimeZone, Timelike, Utc};
 
 #[derive(Default, Clone)]
@@ -295,4 +300,275 @@ pub fn compute_session_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)>
         ("daily_low_dist".to_string(), daily_low_dist),
         ("daily_vwap_dist".to_string(), daily_vwap_dist),
     ]
+}
+
+/// Explicit-validity f64 session lane used by the atomic Tasks 5B-9
+/// migration. The legacy value producer remains the temporary parity bridge;
+/// this replay supplies the information that its prefilled zero vectors lost.
+/// It accepts canonical i64 milliseconds only and never fabricates VWAP from
+/// unit volume when broker volume is absent.
+pub fn compute_session_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureColumnF64>> {
+    let n = ohlcv.len();
+    ensure!(n > 0, "session features require at least one OHLC row");
+    ensure!(
+        ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
+        "session OHLC lengths do not match close length {n}"
+    );
+    for row in 0..n {
+        let open = ohlcv.open[row];
+        let high = ohlcv.high[row];
+        let low = ohlcv.low[row];
+        let close = ohlcv.close[row];
+        ensure!(
+            open.is_finite() && high.is_finite() && low.is_finite() && close.is_finite(),
+            "session OHLC row {row} contains a non-finite price"
+        );
+        ensure!(
+            open > 0.0 && high > 0.0 && low > 0.0 && close > 0.0,
+            "session OHLC row {row} contains a non-positive price"
+        );
+        ensure!(
+            low <= open.min(close) && high >= open.max(close),
+            "session OHLC row {row} violates low <= open/close <= high"
+        );
+    }
+
+    let volume = if let Some(volume) = ohlcv.volume.as_deref() {
+        ensure!(
+            volume.len() == n,
+            "session volume length {} does not match OHLC length {n}",
+            volume.len()
+        );
+        if let Some((row, value)) = volume
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            anyhow::bail!("session volume row {row} is invalid: {value}");
+        }
+        Some(volume)
+    } else {
+        None
+    };
+
+    let legacy = compute_session_feature_columns(ohlcv);
+    let mut validity_by_name: std::collections::HashMap<String, Vec<FeatureCellValidity>> = legacy
+        .iter()
+        .map(|(name, _)| (name.clone(), vec![FeatureCellValidity::Warmup; n]))
+        .collect();
+
+    let Some(timestamps) = ohlcv.timestamp.as_deref() else {
+        for validity in validity_by_name.values_mut() {
+            validity.fill(FeatureCellValidity::MissingInput);
+        }
+        return legacy
+            .into_iter()
+            .map(|(name, values)| {
+                let validity = validity_by_name
+                    .remove(&name)
+                    .expect("session validity row exists");
+                FeatureColumnF64::new(name, values, validity)
+            })
+            .collect();
+    };
+    ensure!(
+        timestamps.len() == n,
+        "session timestamp length {} does not match OHLC length {n}",
+        timestamps.len()
+    );
+    validate_canonical_millisecond_timestamps(timestamps)?;
+
+    let mut asian = SessionAccum::default();
+    let mut london = SessionAccum::default();
+    let mut ny = SessionAccum::default();
+    let mut daily = SessionAccum::default();
+    let mut prev_session_close = f64::NAN;
+    let mut prev_asian_range = 0.0_f64;
+    let mut has_previous_asian = false;
+    let mut atr_sum = 0.0_f64;
+    let mut atr_count = 0_usize;
+
+    for row in 0..n {
+        let open = ohlcv.open[row];
+        let high = ohlcv.high[row];
+        let low = ohlcv.low[row];
+        let close = ohlcv.close[row];
+        let row_volume = volume.map_or(1.0, |values| values[row]);
+
+        if row > 0 {
+            let true_range = (high - low)
+                .max((high - ohlcv.close[row - 1]).abs())
+                .max((low - ohlcv.close[row - 1]).abs());
+            atr_sum += true_range;
+            atr_count += 1;
+        }
+        let atr = if atr_count > 0 {
+            atr_sum / atr_count as f64
+        } else {
+            high - low
+        };
+        let atr_validity = if atr > 1e-10 {
+            FeatureCellValidity::Valid
+        } else {
+            FeatureCellValidity::ZeroDenominator
+        };
+
+        let dt = Utc
+            .timestamp_millis_opt(timestamps[row])
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("session timestamp row {row} is not a UTC instant"))?;
+        let hour = dt.hour();
+        let minute = dt.minute();
+        let asian_open = hour == 0 && minute == 0;
+        let london_open = hour == 7 && minute == 0;
+        let ny_open = hour == 12 && minute == 0;
+
+        if asian_open {
+            if asian.started {
+                prev_session_close = asian.close;
+                prev_asian_range = asian.range();
+                has_previous_asian = true;
+            }
+            asian.reset(open);
+        }
+        if hour < 8 && asian.started {
+            asian.update(high, low, close, row_volume);
+        }
+        if london_open {
+            if london.started {
+                prev_session_close = london.close;
+            }
+            london.reset(open);
+        }
+        if (7..16).contains(&hour) && london.started {
+            london.update(high, low, close, row_volume);
+        }
+        if ny_open {
+            if ny.started {
+                prev_session_close = ny.close;
+            }
+            ny.reset(open);
+        }
+        if (12..21).contains(&hour) && ny.started {
+            ny.update(high, low, close, row_volume);
+        }
+        if asian_open {
+            daily.reset(open);
+        }
+        daily.update(high, low, close, row_volume);
+
+        let mut mark = |name: &str, validity: FeatureCellValidity| {
+            validity_by_name
+                .get_mut(name)
+                .expect("session validity plan covers every output")[row] = validity;
+        };
+
+        mark("session_london_ny_overlap", FeatureCellValidity::Valid);
+        mark("session_open_gap", FeatureCellValidity::Valid);
+        if (london_open || ny_open) && !prev_session_close.is_finite() {
+            mark("session_open_gap", FeatureCellValidity::Warmup);
+        } else if (london_open || ny_open) && atr_validity != FeatureCellValidity::Valid {
+            mark("session_open_gap", atr_validity);
+        }
+
+        if london.started && london.bar_count > 0 {
+            for name in [
+                "session_london_open_dist",
+                "session_london_high_dist",
+                "session_london_low_dist",
+                "session_london_range",
+            ] {
+                mark(name, atr_validity);
+            }
+            mark(
+                "session_london_vwap_dist",
+                if volume.is_none() {
+                    FeatureCellValidity::MissingInput
+                } else if london.vwap_den <= 1e-10 {
+                    FeatureCellValidity::ZeroDenominator
+                } else {
+                    atr_validity
+                },
+            );
+        }
+        if ny.started && ny.bar_count > 0 {
+            for name in [
+                "session_ny_open_dist",
+                "session_ny_high_dist",
+                "session_ny_low_dist",
+                "session_ny_range",
+            ] {
+                mark(name, atr_validity);
+            }
+            mark(
+                "session_ny_vwap_dist",
+                if volume.is_none() {
+                    FeatureCellValidity::MissingInput
+                } else if ny.vwap_den <= 1e-10 {
+                    FeatureCellValidity::ZeroDenominator
+                } else {
+                    atr_validity
+                },
+            );
+        }
+        if asian.started && asian.bar_count > 0 {
+            for name in [
+                "session_asian_open_dist",
+                "session_asian_close_dist",
+                "session_asian_range_norm",
+            ] {
+                mark(name, atr_validity);
+            }
+        }
+
+        if london.started && has_previous_asian {
+            mark(
+                "session_vol_ratio",
+                if prev_asian_range > 1e-10 {
+                    FeatureCellValidity::Valid
+                } else {
+                    FeatureCellValidity::ZeroDenominator
+                },
+            );
+        }
+        if prev_session_close.is_finite() {
+            mark("session_prev_close_dist", atr_validity);
+        }
+
+        if daily.started && daily.bar_count > 0 {
+            mark("daily_range_pct", FeatureCellValidity::Valid);
+            mark("daily_body_pct", FeatureCellValidity::Valid);
+            mark(
+                "daily_position",
+                if daily.range() > 1e-10 {
+                    FeatureCellValidity::Valid
+                } else {
+                    FeatureCellValidity::ZeroDenominator
+                },
+            );
+            mark("daily_high_dist", atr_validity);
+            mark("daily_low_dist", atr_validity);
+            mark(
+                "daily_vwap_dist",
+                if volume.is_none() {
+                    FeatureCellValidity::MissingInput
+                } else if daily.vwap_den <= 1e-10 {
+                    FeatureCellValidity::ZeroDenominator
+                } else {
+                    atr_validity
+                },
+            );
+        }
+    }
+
+    legacy
+        .into_iter()
+        .map(|(name, values)| {
+            let validity = validity_by_name
+                .remove(&name)
+                .ok_or_else(|| anyhow::anyhow!("missing session validity plan for `{name}`"))?;
+            FeatureColumnF64::new(name, values, validity)
+        })
+        .collect()
 }

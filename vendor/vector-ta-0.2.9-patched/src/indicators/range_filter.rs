@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -10,35 +10,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods};
-#[cfg(feature = "python")]
-use pyo3::exceptions::{PyBufferError, PyValueError};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaRangeFilter};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 
 impl<'a> AsRef<[f64]> for RangeFilterInput<'a> {
     #[inline(always)]
@@ -67,10 +38,6 @@ pub struct RangeFilterOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RangeFilterParams {
     pub range_size: Option<f64>,
     pub range_period: Option<usize>,
@@ -1395,712 +1362,6 @@ fn range_filter_batch_inner_into(
     Ok(())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "range_filter")]
-#[pyo3(signature = (data, range_size=2.618, range_period=14, smooth_range=true, smooth_period=27, kernel=None))]
-pub fn range_filter_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    range_size: f64,
-    range_period: usize,
-    smooth_range: bool,
-    smooth_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = RangeFilterParams {
-        range_size: Some(range_size),
-        range_period: Some(range_period),
-        smooth_range: Some(smooth_range),
-        smooth_period: Some(smooth_period),
-    };
-
-    let input = RangeFilterInput::from_slice(slice_in, params);
-
-    let (f, h, l) = py
-        .allow_threads(|| {
-            range_filter_with_kernel(&input, kern).map(|o| (o.filter, o.high_band, o.low_band))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((f.into_pyarray(py), h.into_pyarray(py), l.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "range_filter_batch")]
-#[pyo3(signature = (data,
-                    range_size_start=2.618, range_size_end=2.618, range_size_step=0.1,
-                    range_period_start=14, range_period_end=14, range_period_step=1,
-                    smooth_range=true, smooth_period=27, kernel=None))]
-pub fn range_filter_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    range_size_start: f64,
-    range_size_end: f64,
-    range_size_step: f64,
-    range_period_start: usize,
-    range_period_end: usize,
-    range_period_step: usize,
-    smooth_range: bool,
-    smooth_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-
-    let sweep = RangeFilterBatchRange {
-        range_size: (range_size_start, range_size_end, range_size_step),
-        range_period: (range_period_start, range_period_end, range_period_step),
-        smooth_range: Some(smooth_range),
-        smooth_period: Some(smooth_period),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("range_filter_batch_py: rows*cols overflowed"))?;
-    let f_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let h_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let l_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let f_slice = unsafe { f_arr.as_slice_mut() }.unwrap();
-    let h_slice = unsafe { h_arr.as_slice_mut() }.unwrap();
-    let l_slice = unsafe { l_arr.as_slice_mut() }.unwrap();
-
-    py.allow_threads(|| {
-        range_filter_batch_inner_into(slice_in, &combos, kern, true, f_slice, h_slice, l_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("filter", f_arr.reshape((rows, cols))?)?;
-    dict.set_item("high", h_arr.reshape((rows, cols))?)?;
-    dict.set_item("low", l_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "range_sizes",
-        combos
-            .iter()
-            .map(|c| c.range_size.unwrap_or(2.618))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "range_periods",
-        combos
-            .iter()
-            .map(|c| c.range_period.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_range",
-        combos
-            .iter()
-            .map(|c| c.smooth_range.unwrap_or(true))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_periods",
-        combos
-            .iter()
-            .map(|c| c.smooth_period.unwrap_or(27) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeFilterJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_filter_js(
-    data: &[f64],
-    range_size: Option<f64>,
-    range_period: Option<usize>,
-    smooth_range: Option<bool>,
-    smooth_period: Option<usize>,
-) -> Result<JsValue, JsValue> {
-    let len = data.len();
-
-    let params = RangeFilterParams {
-        range_size: range_size.or(Some(2.618)),
-        range_period: range_period.or(Some(14)),
-        smooth_range: smooth_range.or(Some(true)),
-        smooth_period: smooth_period.or(Some(27)),
-    };
-    let input = RangeFilterInput::from_slice(data, params);
-
-    let result = range_filter(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("filter"),
-        &serde_wasm_bindgen::to_value(&result.filter).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("high_band"),
-        &serde_wasm_bindgen::to_value(&result.high_band).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("low_band"),
-        &serde_wasm_bindgen::to_value(&result.low_band).unwrap(),
-    )?;
-
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_filter_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_filter_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeFilterBatchConfig {
-    pub range_size: (f64, f64, f64),
-    pub range_period: (usize, usize, usize),
-    pub smooth_range: bool,
-    pub smooth_period: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeFilterBatchJsOutput {
-    pub filter: Vec<f64>,
-    pub high: Vec<f64>,
-    pub low: Vec<f64>,
-    pub combos: Vec<RangeFilterParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_filter_batch_unified)]
-pub fn range_filter_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: RangeFilterBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    if data.is_empty() {
-        return Err(JsValue::from_str("Input data slice is empty"));
-    }
-
-    let sweep = RangeFilterBatchRange {
-        range_size: cfg.range_size,
-        range_period: cfg.range_period,
-        smooth_range: Some(cfg.smooth_range),
-        smooth_period: Some(cfg.smooth_period),
-    };
-
-    let out = range_filter_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(out.rows * out.cols * 3);
-    values.extend_from_slice(&out.filter_values);
-    values.extend_from_slice(&out.high_band_values);
-    values.extend_from_slice(&out.low_band_values);
-
-    let obj = js_sys::Object::new();
-
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("values"),
-        &serde_wasm_bindgen::to_value(&values).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("filter"),
-        &serde_wasm_bindgen::to_value(&out.filter_values).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("high_band"),
-        &serde_wasm_bindgen::to_value(&out.high_band_values).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("low_band"),
-        &serde_wasm_bindgen::to_value(&out.low_band_values).unwrap(),
-    )?;
-
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-
-    Ok(obj.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct RangeFilterDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl RangeFilterDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyBufferError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyBufferError::new_err(
-                            "__dlpack__: requested device does not match producer buffer",
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        if let Some(copy_obj) = copy.as_ref() {
-            let do_copy: bool = copy_obj.extract(py)?;
-            if do_copy {
-                return Err(PyBufferError::new_err(
-                    "__dlpack__(copy=True) not supported for range_filter CUDA buffers",
-                ));
-            }
-        }
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "range_filter_cuda_batch_dev")]
-#[pyo3(signature = (data_f32,
-                    range_size_start=2.618, range_size_end=2.618, range_size_step=0.1,
-                    range_period_start=14, range_period_end=14, range_period_step=1,
-                    smooth_range=true, smooth_period=27, device_id=0))]
-pub fn range_filter_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    range_size_start: f64,
-    range_size_end: f64,
-    range_size_step: f64,
-    range_period_start: usize,
-    range_period_end: usize,
-    range_period_step: usize,
-    smooth_range: bool,
-    smooth_period: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sweep = RangeFilterBatchRange {
-        range_size: (range_size_start, range_size_end, range_size_step),
-        range_period: (range_period_start, range_period_end, range_period_step),
-        smooth_range: Some(smooth_range),
-        smooth_period: Some(smooth_period),
-    };
-    let slice_in: &[f32] = data_f32.as_slice()?;
-    let (dev_trio, combos) = py.allow_threads(|| {
-        let cuda =
-            CudaRangeFilter::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.range_filter_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "filter",
-        Py::new(
-            py,
-            RangeFilterDeviceArrayF32Py {
-                buf: Some(dev_trio.filter),
-                rows: dev_trio.rows,
-                cols: dev_trio.cols,
-                _ctx: dev_trio.ctx.clone(),
-                device_id: dev_trio.device_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "high",
-        Py::new(
-            py,
-            RangeFilterDeviceArrayF32Py {
-                buf: Some(dev_trio.high),
-                rows: dev_trio.rows,
-                cols: dev_trio.cols,
-                _ctx: dev_trio.ctx.clone(),
-                device_id: dev_trio.device_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "low",
-        Py::new(
-            py,
-            RangeFilterDeviceArrayF32Py {
-                buf: Some(dev_trio.low),
-                rows: dev_trio.rows,
-                cols: dev_trio.cols,
-                _ctx: dev_trio.ctx.clone(),
-                device_id: dev_trio.device_id,
-            },
-        )?,
-    )?;
-
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", slice_in.len())?;
-    use numpy::IntoPyArray;
-    dict.set_item(
-        "range_sizes",
-        combos
-            .iter()
-            .map(|c| c.range_size.unwrap_or(2.618))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "range_periods",
-        combos
-            .iter()
-            .map(|c| c.range_period.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_range",
-        combos
-            .iter()
-            .map(|c| c.smooth_range.unwrap_or(true))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_periods",
-        combos
-            .iter()
-            .map(|c| c.smooth_period.unwrap_or(27) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "range_filter_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, range_size=2.618, range_period=14, smooth_range=true, smooth_period=27, device_id=0))]
-pub fn range_filter_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    range_size: f64,
-    range_period: usize,
-    smooth_range: bool,
-    smooth_period: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = RangeFilterParams {
-        range_size: Some(range_size),
-        range_period: Some(range_period),
-        smooth_range: Some(smooth_range),
-        smooth_period: Some(smooth_period),
-    };
-    let dev_trio = py.allow_threads(|| {
-        let cuda =
-            CudaRangeFilter::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.range_filter_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "filter",
-        Py::new(
-            py,
-            RangeFilterDeviceArrayF32Py {
-                buf: Some(dev_trio.filter),
-                rows: dev_trio.rows,
-                cols: dev_trio.cols,
-                _ctx: dev_trio.ctx.clone(),
-                device_id: dev_trio.device_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "high",
-        Py::new(
-            py,
-            RangeFilterDeviceArrayF32Py {
-                buf: Some(dev_trio.high),
-                rows: dev_trio.rows,
-                cols: dev_trio.cols,
-                _ctx: dev_trio.ctx.clone(),
-                device_id: dev_trio.device_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "low",
-        Py::new(
-            py,
-            RangeFilterDeviceArrayF32Py {
-                buf: Some(dev_trio.low),
-                rows: dev_trio.rows,
-                cols: dev_trio.cols,
-                _ctx: dev_trio.ctx.clone(),
-                device_id: dev_trio.device_id,
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("range_size", range_size)?;
-    dict.set_item("range_period", range_period)?;
-    dict.set_item("smooth_range", smooth_range)?;
-    dict.set_item("smooth_period", smooth_period)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_filter_batch)]
-pub fn range_filter_batch_js(
-    data: &[f64],
-    range_size_start: f64,
-    range_size_end: f64,
-    range_size_step: f64,
-    range_period_start: usize,
-    range_period_end: usize,
-    range_period_step: usize,
-    smooth_range: bool,
-    smooth_period: usize,
-) -> Result<JsValue, JsValue> {
-    let sweep = RangeFilterBatchRange {
-        range_size: (range_size_start, range_size_end, range_size_step),
-        range_period: (range_period_start, range_period_end, range_period_step),
-        smooth_range: Some(smooth_range),
-        smooth_period: Some(smooth_period),
-    };
-
-    let output = range_filter_batch_slice(data, &sweep, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = serde_json::json!({
-        "filter": output.filter_values,
-        "high": output.high_band_values,
-        "low": output.low_band_values,
-        "rows": output.rows,
-        "cols": output.cols,
-        "combos": output.combos.iter().map(|c| {
-            serde_json::json!({
-                "range_size": c.range_size,
-                "range_period": c.range_period,
-                "smooth_range": c.smooth_range,
-                "smooth_period": c.smooth_period
-            })
-        }).collect::<Vec<_>>()
-    });
-
-    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_filter_batch_into)]
-pub fn range_filter_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    range_size_start: f64,
-    range_size_end: f64,
-    range_size_step: f64,
-    range_period_start: usize,
-    range_period_end: usize,
-    range_period_step: usize,
-    smooth_range: bool,
-    smooth_period: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to range_filter_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = RangeFilterBatchRange {
-            range_size: (range_size_start, range_size_end, range_size_step),
-            range_period: (range_period_start, range_period_end, range_period_step),
-            smooth_range: Some(smooth_range),
-            smooth_period: Some(smooth_period),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let total = rows
-            .checked_mul(cols)
-            .and_then(|v| v.checked_mul(3))
-            .ok_or_else(|| {
-                JsValue::from_str("range_filter_batch_into: rows*cols*3 overflowed usize")
-            })?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let (filter_out, rest) = out.split_at_mut(rows * cols);
-        let (high_out, low_out) = rest.split_at_mut(rows * cols);
-
-        range_filter_batch_inner_into(
-            data,
-            &combos,
-            detect_best_kernel(),
-            false,
-            filter_out,
-            high_out,
-            low_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_filter_into_flat)]
-pub fn range_filter_into_flat(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    range_size: f64,
-    range_period: usize,
-    smooth_range: bool,
-    smooth_period: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 3 * len);
-
-        let params = RangeFilterParams {
-            range_size: Some(range_size),
-            range_period: Some(range_period),
-            smooth_range: Some(smooth_range),
-            smooth_period: Some(smooth_period),
-        };
-        let input = RangeFilterInput::from_slice(data, params);
-
-        let (f, rest) = out.split_at_mut(len);
-        let (h, l) = rest.split_at_mut(len);
-        range_filter_into_slice(f, h, l, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct RangeFilterStream {
     range_size: f64,
@@ -2275,112 +1536,19 @@ impl RangeFilterBuilder {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyclass(name = "RangeFilterStream")]
-pub struct RangeFilterStreamPy {
-    stream: RangeFilterStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RangeFilterStreamPy {
-    #[new]
-    fn new(
-        range_size: f64,
-        range_period: usize,
-        smooth_range: bool,
-        smooth_period: usize,
-    ) -> PyResult<Self> {
-        let params = RangeFilterParams {
-            range_size: Some(range_size),
-            range_period: Some(range_period),
-            smooth_range: Some(smooth_range),
-            smooth_period: Some(smooth_period),
-        };
-        let stream =
-            RangeFilterStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(RangeFilterStreamPy { stream })
-    }
-
-    fn update(&mut self, price: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(price)
-    }
-
-    fn current_value(&self) -> Option<(f64, f64, f64)> {
-        self.stream.current_value()
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_filter_output_into_js(
-    data: &[f64],
-    range_size: Option<f64>,
-    range_period: Option<usize>,
-    smooth_range: Option<bool>,
-    smooth_period: Option<usize>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_filter_js(data, range_size, range_period, smooth_range, smooth_period)?;
-    crate::write_wasm_object_f64_outputs("range_filter_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_filter_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_filter_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "range_filter_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_filter_batch_output_into_js(
-    data: &[f64],
-    range_size_start: f64,
-    range_size_end: f64,
-    range_size_step: f64,
-    range_period_start: usize,
-    range_period_end: usize,
-    range_period_step: usize,
-    smooth_range: bool,
-    smooth_period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_filter_batch_js(
-        data,
-        range_size_start,
-        range_size_end,
-        range_size_step,
-        range_period_start,
-        range_period_end,
-        range_period_step,
-        smooth_range,
-        smooth_period,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs("range_filter_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::{read_candles_from_csv, Candles};
+    use crate::utilities::data_loader::{Candles, read_candles_from_vortex};
     use paste::paste;
     use std::error::Error;
 
     fn check_range_filter_accuracy(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let input = RangeFilterInput::with_default_candles(&candles);
         let result = range_filter_with_kernel(&input, kernel)?;
 
@@ -2467,8 +1635,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = RangeFilterBuilder::new().kernel(kernel).apply(&c)?;
         assert_eq!(out.filter.len(), c.close.len());
         assert_eq!(out.high_band.len(), c.close.len());
@@ -2684,8 +1852,8 @@ mod tests {
     fn check_range_filter_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = RangeFilterBuilder::new().kernel(kernel).apply(&c)?;
 
         for &v in out
@@ -2709,8 +1877,8 @@ mod tests {
     }
 
     fn check_rf_partial_params(_name: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let params = RangeFilterParams {
             range_size: None,
             range_period: None,
@@ -2724,8 +1892,8 @@ mod tests {
     }
 
     fn check_rf_default_candles(_name: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = RangeFilterInput::with_default_candles(&c);
         if let RangeFilterData::Candles { source, .. } = input.data {
             assert_eq!(source, "close");
@@ -2769,8 +1937,8 @@ mod tests {
     }
 
     fn check_rf_nan_handling(_name: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = RangeFilterInput::from_candles(&c, "close", RangeFilterParams::default());
         let out = range_filter_with_kernel(&input, k)?;
 
@@ -2839,8 +2007,8 @@ mod tests {
     }
 
     fn check_rf_batch_default_row(_name: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = RangeFilterBatchBuilder::new()
             .kernel(k)
             .apply_candles(&c, "close")?;
@@ -2852,8 +2020,8 @@ mod tests {
 
     #[test]
     fn test_range_filter_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let input = RangeFilterInput::with_default_candles(&candles);
 
         let baseline = range_filter(&input)?;
@@ -2944,8 +2112,8 @@ mod tests {
 
     fn check_range_filter_reinput(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let first = range_filter_with_kernel(&RangeFilterInput::with_default_candles(&c), kernel)?;
 
@@ -3035,8 +2203,8 @@ mod tests {
     fn check_range_filter_batch_default(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = RangeFilterBatchBuilder::new()
             .kernel(kernel)
             .apply_slice(&c.close)?;
@@ -3185,8 +2353,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = RangeFilterBatchBuilder::new()
             .kernel(kernel)
             .apply_slice(&c.close)?;

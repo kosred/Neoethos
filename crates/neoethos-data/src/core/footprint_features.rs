@@ -28,7 +28,28 @@
 //! stay usable; the fix-window flag works regardless.
 
 use super::super::Ohlcv;
-use crate::core::timestamps::{infer_timestamp_unit, timestamp_to_millis};
+use crate::core::features::{FeatureCellValidity, FeatureColumnF64};
+use crate::core::timestamps::{
+    infer_timestamp_unit, timestamp_to_millis, validate_canonical_millisecond_timestamps,
+};
+use anyhow::{Result, ensure};
+
+/// Versioned CPU oracle consumed by the resident CUDA Footprint-v2 producer.
+/// Changing any output name, rolling boundary, validity reason, timestamp
+/// window, denominator threshold, clamp, or f64 evaluation order requires a
+/// new semantic version and an explicit artifact migration.
+pub const FOOTPRINT_SEMANTIC_VERSION: u32 = 2;
+pub const FOOTPRINT_CPU_ORACLE_AUTHORITY_V2: &str =
+    "neoethos.data.footprint.cpu-oracle.f64.semantic-v2";
+pub const FOOTPRINT_FEATURE_NAMES: [&str; 7] = [
+    "fp_volume_z",
+    "fp_absorption",
+    "fp_effort_result_div",
+    "fp_climax",
+    "fp_delta_proxy",
+    "fp_volprice_corr",
+    "fp_fix_window",
+];
 
 /// Rolling mean/std over a fixed window using cumulative sums — O(n) total.
 struct Rolling {
@@ -74,7 +95,11 @@ fn prefix_sums(values: &[f64]) -> (Vec<f64>, Vec<f64>) {
 }
 
 fn z(v: f64, mean: f64, std: f64) -> f64 {
-    if std > 1e-12 { ((v - mean) / std).clamp(-6.0, 6.0) } else { 0.0 }
+    if std > 1e-12 {
+        ((v - mean) / std).clamp(-6.0, 6.0)
+    } else {
+        0.0
+    }
 }
 
 pub fn compute_footprint_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
@@ -92,19 +117,31 @@ pub fn compute_footprint_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>
         const CORR_W: usize = 48;
         const DELTA_W: usize = 24;
 
-        let volume: Vec<f64> = ohlcv
-            .volume
-            .clone()
-            .unwrap_or_else(|| vec![0.0; n]);
+        let volume: Vec<f64> = ohlcv.volume.clone().unwrap_or_else(|| vec![0.0; n]);
         let has_volume = volume.iter().any(|v| *v > 0.0);
 
-        let range: Vec<f64> = (0..n).map(|i| (ohlcv.high[i] - ohlcv.low[i]).abs()).collect();
+        let range: Vec<f64> = (0..n)
+            .map(|i| (ohlcv.high[i] - ohlcv.low[i]).abs())
+            .collect();
         let abs_ret: Vec<f64> = (0..n)
-            .map(|i| if i == 0 { 0.0 } else { (ohlcv.close[i] - ohlcv.close[i - 1]).abs() })
+            .map(|i| {
+                if i == 0 {
+                    0.0
+                } else {
+                    (ohlcv.close[i] - ohlcv.close[i - 1]).abs()
+                }
+            })
             .collect();
         let signed_vol: Vec<f64> = (0..n)
             .map(|i| {
-                let dir = (ohlcv.close[i] - ohlcv.open[i]).signum();
+                let change = ohlcv.close[i] - ohlcv.open[i];
+                let dir = if change > 0.0 {
+                    1.0
+                } else if change < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
                 volume[i] * dir
             })
             .collect();
@@ -138,7 +175,11 @@ pub fn compute_footprint_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>
                 vol_z[i] = vz;
                 // Absorption: effort up, result down. Positive only when volume
                 // is above its norm AND the bar range is below its norm.
-                absorption[i] = if vz > 0.0 && rz < 0.0 { vz * (-rz) } else { 0.0 };
+                absorption[i] = if vz > 0.0 && rz < 0.0 {
+                    vz * (-rz)
+                } else {
+                    0.0
+                };
                 effort_result[i] = vz - az;
                 // Climax: both effort and result extreme, signed by direction.
                 climax[i] = if vz > 0.0 && rz > 0.0 {
@@ -152,7 +193,11 @@ pub fn compute_footprint_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>
                 let start = end.saturating_sub(DELTA_W);
                 let d = dp[end] - dp[start];
                 let v_sum = vp[end] - vp[start];
-                delta_proxy[i] = if v_sum > 1e-12 { (d / v_sum).clamp(-1.0, 1.0) } else { 0.0 };
+                delta_proxy[i] = if v_sum > 1e-12 {
+                    (d / v_sum).clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
                 // Rolling corr(volume, |ret|) over CORR_W via E[xy]-E[x]E[y].
                 let cend = i + 1;
                 let cstart = cend.saturating_sub(CORR_W);
@@ -181,21 +226,203 @@ pub fn compute_footprint_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>
                     let minute_of_day = (ms / 60_000).rem_euclid(1440);
                     let in_winter_fix = (945..=975).contains(&minute_of_day); // 15:45–16:15
                     let in_summer_fix = (885..=915).contains(&minute_of_day); // 14:45–15:15
-                    fix_window[i] = if in_winter_fix || in_summer_fix { 1.0 } else { 0.0 };
+                    fix_window[i] = if in_winter_fix || in_summer_fix {
+                        1.0
+                    } else {
+                        0.0
+                    };
                 }
             }
         }
     }
 
     vec![
-        ("fp_volume_z".to_string(), vol_z),
-        ("fp_absorption".to_string(), absorption),
-        ("fp_effort_result_div".to_string(), effort_result),
-        ("fp_climax".to_string(), climax),
-        ("fp_delta_proxy".to_string(), delta_proxy),
-        ("fp_volprice_corr".to_string(), volprice_corr),
-        ("fp_fix_window".to_string(), fix_window),
+        (FOOTPRINT_FEATURE_NAMES[0].to_string(), vol_z),
+        (FOOTPRINT_FEATURE_NAMES[1].to_string(), absorption),
+        (FOOTPRINT_FEATURE_NAMES[2].to_string(), effort_result),
+        (FOOTPRINT_FEATURE_NAMES[3].to_string(), climax),
+        (FOOTPRINT_FEATURE_NAMES[4].to_string(), delta_proxy),
+        (FOOTPRINT_FEATURE_NAMES[5].to_string(), volprice_corr),
+        (FOOTPRINT_FEATURE_NAMES[6].to_string(), fix_window),
     ]
+}
+
+/// Explicit-validity f64 Footprint lane.
+///
+/// The legacy function above remains temporarily for the atomic Tasks 5B-9
+/// migration, but this path no longer represents absent volume, rolling
+/// warmup, or zero variance as a usable numeric zero. It also accepts only the
+/// canonical millisecond timestamp contract; unit inference is confined to
+/// the legacy/import boundary.
+pub fn compute_footprint_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureColumnF64>> {
+    let n = ohlcv.len();
+    ensure!(
+        ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
+        "Footprint OHLC lengths do not match close length {n}"
+    );
+    ensure!(n > 0, "Footprint requires at least one OHLC row");
+    for (name, values) in [
+        ("open", &ohlcv.open),
+        ("high", &ohlcv.high),
+        ("low", &ohlcv.low),
+        ("close", &ohlcv.close),
+    ] {
+        if let Some((row, value)) = values
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            anyhow::bail!("Footprint {name} row {row} is non-finite: {value}");
+        }
+    }
+
+    let timestamps_valid = if let Some(timestamps) = ohlcv.timestamp.as_ref() {
+        ensure!(
+            timestamps.len() == n,
+            "Footprint timestamp length {} does not match OHLC length {n}",
+            timestamps.len()
+        );
+        validate_canonical_millisecond_timestamps(timestamps)?;
+        true
+    } else {
+        false
+    };
+
+    let volume = if let Some(volume) = ohlcv.volume.as_ref() {
+        ensure!(
+            volume.len() == n,
+            "Footprint volume length {} does not match OHLC length {n}",
+            volume.len()
+        );
+        if let Some((row, value)) = volume
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            anyhow::bail!("Footprint volume row {row} is invalid: {value}");
+        }
+        Some(volume.as_slice())
+    } else {
+        None
+    };
+
+    let mut vol_z_validity = vec![FeatureCellValidity::MissingInput; n];
+    let mut absorption_validity = vec![FeatureCellValidity::MissingInput; n];
+    let mut effort_validity = vec![FeatureCellValidity::MissingInput; n];
+    let mut climax_validity = vec![FeatureCellValidity::MissingInput; n];
+    let mut delta_validity = vec![FeatureCellValidity::MissingInput; n];
+    let mut corr_validity = vec![FeatureCellValidity::MissingInput; n];
+
+    if let Some(volume) = volume {
+        const W: usize = 96;
+        const CORR_W: usize = 48;
+        const DELTA_W: usize = 24;
+        const EPS: f64 = 1e-12;
+
+        let range: Vec<f64> = (0..n)
+            .map(|row| (ohlcv.high[row] - ohlcv.low[row]).abs())
+            .collect();
+        let abs_ret: Vec<f64> = (0..n)
+            .map(|row| {
+                if row == 0 {
+                    0.0
+                } else {
+                    (ohlcv.close[row] - ohlcv.close[row - 1]).abs()
+                }
+            })
+            .collect();
+        let volume_values = volume.to_vec();
+        let (vp, vps) = prefix_sums(&volume_values);
+        let (rp, rps) = prefix_sums(&range);
+        let (ap, aps) = prefix_sums(&abs_ret);
+        let rolling_volume = Rolling::new(W, volume_values);
+        let rolling_range = Rolling::new(W, range);
+        let rolling_abs_ret = Rolling::new(W, abs_ret);
+
+        for row in 0..n {
+            if row == 0 {
+                vol_z_validity[row] = FeatureCellValidity::Warmup;
+                absorption_validity[row] = FeatureCellValidity::Warmup;
+                effort_validity[row] = FeatureCellValidity::Warmup;
+                climax_validity[row] = FeatureCellValidity::Warmup;
+            } else {
+                let (_, volume_std) = rolling_volume.mean_std(row, &vp, &vps);
+                let (_, range_std) = rolling_range.mean_std(row, &rp, &rps);
+                let (_, abs_ret_std) = rolling_abs_ret.mean_std(row, &ap, &aps);
+                vol_z_validity[row] = if volume_std > EPS {
+                    FeatureCellValidity::Valid
+                } else {
+                    FeatureCellValidity::ZeroDenominator
+                };
+                absorption_validity[row] = if volume_std > EPS && range_std > EPS {
+                    FeatureCellValidity::Valid
+                } else {
+                    FeatureCellValidity::ZeroDenominator
+                };
+                effort_validity[row] = if volume_std > EPS && abs_ret_std > EPS {
+                    FeatureCellValidity::Valid
+                } else {
+                    FeatureCellValidity::ZeroDenominator
+                };
+                climax_validity[row] = absorption_validity[row];
+            }
+
+            let end = row + 1;
+            let delta_start = end.saturating_sub(DELTA_W);
+            let volume_sum = vp[end] - vp[delta_start];
+            delta_validity[row] = if volume_sum > EPS {
+                FeatureCellValidity::Valid
+            } else {
+                FeatureCellValidity::ZeroDenominator
+            };
+
+            let corr_start = end.saturating_sub(CORR_W);
+            let count = (end - corr_start) as f64;
+            corr_validity[row] = if count < 8.0 {
+                FeatureCellValidity::Warmup
+            } else {
+                let ex = (vp[end] - vp[corr_start]) / count;
+                let ey = (ap[end] - ap[corr_start]) / count;
+                let vx = ((vps[end] - vps[corr_start]) / count - ex * ex).max(0.0);
+                let vy = ((aps[end] - aps[corr_start]) / count - ey * ey).max(0.0);
+                if (vx * vy).sqrt() > EPS {
+                    FeatureCellValidity::Valid
+                } else {
+                    FeatureCellValidity::ZeroDenominator
+                }
+            };
+        }
+    }
+
+    let fix_validity = vec![
+        if timestamps_valid {
+            FeatureCellValidity::Valid
+        } else {
+            FeatureCellValidity::MissingInput
+        };
+        n
+    ];
+    let mut validity_by_name = std::collections::HashMap::from([
+        ("fp_volume_z", vol_z_validity),
+        ("fp_absorption", absorption_validity),
+        ("fp_effort_result_div", effort_validity),
+        ("fp_climax", climax_validity),
+        ("fp_delta_proxy", delta_validity),
+        ("fp_volprice_corr", corr_validity),
+        ("fp_fix_window", fix_validity),
+    ]);
+
+    compute_footprint_feature_columns(ohlcv)
+        .into_iter()
+        .map(|(name, values)| {
+            let validity = validity_by_name
+                .remove(name.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing Footprint validity plan for `{name}`"))?;
+            FeatureColumnF64::new(name, values, validity)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -205,7 +432,11 @@ mod tests {
     fn ohlcv_with_volume(closes: &[f64], vols: &[f64]) -> Ohlcv {
         let n = closes.len();
         Ohlcv {
-            timestamp: Some((0..n as i64).map(|i| 1_700_000_000_000 + i * 900_000).collect()),
+            timestamp: Some(
+                (0..n as i64)
+                    .map(|i| 1_700_000_000_000 + i * 900_000)
+                    .collect(),
+            ),
             open: closes.to_vec(),
             high: closes.iter().map(|c| c + 0.001).collect(),
             low: closes.iter().map(|c| c - 0.001).collect(),
@@ -221,7 +452,10 @@ mod tests {
         assert_eq!(cols.len(), 7);
         for (name, col) in &cols {
             assert_eq!(col.len(), 4, "{name} wrong length");
-            assert!(col.iter().all(|v| v.is_finite()), "{name} has non-finite values");
+            assert!(
+                col.iter().all(|v| v.is_finite()),
+                "{name} has non-finite values"
+            );
         }
     }
 
@@ -232,7 +466,10 @@ mod tests {
         let cols = compute_footprint_feature_columns(&o);
         for (name, col) in &cols {
             if name != "fp_fix_window" {
-                assert!(col.iter().all(|v| *v == 0.0), "{name} must be neutral without volume");
+                assert!(
+                    col.iter().all(|v| *v == 0.0),
+                    "{name} must be neutral without volume"
+                );
             }
         }
     }
@@ -252,7 +489,95 @@ mod tests {
         // may be 0; but volume_z must spike. Check volume_z instead as the
         // guaranteed signal, and absorption non-negativity everywhere.
         let vol_z = &cols.iter().find(|(n, _)| n == "fp_volume_z").unwrap().1;
-        assert!(vol_z[n - 1] > 3.0, "10× volume must be a >3σ event, got {}", vol_z[n - 1]);
+        assert!(
+            vol_z[n - 1] > 3.0,
+            "10× volume must be a >3σ event, got {}",
+            vol_z[n - 1]
+        );
         assert!(absorption.iter().all(|v| *v >= 0.0));
+    }
+
+    #[test]
+    fn semantic_v2_cpu_oracle_freezes_schema_and_f64_row() {
+        assert_eq!(FOOTPRINT_SEMANTIC_VERSION, 2);
+        assert_eq!(
+            FOOTPRINT_FEATURE_NAMES,
+            [
+                "fp_volume_z",
+                "fp_absorption",
+                "fp_effort_result_div",
+                "fp_climax",
+                "fp_delta_proxy",
+                "fp_volprice_corr",
+                "fp_fix_window",
+            ]
+        );
+
+        let ohlcv = Ohlcv {
+            timestamp: Some(
+                (0..8)
+                    .map(|minute| 1_704_206_640_000_i64 + minute * 60_000)
+                    .collect(),
+            ),
+            open: vec![99.5, 100.0, 101.0, 100.5, 102.0, 101.0, 103.0, 102.0],
+            high: vec![100.3, 101.4, 101.2, 102.5, 102.4, 103.6, 103.3, 105.8],
+            low: vec![99.2, 99.7, 100.2, 100.1, 100.6, 100.7, 101.6, 101.5],
+            close: vec![100.0, 101.0, 100.5, 102.0, 101.0, 103.0, 102.0, 105.0],
+            volume: Some(vec![10.0, 12.0, 8.0, 20.0, 15.0, 30.0, 18.0, 40.0]),
+        };
+        let columns = compute_footprint_feature_columns_f64(&ohlcv).expect("semantic-v2 oracle");
+        assert_eq!(columns.len(), FOOTPRINT_FEATURE_NAMES.len());
+        for (column, expected_name) in columns.iter().zip(FOOTPRINT_FEATURE_NAMES) {
+            assert_eq!(column.name, expected_name);
+        }
+
+        let expected_row_7_bits = [
+            0x4000_6304_00d2_59eb,
+            0x0000_0000_0000_0000,
+            0x3f9c_48d1_fa16_9900,
+            0x4011_b71c_3122_deda,
+            0x3fdd_b308_5db3_085e,
+            0x3fee_b499_f2a5_be7b,
+            0x3ff0_0000_0000_0000,
+        ];
+        for (column, expected_bits) in columns.iter().zip(expected_row_7_bits) {
+            assert_eq!(column.validity[7], FeatureCellValidity::Valid);
+            assert_eq!(column.values[7].to_bits(), expected_bits, "{}", column.name);
+        }
+    }
+
+    #[test]
+    fn semantic_v2_cpu_oracle_freezes_warmup_and_fix_boundaries() {
+        let ohlcv = Ohlcv {
+            timestamp: Some(
+                (0..8)
+                    .map(|minute| 1_704_206_640_000_i64 + minute * 60_000)
+                    .collect(),
+            ),
+            open: vec![1.0; 8],
+            high: (0..8).map(|row| 1.1 + row as f64 * 0.01).collect(),
+            low: vec![0.9; 8],
+            close: (0..8).map(|row| 1.0 + row as f64 * 0.01).collect(),
+            volume: Some((1..=8).map(|value| value as f64).collect()),
+        };
+        let columns = compute_footprint_feature_columns_f64(&ohlcv).expect("semantic-v2 oracle");
+        for column in &columns[..4] {
+            assert_eq!(column.validity[0], FeatureCellValidity::Warmup);
+            assert!(column.values[0].is_nan());
+        }
+        let correlation = &columns[5];
+        assert!(
+            correlation.validity[..7]
+                .iter()
+                .all(|validity| *validity == FeatureCellValidity::Warmup)
+        );
+        let fix = &columns[6];
+        assert_eq!(fix.values[0], 0.0);
+        assert!(fix.values[1..].iter().all(|value| *value == 1.0));
+        assert!(
+            fix.validity
+                .iter()
+                .all(|validity| *validity == FeatureCellValidity::Valid)
+        );
     }
 }

@@ -1,156 +1,11 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaEhlersEcema;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-mod ecema_python_cuda_handle {
-    use super::*;
-    use cust::context::Context;
-    use cust::memory::DeviceBuffer;
-    use pyo3::exceptions::PyValueError;
-    use pyo3::prelude::*;
-    use pyo3::types::PyDict;
-    use std::ffi::c_void;
-    use std::sync::Arc;
-
-    #[pyclass(module = "vector_ta", unsendable, name = "DeviceArrayF32Py")]
-    pub struct DeviceArrayF32Py {
-        pub(crate) buf: Option<DeviceBuffer<f32>>,
-        pub(crate) rows: usize,
-        pub(crate) cols: usize,
-        pub(crate) _ctx: Arc<Context>,
-        pub(crate) device_id: u32,
-    }
-
-    #[pymethods]
-    impl DeviceArrayF32Py {
-        #[getter]
-        fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-            let d = PyDict::new(py);
-
-            d.set_item("shape", (self.rows, self.cols))?;
-            d.set_item("typestr", "<f4")?;
-            d.set_item(
-                "strides",
-                (
-                    self.cols * std::mem::size_of::<f32>(),
-                    std::mem::size_of::<f32>(),
-                ),
-            )?;
-            let ptr = self
-                .buf
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-                .as_device_ptr()
-                .as_raw() as usize;
-            d.set_item("data", (ptr, false))?;
-
-            d.set_item("version", 3)?;
-            Ok(d)
-        }
-
-        fn __dlpack_device__(&self) -> (i32, i32) {
-            let mut device_ordinal: i32 = self.device_id as i32;
-            unsafe {
-                let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-                let mut value = std::mem::MaybeUninit::<i32>::uninit();
-                let ptr = self
-                    .buf
-                    .as_ref()
-                    .map(|b| b.as_device_ptr().as_raw())
-                    .unwrap_or(0);
-                if ptr != 0 {
-                    let rc = cust::sys::cuPointerGetAttribute(
-                        value.as_mut_ptr() as *mut std::ffi::c_void,
-                        attr,
-                        ptr,
-                    );
-                    if rc == cust::sys::CUresult::CUDA_SUCCESS {
-                        device_ordinal = value.assume_init();
-                    }
-                }
-            }
-            (2, device_ordinal)
-        }
-
-        #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-        fn __dlpack__<'py>(
-            &mut self,
-            py: Python<'py>,
-            stream: Option<pyo3::PyObject>,
-            max_version: Option<pyo3::PyObject>,
-            dl_device: Option<pyo3::PyObject>,
-            copy: Option<pyo3::PyObject>,
-        ) -> PyResult<PyObject> {
-            use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-            let (kdl, alloc_dev) = self.__dlpack_device__();
-            if let Some(d) = dl_device.as_ref() {
-                if let Ok((dev_type, dev_id)) = d.extract::<(i32, i32)>(py) {
-                    if dev_type != kdl || dev_id != alloc_dev {
-                        let wants_copy = copy
-                            .as_ref()
-                            .and_then(|c| c.extract::<bool>(py).ok())
-                            .unwrap_or(false);
-                        if wants_copy {
-                            return Err(PyValueError::new_err(
-                                "device copy not implemented for __dlpack__",
-                            ));
-                        } else {
-                            return Err(PyValueError::new_err(
-                                "__dlpack__: requested device does not match producer buffer",
-                            ));
-                        }
-                    }
-                }
-            }
-
-            let _ = stream;
-
-            let buf = self
-                .buf
-                .take()
-                .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-            let rows = self.rows;
-            let cols = self.cols;
-
-            let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-            export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-        }
-    }
-
-    pub use DeviceArrayF32Py as EcemaDeviceArrayF32Py;
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
-use crate::indicators::moving_averages::ema::{ema, ema_into_slice, EmaInput, EmaParams};
+use crate::indicators::moving_averages::ema::{EmaInput, EmaParams, ema, ema_into_slice};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -188,10 +43,6 @@ pub struct EhlersEcemaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersEcemaParams {
     pub length: Option<usize>,
     pub gain_limit: Option<usize>,
@@ -714,7 +565,6 @@ pub fn ehlers_ecema_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ehlers_ecema_into(
     input: &EhlersEcemaInput,
@@ -765,11 +615,7 @@ unsafe fn ehlers_ecema_scalar_into_with_mode(
         let ema_i = *ema_ptr.add(i);
 
         let prev_ec = if i == start_idx {
-            if pine_compatible {
-                0.0
-            } else {
-                ema_i
-            }
+            if pine_compatible { 0.0 } else { ema_i }
         } else {
             *out_ptr.add(i - 1)
         };
@@ -807,11 +653,7 @@ unsafe fn ehlers_ecema_scalar_into_with_mode(
                 let e0 = (d - s * (k0 as f64)).abs();
                 let e1 = (d - s * (k1 as f64)).abs();
 
-                if e0 <= e1 {
-                    k0
-                } else {
-                    k1
-                }
+                if e0 <= e1 { k0 } else { k1 }
             }
         };
 
@@ -903,11 +745,7 @@ unsafe fn ehlers_ecema_scalar_direct_into_with_mode(
                 let e0 = (d - s * (k0 as f64)).abs();
                 let e1 = (d - s * (k1 as f64)).abs();
 
-                if e0 <= e1 {
-                    k0
-                } else {
-                    k1
-                }
+                if e0 <= e1 { k0 } else { k1 }
             }
         };
 
@@ -1430,11 +1268,7 @@ impl EhlersEcemaStream {
     fn round_nearest_tie_down(x: f64) -> i32 {
         let f = x.floor();
         let r = x - f;
-        if r > 0.5 {
-            (f + 1.0) as i32
-        } else {
-            f as i32
-        }
+        if r > 0.5 { (f + 1.0) as i32 } else { f as i32 }
     }
 
     #[inline(always)]
@@ -1525,486 +1359,11 @@ impl EhlersEcemaStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_ecema")]
-#[pyo3(signature = (data, length=20, gain_limit=50, pine_compatible=false, confirmed_only=false, kernel=None))]
-pub fn ehlers_ecema_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    gain_limit: usize,
-    pine_compatible: bool,
-    confirmed_only: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let owned_if_needed: Option<Vec<f64>> = match data.as_slice() {
-        Ok(_) => None,
-        Err(_) => Some(data.as_array().to_owned().into_raw_vec()),
-    };
-    let slice_in: &[f64] = match &owned_if_needed {
-        Some(v) => v.as_slice(),
-        None => data.as_slice()?,
-    };
-    let kern = validate_kernel(kernel, false)?;
-    let params = EhlersEcemaParams {
-        length: Some(length),
-        gain_limit: Some(gain_limit),
-        pine_compatible: Some(pine_compatible),
-        confirmed_only: Some(confirmed_only),
-    };
-    let input = EhlersEcemaInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| ehlers_ecema_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_ecema_batch")]
-#[pyo3(signature = (data, length_range, gain_limit_range, kernel=None))]
-pub fn ehlers_ecema_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    gain_limit_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let sweep = EhlersEcemaBatchRange {
-        length: length_range,
-        gain_limit: gain_limit_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        let simd = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        ehlers_ecema_batch_inner_into(slice_in, &sweep, simd, true, out_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap_or(20) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "gain_limits",
-        combos
-            .iter()
-            .map(|p| p.gain_limit.unwrap_or(50) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ehlers_ecema_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, length_range, gain_limit_range, pine_compatible=false, confirmed_only=false, device_id=0))]
-pub fn ehlers_ecema_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    length_range: (usize, usize, usize),
-    gain_limit_range: (usize, usize, usize),
-    pine_compatible: bool,
-    confirmed_only: bool,
-    device_id: usize,
-) -> PyResult<ecema_python_cuda_handle::EcemaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = EhlersEcemaBatchRange {
-        length: length_range,
-        gain_limit: gain_limit_range,
-    };
-    let params = EhlersEcemaParams {
-        length: None,
-        gain_limit: None,
-        pine_compatible: Some(pine_compatible),
-        confirmed_only: Some(confirmed_only),
-    };
-
-    let (arr, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaEhlersEcema::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .ehlers_ecema_batch_dev(slice_in, &sweep, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(ecema_python_cuda_handle::EcemaDeviceArrayF32Py {
-        buf: Some(arr.buf),
-        rows: arr.rows,
-        cols: arr.cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ehlers_ecema_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, length=20, gain_limit=50, pine_compatible=false, confirmed_only=false, device_id=0))]
-pub fn ehlers_ecema_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    length: usize,
-    gain_limit: usize,
-    pine_compatible: bool,
-    confirmed_only: bool,
-    device_id: usize,
-) -> PyResult<ecema_python_cuda_handle::EcemaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in = data_tm_f32.as_slice()?;
-    let shape = data_tm_f32.shape();
-    let rows = shape[0];
-    let cols = shape[1];
-    let params = EhlersEcemaParams {
-        length: Some(length),
-        gain_limit: Some(gain_limit),
-        pine_compatible: Some(pine_compatible),
-        confirmed_only: Some(confirmed_only),
-    };
-
-    let (arr, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaEhlersEcema::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .ehlers_ecema_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(ecema_python_cuda_handle::EcemaDeviceArrayF32Py {
-        buf: Some(arr.buf),
-        rows: arr.rows,
-        cols: arr.cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersEcemaStream")]
-pub struct EhlersEcemaStreamPy {
-    inner: EhlersEcemaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersEcemaStreamPy {
-    #[new]
-    #[pyo3(signature = (length=20, gain_limit=50, pine_compatible=false, confirmed_only=false))]
-    pub fn new(
-        length: usize,
-        gain_limit: usize,
-        pine_compatible: bool,
-        confirmed_only: bool,
-    ) -> PyResult<Self> {
-        let params = EhlersEcemaParams {
-            length: Some(length),
-            gain_limit: Some(gain_limit),
-            pine_compatible: Some(pine_compatible),
-            confirmed_only: Some(confirmed_only),
-        };
-        let stream =
-            EhlersEcemaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner: stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        let y = self.inner.next(value);
-        if y.is_nan() {
-            None
-        } else {
-            Some(y)
-        }
-    }
-
-    pub fn next(&mut self, value: f64) -> Option<f64> {
-        self.update(value)
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset()
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersEcemaBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub gain_limit_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersEcemaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<EhlersEcemaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_ecema_js(
-    data: &[f64],
-    length: usize,
-    gain_limit: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = EhlersEcemaParams {
-        length: Some(length),
-        gain_limit: Some(gain_limit),
-        pine_compatible: Some(false),
-        confirmed_only: Some(false),
-    };
-    let input = EhlersEcemaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    ehlers_ecema_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_ecema_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_ecema_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_ecema_batch)]
-pub fn ehlers_ecema_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: EhlersEcemaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = EhlersEcemaBatchRange {
-        length: cfg.length_range,
-        gain_limit: cfg.gain_limit_range,
-    };
-
-    let out = ehlers_ecema_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = EhlersEcemaBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_ecema_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    gain_start: usize,
-    gain_end: usize,
-    gain_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = EhlersEcemaBatchRange {
-            length: (length_start, length_end, length_step),
-            gain_limit: (gain_start, gain_end, gain_step),
-        };
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("size overflow for rows*cols"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        ehlers_ecema_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_ecema_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    gain_limit: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_ecema_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if length == 0 || length > len {
-            return Err(JsValue::from_str("Invalid length"));
-        }
-
-        if gain_limit == 0 {
-            return Err(JsValue::from_str("Invalid gain limit"));
-        }
-
-        let params = EhlersEcemaParams {
-            length: Some(length),
-            gain_limit: Some(gain_limit),
-            pine_compatible: Some(false),
-            confirmed_only: Some(false),
-        };
-        let input = EhlersEcemaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            ehlers_ecema_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ehlers_ecema_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_ecema_into_ex)]
-pub fn ehlers_ecema_into_ex(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    gain_limit: usize,
-    pine_compatible: bool,
-    confirmed_only: bool,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_ecema_into_ex",
-        ));
-    }
-    if length == 0 || length > len {
-        return Err(JsValue::from_str("Invalid length"));
-    }
-    if gain_limit == 0 {
-        return Err(JsValue::from_str("Invalid gain limit"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = EhlersEcemaParams {
-            length: Some(length),
-            gain_limit: Some(gain_limit),
-            pine_compatible: Some(pine_compatible),
-            confirmed_only: Some(confirmed_only),
-        };
-        let input = EhlersEcemaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            ehlers_ecema_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ehlers_ecema_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_ecema_output_into_js(
-    data: &[f64],
-    length: usize,
-    gain_limit: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ehlers_ecema_js(data, length, gain_limit)?;
-    crate::write_wasm_f64_output("ehlers_ecema_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_ecema_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_ecema_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_ecema_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
@@ -2014,8 +1373,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = EhlersEcemaParams {
             length: None,
@@ -2032,8 +1391,8 @@ mod tests {
 
     fn check_ehlers_ecema_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = EhlersEcemaParams {
             length: Some(20),
@@ -2082,8 +1441,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = EhlersEcemaParams {
             length: Some(20),
@@ -2131,8 +1490,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EhlersEcemaInput::with_default_candles(&candles);
         match input.data {
@@ -2247,8 +1606,8 @@ mod tests {
 
     fn check_ehlers_ecema_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = EhlersEcemaParams {
             length: Some(10),
@@ -2311,8 +1670,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EhlersEcemaInput::from_candles(
             &candles,
@@ -2343,8 +1702,8 @@ mod tests {
     fn check_ehlers_ecema_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let length = 20;
         let gain_limit = 50;
@@ -2407,8 +1766,8 @@ mod tests {
     fn check_ehlers_ecema_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             EhlersEcemaParams::default(),
@@ -2629,8 +1988,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = EhlersEcemaBatchBuilder::new()
             .kernel(kernel)
@@ -2650,8 +2009,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = EhlersEcemaBatchBuilder::new()
             .kernel(kernel)
@@ -2671,8 +2030,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (10, 20, 5, 30, 50, 10),
@@ -2802,13 +2161,8 @@ mod tests {
 
         let mut out = vec![0.0f64; len];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             ehlers_ecema_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            ehlers_ecema_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());

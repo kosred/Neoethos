@@ -1,41 +1,19 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaOtt;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
 use crate::indicators::moving_averages::{
-    ema::{ema_with_kernel, EmaInput, EmaParams},
-    linreg::{linreg_with_kernel, LinRegInput, LinRegParams},
-    sma::{sma_with_kernel, SmaInput, SmaParams},
-    wma::{wma_with_kernel, WmaInput, WmaParams},
-    zlema::{zlema_with_kernel, ZlemaInput, ZlemaParams},
+    ema::{EmaInput, EmaParams, ema_with_kernel},
+    linreg::{LinRegInput, LinRegParams, linreg_with_kernel},
+    sma::{SmaInput, SmaParams, sma_with_kernel},
+    wma::{WmaInput, WmaParams, wma_with_kernel},
+    zlema::{ZlemaInput, ZlemaParams, zlema_with_kernel},
 };
-use crate::indicators::tsf::{tsf_with_kernel, TsfInput, TsfParams};
+use crate::indicators::tsf::{TsfInput, TsfParams, tsf_with_kernel};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -77,10 +55,6 @@ pub struct OttOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct OttParams {
     pub period: Option<usize>,
     pub percent: Option<f64>,
@@ -301,7 +275,6 @@ pub fn ott_with_kernel(input: &OttInput, kernel: Kernel) -> Result<OttOutput, Ot
     Ok(OttOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ott_into(input: &OttInput, out: &mut [f64]) -> Result<(), OttError> {
     ott_into_slice(out, input, Kernel::Auto)
@@ -1142,11 +1115,7 @@ impl OttStream {
 
         let cand_long = ma - offset;
         self.long_stop = if ma > lprev {
-            if cand_long > lprev {
-                cand_long
-            } else {
-                lprev
-            }
+            if cand_long > lprev { cand_long } else { lprev }
         } else {
             cand_long
         };
@@ -1736,529 +1705,19 @@ pub fn ott_batch_with_kernel(
     ott_batch_par_slice(data, sweep, kernel)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ott")]
-#[pyo3(signature = (data, period=2, percent=1.4, ma_type="VAR", kernel=None))]
-pub fn ott_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    percent: f64,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = OttParams {
-        period: Some(period),
-        percent: Some(percent),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = OttInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| ott_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "OttStream")]
-pub struct OttStreamPy {
-    stream: OttStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl OttStreamPy {
-    #[new]
-    fn new(period: usize, percent: f64, ma_type: &str) -> PyResult<Self> {
-        let params = OttParams {
-            period: Some(period),
-            percent: Some(percent),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let stream =
-            OttStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(OttStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ott_batch")]
-#[pyo3(signature = (data, period_range, percent_range, ma_types, kernel=None))]
-pub fn ott_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    percent_range: (f64, f64, f64),
-    ma_types: Vec<String>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let sweep = OttBatchRange {
-        period: period_range,
-        percent: percent_range,
-        ma_types,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid_ott(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            ott_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "percents",
-        combos
-            .iter()
-            .map(|p| p.percent.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    let types = PyList::new(py, combos.iter().map(|p| p.ma_type.as_deref().unwrap()))?;
-    dict.set_item("ma_types", types)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ott_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, percent_range, ma_types, device_id=0))]
-pub fn ott_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    percent_range: (f64, f64, f64),
-    ma_types: Vec<String>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = OttBatchRange {
-        period: period_range,
-        percent: percent_range,
-        ma_types,
-    };
-
-    let combos = expand_grid_ott(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let cols = slice_in.len();
-    for prm in &combos {
-        let p = prm.period.unwrap();
-        if p == 0 || p > cols {
-            return Err(PyValueError::new_err(
-                OttError::InvalidPeriod {
-                    period: p,
-                    data_len: cols,
-                }
-                .to_string(),
-            ));
-        }
-        let pct = prm.percent.unwrap();
-        if pct < 0.0 || !pct.is_finite() {
-            return Err(PyValueError::new_err(
-                OttError::InvalidPercent { percent: pct }.to_string(),
-            ));
-        }
-    }
-    let inner = py.allow_threads(|| {
-        let cuda = CudaOtt::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.ott_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ott_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, percent, ma_type="VAR", device_id=0))]
-pub fn ott_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    percent: f64,
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let flat = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = OttParams {
-        period: Some(period),
-        percent: Some(percent),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaOtt::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.ott_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ott_js(
-    data: &[f64],
-    period: usize,
-    percent: f64,
-    ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let params = OttParams {
-        period: Some(period),
-        percent: Some(percent),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = OttInput::from_slice(data, params);
-
-    let mut out = vec![f64::NAN; data.len()];
-
-    let kernel = if cfg!(target_arch = "wasm32") {
-        Kernel::Scalar
-    } else {
-        detect_best_kernel()
-    };
-    ott_into_slice(&mut out, &input, kernel).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ott_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ott_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ott_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    percent: f64,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ott_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let params = OttParams {
-            period: Some(period),
-            percent: Some(percent),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let input = OttInput::from_slice(data, params);
-
-        let kernel = if cfg!(target_arch = "wasm32") {
-            Kernel::Scalar
-        } else {
-            detect_best_kernel()
-        };
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            ott_into_slice(&mut temp, &input, kernel)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ott_into_slice(out, &input, kernel).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For reuse, prefer fast/unsafe API with persistent buffers"
-)]
-pub struct OttContext {
-    period: usize,
-    percent: f64,
-    ma_type: String,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(deprecated)]
-impl OttContext {
-    #[wasm_bindgen(constructor)]
-    pub fn new(period: usize, percent: f64, ma_type: &str) -> Result<OttContext, JsValue> {
-        if period == 0 {
-            return Err(JsValue::from_str("Invalid period: 0"));
-        }
-        if !percent.is_finite() || percent < 0.0 {
-            return Err(JsValue::from_str("Invalid percent"));
-        }
-        Ok(OttContext {
-            period,
-            percent,
-            ma_type: ma_type.to_string(),
-            kernel: if cfg!(target_arch = "wasm32") {
-                Kernel::Scalar
-            } else {
-                detect_best_kernel()
-            },
-        })
-    }
-
-    pub fn update_into(
-        &self,
-        in_ptr: *const f64,
-        out_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if in_ptr.is_null() || out_ptr.is_null() {
-            return Err(JsValue::from_str("null pointer"));
-        }
-        unsafe {
-            let data = std::slice::from_raw_parts(in_ptr, len);
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            let params = OttParams {
-                period: Some(self.period),
-                percent: Some(self.percent),
-                ma_type: Some(self.ma_type.clone()),
-            };
-            let input = OttInput::from_slice(data, params);
-            ott_into_slice(out, &input, self.kernel).map_err(|e| JsValue::from_str(&e.to_string()))
-        }
-    }
-
-    pub fn get_warmup_period(&self) -> usize {
-        self.period.saturating_sub(1)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct OttBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub percent_range: (f64, f64, f64),
-    pub ma_types: Vec<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct OttBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<OttParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ott_batch)]
-pub fn ott_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: OttBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = OttBatchRange {
-        period: cfg.period_range,
-        percent: cfg.percent_range,
-        ma_types: cfg.ma_types,
-    };
-
-    let kernel = if cfg!(target_arch = "wasm32") {
-        Kernel::ScalarBatch
-    } else {
-        detect_best_batch_kernel()
-    };
-    let out = ott_batch_with_kernel(data, &sweep, kernel)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = OttBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ott_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    p_start: usize,
-    p_end: usize,
-    p_step: usize,
-    q_start: f64,
-    q_end: f64,
-    q_step: f64,
-    ma_types: JsValue,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ott_batch_into"));
-    }
-    let types: Vec<String> = serde_wasm_bindgen::from_value(ma_types)
-        .map_err(|e| JsValue::from_str(&format!("Invalid ma_types: {}", e)))?;
-
-    let sweep = OttBatchRange {
-        period: (p_start, p_end, p_step),
-        percent: (q_start, q_end, q_step),
-        ma_types: types,
-    };
-    let combos = expand_grid_ott(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    if combos.is_empty() {
-        return Err(JsValue::from_str("no parameter combinations"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let rows = combos.len();
-        let cols = len;
-
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows * cols overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let row_kern = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-
-        for (r, prm) in combos.iter().enumerate() {
-            let p = prm.period.unwrap();
-            let pct = prm.percent.unwrap();
-            let mt = prm.ma_type.as_deref().unwrap();
-            if p == 0 || p > cols {
-                return Err(JsValue::from_str(
-                    &OttError::InvalidPeriod {
-                        period: p,
-                        data_len: cols,
-                    }
-                    .to_string(),
-                ));
-            }
-            if pct < 0.0 || !pct.is_finite() {
-                return Err(JsValue::from_str(
-                    &OttError::InvalidPercent { percent: pct }.to_string(),
-                ));
-            }
-
-            let ma = calculate_moving_average(data, p, mt, row_kern)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let ma_first = ma.iter().position(|&x| !x.is_nan()).unwrap_or(cols);
-
-            let row = &mut out[r * cols..(r + 1) * cols];
-            for v in &mut row[..ma_first.min(cols)] {
-                *v = f64::NAN;
-            }
-
-            ott_compute_into(data, &ma, pct, ma_first, p, row_kern, row);
-        }
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ott_output_into_js(
-    data: &[f64],
-    period: usize,
-    percent: f64,
-    ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ott_js(data, period, percent, ma_type)?;
-    crate::write_wasm_f64_output("ott_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ott_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ott_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("ott_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
 
     fn check_ott_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = OttInput::from_candles(&candles, "close", OttParams::default());
         let result = ott_with_kernel(&input, kernel)?;
@@ -2289,8 +1748,8 @@ mod tests {
 
     fn check_ott_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = OttParams {
             period: None,
@@ -2306,8 +1765,8 @@ mod tests {
 
     fn check_ott_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = OttInput::with_default_candles(&candles);
         match input.data {
@@ -2428,8 +1887,8 @@ mod tests {
 
     fn check_ott_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = OttInput::from_candles(&candles, "close", OttParams::default());
         let first_result = ott_with_kernel(&input, kernel)?;
@@ -2448,8 +1907,8 @@ mod tests {
 
     fn check_ott_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = OttInput::from_candles(&candles, "close", OttParams::default());
         let result = ott_with_kernel(&input, kernel)?;
@@ -2491,8 +1950,8 @@ mod tests {
 
     fn check_ott_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close = &candles.close;
 
         let input = OttInput::from_candles(&candles, "close", OttParams::default());
@@ -2539,8 +1998,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_ott_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = OttBuilder::new().kernel(kernel).apply(&c)?;
         for &v in &out.values {
             if v.is_nan() {
@@ -2627,8 +2086,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let out = OttBatchBuilder::new()
             .kernel(kernel)
@@ -2687,8 +2146,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let out = OttBatchBuilder::new()
             .kernel(kernel)
@@ -2818,13 +2277,8 @@ fn test_ott_into_matches_api() {
 
     let mut into_out = vec![0.0; data.len()];
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     {
         ott_into(&input, &mut into_out).expect("ott_into failed");
-    }
-    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-    {
-        ott_into_slice(&mut into_out, &input, Kernel::Scalar).expect("ott_into_slice failed");
     }
 
     assert_eq!(baseline.values.len(), into_out.len());

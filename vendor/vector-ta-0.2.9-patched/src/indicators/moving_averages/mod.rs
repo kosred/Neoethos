@@ -66,57 +66,54 @@ pub mod wilders;
 pub mod wma;
 pub mod zlema;
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub use corrected_moving_average::corrected_moving_average_into;
 pub use corrected_moving_average::{
-    corrected_moving_average, corrected_moving_average_batch_par_slice,
-    corrected_moving_average_batch_slice, corrected_moving_average_batch_with_kernel,
-    corrected_moving_average_into_slice, corrected_moving_average_with_kernel,
-    expand_grid_corrected_moving_average, CorrectedMovingAverageBatchBuilder,
-    CorrectedMovingAverageBatchOutput, CorrectedMovingAverageBatchRange,
-    CorrectedMovingAverageBuilder, CorrectedMovingAverageData, CorrectedMovingAverageError,
-    CorrectedMovingAverageInput, CorrectedMovingAverageOutput, CorrectedMovingAverageParams,
-    CorrectedMovingAverageStream,
+    CorrectedMovingAverageBatchBuilder, CorrectedMovingAverageBatchOutput,
+    CorrectedMovingAverageBatchRange, CorrectedMovingAverageBuilder, CorrectedMovingAverageData,
+    CorrectedMovingAverageError, CorrectedMovingAverageInput, CorrectedMovingAverageOutput,
+    CorrectedMovingAverageParams, CorrectedMovingAverageStream, corrected_moving_average,
+    corrected_moving_average_batch_par_slice, corrected_moving_average_batch_slice,
+    corrected_moving_average_batch_with_kernel, corrected_moving_average_into_slice,
+    corrected_moving_average_with_kernel, expand_grid_corrected_moving_average,
 };
-pub use cwma::{cwma, CwmaInput, CwmaOutput, CwmaParams};
+pub use cwma::{CwmaInput, CwmaOutput, CwmaParams, cwma};
 pub use dma::{
-    dma, dma_batch_with_kernel, dma_into_slice, dma_with_kernel, DmaBatchBuilder, DmaBatchOutput,
-    DmaBatchRange, DmaBuilder, DmaData, DmaError, DmaInput, DmaOutput, DmaParams, DmaStream,
+    DmaBatchBuilder, DmaBatchOutput, DmaBatchRange, DmaBuilder, DmaData, DmaError, DmaInput,
+    DmaOutput, DmaParams, DmaStream, dma, dma_batch_with_kernel, dma_into_slice, dma_with_kernel,
 };
 
-pub use edcf::{edcf, EdcfInput, EdcfOutput, EdcfParams};
-pub use ehlers_kama::{ehlers_kama, EhlersKamaInput, EhlersKamaOutput, EhlersKamaParams};
+pub use edcf::{EdcfInput, EdcfOutput, EdcfParams, edcf};
+pub use ehlers_kama::{EhlersKamaInput, EhlersKamaOutput, EhlersKamaParams, ehlers_kama};
 pub use ehlers_pma::{
-    ehlers_pma, expand_grid as expand_grid_ehlers_pma, EhlersPmaBatchRange, EhlersPmaInput,
-    EhlersPmaOutput, EhlersPmaParams,
+    EhlersPmaBatchRange, EhlersPmaInput, EhlersPmaOutput, EhlersPmaParams, ehlers_pma,
+    expand_grid as expand_grid_ehlers_pma,
 };
 pub use ehlers_undersampled_double_moving_average::{
-    ehlers_undersampled_double_moving_average,
-    expand_grid_ehlers_undersampled_double_moving_average,
     EhlersUndersampledDoubleMovingAverageBatchRange, EhlersUndersampledDoubleMovingAverageInput,
     EhlersUndersampledDoubleMovingAverageOutput, EhlersUndersampledDoubleMovingAverageParams,
+    ehlers_undersampled_double_moving_average,
+    expand_grid_ehlers_undersampled_double_moving_average,
 };
 pub use elastic_volume_weighted_moving_average::{
-    elastic_volume_weighted_moving_average, expand_grid_elastic_volume_weighted_moving_average,
     ElasticVolumeWeightedMovingAverageBatchRange, ElasticVolumeWeightedMovingAverageInput,
     ElasticVolumeWeightedMovingAverageOutput, ElasticVolumeWeightedMovingAverageParams,
+    elastic_volume_weighted_moving_average, expand_grid_elastic_volume_weighted_moving_average,
 };
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub use logarithmic_moving_average::logarithmic_moving_average_into;
 pub use logarithmic_moving_average::{
+    LogarithmicMovingAverageBatchBuilder, LogarithmicMovingAverageBatchOutput,
+    LogarithmicMovingAverageBatchRange, LogarithmicMovingAverageBuilder,
+    LogarithmicMovingAverageData, LogarithmicMovingAverageError, LogarithmicMovingAverageInput,
+    LogarithmicMovingAverageOutput, LogarithmicMovingAverageParams, LogarithmicMovingAverageStream,
     expand_grid_logarithmic_moving_average, logarithmic_moving_average,
     logarithmic_moving_average_batch_par_slice, logarithmic_moving_average_batch_slice,
     logarithmic_moving_average_batch_with_kernel, logarithmic_moving_average_into_slice,
-    logarithmic_moving_average_with_kernel, LogarithmicMovingAverageBatchBuilder,
-    LogarithmicMovingAverageBatchOutput, LogarithmicMovingAverageBatchRange,
-    LogarithmicMovingAverageBuilder, LogarithmicMovingAverageData, LogarithmicMovingAverageError,
-    LogarithmicMovingAverageInput, LogarithmicMovingAverageOutput, LogarithmicMovingAverageParams,
-    LogarithmicMovingAverageStream,
+    logarithmic_moving_average_with_kernel,
 };
-pub use uma::{uma, UmaInput, UmaOutput, UmaParams};
+pub use uma::{UmaInput, UmaOutput, UmaParams, uma};
 pub use volatility_adjusted_ma::{
-    vama as volatility_adjusted_ma, VamaInput as VolatilityAdjustedMaInput,
-    VamaOutput as VolatilityAdjustedMaOutput, VamaParams as VolatilityAdjustedMaParams,
+    VamaInput as VolatilityAdjustedMaInput, VamaOutput as VolatilityAdjustedMaOutput,
+    VamaParams as VolatilityAdjustedMaParams, vama as volatility_adjusted_ma,
 };
 pub use volume_adjusted_ma::{
     VolumeAdjustedMa as volume_adjusted_ma, VolumeAdjustedMaInput, VolumeAdjustedMaOutput,
@@ -124,79 +121,36 @@ pub use volume_adjusted_ma::{
 };
 
 pub use ehma::{
-    ehma, ehma_batch_inner_into, ehma_batch_par_slice, ehma_batch_slice, ehma_batch_with_kernel,
-    ehma_batch_with_kernel_slice, ehma_into_slice, ehma_with_kernel, EhmaBatchBuilder,
-    EhmaBatchOutput, EhmaBatchRange, EhmaBuilder, EhmaData, EhmaError, EhmaInput, EhmaOutput,
-    EhmaParams, EhmaStream,
+    EhmaBatchBuilder, EhmaBatchOutput, EhmaBatchRange, EhmaBuilder, EhmaData, EhmaError, EhmaInput,
+    EhmaOutput, EhmaParams, EhmaStream, ehma, ehma_batch_inner_into, ehma_batch_par_slice,
+    ehma_batch_slice, ehma_batch_with_kernel, ehma_batch_with_kernel_slice, ehma_into_slice,
+    ehma_with_kernel,
 };
 
 pub use nama::{
-    nama, nama_batch_with_kernel, nama_into_slice, nama_with_kernel, NamaBatchBuilder,
-    NamaBatchOutput, NamaBatchRange, NamaBuilder, NamaData, NamaError, NamaInput, NamaOutput,
-    NamaParams, NamaStream,
+    NamaBatchBuilder, NamaBatchOutput, NamaBatchRange, NamaBuilder, NamaData, NamaError, NamaInput,
+    NamaOutput, NamaParams, NamaStream, nama, nama_batch_with_kernel, nama_into_slice,
+    nama_with_kernel,
 };
 
 pub use n_order_ema::{
-    expand_grid_n_order_ema, n_order_ema, n_order_ema_batch_from_input_with_kernel,
-    n_order_ema_batch_with_kernel, n_order_ema_into_slice, n_order_ema_with_kernel,
     NOrderEmaBatchBuilder, NOrderEmaBatchOutput, NOrderEmaBatchRange, NOrderEmaBuilder,
     NOrderEmaData, NOrderEmaError, NOrderEmaIirStyle, NOrderEmaInput, NOrderEmaOutput,
-    NOrderEmaParams, NOrderEmaStream, NOrderEmaStyle,
+    NOrderEmaParams, NOrderEmaStream, NOrderEmaStyle, expand_grid_n_order_ema, n_order_ema,
+    n_order_ema_batch_from_input_with_kernel, n_order_ema_batch_with_kernel,
+    n_order_ema_into_slice, n_order_ema_with_kernel,
 };
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub use n_order_ema::n_order_ema_into;
 
 pub use sama::{
-    sama, sama_batch_par_slice, sama_batch_slice, sama_batch_with_kernel, sama_into_slice,
-    sama_with_kernel, SamaBatchBuilder, SamaBatchOutput, SamaBatchRange, SamaBuilder, SamaData,
-    SamaError, SamaInput, SamaOutput, SamaParams, SamaStream,
+    SamaBatchBuilder, SamaBatchOutput, SamaBatchRange, SamaBuilder, SamaData, SamaError, SamaInput,
+    SamaOutput, SamaParams, SamaStream, sama, sama_batch_par_slice, sama_batch_slice,
+    sama_batch_with_kernel, sama_into_slice, sama_with_kernel,
 };
 
 pub use sgf::{
-    expand_grid as expand_grid_sgf, sgf, sgf_batch_into_slice, sgf_batch_par_slice,
-    sgf_batch_slice, sgf_batch_with_kernel, sgf_into_slice, sgf_with_kernel, SgfBatchBuilder,
-    SgfBatchOutput, SgfBatchRange, SgfBuilder, SgfData, SgfError, SgfInput, SgfOutput, SgfParams,
-    SgfStream,
-};
-
-#[cfg(feature = "python")]
-pub use dma::{dma_batch_py, dma_py, DmaStreamPy};
-
-#[cfg(feature = "python")]
-pub use ehma::{ehma_batch_py, ehma_py, EhmaStreamPy};
-
-#[cfg(feature = "python")]
-pub use corrected_moving_average::{
-    corrected_moving_average_batch_py, corrected_moving_average_py, CorrectedMovingAverageStreamPy,
-};
-
-#[cfg(feature = "python")]
-pub use nama::{nama_batch_py, nama_py, NamaStreamPy};
-
-#[cfg(feature = "python")]
-pub use n_order_ema::{
-    n_order_ema_batch_py, n_order_ema_py, register_n_order_ema_module, NOrderEmaStreamPy,
-};
-
-#[cfg(feature = "python")]
-pub use sama::{sama_batch_py, sama_py, SamaStreamPy};
-
-#[cfg(feature = "python")]
-pub use sgf::{sgf_batch_py, sgf_py, SgfStreamPy};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-pub use corrected_moving_average::{
-    corrected_moving_average_alloc, corrected_moving_average_batch_into,
-    corrected_moving_average_batch_js, corrected_moving_average_free,
-    corrected_moving_average_into, corrected_moving_average_js,
-};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-pub use nama::{nama_alloc, nama_batch_unified_js, nama_free, nama_into, nama_js};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-pub use n_order_ema::{
-    n_order_ema_alloc, n_order_ema_batch_into, n_order_ema_batch_js, n_order_ema_free,
-    n_order_ema_into, n_order_ema_js,
+    SgfBatchBuilder, SgfBatchOutput, SgfBatchRange, SgfBuilder, SgfData, SgfError, SgfInput,
+    SgfOutput, SgfParams, SgfStream, expand_grid as expand_grid_sgf, sgf, sgf_batch_into_slice,
+    sgf_batch_par_slice, sgf_batch_slice, sgf_batch_with_kernel, sgf_into_slice, sgf_with_kernel,
 };

@@ -1,19 +1,19 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::moving_averages::tilson::{TilsonBatchRange, TilsonParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -186,18 +186,8 @@ impl CudaTilson {
         let context = Context::new(device).map_err(CudaTilsonError::from)?;
         let context = Arc::new(context);
 
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/tilson_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
-        let module = match Module::from_ptx(ptx, jit_opts) {
-            Ok(m) => m,
-            Err(_) => match Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]) {
-                Ok(m) => m,
-                Err(_) => Module::from_ptx(ptx, &[]).map_err(CudaTilsonError::from)?,
-            },
-        };
+        let module =
+            crate::load_cuda_embedded_module!("tilson_kernel").map_err(CudaTilsonError::from)?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(CudaTilsonError::from)?;
 
         Ok(Self {

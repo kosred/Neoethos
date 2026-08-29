@@ -1,34 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -48,10 +23,6 @@ pub struct SarOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct SarParams {
     pub acceleration: Option<f64>,
     pub maximum: Option<f64>,
@@ -342,7 +313,6 @@ pub fn sar_into_slice(dst: &mut [f64], input: &SarInput, kern: Kernel) -> Result
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn sar_into(input: &SarInput, out: &mut [f64]) -> Result<(), SarError> {
     sar_into_slice(out, input, Kernel::Auto)
@@ -1083,718 +1053,16 @@ fn expand_grid_for_test(r: &SarBatchRange) -> Vec<SarParams> {
     expand_grid(r).expect("expand_grid_for_test should not fail")
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "sar")]
-#[pyo3(signature = (high, low, acceleration=None, maximum=None, kernel=None))]
-pub fn sar_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    acceleration: Option<f64>,
-    maximum: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    let min_len = high_slice.len().min(low_slice.len());
-    let high_trimmed = &high_slice[..min_len];
-    let low_trimmed = &low_slice[..min_len];
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = SarParams {
-        acceleration,
-        maximum,
-    };
-    let input = SarInput::from_slices(high_trimmed, low_trimmed, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| sar_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "SarStream")]
-pub struct SarStreamPy {
-    stream: SarStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl SarStreamPy {
-    #[new]
-    #[pyo3(signature = (acceleration=None, maximum=None))]
-    fn new(acceleration: Option<f64>, maximum: Option<f64>) -> PyResult<Self> {
-        let params = SarParams {
-            acceleration,
-            maximum,
-        };
-        let stream =
-            SarStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(SarStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "sar_batch")]
-#[pyo3(signature = (high, low, acceleration_range, maximum_range, kernel=None))]
-pub fn sar_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    acceleration_range: (f64, f64, f64),
-    maximum_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    let min_len = high_slice.len().min(low_slice.len());
-    let (high_slice, low_slice) = (&high_slice[..min_len], &low_slice[..min_len]);
-
-    let sweep = SarBatchRange {
-        acceleration: acceleration_range,
-        maximum: maximum_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = min_len;
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("sar_batch_py: size overflow in rows*cols"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let k = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        sar_batch_inner_into_noalloc(high_slice, low_slice, &sweep, k, true, slice_out)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "accelerations",
-        combos
-            .iter()
-            .map(|p| p.acceleration.unwrap_or(0.02))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "maximums",
-        combos
-            .iter()
-            .map(|p| p.maximum.unwrap_or(0.2))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-fn sar_batch_inner_into_noalloc(
-    high: &[f64],
-    low: &[f64],
-    sweep: &SarBatchRange,
-    kern: Kernel,
-    parallel: bool,
-    out: &mut [f64],
-) -> Result<Vec<SarParams>, SarError> {
-    let combos = expand_grid(sweep)?;
-
-    let first = high
-        .iter()
-        .zip(low.iter())
-        .position(|(&h, &l)| !h.is_nan() && !l.is_nan())
-        .ok_or(SarError::AllValuesNaN)?;
-    if high.len() - first < 2 {
-        return Err(SarError::NotEnoughValidData {
-            needed: 2,
-            valid: high.len() - first,
-        });
-    }
-
-    let rows = combos.len();
-    let cols = high.len();
-    let expected = rows.checked_mul(cols).ok_or(SarError::InvalidRange {
-        start: sweep.acceleration.0,
-        end: sweep.acceleration.1,
-        step: sweep.acceleration.2,
-    })?;
-    if out.len() != expected {
-        return Err(SarError::OutputLengthMismatch {
-            expected,
-            got: out.len(),
-        });
-    }
-
-    unsafe {
-        let out_mu = std::slice::from_raw_parts_mut(
-            out.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>,
-            out.len(),
-        );
-        let warm: Vec<usize> = vec![first + 1; rows];
-        init_matrix_prefixes(out_mu, cols, &warm);
-    }
-
-    let simd = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        k => k,
-    };
-    let exec = |row: usize, row_out: &mut [f64]| {
-        let p = &combos[row];
-        match simd {
-            Kernel::Scalar | Kernel::ScalarBatch => unsafe {
-                sar_row_scalar(
-                    high,
-                    low,
-                    first,
-                    p.acceleration.unwrap(),
-                    p.maximum.unwrap(),
-                    row_out,
-                );
-            },
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2 | Kernel::Avx2Batch => unsafe {
-                sar_row_avx2(
-                    high,
-                    low,
-                    first,
-                    p.acceleration.unwrap(),
-                    p.maximum.unwrap(),
-                    row_out,
-                );
-            },
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512 | Kernel::Avx512Batch => unsafe {
-                sar_row_avx512(
-                    high,
-                    low,
-                    first,
-                    p.acceleration.unwrap(),
-                    p.maximum.unwrap(),
-                    row_out,
-                );
-            },
-            _ => unsafe {
-                sar_row_scalar(
-                    high,
-                    low,
-                    first,
-                    p.acceleration.unwrap(),
-                    p.maximum.unwrap(),
-                    row_out,
-                );
-            },
-        }
-    };
-
-    if parallel {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            use rayon::prelude::*;
-            out.par_chunks_mut(cols)
-                .enumerate()
-                .for_each(|(row, r)| exec(row, r));
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            for (row, r) in out.chunks_mut(cols).enumerate() {
-                exec(row, r);
-            }
-        }
-    } else {
-        for (row, r) in out.chunks_mut(cols).enumerate() {
-            exec(row, r);
-        }
-    }
-
-    Ok(combos)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sar_js(
-    high: &[f64],
-    low: &[f64],
-    acceleration: f64,
-    maximum: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let min_len = high.len().min(low.len());
-    let (high, low) = (&high[..min_len], &low[..min_len]);
-
-    let params = SarParams {
-        acceleration: Some(acceleration),
-        maximum: Some(maximum),
-    };
-    let input = SarInput::from_slices(high, low, params);
-
-    let mut output = vec![0.0; min_len];
-
-    sar_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct SarDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl SarDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let buf = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let ptr = buf.as_device_ptr().as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "cross-device DLPack copy is not implemented for SarDeviceArrayF32Py",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err(
-                            "requested dl_device does not match SAR producer device",
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "sar_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, acceleration_range, maximum_range, device_id=0))]
-pub fn sar_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    acceleration_range: (f64, f64, f64),
-    maximum_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<SarDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaSar;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err("high/low length mismatch"));
-    }
-    let sweep = SarBatchRange {
-        acceleration: acceleration_range,
-        maximum: maximum_range,
-    };
-    let (buf, rows, cols, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaSar::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (dev, _combos) = cuda
-            .sar_batch_dev(h, l, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        Ok::<_, pyo3::PyErr>((dev.buf, dev.rows, dev.cols, ctx, cuda.device_id()))
-    })?;
-    Ok(SarDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "sar_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, cols, rows, acceleration, maximum, device_id=0))]
-pub fn sar_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    acceleration: f64,
-    maximum: f64,
-    device_id: usize,
-) -> PyResult<SarDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaSar;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let expected = cols.checked_mul(rows).ok_or_else(|| {
-        PyValueError::new_err("sar_cuda_many_series_one_param_dev: size overflow in cols*rows")
-    })?;
-    if expected != h.len() || h.len() != l.len() {
-        return Err(PyValueError::new_err(
-            "time‑major inputs must be equal length and cols*rows",
-        ));
-    }
-    let params = SarParams {
-        acceleration: Some(acceleration),
-        maximum: Some(maximum),
-    };
-    let (buf, r_out, c_out, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaSar::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev = cuda
-            .sar_many_series_one_param_time_major_dev(h, l, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        Ok::<_, pyo3::PyErr>((dev.buf, dev.rows, dev.cols, ctx, cuda.device_id()))
-    })?;
-    Ok(SarDeviceArrayF32Py {
-        buf: Some(buf),
-        rows: r_out,
-        cols: c_out,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sar_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    acceleration: f64,
-    maximum: f64,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to sar_into"));
-    }
-
-    unsafe {
-        let high_slice = std::slice::from_raw_parts(high_ptr, len);
-        let low_slice = std::slice::from_raw_parts(low_ptr, len);
-
-        let params = SarParams {
-            acceleration: Some(acceleration),
-            maximum: Some(maximum),
-        };
-        let input = SarInput::from_slices(high_slice, low_slice, params);
-
-        if high_ptr == out_ptr || low_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            sar_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            sar_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sar_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sar_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sar_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    acc_start: f64,
-    acc_end: f64,
-    acc_step: f64,
-    max_start: f64,
-    max_end: f64,
-    max_step: f64,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to sar_batch_into"));
-    }
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let sweep = SarBatchRange {
-            acceleration: (acc_start, acc_end, acc_step),
-            maximum: (max_start, max_end, max_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("sar_batch_into: size overflow in rows*cols"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        sar_batch_inner_into_noalloc_wasm(high, low, &sweep, Kernel::Scalar, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn sar_batch_inner_into_noalloc_wasm(
-    high: &[f64],
-    low: &[f64],
-    sweep: &SarBatchRange,
-    _kern: Kernel,
-    parallel: bool,
-    out: &mut [f64],
-) -> Result<Vec<SarParams>, SarError> {
-    let combos = expand_grid(sweep)?;
-
-    let min_len = high.len().min(low.len());
-    let (high, low) = (&high[..min_len], &low[..min_len]);
-
-    let first = high
-        .iter()
-        .zip(low.iter())
-        .position(|(&h, &l)| !h.is_nan() && !l.is_nan())
-        .ok_or(SarError::AllValuesNaN)?;
-    if high.len() - first < 2 {
-        return Err(SarError::NotEnoughValidData {
-            needed: 2,
-            valid: high.len() - first,
-        });
-    }
-
-    let rows = combos.len();
-    let cols = high.len();
-    let expected = rows.checked_mul(cols).ok_or(SarError::InvalidRange {
-        start: sweep.acceleration.0,
-        end: sweep.acceleration.1,
-        step: sweep.acceleration.2,
-    })?;
-    if out.len() != expected {
-        return Err(SarError::OutputLengthMismatch {
-            expected,
-            got: out.len(),
-        });
-    }
-
-    unsafe {
-        let out_mu = std::slice::from_raw_parts_mut(
-            out.as_mut_ptr() as *mut std::mem::MaybeUninit<f64>,
-            out.len(),
-        );
-        let warm: Vec<usize> = vec![first + 1; rows];
-        init_matrix_prefixes(out_mu, cols, &warm);
-    }
-
-    let exec = |row: usize, row_out: &mut [f64]| unsafe {
-        let p = &combos[row];
-        sar_row_scalar(
-            high,
-            low,
-            first,
-            p.acceleration.unwrap(),
-            p.maximum.unwrap(),
-            row_out,
-        );
-    };
-
-    if parallel {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            use rayon::prelude::*;
-            out.par_chunks_mut(cols)
-                .enumerate()
-                .for_each(|(row, r)| exec(row, r));
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            for (row, r) in out.chunks_mut(cols).enumerate() {
-                exec(row, r);
-            }
-        }
-    } else {
-        for (row, r) in out.chunks_mut(cols).enumerate() {
-            exec(row, r);
-        }
-    }
-
-    Ok(combos)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SarBatchConfig {
-    pub acceleration_range: (f64, f64, f64),
-    pub maximum_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SarBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<SarParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = sar_batch)]
-pub fn sar_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: SarBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = SarBatchRange {
-        acceleration: config.acceleration_range,
-        maximum: config.maximum_range,
-    };
-
-    let kernel = if cfg!(target_arch = "wasm32") {
-        Kernel::Scalar
-    } else {
-        detect_best_batch_kernel()
-    };
-    let output = sar_batch_inner(high, low, &sweep, kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = SarBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sar_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    acceleration: f64,
-    maximum: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = sar_js(high, low, acceleration, maximum)?;
-    crate::write_wasm_f64_output("sar_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sar_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = sar_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs("sar_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_sar_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = SarParams {
             acceleration: None,
@@ -1809,8 +1077,8 @@ mod tests {
 
     fn check_sar_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = SarInput::from_candles(&candles, SarParams::default());
         let result = sar_with_kernel(&input, kernel)?;
@@ -1894,8 +1162,8 @@ mod tests {
     fn check_sar_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             SarParams::default(),
@@ -2275,8 +1543,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = SarBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -2306,8 +1574,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (0.01, 0.05, 0.01, 0.1, 0.3, 0.1),
@@ -2421,21 +1689,16 @@ mod tests {
 
     #[test]
     fn test_sar_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = SarInput::from_candles(&candles, SarParams::default());
 
         let SarOutput { values: expected } = sar(&input)?;
 
         let mut actual = vec![0.0; candles.high.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             sar_into(&input, &mut actual)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            sar_into_slice(&mut actual, &input, Kernel::Auto)?;
         }
 
         assert_eq!(expected.len(), actual.len());

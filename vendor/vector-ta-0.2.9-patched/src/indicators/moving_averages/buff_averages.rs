@@ -1,35 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaBuffAverages;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -41,92 +15,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct BuffAveragesDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl BuffAveragesDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
 
 impl<'a> AsRef<[f64]> for BuffAveragesInput<'a> {
     #[inline(always)]
@@ -154,10 +42,6 @@ pub struct BuffAveragesOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct BuffAveragesParams {
     pub fast_period: Option<usize>,
     pub slow_period: Option<usize>,
@@ -315,7 +199,9 @@ pub enum BuffAveragesError {
     #[error("buff_averages: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
 
-    #[error("buff_averages: Price and volume arrays have different lengths: price = {price_len}, volume = {volume_len}")]
+    #[error(
+        "buff_averages: Price and volume arrays have different lengths: price = {price_len}, volume = {volume_len}"
+    )]
     MismatchedDataLength { price_len: usize, volume_len: usize },
 
     #[error("buff_averages: Volume data is required for this indicator")]
@@ -372,7 +258,6 @@ pub fn buff_averages_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn buff_averages_into(
     input: &BuffAveragesInput,
@@ -1868,641 +1753,19 @@ fn buff_averages_batch_inner(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "buff_averages")]
-#[pyo3(signature = (price, volume, fast_period=5, slow_period=20, kernel=None))]
-pub fn buff_averages_py<'py>(
-    py: Python<'py>,
-    price: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    fast_period: usize,
-    slow_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let price_slice = price.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = BuffAveragesParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-    };
-    let input = BuffAveragesInput::from_slices(price_slice, volume_slice, params);
-
-    let result = py
-        .allow_threads(|| buff_averages_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        result.fast_buff.into_pyarray(py),
-        result.slow_buff.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "buff_averages_batch")]
-#[pyo3(signature = (price, volume, fast_range, slow_range, kernel=None))]
-pub fn buff_averages_batch_py<'py>(
-    py: Python<'py>,
-    price: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    fast_range: (usize, usize, usize),
-    slow_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::IntoPyArray;
-    let p = price.as_slice()?;
-    let v = volume.as_slice()?;
-    let sweep = BuffAveragesBatchRange {
-        fast_period: fast_range,
-        slow_period: slow_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid_ba(&sweep);
-    let rows = combos.len();
-    let cols = p.len();
-    let fast_arr = unsafe { numpy::PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slow_arr = unsafe { numpy::PyArray1::<f64>::new(py, [rows * cols], false) };
-
-    let fast_slice = unsafe { fast_arr.as_slice_mut()? };
-    let slow_slice = unsafe { slow_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            buff_averages_batch_inner_into(p, v, &sweep, kern, fast_slice, slow_slice)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("fast", fast_arr.reshape((rows, cols))?)?;
-    d.set_item("slow", slow_arr.reshape((rows, cols))?)?;
-    d.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|c| c.0 as i64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|c| c.1 as i64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "buff_averages_cuda_batch_dev")]
-#[pyo3(signature = (price_f32, volume_f32, fast_range, slow_range, device_id=0))]
-pub fn buff_averages_cuda_batch_dev_py(
-    py: Python<'_>,
-    price_f32: PyReadonlyArray1<'_, f32>,
-    volume_f32: PyReadonlyArray1<'_, f32>,
-    fast_range: (usize, usize, usize),
-    slow_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(BuffAveragesDeviceArrayF32Py, BuffAveragesDeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let price = price_f32.as_slice()?;
-    let volume = volume_f32.as_slice()?;
-    let sweep = BuffAveragesBatchRange {
-        fast_period: fast_range,
-        slow_period: slow_range,
-    };
-
-    let (fast, slow, rows, cols, ctx, dev) = py.allow_threads(|| {
-        let cuda =
-            CudaBuffAverages::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (f, s) = cuda
-            .buff_averages_batch_dev(price, volume, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let rows = f.rows;
-        let cols = f.cols;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        Ok::<_, pyo3::PyErr>((f.buf, s.buf, rows, cols, ctx, dev))
-    })?;
-
-    Ok((
-        BuffAveragesDeviceArrayF32Py {
-            buf: Some(fast),
-            rows,
-            cols,
-            _ctx: ctx.clone(),
-            device_id: dev,
-        },
-        BuffAveragesDeviceArrayF32Py {
-            buf: Some(slow),
-            rows,
-            cols,
-            _ctx: ctx,
-            device_id: dev,
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "buff_averages_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, volumes_tm_f32, cols, rows, fast_period, slow_period, device_id=0))]
-pub fn buff_averages_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: PyReadonlyArray1<'_, f32>,
-    volumes_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    fast_period: usize,
-    slow_period: usize,
-    device_id: usize,
-) -> PyResult<(BuffAveragesDeviceArrayF32Py, BuffAveragesDeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let prices = prices_tm_f32.as_slice()?;
-    let volumes = volumes_tm_f32.as_slice()?;
-
-    let (fast, slow, rows_o, cols_o, ctx, dev) = py.allow_threads(|| {
-        let cuda =
-            CudaBuffAverages::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (f, s) = cuda
-            .buff_averages_many_series_one_param_time_major_dev(
-                prices,
-                volumes,
-                cols,
-                rows,
-                fast_period,
-                slow_period,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        Ok::<_, pyo3::PyErr>((f.buf, s.buf, f.rows, f.cols, ctx, dev))
-    })?;
-
-    Ok((
-        BuffAveragesDeviceArrayF32Py {
-            buf: Some(fast),
-            rows: rows_o,
-            cols: cols_o,
-            _ctx: ctx.clone(),
-            device_id: dev,
-        },
-        BuffAveragesDeviceArrayF32Py {
-            buf: Some(slow),
-            rows: rows_o,
-            cols: cols_o,
-            _ctx: ctx,
-            device_id: dev,
-        },
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "BuffAveragesStream")]
-pub struct BuffAveragesStreamPy {
-    stream: BuffAveragesStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl BuffAveragesStreamPy {
-    #[new]
-    fn new(fast_period: usize, slow_period: usize) -> PyResult<Self> {
-        let params = BuffAveragesParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-        };
-        let stream = BuffAveragesStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(BuffAveragesStreamPy { stream })
-    }
-
-    fn update(&mut self, price: f64, volume: f64) -> Option<(f64, f64)> {
-        self.stream.update(price, volume)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BuffAveragesJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = buff_averages)]
-pub fn buff_averages_unified_js(
-    price: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-) -> Result<JsValue, JsValue> {
-    let len = price.len();
-    let params = BuffAveragesParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-    };
-    let input = BuffAveragesInput::from_slices(price, volume, params);
-
-    let mut mat = make_uninit_matrix(2, len);
-    {
-        let warms = {
-            let (_, _, _, sp, first, _) = buff_averages_prepare(&input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            vec![first + sp - 1, first + sp - 1]
-        };
-        init_matrix_prefixes(&mut mat, len, &warms);
-    }
-
-    let values = unsafe {
-        let flat = core::slice::from_raw_parts_mut(mat.as_mut_ptr() as *mut f64, mat.len());
-        let (fast_out, slow_out) = flat.split_at_mut(len);
-        buff_averages_into_slices(fast_out, slow_out, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let ptr = mat.as_mut_ptr() as *mut f64;
-        let len = mat.len();
-        let cap = mat.capacity();
-        core::mem::forget(mat);
-        Vec::from_raw_parts(ptr, len, cap)
-    };
-
-    let js = BuffAveragesJsResult {
-        values,
-        rows: 2,
-        cols: len,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn buff_averages_js(
-    price: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let len = price.len();
-    let params = BuffAveragesParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-    };
-    let input = BuffAveragesInput::from_slices(price, volume, params);
-
-    let mut mat = make_uninit_matrix(2, len);
-    {
-        let (_, _, _, sp, first, _) = buff_averages_prepare(&input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let warm = first + sp - 1;
-        init_matrix_prefixes(&mut mat, len, &[warm, warm]);
-    }
-
-    let values = unsafe {
-        let flat = core::slice::from_raw_parts_mut(mat.as_mut_ptr() as *mut f64, mat.len());
-        let (fast_out, slow_out) = flat.split_at_mut(len);
-        buff_averages_into_slices(fast_out, slow_out, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let ptr = mat.as_mut_ptr() as *mut f64;
-        let len = mat.len();
-        let cap = mat.capacity();
-        core::mem::forget(mat);
-        Vec::from_raw_parts(ptr, len, cap)
-    };
-
-    Ok(values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn buff_averages_into(
-    price_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_period: usize,
-    slow_period: usize,
-) -> Result<(), JsValue> {
-    if price_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to buff_averages_into",
-        ));
-    }
-
-    unsafe {
-        let price = core::slice::from_raw_parts(price_ptr, len);
-        let volume = core::slice::from_raw_parts(volume_ptr, len);
-        let (fast_out, slow_out) =
-            core::slice::from_raw_parts_mut(out_ptr, 2 * len).split_at_mut(len);
-
-        let params = BuffAveragesParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-        };
-        let input = BuffAveragesInput::from_slices(price, volume, params);
-
-        buff_averages_into_slices(fast_out, slow_out, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn buff_averages_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(2 * len);
-    let ptr = v.as_mut_ptr();
-    core::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn buff_averages_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BuffAveragesBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub fast_periods: Vec<usize>,
-    pub slow_periods: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = buff_averages_batch)]
-pub fn buff_averages_batch_unified_js(
-    price: &[f64],
-    volume: &[f64],
-    fast_range: Vec<usize>,
-    slow_range: Vec<usize>,
-) -> Result<JsValue, JsValue> {
-    if fast_range.len() != 3 || slow_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "fast_range and slow_range must each have 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = BuffAveragesBatchRange {
-        fast_period: (fast_range[0], fast_range[1], fast_range[2]),
-        slow_period: (slow_range[0], slow_range[1], slow_range[2]),
-    };
-
-    let out = buff_averages_batch_with_kernel(price, volume, &sweep, detect_best_batch_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(out.fast.len() + out.slow.len());
-    values.extend_from_slice(&out.fast);
-    values.extend_from_slice(&out.slow);
-
-    let js = BuffAveragesBatchJsOutput {
-        values,
-        rows: out.rows * 2,
-        cols: out.cols,
-        fast_periods: out.combos.iter().map(|c| c.0).collect(),
-        slow_periods: out.combos.iter().map(|c| c.1).collect(),
-    };
-
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn buff_averages_batch_into(
-    price_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_fast_ptr: *mut f64,
-    out_slow_ptr: *mut f64,
-    len: usize,
-    fast_start: usize,
-    fast_end: usize,
-    fast_step: usize,
-    slow_start: usize,
-    slow_end: usize,
-    slow_step: usize,
-) -> Result<usize, JsValue> {
-    if price_ptr.is_null()
-        || volume_ptr.is_null()
-        || out_fast_ptr.is_null()
-        || out_slow_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to buff_averages_batch_into",
-        ));
-    }
-    unsafe {
-        let price = core::slice::from_raw_parts(price_ptr, len);
-        let volume = core::slice::from_raw_parts(volume_ptr, len);
-        let sweep = BuffAveragesBatchRange {
-            fast_period: (fast_start, fast_end, fast_step),
-            slow_period: (slow_start, slow_end, slow_step),
-        };
-
-        let combos = {
-            let rows = expand_grid_ba(&sweep).len();
-            let fast_out = core::slice::from_raw_parts_mut(out_fast_ptr, rows * len);
-            let slow_out = core::slice::from_raw_parts_mut(out_slow_ptr, rows * len);
-            buff_averages_batch_inner_into(
-                price,
-                volume,
-                &sweep,
-                detect_best_batch_kernel(),
-                fast_out,
-                slow_out,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?
-        };
-        Ok(combos.len())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-)]
-pub struct BuffAveragesContext {
-    fast_period: usize,
-    slow_period: usize,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(deprecated)]
-impl BuffAveragesContext {
-    #[wasm_bindgen(constructor)]
-    #[deprecated(
-        since = "1.0.0",
-        note = "For performance patterns, use the fast/unsafe API with persistent buffers"
-    )]
-    pub fn new(fast_period: usize, slow_period: usize) -> Result<BuffAveragesContext, JsValue> {
-        if fast_period == 0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid fast period: {}",
-                fast_period
-            )));
-        }
-        if slow_period == 0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid slow period: {}",
-                slow_period
-            )));
-        }
-
-        Ok(BuffAveragesContext {
-            fast_period,
-            slow_period,
-            kernel: Kernel::Auto,
-        })
-    }
-
-    pub fn update_into(
-        &self,
-        price_ptr: *const f64,
-        volume_ptr: *const f64,
-        fast_out_ptr: *mut f64,
-        slow_out_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if len < self.slow_period {
-            return Err(JsValue::from_str("Data length less than slow period"));
-        }
-
-        if price_ptr.is_null()
-            || volume_ptr.is_null()
-            || fast_out_ptr.is_null()
-            || slow_out_ptr.is_null()
-        {
-            return Err(JsValue::from_str("null pointer passed to update_into"));
-        }
-
-        unsafe {
-            let price = std::slice::from_raw_parts(price_ptr, len);
-            let volume = std::slice::from_raw_parts(volume_ptr, len);
-            let fast_out = std::slice::from_raw_parts_mut(fast_out_ptr, len);
-            let slow_out = std::slice::from_raw_parts_mut(slow_out_ptr, len);
-
-            let params = BuffAveragesParams {
-                fast_period: Some(self.fast_period),
-                slow_period: Some(self.slow_period),
-            };
-            let input = BuffAveragesInput::from_slices(price, volume, params);
-
-            let needs_temp = price_ptr == fast_out_ptr
-                || price_ptr == slow_out_ptr
-                || volume_ptr == fast_out_ptr
-                || volume_ptr == slow_out_ptr;
-
-            if needs_temp {
-                let mut temp_fast = vec![0.0; len];
-                let mut temp_slow = vec![0.0; len];
-
-                buff_averages_into_slices(&mut temp_fast, &mut temp_slow, &input, self.kernel)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-                fast_out.copy_from_slice(&temp_fast);
-                slow_out.copy_from_slice(&temp_slow);
-            } else {
-                buff_averages_into_slices(fast_out, slow_out, &input, self.kernel)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn get_warmup_period(&self) -> usize {
-        self.slow_period - 1
-    }
-
-    #[wasm_bindgen]
-    pub fn compute(&self, price: &[f64], volume: &[f64]) -> Result<Vec<f64>, JsValue> {
-        let params = BuffAveragesParams {
-            fast_period: Some(self.fast_period),
-            slow_period: Some(self.slow_period),
-        };
-        let input = BuffAveragesInput::from_slices(price, volume, params);
-        let result = buff_averages_with_kernel(&input, self.kernel)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let mut output = Vec::with_capacity(price.len() * 2);
-        output.extend_from_slice(&result.fast_buff);
-        output.extend_from_slice(&result.slow_buff);
-        Ok(output)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn buff_averages_output_into_js(
-    price: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = buff_averages_js(price, volume, fast_period, slow_period)?;
-    crate::write_wasm_f64_output("buff_averages_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn buff_averages_batch_unified_output_into_js(
-    price: &[f64],
-    volume: &[f64],
-    fast_range: Vec<usize>,
-    slow_range: Vec<usize>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = buff_averages_batch_unified_js(price, volume, fast_range, slow_range)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "buff_averages_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn buff_averages_unified_output_into_js(
-    price: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = buff_averages_unified_js(price, volume, fast_period, slow_period)?;
-    crate::write_wasm_object_f64_outputs("buff_averages_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
 
     fn check_buff_averages_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input =
             BuffAveragesInput::from_candles(&candles, "close", BuffAveragesParams::default());
@@ -2559,8 +1822,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_buff_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = buff_averages_with_kernel(&BuffAveragesInput::with_default_candles(&c), kernel)?;
 
         for (i, &v) in out.fast_buff.iter().enumerate() {
@@ -2595,8 +1858,8 @@ mod tests {
 
     fn check_buff_nan_prefix(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = BuffAveragesInput::with_default_candles(&c);
 
         let (price, _, _, slow_p, first, _) = buff_averages_prepare(&input, kernel)?;
@@ -2632,8 +1895,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = BuffAveragesParams {
             fast_period: None,
@@ -2652,8 +1915,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = BuffAveragesInput::with_default_candles(&candles);
         match input.data {
@@ -2808,8 +2071,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let range = BuffAveragesBatchRange {
             fast_period: (5, 5, 0),
@@ -2868,8 +2131,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let range = BuffAveragesBatchRange {
             fast_period: (3, 7, 2),
@@ -2954,8 +2217,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let range = BuffAveragesBatchRange {
             fast_period: (3, 7, 2),

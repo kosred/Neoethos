@@ -55,7 +55,8 @@ const SECTIONS: Sec[] = [
   { id: "discovery", icon: "🧬", title: "Discovery", group: "Research",
     what: "The strategy factory: a genetic search that breeds and tests thousands of rules and keeps the ones that survive out-of-sample validation.",
     how: [
-      "Pick a Symbol and Base TF (or leave them on config defaults).",
+      "Select an exact canonical dataset identity and its current generation from the Data inventory.",
+      "Every required timeframe must be downloaded or imported directly at that timeframe; a missing one stops the run with the backend error.",
       "Optionally open Advanced for population/generations/portfolio size.",
       "Start and watch the progress bar + counters; results appear in Strategy Lab / Autopilot.",
     ] },
@@ -79,6 +80,7 @@ const SECTIONS: Sec[] = [
     what: "Download historical bars from the broker and refresh real trading costs.",
     how: [
       "Pick Symbol + Timeframe + From date, then Fetch from broker.",
+      "Fetch or import each timeframe directly; higher timeframes are separate broker/source datasets.",
       "Refresh broker costs once so backtests use your account's real commission/swap.",
     ] },
   // ── Desk ──

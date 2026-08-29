@@ -794,11 +794,10 @@ extern "C" __global__ void coppock_many_series_one_param_f64(
  *             `ma("wma", sum_roc, ma_period)`, i.e.
  *             moving_averages/wma.rs:305 `wma_scalar`.
  *
- * SINGLE OUTPUT: the batch accepts "value"/"values" only (cpu_batch.rs:16660).
- *
- * PERIOD-INVARIANT. The CPU batch reads `short_roc_period` (11),
- * `long_roc_period` (14) and `ma_period` (10), pins `ma_type` to "wma", and
- * never reads `period`.
+ * SINGLE OUTPUT: the canonical batch accepts only "value". The production
+ * ABI carries the exact `(short_roc_period, long_roc_period, ma_period)` tuple;
+ * the preserved primary ABI receives the long-window anchor and derives the
+ * other two with the same positive integer half-up scaling as hpc_ta.
  *
  * NOT THE FUSED PATH. `coppock_scalar_default_wma` (:618) exists in this file
  * and is a DIFFERENT accumulation - it seeds `weight_sum`/`sum` over the
@@ -829,8 +828,9 @@ extern "C" __global__ void coppock_many_series_one_param_f64(
  * load-bearing and is reproduced literally; `weights = p * (p + 1) * 0.5` is
  * formed the same way (:310).
  *
- * SEQUENTIAL, one thread per combo column. The only per-thread storage is the
- * `ma_period`-slot ring, a fixed 10 doubles at the CPU default.
+ * SEQUENTIAL, one thread per combo column. The old ROC term is recomputed from
+ * immutable close data at the exact `in_old` index, so a runtime-sized tuple
+ * needs no fixed local array or second device pass.
  * =========================================================================== */
 
 #ifndef NEO_F64_NAN
@@ -841,13 +841,82 @@ extern "C" __global__ void coppock_many_series_one_param_f64(
 #define COPPOCK_NEO_LONG  14
 #define COPPOCK_NEO_MA    10
 
-__device__ __forceinline__ double coppock_neo_roc_sum_f64(
-    const double* __restrict__ d, int i)
+static __device__ __forceinline__ int coppock_scaled_window_f64(
+    int anchor, int default_value)
+{
+    if (anchor <= 0 || default_value <= 0) return 0;
+    const long long numerator = (long long)default_value * (long long)anchor
+                              + (long long)(COPPOCK_NEO_LONG / 2);
+    const long long scaled = numerator / (long long)COPPOCK_NEO_LONG;
+    return (scaled < 1LL) ? 1 : (int)scaled;
+}
+
+static __device__ __forceinline__ double coppock_roc_sum_f64(
+    const double* __restrict__ d, int i, int short_roc_period, int long_roc_period)
 {
     const double current = d[i];
-    const double short_val = ((current / d[i - COPPOCK_NEO_SHORT]) - 1.0) * 100.0;
-    const double long_val  = ((current / d[i - COPPOCK_NEO_LONG])  - 1.0) * 100.0;
+    const double short_val = ((current / d[i - short_roc_period]) - 1.0) * 100.0;
+    const double long_val  = ((current / d[i - long_roc_period])  - 1.0) * 100.0;
     return short_val + long_val;
+}
+
+static __device__ __forceinline__ void coppock_row_f64(
+    const double* __restrict__ data,
+    int len,
+    int short_roc_period,
+    int long_roc_period,
+    int ma_period,
+    int first_valid,
+    double* __restrict__ out_value)
+{
+    for (int i = 0; i < len; ++i) out_value[i] = NEO_F64_NAN;
+    if (first_valid < 0 || first_valid >= len ||
+        short_roc_period <= 0 || long_roc_period <= 0 || ma_period <= 0 ||
+        short_roc_period > len || long_roc_period > len || ma_period > len) {
+        return;
+    }
+
+    const int largest = (short_roc_period > long_roc_period)
+                            ? short_roc_period : long_roc_period;
+    const int roc_start = first_valid + largest;      /* coppock.rs:334 */
+    if (roc_start >= len) return;
+    if (len - first_valid < largest) return;          /* :327 NotEnoughValidData */
+
+    /* wma_prepare's own first-non-NaN scan over the ROC series (wma.rs:259). */
+    int first_roc = roc_start;
+    while (first_roc < len &&
+           isnan(coppock_roc_sum_f64(
+               data, first_roc, short_roc_period, long_roc_period))) {
+        first_roc += 1;
+    }
+    if (first_roc >= len) return;
+
+    const int lookback = ma_period - 1;
+    const double period_f = (double)ma_period;
+    const double weights = period_f * (period_f + 1.0) * 0.5; /* wma.rs:310 */
+    if (first_roc + lookback >= len) return;
+
+    double sum = 0.0;
+    double weight_sum = 0.0;
+    for (int k = 0; k < lookback; ++k) {
+        const double v = coppock_roc_sum_f64(
+            data, first_roc + k, short_roc_period, long_roc_period);
+        weight_sum += v * ((double)k + 1.0);
+        sum += v;
+    }
+
+    for (int i = first_roc + lookback; i < len; ++i) {
+        const double v = coppock_roc_sum_f64(
+            data, i, short_roc_period, long_roc_period);
+        weight_sum += v * period_f;
+        sum += v;
+        out_value[i] = weight_sum / weights;
+
+        const double old = coppock_roc_sum_f64(
+            data, i - lookback, short_roc_period, long_roc_period);
+        weight_sum -= sum;
+        sum -= old;
+    }
 }
 
 extern "C" __global__
@@ -860,59 +929,32 @@ void coppock_neo_batch_f64(const double* __restrict__ data,
 {
     const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (combo >= n_combos) return;
-    (void)periods;
+    const int anchor = periods[combo];
+    const int short_roc_period =
+        coppock_scaled_window_f64(anchor, COPPOCK_NEO_SHORT);
+    const int long_roc_period =
+        coppock_scaled_window_f64(anchor, COPPOCK_NEO_LONG);
+    const int ma_period = coppock_scaled_window_f64(anchor, COPPOCK_NEO_MA);
+    double* __restrict__ row = out + (size_t)combo * (size_t)series_len;
+    coppock_row_f64(data, series_len, short_roc_period, long_roc_period,
+                    ma_period, first_valid, row);
+}
 
-    const int len = series_len;
-    double* __restrict__ o = out + (size_t)combo * (size_t)len;
-
-    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
-    if (first_valid < 0 || first_valid >= len) return;
-
-    const int largest = (COPPOCK_NEO_SHORT > COPPOCK_NEO_LONG)
-                            ? COPPOCK_NEO_SHORT : COPPOCK_NEO_LONG;
-    const int roc_start = first_valid + largest;      /* coppock.rs:334 */
-    if (roc_start >= len) return;
-    if (len - first_valid < largest) return;          /* :327 NotEnoughValidData */
-
-    /* wma_prepare's own first-non-NaN scan over the ROC series (wma.rs:259). */
-    int first_roc = roc_start;
-    while (first_roc < len && isnan(coppock_neo_roc_sum_f64(data, first_roc))) {
-        first_roc += 1;
-    }
-    if (first_roc >= len) return;
-
-    const int    P        = COPPOCK_NEO_MA;
-    const int    lookback = P - 1;
-    const double period_f = (double)P;
-    const double weights  = period_f * (period_f + 1.0) * 0.5;   /* wma.rs:310 */
-
-    if (first_roc + lookback >= len) return;
-
-    double ring[COPPOCK_NEO_MA];
-    double sum = 0.0, weight_sum = 0.0;
-    for (int k = 0; k < lookback; ++k) {
-        const double v = coppock_neo_roc_sum_f64(data, first_roc + k);
-        ring[k] = v;
-        weight_sum += v * ((double)k + 1.0);
-        sum += v;
-    }
-
-    /* `in_old` trails `in_new` by exactly `lookback` bars (wma.rs:327-328),
-       so the ring is `lookback` slots wide - NOT `period`. A `period`-wide
-       ring would hand back a value one bar too old on every wrap. */
-    int old_slot = 0;
-    for (int i = first_roc + lookback; i < len; ++i) {
-        const double v = coppock_neo_roc_sum_f64(data, i);
-        weight_sum += v * period_f;
-        sum += v;
-
-        o[i] = weight_sum / weights;
-
-        const double old = ring[old_slot];
-        ring[old_slot] = v;
-        old_slot += 1; if (old_slot == lookback) old_slot = 0;
-
-        weight_sum -= sum;
-        sum -= old;
-    }
+extern "C" __global__
+void coppock_production_f64(const double* __restrict__ data,
+                            int series_len,
+                            const int* __restrict__ short_roc_periods,
+                            const int* __restrict__ long_roc_periods,
+                            const int* __restrict__ ma_periods,
+                            int n_combos,
+                            int first_valid,
+                            double* __restrict__ out_value)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    double* __restrict__ row =
+        out_value + (size_t)combo * (size_t)series_len;
+    coppock_row_f64(data, series_len,
+                    short_roc_periods[combo], long_roc_periods[combo],
+                    ma_periods[combo], first_valid, row);
 }

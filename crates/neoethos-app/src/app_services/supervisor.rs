@@ -110,7 +110,12 @@ pub struct SupervisorLogEntry {
     pub result: Option<String>,
 }
 
-fn log_entry(kind: &str, detail: impl Into<String>, action: Option<serde_json::Value>, result: Option<String>) {
+fn log_entry(
+    kind: &str,
+    detail: impl Into<String>,
+    action: Option<serde_json::Value>,
+    result: Option<String>,
+) {
     let entry = SupervisorLogEntry {
         ts_ms: chrono::Utc::now().timestamp_millis(),
         kind: kind.to_string(),
@@ -124,7 +129,11 @@ fn log_entry(kind: &str, detail: impl Into<String>, action: Option<serde_json::V
     }
     if let Ok(line) = serde_json::to_string(&entry) {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(f, "{line}");
         }
     }
@@ -133,8 +142,12 @@ fn log_entry(kind: &str, detail: impl Into<String>, action: Option<serde_json::V
 /// Most-recent-first tail of the supervisor journal (for the UI + the next
 /// tick's own memory).
 pub fn recent_log(limit: usize) -> Vec<SupervisorLogEntry> {
-    let Some(path) = log_path() else { return Vec::new() };
-    let Ok(raw) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Some(path) = log_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
     let mut out: Vec<SupervisorLogEntry> = raw
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -150,33 +163,55 @@ pub fn recent_log(limit: usize) -> Vec<SupervisorLogEntry> {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum SupervisorAction {
     /// Record an observation/diagnosis for the operator. Always allowed.
-    Note { text: String },
+    Note {
+        text: String,
+    },
     /// Kick a discovery run (same validated body as the UI button).
-    StartDiscovery { symbol: String, base_tf: String },
+    StartDiscovery {
+        symbol: String,
+        base_tf: String,
+    },
     StopDiscovery,
-    StartTraining { symbol: String, base_tf: String },
+    StartTraining {
+        symbol: String,
+        base_tf: String,
+    },
     StopTraining,
     /// Start live engines for portfolio files. The demo-forward gate still
     /// blocks ineligible strategies on REAL-money environments.
-    StartLive { portfolio_paths: Vec<String> },
+    StartLive {
+        portfolio_paths: Vec<String>,
+    },
     /// Stop ALL live engines (risk-reducing — always allowed).
     StopLive,
     /// Change settings THROUGH the same clamped/validated applier as the UI.
     /// Payload = the camelCase `POST /settings` body (subset).
-    UpdateSettings { payload: serde_json::Value },
+    UpdateSettings {
+        payload: serde_json::Value,
+    },
     /// T3: propose closing a position — lands in the Actions approval queue;
     /// the OPERATOR's click executes it, never this agent.
-    ProposeClose { position_id: i64, reason: String },
+    ProposeClose {
+        position_id: i64,
+        reason: String,
+    },
     /// Fetch a public URL (research). The text excerpt lands in the log so the
     /// NEXT tick can read it.
-    FetchUrl { url: String },
+    FetchUrl {
+        url: String,
+    },
     /// List the MCP tools available via the local MCP sidecar (cTrader,
     /// filesystem, web, …). The result lands in the log for the next tick.
     McpTools,
     /// Invoke an MCP tool through the local MCP sidecar. `args` is the tool's
     /// JSON arguments object. Read-only/queryable tools are fine to call; the
     /// same T1-3 judgement guidelines apply as to every other action.
-    McpCall { server: String, tool: String, #[serde(default)] args: serde_json::Value },
+    McpCall {
+        server: String,
+        tool: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
 }
 
 // ── State bundle ────────────────────────────────────────────────────────────
@@ -184,7 +219,9 @@ pub enum SupervisorAction {
 async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
     // Engines (discovery/training) — same DTO the UI polls.
     let engines = serde_json::to_value(
-        crate::server::system_status::engines(State(state.clone())).await.0,
+        crate::server::system_status::engines(State(state.clone()))
+            .await
+            .0,
     )
     .unwrap_or(serde_json::Value::Null);
 
@@ -206,15 +243,16 @@ async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
             let from = now - 7 * 24 * 3600 * 1000;
             let mut trades =
                 crate::app_services::journal_store::query_closed_trades(&dir, Some(from), None);
-            let mut equity = crate::app_services::journal_store::query_equity(&dir, Some(from), None);
+            let mut equity =
+                crate::app_services::journal_store::query_equity(&dir, Some(from), None);
             // Scope to the ACTIVE account — same rule as the Journal screen.
             if let Some(active) = crate::app_services::journal_store::active_account_id() {
                 trades.retain(|t| t.account_id.as_deref() == Some(active.as_str()));
                 equity.retain(|e| e.account_id.as_deref() == Some(active.as_str()));
             }
-            let stats = serde_json::to_value(
-                crate::app_services::journal_stats::compute_stats(&trades, &equity),
-            )
+            let stats = serde_json::to_value(crate::app_services::journal_stats::compute_stats(
+                &trades, &equity,
+            ))
             .unwrap_or(serde_json::Value::Null);
             let tail: Vec<serde_json::Value> = trades
                 .iter()
@@ -246,12 +284,13 @@ async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
 
     // Discovered portfolios + permanent blacklist.
     let portfolios = serde_json::to_value(
-        crate::server::portfolios::list(State(state.clone())).await.0,
+        crate::server::portfolios::list(State(state.clone()))
+            .await
+            .0,
     )
     .unwrap_or(serde_json::Value::Null);
-    let blacklist =
-        serde_json::to_value(crate::app_services::strategy_blacklist::load())
-            .unwrap_or(serde_json::Value::Null);
+    let blacklist = serde_json::to_value(crate::app_services::strategy_blacklist::load())
+        .unwrap_or(serde_json::Value::Null);
 
     // The agent's own recent memory (notes, fetched research, action results).
     let memory = serde_json::to_value(recent_log(20)).unwrap_or(serde_json::Value::Null);
@@ -338,7 +377,10 @@ pub async fn chat(state: AppApiState, message: String) -> Result<(String, String
     result
 }
 
-async fn run_cycle(state: AppApiState, operator_message: Option<String>) -> Result<(String, String)> {
+async fn run_cycle(
+    state: AppApiState,
+    operator_message: Option<String>,
+) -> Result<(String, String)> {
     let cfg = load_config();
     let max_actions = cfg.max_actions_per_tick.clamp(1, 5);
     let bundle = gather_bundle(&state).await;
@@ -405,12 +447,22 @@ async fn run_cycle(state: AppApiState, operator_message: Option<String>) -> Resu
         let action_json = serde_json::to_value(&action).unwrap_or(serde_json::Value::Null);
         match execute(&state, action).await {
             Ok(outcome) => {
-                log_entry("action", label.clone(), Some(action_json), Some(outcome.clone()));
+                log_entry(
+                    "action",
+                    label.clone(),
+                    Some(action_json),
+                    Some(outcome.clone()),
+                );
                 summary_parts.push(format!("{label}: {outcome}"));
                 executed += 1;
             }
             Err(e) => {
-                log_entry("error", label.clone(), Some(action_json), Some(e.to_string()));
+                log_entry(
+                    "error",
+                    label.clone(),
+                    Some(action_json),
+                    Some(e.to_string()),
+                );
                 summary_parts.push(format!("{label}: FAILED — {e}"));
             }
         }
@@ -477,8 +529,7 @@ pub(crate) fn mcp_sidecar_url() -> String {
 /// * **`neoethos-control-plane`** — the INBOUND control plane, built from
 ///   `crates/neoethos-mcp`, which lets an external LLM drive this backend. It
 ///   is a different process and starting it will not fix this.
-const MCP_SIDECAR_UNREACHABLE: &str =
-    "MCP sidecar not reachable. The process that must be running is \
+const MCP_SIDECAR_UNREACHABLE: &str = "MCP sidecar not reachable. The process that must be running is \
      `neoethos-mcp` (the OUTBOUND sidecar built from the `mcp/` workspace, \
      spawned next to the app, listening on the port in `mcp_servers.json`). \
      It is NOT `neoethos-control-plane` (the INBOUND control plane built from \
@@ -499,8 +550,8 @@ fn is_read_only_mcp_tool(tool: &str) -> bool {
         .unwrap_or(tool)
         .to_ascii_lowercase();
     const READ_ONLY_VERBS: &[&str] = &[
-        "list", "get", "read", "search", "fetch", "status", "describe", "find",
-        "query", "show", "info", "count", "lookup", "view", "inspect", "resolve",
+        "list", "get", "read", "search", "fetch", "status", "describe", "find", "query", "show",
+        "info", "count", "lookup", "view", "inspect", "resolve",
     ];
     READ_ONLY_VERBS.iter().any(|v| {
         name == *v || name.starts_with(&format!("{v}_")) || name.starts_with(&format!("{v}-"))
@@ -509,18 +560,30 @@ fn is_read_only_mcp_tool(tool: &str) -> bool {
 
 fn action_label(a: &SupervisorAction) -> String {
     match a {
-        SupervisorAction::Note { text } => format!("note: {}", text.chars().take(160).collect::<String>()),
+        SupervisorAction::Note { text } => {
+            format!("note: {}", text.chars().take(160).collect::<String>())
+        }
         SupervisorAction::McpTools => "mcp_tools".into(),
         SupervisorAction::McpCall { server, tool, .. } => format!("mcp_call {server}/{tool}"),
-        SupervisorAction::StartDiscovery { symbol, base_tf } => format!("start_discovery {symbol} {base_tf}"),
+        SupervisorAction::StartDiscovery { symbol, base_tf } => {
+            format!("start_discovery {symbol} {base_tf}")
+        }
         SupervisorAction::StopDiscovery => "stop_discovery".into(),
-        SupervisorAction::StartTraining { symbol, base_tf } => format!("start_training {symbol} {base_tf}"),
+        SupervisorAction::StartTraining { symbol, base_tf } => {
+            format!("start_training {symbol} {base_tf}")
+        }
         SupervisorAction::StopTraining => "stop_training".into(),
-        SupervisorAction::StartLive { portfolio_paths } => format!("start_live ×{}", portfolio_paths.len()),
+        SupervisorAction::StartLive { portfolio_paths } => {
+            format!("start_live ×{}", portfolio_paths.len())
+        }
         SupervisorAction::StopLive => "stop_live (all)".into(),
         SupervisorAction::UpdateSettings { .. } => "update_settings".into(),
-        SupervisorAction::ProposeClose { position_id, .. } => format!("propose_close #{position_id}"),
-        SupervisorAction::FetchUrl { url } => format!("fetch_url {}", url.chars().take(120).collect::<String>()),
+        SupervisorAction::ProposeClose { position_id, .. } => {
+            format!("propose_close #{position_id}")
+        }
+        SupervisorAction::FetchUrl { url } => {
+            format!("fetch_url {}", url.chars().take(120).collect::<String>())
+        }
     }
 }
 
@@ -532,10 +595,21 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
         SupervisorAction::Note { text } => Ok(format!("noted: {text}")),
 
         SupervisorAction::StartDiscovery { symbol, base_tf } => {
-            let body: engines_control::StartJobBody = serde_json::from_value(
-                serde_json::json!({ "symbol": symbol, "base_tf": base_tf }),
-            )?;
-            let resp = engines_control::discovery_start(State(state.clone()), Some(Json(body))).await;
+            let settings = neoethos_core::Settings::from_yaml(state.config_path())
+                .context("cannot resolve data root for exact Supervisor discovery selection")?;
+            let dataset_identity =
+                crate::app_services::discovery::resolve_unique_background_dataset_identity(
+                    &settings.system.data_dir,
+                    &symbol,
+                    &base_tf,
+                )?;
+            let body: engines_control::StartJobBody = serde_json::from_value(serde_json::json!({
+                "dataset_identity": dataset_identity.to_path_component(),
+                "symbol": symbol,
+                "base_tf": base_tf,
+            }))?;
+            let resp =
+                engines_control::discovery_start(State(state.clone()), Some(Json(body))).await;
             Ok(format!("discovery start → {}", response_status(&resp)))
         }
         SupervisorAction::StopDiscovery => {
@@ -546,7 +620,8 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
             let body: engines_control::StartJobBody = serde_json::from_value(
                 serde_json::json!({ "symbol": symbol, "base_tf": base_tf }),
             )?;
-            let resp = engines_control::training_start(State(state.clone()), Some(Json(body))).await;
+            let resp =
+                engines_control::training_start(State(state.clone()), Some(Json(body))).await;
             Ok(format!("training start → {}", response_status(&resp)))
         }
         SupervisorAction::StopTraining => {
@@ -555,9 +630,8 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
         }
 
         SupervisorAction::StartLive { portfolio_paths } => {
-            let body: autonomous::StartLiveBody = serde_json::from_value(
-                serde_json::json!({ "portfolio_paths": portfolio_paths }),
-            )?;
+            let body: autonomous::StartLiveBody =
+                serde_json::from_value(serde_json::json!({ "portfolio_paths": portfolio_paths }))?;
             let resp = autonomous::start_live(State(state.clone()), Json(body)).await;
             Ok(format!("live start → {}", response_status(&resp)))
         }
@@ -573,7 +647,10 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
             Ok(format!("settings update → {}", response_status(&resp)))
         }
 
-        SupervisorAction::ProposeClose { position_id, reason } => {
+        SupervisorAction::ProposeClose {
+            position_id,
+            reason,
+        } => {
             let id = crate::app_services::pending_actions::propose(
                 crate::app_services::pending_actions::ActionKind::ClosePosition {
                     position_id,
@@ -615,7 +692,11 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
                 Ok(out.split_whitespace().collect::<Vec<_>>().join(" "))
             })
             .await??;
-            Ok(format!("fetched {} chars: {}", text.len(), text.chars().take(1500).collect::<String>()))
+            Ok(format!(
+                "fetched {} chars: {}",
+                text.len(),
+                text.chars().take(1500).collect::<String>()
+            ))
         }
 
         SupervisorAction::McpTools => {
@@ -628,7 +709,14 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
                 .context(MCP_SIDECAR_UNREACHABLE)?
                 .error_for_status()?;
             let v: serde_json::Value = resp.json().await?;
-            Ok(format!("MCP tools: {}", serde_json::to_string(&v).unwrap_or_default().chars().take(2000).collect::<String>()))
+            Ok(format!(
+                "MCP tools: {}",
+                serde_json::to_string(&v)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(2000)
+                    .collect::<String>()
+            ))
         }
 
         SupervisorAction::McpCall { server, tool, args } => {
@@ -660,14 +748,25 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
                 .context(MCP_SIDECAR_UNREACHABLE)?
                 .error_for_status()?;
             let v: serde_json::Value = resp.json().await?;
-            Ok(format!("mcp_call {server}/{tool} → {}", serde_json::to_string(&v).unwrap_or_default().chars().take(2000).collect::<String>()))
+            Ok(format!(
+                "mcp_call {server}/{tool} → {}",
+                serde_json::to_string(&v)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(2000)
+                    .collect::<String>()
+            ))
         }
     }
 }
 
 fn response_status(resp: &axum::response::Response) -> String {
     let s = resp.status();
-    if s.is_success() { format!("OK {s}") } else { format!("HTTP {s}") }
+    if s.is_success() {
+        format!("OK {s}")
+    } else {
+        format!("HTTP {s}")
+    }
 }
 
 // ── Background loop ─────────────────────────────────────────────────────────
@@ -716,9 +815,18 @@ mod s02_tests {
     #[test]
     fn read_only_tools_are_allowed_directly() {
         for t in [
-            "list_positions", "get_account", "read_file", "search_web",
-            "fetch", "status", "describe-tool", "find_symbol", "query",
-            "ctrader.get_orders", "fs/read_file", "ns:list",
+            "list_positions",
+            "get_account",
+            "read_file",
+            "search_web",
+            "fetch",
+            "status",
+            "describe-tool",
+            "find_symbol",
+            "query",
+            "ctrader.get_orders",
+            "fs/read_file",
+            "ns:list",
         ] {
             assert!(is_read_only_mcp_tool(t), "{t} should be read-only");
         }
@@ -728,9 +836,18 @@ mod s02_tests {
     fn mutating_or_unknown_tools_require_approval() {
         // Fail-closed: anything not clearly read-only must be gated.
         for t in [
-            "place_order", "cancel_order", "write_file", "delete_file",
-            "modify_position", "send_email", "transfer", "execute", "run",
-            "ctrader.close_position", "fs/write", "do_something_weird",
+            "place_order",
+            "cancel_order",
+            "write_file",
+            "delete_file",
+            "modify_position",
+            "send_email",
+            "transfer",
+            "execute",
+            "run",
+            "ctrader.close_position",
+            "fs/write",
+            "do_something_weird",
         ] {
             assert!(!is_read_only_mcp_tool(t), "{t} must require approval");
         }

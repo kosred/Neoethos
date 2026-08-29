@@ -728,8 +728,10 @@ structurally impossible rather than forbidden by policy.
   timestamp against `oos_start_ms`. An overlap is a **hard error that aborts the
   session**, not a warning — a leaked OOS window cannot be un-leaked.
 * **No search ever runs on OOS data. Only evaluation.** Stage 2 takes the
-  promotion candidate's already-selected portfolio genes (with canonical indices)
-  and backtests them. Nothing is fitted, nothing is selected.
+  promotion candidate's ordered batch-bound genes. Every gene retains its source
+  ordinal/cursor and the batch-local post-prefilter feature-name table that gives
+  its indices meaning; OOS projects by those names and backtests the result.
+  Nothing is fitted, nothing is selected.
 * The touch budget is `OOS_TOUCHES_TOTAL = 1` per `(scenario, window)`. Once
   spent, the session stops — whether the promotion passed or failed. A
   configuration that touches the OOS window more than once has spent it.
@@ -1016,8 +1018,12 @@ Root: resolved through the existing store resolver
       proposals.json           the 100 stamped proposals, in draw order
       statistics.json          per-search TrialStatisticsReport
       censuses.json            ten rejection counters, CostBandCensus, batch ledger
-      promotion/slot_NNN.json  canonical genes + the canonical feature NAMES their
-                               indices address + the slot's config_hash STAMP.
+      promotion/slot_NNN.json  v4 ordered batch bindings: canonical input receipt +
+                               receipt SHA-256 + exact evaluated window + effective
+                               search-config hash + batch-local feature names +
+                               ordinal/cursor-tagged local genes. There is no flat or
+                               canonical gene list. The slot's proposal config_hash
+                               remains a separate top-level stamp.
                                ONE PER SEARCH, not one per sweep: a sweep runs 100
                                searches and each selects its own portfolio, so a
                                single file per sweep could only describe one of them.
@@ -1025,8 +1031,8 @@ Root: resolved through the existing store resolver
                                a search that selected nothing writes NOTHING, so
                                "no evidence" has exactly one shape. Read once, by
                                the promotion path, BEFORE the out-of-sample touch is
-                               journalled as spent — and refused unless the stamp is
-                               the promoted configuration's.
+                               journalled as spent — and strict-refused unless every
+                               batch binding and the proposal stamp validate exactly.
       trial_returns.bin        KEPT ONLY for best-ever / promotion / control (§3.2)
   session_champions.json       one champion row per sweep (the pbo_session input)
   verdict.json                 written ONCE, at stop

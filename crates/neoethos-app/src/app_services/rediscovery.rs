@@ -84,15 +84,30 @@ pub fn spawn(state: AppApiState) {
                 let Ok(q) = queue().lock() else { continue };
                 q.front().cloned()
             };
-            let Some((symbol, base_tf)) = next else { continue };
+            let Some((symbol, base_tf)) = next else {
+                continue;
+            };
 
             // Settings gate — read fresh each tick so the toggle applies live.
-            let enabled = neoethos_core::Settings::from_yaml(
+            let settings = match neoethos_core::Settings::from_yaml(
                 &crate::server::state::current_config_path(),
-            )
-            .map(|s| s.system.auto_rediscover_on_cull)
-            .unwrap_or(true);
-            if !enabled {
+            ) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "neoethos_app::rediscovery",
+                        %symbol,
+                        %base_tf,
+                        error = %error,
+                        "cannot resolve exact rediscovery dataset identity because Settings are unavailable — dropping request"
+                    );
+                    if let Ok(mut q) = queue().lock() {
+                        q.pop_front();
+                    }
+                    continue;
+                }
+            };
+            if !settings.system.auto_rediscover_on_cull {
                 tracing::info!(
                     target: "neoethos_app::rediscovery",
                     %symbol, %base_tf,
@@ -104,8 +119,31 @@ pub fn spawn(state: AppApiState) {
                 continue;
             }
 
+            let dataset_identity =
+                match crate::app_services::discovery::resolve_unique_background_dataset_identity(
+                    &settings.system.data_dir,
+                    &symbol,
+                    &base_tf,
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "neoethos_app::rediscovery",
+                            %symbol,
+                            %base_tf,
+                            error = %error,
+                            "rediscovery did not resolve exactly one canonical dataset identity — dropping request"
+                        );
+                        if let Ok(mut q) = queue().lock() {
+                            q.pop_front();
+                        }
+                        continue;
+                    }
+                };
+
             let body: crate::server::engines_control::StartJobBody =
                 match serde_json::from_value(serde_json::json!({
+                    "dataset_identity": dataset_identity.to_path_component(),
                     "symbol": symbol,
                     "base_tf": base_tf,
                 })) {

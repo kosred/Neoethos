@@ -8,8 +8,7 @@ import {
   type BrokerSymbol,
 } from "../api";
 import { useSpotStream } from "../hooks";
-
-const BROKER_TFS = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"];
+import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
 
 export default function Markets() {
   const [symbols, setSymbols] = useState<string[]>([]);
@@ -43,11 +42,13 @@ export default function Markets() {
     (async () => {
       try {
         const tfs = (await brokerTimeframes()).timeframes;
-        setTimeframes(tfs.length ? tfs : BROKER_TFS);
-        setTf((p) => (tfs.includes(p) ? p : tfs.includes("H1") ? "H1" : tfs[0] ?? "H1"));
+        const options = tfs.length ? tfs : [...CANONICAL_BROKER_TIMEFRAMES];
+        setTimeframes(options);
+        setTf((p) => (options.includes(p) ? p : options.includes("H1") ? "H1" : options[0] ?? "H1"));
       } catch {
-        setTimeframes(BROKER_TFS);
-        setTf((p) => (BROKER_TFS.includes(p) ? p : "H1"));
+        const options: string[] = [...CANONICAL_BROKER_TIMEFRAMES];
+        setTimeframes(options);
+        setTf((p) => (options.includes(p) ? p : "H1"));
       }
     })();
   }, []);

@@ -138,7 +138,7 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             supports_cpu_batch: true,
             supports_cuda_single: false,
             supports_cuda_sweep: false,
-            notes: Some("CPU, Python, and WASM only."),
+            notes: Some("CPU only."),
         },
         MovingAverageInfo {
             id: "cora_wave",
@@ -270,7 +270,7 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             supports_cpu_batch: true,
             supports_cuda_single: false,
             supports_cuda_sweep: false,
-            notes: Some("CPU, Python, and WASM only."),
+            notes: Some("CPU only."),
         },
         MovingAverageInfo {
             id: "kama",
@@ -324,13 +324,19 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             id: "ehlers_pma",
             label: "Ehlers PMA",
             requires_candles: false,
-            period_based: true,
+            // EhlersPmaParams is a unit struct: the formula has no period to
+            // sweep. Advertising one makes the generic registry inject an
+            // ignored `period` and return the same predict/trigger pair under
+            // every requested period name.
+            period_based: false,
             single_output: false,
             supports_cpu_single: true,
             supports_cpu_batch: true,
             supports_cuda_single: true,
             supports_cuda_sweep: true,
-            notes: Some("Dual-output; CPU and CUDA batch support output selection via typed params."),
+            notes: Some(
+                "Dual-output; CPU and CUDA batch support output selection via typed params.",
+            ),
         },
         MovingAverageInfo {
             id: "ehlers_undersampled_double_moving_average",
@@ -340,9 +346,11 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             single_output: false,
             supports_cpu_single: true,
             supports_cpu_batch: true,
-            supports_cuda_single: false,
-            supports_cuda_sweep: false,
-            notes: Some("Dual-output; CPU batch support output selection via typed params."),
+            supports_cuda_single: true,
+            supports_cuda_sweep: true,
+            notes: Some(
+                "Dual-output; CPU and resident f64 CUDA batch support exact typed output selection.",
+            ),
         },
         MovingAverageInfo {
             id: "ehma",
@@ -378,7 +386,7 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             supports_cpu_batch: true,
             supports_cuda_single: false,
             supports_cuda_sweep: false,
-            notes: Some("CPU, Python, and WASM only."),
+            notes: Some("CPU only."),
         },
         MovingAverageInfo {
             id: "nma",
@@ -532,9 +540,11 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             single_output: false,
             supports_cpu_single: true,
             supports_cpu_batch: true,
-            supports_cuda_single: false,
-            supports_cuda_sweep: false,
-            notes: Some("Primary output is the corrected line; secondary output is the raw T3 line."),
+            supports_cuda_single: true,
+            supports_cuda_sweep: true,
+            notes: Some(
+                "Primary output is the corrected line; secondary output is the raw T3 line.",
+            ),
         },
         MovingAverageInfo {
             id: "wave_smoother",
@@ -606,7 +616,9 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             supports_cpu_batch: true,
             supports_cuda_single: false,
             supports_cuda_sweep: false,
-            notes: Some("Direct API defaults to absolute-volume mode; generic MA period-based routes use the length parameter with volume-sum mode."),
+            notes: Some(
+                "Direct API is fixed-gamma-N over close; generic/search routes are close-source rolling-volume-sum keyed by length (default 30). The two f64 identities are versioned separately.",
+            ),
         },
         MovingAverageInfo {
             id: "dma",
@@ -666,7 +678,9 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             supports_cpu_batch: true,
             supports_cuda_single: false,
             supports_cuda_sweep: true,
-            notes: Some("Dual-output (fast/slow); CPU and CUDA batch support output selection via typed params."),
+            notes: Some(
+                "Dual-output (fast/slow); CPU and CUDA batch support output selection via typed params.",
+            ),
         },
         MovingAverageInfo {
             id: "frama",
@@ -714,7 +728,9 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             supports_cpu_batch: true,
             supports_cuda_single: false,
             supports_cuda_sweep: true,
-            notes: Some("Requires high/low for single-call path; available via CPU and CUDA batch."),
+            notes: Some(
+                "Requires high/low for single-call path; available via CPU and CUDA batch.",
+            ),
         },
         MovingAverageInfo {
             id: "uma",
@@ -750,7 +766,9 @@ pub fn list_moving_averages() -> &'static [MovingAverageInfo] {
             supports_cpu_batch: true,
             supports_cuda_single: false,
             supports_cuda_sweep: true,
-            notes: Some("Dual-output; CPU and CUDA batch support output selection via typed params."),
+            notes: Some(
+                "Dual-output; CPU and CUDA batch support output selection via typed params.",
+            ),
         },
         MovingAverageInfo {
             id: "mwdx",

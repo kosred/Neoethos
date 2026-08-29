@@ -100,7 +100,11 @@ fn sidecar_port() -> u16 {
     };
     match parsed.get("port") {
         None => DEFAULT_SIDECAR_PORT,
-        Some(v) => match v.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0) {
+        Some(v) => match v
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|n| *n > 0)
+        {
             Some(port) => port,
             None => {
                 tracing::warn!(
@@ -158,11 +162,7 @@ pub async fn config_put(Json(body): Json<McpConfigBody>) -> Response {
                 .into_response();
         }
     };
-    if !parsed
-        .get("servers")
-        .map(|s| s.is_array())
-        .unwrap_or(false)
-    {
+    if !parsed.get("servers").map(|s| s.is_array()).unwrap_or(false) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({

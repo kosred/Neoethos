@@ -1,26 +1,12 @@
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::cci::{cci_with_kernel, CciInput, CciParams};
-use crate::indicators::ema::{ema_into_slice, ema_with_kernel, EmaInput, EmaParams};
-use crate::indicators::mfi::{mfi_with_kernel, MfiInput, MfiParams};
+use crate::indicators::cci::{CciInput, CciParams, cci_with_kernel};
+use crate::indicators::ema::{EmaInput, EmaParams, ema_into_slice, ema_with_kernel};
+use crate::indicators::mfi::{MfiInput, MfiParams, mfi_with_kernel};
 use crate::indicators::moving_averages::sma::{
-    sma_into_slice, sma_with_kernel, SmaInput, SmaParams,
+    SmaInput, SmaParams, sma_into_slice, sma_with_kernel,
 };
-use crate::indicators::rsi::{rsi_with_kernel, RsiInput, RsiParams};
-use crate::indicators::tsi::{tsi_with_kernel, TsiInput, TsiParams};
-use crate::indicators::willr::{willr_with_kernel, WillrInput, WillrParams};
+use crate::indicators::rsi::{RsiInput, RsiParams, rsi_with_kernel};
+use crate::indicators::tsi::{TsiInput, TsiParams, tsi_with_kernel};
+use crate::indicators::willr::{WillrInput, WillrParams, willr_with_kernel};
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
@@ -34,10 +20,6 @@ use std::mem::MaybeUninit;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub enum ModGodModeMode {
     Godmode,
     Tradition,
@@ -79,10 +61,6 @@ pub enum ModGodModeData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct ModGodModeOutput {
     pub wavetrend: Vec<f64>,
     pub signal: Vec<f64>,
@@ -90,10 +68,6 @@ pub struct ModGodModeOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct ModGodModeParams {
     pub n1: Option<usize>,
     pub n2: Option<usize>,
@@ -1013,7 +987,6 @@ pub fn mod_god_mode_into_slices(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn mod_god_mode_into(
     input: &ModGodModeInput,
@@ -3171,647 +3144,10 @@ impl ModGodModeBatchBuilder {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "mod_god_mode")]
-#[pyo3(signature=(high, low, close, volume=None, n1=None, n2=None, n3=None, mode=None, use_volume=None, kernel=None))]
-pub fn mod_god_mode_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: Option<PyReadonlyArray1<'py, f64>>,
-    n1: Option<usize>,
-    n2: Option<usize>,
-    n3: Option<usize>,
-    mode: Option<String>,
-    use_volume: Option<bool>,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let v_opt = volume.as_ref().map(|v| v.as_slice()).transpose()?;
-    let mode_enum = match mode {
-        Some(m) => Some(
-            m.parse::<ModGodModeMode>()
-                .map_err(|e| PyValueError::new_err(e))?,
-        ),
-        None => None,
-    };
-    let params = ModGodModeParams {
-        n1,
-        n2,
-        n3,
-        mode: mode_enum,
-        use_volume,
-    };
-    let kern = validate_kernel(kernel, false).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let out = py
-        .allow_threads(|| {
-            mod_god_mode_with_kernel(&ModGodModeInput::from_slices(h, l, c, v_opt, params), kern)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.wavetrend.into_pyarray(py),
-        out.signal.into_pyarray(py),
-        out.histogram.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "mod_god_mode_batch")]
-#[pyo3(signature=(high, low, close, volume, n1_range, n2_range, n3_range, mode="tradition_mg", kernel=None))]
-pub fn mod_god_mode_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: Option<PyReadonlyArray1<'py, f64>>,
-    n1_range: (usize, usize, usize),
-    n2_range: (usize, usize, usize),
-    n3_range: (usize, usize, usize),
-    mode: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let v = volume.as_ref().map(|v| v.as_slice()).transpose()?;
-    let m = mode
-        .parse::<ModGodModeMode>()
-        .map_err(|e| PyValueError::new_err(e))?;
-    let sweep = ModGodModeBatchRange {
-        n1: n1_range,
-        n2: n2_range,
-        n3: n3_range,
-        mode: m,
-    };
-    let kern = validate_kernel(kernel, true).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let o = py
-        .allow_threads(|| mod_god_mode_batch_with_kernel(h, l, c, v, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let d = pyo3::types::PyDict::new(py);
-    use numpy::IntoPyArray;
-    d.set_item(
-        "wavetrend",
-        o.wavetrend.into_pyarray(py).reshape((o.rows, o.cols))?,
-    )?;
-    d.set_item(
-        "signal",
-        o.signal.into_pyarray(py).reshape((o.rows, o.cols))?,
-    )?;
-    d.set_item(
-        "histogram",
-        o.histogram.into_pyarray(py).reshape((o.rows, o.cols))?,
-    )?;
-    d.set_item(
-        "n1s",
-        o.combos
-            .iter()
-            .map(|p| p.n1.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "n2s",
-        o.combos
-            .iter()
-            .map(|p| p.n2.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "n3s",
-        o.combos
-            .iter()
-            .map(|p| p.n3.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "modes",
-        o.combos
-            .iter()
-            .map(|p| format!("{:?}", p.mode.unwrap()))
-            .collect::<Vec<_>>(),
-    )?;
-    d.set_item("rows", o.rows)?;
-    d.set_item("cols", o.cols)?;
-    Ok(d.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaModGodMode};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyReadonlyArray2;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::types::PyDict;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::{pyfunction, PyResult, Python};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "mod_god_mode_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, n1_range, n2_range, n3_range, mode="tradition_mg", use_volume=false, volume_f32=None, device_id=0))]
-pub fn mod_god_mode_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: PyReadonlyArray1<'py, f32>,
-    low_f32: PyReadonlyArray1<'py, f32>,
-    close_f32: PyReadonlyArray1<'py, f32>,
-    n1_range: (usize, usize, usize),
-    n2_range: (usize, usize, usize),
-    n3_range: (usize, usize, usize),
-    mode: &str,
-    use_volume: bool,
-    volume_f32: Option<PyReadonlyArray1<'py, f32>>,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let vol = if use_volume {
-        Some(
-            volume_f32
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("volume required when use_volume=true"))?
-                .as_slice()?,
-        )
-    } else {
-        None
-    };
-    let m = mode
-        .parse::<ModGodModeMode>()
-        .map_err(|e| PyValueError::new_err(e))?;
-    let sweep = ModGodModeBatchRange {
-        n1: n1_range,
-        n2: n2_range,
-        n3: n3_range,
-        mode: m,
-    };
-    let (wt, sig, hist, combos, rows, cols, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaModGodMode::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let res = cuda
-            .mod_god_mode_batch_dev(h, l, c, vol, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = res.outputs;
-        let rows = out.rows();
-        let cols = out.cols();
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        Ok::<_, PyErr>((
-            out.wt1, out.wt2, out.hist, res.combos, rows, cols, ctx, dev_id,
-        ))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "wavetrend",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: wt,
-                _ctx: Some(ctx.clone()),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "signal",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: sig,
-                _ctx: Some(ctx.clone()),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "histogram",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: hist,
-                _ctx: Some(ctx),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "n1s",
-        combos
-            .iter()
-            .map(|p| p.n1.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "n2s",
-        combos
-            .iter()
-            .map(|p| p.n2.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "n3s",
-        combos
-            .iter()
-            .map(|p| p.n3.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "modes",
-        combos
-            .iter()
-            .map(|p| format!("{:?}", p.mode.unwrap()))
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "mod_god_mode_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, n1=17, n2=6, n3=4, mode="tradition_mg", use_volume=false, volume_tm_f32=None, device_id=0))]
-pub fn mod_god_mode_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: PyReadonlyArray1<'py, f32>,
-    low_tm_f32: PyReadonlyArray1<'py, f32>,
-    close_tm_f32: PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    n1: usize,
-    n2: usize,
-    n3: usize,
-    mode: &str,
-    use_volume: bool,
-    volume_tm_f32: Option<PyReadonlyArray1<'py, f32>>,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let vol = if use_volume {
-        Some(
-            volume_tm_f32
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("volume required when use_volume=true"))?
-                .as_slice()?,
-        )
-    } else {
-        None
-    };
-    let m = mode
-        .parse::<ModGodModeMode>()
-        .map_err(|e| PyValueError::new_err(e))?;
-    let params = ModGodModeParams {
-        n1: Some(n1),
-        n2: Some(n2),
-        n3: Some(n3),
-        mode: Some(m),
-        use_volume: Some(use_volume),
-    };
-    let (wt, sig, hist, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaModGodMode::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.mod_god_mode_many_series_one_param_time_major_dev(h, l, c, vol, cols, rows, &params)
-            .map(|tr| {
-                (
-                    tr.wt1,
-                    tr.wt2,
-                    tr.hist,
-                    cuda.context_arc(),
-                    cuda.device_id(),
-                )
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "wavetrend",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: wt,
-                _ctx: Some(ctx.clone()),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "signal",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: sig,
-                _ctx: Some(ctx.clone()),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "histogram",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: hist,
-                _ctx: Some(ctx),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("n1", n1)?;
-    dict.set_item("n2", n2)?;
-    dict.set_item("n3", n3)?;
-    dict.set_item("mode", mode)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass]
-pub struct ModGodModeStreamPy {
-    stream: ModGodModeStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ModGodModeStreamPy {
-    #[new]
-    #[pyo3(signature = (n1=17, n2=6, n3=4, mode="tradition_mg", use_volume=false))]
-    pub fn new(n1: usize, n2: usize, n3: usize, mode: &str, use_volume: bool) -> PyResult<Self> {
-        let mode_enum = mode
-            .parse::<ModGodModeMode>()
-            .map_err(|e| PyValueError::new_err(format!("Invalid mode: {}", e)))?;
-
-        Ok(Self {
-            stream: ModGodModeStream::new(n1, n2, n3, mode_enum, use_volume),
-        })
-    }
-
-    pub fn update(
-        &mut self,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: Option<f64>,
-    ) -> Option<(f64, f64, f64)> {
-        self.stream.update(high, low, close, volume)
-    }
-
-    pub fn reset(&mut self) {
-        self.stream.reset()
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = mod_god_mode)]
-pub fn mod_god_mode_wasm(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: Option<Vec<f64>>,
-    n1: Option<usize>,
-    n2: Option<usize>,
-    n3: Option<usize>,
-    mode: Option<String>,
-    use_volume: Option<bool>,
-) -> Result<JsValue, JsValue> {
-    let mode_enum = if let Some(m) = mode {
-        match m.parse::<ModGodModeMode>() {
-            Ok(mode) => Some(mode),
-            Err(e) => return Err(JsValue::from_str(&format!("Invalid mode: {}", e))),
-        }
-    } else {
-        None
-    };
-
-    let params = ModGodModeParams {
-        n1,
-        n2,
-        n3,
-        mode: mode_enum,
-        use_volume,
-    };
-
-    let input = ModGodModeInput::from_slices(high, low, close, volume.as_deref(), params);
-
-    match mod_god_mode(&input) {
-        Ok(output) => {
-            let result = serde_wasm_bindgen::to_value(&output)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            Ok(result)
-        }
-        Err(e) => Err(JsValue::from_str(&e.to_string())),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mod_god_mode_alloc(size: usize) -> *mut f64 {
-    let mut buf = Vec::<f64>::with_capacity(size);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mod_god_mode_free(ptr: *mut f64, size: usize) {
-    unsafe {
-        Vec::from_raw_parts(ptr, 0, size);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mod_god_mode_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    vol_ptr: *const f64,
-    len: usize,
-    has_volume: bool,
-    n1: usize,
-    n2: usize,
-    n3: usize,
-    mode: &str,
-    out_w_ptr: *mut f64,
-    out_s_ptr: *mut f64,
-    out_h_ptr: *mut f64,
-) -> Result<(), JsValue> {
-    if [
-        high_ptr as usize,
-        low_ptr as usize,
-        close_ptr as usize,
-        out_w_ptr as usize,
-        out_s_ptr as usize,
-        out_h_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    let m = mode
-        .parse::<ModGodModeMode>()
-        .map_err(|e| JsValue::from_str(&e))?;
-    unsafe {
-        let h = core::slice::from_raw_parts(high_ptr, len);
-        let l = core::slice::from_raw_parts(low_ptr, len);
-        let c = core::slice::from_raw_parts(close_ptr, len);
-        let v = if has_volume {
-            Some(core::slice::from_raw_parts(vol_ptr, len))
-        } else {
-            None
-        };
-        let params = ModGodModeParams {
-            n1: Some(n1),
-            n2: Some(n2),
-            n3: Some(n3),
-            mode: Some(m),
-            use_volume: Some(has_volume),
-        };
-        let out = mod_god_mode_with_kernel(
-            &ModGodModeInput::from_slices(h, l, c, v, params),
-            detect_best_kernel(),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        core::slice::from_raw_parts_mut(out_w_ptr, len).copy_from_slice(&out.wavetrend);
-        core::slice::from_raw_parts_mut(out_s_ptr, len).copy_from_slice(&out.signal);
-        core::slice::from_raw_parts_mut(out_h_ptr, len).copy_from_slice(&out.histogram);
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ModGodModeJsFlat {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mod_god_mode_into_flat(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    vol_ptr: *const f64,
-    len: usize,
-    has_volume: bool,
-    n1: usize,
-    n2: usize,
-    n3: usize,
-    mode: &str,
-    out_ptr: *mut f64,
-) -> Result<(), JsValue> {
-    if [
-        high_ptr as usize,
-        low_ptr as usize,
-        close_ptr as usize,
-        out_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    let m = mode
-        .parse::<ModGodModeMode>()
-        .map_err(|e| JsValue::from_str(&e))?;
-    unsafe {
-        let h = core::slice::from_raw_parts(high_ptr, len);
-        let l = core::slice::from_raw_parts(low_ptr, len);
-        let c = core::slice::from_raw_parts(close_ptr, len);
-        let v = if has_volume {
-            Some(core::slice::from_raw_parts(vol_ptr, len))
-        } else {
-            None
-        };
-
-        let wt = core::slice::from_raw_parts_mut(out_ptr, len);
-        let sig = core::slice::from_raw_parts_mut(out_ptr.add(len), len);
-        let hist = core::slice::from_raw_parts_mut(out_ptr.add(2 * len), len);
-
-        let params = ModGodModeParams {
-            n1: Some(n1),
-            n2: Some(n2),
-            n3: Some(n3),
-            mode: Some(m),
-            use_volume: Some(has_volume),
-        };
-        let inp = ModGodModeInput::from_slices(h, l, c, v, params);
-        mod_god_mode_into_slices(wt, sig, hist, &inp, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = mod_god_mode_js_flat)]
-pub fn mod_god_mode_js_flat(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: Option<Vec<f64>>,
-    n1: usize,
-    n2: usize,
-    n3: usize,
-    mode: &str,
-    use_volume: bool,
-) -> Result<JsValue, JsValue> {
-    let m = mode
-        .parse::<ModGodModeMode>()
-        .map_err(|e| JsValue::from_str(&e))?;
-    let params = ModGodModeParams {
-        n1: Some(n1),
-        n2: Some(n2),
-        n3: Some(n3),
-        mode: Some(m),
-        use_volume: Some(use_volume),
-    };
-    let out = mod_god_mode_with_kernel(
-        &ModGodModeInput::from_slices(high, low, close, volume.as_deref(), params),
-        detect_best_kernel(),
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let cols = close.len();
-    let mut values = Vec::with_capacity(3 * cols);
-    values.extend_from_slice(&out.wavetrend);
-    values.extend_from_slice(&out.signal);
-    values.extend_from_slice(&out.histogram);
-
-    serde_wasm_bindgen::to_value(&ModGodModeJsFlat {
-        values,
-        rows: 3,
-        cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::{read_candles_from_csv, Candles};
+    use crate::utilities::data_loader::{Candles, read_candles_from_vortex};
 
     fn generate_test_candles(len: usize) -> Candles {
         let mut open = vec![0.0; len];
@@ -4081,11 +3417,11 @@ mod tests {
     }
 
     fn check_mod_god_mode_accuracy(kernel: Kernel) {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = match read_candles_from_csv(file_path) {
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = match read_candles_from_vortex(file_path) {
             Ok(c) => c,
             Err(e) => {
-                panic!("Failed to read CSV file: {}", e);
+                panic!("failed to read Vortex fixture: {}", e);
             }
         };
 
@@ -4128,7 +3464,10 @@ mod tests {
             assert!(
                 diff < 4.0,
                 "MOD_GOD_MODE wavetrend mismatch at index {}: got {:.8}, expected {:.8}, diff {:.8}",
-                i, val, expected_last_five[i], diff
+                i,
+                val,
+                expected_last_five[i],
+                diff
             );
         }
     }
@@ -4222,15 +3561,9 @@ mod tests {
     }
 
     fn check_batch_default_row(kernel: Kernel) {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = match read_candles_from_csv(file) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("WARNING: Could not read CSV file: {}", e);
-                println!("Using generated test data instead");
-                generate_test_candles(20)
-            }
-        };
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)
+            .expect("the immutable Vortex fixture must be present and valid");
         let range = ModGodModeBatchRange {
             n1: (5, 5, 0),
             n2: (3, 3, 0),
@@ -4263,15 +3596,9 @@ mod tests {
     }
 
     fn check_batch_sweep(kernel: Kernel) {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = match read_candles_from_csv(file) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("WARNING: Could not read CSV file: {}", e);
-                println!("Using generated test data instead");
-                generate_test_candles(20)
-            }
-        };
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)
+            .expect("the immutable Vortex fixture must be present and valid");
         let range = ModGodModeBatchRange {
             n1: (3, 5, 1),
             n2: (2, 3, 1),
@@ -4419,15 +3746,14 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_mod_god_mode_into_matches_api() {
         fn eq_or_both_nan_eps(a: f64, b: f64) -> bool {
             (a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-12
         }
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file).expect("failed to read candles CSV");
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file).expect("failed to read Vortex candle fixture");
         let params = ModGodModeParams::default();
         let input = ModGodModeInput::from_candles(&candles, params);
 

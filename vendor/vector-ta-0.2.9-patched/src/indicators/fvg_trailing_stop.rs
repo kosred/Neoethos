@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 use std::convert::AsRef;
 use std::error::Error;
@@ -33,10 +17,6 @@ pub struct FvgTrailingStopOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct FvgTrailingStopParams {
     pub unmitigated_fvg_lookback: Option<usize>,
     pub smoothing_length: Option<usize>,
@@ -2459,579 +2439,6 @@ impl FvgTrailingStopStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "fvg_trailing_stop")]
-#[pyo3(signature = (high, low, close, unmitigated_fvg_lookback, smoothing_length, reset_on_cross, kernel=None))]
-pub fn fvg_trailing_stop_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    unmitigated_fvg_lookback: usize,
-    smoothing_length: usize,
-    reset_on_cross: bool,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    use numpy::IntoPyArray;
-    let (h, l, c) = (high.as_slice()?, low.as_slice()?, close.as_slice()?);
-    let kern = validate_kernel(kernel, false)?;
-    let params = FvgTrailingStopParams {
-        unmitigated_fvg_lookback: Some(unmitigated_fvg_lookback),
-        smoothing_length: Some(smoothing_length),
-        reset_on_cross: Some(reset_on_cross),
-    };
-    let input = FvgTrailingStopInput::from_slices(h, l, c, params);
-    let out = py
-        .allow_threads(|| fvg_trailing_stop_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.upper.into_pyarray(py),
-        out.lower.into_pyarray(py),
-        out.upper_ts.into_pyarray(py),
-        out.lower_ts.into_pyarray(py),
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "fvg_trailing_stop_cuda_batch_dev")]
-#[pyo3(signature = (high, low, close, lookback_range, smoothing_range, reset_toggle, device_id=0))]
-pub fn fvg_trailing_stop_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: PyReadonlyArray1<'_, f32>,
-    low: PyReadonlyArray1<'_, f32>,
-    close: PyReadonlyArray1<'_, f32>,
-    lookback_range: (usize, usize, usize),
-    smoothing_range: (usize, usize, usize),
-    reset_toggle: (bool, bool),
-    device_id: usize,
-) -> PyResult<(
-    DeviceArrayF32Py,
-    DeviceArrayF32Py,
-    DeviceArrayF32Py,
-    DeviceArrayF32Py,
-)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let (h, l, c) = (high.as_slice()?, low.as_slice()?, close.as_slice()?);
-    let sweep = FvgTsBatchRange {
-        lookback: lookback_range,
-        smoothing: smoothing_range,
-        reset_on_cross: reset_toggle,
-    };
-    let (u, lwr, uts, lts) = py.allow_threads(|| {
-        let cuda = crate::cuda::fvg_trailing_stop_wrapper::CudaFvgTs::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let batch = cuda
-            .fvg_ts_batch_dev(h, l, c, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((batch.upper, batch.lower, batch.upper_ts, batch.lower_ts))
-    })?;
-    let upper_dev = make_device_array_py(device_id, u)?;
-    let lower_dev = make_device_array_py(device_id, lwr)?;
-    let upper_ts_dev = make_device_array_py(device_id, uts)?;
-    let lower_ts_dev = make_device_array_py(device_id, lts)?;
-    Ok((upper_dev, lower_dev, upper_ts_dev, lower_ts_dev))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "fvg_trailing_stop_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, close_tm, cols, rows, unmitigated_fvg_lookback, smoothing_length, reset_on_cross, device_id=0))]
-pub fn fvg_trailing_stop_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: PyReadonlyArray1<'_, f32>,
-    low_tm: PyReadonlyArray1<'_, f32>,
-    close_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    unmitigated_fvg_lookback: usize,
-    smoothing_length: usize,
-    reset_on_cross: bool,
-    device_id: usize,
-) -> PyResult<(
-    DeviceArrayF32Py,
-    DeviceArrayF32Py,
-    DeviceArrayF32Py,
-    DeviceArrayF32Py,
-)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let (h, l, c) = (
-        high_tm.as_slice()?,
-        low_tm.as_slice()?,
-        close_tm.as_slice()?,
-    );
-    if h.len() != l.len() || h.len() != c.len() || h.len() != cols * rows {
-        return Err(PyValueError::new_err(
-            "time-major arrays must match cols*rows",
-        ));
-    }
-    let params = FvgTrailingStopParams {
-        unmitigated_fvg_lookback: Some(unmitigated_fvg_lookback),
-        smoothing_length: Some(smoothing_length),
-        reset_on_cross: Some(reset_on_cross),
-    };
-    let (u, lw, uts, lts) = py.allow_threads(|| {
-        let cuda = crate::cuda::fvg_trailing_stop_wrapper::CudaFvgTs::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.fvg_ts_many_series_one_param_time_major_dev(h, l, c, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let upper_dev = make_device_array_py(device_id, u)?;
-    let lower_dev = make_device_array_py(device_id, lw)?;
-    let upper_ts_dev = make_device_array_py(device_id, uts)?;
-    let lower_ts_dev = make_device_array_py(device_id, lts)?;
-    Ok((upper_dev, lower_dev, upper_ts_dev, lower_ts_dev))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "fvg_trailing_stop_batch")]
-#[pyo3(signature = (high, low, close, lookback_range, smoothing_range, reset_toggle, kernel=None))]
-pub fn fvg_trailing_stop_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    lookback_range: (usize, usize, usize),
-    smoothing_range: (usize, usize, usize),
-    reset_toggle: (bool, bool),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let (h, l, c) = (high.as_slice()?, low.as_slice()?, close.as_slice()?);
-    let sweep = FvgTsBatchRange {
-        lookback: lookback_range,
-        smoothing: smoothing_range,
-        reset_on_cross: reset_toggle,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid_ts(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = h.len();
-    let rows4 = rows
-        .checked_mul(4)
-        .ok_or_else(|| PyValueError::new_err("rows*4 overflow"))?;
-    let total = rows4
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*4*cols overflow"))?;
-
-    let flat = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let flat_mut = unsafe { flat.as_slice_mut()? };
-
-    py.allow_threads(|| fvg_ts_batch_inner_into(h, l, c, &sweep, kern, true, flat_mut))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-
-    dict.set_item("values", flat.reshape((rows4, cols))?)?;
-    dict.set_item(
-        "lookbacks",
-        combos
-            .iter()
-            .map(|p| p.unmitigated_fvg_lookback.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smoothings",
-        combos
-            .iter()
-            .map(|p| p.smoothing_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "resets",
-        combos
-            .iter()
-            .map(|p| p.reset_on_cross.unwrap_or(false))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass]
-pub struct FvgTrailingStopStreamPy {
-    stream: FvgTrailingStopStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl FvgTrailingStopStreamPy {
-    #[new]
-    fn new(
-        unmitigated_fvg_lookback: usize,
-        smoothing_length: usize,
-        reset_on_cross: bool,
-    ) -> PyResult<Self> {
-        let params = FvgTrailingStopParams {
-            unmitigated_fvg_lookback: Some(unmitigated_fvg_lookback),
-            smoothing_length: Some(smoothing_length),
-            reset_on_cross: Some(reset_on_cross),
-        };
-        let stream = FvgTrailingStopStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(FvgTrailingStopStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64, f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fvg_ts_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fvg_ts_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FvgTsJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FvgTsBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<FvgTrailingStopParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "fvgTrailingStop")]
-pub fn fvg_trailing_stop_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    unmitigated_fvg_lookback: usize,
-    smoothing_length: usize,
-    reset_on_cross: bool,
-) -> Result<JsValue, JsValue> {
-    if high.is_empty() || low.is_empty() || close.is_empty() {
-        return Err(JsValue::from_str(
-            "fvg_trailing_stop: Input data slice is empty.",
-        ));
-    }
-
-    let params = FvgTrailingStopParams {
-        unmitigated_fvg_lookback: Some(unmitigated_fvg_lookback),
-        smoothing_length: Some(smoothing_length),
-        reset_on_cross: Some(reset_on_cross),
-    };
-    let input = FvgTrailingStopInput::from_slices(high, low, close, params);
-
-    let (h, low_in, c, lookback, smoothing_len, reset, first, all_valid) =
-        fvg_ts_prepare(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let len = h.len();
-    let warm = (first + 2 + smoothing_len.saturating_sub(1)).min(len);
-
-    let mut buf_mu = make_uninit_matrix(4, len);
-    init_matrix_prefixes(&mut buf_mu, len, &[warm, warm, warm, warm]);
-    let out: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(buf_mu.as_mut_ptr() as *mut f64, buf_mu.len()) };
-    let (first_half, second_half) = out.split_at_mut(2 * len);
-    let (u, l) = first_half.split_at_mut(len);
-    let (uts, lts) = second_half.split_at_mut(len);
-
-    let chosen = Kernel::Scalar;
-    fvg_ts_compute_into(
-        h,
-        low_in,
-        c,
-        lookback,
-        smoothing_len,
-        reset,
-        u,
-        l,
-        uts,
-        lts,
-        chosen,
-        all_valid,
-    );
-    for v in &mut u[..warm] {
-        *v = f64::NAN;
-    }
-    for v in &mut l[..warm] {
-        *v = f64::NAN;
-    }
-    for v in &mut uts[..warm] {
-        *v = f64::NAN;
-    }
-    for v in &mut lts[..warm] {
-        *v = f64::NAN;
-    }
-
-    let obj = js_sys::Object::new();
-    let upper_arr = js_sys::Array::from_iter(u.iter().map(|&v| JsValue::from_f64(v)));
-    let lower_arr = js_sys::Array::from_iter(l.iter().map(|&v| JsValue::from_f64(v)));
-    let upper_ts_arr = js_sys::Array::from_iter(uts.iter().map(|&v| JsValue::from_f64(v)));
-    let lower_ts_arr = js_sys::Array::from_iter(lts.iter().map(|&v| JsValue::from_f64(v)));
-
-    js_sys::Reflect::set(&obj, &JsValue::from_str("upper"), &upper_arr)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("lower"), &lower_arr)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("upperTs"), &upper_ts_arr)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("lowerTs"), &lower_ts_arr)?;
-
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fvg_trailing_stop_into_flat(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    unmitigated_fvg_lookback: usize,
-    smoothing_length: usize,
-    reset_on_cross: bool,
-) -> Result<(), JsValue> {
-    if [
-        high_ptr as usize,
-        low_ptr as usize,
-        close_ptr as usize,
-        out_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let h = core::slice::from_raw_parts(high_ptr, len);
-        let l = core::slice::from_raw_parts(low_ptr, len);
-        let c = core::slice::from_raw_parts(close_ptr, len);
-        let out = core::slice::from_raw_parts_mut(out_ptr, 4 * len);
-        let (first_half, second_half) = out.split_at_mut(2 * len);
-        let (u, lw) = first_half.split_at_mut(len);
-        let (uts, lts) = second_half.split_at_mut(len);
-        let params = FvgTrailingStopParams {
-            unmitigated_fvg_lookback: Some(unmitigated_fvg_lookback),
-            smoothing_length: Some(smoothing_length),
-            reset_on_cross: Some(reset_on_cross),
-        };
-        let input = FvgTrailingStopInput::from_slices(h, l, c, params);
-        fvg_trailing_stop_into_slices(u, lw, uts, lts, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "fvgTrailingStopBatch")]
-pub fn fvg_trailing_stop_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    lookback_start: usize,
-    lookback_end: usize,
-    lookback_step: usize,
-    smoothing_start: usize,
-    smoothing_end: usize,
-    smoothing_step: usize,
-    reset_include_false: bool,
-    reset_include_true: bool,
-) -> Result<JsValue, JsValue> {
-    if high.is_empty() || low.is_empty() || close.is_empty() {
-        return Err(JsValue::from_str(
-            "fvg_trailing_stop: Input data slice is empty.",
-        ));
-    }
-    let cols = high.len();
-    if cols != low.len() || cols != close.len() {
-        let e = FvgTrailingStopError::InvalidPeriod {
-            period: cols,
-            data_len: cols,
-        };
-        return Err(JsValue::from_str(&e.to_string()));
-    }
-    let sweep = FvgTsBatchRange {
-        lookback: (lookback_start, lookback_end, lookback_step),
-        smoothing: (smoothing_start, smoothing_end, smoothing_step),
-        reset_on_cross: (reset_include_false, reset_include_true),
-    };
-    let combos = expand_grid_ts(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-
-    let first = first_valid_ohlc(high, low, close);
-    if first == usize::MAX {
-        let e = FvgTrailingStopError::AllValuesNaN;
-        return Err(JsValue::from_str(&e.to_string()));
-    }
-    let mut max_sm = 0usize;
-    let rows4 = rows
-        .checked_mul(4)
-        .ok_or_else(|| JsValue::from_str("rows*4 overflow"))?;
-    let mut buf_mu = make_uninit_matrix(rows4, cols);
-    let mut warms = Vec::with_capacity(rows4);
-    for prm in &combos {
-        let look = prm.unmitigated_fvg_lookback.unwrap_or(5);
-        if look == 0 {
-            let e = FvgTrailingStopError::InvalidLookback { lookback: look };
-            return Err(JsValue::from_str(&e.to_string()));
-        }
-        let sm = prm.smoothing_length.unwrap_or(9);
-        if sm == 0 {
-            let e = FvgTrailingStopError::InvalidSmoothingLength { smoothing: sm };
-            return Err(JsValue::from_str(&e.to_string()));
-        }
-        if sm > max_sm {
-            max_sm = sm;
-        }
-        let w = (first + 2 + sm.saturating_sub(1)).min(cols);
-        warms.extend_from_slice(&[w, w, w, w]);
-    }
-    let need = 2 + max_sm.saturating_sub(1);
-    if cols - first < need {
-        let e = FvgTrailingStopError::NotEnoughValidData {
-            needed: need,
-            valid: cols - first,
-        };
-        return Err(JsValue::from_str(&e.to_string()));
-    }
-    init_matrix_prefixes(&mut buf_mu, cols, &warms);
-
-    let flat: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(buf_mu.as_mut_ptr() as *mut f64, buf_mu.len()) };
-    fvg_ts_batch_inner_into(
-        high,
-        low,
-        close,
-        &sweep,
-        detect_best_batch_kernel(),
-        false,
-        flat,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let values = unsafe {
-        Vec::from_raw_parts(
-            buf_mu.as_mut_ptr() as *mut f64,
-            buf_mu.len(),
-            buf_mu.capacity(),
-        )
-    };
-    core::mem::forget(buf_mu);
-
-    let out = FvgTsBatchJsOutput {
-        values,
-        combos,
-        rows,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "fvgTrailingStopAlloc")]
-pub fn fvg_trailing_stop_alloc_js(size: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(size * 4);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "fvgTrailingStopFree")]
-pub fn fvg_trailing_stop_free_js(ptr: *mut f64, size: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, size * 4);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "fvgTrailingStopZeroCopy")]
-pub fn fvg_trailing_stop_zero_copy_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    unmitigated_fvg_lookback: usize,
-    smoothing_length: usize,
-    reset_on_cross: bool,
-    ptr: *mut f64,
-) -> Result<JsValue, JsValue> {
-    if ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    let len = high.len();
-
-    let (upper, lower, upper_ts, lower_ts) = unsafe {
-        (
-            std::slice::from_raw_parts_mut(ptr, len),
-            std::slice::from_raw_parts_mut(ptr.add(len), len),
-            std::slice::from_raw_parts_mut(ptr.add(len * 2), len),
-            std::slice::from_raw_parts_mut(ptr.add(len * 3), len),
-        )
-    };
-
-    for i in 0..len {
-        upper[i] = f64::NAN;
-        lower[i] = f64::NAN;
-        upper_ts[i] = f64::NAN;
-        lower_ts[i] = f64::NAN;
-    }
-
-    let params = FvgTrailingStopParams {
-        unmitigated_fvg_lookback: Some(unmitigated_fvg_lookback),
-        smoothing_length: Some(smoothing_length),
-        reset_on_cross: Some(reset_on_cross),
-    };
-
-    let input = FvgTrailingStopInput {
-        data: FvgTrailingStopData::Slices { high, low, close },
-        params,
-    };
-
-    fvg_trailing_stop_into_slices(upper, lower, upper_ts, lower_ts, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    let upper_arr = unsafe { js_sys::Float64Array::view(upper) };
-    let lower_arr = unsafe { js_sys::Float64Array::view(lower) };
-    let upper_ts_arr = unsafe { js_sys::Float64Array::view(upper_ts) };
-    let lower_ts_arr = unsafe { js_sys::Float64Array::view(lower_ts) };
-
-    js_sys::Reflect::set(&obj, &JsValue::from_str("upper"), &upper_arr)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("lower"), &lower_arr)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("upperTs"), &upper_ts_arr)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("lowerTs"), &lower_ts_arr)?;
-
-    Ok(obj.into())
-}
-
 #[derive(Copy, Clone, Debug)]
 pub struct FvgTrailingStopBuilder {
     unmitigated_fvg_lookback: Option<usize>,
@@ -3111,92 +2518,10 @@ impl FvgTrailingStopBuilder {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fvg_trailing_stop_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    unmitigated_fvg_lookback: usize,
-    smoothing_length: usize,
-    reset_on_cross: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fvg_trailing_stop_js(
-        high,
-        low,
-        close,
-        unmitigated_fvg_lookback,
-        smoothing_length,
-        reset_on_cross,
-    )?;
-    crate::write_wasm_object_f64_outputs("fvg_trailing_stop_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fvg_trailing_stop_zero_copy_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    unmitigated_fvg_lookback: usize,
-    smoothing_length: usize,
-    reset_on_cross: bool,
-    ptr: *mut f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fvg_trailing_stop_zero_copy_js(
-        high,
-        low,
-        close,
-        unmitigated_fvg_lookback,
-        smoothing_length,
-        reset_on_cross,
-        ptr,
-    )?;
-    crate::write_wasm_object_f64_outputs("fvg_trailing_stop_zero_copy_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fvg_trailing_stop_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    lookback_start: usize,
-    lookback_end: usize,
-    lookback_step: usize,
-    smoothing_start: usize,
-    smoothing_end: usize,
-    smoothing_step: usize,
-    reset_include_false: bool,
-    reset_include_true: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fvg_trailing_stop_batch_js(
-        high,
-        low,
-        close,
-        lookback_start,
-        lookback_end,
-        lookback_step,
-        smoothing_start,
-        smoothing_end,
-        smoothing_step,
-        reset_include_false,
-        reset_include_true,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "fvg_trailing_stop_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     macro_rules! skip_if_unsupported {
         ($kernel:expr, $test_name:expr) => {
@@ -3213,8 +2538,8 @@ mod tests {
 
     fn check_fvg_ts_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = FvgTrailingStopParams {
             unmitigated_fvg_lookback: Some(5),
@@ -3262,8 +2587,8 @@ mod tests {
 
     fn check_fvg_ts_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = FvgTrailingStopInput::with_default_candles(&candles);
         let output = fvg_trailing_stop_with_kernel(&input, kernel)?;
@@ -3354,8 +2679,8 @@ mod tests {
         skip_if_unsupported!(kernel, test_name);
         #[cfg(debug_assertions)]
         {
-            let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-            let candles = read_candles_from_csv(file_path)?;
+            let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+            let candles = read_candles_from_vortex(file_path)?;
 
             let params = FvgTrailingStopParams::default();
             let input = FvgTrailingStopInput::from_candles(&candles, params);
@@ -3395,8 +2720,8 @@ mod tests {
 
     fn check_fvg_ts_batch_default(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = FvgTsBatchBuilder::new()
             .kernel(kernel)
@@ -3411,8 +2736,8 @@ mod tests {
 
     fn check_fvg_ts_batch_sweep(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = FvgTsBatchBuilder::new()
             .kernel(kernel)

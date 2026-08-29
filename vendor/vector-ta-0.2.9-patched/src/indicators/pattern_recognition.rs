@@ -1,31 +1,7 @@
 use crate::utilities::data_loader::Candles;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_u64_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub use crate::utilities::dlpack_cuda::DeviceArrayF32Py;
 use crate::utilities::enums::Kernel;
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::{CopyDestination, DeviceBuffer};
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArrayMethods};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::mem::MaybeUninit;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum PatternData<'a> {
@@ -259,20 +235,20 @@ pub struct PatternSpec {
 pub struct PatternRecognitionOutput {
     pub rows: usize,
     pub cols: usize,
-    pub values_u8: Vec<u8>,
+    /// Pattern-major signed values from the native vector-ta formulas.
+    ///
+    /// The only valid values are `-100`, `-80`, `0`, `80`, and `100`.
+    /// Direction and strength are semantic data, not a hit-only boolean.
+    pub values_i8: Vec<i8>,
     pub pattern_ids: Vec<&'static str>,
     pub warmup: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackedPatternRecognitionOutput {
-    pub rows: usize,
-    pub cols: usize,
-    pub words_per_row: usize,
-    pub words_u64: Vec<u64>,
-    pub pattern_ids: Vec<&'static str>,
-    pub warmup: Option<usize>,
-}
+/// Versioned native vector-ta candlestick-pattern semantics.
+///
+/// Version 2 preserves signed strength in the matrix ABI and distinguishes
+/// BodyDoji, ShadowShort, and ShadowVeryShort candle settings.
+pub const VECTOR_TA_PATTERN_SEMANTICS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 struct SharedPatternPrimitives {
@@ -336,37 +312,6 @@ fn build_shared_primitives(
     }
 }
 
-impl PatternRecognitionOutput {
-    pub fn to_bitmask_u64(&self) -> PackedPatternRecognitionOutput {
-        let words_per_row = self.cols.div_ceil(64);
-        let mut words_u64 = vec![0u64; self.rows.saturating_mul(words_per_row)];
-
-        for row in 0..self.rows {
-            let src_start = row * self.cols;
-            let src = &self.values_u8[src_start..src_start + self.cols];
-            let dst_start = row * words_per_row;
-            let dst = &mut words_u64[dst_start..dst_start + words_per_row];
-
-            for (idx, v) in src.iter().enumerate() {
-                if *v != 0 {
-                    let word = idx / 64;
-                    let bit = idx % 64;
-                    dst[word] |= 1u64 << bit;
-                }
-            }
-        }
-
-        PackedPatternRecognitionOutput {
-            rows: self.rows,
-            cols: self.cols,
-            words_per_row,
-            words_u64,
-            pattern_ids: self.pattern_ids.clone(),
-            warmup: self.warmup,
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum PatternRecognitionError {
     #[error(
@@ -379,7 +324,9 @@ pub enum PatternRecognitionError {
         close: usize,
     },
 
-    #[error("pattern_recognition: output length mismatch for `{pattern_id}`: expected {expected}, got {got}")]
+    #[error(
+        "pattern_recognition: output length mismatch for `{pattern_id}`: expected {expected}, got {got}"
+    )]
     OutputLengthMismatch {
         pattern_id: &'static str,
         expected: usize,
@@ -1144,7 +1091,7 @@ pub fn pattern_recognition_with_kernel(
     };
 
     let rows = PATTERN_RUNNERS.len();
-    let mut matrix = make_uninit_u8_matrix(rows, cols);
+    let mut matrix = make_uninit_i8_matrix(rows, cols);
     let mut pattern_input = PatternInput {
         data: pattern_data,
         params: PatternParams {
@@ -1168,18 +1115,18 @@ pub fn pattern_recognition_with_kernel(
         for idx in 0..cols {
             unsafe {
                 dst.get_unchecked_mut(idx)
-                    .write((*out.values.get_unchecked(idx) != 0) as u8);
+                    .write(*out.values.get_unchecked(idx));
             }
         }
     }
 
     let pattern_ids = PATTERN_RUNNERS.iter().map(|x| x.id).collect();
-    let values_u8 = unsafe { assume_init_u8(matrix) };
+    let values_i8 = unsafe { assume_init_i8(matrix) };
 
     Ok(PatternRecognitionOutput {
         rows,
         cols,
-        values_u8,
+        values_i8,
         pattern_ids,
         warmup: None,
     })
@@ -1188,34 +1135,21 @@ pub fn pattern_recognition_with_kernel(
 pub fn extract_pattern_series<'a>(
     output: &'a PatternRecognitionOutput,
     pattern_id: &str,
-) -> Option<&'a [u8]> {
+) -> Option<&'a [i8]> {
     let row = output.pattern_ids.iter().position(|id| *id == pattern_id)?;
     let start = row.checked_mul(output.cols)?;
     let end = start.checked_add(output.cols)?;
-    output.values_u8.get(start..end)
+    output.values_i8.get(start..end)
 }
 
-pub fn pattern_hit(
-    output: &PatternRecognitionOutput,
-    pattern_id: &str,
-    bar: usize,
-) -> Option<bool> {
-    let row = output.pattern_ids.iter().position(|id| *id == pattern_id)?;
-    if bar >= output.cols {
-        return None;
-    }
-    let idx = row.checked_mul(output.cols)?.checked_add(bar)?;
-    output.values_u8.get(idx).map(|x| *x != 0)
-}
-
-fn make_uninit_u8_matrix(rows: usize, cols: usize) -> Vec<MaybeUninit<u8>> {
+fn make_uninit_i8_matrix(rows: usize, cols: usize) -> Vec<MaybeUninit<i8>> {
     let total = rows
         .checked_mul(cols)
         .expect("rows * cols overflowed usize");
 
-    let mut v: Vec<MaybeUninit<u8>> = Vec::new();
+    let mut v: Vec<MaybeUninit<i8>> = Vec::new();
     v.try_reserve_exact(total)
-        .expect("OOM in make_uninit_u8_matrix");
+        .expect("OOM in make_uninit_i8_matrix");
 
     #[cfg(not(debug_assertions))]
     unsafe {
@@ -1225,15 +1159,15 @@ fn make_uninit_u8_matrix(rows: usize, cols: usize) -> Vec<MaybeUninit<u8>> {
     #[cfg(debug_assertions)]
     {
         for _ in 0..total {
-            v.push(MaybeUninit::new(0xCD));
+            v.push(MaybeUninit::new(-51));
         }
     }
 
     v
 }
 
-unsafe fn assume_init_u8(mut v: Vec<MaybeUninit<u8>>) -> Vec<u8> {
-    let ptr = v.as_mut_ptr() as *mut u8;
+unsafe fn assume_init_i8(mut v: Vec<MaybeUninit<i8>>) -> Vec<i8> {
+    let ptr = v.as_mut_ptr() as *mut i8;
     let len = v.len();
     let cap = v.capacity();
     std::mem::forget(v);
@@ -1254,11 +1188,7 @@ pub enum PatternError {
 
 #[inline(always)]
 fn candle_color(open: f64, close: f64) -> i32 {
-    if close >= open {
-        1
-    } else {
-        -1
-    }
+    if close >= open { 1 } else { -1 }
 }
 
 #[inline(always)]
@@ -1394,19 +1324,11 @@ pub fn cdl3blackcrows(input: &PatternInput) -> Result<PatternOutput, PatternErro
     let mut out = vec![0i8; size];
 
     fn candle_color(o: f64, c: f64) -> i8 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
 
     fn lower_shadow(o: f64, c: f64, l: f64) -> f64 {
-        if c < o {
-            c - l
-        } else {
-            o - l
-        }
+        if c < o { c - l } else { o - l }
     }
 
     let mut sum2 = 0.0;
@@ -1479,11 +1401,7 @@ pub fn cdl3inside(input: &PatternInput) -> Result<PatternOutput, PatternError> {
     }
 
     fn candle_color(o: f64, c: f64) -> i8 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
 
     fn candle_range(o: f64, c: f64) -> f64 {
@@ -1495,19 +1413,11 @@ pub fn cdl3inside(input: &PatternInput) -> Result<PatternOutput, PatternError> {
     }
 
     fn max2(a: f64, b: f64) -> f64 {
-        if a > b {
-            a
-        } else {
-            b
-        }
+        if a > b { a } else { b }
     }
 
     fn min2(a: f64, b: f64) -> f64 {
-        if a < b {
-            a
-        } else {
-            b
-        }
+        if a < b { a } else { b }
     }
 
     let mut out = vec![0i8; size];
@@ -1570,11 +1480,7 @@ pub fn cdl3linestrike(input: &PatternInput) -> Result<PatternOutput, PatternErro
     }
 
     fn candle_color(o: f64, c: f64) -> i8 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
 
     fn candle_range(o: f64, c: f64) -> f64 {
@@ -1582,19 +1488,11 @@ pub fn cdl3linestrike(input: &PatternInput) -> Result<PatternOutput, PatternErro
     }
 
     fn max2(a: f64, b: f64) -> f64 {
-        if a > b {
-            a
-        } else {
-            b
-        }
+        if a > b { a } else { b }
     }
 
     fn min2(a: f64, b: f64) -> f64 {
-        if a < b {
-            a
-        } else {
-            b
-        }
+        if a < b { a } else { b }
     }
 
     let mut out = vec![0i8; size];
@@ -1652,11 +1550,7 @@ pub fn cdl3outside(input: &PatternInput) -> Result<PatternOutput, PatternError> 
     let (open, high, low, close) = input_ohlc(&input.data)?;
 
     fn candle_color(o: f64, c: f64) -> i8 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
 
     let size = open.len();
@@ -1707,28 +1601,16 @@ pub fn cdl3starsinsouth(input: &PatternInput) -> Result<PatternOutput, PatternEr
     let (open, high, low, close) = input_ohlc(&input.data)?;
 
     fn candle_color(o: f64, c: f64) -> i8 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
     fn real_body(o: f64, c: f64) -> f64 {
         (c - o).abs()
     }
     fn lower_shadow(o: f64, c: f64, l: f64) -> f64 {
-        if c < o {
-            c - l
-        } else {
-            o - l
-        }
+        if c < o { c - l } else { o - l }
     }
     fn upper_shadow(o: f64, c: f64, h: f64) -> f64 {
-        if c < o {
-            h - o
-        } else {
-            h - c
-        }
+        if c < o { h - o } else { h - c }
     }
     fn candle_range(o: f64, c: f64) -> f64 {
         (c - o).abs()
@@ -1856,11 +1738,7 @@ pub fn cdl3whitesoldiers(input: &PatternInput) -> Result<PatternOutput, PatternE
     let (open, high, low, close) = input_ohlc(&input.data)?;
 
     fn candle_color(o: f64, c: f64) -> i8 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
 
     fn candle_range(o: f64, c: f64) -> f64 {
@@ -1872,19 +1750,11 @@ pub fn cdl3whitesoldiers(input: &PatternInput) -> Result<PatternOutput, PatternE
     }
 
     fn upper_shadow(o: f64, c: f64, h: f64) -> f64 {
-        if c < o {
-            h - o
-        } else {
-            h - c
-        }
+        if c < o { h - o } else { h - c }
     }
 
     fn max2(a: f64, b: f64) -> f64 {
-        if a > b {
-            a
-        } else {
-            b
-        }
+        if a > b { a } else { b }
     }
 
     let size = open.len();
@@ -2023,11 +1893,7 @@ pub fn cdlabandonedbaby(input: &PatternInput) -> Result<PatternOutput, PatternEr
     let penetration = input.params.penetration;
 
     fn candle_color(o: f64, c: f64) -> i8 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
 
     fn real_body(o: f64, c: f64) -> f64 {
@@ -2149,11 +2015,7 @@ pub fn cdladvanceblock(input: &PatternInput) -> Result<PatternOutput, PatternErr
 
     #[inline(always)]
     fn upper_shadow(o: f64, h: f64, c: f64) -> f64 {
-        if c >= o {
-            h - c
-        } else {
-            h - o
-        }
+        if c >= o { h - c } else { h - o }
     }
 
     #[inline(always)]
@@ -2339,20 +2201,12 @@ pub fn cdlbelthold(input: &PatternInput) -> Result<PatternOutput, PatternError> 
 
     #[inline(always)]
     fn lower_shadow(o: f64, l: f64, c: f64) -> f64 {
-        if c >= o {
-            o - l
-        } else {
-            c - l
-        }
+        if c >= o { o - l } else { c - l }
     }
 
     #[inline(always)]
     fn upper_shadow(o: f64, h: f64, c: f64) -> f64 {
-        if c >= o {
-            h - c
-        } else {
-            h - o
-        }
+        if c >= o { h - c } else { h - o }
     }
 
     #[inline(always)]
@@ -2556,20 +2410,12 @@ pub fn cdlclosingmarubozu(input: &PatternInput) -> Result<PatternOutput, Pattern
 
     #[inline(always)]
     fn lower_shadow(o: f64, l: f64, c: f64) -> f64 {
-        if c >= o {
-            o - l
-        } else {
-            c - l
-        }
+        if c >= o { o - l } else { c - l }
     }
 
     #[inline(always)]
     fn upper_shadow(o: f64, h: f64, c: f64) -> f64 {
-        if c >= o {
-            h - c
-        } else {
-            h - o
-        }
+        if c >= o { h - c } else { h - o }
     }
 
     #[inline(always)]
@@ -2674,29 +2520,17 @@ pub fn cdlconcealbabyswall(input: &PatternInput) -> Result<PatternOutput, Patter
 
     #[inline(always)]
     fn upper_shadow(o: f64, h: f64, c: f64) -> f64 {
-        if c >= o {
-            h - c
-        } else {
-            h - o
-        }
+        if c >= o { h - c } else { h - o }
     }
 
     #[inline(always)]
     fn lower_shadow(o: f64, l: f64, c: f64) -> f64 {
-        if c >= o {
-            o - l
-        } else {
-            c - l
-        }
+        if c >= o { o - l } else { c - l }
     }
 
     #[inline(always)]
     fn candle_color(o: f64, c: f64) -> i32 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
 
     #[inline(always)]
@@ -2843,11 +2677,7 @@ pub fn cdlcounterattack(input: &PatternInput) -> Result<PatternOutput, PatternEr
 
     #[inline(always)]
     fn candle_color(o: f64, c: f64) -> i32 {
-        if c >= o {
-            1
-        } else {
-            -1
-        }
+        if c >= o { 1 } else { -1 }
     }
 
     #[inline(always)]
@@ -3148,20 +2978,12 @@ pub fn cdldragonflydoji(input: &PatternInput) -> Result<PatternOutput, PatternEr
 
     #[inline(always)]
     fn upper_shadow(o: f64, h: f64, c: f64) -> f64 {
-        if c >= o {
-            h - c
-        } else {
-            h - o
-        }
+        if c >= o { h - c } else { h - o }
     }
 
     #[inline(always)]
     fn lower_shadow(o: f64, l: f64, c: f64) -> f64 {
-        if c >= o {
-            o - l
-        } else {
-            c - l
-        }
+        if c >= o { o - l } else { c - l }
     }
 
     #[inline(always)]
@@ -3940,7 +3762,7 @@ pub fn cdlharami(input: &PatternInput) -> Result<PatternOutput, PatternError> {
 
 #[inline]
 pub fn cdlharamicross(input: &PatternInput) -> Result<PatternOutput, PatternError> {
-    let (open, _, _, close) = input_ohlc(&input.data)?;
+    let (open, high, low, close) = input_ohlc(&input.data)?;
 
     let size = open.len();
     let body_long_period = 10;
@@ -3975,7 +3797,7 @@ pub fn cdlharamicross(input: &PatternInput) -> Result<PatternOutput, PatternErro
     }
     i = body_doji_trailing_idx;
     while i < lookback_total {
-        body_doji_period_total += real_body(open[i], close[i]);
+        body_doji_period_total += high[i] - low[i];
         i += 1;
     }
     i = lookback_total;
@@ -3983,7 +3805,7 @@ pub fn cdlharamicross(input: &PatternInput) -> Result<PatternOutput, PatternErro
         if real_body(open[i - 1], close[i - 1])
             > candle_average(body_long_period_total, body_long_period)
             && real_body(open[i], close[i])
-                <= candle_average(body_doji_period_total, body_doji_period)
+                <= 0.1 * candle_average(body_doji_period_total, body_doji_period)
         {
             let hi0 = open[i - 1].max(close[i - 1]);
             let lo0 = open[i - 1].min(close[i - 1]);
@@ -3999,8 +3821,8 @@ pub fn cdlharamicross(input: &PatternInput) -> Result<PatternOutput, PatternErro
 
         body_long_period_total += real_body(open[i - 1], close[i - 1])
             - real_body(open[body_long_trailing_idx], close[body_long_trailing_idx]);
-        body_doji_period_total += real_body(open[i], close[i])
-            - real_body(open[body_doji_trailing_idx], close[body_doji_trailing_idx]);
+        body_doji_period_total +=
+            (high[i] - low[i]) - (high[body_doji_trailing_idx] - low[body_doji_trailing_idx]);
         i += 1;
         body_long_trailing_idx += 1;
         body_doji_trailing_idx += 1;
@@ -4287,7 +4109,8 @@ pub fn cdllongline(input: &PatternInput) -> Result<PatternOutput, PatternError> 
     }
     i = shadow_trailing_idx;
     while i < lookback_total {
-        shadow_period_total += upper_shadow(open[i], high[i], close[i]);
+        shadow_period_total +=
+            upper_shadow(open[i], high[i], close[i]) + lower_shadow(open[i], low[i], close[i]);
         i += 1;
     }
 
@@ -4295,9 +4118,9 @@ pub fn cdllongline(input: &PatternInput) -> Result<PatternOutput, PatternError> 
     while i < size {
         if real_body(open[i], close[i]) > candle_average(body_period_total, body_long_period)
             && upper_shadow(open[i], high[i], close[i])
-                < candle_average(shadow_period_total, shadow_short_period)
+                < candle_average(shadow_period_total, shadow_short_period) / 2.0
             && lower_shadow(open[i], low[i], close[i])
-                < candle_average(shadow_period_total, shadow_short_period)
+                < candle_average(shadow_period_total, shadow_short_period) / 2.0
         {
             out[i] = (candle_color(open[i], close[i]) as i8) * 100;
         }
@@ -4305,9 +4128,15 @@ pub fn cdllongline(input: &PatternInput) -> Result<PatternOutput, PatternError> 
         body_period_total += real_body(open[i], close[i])
             - real_body(open[body_trailing_idx], close[body_trailing_idx]);
         shadow_period_total += upper_shadow(open[i], high[i], close[i])
+            + lower_shadow(open[i], low[i], close[i])
             - upper_shadow(
                 open[shadow_trailing_idx],
                 high[shadow_trailing_idx],
+                close[shadow_trailing_idx],
+            )
+            - lower_shadow(
+                open[shadow_trailing_idx],
+                low[shadow_trailing_idx],
                 close[shadow_trailing_idx],
             );
 
@@ -4357,7 +4186,7 @@ pub fn cdlmarubozu(input: &PatternInput) -> Result<PatternOutput, PatternError> 
     }
     i = shadow_very_short_trailing_idx;
     while i < lookback_total {
-        shadow_very_short_period_total += upper_shadow(open[i], high[i], close[i]);
+        shadow_very_short_period_total += high[i] - low[i];
         i += 1;
     }
 
@@ -4365,21 +4194,17 @@ pub fn cdlmarubozu(input: &PatternInput) -> Result<PatternOutput, PatternError> 
     while i < size {
         if real_body(open[i], close[i]) > candle_average(body_long_period_total, body_long_period)
             && upper_shadow(open[i], high[i], close[i])
-                < candle_average(shadow_very_short_period_total, shadow_very_short_period)
+                < 0.1 * candle_average(shadow_very_short_period_total, shadow_very_short_period)
             && lower_shadow(open[i], low[i], close[i])
-                < candle_average(shadow_very_short_period_total, shadow_very_short_period)
+                < 0.1 * candle_average(shadow_very_short_period_total, shadow_very_short_period)
         {
             out[i] = (candle_color(open[i], close[i]) as i8) * 100;
         }
 
         body_long_period_total += real_body(open[i], close[i])
             - real_body(open[body_long_trailing_idx], close[body_long_trailing_idx]);
-        shadow_very_short_period_total += upper_shadow(open[i], high[i], close[i])
-            - upper_shadow(
-                open[shadow_very_short_trailing_idx],
-                high[shadow_very_short_trailing_idx],
-                close[shadow_very_short_trailing_idx],
-            );
+        shadow_very_short_period_total += (high[i] - low[i])
+            - (high[shadow_very_short_trailing_idx] - low[shadow_very_short_trailing_idx]);
 
         i += 1;
         body_long_trailing_idx += 1;
@@ -6816,448 +6641,6 @@ pub fn cdlxsidegap3methods(input: &PatternInput) -> Result<PatternOutput, Patter
     Ok(PatternOutput { values: out })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "pattern_recognition")]
-#[pyo3(signature = (open, high, low, close, kernel=None))]
-pub fn pattern_recognition_py<'py>(
-    py: Python<'py>,
-    open: numpy::PyReadonlyArray1<'py, f64>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let open_slice = open.as_slice()?;
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let input = PatternRecognitionInput::with_default_slices(
-        open_slice,
-        high_slice,
-        low_slice,
-        close_slice,
-    );
-    let output = py
-        .allow_threads(|| pattern_recognition_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    let rows = output.rows;
-    let cols = output.cols;
-    let values = output.values_u8.into_pyarray(py);
-    dict.set_item("values", values.reshape((rows, cols))?)?;
-    dict.set_item(
-        "pattern_ids",
-        PyList::new(py, output.pattern_ids.iter().copied())?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("warmup", output.warmup)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pattern_recognition_cuda_batch_dev")]
-#[pyo3(signature = (open_f32, high_f32, low_f32, close_f32, device_id=0))]
-pub fn pattern_recognition_cuda_batch_dev_py(
-    py: Python<'_>,
-    open_f32: numpy::PyReadonlyArray1<'_, f32>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_f32: numpy::PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::pattern_recognition_wrapper::CudaPatternRecognition;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let open_slice = open_f32.as_slice()?;
-    let high_slice = high_f32.as_slice()?;
-    let low_slice = low_f32.as_slice()?;
-    let close_slice = close_f32.as_slice()?;
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaPatternRecognition::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let d_f32 = cuda
-            .compute_native_matrix_f32_device_from_host_inputs(
-                open_slice,
-                high_slice,
-                low_slice,
-                close_slice,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((d_f32, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pattern_recognition_cuda_host_f32")]
-#[pyo3(signature = (open_f32, high_f32, low_f32, close_f32, device_id=0))]
-pub fn pattern_recognition_cuda_host_f32_py<'py>(
-    py: Python<'py>,
-    open_f32: numpy::PyReadonlyArray1<'py, f32>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::pattern_recognition_wrapper::CudaPatternRecognition;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let open_slice = open_f32.as_slice()?;
-    let high_slice = high_f32.as_slice()?;
-    let low_slice = low_f32.as_slice()?;
-    let close_slice = close_f32.as_slice()?;
-
-    let (values_f32, pattern_ids, rows, cols) = py.allow_threads(|| {
-        let cuda = CudaPatternRecognition::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let native_ids = CudaPatternRecognition::native_supported_pattern_ids();
-        let rows = native_ids.len();
-        let cols = close_slice.len();
-        let d_u8 = cuda
-            .compute_native_matrix_device_from_host_inputs(
-                open_slice,
-                high_slice,
-                low_slice,
-                close_slice,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.synchronize()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let mut host_u8 = vec![0u8; rows.saturating_mul(cols)];
-        d_u8.copy_to(host_u8.as_mut_slice())
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let mut values_f32 = Vec::with_capacity(host_u8.len());
-        values_f32.extend(host_u8.into_iter().map(|x| x as f32));
-        let pattern_ids = native_ids
-            .iter()
-            .map(|x| (*x).to_string())
-            .collect::<Vec<_>>();
-        Ok::<_, PyErr>((values_f32, pattern_ids, rows, cols))
-    })?;
-
-    let dict = PyDict::new(py);
-    let values = values_f32.into_pyarray(py);
-    dict.set_item("values", values.reshape((rows, cols))?)?;
-    dict.set_item("pattern_ids", pattern_ids)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("warmup", py.None())?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct PatternRecognitionDeviceBitmaskU64Py {
-    pub(crate) buf: Option<DeviceBuffer<u64>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) words_per_row: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl PatternRecognitionDeviceBitmaskU64Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.words_per_row))?;
-        d.set_item("typestr", "<u8")?;
-        d.set_item(
-            "strides",
-            (
-                self.words_per_row * std::mem::size_of::<u64>(),
-                std::mem::size_of::<u64>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        if let Some(obj) = stream.as_ref() {
-            if let Ok(i) = obj.extract::<i64>(py) {
-                if i == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__: stream 0 is disallowed for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-        let rows = self.rows;
-        let cols = self.words_per_row;
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-        export_u64_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "pattern_recognition_cuda_bitmask_dev")]
-#[pyo3(signature = (open_f32, high_f32, low_f32, close_f32, device_id=0))]
-pub fn pattern_recognition_cuda_bitmask_dev_py<'py>(
-    py: Python<'py>,
-    open_f32: numpy::PyReadonlyArray1<'py, f32>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::pattern_recognition_wrapper::CudaPatternRecognition;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let open_slice = open_f32.as_slice()?;
-    let high_slice = high_f32.as_slice()?;
-    let low_slice = low_f32.as_slice()?;
-    let close_slice = close_f32.as_slice()?;
-
-    let (bitmask, pattern_ids) = py.allow_threads(|| {
-        let cuda = CudaPatternRecognition::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let bitmask = cuda
-            .compute_native_matrix_bitmask_u64_device_from_host_inputs(
-                open_slice,
-                high_slice,
-                low_slice,
-                close_slice,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let pattern_ids = CudaPatternRecognition::native_supported_pattern_ids()
-            .iter()
-            .map(|x| (*x).to_string())
-            .collect::<Vec<_>>();
-        Ok::<_, PyErr>((bitmask, pattern_ids))
-    })?;
-
-    let handle = Py::new(
-        py,
-        PatternRecognitionDeviceBitmaskU64Py {
-            buf: Some(bitmask.buf),
-            rows: bitmask.rows,
-            cols: bitmask.cols,
-            words_per_row: bitmask.words_per_row,
-            _ctx: bitmask.ctx,
-            device_id: bitmask.device_id,
-        },
-    )?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", handle)?;
-    dict.set_item("pattern_ids", pattern_ids)?;
-    dict.set_item("rows", bitmask.rows)?;
-    dict.set_item("cols", bitmask.cols)?;
-    dict.set_item("words_per_row", bitmask.words_per_row)?;
-    dict.set_item("warmup", py.None())?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct PatternRecognitionJsOutput {
-    values: Vec<u8>,
-    pattern_ids: Vec<String>,
-    rows: usize,
-    cols: usize,
-    warmup: Option<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct PatternRecognitionIntoMeta {
-    pattern_ids: Vec<String>,
-    rows: usize,
-    cols: usize,
-    warmup: Option<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pattern_recognition_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-) -> Result<JsValue, JsValue> {
-    let input = PatternRecognitionInput::with_default_slices(open, high, low, close);
-    let output = pattern_recognition(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js_output = PatternRecognitionJsOutput {
-        values: output.values_u8,
-        pattern_ids: output
-            .pattern_ids
-            .into_iter()
-            .map(|x| x.to_string())
-            .collect(),
-        rows: output.rows,
-        cols: output.cols,
-        warmup: output.warmup,
-    };
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pattern_recognition_alloc(len: usize) -> *mut u8 {
-    let mut vec = Vec::<u8>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pattern_recognition_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pattern_recognition_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut u8,
-    len: usize,
-    out_len: usize,
-) -> Result<JsValue, JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to pattern_recognition_into",
-        ));
-    }
-    if len == 0 {
-        return Err(JsValue::from_str("len must be > 0"));
-    }
-
-    let rows = PATTERN_RUNNERS.len();
-    let expected_out_len = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*len overflow"))?;
-    if out_len < expected_out_len {
-        return Err(JsValue::from_str("output buffer too small"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let output = pattern_recognition(&PatternRecognitionInput::with_default_slices(
-            open, high, low, close,
-        ))
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        if output.values_u8.len() != expected_out_len {
-            return Err(JsValue::from_str("unexpected output length"));
-        }
-        let out_slice = std::slice::from_raw_parts_mut(out_ptr, expected_out_len);
-        out_slice.copy_from_slice(&output.values_u8);
-
-        let meta = PatternRecognitionIntoMeta {
-            pattern_ids: output
-                .pattern_ids
-                .into_iter()
-                .map(|x| x.to_string())
-                .collect(),
-            rows: output.rows,
-            cols: output.cols,
-            warmup: output.warmup,
-        };
-        serde_wasm_bindgen::to_value(&meta)
-            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn pattern_recognition_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = pattern_recognition_js(open, high, low, close)?;
-    crate::write_wasm_object_f64_outputs("pattern_recognition_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7327,6 +6710,132 @@ mod tests {
         }
 
         Candles::new(timestamp, open, high, low, close, volume)
+    }
+
+    fn base_setting_fixture(len: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        (
+            vec![100.0; len],
+            vec![102.0; len],
+            vec![99.0; len],
+            vec![101.0; len],
+        )
+    }
+
+    fn direct_pattern(
+        pattern_type: PatternType,
+        open: &[f64],
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+    ) -> Vec<i8> {
+        pattern(&PatternInput::from_slices(
+            open,
+            high,
+            low,
+            close,
+            PatternParams {
+                pattern_type,
+                penetration: 0.0,
+            },
+        ))
+        .expect("the semantic-boundary fixture is valid")
+        .values
+    }
+
+    #[test]
+    fn semantic_uniqueness_harami_cross_uses_native_body_doji_setting() {
+        assert_eq!(VECTOR_TA_PATTERN_SEMANTICS_VERSION, 2);
+        // VectorTaPatternSemanticsV2 invariant:
+        //   BodyShort = mean(real body over the previous 10 candles)
+        //   BodyDoji  = 0.1 * mean(high-low over the previous 10 candles)
+        let (mut open, mut high, mut low, mut close) = base_setting_fixture(12);
+        open[10] = 100.0;
+        high[10] = 104.5;
+        low[10] = 99.5;
+        close[10] = 104.0;
+        open[11] = 103.0;
+        high[11] = 103.2;
+        low[11] = 102.3;
+        close[11] = 102.5;
+
+        let harami = direct_pattern(PatternType::CdlHarami, &open, &high, &low, &close);
+        let cross = direct_pattern(PatternType::CdlHaramiCross, &open, &high, &low, &close);
+        assert_eq!(harami[11], -100, "short inner body is a strict Harami");
+        assert_eq!(
+            cross[11], 0,
+            "a 0.5 body exceeds the native BodyDoji threshold (0.32)"
+        );
+
+        // One shared real-body endpoint is the native 80-strength boundary.
+        open[11] = 104.0;
+        high[11] = 104.2;
+        low[11] = 103.3;
+        close[11] = 103.5;
+        let shared_end = direct_pattern(PatternType::CdlHarami, &open, &high, &low, &close);
+        assert_eq!(shared_end[11], -80);
+
+        // Reverse the first candle to prove the bullish sign is retained too.
+        open[10] = 104.0;
+        close[10] = 100.0;
+        open[11] = 101.0;
+        high[11] = 101.7;
+        low[11] = 100.8;
+        close[11] = 101.5;
+        let bullish = direct_pattern(PatternType::CdlHarami, &open, &high, &low, &close);
+        assert_eq!(bullish[11], 100);
+
+        // A true doji remains a Harami Cross; the repair must distinguish the
+        // thresholds, not disable the pattern.
+        open[11] = 102.50;
+        high[11] = 102.65;
+        low[11] = 102.40;
+        close[11] = 102.55;
+        let true_cross = direct_pattern(PatternType::CdlHaramiCross, &open, &high, &low, &close);
+        assert_eq!(true_cross[11], 100);
+    }
+
+    #[test]
+    fn semantic_uniqueness_long_line_and_marubozu_use_native_shadow_settings() {
+        // VectorTaPatternSemanticsV2 invariant:
+        //   ShadowShort     = mean(upper+lower shadows, 10) / 2
+        //   ShadowVeryShort = 0.1 * mean(high-low, 10)
+        let (mut open, mut high, mut low, mut close) = base_setting_fixture(11);
+        open[10] = 100.0;
+        high[10] = 103.5;
+        low[10] = 99.5;
+        close[10] = 103.0;
+
+        let long_line = direct_pattern(PatternType::CdlLongLine, &open, &high, &low, &close);
+        let marubozu = direct_pattern(PatternType::CdlMarubozu, &open, &high, &low, &close);
+        assert_eq!(
+            long_line[10], 100,
+            "0.5 shadows are below the native ShadowShort threshold 1.0"
+        );
+        assert_eq!(
+            marubozu[10], 0,
+            "0.5 shadows exceed the native ShadowVeryShort threshold 0.3"
+        );
+    }
+
+    #[test]
+    fn semantic_uniqueness_kicking_by_length_keeps_longer_candle_direction() {
+        let (mut open, mut high, mut low, mut close) = base_setting_fixture(12);
+        open[10] = 105.0;
+        high[10] = 105.05;
+        low[10] = 100.95;
+        close[10] = 101.0;
+        open[11] = 106.0;
+        high[11] = 109.05;
+        low[11] = 105.95;
+        close[11] = 109.0;
+
+        let kicking = direct_pattern(PatternType::CdlKicking, &open, &high, &low, &close);
+        let by_length = direct_pattern(PatternType::CdlKickingByLength, &open, &high, &low, &close);
+        assert_eq!(kicking[11], 100, "Kicking follows the second candle");
+        assert_eq!(
+            by_length[11], -100,
+            "KickingByLength follows the longer first candle"
+        );
     }
 
     #[test]
@@ -7403,9 +6912,13 @@ mod tests {
 
         assert_eq!(out.rows, PATTERN_RUNNERS.len());
         assert_eq!(out.cols, candles.close.len());
-        assert_eq!(out.values_u8.len(), out.rows * out.cols);
+        assert_eq!(out.values_i8.len(), out.rows * out.cols);
         assert_eq!(out.pattern_ids.len(), out.rows);
-        assert!(out.values_u8.iter().all(|v| *v == 0 || *v == 1));
+        assert!(
+            out.values_i8
+                .iter()
+                .all(|value| matches!(*value, -100 | -80 | 0 | 80 | 100))
+        );
 
         for spec in list_patterns() {
             assert_eq!(out.pattern_ids[spec.row_index], spec.id);
@@ -7429,10 +6942,7 @@ mod tests {
             let direct = (runner.run)(&direct_input).unwrap();
             let series = extract_pattern_series(&out, runner.id).unwrap();
             for (idx, v) in direct.values.iter().enumerate() {
-                let mapped = if *v == 0 { 0 } else { 1 };
-                assert_eq!(series[idx], mapped, "pattern={} bar={}", runner.id, idx);
-                let hit = pattern_hit(&out, runner.id, idx).unwrap();
-                assert_eq!(hit, mapped != 0, "pattern={} bar={}", runner.id, idx);
+                assert_eq!(series[idx], *v, "pattern={} bar={}", runner.id, idx);
             }
             assert_eq!(out.pattern_ids[row], runner.id);
         }
@@ -7455,8 +6965,7 @@ mod tests {
             let direct = (runner.run)(&direct_input).unwrap();
             let series = extract_pattern_series(&out, runner.id).unwrap();
             for (idx, v) in direct.values.iter().enumerate() {
-                let mapped = if *v == 0 { 0 } else { 1 };
-                assert_eq!(series[idx], mapped, "pattern={} bar={}", runner.id, idx);
+                assert_eq!(series[idx], *v, "pattern={} bar={}", runner.id, idx);
             }
         }
     }
@@ -7477,32 +6986,7 @@ mod tests {
         assert_eq!(from_candles.rows, from_slices.rows);
         assert_eq!(from_candles.cols, from_slices.cols);
         assert_eq!(from_candles.pattern_ids, from_slices.pattern_ids);
-        assert_eq!(from_candles.values_u8, from_slices.values_u8);
-    }
-
-    #[test]
-    fn packed_bitmask_export_matches_dense_values() {
-        let candles = synthetic_candles(191);
-        let out =
-            pattern_recognition(&PatternRecognitionInput::with_default_candles(&candles)).unwrap();
-        let packed = out.to_bitmask_u64();
-
-        assert_eq!(packed.rows, out.rows);
-        assert_eq!(packed.cols, out.cols);
-        assert_eq!(packed.pattern_ids, out.pattern_ids);
-        assert_eq!(packed.warmup, out.warmup);
-        assert_eq!(packed.words_per_row, out.cols.div_ceil(64));
-        assert_eq!(packed.words_u64.len(), packed.rows * packed.words_per_row);
-
-        for row in 0..out.rows {
-            for col in 0..out.cols {
-                let dense_idx = row * out.cols + col;
-                let word = row * packed.words_per_row + (col / 64);
-                let bit = col % 64;
-                let packed_hit = ((packed.words_u64[word] >> bit) & 1) != 0;
-                assert_eq!(packed_hit, out.values_u8[dense_idx] != 0);
-            }
-        }
+        assert_eq!(from_candles.values_i8, from_slices.values_i8);
     }
 
     #[test]

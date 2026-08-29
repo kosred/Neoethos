@@ -1,26 +1,10 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::rsi::{rsi_into_slice, RsiInput, RsiParams};
+use crate::indicators::rsi::{RsiInput, RsiParams, rsi_into_slice};
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
@@ -40,10 +24,6 @@ pub struct EhlersDataSamplingRelativeStrengthIndicatorOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersDataSamplingRelativeStrengthIndicatorParams {
     pub length: Option<usize>,
 }
@@ -373,17 +353,9 @@ fn midpoint_series(open: &[f64], close: &[f64]) -> Vec<f64> {
 #[inline(always)]
 fn classify_signal(slo: f64, prev_slo_nz: f64) -> f64 {
     if slo > 0.0 {
-        if slo > prev_slo_nz {
-            2.0
-        } else {
-            1.0
-        }
+        if slo > prev_slo_nz { 2.0 } else { 1.0 }
     } else if slo < 0.0 {
-        if slo < prev_slo_nz {
-            -2.0
-        } else {
-            -1.0
-        }
+        if slo < prev_slo_nz { -2.0 } else { -1.0 }
     } else {
         0.0
     }
@@ -565,7 +537,6 @@ pub fn ehlers_data_sampling_relative_strength_indicator_into_slice(
     )
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn ehlers_data_sampling_relative_strength_indicator_into(
     input: &EhlersDataSamplingRelativeStrengthIndicatorInput,
     dst_ds_rsi: &mut [f64],
@@ -749,7 +720,7 @@ pub fn ehlers_data_sampling_relative_strength_indicator_batch_with_kernel(
         other => {
             return Err(
                 EhlersDataSamplingRelativeStrengthIndicatorError::InvalidKernelForBatch(other),
-            )
+            );
         }
     }
 
@@ -949,7 +920,7 @@ fn ehlers_data_sampling_relative_strength_indicator_batch_inner_into(
         other => {
             return Err(
                 EhlersDataSamplingRelativeStrengthIndicatorError::InvalidKernelForBatch(other),
-            )
+            );
         }
     }
 
@@ -1051,391 +1022,11 @@ fn ehlers_data_sampling_relative_strength_indicator_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_data_sampling_relative_strength_indicator")]
-#[pyo3(signature = (open_, close, length=14, kernel=None))]
-pub fn ehlers_data_sampling_relative_strength_indicator_py<'py>(
-    py: Python<'py>,
-    open_: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let open_ = open_.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let input = EhlersDataSamplingRelativeStrengthIndicatorInput::from_slices(
-        open_,
-        close,
-        EhlersDataSamplingRelativeStrengthIndicatorParams {
-            length: Some(length),
-        },
-    );
-    let out = py
-        .allow_threads(|| {
-            ehlers_data_sampling_relative_strength_indicator_with_kernel(&input, kern)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.ds_rsi.into_pyarray(py),
-        out.original_rsi.into_pyarray(py),
-        out.signal.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersDataSamplingRelativeStrengthIndicatorStream")]
-pub struct EhlersDataSamplingRelativeStrengthIndicatorStreamPy {
-    stream: EhlersDataSamplingRelativeStrengthIndicatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersDataSamplingRelativeStrengthIndicatorStreamPy {
-    #[new]
-    #[pyo3(signature = (length=14))]
-    fn new(length: usize) -> PyResult<Self> {
-        let stream = EhlersDataSamplingRelativeStrengthIndicatorStream::try_new(
-            EhlersDataSamplingRelativeStrengthIndicatorParams {
-                length: Some(length),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, open_: f64, close: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(open_, close)
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_data_sampling_relative_strength_indicator_batch")]
-#[pyo3(signature = (open_, close, length_range=(14,14,0), kernel=None))]
-pub fn ehlers_data_sampling_relative_strength_indicator_batch_py<'py>(
-    py: Python<'py>,
-    open_: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let open_ = open_.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            ehlers_data_sampling_relative_strength_indicator_batch_with_kernel(
-                open_,
-                close,
-                &EhlersDataSamplingRelativeStrengthIndicatorBatchRange {
-                    length: length_range,
-                },
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = output.rows;
-    let cols = output.cols;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "ds_rsi",
-        output.ds_rsi.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "original_rsi",
-        output.original_rsi.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "signal",
-        output.signal.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.length.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_ehlers_data_sampling_relative_strength_indicator_module(
-    m: &Bound<'_, PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(
-        ehlers_data_sampling_relative_strength_indicator_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        ehlers_data_sampling_relative_strength_indicator_batch_py,
-        m
-    )?)?;
-    m.add_class::<EhlersDataSamplingRelativeStrengthIndicatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EhlersDataSamplingRelativeStrengthIndicatorBatchConfig {
-    pub length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_data_sampling_relative_strength_indicator_js)]
-pub fn ehlers_data_sampling_relative_strength_indicator_js(
-    open_: &[f64],
-    close: &[f64],
-    length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = EhlersDataSamplingRelativeStrengthIndicatorInput::from_slices(
-        open_,
-        close,
-        EhlersDataSamplingRelativeStrengthIndicatorParams {
-            length: Some(length),
-        },
-    );
-    let out = ehlers_data_sampling_relative_strength_indicator_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("ds_rsi"),
-        &serde_wasm_bindgen::to_value(&out.ds_rsi).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("original_rsi"),
-        &serde_wasm_bindgen::to_value(&out.original_rsi).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("signal"),
-        &serde_wasm_bindgen::to_value(&out.signal).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_data_sampling_relative_strength_indicator_batch_js)]
-pub fn ehlers_data_sampling_relative_strength_indicator_batch_js(
-    open_: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: EhlersDataSamplingRelativeStrengthIndicatorBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: length_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let out = ehlers_data_sampling_relative_strength_indicator_batch_with_kernel(
-        open_,
-        close,
-        &EhlersDataSamplingRelativeStrengthIndicatorBatchRange {
-            length: (
-                config.length_range[0],
-                config.length_range[1],
-                config.length_range[2],
-            ),
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("ds_rsi"),
-        &serde_wasm_bindgen::to_value(&out.ds_rsi).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("original_rsi"),
-        &serde_wasm_bindgen::to_value(&out.original_rsi).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("signal"),
-        &serde_wasm_bindgen::to_value(&out.signal).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_data_sampling_relative_strength_indicator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(3 * len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_data_sampling_relative_strength_indicator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, 3 * len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_data_sampling_relative_strength_indicator_into(
-    open_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_data_sampling_relative_strength_indicator_into",
-        ));
-    }
-    unsafe {
-        let open_ = std::slice::from_raw_parts(open_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 3 * len);
-        let (dst_ds_rsi, tail) = out.split_at_mut(len);
-        let (dst_original_rsi, dst_signal) = tail.split_at_mut(len);
-        let input = EhlersDataSamplingRelativeStrengthIndicatorInput::from_slices(
-            open_,
-            close,
-            EhlersDataSamplingRelativeStrengthIndicatorParams {
-                length: Some(length),
-            },
-        );
-        ehlers_data_sampling_relative_strength_indicator_into_slice(
-            dst_ds_rsi,
-            dst_original_rsi,
-            dst_signal,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_data_sampling_relative_strength_indicator_batch_into(
-    open_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<usize, JsValue> {
-    if open_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_data_sampling_relative_strength_indicator_batch_into",
-        ));
-    }
-    let sweep = EhlersDataSamplingRelativeStrengthIndicatorBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-    let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .and_then(|v| v.checked_mul(3))
-        .ok_or_else(|| {
-            JsValue::from_str(
-                "rows*cols overflow in ehlers_data_sampling_relative_strength_indicator_batch_into",
-            )
-        })?;
-    unsafe {
-        let open_ = std::slice::from_raw_parts(open_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let split = rows * len;
-        let (dst_ds_rsi, tail) = out.split_at_mut(split);
-        let (dst_original_rsi, dst_signal) = tail.split_at_mut(split);
-        ehlers_data_sampling_relative_strength_indicator_batch_inner_into(
-            open_,
-            close,
-            &sweep,
-            Kernel::Auto,
-            false,
-            dst_ds_rsi,
-            dst_original_rsi,
-            dst_signal,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_data_sampling_relative_strength_indicator_output_into_js(
-    open_: &[f64],
-    close: &[f64],
-    length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_data_sampling_relative_strength_indicator_js(open_, close, length)?;
-    crate::write_wasm_object_f64_outputs(
-        "ehlers_data_sampling_relative_strength_indicator_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_data_sampling_relative_strength_indicator_batch_output_into_js(
-    open_: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_data_sampling_relative_strength_indicator_batch_js(open_, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_data_sampling_relative_strength_indicator_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu, IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue,
+        IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue, compute_cpu,
     };
 
     fn sample_open_close(len: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -1475,8 +1066,8 @@ mod tests {
     }
 
     #[test]
-    fn ehlers_data_sampling_relative_strength_indicator_output_contract(
-    ) -> Result<(), Box<dyn Error>> {
+    fn ehlers_data_sampling_relative_strength_indicator_output_contract()
+    -> Result<(), Box<dyn Error>> {
         let (open, _high, _low, close) = sample_open_close(256);
         let input = EhlersDataSamplingRelativeStrengthIndicatorInput::from_slices(
             &open,
@@ -1497,8 +1088,8 @@ mod tests {
     }
 
     #[test]
-    fn ehlers_data_sampling_relative_strength_indicator_into_matches_api(
-    ) -> Result<(), Box<dyn Error>> {
+    fn ehlers_data_sampling_relative_strength_indicator_into_matches_api()
+    -> Result<(), Box<dyn Error>> {
         let (open, _high, _low, close) = sample_open_close(220);
         let input = EhlersDataSamplingRelativeStrengthIndicatorInput::from_slices(
             &open,
@@ -1523,8 +1114,8 @@ mod tests {
     }
 
     #[test]
-    fn ehlers_data_sampling_relative_strength_indicator_stream_matches_batch(
-    ) -> Result<(), Box<dyn Error>> {
+    fn ehlers_data_sampling_relative_strength_indicator_stream_matches_batch()
+    -> Result<(), Box<dyn Error>> {
         let (open, _high, _low, close) = sample_open_close(256);
         let batch = ehlers_data_sampling_relative_strength_indicator(
             &EhlersDataSamplingRelativeStrengthIndicatorInput::from_slices(
@@ -1558,8 +1149,8 @@ mod tests {
     }
 
     #[test]
-    fn ehlers_data_sampling_relative_strength_indicator_batch_single_matches_single(
-    ) -> Result<(), Box<dyn Error>> {
+    fn ehlers_data_sampling_relative_strength_indicator_batch_single_matches_single()
+    -> Result<(), Box<dyn Error>> {
         let (open, _high, _low, close) = sample_open_close(256);
         let single = ehlers_data_sampling_relative_strength_indicator(
             &EhlersDataSamplingRelativeStrengthIndicatorInput::from_slices(
@@ -1602,8 +1193,8 @@ mod tests {
     }
 
     #[test]
-    fn ehlers_data_sampling_relative_strength_indicator_dispatch_compute_returns_outputs(
-    ) -> Result<(), Box<dyn Error>> {
+    fn ehlers_data_sampling_relative_strength_indicator_dispatch_compute_returns_outputs()
+    -> Result<(), Box<dyn Error>> {
         let (open, high, low, close) = sample_open_close(192);
         for output_id in ["ds_rsi", "original_rsi", "signal"] {
             let req = IndicatorComputeRequest {

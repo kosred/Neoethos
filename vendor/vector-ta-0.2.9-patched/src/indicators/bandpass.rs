@@ -1,49 +1,17 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::bandpass_wrapper::CudaBandpass;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-use crate::indicators::highpass::{highpass, HighPassError, HighPassInput, HighPassParams};
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::indicators::highpass::{HighPassError, HighPassInput, HighPassParams, highpass};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
 use std::f64::consts::PI;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 use thiserror::Error;
 
 impl<'a> AsRef<[f64]> for BandPassInput<'a> {
@@ -72,10 +40,6 @@ pub enum BandPassData<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct BandPassParams {
     pub period: Option<usize>,
     pub bandwidth: Option<f64>,
@@ -273,7 +237,7 @@ fn bandpass_prepare<'a>(
             valid: len - first_valid,
         });
     }
-    if !(0.0..=1.0).contains(&bandwidth) || !bandwidth.is_finite() {
+    if !bandwidth.is_finite() || bandwidth <= 0.0 || bandwidth > 1.0 {
         return Err(BandPassError::InvalidBandwidth { bandwidth });
     }
 
@@ -487,7 +451,6 @@ pub fn bandpass_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn bandpass_into(
     input: &BandPassInput,
@@ -1127,91 +1090,6 @@ fn expand_grid(r: &BandPassBatchRange) -> Vec<BandPassParams> {
         }
     }
     out
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "BandPassDeviceArrayF32", unsendable)]
-pub struct BandPassDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-    pub(crate) stream: usize,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl BandPassDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        Ok((2, self.device_id as i32))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
 }
 
 pub fn bandpass_batch_with_kernel(
@@ -1883,34 +1761,11 @@ fn expand_grid_for_bandpass(r: &BandPassBatchRange) -> Vec<BandPassParams> {
     expand_grid(r)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bandpass_output_into_js(
-    data: &[f64],
-    period: usize,
-    bandwidth: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = bandpass_js(data, period, bandwidth)?;
-    crate::write_wasm_object_f64_outputs("bandpass_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bandpass_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = bandpass_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("bandpass_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_bandpass_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
@@ -1982,8 +1837,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = BandPassParams::default();
         let input = BandPassInput::from_candles(&candles, "close", default_params);
         let output = bandpass_with_kernel(&input, kernel)?;
@@ -1995,8 +1850,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = BandPassInput::with_default_candles(&candles);
         let result = bandpass_with_kernel(&input, kernel)?;
         let expected_bp_last_five = [
@@ -2131,8 +1986,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = BandPassInput::with_default_candles(&candles);
         match input.data {
             BandPassData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -2192,8 +2047,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = BandPassParams {
             period: Some(20),
             bandwidth: Some(0.3),
@@ -2214,8 +2069,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = BandPassInput::from_candles(
             &candles,
             "close",
@@ -2299,8 +2154,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             BandPassParams {
@@ -2342,23 +2197,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in bp at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in bp at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in bp at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in bp at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in bp at index {} with params {:?}",
-						test_name, val, bits, i, params
-					);
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in bp at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
             }
 
@@ -2371,23 +2226,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in bp_normalized at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in bp_normalized at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in bp_normalized at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in bp_normalized at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in bp_normalized at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in bp_normalized at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
             }
 
@@ -2400,23 +2255,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in signal at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in signal at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in signal at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in signal at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in signal at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in signal at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
             }
 
@@ -2429,23 +2284,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in trigger at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in trigger at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in trigger at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in trigger at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in trigger at index {} with params {:?}",
-                    test_name, val, bits, i, params
-                );
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in trigger at index {} with params {:?}",
+                        test_name, val, bits, i, params
+                    );
                 }
             }
         }
@@ -2467,8 +2322,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 20;
         let bandwidth = 0.3;
@@ -2827,8 +2682,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = BandPassBatchBuilder::new()
             .kernel(kernel)
@@ -2883,8 +2738,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = BandPassBatchBuilder::new()
             .kernel(kernel)
@@ -2905,23 +2760,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in bp at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in bp at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in bp at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in bp at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in bp at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in bp at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
             }
 
@@ -2934,23 +2789,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in bp_normalized at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in bp_normalized at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in bp_normalized at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in bp_normalized at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in bp_normalized at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in bp_normalized at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
             }
 
@@ -2963,23 +2818,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in signal at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in signal at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in signal at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in signal at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in signal at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in signal at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
             }
 
@@ -2992,23 +2847,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in trigger at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in trigger at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in trigger at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in trigger at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in trigger at row {} col {} with params {:?}",
-                    test, val, bits, row_idx, col_idx, params
-                );
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in trigger at row {} col {} with params {:?}",
+                        test, val, bits, row_idx, col_idx, params
+                    );
                 }
             }
         }
@@ -3026,525 +2881,4 @@ mod tests {
 
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bandpass")]
-#[pyo3(signature = (data, period=20, bandwidth=0.3, kernel=None))]
-pub fn bandpass_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    bandwidth: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArrayMethods;
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = BandPassParams {
-        period: Some(period),
-        bandwidth: Some(bandwidth),
-    };
-    let inp = BandPassInput::from_slice(slice_in, params);
-
-    let out = py
-        .allow_threads(|| bandpass_with_kernel(&inp, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("bp", out.bp.into_pyarray(py))?;
-    dict.set_item("bp_normalized", out.bp_normalized.into_pyarray(py))?;
-    dict.set_item("signal", out.signal.into_pyarray(py))?;
-    dict.set_item("trigger", out.trigger.into_pyarray(py))?;
-
-    Ok(dict.into())
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "BandPassStream")]
-pub struct BandPassStreamPy {
-    stream: BandPassStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl BandPassStreamPy {
-    #[new]
-    fn new(period: usize, bandwidth: f64) -> PyResult<Self> {
-        let params = BandPassParams {
-            period: Some(period),
-            bandwidth: Some(bandwidth),
-        };
-        let stream =
-            BandPassStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(BandPassStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> f64 {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bandpass_batch")]
-#[pyo3(signature = (data, period_range, bandwidth_range, kernel=None))]
-pub fn bandpass_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    bandwidth_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let sweep = BandPassBatchRange {
-        period: period_range,
-        bandwidth: bandwidth_range,
-    };
-
-    let kern = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| bandpass_batch_with_kernel(slice_in, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = output.rows;
-    let cols = output.cols;
-
-    unsafe {
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("bandpass_batch: rows*cols overflow"))?;
-        let bp_arr = PyArray1::<f64>::new(py, [total], false);
-        let bpn_arr = PyArray1::<f64>::new(py, [total], false);
-        let sig_arr = PyArray1::<f64>::new(py, [total], false);
-        let trg_arr = PyArray1::<f64>::new(py, [total], false);
-
-        bp_arr.as_slice_mut()?.copy_from_slice(&output.bp);
-        bpn_arr
-            .as_slice_mut()?
-            .copy_from_slice(&output.bp_normalized);
-        sig_arr.as_slice_mut()?.copy_from_slice(&output.signal);
-        trg_arr.as_slice_mut()?.copy_from_slice(&output.trigger);
-
-        let d = PyDict::new(py);
-        d.set_item("bp", bp_arr.reshape((rows, cols))?)?;
-        d.set_item("bp_normalized", bpn_arr.reshape((rows, cols))?)?;
-        d.set_item("signal", sig_arr.reshape((rows, cols))?)?;
-        d.set_item("trigger", trg_arr.reshape((rows, cols))?)?;
-        d.set_item(
-            "periods",
-            output
-                .combos
-                .iter()
-                .map(|p| p.period.unwrap() as u64)
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        d.set_item(
-            "bandwidths",
-            output
-                .combos
-                .iter()
-                .map(|p| p.bandwidth.unwrap())
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        Ok(d)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "bandpass_cuda_batch_dev")]
-#[pyo3(signature = (close_f32, period_range, bandwidth_range, device_id=0))]
-pub fn bandpass_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    bandwidth_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = close_f32.as_slice()?;
-    let sweep = BandPassBatchRange {
-        period: period_range,
-        bandwidth: bandwidth_range,
-    };
-    let (outputs, combos, dev_id, ctx) = py.allow_threads(|| -> PyResult<_> {
-        let cuda =
-            CudaBandpass::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let ctx = cuda.context_arc();
-        let res = cuda
-            .bandpass_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.stream()
-            .synchronize()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((res.outputs, res.combos, dev_id, ctx))
-    })?;
-
-    let d = PyDict::new(py);
-    d.set_item(
-        "bp",
-        Py::new(
-            py,
-            BandPassDeviceArrayF32Py {
-                inner: outputs.first,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-                stream: 0,
-            },
-        )?,
-    )?;
-    d.set_item(
-        "bp_normalized",
-        Py::new(
-            py,
-            BandPassDeviceArrayF32Py {
-                inner: outputs.second,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-                stream: 0,
-            },
-        )?,
-    )?;
-    d.set_item(
-        "signal",
-        Py::new(
-            py,
-            BandPassDeviceArrayF32Py {
-                inner: outputs.third,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-                stream: 0,
-            },
-        )?,
-    )?;
-    d.set_item(
-        "trigger",
-        Py::new(
-            py,
-            BandPassDeviceArrayF32Py {
-                inner: outputs.fourth,
-                _ctx: ctx,
-                device_id: dev_id,
-                stream: 0,
-            },
-        )?,
-    )?;
-
-    let periods: Vec<usize> = combos.iter().map(|p| p.period.unwrap()).collect();
-    let bands: Vec<f64> = combos.iter().map(|p| p.bandwidth.unwrap()).collect();
-    d.set_item("periods", periods.into_pyarray(py))?;
-    d.set_item("bandwidths", bands.into_pyarray(py))?;
-    d.set_item("rows", combos.len())?;
-    d.set_item("cols", slice.len())?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "bandpass_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, bandwidth, device_id=0))]
-pub fn bandpass_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    period: usize,
-    bandwidth: f64,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = BandPassParams {
-        period: Some(period),
-        bandwidth: Some(bandwidth),
-    };
-
-    let (outputs, dev_id, ctx) = py.allow_threads(|| -> PyResult<_> {
-        let cuda =
-            CudaBandpass::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let ctx = cuda.context_arc();
-        let out = cuda
-            .bandpass_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.stream()
-            .synchronize()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((out, dev_id, ctx))
-    })?;
-
-    let d = PyDict::new(py);
-    d.set_item(
-        "bp",
-        Py::new(
-            py,
-            BandPassDeviceArrayF32Py {
-                inner: outputs.first,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-                stream: 0,
-            },
-        )?,
-    )?;
-    d.set_item(
-        "bp_normalized",
-        Py::new(
-            py,
-            BandPassDeviceArrayF32Py {
-                inner: outputs.second,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-                stream: 0,
-            },
-        )?,
-    )?;
-    d.set_item(
-        "signal",
-        Py::new(
-            py,
-            BandPassDeviceArrayF32Py {
-                inner: outputs.third,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-                stream: 0,
-            },
-        )?,
-    )?;
-    d.set_item(
-        "trigger",
-        Py::new(
-            py,
-            BandPassDeviceArrayF32Py {
-                inner: outputs.fourth,
-                _ctx: ctx,
-                device_id: dev_id,
-                stream: 0,
-            },
-        )?,
-    )?;
-    d.set_item("rows", rows)?;
-    d.set_item("cols", cols)?;
-    d.set_item("period", period)?;
-    d.set_item("bandwidth", bandwidth)?;
-    Ok(d)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BandPassJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "bandpass_js")]
-pub fn bandpass_js(data: &[f64], period: usize, bandwidth: f64) -> Result<JsValue, JsValue> {
-    let input = BandPassInput::from_slice(
-        data,
-        BandPassParams {
-            period: Some(period),
-            bandwidth: Some(bandwidth),
-        },
-    );
-    let out = bandpass_with_kernel(&input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let cols = data.len();
-    let mut values = Vec::with_capacity(4 * cols);
-    values.extend_from_slice(&out.bp);
-    values.extend_from_slice(&out.bp_normalized);
-    values.extend_from_slice(&out.signal);
-    values.extend_from_slice(&out.trigger);
-    serde_wasm_bindgen::to_value(&BandPassJsResult {
-        values,
-        rows: 4,
-        cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BandPassBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub bandwidth_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BandPassBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub combos: Vec<BandPassParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "bandpass_batch")]
-pub fn bandpass_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: BandPassBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = BandPassBatchRange {
-        period: cfg.period_range,
-        bandwidth: cfg.bandwidth_range,
-    };
-    let out = bandpass_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-
-    let total = rows
-        .checked_mul(cols)
-        .and_then(|v| v.checked_mul(4))
-        .ok_or_else(|| JsValue::from_str("bandpass_batch_js: rows*cols overflow"))?;
-    let mut values = Vec::with_capacity(total);
-    values.extend_from_slice(&out.bp);
-    values.extend_from_slice(&out.bp_normalized);
-    values.extend_from_slice(&out.signal);
-    values.extend_from_slice(&out.trigger);
-
-    let js_output = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &js_output,
-        &JsValue::from_str("values"),
-        &serde_wasm_bindgen::to_value(&values).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &js_output,
-        &JsValue::from_str("combos"),
-        &JsValue::from_f64(out.combos.len() as f64),
-    )?;
-    js_sys::Reflect::set(
-        &js_output,
-        &JsValue::from_str("outputs"),
-        &JsValue::from_f64(4.0),
-    )?;
-    js_sys::Reflect::set(
-        &js_output,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(cols as f64),
-    )?;
-    Ok(JsValue::from(js_output))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "bandpass_batch_metadata")]
-pub fn bandpass_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    bandwidth_start: f64,
-    bandwidth_end: f64,
-    bandwidth_step: f64,
-) -> Result<JsValue, JsValue> {
-    let sweep = BandPassBatchRange {
-        period: (period_start, period_end, period_step),
-        bandwidth: (bandwidth_start, bandwidth_end, bandwidth_step),
-    };
-    let combos = expand_grid(&sweep);
-
-    let mut flat = Vec::with_capacity(combos.len() * 2);
-    for combo in &combos {
-        flat.push(combo.period.unwrap() as f64);
-        flat.push(combo.bandwidth.unwrap());
-    }
-    serde_wasm_bindgen::to_value(&flat).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bandpass_into(
-    in_ptr: *const f64,
-    len: usize,
-    period: usize,
-    bandwidth: f64,
-    bp_ptr: *mut f64,
-    bpn_ptr: *mut f64,
-    sig_ptr: *mut f64,
-    trg_ptr: *mut f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null()
-        || bp_ptr.is_null()
-        || bpn_ptr.is_null()
-        || sig_ptr.is_null()
-        || trg_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer in bandpass_into"));
-    }
-
-    if in_ptr == bp_ptr as *const f64
-        || in_ptr == bpn_ptr as *const f64
-        || in_ptr == sig_ptr as *const f64
-        || in_ptr == trg_ptr as *const f64
-    {
-        return Err(JsValue::from_str(
-            "input and output pointers must not alias",
-        ));
-    }
-
-    let out_ptrs = [bp_ptr, bpn_ptr, sig_ptr, trg_ptr];
-    for i in 0..out_ptrs.len() {
-        for j in i + 1..out_ptrs.len() {
-            if out_ptrs[i] == out_ptrs[j] {
-                return Err(JsValue::from_str(
-                    "output pointers must not alias with each other",
-                ));
-            }
-        }
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let mut bp = std::slice::from_raw_parts_mut(bp_ptr, len);
-        let mut bpn = std::slice::from_raw_parts_mut(bpn_ptr, len);
-        let mut sig = std::slice::from_raw_parts_mut(sig_ptr, len);
-        let mut trg = std::slice::from_raw_parts_mut(trg_ptr, len);
-        let input = BandPassInput::from_slice(
-            data,
-            BandPassParams {
-                period: Some(period),
-                bandwidth: Some(bandwidth),
-            },
-        );
-        bandpass_into_slice(
-            &mut bp,
-            &mut bpn,
-            &mut sig,
-            &mut trg,
-            &input,
-            detect_best_kernel(),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bandpass_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bandpass_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
 }

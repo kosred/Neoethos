@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -61,10 +45,6 @@ pub struct TrendDirectionForceIndexOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TrendDirectionForceIndexParams {
     pub length: Option<usize>,
 }
@@ -279,11 +259,7 @@ impl EmaSeededStream {
         if !self.filled && count >= self.period {
             self.filled = true;
         }
-        if self.filled {
-            Some(self.mean)
-        } else {
-            None
-        }
+        if self.filled { Some(self.mean) } else { None }
     }
 }
 
@@ -607,7 +583,6 @@ pub fn trend_direction_force_index_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn trend_direction_force_index_into(
     input: &TrendDirectionForceIndexInput,
     out: &mut [f64],
@@ -925,286 +900,11 @@ fn trend_direction_force_index_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "trend_direction_force_index")]
-#[pyo3(signature = (data, length=10, kernel=None))]
-pub fn trend_direction_force_index_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let input = TrendDirectionForceIndexInput::from_slice(
-        data,
-        TrendDirectionForceIndexParams {
-            length: Some(length),
-        },
-    );
-    let out = py
-        .allow_threads(|| trend_direction_force_index_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "TrendDirectionForceIndexStream")]
-pub struct TrendDirectionForceIndexStreamPy {
-    stream: TrendDirectionForceIndexStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl TrendDirectionForceIndexStreamPy {
-    #[new]
-    fn new(length: usize) -> PyResult<Self> {
-        let stream = TrendDirectionForceIndexStream::try_new(TrendDirectionForceIndexParams {
-            length: Some(length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "trend_direction_force_index_batch")]
-#[pyo3(signature = (data, length_range=(10,10,0), kernel=None))]
-pub fn trend_direction_force_index_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            trend_direction_force_index_batch_with_kernel(
-                data,
-                &TrendDirectionForceIndexBatchRange {
-                    length: length_range,
-                },
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = output.rows;
-    let cols = output.cols;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "values",
-        output.values.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.length.unwrap_or(10) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_trend_direction_force_index_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(trend_direction_force_index_py, m)?)?;
-    m.add_function(wrap_pyfunction!(trend_direction_force_index_batch_py, m)?)?;
-    m.add_class::<TrendDirectionForceIndexStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrendDirectionForceIndexBatchConfig {
-    pub length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = trend_direction_force_index_js)]
-pub fn trend_direction_force_index_js(data: &[f64], length: usize) -> Result<JsValue, JsValue> {
-    let input = TrendDirectionForceIndexInput::from_slice(
-        data,
-        TrendDirectionForceIndexParams {
-            length: Some(length),
-        },
-    );
-    let out = trend_direction_force_index_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&out.values).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = trend_direction_force_index_batch_js)]
-pub fn trend_direction_force_index_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: TrendDirectionForceIndexBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: length_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let out = trend_direction_force_index_batch_with_kernel(
-        data,
-        &TrendDirectionForceIndexBatchRange {
-            length: (
-                config.length_range[0],
-                config.length_range[1],
-                config.length_range[2],
-            ),
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("values"),
-        &serde_wasm_bindgen::to_value(&out.values).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_direction_force_index_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_direction_force_index_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_direction_force_index_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to trend_direction_force_index_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        let input = TrendDirectionForceIndexInput::from_slice(
-            data,
-            TrendDirectionForceIndexParams {
-                length: Some(length),
-            },
-        );
-        trend_direction_force_index_into_slice(out, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_direction_force_index_batch_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to trend_direction_force_index_batch_into",
-        ));
-    }
-    let sweep = TrendDirectionForceIndexBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-    let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows.checked_mul(len).ok_or_else(|| {
-        JsValue::from_str("rows*cols overflow in trend_direction_force_index_batch_into")
-    })?;
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        trend_direction_force_index_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_direction_force_index_output_into_js(
-    data: &[f64],
-    length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = trend_direction_force_index_js(data, length)?;
-    crate::write_wasm_object_f64_outputs("trend_direction_force_index_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_direction_force_index_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = trend_direction_force_index_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "trend_direction_force_index_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu, IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue,
+        IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue, compute_cpu,
     };
 
     fn sample_data(len: usize) -> Vec<f64> {

@@ -1194,13 +1194,14 @@ DEFINE_ALMA_MS1P_TILED(alma_ms1p_tiled_f32_tx128_ty4, 128, 4)
 // the CPU defaults (alma.rs:125,129) and are read from nothing else in the
 // batch path.
 //
-// THE WEIGHTS ARE BUILT ON THE DEVICE IN THE CPU'S EXACT ORDER:
-//   `m = offset * (period - 1)`, `s = period / sigma`, `s2 = 2*s*s`,
-//   `inv_s2 = 1/s2`, then for i ascending `w = exp(-diff*diff*inv_s2)` with
-//   `norm += w`. The normaliser is an ASCENDING accumulation of the same
-//   exponentials, not a closed form, because the closed form does not exist
-//   and a different summation order is a different `inv_norm` for every bar.
-//   `exp`, not `__expf` and not `expf` -- this is the f64 `exp`.
+// THE WEIGHTS ARE CPU-OWNED EXACT BYTES. Gate182 exposed two independent
+// false authorities. First, libdevice `exp` differed from the host `f64::exp`
+// at three of fourteen default weights. Second, the old CPU Auto path treated
+// the hardware-dependent AVX2/FMA oracle 0x3ff1333f3da1ceaa as canonical while
+// the published, non-FMA scalar operation order produced the canonical
+// non-FMA scalar result 0x3ff1333f3da1ceab. The CPU now owns one explicit
+// TradingView non-floored coefficient row and uploads weights plus inv_norm;
+// this kernel performs no transcendental reconstruction and no FMA.
 //
 // THE DOT PRODUCT'S ASSOCIATION IS NOT THE OBVIOUS ONE. The CPU's inner line
 // is `sum += d0*w0 + d1*w1 + d2*w2 + d3*w3`, i.e. the four products are folded
@@ -1245,24 +1246,26 @@ extern "C" __global__ void neoethos_alma_batch_f64(
     const int* __restrict__ periods,
     int n_combos,
     int first_valid,
+    const double* __restrict__ exact_coefficients,
+    int coefficient_stride,
     double* __restrict__ out)
 {
+    // Gate182: 0x3ff1333f3da1ceaa was the hardware-dependent AVX2/FMA oracle;
+    // 0x3ff1333f3da1ceab is the canonical non-FMA scalar result. The exact
+    // coefficient bytes arrive from the shared published-formula authority.
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= n_combos) return;
     double* __restrict__ row = out + (size_t)r * (size_t)n;
     const int period = periods[r];
-
-    // `AlmaParams` defaults -- alma.rs:125, :129.
-    const double offset = 0.85;
-    const double sigma = 6.0;
 
     const bool declined =
         (n <= 0) ||
         (first_valid < 0) || (first_valid >= n) ||
         (period == 0) || (period > n) || (period > NEO_S1_ALMA_MAX_PERIOD) ||
         ((n - first_valid) < period) ||
-        (sigma <= 0.0) ||
-        (offset < 0.0) || (offset > 1.0);
+        (exact_coefficients == nullptr) ||
+        (coefficient_stride <= period) ||
+        (coefficient_stride > NEO_S1_ALMA_MAX_PERIOD + 1);
     if (declined) {
         for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
         return;
@@ -1272,19 +1275,9 @@ extern "C" __global__ void neoethos_alma_batch_f64(
     for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
     if (warm >= n) return;
 
-    double weights[NEO_S1_ALMA_MAX_PERIOD];
-    const double m = offset * (double)(period - 1);
-    const double s = (double)period / sigma;
-    const double s2 = 2.0 * s * s;
-    const double inv_s2 = 1.0 / s2;
-    double norm = 0.0;
-    for (int i = 0; i < period; ++i) {
-        const double diff = (double)i - m;
-        const double w = exp(-diff * diff * inv_s2);
-        weights[i] = w;
-        norm += w;
-    }
-    const double inv_norm = 1.0 / norm;
+    const double* weights = exact_coefficients
+        + (size_t)r * (size_t)coefficient_stride;
+    const double inv_norm = weights[coefficient_stride - 1];
 
     const int p4 = period & ~3;
 

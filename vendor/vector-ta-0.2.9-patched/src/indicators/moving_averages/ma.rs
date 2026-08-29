@@ -1,88 +1,88 @@
-use crate::indicators::alma::{alma, AlmaData, AlmaInput, AlmaParams};
-use crate::indicators::cora_wave::{cora_wave, CoraWaveData, CoraWaveInput, CoraWaveParams};
-use crate::indicators::cwma::{cwma, CwmaData, CwmaInput, CwmaParams};
-use crate::indicators::dema::{dema, DemaData, DemaInput, DemaParams};
-use crate::indicators::edcf::{edcf, EdcfData, EdcfInput, EdcfParams};
+use crate::indicators::alma::{AlmaData, AlmaInput, AlmaParams, alma};
+use crate::indicators::cora_wave::{CoraWaveData, CoraWaveInput, CoraWaveParams, cora_wave};
+use crate::indicators::cwma::{CwmaData, CwmaInput, CwmaParams, cwma};
+use crate::indicators::dema::{DemaData, DemaInput, DemaParams, dema};
+use crate::indicators::edcf::{EdcfData, EdcfInput, EdcfParams, edcf};
 use crate::indicators::ehlers_itrend::{
-    ehlers_itrend, EhlersITrendData, EhlersITrendInput, EhlersITrendParams,
+    EhlersITrendData, EhlersITrendInput, EhlersITrendParams, ehlers_itrend,
 };
-use crate::indicators::ema::{ema, EmaData, EmaInput, EmaParams};
-use crate::indicators::epma::{epma, EpmaData, EpmaInput, EpmaParams};
-use crate::indicators::fwma::{fwma, FwmaData, FwmaInput, FwmaParams};
-use crate::indicators::gaussian::{gaussian, GaussianData, GaussianInput, GaussianParams};
-use crate::indicators::highpass::{highpass, HighPassData, HighPassInput, HighPassParams};
+use crate::indicators::ema::{EmaData, EmaInput, EmaParams, ema};
+use crate::indicators::epma::{EpmaData, EpmaInput, EpmaParams, epma};
+use crate::indicators::fwma::{FwmaData, FwmaInput, FwmaParams, fwma};
+use crate::indicators::gaussian::{GaussianData, GaussianInput, GaussianParams, gaussian};
+use crate::indicators::highpass::{HighPassData, HighPassInput, HighPassParams, highpass};
 use crate::indicators::highpass_2_pole::{
-    highpass_2_pole, HighPass2Data, HighPass2Input, HighPass2Params,
+    HighPass2Data, HighPass2Input, HighPass2Params, highpass_2_pole,
 };
-use crate::indicators::hma::{hma, HmaData, HmaInput, HmaParams};
-use crate::indicators::hwma::{hwma, HwmaData, HwmaInput, HwmaParams};
-use crate::indicators::jma::{jma, JmaData, JmaInput, JmaParams};
-use crate::indicators::jsa::{jsa, JsaData, JsaInput, JsaParams};
-use crate::indicators::kama::{kama, KamaData, KamaInput, KamaParams};
-use crate::indicators::linreg::{linreg, LinRegData, LinRegInput, LinRegParams};
-use crate::indicators::maaq::{maaq, MaaqData, MaaqInput, MaaqParams};
-use crate::indicators::mama::{mama, MamaData, MamaInput, MamaParams};
+use crate::indicators::hma::{HmaData, HmaInput, HmaParams, hma};
+use crate::indicators::hwma::{HwmaData, HwmaInput, HwmaParams, hwma};
+use crate::indicators::jma::{JmaData, JmaInput, JmaParams, jma};
+use crate::indicators::jsa::{JsaData, JsaInput, JsaParams, jsa};
+use crate::indicators::kama::{KamaData, KamaInput, KamaParams, kama};
+use crate::indicators::linreg::{LinRegData, LinRegInput, LinRegParams, linreg};
+use crate::indicators::maaq::{MaaqData, MaaqInput, MaaqParams, maaq};
+use crate::indicators::mama::{MamaData, MamaInput, MamaParams, mama};
 use crate::indicators::moving_averages::corrected_moving_average::{
-    corrected_moving_average, corrected_moving_average_with_kernel, CorrectedMovingAverageData,
-    CorrectedMovingAverageInput, CorrectedMovingAverageParams,
+    CorrectedMovingAverageData, CorrectedMovingAverageInput, CorrectedMovingAverageParams,
+    corrected_moving_average, corrected_moving_average_with_kernel,
 };
-use crate::indicators::moving_averages::dma::{dma, DmaData, DmaInput, DmaParams};
+use crate::indicators::moving_averages::dma::{DmaData, DmaInput, DmaParams, dma};
 use crate::indicators::moving_averages::ehlers_ecema::{
-    ehlers_ecema, EhlersEcemaData, EhlersEcemaInput, EhlersEcemaParams,
+    EhlersEcemaData, EhlersEcemaInput, EhlersEcemaParams, ehlers_ecema,
 };
 use crate::indicators::moving_averages::ehlers_kama::{
-    ehlers_kama, EhlersKamaData, EhlersKamaInput, EhlersKamaParams,
+    EhlersKamaData, EhlersKamaInput, EhlersKamaParams, ehlers_kama,
 };
-use crate::indicators::moving_averages::ehma::{ehma, EhmaData, EhmaInput, EhmaParams};
+use crate::indicators::moving_averages::ehma::{EhmaData, EhmaInput, EhmaParams, ehma};
 use crate::indicators::moving_averages::elastic_volume_weighted_moving_average::{
-    elastic_volume_weighted_moving_average, elastic_volume_weighted_moving_average_with_kernel,
     ElasticVolumeWeightedMovingAverageData, ElasticVolumeWeightedMovingAverageInput,
-    ElasticVolumeWeightedMovingAverageParams,
+    ElasticVolumeWeightedMovingAverageParams, elastic_volume_weighted_moving_average,
+    elastic_volume_weighted_moving_average_with_kernel,
 };
 use crate::indicators::moving_averages::ema_deviation_corrected_t3::{
-    ema_deviation_corrected_t3, EmaDeviationCorrectedT3Data, EmaDeviationCorrectedT3Input,
-    EmaDeviationCorrectedT3Params,
+    EmaDeviationCorrectedT3Data, EmaDeviationCorrectedT3Input, EmaDeviationCorrectedT3Params,
+    ema_deviation_corrected_t3,
 };
-use crate::indicators::moving_averages::frama::{frama, FramaInput, FramaParams};
+use crate::indicators::moving_averages::frama::{FramaInput, FramaParams, frama};
 use crate::indicators::moving_averages::n_order_ema::{
-    n_order_ema, n_order_ema_with_kernel, NOrderEmaData, NOrderEmaIirStyle, NOrderEmaInput,
-    NOrderEmaParams, NOrderEmaStyle,
+    NOrderEmaData, NOrderEmaIirStyle, NOrderEmaInput, NOrderEmaParams, NOrderEmaStyle, n_order_ema,
+    n_order_ema_with_kernel,
 };
-use crate::indicators::moving_averages::nama::{nama, NamaData, NamaInput, NamaParams};
-use crate::indicators::moving_averages::sama::{sama, SamaData, SamaInput, SamaParams};
-use crate::indicators::moving_averages::sgf::{sgf, SgfData, SgfInput, SgfParams};
+use crate::indicators::moving_averages::nama::{NamaData, NamaInput, NamaParams, nama};
+use crate::indicators::moving_averages::sama::{SamaData, SamaInput, SamaParams, sama};
+use crate::indicators::moving_averages::sgf::{SgfData, SgfInput, SgfParams, sgf};
 use crate::indicators::moving_averages::volatility_adjusted_ma::{
-    vama, VamaData, VamaInput, VamaParams,
+    VamaData, VamaInput, VamaParams, vama,
 };
 use crate::indicators::moving_averages::wave_smoother::{
-    wave_smoother, WaveSmootherData, WaveSmootherInput, WaveSmootherParams,
+    WaveSmootherData, WaveSmootherInput, WaveSmootherParams, wave_smoother,
 };
-use crate::indicators::mwdx::{mwdx, MwdxData, MwdxInput, MwdxParams};
-use crate::indicators::nma::{nma, NmaData, NmaInput, NmaParams};
-use crate::indicators::pwma::{pwma, PwmaData, PwmaInput, PwmaParams};
-use crate::indicators::reflex::{reflex, ReflexData, ReflexInput, ReflexParams};
-use crate::indicators::sinwma::{sinwma, SinWmaData, SinWmaInput, SinWmaParams};
-use crate::indicators::sma::{sma, SmaData, SmaInput, SmaParams};
-use crate::indicators::smma::{smma, SmmaData, SmmaInput, SmmaParams};
-use crate::indicators::sqwma::{sqwma, SqwmaData, SqwmaInput, SqwmaParams};
-use crate::indicators::srwma::{srwma, SrwmaData, SrwmaInput, SrwmaParams};
+use crate::indicators::mwdx::{MwdxData, MwdxInput, MwdxParams, mwdx};
+use crate::indicators::nma::{NmaData, NmaInput, NmaParams, nma};
+use crate::indicators::pwma::{PwmaData, PwmaInput, PwmaParams, pwma};
+use crate::indicators::reflex::{ReflexData, ReflexInput, ReflexParams, reflex};
+use crate::indicators::sinwma::{SinWmaData, SinWmaInput, SinWmaParams, sinwma};
+use crate::indicators::sma::{SmaData, SmaInput, SmaParams, sma};
+use crate::indicators::smma::{SmmaData, SmmaInput, SmmaParams, smma};
+use crate::indicators::sqwma::{SqwmaData, SqwmaInput, SqwmaParams, sqwma};
+use crate::indicators::srwma::{SrwmaData, SrwmaInput, SrwmaParams, srwma};
 use crate::indicators::supersmoother::{
-    supersmoother, SuperSmootherData, SuperSmootherInput, SuperSmootherParams,
+    SuperSmootherData, SuperSmootherInput, SuperSmootherParams, supersmoother,
 };
 use crate::indicators::supersmoother_3_pole::{
-    supersmoother_3_pole, SuperSmoother3PoleData, SuperSmoother3PoleInput, SuperSmoother3PoleParams,
+    SuperSmoother3PoleData, SuperSmoother3PoleInput, SuperSmoother3PoleParams, supersmoother_3_pole,
 };
-use crate::indicators::swma::{swma, SwmaData, SwmaInput, SwmaParams};
-use crate::indicators::tema::{tema, TemaData, TemaInput, TemaParams};
-use crate::indicators::tilson::{tilson, TilsonData, TilsonInput, TilsonParams};
-use crate::indicators::trendflex::{trendflex, TrendFlexData, TrendFlexInput, TrendFlexParams};
-use crate::indicators::trima::{trima, TrimaData, TrimaInput, TrimaParams};
-use crate::indicators::vpwma::{vpwma, VpwmaData, VpwmaInput, VpwmaParams};
-use crate::indicators::vwap::{vwap, VwapData, VwapInput, VwapParams};
-use crate::indicators::vwma::{vwma, VwmaData, VwmaInput, VwmaParams};
-use crate::indicators::wilders::{wilders, WildersData, WildersInput, WildersParams};
-use crate::indicators::wma::{wma, WmaData, WmaInput, WmaParams};
-use crate::indicators::zlema::{zlema, ZlemaData, ZlemaInput, ZlemaParams};
+use crate::indicators::swma::{SwmaData, SwmaInput, SwmaParams, swma};
+use crate::indicators::tema::{TemaData, TemaInput, TemaParams, tema};
+use crate::indicators::tilson::{TilsonData, TilsonInput, TilsonParams, tilson};
+use crate::indicators::trendflex::{TrendFlexData, TrendFlexInput, TrendFlexParams, trendflex};
+use crate::indicators::trima::{TrimaData, TrimaInput, TrimaParams, trima};
+use crate::indicators::vpwma::{VpwmaData, VpwmaInput, VpwmaParams, vpwma};
+use crate::indicators::vwap::{VwapData, VwapInput, VwapParams, vwap};
+use crate::indicators::vwma::{VwmaData, VwmaInput, VwmaParams, vwma};
+use crate::indicators::wilders::{WildersData, WildersInput, WildersParams, wilders};
+use crate::indicators::wma::{WmaData, WmaInput, WmaParams, wma};
+use crate::indicators::zlema::{ZlemaData, ZlemaInput, ZlemaParams, zlema};
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use std::error::Error;
@@ -141,20 +141,6 @@ use crate::indicators::vwma::vwma_with_kernel;
 use crate::indicators::wilders::wilders_with_kernel;
 use crate::indicators::wma::wma_with_kernel;
 use crate::indicators::zlema::zlema_with_kernel;
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{PyArray1, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum MaData<'a> {
@@ -2624,81 +2610,10 @@ pub fn ma_with_kernel<'a>(
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ma")]
-#[pyo3(signature = (data, ma_type, period, kernel=None))]
-pub fn ma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    ma_type: &str,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| -> Result<Vec<f64>, Box<dyn Error + Send + Sync>> {
-            match ma_with_kernel(ma_type, MaData::Slice(slice_in), period, kern) {
-                Ok(result) => Ok(result),
-                Err(e) => {
-                    if e.to_string().contains("Unknown moving average type") {
-                        ma_with_kernel("sma", MaData::Slice(slice_in), period, kern).map_err(
-                            |e| -> Box<dyn Error + Send + Sync> {
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    e.to_string(),
-                                ))
-                            },
-                        )
-                    } else {
-                        Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )) as Box<dyn Error + Send + Sync>)
-                    }
-                }
-            }
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ma")]
-pub fn ma_js(data: &[f64], ma_type: &str, period: usize) -> Result<Vec<f64>, JsValue> {
-    match ma(ma_type, MaData::Slice(data), period) {
-        Ok(result) => Ok(result),
-        Err(e) => {
-            if e.to_string().contains("Unknown moving average type") {
-                ma("sma", MaData::Slice(data), period)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))
-            } else {
-                Err(JsValue::from_str(&e.to_string()))
-            }
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ma_output_into_js(
-    data: &[f64],
-    ma_type: &str,
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ma_js(data, ma_type, period)?;
-    crate::write_wasm_f64_output("ma_output_into_js", &values, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_all_ma_variants() {
@@ -2750,8 +2665,8 @@ mod tests {
             "mama",
         ];
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path).expect("Failed to load test candles");
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path).expect("Failed to load test candles");
 
         for &ma_type in &ma_types {
             let period = 80;

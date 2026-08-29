@@ -1,54 +1,10 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::indicators::moving_averages::linreg::{LinRegParams, LinRegStream};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{detect_best_batch_kernel, detect_best_kernel, make_uninit_matrix};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_momentum_oscillator_output_into_js(
-    data: &[f64],
-    length: Option<usize>,
-    smoothing_length: Option<usize>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adaptive_momentum_oscillator_js(data, length, smoothing_length)?;
-    crate::write_wasm_object_f64_outputs("adaptive_momentum_oscillator_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_momentum_oscillator_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adaptive_momentum_oscillator_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "adaptive_momentum_oscillator_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
 
 #[cfg(test)]
 use std::error::Error as StdError;
@@ -59,6 +15,10 @@ const DEFAULT_LENGTH: usize = 14;
 const DEFAULT_SMOOTHING_LENGTH: usize = 9;
 const MIN_LENGTH: usize = 1;
 const MIN_SMOOTHING_LENGTH: usize = 1;
+
+// Mathematical authority for this version, including initialization and `na`
+// behavior:
+// https://pine-facade.tradingview.com/pine-facade/get/PUB%3B1763d63e649c4be4baf7fe86bee776b8/last
 
 impl<'a> AsRef<[f64]> for AdaptiveMomentumOscillatorInput<'a> {
     #[inline(always)]
@@ -94,10 +54,6 @@ pub enum AdaptiveMomentumOscillatorOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdaptiveMomentumOscillatorParams {
     pub length: Option<usize>,
     pub smoothing_length: Option<usize>,
@@ -327,17 +283,18 @@ fn prepare_input<'a>(
         return Err(AdaptiveMomentumOscillatorError::EmptyInputData);
     }
 
-    let first_valid = data
-        .iter()
-        .position(|value| !value.is_nan())
-        .ok_or(AdaptiveMomentumOscillatorError::AllValuesNaN)?;
+    if data.iter().all(|value| value.is_nan()) {
+        return Err(AdaptiveMomentumOscillatorError::AllValuesNaN);
+    }
 
     let length = input.get_length();
     let smoothing_length = input.get_smoothing_length();
     validate_params(length, smoothing_length)?;
 
-    let valid = data.len() - first_valid;
-    let needed = length + smoothing_length;
+    // The creator's raw momentum begins with the history available on each
+    // bar. Only the linear-regression window controls the output warmup.
+    let valid = data.len();
+    let needed = smoothing_length;
     if valid < needed {
         return Err(AdaptiveMomentumOscillatorError::NotEnoughValidData { needed, valid });
     }
@@ -355,7 +312,6 @@ struct AmoRawState {
     length: usize,
     ring: Vec<f64>,
     head: usize,
-    count: usize,
 }
 
 impl AmoRawState {
@@ -365,7 +321,6 @@ impl AmoRawState {
             length,
             ring: vec![f64::NAN; length],
             head: 0,
-            count: 0,
         }
     }
 
@@ -382,41 +337,31 @@ impl AmoRawState {
         if self.head == self.length {
             self.head = 0;
         }
-        if self.count < self.length {
-            self.count += 1;
-        }
     }
 
     #[inline(always)]
     fn update(&mut self, value: f64) -> f64 {
-        let out = if value.is_finite() && self.count >= self.length {
-            let mut best_abs = -1.0;
-            let mut best_delta = f64::NAN;
-            let mut valid = true;
-            for lag in 1..=self.length {
-                let past = self.history_value(lag);
-                if !past.is_finite() {
-                    valid = false;
-                    break;
-                }
-                let delta = value - past;
-                let abs_delta = delta.abs();
-                if abs_delta >= best_abs {
-                    best_abs = abs_delta;
-                    best_delta = delta;
-                }
-            }
-            if valid {
-                best_delta
-            } else {
+        // Creator Pine initializes both locals to zero on every bar. A missing
+        // historical value turns `math.max` into `na`; all following equality
+        // tests are false, but the delta selected before that hole is retained.
+        let mut max_momentum: f64 = 0.0;
+        let mut selected_delta = 0.0;
+        for lag in 1..=self.length {
+            let past = self.history_value(lag);
+            let delta = value - past;
+            let absolute_momentum = delta.abs();
+            max_momentum = if max_momentum.is_nan() || absolute_momentum.is_nan() {
                 f64::NAN
+            } else {
+                max_momentum.max(absolute_momentum)
+            };
+            if max_momentum == absolute_momentum {
+                selected_delta = delta;
             }
-        } else {
-            f64::NAN
-        };
+        }
 
         self.push(value);
-        out
+        selected_delta
     }
 }
 
@@ -449,15 +394,19 @@ impl AdaptiveAverageState {
 
     #[inline(always)]
     fn push_change(&mut self, change: f64) {
-        let normalized = if change.is_finite() { change } else { 0.0 };
+        // Pine `math.sum` ignores `na` observations and waits until it owns the
+        // requested number of non-na observations.
+        if change.is_nan() {
+            return;
+        }
         if self.count < self.length {
-            self.change_ring[self.head] = normalized;
-            self.change_sum += normalized;
+            self.change_ring[self.head] = change;
+            self.change_sum += change;
             self.count += 1;
         } else {
             let old = self.change_ring[self.head];
-            self.change_ring[self.head] = normalized;
-            self.change_sum += normalized - old;
+            self.change_ring[self.head] = change;
+            self.change_sum += change - old;
         }
         self.head += 1;
         if self.head == self.length {
@@ -466,30 +415,29 @@ impl AdaptiveAverageState {
     }
 
     #[inline(always)]
-    fn update(&mut self, input: f64) -> Option<f64> {
-        let change = if self.have_prev && input.is_finite() && self.prev.is_finite() {
+    fn update(&mut self, input: f64) -> f64 {
+        let change = if self.have_prev {
             (input - self.prev).abs()
         } else {
-            0.0
+            f64::NAN
         };
         self.push_change(change);
 
-        if input.is_finite() && self.change_sum > 0.0 {
-            let efficiency_ratio = input.abs() / self.change_sum;
-            let delta = efficiency_ratio * (input - self.value);
-            if delta.is_finite() {
-                self.value += delta;
-            }
+        let rolling_sum = if self.count == self.length {
+            self.change_sum
+        } else {
+            f64::NAN
+        };
+        let efficiency_ratio = input.abs() / rolling_sum;
+        let delta = efficiency_ratio * (input - self.value);
+        if !delta.is_nan() {
+            self.value += delta;
         }
 
         self.prev = input;
         self.have_prev = true;
 
-        if input.is_finite() {
-            Some(self.value)
-        } else {
-            None
-        }
+        self.value
     }
 }
 
@@ -521,15 +469,11 @@ impl AdaptiveMomentumOscillatorCore {
     }
 
     #[inline(always)]
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
+    fn update(&mut self, value: f64) -> (f64, f64) {
         let raw = self.raw.update(value);
         let amo = self.smoothing.update(raw).unwrap_or(f64::NAN);
         let ama = self.average.update(amo);
-        if amo.is_finite() {
-            Some((amo, ama.unwrap_or(f64::NAN)))
-        } else {
-            None
-        }
+        (amo, ama)
     }
 }
 
@@ -560,10 +504,9 @@ fn compute_into_slices(
     })?;
 
     for idx in 0..prepared.len {
-        if let Some((amo, ama)) = core.update(prepared.data[idx]) {
-            amo_out[idx] = amo;
-            ama_out[idx] = ama;
-        }
+        let (amo, ama) = core.update(prepared.data[idx]);
+        amo_out[idx] = amo;
+        ama_out[idx] = ama;
     }
 
     Ok(())
@@ -584,12 +527,11 @@ fn compute_output_into_slice(
     })?;
 
     for idx in 0..prepared.len {
-        if let Some((amo, ama)) = core.update(prepared.data[idx]) {
-            out[idx] = match field {
-                AdaptiveMomentumOscillatorOutputField::Amo => amo,
-                AdaptiveMomentumOscillatorOutputField::Ama => ama,
-            };
-        }
+        let (amo, ama) = core.update(prepared.data[idx]);
+        out[idx] = match field {
+            AdaptiveMomentumOscillatorOutputField::Amo => amo,
+            AdaptiveMomentumOscillatorOutputField::Ama => ama,
+        };
     }
 
     Ok(())
@@ -637,7 +579,6 @@ pub fn adaptive_momentum_oscillator_output_into_slice(
     compute_output_into_slice(prepared, field, out)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn adaptive_momentum_oscillator_into(
     input: &AdaptiveMomentumOscillatorInput<'_>,
@@ -663,7 +604,7 @@ impl AdaptiveMomentumOscillatorStream {
 
     #[inline(always)]
     pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.core.update(value)
+        Some(self.core.update(value))
     }
 
     pub fn reset(&mut self) {
@@ -882,7 +823,7 @@ pub fn adaptive_momentum_oscillator_batch_with_kernel(
         other => {
             return Err(AdaptiveMomentumOscillatorError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
 
@@ -1070,396 +1011,6 @@ fn adaptive_momentum_oscillator_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "adaptive_momentum_oscillator")]
-#[pyo3(signature = (data, length=None, smoothing_length=None, *, kernel=None))]
-pub fn adaptive_momentum_oscillator_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: Option<usize>,
-    smoothing_length: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = AdaptiveMomentumOscillatorInput::from_slice(
-        slice,
-        AdaptiveMomentumOscillatorParams {
-            length,
-            smoothing_length,
-        },
-    );
-    let out = py
-        .allow_threads(|| adaptive_momentum_oscillator_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((out.amo.into_pyarray(py), out.ama.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adaptive_momentum_oscillator_batch")]
-#[pyo3(signature = (data, length_range, smoothing_length_range, kernel=None))]
-pub fn adaptive_momentum_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    smoothing_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = AdaptiveMomentumOscillatorBatchRange {
-        length: length_range,
-        smoothing_length: smoothing_length_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let amo_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let ama_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let amo_slice = unsafe { amo_arr.as_slice_mut()? };
-    let ama_slice = unsafe { ama_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch_kernel = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            adaptive_momentum_oscillator_batch_inner_into(
-                slice,
-                &sweep,
-                batch_kernel,
-                !matches!(batch_kernel, Kernel::ScalarBatch),
-                amo_slice,
-                ama_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("amo", amo_arr.reshape((rows, cols))?)?;
-    dict.set_item("ama", ama_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smoothing_lengths",
-        combos
-            .iter()
-            .map(|combo| combo.smoothing_length.unwrap_or(DEFAULT_SMOOTHING_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdaptiveMomentumOscillatorStream")]
-pub struct AdaptiveMomentumOscillatorStreamPy {
-    inner: AdaptiveMomentumOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdaptiveMomentumOscillatorStreamPy {
-    #[new]
-    pub fn new(length: Option<usize>, smoothing_length: Option<usize>) -> PyResult<Self> {
-        let inner = AdaptiveMomentumOscillatorStream::try_new(AdaptiveMomentumOscillatorParams {
-            length,
-            smoothing_length,
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.inner.update(value)
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_adaptive_momentum_oscillator_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(adaptive_momentum_oscillator_py, m)?)?;
-    m.add_function(wrap_pyfunction!(adaptive_momentum_oscillator_batch_py, m)?)?;
-    m.add_class::<AdaptiveMomentumOscillatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct AdaptiveMomentumOscillatorJsOutput {
-    amo: Vec<f64>,
-    ama: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct AdaptiveMomentumOscillatorStreamJsOutput {
-    amo: f64,
-    ama: f64,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveMomentumOscillatorBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub smoothing_length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveMomentumOscillatorBatchJsOutput {
-    pub amo: Vec<f64>,
-    pub ama: Vec<f64>,
-    pub combos: Vec<AdaptiveMomentumOscillatorParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_momentum_oscillator_js)]
-pub fn adaptive_momentum_oscillator_js(
-    data: &[f64],
-    length: Option<usize>,
-    smoothing_length: Option<usize>,
-) -> Result<JsValue, JsValue> {
-    let out = adaptive_momentum_oscillator(&AdaptiveMomentumOscillatorInput::from_slice(
-        data,
-        AdaptiveMomentumOscillatorParams {
-            length,
-            smoothing_length,
-        },
-    ))
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&AdaptiveMomentumOscillatorJsOutput {
-        amo: out.amo,
-        ama: out.ama,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_momentum_oscillator_batch)]
-pub fn adaptive_momentum_oscillator_batch_unified_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: AdaptiveMomentumOscillatorBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let out = adaptive_momentum_oscillator_batch_with_kernel(
-        data,
-        &AdaptiveMomentumOscillatorBatchRange {
-            length: config.length_range,
-            smoothing_length: config.smoothing_length_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&AdaptiveMomentumOscillatorBatchJsOutput {
-        amo: out.amo,
-        ama: out.ama,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_momentum_oscillator_alloc)]
-pub fn adaptive_momentum_oscillator_alloc(len: usize) -> *mut f64 {
-    let mut values = vec![0.0; len];
-    let ptr = values.as_mut_ptr();
-    std::mem::forget(values);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_momentum_oscillator_free)]
-pub fn adaptive_momentum_oscillator_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Vec::from_raw_parts(ptr, 0, len));
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_momentum_oscillator_into)]
-pub fn adaptive_momentum_oscillator_into_js(
-    data_ptr: *const f64,
-    amo_ptr: *mut f64,
-    ama_ptr: *mut f64,
-    len: usize,
-    length: Option<usize>,
-    smoothing_length: Option<usize>,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || amo_ptr.is_null() || ama_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to adaptive_momentum_oscillator_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let input = AdaptiveMomentumOscillatorInput::from_slice(
-            data,
-            AdaptiveMomentumOscillatorParams {
-                length,
-                smoothing_length,
-            },
-        );
-
-        let alias_input = data_ptr == amo_ptr as *const f64 || data_ptr == ama_ptr as *const f64;
-        let alias_outputs = amo_ptr == ama_ptr;
-        if alias_input || alias_outputs {
-            let mut amo = vec![0.0; len];
-            let mut ama = vec![0.0; len];
-            adaptive_momentum_oscillator_into_slice(&mut amo, &mut ama, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(amo_ptr, len).copy_from_slice(&amo);
-            std::slice::from_raw_parts_mut(ama_ptr, len).copy_from_slice(&ama);
-            return Ok(());
-        }
-
-        let amo = std::slice::from_raw_parts_mut(amo_ptr, len);
-        let ama = std::slice::from_raw_parts_mut(ama_ptr, len);
-        adaptive_momentum_oscillator_into_slice(amo, ama, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_momentum_oscillator_batch_into)]
-pub fn adaptive_momentum_oscillator_batch_into(
-    data_ptr: *const f64,
-    amo_ptr: *mut f64,
-    ama_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    smoothing_length_start: usize,
-    smoothing_length_end: usize,
-    smoothing_length_step: usize,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || amo_ptr.is_null() || ama_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to adaptive_momentum_oscillator_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let sweep = AdaptiveMomentumOscillatorBatchRange {
-            length: (length_start, length_end, length_step),
-            smoothing_length: (
-                smoothing_length_start,
-                smoothing_length_end,
-                smoothing_length_step,
-            ),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-        let alias_input = data_ptr == amo_ptr as *const f64 || data_ptr == ama_ptr as *const f64;
-        let alias_outputs = amo_ptr == ama_ptr;
-        if alias_input || alias_outputs {
-            let mut amo = vec![0.0; total];
-            let mut ama = vec![0.0; total];
-            let batch_kernel = detect_best_batch_kernel();
-            adaptive_momentum_oscillator_batch_inner_into(
-                data,
-                &sweep,
-                batch_kernel,
-                !matches!(batch_kernel, Kernel::ScalarBatch),
-                &mut amo,
-                &mut ama,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(amo_ptr, total).copy_from_slice(&amo);
-            std::slice::from_raw_parts_mut(ama_ptr, total).copy_from_slice(&ama);
-            return Ok(rows);
-        }
-
-        let amo = std::slice::from_raw_parts_mut(amo_ptr, total);
-        let ama = std::slice::from_raw_parts_mut(ama_ptr, total);
-        let batch_kernel = detect_best_batch_kernel();
-        adaptive_momentum_oscillator_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel,
-            !matches!(batch_kernel, Kernel::ScalarBatch),
-            amo,
-            ama,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct AdaptiveMomentumOscillatorStreamWasm {
-    inner: AdaptiveMomentumOscillatorStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl AdaptiveMomentumOscillatorStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        length: Option<usize>,
-        smoothing_length: Option<usize>,
-    ) -> Result<AdaptiveMomentumOscillatorStreamWasm, JsValue> {
-        Ok(Self {
-            inner: AdaptiveMomentumOscillatorStream::try_new(AdaptiveMomentumOscillatorParams {
-                length,
-                smoothing_length,
-            })
-            .map_err(|e| JsValue::from_str(&e.to_string()))?,
-        })
-    }
-
-    pub fn update(&mut self, value: f64) -> Result<JsValue, JsValue> {
-        match self.inner.update(value) {
-            Some((amo, ama)) => {
-                serde_wasm_bindgen::to_value(&AdaptiveMomentumOscillatorStreamJsOutput { amo, ama })
-                    .map_err(|e| JsValue::from_str(&e.to_string()))
-            }
-            None => Ok(JsValue::NULL),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1481,31 +1032,27 @@ mod tests {
         let mut amo = vec![f64::NAN; data.len()];
         let mut ama = vec![f64::NAN; data.len()];
 
-        let mut raw = vec![f64::NAN; data.len()];
+        let mut raw = vec![0.0; data.len()];
         for idx in 0..data.len() {
             let value = data[idx];
-            if !value.is_finite() || idx < length {
-                continue;
-            }
-            let mut best_abs = -1.0;
-            let mut best_delta = f64::NAN;
-            let mut valid = true;
+            let mut max_momentum: f64 = 0.0;
+            let mut selected_delta = 0.0;
             for lag in 1..=length {
-                let past = data[idx - lag];
-                if !past.is_finite() {
-                    valid = false;
-                    break;
-                }
+                let past = idx
+                    .checked_sub(lag)
+                    .map_or(f64::NAN, |history| data[history]);
                 let delta = value - past;
-                let abs_delta = delta.abs();
-                if abs_delta >= best_abs {
-                    best_abs = abs_delta;
-                    best_delta = delta;
+                let absolute_momentum = delta.abs();
+                max_momentum = if max_momentum.is_nan() || absolute_momentum.is_nan() {
+                    f64::NAN
+                } else {
+                    max_momentum.max(absolute_momentum)
+                };
+                if max_momentum == absolute_momentum {
+                    selected_delta = delta;
                 }
             }
-            if valid {
-                raw[idx] = best_delta;
-            }
+            raw[idx] = selected_delta;
         }
 
         if smoothing_length > 0 {
@@ -1546,33 +1093,36 @@ mod tests {
 
         for idx in 0..data.len() {
             let current = amo[idx];
-            let change = if have_prev && current.is_finite() && prev.is_finite() {
+            let change = if have_prev {
                 (current - prev).abs()
             } else {
-                0.0
+                f64::NAN
             };
 
-            if count < length {
-                change_ring[head] = change;
-                change_sum += change;
-                count += 1;
-            } else {
-                let old = change_ring[head];
-                change_ring[head] = change;
-                change_sum += change - old;
-            }
-            head = (head + 1) % length;
-
-            if current.is_finite() {
-                if change_sum > 0.0 {
-                    let efficiency_ratio = current.abs() / change_sum;
-                    let delta = efficiency_ratio * (current - ama_state);
-                    if delta.is_finite() {
-                        ama_state += delta;
-                    }
+            if !change.is_nan() {
+                if count < length {
+                    change_ring[head] = change;
+                    change_sum += change;
+                    count += 1;
+                } else {
+                    let old = change_ring[head];
+                    change_ring[head] = change;
+                    change_sum += change - old;
                 }
-                ama[idx] = ama_state;
+                head = (head + 1) % length;
             }
+
+            let rolling_sum = if count == length {
+                change_sum
+            } else {
+                f64::NAN
+            };
+            let efficiency_ratio = current.abs() / rolling_sum;
+            let delta = efficiency_ratio * (current - ama_state);
+            if !delta.is_nan() {
+                ama_state += delta;
+            }
+            ama[idx] = ama_state;
 
             prev = current;
             have_prev = true;
@@ -1661,6 +1211,64 @@ mod tests {
             let b = expected_ama[idx];
             assert!((a.is_nan() && b.is_nan()) || (a - b).abs() <= 1e-9);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn creator_pine_available_history_and_interior_na_are_exact() -> Result<(), Box<dyn StdError>> {
+        // Creator Pine, source lines 40-53 and 81-82:
+        // - raw momentum starts from 0 and keeps the best delta selected before a
+        //   missing historical lag poisons `math.max`;
+        // - `ta.linreg(raw, 2, 0)` therefore emits at row 1, not row length+1;
+        // - `math.sum` waits for three non-na changes, so AMA remains its 0 seed.
+        let data = [
+            1.0,
+            2.0,
+            4.0,
+            8.0,
+            f64::NAN,
+            32.0,
+            64.0,
+            128.0,
+            256.0,
+            512.0,
+        ];
+        let output = adaptive_momentum_oscillator(&AdaptiveMomentumOscillatorInput::from_slice(
+            &data,
+            AdaptiveMomentumOscillatorParams {
+                length: Some(3),
+                smoothing_length: Some(2),
+            },
+        ))?;
+
+        assert!(output.amo[0].is_nan(), "ta.linreg needs two raw values");
+        for (row, expected) in [
+            (1, 1.0f64),
+            (2, 3.0),
+            (3, 7.0),
+            (4, 0.0),
+            (5, 0.0),
+            (6, 32.0),
+            (7, 96.0),
+        ] {
+            assert_eq!(
+                output.amo[row].to_bits(),
+                expected.to_bits(),
+                "creator Pine AMO mismatch at row {row}"
+            );
+        }
+        for row in 0..=5 {
+            assert_eq!(
+                output.ama[row].to_bits(),
+                0.0f64.to_bits(),
+                "creator Pine AMA must retain its zero seed at row {row}"
+            );
+        }
+        assert_eq!(
+            output.ama[6].to_bits(),
+            (1024.0f64 / 39.0).to_bits(),
+            "creator Pine AMA must use the first complete three-change math.sum window"
+        );
         Ok(())
     }
 

@@ -1,26 +1,11 @@
-use crate::indicators::moving_averages::ma::{ma, MaData};
+use crate::indicators::moving_averages::ma::{MaData, ma};
 use crate::indicators::utility_functions::RollingError;
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 use std::convert::AsRef;
 use std::error::Error;
@@ -92,10 +77,6 @@ impl<'a> KdjInput<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct KdjParams {
     pub fast_k_period: Option<usize>,
     pub slow_k_period: Option<usize>,
@@ -287,7 +268,6 @@ pub fn kdj_with_kernel(input: &KdjInput, kernel: Kernel) -> Result<KdjOutput, Kd
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn kdj_into(
     input: &KdjInput,
@@ -495,19 +475,11 @@ fn kdj_compute_into_scalar(
         #[inline(always)]
         fn inc(i: usize, cap: usize) -> usize {
             let j = i + 1;
-            if j == cap {
-                0
-            } else {
-                j
-            }
+            if j == cap { 0 } else { j }
         }
         #[inline(always)]
         fn dec(i: usize, cap: usize) -> usize {
-            if i == 0 {
-                cap - 1
-            } else {
-                i - 1
-            }
+            if i == 0 { cap - 1 } else { i - 1 }
         }
 
         let mut stoch_ring = vec![f64::NAN; slow_k];
@@ -2321,53 +2293,13 @@ unsafe fn kdj_row_avx512_long(
     )
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kdj_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fast_k_period: usize,
-    slow_k_period: usize,
-    slow_k_ma_type: &str,
-    slow_d_period: usize,
-    slow_d_ma_type: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kdj_js(
-        high,
-        low,
-        close,
-        fast_k_period,
-        slow_k_period,
-        slow_k_ma_type,
-        slow_d_period,
-        slow_d_ma_type,
-    )?;
-    crate::write_wasm_object_f64_outputs("kdj_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kdj_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kdj_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("kdj_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_kdj_into_matches_api() -> Result<(), Box<dyn Error>> {
         let n = 256usize;
@@ -2422,8 +2354,8 @@ mod tests {
 
     fn check_kdj_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = KdjParams {
             fast_k_period: None,
             slow_k_period: Some(4),
@@ -2441,8 +2373,8 @@ mod tests {
 
     fn check_kdj_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = KdjParams::default();
         let input = KdjInput::from_candles(&candles, params);
         let result = kdj_with_kernel(&input, kernel)?;
@@ -2500,8 +2432,8 @@ mod tests {
 
     fn check_kdj_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KdjInput::with_default_candles(&candles);
         match input.data {
             KdjData::Candles { .. } => {}
@@ -2582,8 +2514,8 @@ mod tests {
 
     fn check_kdj_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = KdjParams {
             fast_k_period: Some(9),
             slow_k_period: Some(3),
@@ -2623,8 +2555,8 @@ mod tests {
 
     fn check_kdj_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = KdjParams::default();
         let input = KdjInput::from_candles(&candles, params);
         let result = kdj_with_kernel(&input, kernel)?;
@@ -2645,8 +2577,8 @@ mod tests {
     fn check_kdj_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             KdjParams::default(),
@@ -2735,53 +2667,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in K \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in K \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in K \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in K \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in K \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in K \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
             }
 
@@ -2794,53 +2726,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in D \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in D \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in D \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in D \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in D \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in D \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
             }
 
@@ -2853,53 +2785,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in J \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in J \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in J \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in J \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in J \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in J \
 						 with params: fast_k_period={}, slow_k_period={}, slow_k_ma_type={}, slow_d_period={}, slow_d_ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.fast_k_period.unwrap_or(9),
-						params.slow_k_period.unwrap_or(3),
-						params.slow_k_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_d_period.unwrap_or(3),
-						params.slow_d_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_k_period.unwrap_or(9),
+                        params.slow_k_period.unwrap_or(3),
+                        params.slow_k_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_d_period.unwrap_or(3),
+                        params.slow_d_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
             }
         }
@@ -3298,8 +3230,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = KdjBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -3318,8 +3250,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 2, 6, 2, 2, 6, 2, "sma", "sma"),
@@ -3601,489 +3533,6 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kdj")]
-#[pyo3(signature = (high, low, close, fast_k_period=9, slow_k_period=3, slow_k_ma_type="sma", slow_d_period=3, slow_d_ma_type="sma", kernel=None))]
-pub fn kdj_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    fast_k_period: usize,
-    slow_k_period: usize,
-    slow_k_ma_type: &str,
-    slow_d_period: usize,
-    slow_d_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    use numpy::PyArray1;
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let params = KdjParams {
-        fast_k_period: Some(fast_k_period),
-        slow_k_period: Some(slow_k_period),
-        slow_k_ma_type: Some(slow_k_ma_type.to_string()),
-        slow_d_period: Some(slow_d_period),
-        slow_d_ma_type: Some(slow_d_ma_type.to_string()),
-    };
-    let inp = KdjInput::from_slices(h, l, c, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    let (rows, cols) = (1, c.len());
-    let k_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let d_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let j_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-
-    let k_slice = unsafe { k_arr.as_slice_mut()? };
-    let d_slice = unsafe { d_arr.as_slice_mut()? };
-    let j_slice = unsafe { j_arr.as_slice_mut()? };
-
-    py.allow_threads(|| kdj_into_slices(k_slice, d_slice, j_slice, &inp, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((k_arr, d_arr, j_arr))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "KdjStream")]
-pub struct KdjStreamPy {
-    stream: KdjStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl KdjStreamPy {
-    #[new]
-    fn new(
-        fast_k_period: usize,
-        slow_k_period: usize,
-        slow_k_ma_type: &str,
-        slow_d_period: usize,
-        slow_d_ma_type: &str,
-    ) -> PyResult<Self> {
-        let params = KdjParams {
-            fast_k_period: Some(fast_k_period),
-            slow_k_period: Some(slow_k_period),
-            slow_k_ma_type: Some(slow_k_ma_type.to_string()),
-            slow_d_period: Some(slow_d_period),
-            slow_d_ma_type: Some(slow_d_ma_type.to_string()),
-        };
-        let stream =
-            KdjStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(KdjStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kdj_batch")]
-#[pyo3(signature = (high, low, close,
-                    fast_k_range, slow_k_range, slow_k_ma_type,
-                    slow_d_range, slow_d_ma_type, kernel=None))]
-pub fn kdj_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    fast_k_range: (usize, usize, usize),
-    slow_k_range: (usize, usize, usize),
-    slow_k_ma_type: &str,
-    slow_d_range: (usize, usize, usize),
-    slow_d_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods};
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let range = KdjBatchRange {
-        fast_k_period: fast_k_range,
-        slow_k_period: slow_k_range,
-        slow_k_ma_type: (
-            slow_k_ma_type.to_string(),
-            slow_k_ma_type.to_string(),
-            "".to_string(),
-        ),
-        slow_d_period: slow_d_range,
-        slow_d_ma_type: (
-            slow_d_ma_type.to_string(),
-            slow_d_ma_type.to_string(),
-            "".to_string(),
-        ),
-    };
-
-    let kern = validate_kernel(kernel, true)?;
-    let combos;
-    let rows;
-    let cols = c.len();
-
-    let k_arr = unsafe { PyArray1::<f64>::new(py, [1], false) };
-    let d_arr = unsafe { PyArray1::<f64>::new(py, [1], false) };
-    let j_arr = unsafe { PyArray1::<f64>::new(py, [1], false) };
-
-    let (k_vec, d_vec, j_vec, cmbs, rws) = py
-        .allow_threads(|| {
-            let out = kdj_batch_inner(
-                h,
-                l,
-                c,
-                &range,
-                match kern {
-                    Kernel::Avx512Batch => Kernel::Avx512,
-                    Kernel::Avx2Batch => Kernel::Avx2,
-                    Kernel::ScalarBatch => Kernel::Scalar,
-                    Kernel::Auto => detect_best_batch_kernel(),
-                    _ => kern,
-                },
-                true,
-            )?;
-            Ok::<_, KdjError>((out.k, out.d, out.j, out.combos, out.rows))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    combos = cmbs;
-    rows = rws;
-
-    let k_arr = k_vec.into_pyarray(py).reshape((rows, cols))?;
-    let d_arr = d_vec.into_pyarray(py).reshape((rows, cols))?;
-    let j_arr = j_vec.into_pyarray(py).reshape((rows, cols))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("k", k_arr)?;
-    dict.set_item("d", d_arr)?;
-    dict.set_item("j", j_arr)?;
-    dict.set_item(
-        "fast_k_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_k_period.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_k_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_k_period.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_d_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_d_period.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    let combo_list = PyList::new(
-        py,
-        combos.iter().map(|c| {
-            let combo_dict = PyDict::new(py);
-            combo_dict
-                .set_item("fast_k_period", c.fast_k_period.unwrap())
-                .unwrap();
-            combo_dict
-                .set_item("slow_k_period", c.slow_k_period.unwrap())
-                .unwrap();
-            combo_dict
-                .set_item(
-                    "slow_k_ma_type",
-                    c.slow_k_ma_type.as_ref().unwrap().as_str(),
-                )
-                .unwrap();
-            combo_dict
-                .set_item("slow_d_period", c.slow_d_period.unwrap())
-                .unwrap();
-            combo_dict
-                .set_item(
-                    "slow_d_ma_type",
-                    c.slow_d_ma_type.as_ref().unwrap().as_str(),
-                )
-                .unwrap();
-            combo_dict
-        }),
-    )?;
-    dict.set_item("combos", combo_list)?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaKdj};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kdj_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, fast_k_range, slow_k_range, slow_k_ma_range, slow_d_range, slow_d_ma_range, device_id=0))]
-pub fn kdj_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: PyReadonlyArray1<'_, f32>,
-    low_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    fast_k_range: (usize, usize, usize),
-    slow_k_range: (usize, usize, usize),
-    slow_k_ma_range: (String, String, String),
-    slow_d_range: (usize, usize, usize),
-    slow_d_ma_range: (String, String, String),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = KdjBatchRange {
-        fast_k_period: fast_k_range,
-        slow_k_period: slow_k_range,
-        slow_k_ma_type: slow_k_ma_range,
-        slow_d_period: slow_d_range,
-        slow_d_ma_type: slow_d_ma_range,
-    };
-    let (k_dev, d_dev, j_dev) = py.allow_threads(|| {
-        let cuda = CudaKdj::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.kdj_batch_dev(h, l, c, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let k = make_device_array_py(device_id, k_dev)?;
-    let d = make_device_array_py(device_id, d_dev)?;
-    let j = make_device_array_py(device_id, j_dev)?;
-    Ok((k, d, j))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kdj_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, fast_k, slow_k, slow_k_ma, slow_d, slow_d_ma, device_id=0))]
-pub fn kdj_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: PyReadonlyArray1<'_, f32>,
-    low_tm_f32: PyReadonlyArray1<'_, f32>,
-    close_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    fast_k: usize,
-    slow_k: usize,
-    slow_k_ma: String,
-    slow_d: usize,
-    slow_d_ma: String,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let htm = high_tm_f32.as_slice()?;
-    let ltm = low_tm_f32.as_slice()?;
-    let ctm = close_tm_f32.as_slice()?;
-    let params = KdjParams {
-        fast_k_period: Some(fast_k),
-        slow_k_period: Some(slow_k),
-        slow_k_ma_type: Some(slow_k_ma),
-        slow_d_period: Some(slow_d),
-        slow_d_ma_type: Some(slow_d_ma),
-    };
-    let (k_dev, d_dev, j_dev) = py.allow_threads(|| {
-        let cuda = CudaKdj::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.kdj_many_series_one_param_time_major_dev(htm, ltm, ctm, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let k = make_device_array_py(device_id, k_dev)?;
-    let d = make_device_array_py(device_id, d_dev)?;
-    let j = make_device_array_py(device_id, j_dev)?;
-    Ok((k, d, j))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KdjJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kdj")]
-pub fn kdj_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fast_k_period: usize,
-    slow_k_period: usize,
-    slow_k_ma_type: &str,
-    slow_d_period: usize,
-    slow_d_ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    let params = KdjParams {
-        fast_k_period: Some(fast_k_period),
-        slow_k_period: Some(slow_k_period),
-        slow_k_ma_type: Some(slow_k_ma_type.to_string()),
-        slow_d_period: Some(slow_d_period),
-        slow_d_ma_type: Some(slow_d_ma_type.to_string()),
-    };
-    let input = KdjInput::from_slices(high, low, close, params);
-
-    let mut k = vec![0.0; close.len()];
-    let mut d = vec![0.0; close.len()];
-    let mut j = vec![0.0; close.len()];
-    kdj_into_slices(&mut k, &mut d, &mut j, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(3 * close.len());
-    values.extend_from_slice(&k);
-    values.extend_from_slice(&d);
-    values.extend_from_slice(&j);
-    let result = KdjJsOutput {
-        values,
-        rows: 3,
-        cols: close.len(),
-    };
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kdj_alloc")]
-pub fn kdj_alloc(len: usize) -> *mut f64 {
-    let mut v: Vec<f64> = Vec::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kdj_free")]
-pub fn kdj_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kdj_into")]
-pub fn kdj_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    k_ptr: *mut f64,
-    d_ptr: *mut f64,
-    j_ptr: *mut f64,
-    len: usize,
-    fast_k_period: usize,
-    slow_k_period: usize,
-    slow_k_ma_type: &str,
-    slow_d_period: usize,
-    slow_d_ma_type: &str,
-) -> Result<(), JsValue> {
-    if [
-        high_ptr as usize,
-        low_ptr as usize,
-        close_ptr as usize,
-        k_ptr as usize,
-        d_ptr as usize,
-        j_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer passed to kdj_into"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let k = std::slice::from_raw_parts_mut(k_ptr, len);
-        let d = std::slice::from_raw_parts_mut(d_ptr, len);
-        let j = std::slice::from_raw_parts_mut(j_ptr, len);
-
-        let params = KdjParams {
-            fast_k_period: Some(fast_k_period),
-            slow_k_period: Some(slow_k_period),
-            slow_k_ma_type: Some(slow_k_ma_type.to_string()),
-            slow_d_period: Some(slow_d_period),
-            slow_d_ma_type: Some(slow_d_ma_type.to_string()),
-        };
-        let input = KdjInput::from_slices(h, l, c, params);
-        kdj_into_slices(k, d, j, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KdjBatchConfig {
-    pub fast_k_period: (usize, usize, usize),
-    pub slow_k_period: (usize, usize, usize),
-    pub slow_k_ma_type: String,
-    pub slow_d_period: (usize, usize, usize),
-    pub slow_d_ma_type: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KdjBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<KdjParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "kdj_batch")]
-pub fn kdj_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: KdjBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = KdjBatchRange {
-        fast_k_period: cfg.fast_k_period,
-        slow_k_period: cfg.slow_k_period,
-        slow_k_ma_type: (
-            cfg.slow_k_ma_type.clone(),
-            cfg.slow_k_ma_type,
-            "".to_string(),
-        ),
-        slow_d_period: cfg.slow_d_period,
-        slow_d_ma_type: (
-            cfg.slow_d_ma_type.clone(),
-            cfg.slow_d_ma_type,
-            "".to_string(),
-        ),
-    };
-    let out = kdj_batch_inner(high, low, close, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(out.rows * 3 * out.cols);
-    for row in 0..out.rows {
-        let s = row * out.cols;
-        values.extend_from_slice(&out.k[s..s + out.cols]);
-        values.extend_from_slice(&out.d[s..s + out.cols]);
-        values.extend_from_slice(&out.j[s..s + out.cols]);
-    }
-    let js = KdjBatchJsOutput {
-        values,
-        combos: out.combos,
-        rows: out.rows * 3,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
 }
 
 #[inline]

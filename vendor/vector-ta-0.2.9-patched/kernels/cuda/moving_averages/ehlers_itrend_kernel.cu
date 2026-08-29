@@ -351,16 +351,15 @@ void ehlers_itrend_many_series_one_param_f32(
 //     `if (!(f >= 1.0)) dcp = 1;` — the negated comparison is what makes NaN
 //     land on 1 rather than on max_dc.
 //
-// THE TWO SUMMATION PATHS ARE NOT EQUIVALENT, AND BOTH ARE HERE.
-//   The CPU builds a PREFIX SUM when `first_valid == 0` and every value is
-//   finite, and otherwise walks a ring adding `dcp` terms. `prefix[end] -
-//   prefix[start]` and a `dcp`-term sum are different roundings of the same
-//   exact quantity, so choosing one for both cases would diverge from the CPU
-//   on exactly the frames the other path handles. Both are implemented, under
-//   the same condition, and the "all finite" scan is done up front.
-//   The prefix is not materialised for the whole series — only the last
-//   `max_dc + 1` prefix values are ever read (`start >= end - dcp >=
-//   end - max_dc`), so a ring of that size is exact, not an approximation.
+// f64 NUMERICAL AUTHORITY V1.
+// ehlers_itrend_f64_pow2_scaled_chronological_neumaier_window_explicit_wma4_rn_v1
+//   The adaptive SMA is reduced chronologically (oldest -> newest) after exact
+//   power-of-two normalization with Neumaier compensation. A prefix difference
+//   is deliberately forbidden: on long, large-offset series it subtracts two
+//   accumulated quantities and can lose many low bits. CPU scalar/Auto/AVX,
+//   batch, legacy and stream use the same versioned schedule. The following
+//   4-3-2-1 WMA and Hilbert transform are also spelled as explicit operations;
+//   build.rs compiles this f64 lane with -fmad=false.
 //
 // f32 HAZARDS FIXED: `atan2f` -> `atan2`; `__fmaf_rn` -> the exact
 // multiply/add the CPU writes (the CPU line `0.0962*a + 0.5769*b - 0.5769*c -
@@ -379,6 +378,88 @@ void ehlers_itrend_many_series_one_param_f32(
 
 __device__ __forceinline__ double neo_s2_qnan() {
     return __longlong_as_double(0x7ff8000000000000LL);
+}
+
+__device__ __forceinline__ double neo_s2_floor_power_of_two_v1(double max_abs) {
+    const unsigned long long bits =
+        ((unsigned long long)__double_as_longlong(max_abs)) & 0x7fffffffffffffffULL;
+    const unsigned long long exponent = bits & 0x7ff0000000000000ULL;
+    if (exponent != 0ULL) {
+        return __longlong_as_double((long long)exponent);
+    }
+    const int highest_mantissa_bit = 63 - __clzll(bits);
+    return __longlong_as_double((long long)(1ULL << highest_mantissa_bit));
+}
+
+__device__ __forceinline__ void neo_s2_neumaier_add_v1(
+    double value,
+    double* sum,
+    double* correction)
+{
+    const double next = *sum + value;
+    if (fabs(*sum) >= fabs(value)) {
+        *correction += (*sum - next) + value;
+    } else {
+        *correction += (value - next) + *sum;
+    }
+    *sum = next;
+}
+
+__device__ __forceinline__ double neo_s2_stable_window_mean_v1(
+    const double* ring,
+    int oldest,
+    int count,
+    int capacity)
+{
+    double max_abs = 0.0;
+    int index = oldest;
+    for (int offset = 0; offset < count; ++offset) {
+        const double value = ring[index];
+        if (!isfinite(value)) return neo_s2_qnan();
+        const double magnitude = fabs(value);
+        if (magnitude > max_abs) max_abs = magnitude;
+        index += 1;
+        if (index == capacity) index = 0;
+    }
+    if (max_abs == 0.0) return 0.0;
+
+    const double scale = neo_s2_floor_power_of_two_v1(max_abs);
+    double sum = 0.0;
+    double correction = 0.0;
+    index = oldest;
+    for (int offset = 0; offset < count; ++offset) {
+        neo_s2_neumaier_add_v1(ring[index] / scale, &sum, &correction);
+        index += 1;
+        if (index == capacity) index = 0;
+    }
+    const double result = ((sum + correction) / (double)count) * scale;
+    if (!isfinite(result)) return neo_s2_qnan();
+    return (result == 0.0) ? 0.0 : result;
+}
+
+__device__ __forceinline__ double neo_s2_wma4_v1(
+    double current,
+    double lag1,
+    double lag2,
+    double lag3)
+{
+    const double weighted_0 = 4.0 * current;
+    const double weighted_1 = weighted_0 + 3.0 * lag1;
+    const double weighted_2 = weighted_1 + 2.0 * lag2;
+    const double weighted_3 = weighted_2 + lag3;
+    return weighted_3 / 10.0;
+}
+
+__device__ __forceinline__ double neo_s2_hilbert4_v1(
+    double current,
+    double lag2,
+    double lag4,
+    double lag6)
+{
+    const double term_0 = 0.0962 * current;
+    const double term_1 = term_0 + 0.5769 * lag2;
+    const double term_2 = term_1 - 0.5769 * lag4;
+    return term_2 - 0.0962 * lag6;
 }
 
 // `ring_get(buf, center, off)` from ehlers_itrend.rs:266.
@@ -416,15 +497,6 @@ extern "C" __global__ void neoethos_ehlers_itrend_batch_f64(
     const int warm = first_valid + warmup_bars;
     for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
 
-    // `prefix_sum` is Some only when first_valid == 0 AND every value is
-    // finite. The scan is the CPU's `for &x in src { if !x.is_finite() ... }`.
-    bool use_prefix = (first_valid == 0);
-    if (use_prefix) {
-        for (int i = 0; i < n; ++i) {
-            if (!isfinite(prices[i])) { use_prefix = false; break; }
-        }
-    }
-
     double fir_buf[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     double det_buf[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     double i1_buf [7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
@@ -437,18 +509,15 @@ extern "C" __global__ void neoethos_ehlers_itrend_batch_f64(
     double src_l1 = 0.0, src_l2 = 0.0, src_l3 = 0.0;
     int ring_ptr = 0;
 
-    // One backing store, two meanings: prefix sums (path A) or raw values
-    // (path B). Path A needs max_dc + 1 entries, path B needs max_dc.
+    // Raw values in insertion order; `sum_idx` always names the next slot.
     double sring[ITREND_MAX_DC + 1];
-    for (int k = 0; k <= max_dc; ++k) sring[k] = 0.0;
-    const int pcap = max_dc + 1;
-    double acc = 0.0;          // running prefix, path A
-    int sum_idx = 0;           // ring cursor, path B
+    for (int k = 0; k < max_dc; ++k) sring[k] = 0.0;
+    int sum_idx = 0;
 
     for (int i = 0; i < n; ++i) {
         const double x0 = prices[i];
 
-        const double fir_val = (4.0 * x0 + 3.0 * src_l1 + 2.0 * src_l2 + src_l3) / 10.0;
+        const double fir_val = neo_s2_wma4_v1(x0, src_l1, src_l2, src_l3);
         fir_buf[ring_ptr] = fir_val;
 
         const double fir_0 = neo_s2_ring7(fir_buf, ring_ptr, 0);
@@ -456,7 +525,7 @@ extern "C" __global__ void neoethos_ehlers_itrend_batch_f64(
         const double fir_4 = neo_s2_ring7(fir_buf, ring_ptr, 4);
         const double fir_6 = neo_s2_ring7(fir_buf, ring_ptr, 6);
 
-        const double h_in = 0.0962 * fir_0 + 0.5769 * fir_2 - 0.5769 * fir_4 - 0.0962 * fir_6;
+        const double h_in = neo_s2_hilbert4_v1(fir_0, fir_2, fir_4, fir_6);
         const double period_mult = 0.075 * prev_mesa + 0.54;
         const double det_val = h_in * period_mult;
         det_buf[ring_ptr] = det_val;
@@ -468,7 +537,7 @@ extern "C" __global__ void neoethos_ehlers_itrend_batch_f64(
         const double det_2 = neo_s2_ring7(det_buf, ring_ptr, 2);
         const double det_4 = neo_s2_ring7(det_buf, ring_ptr, 4);
         const double det_6 = neo_s2_ring7(det_buf, ring_ptr, 6);
-        const double h_in_q1 = 0.0962 * det_0 + 0.5769 * det_2 - 0.5769 * det_4 - 0.0962 * det_6;
+        const double h_in_q1 = neo_s2_hilbert4_v1(det_0, det_2, det_4, det_6);
         const double q1_val = h_in_q1 * period_mult;
         q1_buf[ring_ptr] = q1_val;
 
@@ -476,15 +545,13 @@ extern "C" __global__ void neoethos_ehlers_itrend_batch_f64(
         const double i1_2 = neo_s2_ring7(i1_buf, ring_ptr, 2);
         const double i1_4 = neo_s2_ring7(i1_buf, ring_ptr, 4);
         const double i1_6 = neo_s2_ring7(i1_buf, ring_ptr, 6);
-        const double j_i_val =
-            (0.0962 * i1_0 + 0.5769 * i1_2 - 0.5769 * i1_4 - 0.0962 * i1_6) * period_mult;
+        const double j_i_val = neo_s2_hilbert4_v1(i1_0, i1_2, i1_4, i1_6) * period_mult;
 
         const double q1_0 = neo_s2_ring7(q1_buf, ring_ptr, 0);
         const double q1_2 = neo_s2_ring7(q1_buf, ring_ptr, 2);
         const double q1_4 = neo_s2_ring7(q1_buf, ring_ptr, 4);
         const double q1_6 = neo_s2_ring7(q1_buf, ring_ptr, 6);
-        const double j_q_val =
-            (0.0962 * q1_0 + 0.5769 * q1_2 - 0.5769 * q1_4 - 0.0962 * q1_6) * period_mult;
+        const double j_q_val = neo_s2_hilbert4_v1(q1_0, q1_2, q1_4, q1_6) * period_mult;
 
         const double i2_cur = 0.2 * (i1_val - j_q_val) + 0.8 * prev_i2;
         const double q2_cur = 0.2 * (q1_val + j_i_val) + 0.8 * prev_q2;
@@ -526,32 +593,16 @@ extern "C" __global__ void neoethos_ehlers_itrend_batch_f64(
         else if (f >= (double)max_dc)    dcp = max_dc;
         else                             dcp = (int)f;
 
-        double sum_src;
-        if (use_prefix) {
-            // prefix[end] - prefix[start], end = i + 1.
-            acc += x0;
-            const int end = i + 1;
-            sring[end % pcap] = acc;
-            const int start = (end > dcp) ? (end - dcp) : 0;
-            const double p_end = acc;
-            const double p_start = (start == 0) ? 0.0 : sring[start % pcap];
-            sum_src = p_end - p_start;
-        } else {
-            sring[sum_idx] = x0;
-            sum_idx += 1;
-            if (sum_idx == max_dc) sum_idx = 0;
-            sum_src = 0.0;
-            int idx2 = sum_idx;
-            for (int k = 0; k < dcp; ++k) {
-                idx2 = (idx2 == 0) ? (max_dc - 1) : (idx2 - 1);
-                sum_src += sring[idx2];
-            }
-        }
-        const double it_val = sum_src / (double)dcp;
+        sring[sum_idx] = x0;
+        sum_idx += 1;
+        if (sum_idx == max_dc) sum_idx = 0;
+        const int oldest = (sum_idx + max_dc - dcp) % max_dc;
+        const double it_val =
+            neo_s2_stable_window_mean_v1(sring, oldest, dcp, max_dc);
 
         const double eit_val = (i < warmup_bars)
             ? x0
-            : ((4.0 * it_val + 3.0 * prev_it1 + 2.0 * prev_it2 + prev_it3) / 10.0);
+            : neo_s2_wma4_v1(it_val, prev_it1, prev_it2, prev_it3);
 
         prev_it3 = prev_it2;
         prev_it2 = prev_it1;

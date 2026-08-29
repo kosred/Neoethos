@@ -3,11 +3,10 @@
 // asked for "the same filters" in both, and a copy-paste pair would diverge on
 // the first change.
 
-/** Fastest-first, so timeframe chips read in the order runs actually go. */
-export const TF_ORDER = [
-  "MN1", "W1", "D1", "H12", "H8", "H6", "H4", "H3", "H2", "H1",
-  "M30", "M20", "M15", "M12", "M10", "M6", "M5", "M4", "M3", "M2", "M1",
-];
+import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
+
+/** Slowest-first display order, derived only from exact broker periods. */
+export const TF_ORDER: string[] = [...CANONICAL_BROKER_TIMEFRAMES].reverse();
 
 export const tfRank = (t: string) => {
   const i = TF_ORDER.indexOf(t);

@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -13,23 +13,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum KvoData<'a> {
@@ -50,10 +33,6 @@ pub struct KvoOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct KvoParams {
     pub short_period: Option<usize>,
     pub long_period: Option<usize>,
@@ -459,7 +438,6 @@ pub fn kvo_into_slice(dst: &mut [f64], input: &KvoInput, kern: Kernel) -> Result
     kvo_compute_into(dst, input, kern)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn kvo_into(input: &KvoInput, out: &mut [f64]) -> Result<(), KvoError> {
     kvo_compute_into(out, input, Kernel::Auto)
@@ -1316,47 +1294,18 @@ impl KvoStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kvo_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    short_period: usize,
-    long_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = kvo_js(high, low, close, volume, short_period, long_period)?;
-    crate::write_wasm_f64_output("kvo_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kvo_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kvo_batch_js(high, low, close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs("kvo_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_kvo_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = KvoParams {
             short_period: None,
@@ -1371,8 +1320,8 @@ mod tests {
 
     fn check_kvo_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KvoInput::from_candles(&candles, KvoParams::default());
         let result = kvo_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -1400,8 +1349,8 @@ mod tests {
 
     fn check_kvo_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KvoInput::with_default_candles(&candles);
         match input.data {
             KvoData::Candles { .. } => {}
@@ -1414,8 +1363,8 @@ mod tests {
 
     fn check_kvo_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = KvoParams {
             short_period: Some(0),
             long_period: Some(5),
@@ -1432,8 +1381,8 @@ mod tests {
 
     fn check_kvo_period_invalid(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = KvoParams {
             short_period: Some(5),
             long_period: Some(2),
@@ -1450,8 +1399,8 @@ mod tests {
 
     fn check_kvo_very_small_dataset(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let mut candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let mut candles = (*read_candles_from_vortex(file_path)?).clone();
         candles.high.truncate(1);
         candles.low.truncate(1);
         candles.close.truncate(1);
@@ -1468,8 +1417,8 @@ mod tests {
 
     fn check_kvo_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = KvoParams {
             short_period: Some(2),
             long_period: Some(5),
@@ -1493,8 +1442,8 @@ mod tests {
 
     fn check_kvo_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KvoInput::from_candles(&candles, KvoParams::default());
         let res = kvo_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -1514,8 +1463,8 @@ mod tests {
     fn check_kvo_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let short = 2;
         let long = 5;
@@ -1568,8 +1517,8 @@ mod tests {
     fn check_kvo_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             KvoParams::default(),
@@ -2000,8 +1949,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = KvoBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
         let def = KvoParams::default();
         let row = output.values_for(&def).expect("default row missing");
@@ -2027,8 +1976,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (1, 5, 1, 2, 10, 2),
@@ -2140,7 +2089,6 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_kvo_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let len = 512usize;
@@ -2190,238 +2138,6 @@ mod tests {
 
         Ok(())
     }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kvo")]
-#[pyo3(signature = (high, low, close, volume, short_period=None, long_period=None, kernel=None))]
-pub fn kvo_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    short_period: Option<usize>,
-    long_period: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = KvoParams {
-        short_period,
-        long_period,
-    };
-    let input = KvoInput::from_slices(high_slice, low_slice, close_slice, volume_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| kvo_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "KvoStream")]
-pub struct KvoStreamPy {
-    stream: KvoStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl KvoStreamPy {
-    #[new]
-    fn new(short_period: Option<usize>, long_period: Option<usize>) -> PyResult<Self> {
-        let params = KvoParams {
-            short_period,
-            long_period,
-        };
-        let stream =
-            KvoStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(KvoStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64, volume: f64) -> Option<f64> {
-        self.stream.update(high, low, close, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kvo_batch")]
-#[pyo3(signature = (high, low, close, volume, short_range, long_range, kernel=None))]
-pub fn kvo_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    short_range: (usize, usize, usize),
-    long_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let v = volume.as_slice()?;
-
-    let sweep = KvoBatchRange {
-        short_period: short_range,
-        long_period: long_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = h.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow"))?;
-    let arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_flat: &mut [f64] = unsafe { arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    let simd = match kern {
-        Kernel::Auto => detect_best_kernel(),
-        k => k,
-    };
-
-    py.allow_threads(|| kvo_batch_inner_into(h, l, c, v, &sweep, simd, true, out_flat))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "shorts",
-        combos
-            .iter()
-            .map(|p| p.short_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "longs",
-        combos
-            .iter()
-            .map(|p| p.long_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kvo_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, volume_f32, short_range, long_range, device_id=0))]
-pub fn kvo_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    volume_f32: numpy::PyReadonlyArray1<'py, f32>,
-    short_range: (usize, usize, usize),
-    long_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaKvo;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let v = volume_f32.as_slice()?;
-    if h.len() != l.len() || h.len() != c.len() || h.len() != v.len() {
-        return Err(PyValueError::new_err("inputs must have equal length"));
-    }
-
-    let sweep = KvoBatchRange {
-        short_period: short_range,
-        long_period: long_range,
-    };
-    let (inner, combos) = py.allow_threads(|| {
-        let cuda = CudaKvo::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.kvo_batch_dev(h, l, c, v, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dev = make_device_array_py(device_id, inner)?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "shorts",
-        combos
-            .iter()
-            .map(|p| p.short_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "longs",
-        combos
-            .iter()
-            .map(|p| p.long_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok((dev, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kvo_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, volume_tm_f32, cols, rows, short_period, long_period, device_id=0))]
-pub fn kvo_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    volume_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    short_period: usize,
-    long_period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaKvo;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let v = volume_tm_f32.as_slice()?;
-    if h.len() != l.len() || h.len() != c.len() || h.len() != v.len() {
-        return Err(PyValueError::new_err("inputs must have equal length"));
-    }
-    let elems = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("cols * rows overflow"))?;
-    if elems != h.len() {
-        return Err(PyValueError::new_err("cols*rows must equal data length"));
-    }
-
-    let params = KvoParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaKvo::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.kvo_many_series_one_param_time_major_dev(h, l, c, v, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dev = make_device_array_py(device_id, inner)?;
-
-    Ok(dev)
 }
 
 #[inline(always)]
@@ -2585,302 +2301,4 @@ fn kvo_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[inline]
-fn kvo_wasm_into_slice(
-    dst: &mut [f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    short_period: usize,
-    long_period: usize,
-    kern: Kernel,
-) -> Result<(), KvoError> {
-    if dst.len() != high.len()
-        || dst.len() != low.len()
-        || dst.len() != close.len()
-        || dst.len() != volume.len()
-    {
-        return Err(KvoError::OutputLengthMismatch {
-            expected: high.len(),
-            got: dst.len(),
-        });
-    }
-
-    let params = KvoParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-    };
-    let input = KvoInput {
-        data: KvoData::Slices {
-            high,
-            low,
-            close,
-            volume,
-        },
-        params,
-    };
-
-    kvo_compute_into(dst, &input, kern)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kvo_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    short_period: usize,
-    long_period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let mut output = vec![0.0; high.len()];
-
-    kvo_wasm_into_slice(
-        &mut output,
-        high,
-        low,
-        close,
-        volume,
-        short_period,
-        long_period,
-        detect_best_kernel(),
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kvo_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period: usize,
-    long_period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        if high_ptr == out_ptr
-            || low_ptr == out_ptr
-            || close_ptr == out_ptr
-            || volume_ptr == out_ptr
-        {
-            let mut temp = vec![0.0; len];
-            kvo_wasm_into_slice(
-                &mut temp,
-                high,
-                low,
-                close,
-                volume,
-                short_period,
-                long_period,
-                detect_best_kernel(),
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            kvo_wasm_into_slice(
-                out,
-                high,
-                low,
-                close,
-                volume,
-                short_period,
-                long_period,
-                detect_best_kernel(),
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kvo_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kvo_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KvoBatchConfig {
-    pub short_period_range: (usize, usize, usize),
-    pub long_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KvoBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<KvoParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = kvo_batch)]
-pub fn kvo_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: KvoBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = KvoBatchRange {
-        short_period: config.short_period_range,
-        long_period: config.long_period_range,
-    };
-
-    let output = kvo_batch_inner(
-        high,
-        low,
-        close,
-        volume,
-        &sweep,
-        detect_best_kernel(),
-        false,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = KvoBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kvo_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period_start: usize,
-    short_period_end: usize,
-    short_period_step: usize,
-    long_period_start: usize,
-    long_period_end: usize,
-    long_period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    if short_period_start == 0 || long_period_start == 0 {
-        return Err(JsValue::from_str("Period cannot be zero"));
-    }
-
-    if short_period_step == 0 || long_period_step == 0 {
-        return Err(JsValue::from_str("Step cannot be zero"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        let sweep = KvoBatchRange {
-            short_period: (short_period_start, short_period_end, short_period_step),
-            long_period: (long_period_start, long_period_end, long_period_step),
-        };
-
-        let aliased = high_ptr == out_ptr
-            || low_ptr == out_ptr
-            || close_ptr == out_ptr
-            || volume_ptr == out_ptr;
-
-        if aliased {
-            let output = kvo_batch_inner(
-                high,
-                low,
-                close,
-                volume,
-                &sweep,
-                detect_best_kernel(),
-                false,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let total_size = output.values.len();
-            let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
-            out.copy_from_slice(&output.values);
-
-            Ok(output.rows)
-        } else {
-            let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let rows = combos.len();
-            let total_size = rows
-                .checked_mul(len)
-                .ok_or_else(|| JsValue::from_str("rows * len overflow"))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
-
-            kvo_batch_inner_into(
-                high,
-                low,
-                close,
-                volume,
-                &sweep,
-                detect_best_kernel(),
-                false,
-                out,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            Ok(rows)
-        }
-    }
 }

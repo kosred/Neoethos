@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -86,10 +68,6 @@ pub struct MarketStructureConfluenceOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MarketStructureConfluenceParams {
     pub swing_size: Option<usize>,
     pub bos_confirmation: Option<String>,
@@ -234,18 +212,26 @@ pub enum MarketStructureConfluenceError {
     },
     #[error("market_structure_confluence: all values are NaN")]
     AllValuesNaN,
-    #[error("market_structure_confluence: invalid swing_size: swing_size = {swing_size}, data length = {data_len}")]
+    #[error(
+        "market_structure_confluence: invalid swing_size: swing_size = {swing_size}, data length = {data_len}"
+    )]
     InvalidSwingSize { swing_size: usize, data_len: usize },
     #[error("market_structure_confluence: invalid bos_confirmation: {bos_confirmation}")]
     InvalidBosConfirmation { bos_confirmation: String },
-    #[error("market_structure_confluence: invalid basis_length: basis_length = {basis_length}, data length = {data_len}")]
+    #[error(
+        "market_structure_confluence: invalid basis_length: basis_length = {basis_length}, data length = {data_len}"
+    )]
     InvalidBasisLength {
         basis_length: usize,
         data_len: usize,
     },
-    #[error("market_structure_confluence: invalid atr_length: atr_length = {atr_length}, data length = {data_len}")]
+    #[error(
+        "market_structure_confluence: invalid atr_length: atr_length = {atr_length}, data length = {data_len}"
+    )]
     InvalidAtrLength { atr_length: usize, data_len: usize },
-    #[error("market_structure_confluence: invalid atr_smooth: atr_smooth = {atr_smooth}, data length = {data_len}")]
+    #[error(
+        "market_structure_confluence: invalid atr_smooth: atr_smooth = {atr_smooth}, data length = {data_len}"
+    )]
     InvalidAtrSmooth { atr_smooth: usize, data_len: usize },
     #[error("market_structure_confluence: invalid vol_mult: {vol_mult}")]
     InvalidVolMult { vol_mult: f64 },
@@ -1489,7 +1475,7 @@ pub fn market_structure_confluence_batch_with_kernel(
         _ => {
             return Err(MarketStructureConfluenceError::InvalidKernelForBatch(
                 kernel,
-            ))
+            ));
         }
     };
     let single_kernel = batch_kernel.to_non_batch();
@@ -1795,552 +1781,199 @@ unsafe fn assume_init_vec(buf: ManuallyDrop<Vec<MaybeUninit<f64>>>) -> Vec<f64> 
     Vec::from_raw_parts(buf.as_mut_ptr() as *mut f64, buf.len(), buf.capacity())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "market_structure_confluence")]
-#[pyo3(signature = (high, low, close, swing_size=DEFAULT_SWING_SIZE, bos_confirmation=DEFAULT_BOS_CONFIRMATION, basis_length=DEFAULT_BASIS_LENGTH, atr_length=DEFAULT_ATR_LENGTH, atr_smooth=DEFAULT_ATR_SMOOTH, vol_mult=DEFAULT_VOL_MULT, kernel=None))]
-pub fn market_structure_confluence_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    swing_size: usize,
-    bos_confirmation: &str,
-    basis_length: usize,
-    atr_length: usize,
-    atr_smooth: usize,
-    vol_mult: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = MarketStructureConfluenceInput::from_slices(
-        high,
-        low,
-        close,
-        MarketStructureConfluenceParams {
-            swing_size: Some(swing_size),
-            bos_confirmation: Some(bos_confirmation.to_string()),
-            basis_length: Some(basis_length),
-            atr_length: Some(atr_length),
-            atr_smooth: Some(atr_smooth),
-            vol_mult: Some(vol_mult),
-        },
-    );
-    let output = py
-        .allow_threads(|| market_structure_confluence_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("basis", output.basis.into_pyarray(py))?;
-    dict.set_item("upper_band", output.upper_band.into_pyarray(py))?;
-    dict.set_item("lower_band", output.lower_band.into_pyarray(py))?;
-    dict.set_item(
-        "structure_direction",
-        output.structure_direction.into_pyarray(py),
-    )?;
-    dict.set_item("bullish_arrow", output.bullish_arrow.into_pyarray(py))?;
-    dict.set_item("bearish_arrow", output.bearish_arrow.into_pyarray(py))?;
-    dict.set_item("bullish_change", output.bullish_change.into_pyarray(py))?;
-    dict.set_item("bearish_change", output.bearish_change.into_pyarray(py))?;
-    dict.set_item("hh", output.hh.into_pyarray(py))?;
-    dict.set_item("lh", output.lh.into_pyarray(py))?;
-    dict.set_item("hl", output.hl.into_pyarray(py))?;
-    dict.set_item("ll", output.ll.into_pyarray(py))?;
-    dict.set_item("bullish_bos", output.bullish_bos.into_pyarray(py))?;
-    dict.set_item("bullish_choch", output.bullish_choch.into_pyarray(py))?;
-    dict.set_item("bearish_bos", output.bearish_bos.into_pyarray(py))?;
-    dict.set_item("bearish_choch", output.bearish_choch.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "market_structure_confluence_batch")]
-#[pyo3(signature = (high, low, close, swing_size_range=(DEFAULT_SWING_SIZE, DEFAULT_SWING_SIZE, 0), bos_confirmation_options=vec![DEFAULT_BOS_CONFIRMATION.to_string()], basis_length_range=(DEFAULT_BASIS_LENGTH, DEFAULT_BASIS_LENGTH, 0), atr_length_range=(DEFAULT_ATR_LENGTH, DEFAULT_ATR_LENGTH, 0), atr_smooth_range=(DEFAULT_ATR_SMOOTH, DEFAULT_ATR_SMOOTH, 0), vol_mult_range=(DEFAULT_VOL_MULT, DEFAULT_VOL_MULT, 0.0), kernel=None))]
-pub fn market_structure_confluence_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    swing_size_range: (usize, usize, usize),
-    bos_confirmation_options: Vec<String>,
-    basis_length_range: (usize, usize, usize),
-    atr_length_range: (usize, usize, usize),
-    atr_smooth_range: (usize, usize, usize),
-    vol_mult_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            market_structure_confluence_batch_with_kernel(
-                high,
-                low,
-                close,
-                &MarketStructureConfluenceBatchRange {
-                    swing_size: swing_size_range,
-                    bos_confirmation: bos_confirmation_options,
-                    basis_length: basis_length_range,
-                    atr_length: atr_length_range,
-                    atr_smooth: atr_smooth_range,
-                    vol_mult: vol_mult_range,
-                },
-                kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let total = output.rows * output.cols;
-    let arrays = [
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-    ];
-    unsafe { arrays[0].as_slice_mut()? }.copy_from_slice(&output.basis);
-    unsafe { arrays[1].as_slice_mut()? }.copy_from_slice(&output.upper_band);
-    unsafe { arrays[2].as_slice_mut()? }.copy_from_slice(&output.lower_band);
-    unsafe { arrays[3].as_slice_mut()? }.copy_from_slice(&output.structure_direction);
-    unsafe { arrays[4].as_slice_mut()? }.copy_from_slice(&output.bullish_arrow);
-    unsafe { arrays[5].as_slice_mut()? }.copy_from_slice(&output.bearish_arrow);
-    unsafe { arrays[6].as_slice_mut()? }.copy_from_slice(&output.bullish_change);
-    unsafe { arrays[7].as_slice_mut()? }.copy_from_slice(&output.bearish_change);
-    unsafe { arrays[8].as_slice_mut()? }.copy_from_slice(&output.hh);
-    unsafe { arrays[9].as_slice_mut()? }.copy_from_slice(&output.lh);
-    unsafe { arrays[10].as_slice_mut()? }.copy_from_slice(&output.hl);
-    unsafe { arrays[11].as_slice_mut()? }.copy_from_slice(&output.ll);
-    unsafe { arrays[12].as_slice_mut()? }.copy_from_slice(&output.bullish_bos);
-    unsafe { arrays[13].as_slice_mut()? }.copy_from_slice(&output.bullish_choch);
-    unsafe { arrays[14].as_slice_mut()? }.copy_from_slice(&output.bearish_bos);
-    unsafe { arrays[15].as_slice_mut()? }.copy_from_slice(&output.bearish_choch);
-
-    let dict = PyDict::new(py);
-    dict.set_item("basis", arrays[0].reshape((output.rows, output.cols))?)?;
-    dict.set_item("upper_band", arrays[1].reshape((output.rows, output.cols))?)?;
-    dict.set_item("lower_band", arrays[2].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "structure_direction",
-        arrays[3].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "bullish_arrow",
-        arrays[4].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "bearish_arrow",
-        arrays[5].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "bullish_change",
-        arrays[6].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "bearish_change",
-        arrays[7].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item("hh", arrays[8].reshape((output.rows, output.cols))?)?;
-    dict.set_item("lh", arrays[9].reshape((output.rows, output.cols))?)?;
-    dict.set_item("hl", arrays[10].reshape((output.rows, output.cols))?)?;
-    dict.set_item("ll", arrays[11].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "bullish_bos",
-        arrays[12].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "bullish_choch",
-        arrays[13].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "bearish_bos",
-        arrays[14].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "bearish_choch",
-        arrays[15].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "swing_sizes",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.swing_size.unwrap_or(DEFAULT_SWING_SIZE) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "bos_confirmations",
-        output
-            .combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .bos_confirmation
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_BOS_CONFIRMATION.to_string())
-            })
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "basis_lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.basis_length.unwrap_or(DEFAULT_BASIS_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "atr_lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.atr_length.unwrap_or(DEFAULT_ATR_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "atr_smooths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.atr_smooth.unwrap_or(DEFAULT_ATR_SMOOTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "vol_mults",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.vol_mult.unwrap_or(DEFAULT_VOL_MULT))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MarketStructureConfluenceStream")]
-pub struct MarketStructureConfluenceStreamPy {
-    stream: MarketStructureConfluenceStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MarketStructureConfluenceStreamPy {
-    #[new]
-    #[pyo3(signature = (swing_size=DEFAULT_SWING_SIZE, bos_confirmation=DEFAULT_BOS_CONFIRMATION, basis_length=DEFAULT_BASIS_LENGTH, atr_length=DEFAULT_ATR_LENGTH, atr_smooth=DEFAULT_ATR_SMOOTH, vol_mult=DEFAULT_VOL_MULT))]
-    fn new(
-        swing_size: usize,
-        bos_confirmation: &str,
-        basis_length: usize,
-        atr_length: usize,
-        atr_smooth: usize,
-        vol_mult: f64,
-    ) -> PyResult<Self> {
-        let stream = MarketStructureConfluenceStream::try_new(MarketStructureConfluenceParams {
-            swing_size: Some(swing_size),
-            bos_confirmation: Some(bos_confirmation.to_string()),
-            basis_length: Some(basis_length),
-            atr_length: Some(atr_length),
-            atr_smooth: Some(atr_smooth),
-            vol_mult: Some(vol_mult),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<Vec<f64>> {
-        self.stream.update(high, low, close).map(|output| {
-            vec![
-                output.basis,
-                output.upper_band,
-                output.lower_band,
-                output.structure_direction,
-                output.bullish_arrow,
-                output.bearish_arrow,
-                output.bullish_change,
-                output.bearish_change,
-                output.hh,
-                output.lh,
-                output.hl,
-                output.ll,
-                output.bullish_bos,
-                output.bullish_choch,
-                output.bearish_bos,
-                output.bearish_choch,
-            ]
-        })
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_market_structure_confluence_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(market_structure_confluence_py, m)?)?;
-    m.add_function(wrap_pyfunction!(market_structure_confluence_batch_py, m)?)?;
-    m.add_class::<MarketStructureConfluenceStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MarketStructureConfluenceJsOutput {
-    pub basis: Vec<f64>,
-    pub upper_band: Vec<f64>,
-    pub lower_band: Vec<f64>,
-    pub structure_direction: Vec<f64>,
-    pub bullish_arrow: Vec<f64>,
-    pub bearish_arrow: Vec<f64>,
-    pub bullish_change: Vec<f64>,
-    pub bearish_change: Vec<f64>,
-    pub hh: Vec<f64>,
-    pub lh: Vec<f64>,
-    pub hl: Vec<f64>,
-    pub ll: Vec<f64>,
-    pub bullish_bos: Vec<f64>,
-    pub bullish_choch: Vec<f64>,
-    pub bearish_bos: Vec<f64>,
-    pub bearish_choch: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = market_structure_confluence_js)]
-pub fn market_structure_confluence_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    swing_size: usize,
-    bos_confirmation: String,
-    basis_length: usize,
-    atr_length: usize,
-    atr_smooth: usize,
-    vol_mult: f64,
-) -> Result<JsValue, JsValue> {
-    let input = MarketStructureConfluenceInput::from_slices(
-        high,
-        low,
-        close,
-        MarketStructureConfluenceParams {
-            swing_size: Some(swing_size),
-            bos_confirmation: Some(bos_confirmation),
-            basis_length: Some(basis_length),
-            atr_length: Some(atr_length),
-            atr_smooth: Some(atr_smooth),
-            vol_mult: Some(vol_mult),
-        },
-    );
-    let output = market_structure_confluence_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&MarketStructureConfluenceJsOutput {
-        basis: output.basis,
-        upper_band: output.upper_band,
-        lower_band: output.lower_band,
-        structure_direction: output.structure_direction,
-        bullish_arrow: output.bullish_arrow,
-        bearish_arrow: output.bearish_arrow,
-        bullish_change: output.bullish_change,
-        bearish_change: output.bearish_change,
-        hh: output.hh,
-        lh: output.lh,
-        hl: output.hl,
-        ll: output.ll,
-        bullish_bos: output.bullish_bos,
-        bullish_choch: output.bullish_choch,
-        bearish_bos: output.bearish_bos,
-        bearish_choch: output.bearish_choch,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MarketStructureConfluenceBatchConfig {
-    pub swing_size_range: (usize, usize, usize),
-    pub bos_confirmation_options: Vec<String>,
-    pub basis_length_range: (usize, usize, usize),
-    pub atr_length_range: (usize, usize, usize),
-    pub atr_smooth_range: (usize, usize, usize),
-    pub vol_mult_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MarketStructureConfluenceBatchJsOutput {
-    pub basis: Vec<f64>,
-    pub upper_band: Vec<f64>,
-    pub lower_band: Vec<f64>,
-    pub structure_direction: Vec<f64>,
-    pub bullish_arrow: Vec<f64>,
-    pub bearish_arrow: Vec<f64>,
-    pub bullish_change: Vec<f64>,
-    pub bearish_change: Vec<f64>,
-    pub hh: Vec<f64>,
-    pub lh: Vec<f64>,
-    pub hl: Vec<f64>,
-    pub ll: Vec<f64>,
-    pub bullish_bos: Vec<f64>,
-    pub bullish_choch: Vec<f64>,
-    pub bearish_bos: Vec<f64>,
-    pub bearish_choch: Vec<f64>,
-    pub swing_sizes: Vec<usize>,
-    pub bos_confirmations: Vec<String>,
-    pub basis_lengths: Vec<usize>,
-    pub atr_lengths: Vec<usize>,
-    pub atr_smooths: Vec<usize>,
-    pub vol_mults: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = market_structure_confluence_batch)]
-pub fn market_structure_confluence_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: MarketStructureConfluenceBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let output = market_structure_confluence_batch_with_kernel(
-        high,
-        low,
-        close,
-        &MarketStructureConfluenceBatchRange {
-            swing_size: cfg.swing_size_range,
-            bos_confirmation: cfg.bos_confirmation_options,
-            basis_length: cfg.basis_length_range,
-            atr_length: cfg.atr_length_range,
-            atr_smooth: cfg.atr_smooth_range,
-            vol_mult: cfg.vol_mult_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&MarketStructureConfluenceBatchJsOutput {
-        basis: output.basis,
-        upper_band: output.upper_band,
-        lower_band: output.lower_band,
-        structure_direction: output.structure_direction,
-        bullish_arrow: output.bullish_arrow,
-        bearish_arrow: output.bearish_arrow,
-        bullish_change: output.bullish_change,
-        bearish_change: output.bearish_change,
-        hh: output.hh,
-        lh: output.lh,
-        hl: output.hl,
-        ll: output.ll,
-        bullish_bos: output.bullish_bos,
-        bullish_choch: output.bullish_choch,
-        bearish_bos: output.bearish_bos,
-        bearish_choch: output.bearish_choch,
-        swing_sizes: output
-            .combos
-            .iter()
-            .map(|combo| combo.swing_size.unwrap_or(DEFAULT_SWING_SIZE))
-            .collect(),
-        bos_confirmations: output
-            .combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .bos_confirmation
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_BOS_CONFIRMATION.to_string())
-            })
-            .collect(),
-        basis_lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.basis_length.unwrap_or(DEFAULT_BASIS_LENGTH))
-            .collect(),
-        atr_lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.atr_length.unwrap_or(DEFAULT_ATR_LENGTH))
-            .collect(),
-        atr_smooths: output
-            .combos
-            .iter()
-            .map(|combo| combo.atr_smooth.unwrap_or(DEFAULT_ATR_SMOOTH))
-            .collect(),
-        vol_mults: output
-            .combos
-            .iter()
-            .map(|combo| combo.vol_mult.unwrap_or(DEFAULT_VOL_MULT))
-            .collect(),
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn market_structure_confluence_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    swing_size: usize,
-    bos_confirmation: String,
-    basis_length: usize,
-    atr_length: usize,
-    atr_smooth: usize,
-    vol_mult: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = market_structure_confluence_js(
-        high,
-        low,
-        close,
-        swing_size,
-        bos_confirmation,
-        basis_length,
-        atr_length,
-        atr_smooth,
-        vol_mult,
-    )?;
-    crate::write_wasm_object_f64_outputs("market_structure_confluence_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn market_structure_confluence_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = market_structure_confluence_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "market_structure_confluence_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_uniqueness_change_includes_a_delayed_first_published_break() {
+        let run = |bullish: bool| {
+            let mut high = vec![11.0; 24];
+            let mut low = vec![9.0; 24];
+            let mut close = vec![10.0; 24];
+            if bullish {
+                high[15] = 12.5;
+                low[15] = 9.5;
+                close[15] = 12.0;
+            } else {
+                high[15] = 10.5;
+                low[15] = 7.5;
+                close[15] = 8.0;
+            }
+            market_structure_confluence_with_kernel(
+                &MarketStructureConfluenceInput::from_slices(
+                    &high,
+                    &low,
+                    &close,
+                    MarketStructureConfluenceParams {
+                        swing_size: Some(2),
+                        bos_confirmation: Some("Candle Close".into()),
+                        basis_length: Some(5),
+                        atr_length: Some(1),
+                        atr_smooth: Some(1),
+                        vol_mult: Some(0.5),
+                    },
+                ),
+                Kernel::Scalar,
+            )
+            .expect("the delayed-break boundary is valid")
+        };
+
+        let bullish = run(true);
+        assert_eq!(bullish.bullish_change[15], 1.0);
+        assert_eq!(bullish.bullish_choch[15], 0.0);
+        assert!(bullish.bullish_change[15].is_finite());
+
+        let bearish = run(false);
+        assert_eq!(bearish.bearish_change[15], 1.0);
+        assert_eq!(bearish.bearish_choch[15], 0.0);
+        assert!(bearish.bearish_change[15].is_finite());
+    }
+
+    #[test]
+    fn market_structure_confluence_matches_hand_derived_minimal_vector() {
+        // Independent small-vector oracle for the published contract: a
+        // centred two-bars-per-side swing, close-confirmed structure breaks,
+        // WMA(1) basis and SMA(1)-of-ATR(1) volatility. With all smoothing
+        // lengths equal to one, `basis == close` and `svol == true_range`, so
+        // every continuous value below can be derived without calling another
+        // indicator implementation.
+        let high = [
+            12.0, 13.0, 15.0, 14.0, 13.0, 16.5, 14.0, 13.0, 12.0, 11.0, 20.0, 15.0, 14.0, 22.0,
+        ];
+        let low = [
+            8.0, 9.0, 5.0, 7.0, 8.0, 10.0, 4.0, 6.0, 7.0, 2.0, 3.0, 4.0, 5.0, 14.0,
+        ];
+        let close = [
+            10.0, 11.0, 10.0, 12.0, 12.0, 16.0, 12.0, 11.0, 10.0, 3.0, 10.0, 12.0, 13.0, 21.0,
+        ];
+        let true_range = [
+            4.0, 4.0, 10.0, 7.0, 5.0, 6.5, 12.0, 7.0, 5.0, 9.0, 17.0, 11.0, 9.0, 9.0,
+        ];
+        let input = MarketStructureConfluenceInput::from_slices(
+            &high,
+            &low,
+            &close,
+            MarketStructureConfluenceParams {
+                swing_size: Some(2),
+                bos_confirmation: Some("Candle Close".into()),
+                basis_length: Some(1),
+                atr_length: Some(1),
+                atr_smooth: Some(1),
+                vol_mult: Some(0.5),
+            },
+        );
+        let output = market_structure_confluence_with_kernel(&input, Kernel::Scalar)
+            .expect("the hand-derived parameter boundary is valid");
+
+        for index in 0..close.len() {
+            assert_eq!(output.basis[index].to_bits(), close[index].to_bits());
+            assert_eq!(
+                output.upper_band[index].to_bits(),
+                (close[index] + 0.5 * true_range[index]).to_bits()
+            );
+            assert_eq!(
+                output.lower_band[index].to_bits(),
+                (close[index] - 0.5 * true_range[index]).to_bits()
+            );
+        }
+
+        assert_eq!(
+            output.structure_direction,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0
+            ]
+        );
+        assert_eq!(
+            output.bullish_arrow,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0
+            ]
+        );
+        assert_eq!(
+            output.bearish_arrow,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0
+            ]
+        );
+        assert_eq!(
+            output.bullish_change,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
+            ]
+        );
+        assert_eq!(
+            output.bearish_change,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0
+            ]
+        );
+        assert_eq!(
+            output.hh,
+            [
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0
+            ]
+        );
+        assert_eq!(output.lh, [0.0; 14]);
+        assert_eq!(
+            output.hl,
+            [
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            ]
+        );
+        assert_eq!(
+            output.ll,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
+            ]
+        );
+        assert_eq!(
+            output.bullish_bos,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            ]
+        );
+        assert_eq!(
+            output.bullish_choch,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
+            ]
+        );
+        assert_eq!(output.bearish_bos, [0.0; 14]);
+        assert_eq!(
+            output.bearish_choch,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0
+            ]
+        );
+
+        // The published setting is semantic: a wick may confirm the same
+        // swing break that a candle close must reject. This guards against
+        // collapsing the enum to one convenient branch in either lane.
+        let mut close_below_swing = close;
+        close_below_swing[5] = 14.0;
+        let run = |confirmation: &str| {
+            market_structure_confluence_with_kernel(
+                &MarketStructureConfluenceInput::from_slices(
+                    &high,
+                    &low,
+                    &close_below_swing,
+                    MarketStructureConfluenceParams {
+                        swing_size: Some(2),
+                        bos_confirmation: Some(confirmation.into()),
+                        basis_length: Some(1),
+                        atr_length: Some(1),
+                        atr_smooth: Some(1),
+                        vol_mult: Some(0.5),
+                    },
+                ),
+                Kernel::Scalar,
+            )
+            .expect("both documented confirmation modes are valid")
+        };
+        assert_eq!(run("Candle Close").structure_direction[5], 0.0);
+        assert_eq!(run("Wicks").structure_direction[5], 1.0);
+    }
 
     fn sample_ohlc() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let mut high = Vec::with_capacity(420);

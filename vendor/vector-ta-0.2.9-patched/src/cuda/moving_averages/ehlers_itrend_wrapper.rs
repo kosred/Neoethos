@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::ehlers_itrend::{
@@ -7,9 +7,9 @@ use crate::indicators::moving_averages::ehlers_itrend::{
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
 use cust::memory::{AsyncCopyDestination, DeviceCopy, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::convert::TryFrom;
@@ -133,11 +133,6 @@ impl CudaEhlersITrend {
         let device = Device::get_device(device_id as u32)?;
         let context = std::sync::Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/ehlers_itrend_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("ehlers_itrend_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

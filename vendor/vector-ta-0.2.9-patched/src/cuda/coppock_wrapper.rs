@@ -1,12 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32 as GenericDeviceArrayF32;
 use crate::indicators::coppock::{CoppockBatchRange, CoppockParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -107,14 +107,7 @@ impl CudaCoppock {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/coppock_kernel.ptx"));
-        let jit = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
-        let module = Module::from_ptx(ptx, jit)
-            .or_else(|_| Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]))
-            .or_else(|_| Module::from_ptx(ptx, &[]))?;
+        let module = crate::load_cuda_embedded_module!("coppock_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {
             module,
@@ -841,14 +834,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "coppock",
-            "one_series_many_params",
-            "coppock_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "coppock",
+                "one_series_many_params",
+                "coppock_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }

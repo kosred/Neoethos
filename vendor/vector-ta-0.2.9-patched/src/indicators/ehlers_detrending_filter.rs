@@ -1,22 +1,6 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{alloc_uninit_f64, detect_best_batch_kernel, detect_best_kernel};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -53,10 +37,6 @@ pub struct EhlersDetrendingFilterOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersDetrendingFilterParams {
     pub length: Option<usize>,
 }
@@ -197,9 +177,7 @@ pub enum EhlersDetrendingFilterError {
     InvalidLength { length: usize, data_len: usize },
     #[error("ehlers_detrending_filter: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error(
-        "ehlers_detrending_filter: Output length mismatch: expected = {expected}, got = {got}"
-    )]
+    #[error("ehlers_detrending_filter: Output length mismatch: expected = {expected}, got = {got}")]
     OutputLengthMismatch { expected: usize, got: usize },
     #[error("ehlers_detrending_filter: Invalid range: start={start}, end={end}, step={step}")]
     InvalidRange {
@@ -355,17 +333,9 @@ impl EhlersDetrendingFilterStream {
         let filt = self.weighted_filter();
         let slo = filt - self.prev_filt;
         let signal = if slo > 0.0 {
-            if slo > self.prev_slo {
-                2.0
-            } else {
-                1.0
-            }
+            if slo > self.prev_slo { 2.0 } else { 1.0 }
         } else if slo < 0.0 {
-            if slo < self.prev_slo {
-                -2.0
-            } else {
-                -1.0
-            }
+            if slo < self.prev_slo { -2.0 } else { -1.0 }
         } else {
             0.0
         };
@@ -482,7 +452,6 @@ pub fn ehlers_detrending_filter_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn ehlers_detrending_filter_into(
     input: &EhlersDetrendingFilterInput,
     out_edf: &mut [f64],
@@ -806,343 +775,12 @@ fn ehlers_detrending_filter_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_detrending_filter")]
-#[pyo3(signature = (data, length=DEFAULT_LENGTH, kernel=None))]
-pub fn ehlers_detrending_filter_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = EhlersDetrendingFilterInput::from_slice(
-        data,
-        EhlersDetrendingFilterParams {
-            length: Some(length),
-        },
-    );
-    let output = py
-        .allow_threads(|| ehlers_detrending_filter_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((output.edf.into_pyarray(py), output.signal.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersDetrendingFilterStream")]
-pub struct EhlersDetrendingFilterStreamPy {
-    stream: EhlersDetrendingFilterStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersDetrendingFilterStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH))]
-    fn new(length: usize) -> PyResult<Self> {
-        let stream = EhlersDetrendingFilterStream::try_new(EhlersDetrendingFilterParams {
-            length: Some(length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_detrending_filter_batch")]
-#[pyo3(signature = (data, length_range, kernel=None))]
-pub fn ehlers_detrending_filter_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let sweep = EhlersDetrendingFilterBatchRange {
-        length: length_range,
-    };
-    let combos = expand_grid_ehlers_detrending_filter(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let edf_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_edf = unsafe { edf_arr.as_slice_mut()? };
-    let out_signal = unsafe { signal_arr.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        ehlers_detrending_filter_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            out_edf,
-            out_signal,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let lengths: Vec<usize> = combos
-        .iter()
-        .map(|c| c.length.unwrap_or(DEFAULT_LENGTH))
-        .collect();
-    let dict = PyDict::new(py);
-    dict.set_item("edf", edf_arr.reshape((rows, cols))?)?;
-    dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("lengths", lengths.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_ehlers_detrending_filter_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(ehlers_detrending_filter_py, m)?)?;
-    m.add_function(wrap_pyfunction!(ehlers_detrending_filter_batch_py, m)?)?;
-    m.add_class::<EhlersDetrendingFilterStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EhlersDetrendingFilterJsOutput {
-    edf: Vec<f64>,
-    signal: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EhlersDetrendingFilterBatchConfig {
-    length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EhlersDetrendingFilterBatchJsOutput {
-    edf: Vec<f64>,
-    signal: Vec<f64>,
-    rows: usize,
-    cols: usize,
-    combos: Vec<EhlersDetrendingFilterParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_detrending_filter_js")]
-pub fn ehlers_detrending_filter_js(data: &[f64], length: usize) -> Result<JsValue, JsValue> {
-    let input = EhlersDetrendingFilterInput::from_slice(
-        data,
-        EhlersDetrendingFilterParams {
-            length: Some(length),
-        },
-    );
-    let output = ehlers_detrending_filter_with_kernel(&input, Kernel::Scalar)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersDetrendingFilterJsOutput {
-        edf: output.edf,
-        signal: output.signal,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_detrending_filter_batch_js")]
-pub fn ehlers_detrending_filter_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: EhlersDetrendingFilterBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: ranges must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let sweep = EhlersDetrendingFilterBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-    };
-    let batch = ehlers_detrending_filter_batch_slice(data, &sweep, Kernel::Scalar)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersDetrendingFilterBatchJsOutput {
-        edf: batch.edf,
-        signal: batch.signal,
-        rows: batch.rows,
-        cols: batch.cols,
-        combos: batch.combos,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_detrending_filter_alloc(len: usize) -> *mut f64 {
-    let mut buf = vec![0.0_f64; len * 2];
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_detrending_filter_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len * 2);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_detrending_filter_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_detrending_filter_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len * 2);
-        let (out_edf, out_signal) = out.split_at_mut(len);
-        let input = EhlersDetrendingFilterInput::from_slice(
-            data,
-            EhlersDetrendingFilterParams {
-                length: Some(length),
-            },
-        );
-        ehlers_detrending_filter_into_slice(out_edf, out_signal, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ehlers_detrending_filter_into_host")]
-pub fn ehlers_detrending_filter_into_host(
-    data: &[f64],
-    out_ptr: *mut f64,
-    length: usize,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_detrending_filter_into_host",
-        ));
-    }
-    unsafe {
-        let out = std::slice::from_raw_parts_mut(out_ptr, data.len() * 2);
-        let (out_edf, out_signal) = out.split_at_mut(data.len());
-        let input = EhlersDetrendingFilterInput::from_slice(
-            data,
-            EhlersDetrendingFilterParams {
-                length: Some(length),
-            },
-        );
-        ehlers_detrending_filter_into_slice(out_edf, out_signal, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_detrending_filter_batch_into(
-    data: &[f64],
-    out_ptr: *mut f64,
-    config: JsValue,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_detrending_filter_batch_into",
-        ));
-    }
-    let config: EhlersDetrendingFilterBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: ranges must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let sweep = EhlersDetrendingFilterBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-    };
-    let combos = expand_grid_ehlers_detrending_filter(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .and_then(|x| x.checked_mul(2))
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, total) };
-    let (out_edf, out_signal) = out.split_at_mut(rows * cols);
-    ehlers_detrending_filter_batch_inner_into(
-        data,
-        &sweep,
-        Kernel::Scalar,
-        false,
-        out_edf,
-        out_signal,
-    )
-    .map(|_| ())
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_detrending_filter_output_into_js(
-    data: &[f64],
-    length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_detrending_filter_js(data, length)?;
-    crate::write_wasm_object_f64_outputs("ehlers_detrending_filter_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_detrending_filter_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_detrending_filter_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_detrending_filter_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-        ParamValue,
+        IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+        compute_cpu_batch,
     };
 
     fn sample_data(len: usize) -> Vec<f64> {

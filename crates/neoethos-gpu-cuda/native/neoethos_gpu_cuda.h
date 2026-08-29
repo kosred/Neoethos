@@ -2,9 +2,13 @@
 #include <cstddef>
 #include <cstdint>
 
-#define NEOETHOS_GPU_ABI_VERSION 3u
+#define NEOETHOS_GPU_ABI_VERSION 4u
 
 extern "C" {
+
+struct CUctx_st;
+struct CUstream_st;
+struct CUevent_st;
 
 struct NeoBufferRef {
   std::uint64_t offset;
@@ -40,11 +44,11 @@ struct NeoGeneDescriptor {
   std::uint64_t candidate_id;
   std::uint32_t term_offset;
   std::uint32_t term_count;
-  float long_threshold;
-  float short_threshold;
+  double long_threshold;
+  double short_threshold;
   std::int64_t stop_ticks;
   std::int64_t target_ticks;
-  float stop_vol_multiplier;
+  double stop_vol_multiplier;
   std::uint32_t flags;
   std::uint64_t reserved;
 };
@@ -106,8 +110,8 @@ struct NeoFirstHitEvent {
   std::uint32_t last_bar;
   std::int32_t direction;
   std::int32_t precedence;
-  float stop_price;
-  float target_price;
+  double stop_price;
+  double target_price;
 };
 
 struct NeoFirstHitResult {
@@ -216,7 +220,7 @@ struct NeoPopulationDatasetView {
   const double* close;
   const double* high;
   const double* low;
-  const float* indicators;
+  const double* indicators;
   const std::int64_t* months;
   const std::int64_t* days;
   const std::int64_t* timestamps;
@@ -227,22 +231,175 @@ struct NeoPopulationDatasetView {
   std::size_t adaptive_base_pips_len;
 };
 
-/// Canonical gene batch. `descriptors` carries identity and thresholds; the
-/// f64 stop/target/multiplier arrays carry the exact host precision that the
-/// canonical CPU semantics require, so no ticks-to-pips rounding is introduced.
+/// Immutable parent bytes for the V1 resident route. Unlike the compatibility
+/// dataset view, it cannot contain view-local adaptive settings.
+struct NeoPopulationParentDatasetV1 {
+  NeoDatasetHeader header;
+  const double* close;
+  const double* high;
+  const double* low;
+  const double* indicators_feature_major;
+  const std::int64_t* months;
+  const std::int64_t* days;
+  const std::int64_t* timestamps;
+  const std::int8_t* smc_rows;
+};
+
+#define NEO_POPULATION_PARENT_OWNED_V1 0u
+#define NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3 1u
+#define NEO_POPULATION_STREAM_OWNED 0u
+#define NEO_POPULATION_STREAM_BORROWED 1u
+
+/// Immediate gpu-cuda-owned bind descriptor for a sealed V3 resident store.
+/// The native session borrows every listed parent pointer and the admitted run
+/// stream. Rust retains their opaque owners until a consumer completion event
+/// proves that no queued population read can still reach them.
+struct NeoPopulationResidentFeatureStoreV3 {
+  std::uint32_t abi_version;
+  std::uint32_t selected_device_ordinal;
+  std::uint64_t row_count;
+  std::uint32_t feature_count;
+  std::uint32_t smc_slots;
+  std::uint16_t compute_capability_major;
+  std::uint16_t compute_capability_minor;
+  std::uint32_t reserved;
+  std::uint64_t packed_validity_bytes;
+  const double* close;
+  const double* high;
+  const double* low;
+  const double* indicators_bar_major;
+  const std::uint8_t* indicators_validity_u4;
+  const std::int64_t* months;
+  const std::int64_t* days;
+  const std::int64_t* timestamps;
+  const std::int8_t* smc_rows;
+  CUctx_st* admitted_primary_context;
+  CUstream_st* admitted_run_stream;
+  CUevent_st* ready_event;
+  std::uint8_t device_uuid[16];
+  std::uint8_t admission_identity_sha256[32];
+  std::uint8_t canonical_content_merkle[32];
+};
+
+#define NEO_POPULATION_VIEW_FULL 0u
+#define NEO_POPULATION_VIEW_CONTIGUOUS_RANGE 1u
+#define NEO_POPULATION_VIEW_ORDERED_INDICES 2u
+#define NEO_POPULATION_TIMESTAMP_CANONICAL 0u
+#define NEO_POPULATION_TIMESTAMP_DISABLED_INDEX_DELTA 1u
+
+/// One view over an already uploaded immutable parent. Full/range use scalar
+/// offsets. Only ordered views supply a compact u64 index map. Adaptive values
+/// are view-local and must cover exactly `row_count` rows when present.
+struct NeoPopulationEvaluationViewV1 {
+  std::uint32_t abi_version;
+  std::uint32_t view_kind;
+  std::uint64_t parent_row_count;
+  std::uint64_t range_start;
+  std::uint64_t row_count;
+  const std::uint64_t* ordered_indices;
+  std::size_t ordered_index_count;
+  std::uint32_t timestamp_mode;
+  const double* adaptive_base_pips;
+  std::size_t adaptive_base_pips_len;
+};
+
+/// Exact transfer and synchronization facts for one native resident session.
+/// Metric rows and diagnostics are intermediate/full-population D2H classes;
+/// neither is a compact-final result. The accepted-trade total is the scalar
+/// control-plane D2H performed by the current wait boundary.
+struct NeoPopulationResidencyCountersV1 {
+  std::uint64_t parent_upload_count;
+  std::uint64_t parent_upload_bytes;
+  std::uint64_t view_binding_count;
+  std::uint64_t full_binding_count;
+  std::uint64_t range_binding_count;
+  std::uint64_t ordered_binding_count;
+  std::uint64_t ordered_index_upload_bytes;
+  std::uint64_t adaptive_upload_bytes;
+  std::uint64_t stream_creation_count;
+  std::uint64_t explicit_synchronization_count;
+  std::uint64_t metric_rows_readback_count;
+  std::uint64_t metric_rows_readback_rows;
+  std::uint64_t metric_rows_readback_bytes;
+  std::uint64_t diagnostic_readback_count;
+  std::uint64_t diagnostic_readback_rows;
+  std::uint64_t diagnostic_readback_bytes;
+  std::uint64_t accepted_trade_total_readback_count;
+  std::uint64_t accepted_trade_total_readback_bytes;
+};
+
+/// Fixed-width control-plane receipt for one metrics-only launch whose metric
+/// rows remain resident on the population session's native CUDA stream.
+///
+/// This value is not a device pointer and cannot authorize a detached read. The
+/// Rust owner binds it to the borrowed `PopulationSession`; the next resident
+/// GPU stage must consume the event as a stream dependency. Diagnostic outcome
+/// and accepted-total extents are explicitly zero in this mode.
+/// `total_device_bytes` is the exact sum of the three evaluation workspaces and
+/// the scenario SoA named below. Immutable parent/gene buffers are charged by
+/// their own run-level receipt rather than silently folded into this sub-plan.
+struct NeoPopulationResidentMetricsHandleV1 {
+  std::uint32_t abi_version;
+  std::uint32_t reserved;
+  std::uint64_t event_id;
+  std::uint64_t scenario_count;
+  std::uint64_t month_capacity;
+  std::uint64_t metric_rows_bytes;
+  std::uint64_t monthly_pnls_bytes;
+  std::uint64_t month_start_equities_bytes;
+  std::uint64_t scenario_descriptor_bytes;
+  std::uint64_t total_device_bytes;
+  std::uint64_t outcome_bytes;
+  std::uint64_t accepted_trade_total_bytes;
+};
+
+/// One bounded terminal result from a strict metrics-only launch. This is the
+/// sole host readback permitted at the end of the current one-scenario V1
+/// research seam: no outcome, diagnostic, or accepted-trade buffer exists.
+struct NeoPopulationTerminalCompactResultV1 {
+  std::uint32_t abi_version;
+  std::uint32_t reserved;
+  std::uint64_t event_id;
+  std::uint64_t scenario_count;
+  NeoPopulationMetricRow metric_row;
+  std::uint64_t terminal_synchronization_count;
+  std::uint64_t terminal_readback_count;
+  std::uint64_t terminal_readback_rows;
+  std::uint64_t terminal_readback_bytes;
+};
+
+/// Immutable identity of the physical CUDA device selected by one population
+/// session. The UUID and name are fixed-width raw bytes so the Rust/C ABI has
+/// no allocator, locale, or null-termination dependency.
+struct NeoPopulationDeviceIdentityV1 {
+  std::uint32_t selected_device_ordinal;
+  std::uint32_t compute_capability_major;
+  std::uint32_t compute_capability_minor;
+  std::uint32_t multiprocessor_count;
+  std::uint64_t total_global_memory_bytes;
+  std::int32_t pci_domain_id;
+  std::int32_t pci_bus_id;
+  std::int32_t pci_device_id;
+  std::uint8_t uuid[16];
+  std::uint8_t name[256];
+};
+
+/// Canonical gene batch. `descriptors` carries identity and thresholds; all
+/// floating signal inputs (CSR weights, stop/target/multiplier arrays, SMC
+/// weights and gate) retain the exact f64 host precision through device math.
 struct NeoPopulationGeneView {
   const NeoGeneDescriptor* descriptors;
   std::size_t count;
   const std::int32_t* offsets;
   const std::int32_t* indices;
-  const float* weights;
+  const double* weights;
   std::size_t term_count;
   const double* stop_pips;
   const double* target_pips;
   const double* stop_vol_multipliers;
   const std::int8_t* smc_flags;
-  const float* smc_weights;
-  float gate_threshold;
+  const double* smc_weights;
+  double gate_threshold;
   std::uint32_t smc_gate_disabled;
 };
 
@@ -338,6 +495,14 @@ struct NeoCudaPopulationSession;
 #define NEO_POPULATION_STATUS_SYNC_FAILED (-40)
 #define NEO_POPULATION_STATUS_UNKNOWN_EVENT (-41)
 #define NEO_POPULATION_STATUS_DATASET_REUPLOAD (-42)
+#define NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH (-43)
+#define NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH (-44)
+#define NEO_POPULATION_STATUS_STRICT_RESIDENT_IN_FLIGHT (-45)
+#define NEO_POPULATION_STATUS_STRICT_RESIDENT_POISONED (-46)
+
+#define NEO_CUDA_DEVICE_PROBE_OK 0
+#define NEO_CUDA_DEVICE_PROBE_INVALID_OUTPUT (-50)
+#define NEO_CUDA_DEVICE_PROBE_ADAPTER_UNAVAILABLE (-51)
 
 /// `max_events` is VESTIGIAL: it must be non-zero, and the device ignores it.
 ///
@@ -354,23 +519,52 @@ NeoCudaPopulationSession* neoethos_gpu_cuda_population_create(
 std::int32_t neoethos_gpu_cuda_population_upload_dataset(
     NeoCudaPopulationSession* session,
     const NeoPopulationDatasetView* dataset);
+std::int32_t neoethos_gpu_cuda_population_upload_parent_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationParentDatasetV1* parent);
+NeoCudaPopulationSession* neoethos_gpu_cuda_population_bind_resident_feature_store_v3(
+    const NeoPopulationResidentFeatureStoreV3* resident,
+    std::int32_t* status);
+std::int32_t neoethos_gpu_cuda_population_bind_view_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationEvaluationViewV1* view);
+std::int32_t neoethos_gpu_cuda_population_read_residency_counters_v1(
+    NeoCudaPopulationSession* session,
+    NeoPopulationResidencyCountersV1* counters);
+std::int32_t neoethos_gpu_cuda_population_read_device_identity_v1(
+    NeoCudaPopulationSession* session,
+    NeoPopulationDeviceIdentityV1* identity);
 std::int32_t neoethos_gpu_cuda_population_upload_genes(
     NeoCudaPopulationSession* session,
     const NeoPopulationGeneView* genes);
 std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
     NeoCudaPopulationSession* session,
     const NeoPopulationScenarioView* scenarios);
+std::int32_t neoethos_gpu_cuda_population_b_enqueue_metrics_only_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationSettings* settings,
+    NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    NeoPopulationCounters* counters);
+std::int32_t neoethos_gpu_cuda_population_consume_terminal_compact_result_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    NeoPopulationTerminalCompactResultV1* compact_result);
+/// Compatibility/DeviceParityOnly. Strict resident production uses the
+/// metrics-only enqueue above and never waits or reads metric rows on the host.
 std::int32_t neoethos_gpu_cuda_population_b_evaluate(
     NeoCudaPopulationSession* session,
     const NeoPopulationSettings* settings,
     std::uint64_t* event_id,
     NeoPopulationCounters* counters);
+/// Compatibility/DeviceParityOnly host synchronization.
 std::int32_t neoethos_gpu_cuda_population_wait(
     NeoCudaPopulationSession* session,
     std::uint64_t event_id);
+/// Compatibility/DeviceParityOnly full metric-row D2H readback.
 std::int32_t neoethos_gpu_cuda_population_read_metrics(
     NeoCudaPopulationSession* session,
     NeoPopulationReadback* readback);
+/// Compatibility/DeviceParityOnly diagnostic D2H readback.
 std::int32_t neoethos_gpu_cuda_population_read_diagnostics(
     NeoCudaPopulationSession* session,
     NeoPopulationDiagnosticReadback* readback);
@@ -378,6 +572,9 @@ void neoethos_gpu_cuda_population_destroy(NeoCudaPopulationSession* session);
 
 std::uint32_t neoethos_gpu_cuda_abi_version();
 std::int32_t neoethos_gpu_cuda_runtime_available();
+/// Fallible exact CUDA enumeration. CUDA success writes the exact count,
+/// including zero. CUDA errors are returned unchanged and never become zero.
+std::int32_t neoethos_gpu_cuda_probe_device_count_v1(std::uint32_t* out_count);
 /// Number of visible CUDA devices, or 0 when the runtime is unavailable.
 std::int32_t neoethos_gpu_cuda_device_count();
 std::uint64_t neoethos_gpu_cuda_device_free_memory(std::int32_t device);
@@ -385,8 +582,8 @@ std::int32_t neoethos_gpu_cuda_smoke(const std::uint32_t* input,
                                      std::uint32_t* output,
                                      std::size_t len);
 std::int32_t neoethos_gpu_cuda_warp_first_hit(
-    const float* highs,
-    const float* lows,
+    const double* highs,
+    const double* lows,
     std::size_t rows,
     const NeoFirstHitEvent* events,
     NeoFirstHitResult* results,

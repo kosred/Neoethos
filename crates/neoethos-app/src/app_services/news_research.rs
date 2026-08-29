@@ -166,7 +166,11 @@ pub async fn build_feed(feeds: Vec<String>) -> NewsFeed {
     // Dedup by canonical link (some feeds syndicate the same wire story),
     // then sort newest-first; undated items sink to the bottom.
     dedup_by_link(&mut items);
-    items.sort_by(|a, b| b.published_ms.unwrap_or(0).cmp(&a.published_ms.unwrap_or(0)));
+    items.sort_by(|a, b| {
+        b.published_ms
+            .unwrap_or(0)
+            .cmp(&a.published_ms.unwrap_or(0))
+    });
     items.truncate(TOTAL_CAP);
 
     let ai_summary = summarise(&items).await.unwrap_or_default();
@@ -380,7 +384,10 @@ fn dedup_by_link(items: &mut Vec<NewsItem>) {
 fn host_of(url: &str) -> String {
     url::Url::parse(url)
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_string()))
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.trim_start_matches("www.").to_string())
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "news".to_string())
 }

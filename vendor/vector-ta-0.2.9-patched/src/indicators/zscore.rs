@@ -1,47 +1,23 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 use crate::cuda::{CudaZscore, CudaZscoreError};
 use crate::indicators::deviation::{
-    deviation, DevError, DevInput, DevParams, DeviationData, DeviationOutput,
+    DevError, DevInput, DevParams, DeviationData, DeviationOutput, deviation,
 };
-use crate::indicators::moving_averages::ma::{ma, MaData};
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::indicators::moving_averages::ma::{MaData, ma};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for ZscoreInput<'a> {
     #[inline(always)]
@@ -74,10 +50,6 @@ pub struct ZscoreOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct ZscoreParams {
     pub period: Option<usize>,
     pub ma_type: Option<String>,
@@ -720,18 +692,10 @@ impl ZscoreStream {
 
             let var = if self.kind == MaKind::Sma {
                 let v = ex2 - mean * mean;
-                if v < 0.0 {
-                    0.0
-                } else {
-                    v
-                }
+                if v < 0.0 { 0.0 } else { v }
             } else {
                 let v = ex2 - 2.0 * mean * ex + mean * mean;
-                if v < 0.0 {
-                    0.0
-                } else {
-                    v
-                }
+                if v < 0.0 { 0.0 } else { v }
             };
 
             let sd = var.sqrt();
@@ -2125,323 +2089,6 @@ pub fn zscore_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "zscore")]
-#[pyo3(signature = (data, period=14, ma_type="sma", nbdev=1.0, devtype=0, kernel=None))]
-pub fn zscore_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    ma_type: &str,
-    nbdev: f64,
-    devtype: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = ZscoreParams {
-        period: Some(period),
-        ma_type: Some(ma_type.to_string()),
-        nbdev: Some(nbdev),
-        devtype: Some(devtype),
-    };
-    let input = ZscoreInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| zscore_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct ZscoreDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl ZscoreDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        let ptr_val = self.inner.buf.as_device_ptr().as_raw() as usize;
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (dev_type, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != dev_type || dev_id != alloc_dev {
-                    return Err(PyValueError::new_err(
-                        "zscore: dl_device mismatch; cross-device copy not implemented",
-                    ));
-                }
-            }
-        }
-        let _ = stream;
-        let _ = copy;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl ZscoreDeviceArrayF32Py {
-    pub fn new_from_rust(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "zscore_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, nbdev_range=(1.0, 1.0, 0.0), device_id=0))]
-pub fn zscore_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    nbdev_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(ZscoreDeviceArrayF32Py, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = ZscoreBatchRange {
-        period: period_range,
-        ma_type: ("sma".to_string(), "sma".to_string(), "".to_string()),
-        nbdev: nbdev_range,
-        devtype: (0, 0, 0),
-    };
-
-    let (inner, ctx, dev_id, combos) = py.allow_threads(|| {
-        let cuda = CudaZscore::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let (arr, combos) = cuda
-            .zscore_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id, combos))
-    })?;
-
-    let dict = PyDict::new(py);
-    let periods: Vec<u64> = combos.iter().map(|(p, _)| *p as u64).collect();
-    let nbdevs: Vec<f64> = combos.iter().map(|(_, nb)| *nb as f64).collect();
-    let devtypes: Vec<u64> = combos.iter().map(|_| 0u64).collect();
-    let ma_types = PyList::new(py, vec!["sma"; combos.len()])?;
-
-    dict.set_item("periods", periods.into_pyarray(py))?;
-    dict.set_item("nbdevs", nbdevs.into_pyarray(py))?;
-    dict.set_item("ma_types", ma_types)?;
-    dict.set_item("devtypes", devtypes.into_pyarray(py))?;
-
-    Ok((
-        ZscoreDeviceArrayF32Py::new_from_rust(inner, ctx, dev_id),
-        dict,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "zscore_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, period, nbdev=1.0, device_id=0))]
-pub fn zscore_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    nbdev: f64,
-    device_id: usize,
-) -> PyResult<ZscoreDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    if nbdev < 0.0 || !nbdev.is_finite() {
-        return Err(PyValueError::new_err(
-            "nbdev must be non-negative and finite",
-        ));
-    }
-
-    let slice_in = data_tm_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaZscore::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .zscore_many_series_one_param_time_major_dev(slice_in, cols, rows, period, nbdev as f32)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(ZscoreDeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ZscoreStream")]
-pub struct ZscoreStreamPy {
-    stream: ZscoreStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ZscoreStreamPy {
-    #[new]
-    fn new(period: usize, ma_type: &str, nbdev: f64, devtype: usize) -> PyResult<Self> {
-        let params = ZscoreParams {
-            period: Some(period),
-            ma_type: Some(ma_type.to_string()),
-            nbdev: Some(nbdev),
-            devtype: Some(devtype),
-        };
-        let stream =
-            ZscoreStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(ZscoreStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "zscore_batch")]
-#[pyo3(signature = (data, period_range, ma_type="sma", nbdev_range=(1.0, 1.0, 0.0), devtype_range=(0, 0, 0), kernel=None))]
-pub fn zscore_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    ma_type: &str,
-    nbdev_range: (f64, f64, f64),
-    devtype_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-
-    let sweep = ZscoreBatchRange {
-        period: period_range,
-        ma_type: (ma_type.to_string(), ma_type.to_string(), "".to_string()),
-        nbdev: nbdev_range,
-        devtype: devtype_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("zscore_batch: rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            zscore_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_types",
-        PyList::new(
-            py,
-            combos.iter().map(|p| p.ma_type.as_ref().unwrap().clone()),
-        )?,
-    )?;
-    dict.set_item(
-        "nbdevs",
-        combos
-            .iter()
-            .map(|p| p.nbdev.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "devtypes",
-        combos
-            .iter()
-            .map(|p| p.devtype.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
 pub fn zscore_into_slice(
     dst: &mut [f64],
     input: &ZscoreInput,
@@ -2510,7 +2157,7 @@ pub fn zscore_into_slice(
                 return Err(ZscoreError::InvalidPeriod {
                     period: 0,
                     data_len: 0,
-                })
+                });
             }
         }
     }?;
@@ -2518,7 +2165,6 @@ pub fn zscore_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn zscore_into(input: &ZscoreInput, out: &mut [f64]) -> Result<(), ZscoreError> {
     zscore_into_slice(out, input, Kernel::Auto)
 }
@@ -2726,219 +2372,15 @@ unsafe fn zscore_compute_into_avx512(
     zscore_compute_into_scalar(data, period, first, ma_type, nbdev, devtype, out)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn zscore_js(
-    data: &[f64],
-    period: usize,
-    ma_type: &str,
-    nbdev: f64,
-    devtype: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = ZscoreParams {
-        period: Some(period),
-        ma_type: Some(ma_type.to_string()),
-        nbdev: Some(nbdev),
-        devtype: Some(devtype),
-    };
-    let input = ZscoreInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    zscore_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn zscore_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn zscore_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn zscore_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    ma_type: &str,
-    nbdev: f64,
-    devtype: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = ZscoreParams {
-            period: Some(period),
-            ma_type: Some(ma_type.to_string()),
-            nbdev: Some(nbdev),
-            devtype: Some(devtype),
-        };
-        let input = ZscoreInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            zscore_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            zscore_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ZscoreBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub ma_type: String,
-    pub nbdev_range: (f64, f64, f64),
-    pub devtype_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ZscoreBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<ZscoreParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = zscore_batch)]
-pub fn zscore_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: ZscoreBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = ZscoreBatchRange {
-        period: config.period_range,
-        ma_type: (
-            config.ma_type.clone(),
-            config.ma_type.clone(),
-            "".to_string(),
-        ),
-        nbdev: config.nbdev_range,
-        devtype: config.devtype_range,
-    };
-
-    let output = zscore_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = ZscoreBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn zscore_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    ma_type: &str,
-    nbdev_start: f64,
-    nbdev_end: f64,
-    nbdev_step: f64,
-    devtype_start: usize,
-    devtype_end: usize,
-    devtype_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = ZscoreBatchRange {
-        period: (period_start, period_end, period_step),
-        ma_type: (ma_type.to_string(), ma_type.to_string(), "".to_string()),
-        nbdev: (nbdev_start, nbdev_end, nbdev_step),
-        devtype: (devtype_start, devtype_end, devtype_step),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let n_combos = combos.len();
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let total = n_combos
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("zscore_batch_into: rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let simd = detect_best_kernel();
-        zscore_batch_inner_into(data, &sweep, simd, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(n_combos)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn zscore_output_into_js(
-    data: &[f64],
-    period: usize,
-    ma_type: &str,
-    nbdev: f64,
-    devtype: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = zscore_js(data, period, ma_type, nbdev, devtype)?;
-    crate::write_wasm_f64_output("zscore_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn zscore_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = zscore_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("zscore_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     fn check_zscore_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = ZscoreParams {
             period: None,
             ma_type: None,
@@ -3031,8 +2473,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = ZscoreInput::with_default_candles(&candles);
         match input.data {
             ZscoreData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -3042,8 +2484,8 @@ mod tests {
     }
     fn check_zscore_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = ZscoreInput::from_candles(&candles, "close", ZscoreParams::default());
         let result = zscore_with_kernel(&input, kernel)?;
@@ -3098,8 +2540,8 @@ mod tests {
     fn check_zscore_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             ZscoreParams::default(),
@@ -3385,8 +2827,8 @@ mod tests {
     generate_all_zscore_tests!(check_zscore_property);
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = ZscoreBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -3419,8 +2861,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 0.5, 2.0, 0.5, 0),
@@ -3471,38 +2913,59 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {} (MA: {}): Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                            "[{}] Config {} (MA: {}): Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) with params: period={}, ma_type={}, nbdev={}, devtype={}",
-							test, cfg_idx, ma_type, val, bits, row, col, idx,
-							combo.period.unwrap_or(14),
-							combo.ma_type.as_deref().unwrap_or("sma"),
-							combo.nbdev.unwrap_or(1.0),
-							combo.devtype.unwrap_or(0)
-						);
+                            test,
+                            cfg_idx,
+                            ma_type,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(14),
+                            combo.ma_type.as_deref().unwrap_or("sma"),
+                            combo.nbdev.unwrap_or(1.0),
+                            combo.devtype.unwrap_or(0)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {} (MA: {}): Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                            "[{}] Config {} (MA: {}): Found init_matrix_prefixes poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) with params: period={}, ma_type={}, nbdev={}, devtype={}",
-							test, cfg_idx, ma_type, val, bits, row, col, idx,
-							combo.period.unwrap_or(14),
-							combo.ma_type.as_deref().unwrap_or("sma"),
-							combo.nbdev.unwrap_or(1.0),
-							combo.devtype.unwrap_or(0)
-						);
+                            test,
+                            cfg_idx,
+                            ma_type,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(14),
+                            combo.ma_type.as_deref().unwrap_or("sma"),
+                            combo.nbdev.unwrap_or(1.0),
+                            combo.devtype.unwrap_or(0)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Config {} (MA: {}): Found make_uninit_matrix poison value {} (0x{:016X}) \
+                            "[{}] Config {} (MA: {}): Found make_uninit_matrix poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) with params: period={}, ma_type={}, nbdev={}, devtype={}",
-							test, cfg_idx, ma_type, val, bits, row, col, idx,
-							combo.period.unwrap_or(14),
-							combo.ma_type.as_deref().unwrap_or("sma"),
-							combo.nbdev.unwrap_or(1.0),
-							combo.devtype.unwrap_or(0)
-						);
+                            test,
+                            cfg_idx,
+                            ma_type,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(14),
+                            combo.ma_type.as_deref().unwrap_or("sma"),
+                            combo.nbdev.unwrap_or(1.0),
+                            combo.devtype.unwrap_or(0)
+                        );
                     }
                 }
             }
@@ -3569,21 +3032,16 @@ mod tests {
 
     #[test]
     fn test_zscore_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = ZscoreInput::from_candles(&candles, "close", ZscoreParams::default());
 
         let baseline = zscore(&input)?.values;
 
         let mut out = vec![0.0; baseline.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             zscore_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            zscore_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());

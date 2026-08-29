@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde_wasm_bindgen;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -30,7 +12,7 @@ use rayon::prelude::*;
 use std::error::Error;
 use thiserror::Error;
 
-use crate::indicators::moving_averages::ma::{ma, MaData};
+use crate::indicators::moving_averages::ma::{MaData, ma};
 
 #[derive(Debug, Clone)]
 pub enum RsmkData<'a> {
@@ -52,10 +34,6 @@ pub struct RsmkOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RsmkParams {
     pub lookback: Option<usize>,
     pub period: Option<usize>,
@@ -259,13 +237,6 @@ pub enum RsmkError {
     InvalidKernelForBatch(Kernel),
     #[error("rsmk: Error from MA function: {0}")]
     MaError(String),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-impl From<RsmkError> for JsValue {
-    fn from(err: RsmkError) -> Self {
-        JsValue::from_str(&err.to_string())
-    }
 }
 
 #[inline]
@@ -1077,7 +1048,6 @@ fn rsmk_into_impl(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn rsmk_into(
     input: &RsmkInput,
@@ -2004,680 +1974,18 @@ fn rsmk_batch_inner(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "rsmk")]
-#[pyo3(signature = (main, compare, lookback, period, signal_period, matype=None, signal_matype=None, kernel=None))]
-pub fn rsmk_py<'py>(
-    py: Python<'py>,
-    main: PyReadonlyArray1<'py, f64>,
-    compare: PyReadonlyArray1<'py, f64>,
-    lookback: usize,
-    period: usize,
-    signal_period: usize,
-    matype: Option<&str>,
-    signal_matype: Option<&str>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let main_slice = main.as_slice()?;
-    let compare_slice = compare.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = RsmkParams {
-        lookback: Some(lookback),
-        period: Some(period),
-        signal_period: Some(signal_period),
-        matype: matype.map(|s| s.to_string()),
-        signal_matype: signal_matype.map(|s| s.to_string()),
-    };
-    let input = RsmkInput::from_slices(main_slice, compare_slice, params);
-
-    let output = py
-        .allow_threads(|| rsmk_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        output.indicator.into_pyarray(py),
-        output.signal.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "rsmk_batch")]
-#[pyo3(signature = (main, compare, lookback_range, period_range, signal_period_range, matype=None, signal_matype=None, kernel=None))]
-pub fn rsmk_batch_py<'py>(
-    py: Python<'py>,
-    main: PyReadonlyArray1<'py, f64>,
-    compare: PyReadonlyArray1<'py, f64>,
-    lookback_range: (usize, usize, usize),
-    period_range: (usize, usize, usize),
-    signal_period_range: (usize, usize, usize),
-    matype: Option<&str>,
-    signal_matype: Option<&str>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let main_slice = main.as_slice()?;
-    let compare_slice = compare.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = RsmkBatchRange {
-        lookback: lookback_range,
-        period: period_range,
-        signal_period: signal_period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = main_slice.len();
-
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "rsmk: rows*cols overflow (rows={}, cols={})",
-            rows, cols
-        ))
-    })?;
-
-    let indicator_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let indicator_slice = unsafe { indicator_arr.as_slice_mut()? };
-    let signal_slice = unsafe { signal_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kern,
-            };
-
-            rsmk_batch_inner_into(
-                main_slice,
-                compare_slice,
-                &sweep,
-                simd,
-                true,
-                indicator_slice,
-                signal_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("indicator", indicator_arr.reshape((rows, cols))?)?;
-    dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lookbacks",
-        combos
-            .iter()
-            .map(|p| p.lookback.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signal_periods",
-        combos
-            .iter()
-            .map(|p| p.signal_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    use pyo3::types::PyList;
-    dict.set_item(
-        "matypes",
-        PyList::new(
-            py,
-            combos.iter().map(|p| p.matype.as_deref().unwrap_or("ema")),
-        )?,
-    )?;
-    dict.set_item(
-        "signal_matypes",
-        PyList::new(
-            py,
-            combos
-                .iter()
-                .map(|p| p.signal_matype.as_deref().unwrap_or("ema")),
-        )?,
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RsmkStream")]
-pub struct RsmkStreamPy {
-    inner: RsmkStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RsmkStreamPy {
-    #[new]
-    pub fn new(
-        lookback: usize,
-        period: usize,
-        signal_period: usize,
-        matype: Option<&str>,
-        signal_matype: Option<&str>,
-    ) -> PyResult<Self> {
-        let params = RsmkParams {
-            lookback: Some(lookback),
-            period: Some(period),
-            signal_period: Some(signal_period),
-            matype: matype.map(|s| s.to_string()),
-            signal_matype: signal_matype.map(|s| s.to_string()),
-        };
-        let inner =
-            RsmkStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(RsmkStreamPy { inner })
-    }
-
-    pub fn update(&mut self, main: f64, compare: f64) -> Option<(f64, f64)> {
-        self.inner.update(main, compare)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RsmkResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rsmk_js(
-    main: &[f64],
-    compare: &[f64],
-    lookback: usize,
-    period: usize,
-    signal_period: usize,
-    matype: Option<String>,
-    signal_matype: Option<String>,
-) -> Result<JsValue, JsValue> {
-    let params = RsmkParams {
-        lookback: Some(lookback),
-        period: Some(period),
-        signal_period: Some(signal_period),
-        matype: matype.or(Some("ema".into())),
-        signal_matype: signal_matype.or(Some("ema".into())),
-    };
-    let input = RsmkInput::from_slices(main, compare, params);
-    let out = rsmk(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    if out.indicator.len() != main.len() || out.signal.len() != main.len() {
-        return Err(JsValue::from_str("length mismatch"));
-    }
-    let mut values = Vec::with_capacity(2 * main.len());
-    values.extend_from_slice(&out.indicator);
-    values.extend_from_slice(&out.signal);
-
-    let res = RsmkResult {
-        values,
-        rows: 2,
-        cols: main.len(),
-    };
-    serde_wasm_bindgen::to_value(&res)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rsmk_into(
-    in_ptr: *const f64,
-    indicator_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    len: usize,
-    compare_ptr: *const f64,
-    lookback: usize,
-    period: usize,
-    signal_period: usize,
-    matype: Option<String>,
-    signal_matype: Option<String>,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || indicator_ptr.is_null() || signal_ptr.is_null() || compare_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let main = std::slice::from_raw_parts(in_ptr, len);
-        let compare = std::slice::from_raw_parts(compare_ptr, len);
-        let params = RsmkParams {
-            lookback: Some(lookback),
-            period: Some(period),
-            signal_period: Some(signal_period),
-            matype: matype.or_else(|| Some("ema".to_string())),
-            signal_matype: signal_matype.or_else(|| Some("ema".to_string())),
-        };
-        let input = RsmkInput::from_slices(main, compare, params);
-
-        let in_aliased = in_ptr == indicator_ptr || in_ptr == signal_ptr;
-        let compare_aliased = compare_ptr == indicator_ptr || compare_ptr == signal_ptr;
-        let outputs_aliased = indicator_ptr == signal_ptr;
-
-        if in_aliased || compare_aliased || outputs_aliased {
-            let mut temp_indicator = vec![0.0; len];
-            let mut temp_signal = vec![0.0; len];
-
-            rsmk_into_slice(&mut temp_indicator, &mut temp_signal, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let indicator_out = std::slice::from_raw_parts_mut(indicator_ptr, len);
-            let signal_out = std::slice::from_raw_parts_mut(signal_ptr, len);
-
-            if outputs_aliased {
-                indicator_out.copy_from_slice(&temp_indicator);
-                signal_out.copy_from_slice(&temp_signal);
-            } else {
-                indicator_out.copy_from_slice(&temp_indicator);
-                signal_out.copy_from_slice(&temp_signal);
-            }
-        } else {
-            let indicator_out = std::slice::from_raw_parts_mut(indicator_ptr, len);
-            let signal_out = std::slice::from_raw_parts_mut(signal_ptr, len);
-            rsmk_into_slice(indicator_out, signal_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rsmk_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rsmk_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::rsmk_wrapper::{CudaRsmk, CudaRsmkBatchPlan};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::{CopyDestination, DeviceBuffer};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::{pyfunction, PyResult, Python};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "RsmkCudaBatchPlan", unsendable)]
-pub struct RsmkCudaBatchPlanPy {
-    cuda: CudaRsmk,
-    plan: CudaRsmkBatchPlan,
-    device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl RsmkCudaBatchPlanPy {
-    #[getter]
-    fn rows(&self) -> usize {
-        self.plan.rows()
-    }
-
-    #[getter]
-    fn cols(&self) -> usize {
-        self.plan.cols()
-    }
-
-    #[getter]
-    fn device_id(&self) -> u32 {
-        self.device_id
-    }
-
-    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        use pyo3::types::PyList;
-
-        let dict = PyDict::new(py);
-        let params = PyList::empty(py);
-        for prm in self.plan.params() {
-            let item = PyDict::new(py);
-            item.set_item("lookback", prm.lookback.unwrap_or(90))?;
-            item.set_item("period", prm.period.unwrap_or(3))?;
-            item.set_item("signal_period", prm.signal_period.unwrap_or(20))?;
-            item.set_item("matype", prm.matype.as_deref().unwrap_or("ema"))?;
-            item.set_item(
-                "signal_matype",
-                prm.signal_matype.as_deref().unwrap_or("ema"),
-            )?;
-            params.append(item)?;
-        }
-        dict.set_item("params", params)?;
-        dict.set_item("rows", self.plan.rows())?;
-        dict.set_item("cols", self.plan.cols())?;
-        dict.set_item("device_id", self.device_id)?;
-        Ok(dict)
-    }
-
-    fn execute<'py>(
-        &mut self,
-        py: Python<'py>,
-        main_f32: PyReadonlyArray1<'py, f32>,
-        compare_f32: PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let main = main_f32.as_slice()?;
-        let compare = compare_f32.as_slice()?;
-        let rows = self.plan.rows();
-        let cols = self.plan.cols();
-        if main.len() != cols || compare.len() != cols {
-            return Err(PyValueError::new_err(format!(
-                "rsmk CUDA plan input length mismatch: expected {}, got main={}, compare={}",
-                cols,
-                main.len(),
-                compare.len()
-            )));
-        }
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("rsmk CUDA plan rows*cols overflow"))?;
-        let (indicator, signal) = py.allow_threads(|| -> PyResult<(Vec<f32>, Vec<f32>)> {
-            let d_main =
-                DeviceBuffer::from_slice(main).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let d_compare = DeviceBuffer::from_slice(compare)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            self.cuda
-                .launch_rsmk_batch_plan(&d_main, &d_compare, &mut self.plan)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            self.cuda
-                .synchronize()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let mut indicator = vec![0f32; total];
-            let mut signal = vec![0f32; total];
-            let (indicator_buf, signal_buf) = self.plan.outputs();
-            indicator_buf
-                .copy_to(&mut indicator)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            signal_buf
-                .copy_to(&mut signal)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok((indicator, signal))
-        })?;
-        let dict = self.metadata(py)?;
-        let indicator_arr = indicator.into_pyarray(py);
-        let signal_arr = signal.into_pyarray(py);
-        dict.set_item("indicator", indicator_arr.reshape((rows, cols))?)?;
-        dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-        Ok(dict)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "rsmk_cuda_batch_plan_create")]
-#[pyo3(signature = (series_len, first_valid, lookback_range, period_range, signal_period_range, device_id=0))]
-pub fn rsmk_cuda_batch_plan_create_py(
-    py: Python<'_>,
-    series_len: usize,
-    first_valid: usize,
-    lookback_range: (usize, usize, usize),
-    period_range: (usize, usize, usize),
-    signal_period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<RsmkCudaBatchPlanPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sweep = RsmkBatchRange {
-        lookback: lookback_range,
-        period: period_range,
-        signal_period: signal_period_range,
-    };
-    let (cuda, plan, dev_id) = py.allow_threads(|| {
-        let cuda = CudaRsmk::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let plan = cuda
-            .prepare_rsmk_batch_plan(series_len, first_valid, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((cuda, plan, dev_id))
-    })?;
-    Ok(RsmkCudaBatchPlanPy {
-        cuda,
-        plan,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "rsmk_cuda_batch_dev")]
-#[pyo3(signature = (main_f32, compare_f32, lookback_range, period_range, signal_period_range, device_id=0))]
-pub fn rsmk_cuda_batch_dev_py(
-    py: Python<'_>,
-    main_f32: PyReadonlyArray1<'_, f32>,
-    compare_f32: PyReadonlyArray1<'_, f32>,
-    lookback_range: (usize, usize, usize),
-    period_range: (usize, usize, usize),
-    signal_period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let main = main_f32.as_slice()?;
-    let comp = compare_f32.as_slice()?;
-    let sweep = RsmkBatchRange {
-        lookback: lookback_range,
-        period: period_range,
-        signal_period: signal_period_range,
-    };
-    let (pair, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaRsmk::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.rsmk_batch_dev(main, comp, &sweep)
-            .map(|(pair, _combos)| (pair, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: pair.a,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-        DeviceArrayF32Py {
-            inner: pair.b,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "rsmk_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (main_tm_f32, compare_tm_f32, cols, rows, lookback, period, signal_period, device_id=0))]
-pub fn rsmk_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    main_tm_f32: PyReadonlyArray2<'_, f32>,
-    compare_tm_f32: PyReadonlyArray2<'_, f32>,
-    cols: usize,
-    rows: usize,
-    lookback: usize,
-    period: usize,
-    signal_period: usize,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let main_tm: &[f32] = main_tm_f32.as_slice()?;
-    let comp_tm: &[f32] = compare_tm_f32.as_slice()?;
-    let params = RsmkParams {
-        lookback: Some(lookback),
-        period: Some(period),
-        signal_period: Some(signal_period),
-        matype: Some("ema".into()),
-        signal_matype: Some("ema".into()),
-    };
-    let (pair, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaRsmk::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.rsmk_many_series_one_param_time_major_dev(main_tm, comp_tm, cols, rows, &params)
-            .map(|pair| (pair, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: pair.a,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-        DeviceArrayF32Py {
-            inner: pair.b,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-    ))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RsmkBatchConfig {
-    pub lookback_range: (usize, usize, usize),
-    pub period_range: (usize, usize, usize),
-    pub signal_period_range: (usize, usize, usize),
-    pub matype: Option<String>,
-    pub signal_matype: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RsmkBatchJsOutput {
-    pub indicators: Vec<f64>,
-    pub signals: Vec<f64>,
-    pub combos: Vec<RsmkParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = rsmk_batch)]
-pub fn rsmk_batch_js(main: &[f64], compare: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: RsmkBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let output = RsmkBatchBuilder::new()
-        .lookback_range(
-            config.lookback_range.0,
-            config.lookback_range.1,
-            config.lookback_range.2,
-        )
-        .period_range(
-            config.period_range.0,
-            config.period_range.1,
-            config.period_range.2,
-        )
-        .signal_period_range(
-            config.signal_period_range.0,
-            config.signal_period_range.1,
-            config.signal_period_range.2,
-        )
-        .apply_slices(main, compare)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let indicators: Vec<f64> = output
-        .indicator
-        .chunks(output.cols)
-        .flat_map(|row| row.iter().copied())
-        .collect();
-
-    let signals: Vec<f64> = output
-        .signal
-        .chunks(output.cols)
-        .flat_map(|row| row.iter().copied())
-        .collect();
-
-    let js_output = RsmkBatchJsOutput {
-        indicators,
-        signals,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rsmk_output_into_js(
-    main: &[f64],
-    compare: &[f64],
-    lookback: usize,
-    period: usize,
-    signal_period: usize,
-    matype: Option<String>,
-    signal_matype: Option<String>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = rsmk_js(
-        main,
-        compare,
-        lookback,
-        period,
-        signal_period,
-        matype,
-        signal_matype,
-    )?;
-    crate::write_wasm_object_f64_outputs("rsmk_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rsmk_batch_output_into_js(
-    main: &[f64],
-    compare: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = rsmk_batch_js(main, compare, config)?;
-    crate::write_wasm_selected_object_f64_outputs("rsmk_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     #[test]
     fn test_rsmk_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let input = RsmkInput::with_default_candles(&candles, &candles);
 
@@ -2717,8 +2025,8 @@ mod tests {
 
     fn check_rsmk_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = RsmkParams {
             lookback: None,
             period: None,
@@ -2735,8 +2043,8 @@ mod tests {
 
     fn check_rsmk_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = RsmkParams::default();
         let input = RsmkInput::from_candles(&candles, &candles, "close", params.clone());
         let rsmk_result = rsmk_with_kernel(&input, kernel)?;
@@ -2757,8 +2065,8 @@ mod tests {
 
     fn check_rsmk_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = RsmkInput::with_default_candles(&candles, &candles);
         let rsmk_result = rsmk_with_kernel(&input, kernel)?;
         assert_eq!(rsmk_result.indicator.len(), candles.close.len());
@@ -2844,8 +2152,8 @@ mod tests {
     fn check_rsmk_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             RsmkParams::default(),
@@ -2906,44 +2214,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in indicator at index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in indicator at index {} \
 						 with params: lookback={}, period={}, signal_period={}, matype={}, signal_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.lookback.unwrap_or(90),
-						params.period.unwrap_or(3),
-						params.signal_period.unwrap_or(20),
-						params.matype.as_deref().unwrap_or("ema"),
-						params.signal_matype.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.lookback.unwrap_or(90),
+                        params.period.unwrap_or(3),
+                        params.signal_period.unwrap_or(20),
+                        params.matype.as_deref().unwrap_or("ema"),
+                        params.signal_matype.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in indicator at index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in indicator at index {} \
 						 with params: lookback={}, period={}, signal_period={}, matype={}, signal_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.lookback.unwrap_or(90),
-						params.period.unwrap_or(3),
-						params.signal_period.unwrap_or(20),
-						params.matype.as_deref().unwrap_or("ema"),
-						params.signal_matype.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.lookback.unwrap_or(90),
+                        params.period.unwrap_or(3),
+                        params.signal_period.unwrap_or(20),
+                        params.matype.as_deref().unwrap_or("ema"),
+                        params.signal_matype.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in indicator at index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in indicator at index {} \
 						 with params: lookback={}, period={}, signal_period={}, matype={}, signal_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.lookback.unwrap_or(90),
-						params.period.unwrap_or(3),
-						params.signal_period.unwrap_or(20),
-						params.matype.as_deref().unwrap_or("ema"),
-						params.signal_matype.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.lookback.unwrap_or(90),
+                        params.period.unwrap_or(3),
+                        params.signal_period.unwrap_or(20),
+                        params.matype.as_deref().unwrap_or("ema"),
+                        params.signal_matype.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
             }
 
@@ -2956,44 +2273,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in signal at index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in signal at index {} \
 						 with params: lookback={}, period={}, signal_period={}, matype={}, signal_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.lookback.unwrap_or(90),
-						params.period.unwrap_or(3),
-						params.signal_period.unwrap_or(20),
-						params.matype.as_deref().unwrap_or("ema"),
-						params.signal_matype.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.lookback.unwrap_or(90),
+                        params.period.unwrap_or(3),
+                        params.signal_period.unwrap_or(20),
+                        params.matype.as_deref().unwrap_or("ema"),
+                        params.signal_matype.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in signal at index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in signal at index {} \
 						 with params: lookback={}, period={}, signal_period={}, matype={}, signal_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.lookback.unwrap_or(90),
-						params.period.unwrap_or(3),
-						params.signal_period.unwrap_or(20),
-						params.matype.as_deref().unwrap_or("ema"),
-						params.signal_matype.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.lookback.unwrap_or(90),
+                        params.period.unwrap_or(3),
+                        params.signal_period.unwrap_or(20),
+                        params.matype.as_deref().unwrap_or("ema"),
+                        params.signal_matype.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in signal at index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in signal at index {} \
 						 with params: lookback={}, period={}, signal_period={}, matype={}, signal_matype={} (param set {})",
-						test_name, val, bits, i,
-						params.lookback.unwrap_or(90),
-						params.period.unwrap_or(3),
-						params.signal_period.unwrap_or(20),
-						params.matype.as_deref().unwrap_or("ema"),
-						params.signal_matype.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.lookback.unwrap_or(90),
+                        params.period.unwrap_or(3),
+                        params.signal_period.unwrap_or(20),
+                        params.matype.as_deref().unwrap_or("ema"),
+                        params.signal_matype.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
             }
         }
@@ -3346,8 +2672,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let main = &candles.close;
         let compare = &candles.close;
 
@@ -3419,8 +2745,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let main = &candles.close;
         let compare = &candles.close;
 
@@ -3459,44 +2785,62 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in indicator \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in indicator \
 						 at row {} col {} (flat index {}) with params: lookback={}, period={}, signal_period={}, \
 						 matype={}, signal_matype={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.lookback.unwrap_or(90),
-						combo.period.unwrap_or(3),
-						combo.signal_period.unwrap_or(20),
-						combo.matype.as_deref().unwrap_or("ema"),
-						combo.signal_matype.as_deref().unwrap_or("ema")
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.lookback.unwrap_or(90),
+                        combo.period.unwrap_or(3),
+                        combo.signal_period.unwrap_or(20),
+                        combo.matype.as_deref().unwrap_or("ema"),
+                        combo.signal_matype.as_deref().unwrap_or("ema")
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in indicator \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in indicator \
 						 at row {} col {} (flat index {}) with params: lookback={}, period={}, signal_period={}, \
 						 matype={}, signal_matype={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.lookback.unwrap_or(90),
-						combo.period.unwrap_or(3),
-						combo.signal_period.unwrap_or(20),
-						combo.matype.as_deref().unwrap_or("ema"),
-						combo.signal_matype.as_deref().unwrap_or("ema")
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.lookback.unwrap_or(90),
+                        combo.period.unwrap_or(3),
+                        combo.signal_period.unwrap_or(20),
+                        combo.matype.as_deref().unwrap_or("ema"),
+                        combo.signal_matype.as_deref().unwrap_or("ema")
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in indicator \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in indicator \
 						 at row {} col {} (flat index {}) with params: lookback={}, period={}, signal_period={}, \
 						 matype={}, signal_matype={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.lookback.unwrap_or(90),
-						combo.period.unwrap_or(3),
-						combo.signal_period.unwrap_or(20),
-						combo.matype.as_deref().unwrap_or("ema"),
-						combo.signal_matype.as_deref().unwrap_or("ema")
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.lookback.unwrap_or(90),
+                        combo.period.unwrap_or(3),
+                        combo.signal_period.unwrap_or(20),
+                        combo.matype.as_deref().unwrap_or("ema"),
+                        combo.signal_matype.as_deref().unwrap_or("ema")
+                    );
                 }
             }
 
@@ -3512,44 +2856,62 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in signal \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in signal \
 						 at row {} col {} (flat index {}) with params: lookback={}, period={}, signal_period={}, \
 						 matype={}, signal_matype={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.lookback.unwrap_or(90),
-						combo.period.unwrap_or(3),
-						combo.signal_period.unwrap_or(20),
-						combo.matype.as_deref().unwrap_or("ema"),
-						combo.signal_matype.as_deref().unwrap_or("ema")
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.lookback.unwrap_or(90),
+                        combo.period.unwrap_or(3),
+                        combo.signal_period.unwrap_or(20),
+                        combo.matype.as_deref().unwrap_or("ema"),
+                        combo.signal_matype.as_deref().unwrap_or("ema")
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in signal \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in signal \
 						 at row {} col {} (flat index {}) with params: lookback={}, period={}, signal_period={}, \
 						 matype={}, signal_matype={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.lookback.unwrap_or(90),
-						combo.period.unwrap_or(3),
-						combo.signal_period.unwrap_or(20),
-						combo.matype.as_deref().unwrap_or("ema"),
-						combo.signal_matype.as_deref().unwrap_or("ema")
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.lookback.unwrap_or(90),
+                        combo.period.unwrap_or(3),
+                        combo.signal_period.unwrap_or(20),
+                        combo.matype.as_deref().unwrap_or("ema"),
+                        combo.signal_matype.as_deref().unwrap_or("ema")
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in signal \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in signal \
 						 at row {} col {} (flat index {}) with params: lookback={}, period={}, signal_period={}, \
 						 matype={}, signal_matype={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.lookback.unwrap_or(90),
-						combo.period.unwrap_or(3),
-						combo.signal_period.unwrap_or(20),
-						combo.matype.as_deref().unwrap_or("ema"),
-						combo.signal_matype.as_deref().unwrap_or("ema")
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.lookback.unwrap_or(90),
+                        combo.period.unwrap_or(3),
+                        combo.signal_period.unwrap_or(20),
+                        combo.matype.as_deref().unwrap_or("ema"),
+                        combo.signal_matype.as_deref().unwrap_or("ema")
+                    );
                 }
             }
         }

@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -27,13 +11,6 @@ use rayon::prelude::*;
 use std::convert::AsRef;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::bollinger_bands_width_wrapper::CudaBbw;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
 
 impl<'a> AsRef<[f64]> for BollingerBandsWidthInput<'a> {
     #[inline(always)]
@@ -171,11 +148,7 @@ impl BollingerBandsWidthStream {
 
 #[inline(always)]
 fn fast_sqrt64(x: f64) -> f64 {
-    if x <= 0.0 {
-        0.0
-    } else {
-        x.sqrt()
-    }
+    if x <= 0.0 { 0.0 } else { x.sqrt() }
 }
 
 #[derive(Debug, Clone)]
@@ -193,10 +166,6 @@ pub struct BollingerBandsWidthOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct BollingerBandsWidthParams {
     pub period: Option<usize>,
     pub devup: Option<f64>,
@@ -480,7 +449,6 @@ pub fn bollinger_bands_width_compute_into(
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn bollinger_bands_width_into(
     input: &BollingerBandsWidthInput,
     out: &mut [f64],
@@ -1687,71 +1655,11 @@ pub fn bollinger_bands_width_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bollinger_bands_width_output_into_js(
-    data: &[f64],
-    period: usize,
-    devup: f64,
-    devdn: f64,
-    matype: Option<String>,
-    devtype: Option<usize>,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = bollinger_bands_width_js(data, period, devup, devdn, matype, devtype)?;
-    crate::write_wasm_f64_output("bollinger_bands_width_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bollinger_bands_width_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    devup_start: f64,
-    devup_end: f64,
-    devup_step: f64,
-    devdn_start: f64,
-    devdn_end: f64,
-    devdn_step: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = bollinger_bands_width_batch_js(
-        data,
-        period_start,
-        period_end,
-        period_step,
-        devup_start,
-        devup_end,
-        devup_step,
-        devdn_start,
-        devdn_end,
-        devdn_step,
-    )?;
-    crate::write_wasm_f64_output("bollinger_bands_width_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bollinger_bands_width_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = bollinger_bands_width_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "bollinger_bands_width_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
     use paste::paste;
 
@@ -1767,13 +1675,8 @@ mod tests {
         let baseline = bollinger_bands_width_with_kernel(&input, Kernel::Auto)?.values;
 
         let mut out = vec![0.0; data.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             bollinger_bands_width_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            bollinger_bands_width_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1799,8 +1702,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = BollingerBandsWidthParams {
             period: Some(22),
             devup: Some(2.2),
@@ -1819,8 +1722,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = BollingerBandsWidthInput::with_default_candles(&candles);
         let output = bollinger_bands_width_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -1889,8 +1792,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = BollingerBandsWidthInput::with_default_candles(&candles);
         let result = bollinger_bands_width_with_kernel(&input, kernel)?;
         let check_index = 240;
@@ -1913,8 +1816,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = BollingerBandsWidthBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1931,8 +1834,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             BollingerBandsWidthParams::default(),
@@ -1984,7 +1887,10 @@ mod tests {
                     if bits == 0x11111111_11111111 {
                         panic!(
                             "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with params: period={}, devup={}, devdn={}, source={}",
-                            test_name, val, bits, i,
+                            test_name,
+                            val,
+                            bits,
+                            i,
                             params.period.unwrap_or(20),
                             params.devup.unwrap_or(2.0),
                             params.devdn.unwrap_or(2.0),
@@ -1995,7 +1901,10 @@ mod tests {
                     if bits == 0x22222222_22222222 {
                         panic!(
                             "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with params: period={}, devup={}, devdn={}, source={}",
-                            test_name, val, bits, i,
+                            test_name,
+                            val,
+                            bits,
+                            i,
                             params.period.unwrap_or(20),
                             params.devup.unwrap_or(2.0),
                             params.devdn.unwrap_or(2.0),
@@ -2006,7 +1915,10 @@ mod tests {
                     if bits == 0x33333333_33333333 {
                         panic!(
                             "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with params: period={}, devup={}, devdn={}, source={}",
-                            test_name, val, bits, i,
+                            test_name,
+                            val,
+                            bits,
+                            i,
                             params.period.unwrap_or(20),
                             params.devup.unwrap_or(2.0),
                             params.devdn.unwrap_or(2.0),
@@ -2032,8 +1944,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let batch_configs = vec![
             (2, 50, 5, 1.0, 3.0, 0.5, 1.0, 3.0, 0.5),
@@ -2079,7 +1991,12 @@ mod tests {
                     if bits == 0x11111111_11111111 {
                         panic!(
                             "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, devup={}, devdn={}, source={}",
-                            test, val, bits, row, col, idx,
+                            test,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
                             params.period.unwrap_or(20),
                             params.devup.unwrap_or(2.0),
                             params.devdn.unwrap_or(2.0),
@@ -2090,7 +2007,12 @@ mod tests {
                     if bits == 0x22222222_22222222 {
                         panic!(
                             "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, devup={}, devdn={}, source={}",
-                            test, val, bits, row, col, idx,
+                            test,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
                             params.period.unwrap_or(20),
                             params.devup.unwrap_or(2.0),
                             params.devdn.unwrap_or(2.0),
@@ -2101,7 +2023,12 @@ mod tests {
                     if bits == 0x33333333_33333333 {
                         panic!(
                             "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, devup={}, devdn={}, source={}",
-                            test, val, bits, row, col, idx,
+                            test,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
                             params.period.unwrap_or(20),
                             params.devup.unwrap_or(2.0),
                             params.devdn.unwrap_or(2.0),
@@ -2404,491 +2331,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bollinger_bands_width")]
-#[pyo3(signature = (data, period, devup, devdn, matype=None, devtype=None, kernel=None))]
-pub fn bollinger_bands_width_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    devup: f64,
-    devdn: f64,
-    matype: Option<&str>,
-    devtype: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use crate::utilities::kernel_validation::validate_kernel;
-    use numpy::{IntoPyArray, PyArrayMethods};
-    use pyo3::exceptions::PyValueError;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = BollingerBandsWidthParams {
-        period: Some(period),
-        devup: Some(devup),
-        devdn: Some(devdn),
-        matype: matype.map(|s| s.to_string()),
-        devtype: devtype,
-    };
-    let bbw_in = BollingerBandsWidthInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| bollinger_bands_width_with_kernel(&bbw_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "BollingerBandsWidthStream")]
-pub struct BollingerBandsWidthStreamPy {
-    inner: BollingerBandsWidthStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl BollingerBandsWidthStreamPy {
-    #[new]
-    fn new(
-        period: usize,
-        devup: f64,
-        devdn: f64,
-        matype: Option<&str>,
-        devtype: Option<usize>,
-    ) -> PyResult<Self> {
-        if period == 0 {
-            return Err(PyValueError::new_err("period must be > 0"));
-        }
-        let mt = matype.unwrap_or("sma");
-        let dt = devtype.unwrap_or(0);
-        Ok(Self {
-            inner: BollingerBandsWidthStream::new(period, devup, devdn, mt, dt),
-        })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bollinger_bands_width_batch")]
-#[pyo3(signature = (data, period_range, devup_range, devdn_range, kernel=None))]
-pub fn bollinger_bands_width_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    devup_range: (f64, f64, f64),
-    devdn_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-    let slice_in = data.as_slice()?;
-
-    let sweep = BollingerBandsWidthBatchRange {
-        period: period_range,
-        devup: devup_range,
-        devdn: devdn_range,
-    };
-
-    let combos = expand_grid_checked(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("bbw: output size overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let first = slice_in
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| PyValueError::new_err("All values NaN"))?;
-    for (r, p) in combos.iter().enumerate() {
-        let warm = first + p.period.unwrap() - 1;
-        let start = r * cols;
-        slice_out[start..start + warm.min(cols)].fill(f64::NAN);
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-    let combos = py
-        .allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-
-            let simd = match k {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            bollinger_bands_width_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "devups",
-        combos
-            .iter()
-            .map(|p| p.devup.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "devdns",
-        combos
-            .iter()
-            .map(|p| p.devdn.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "bollinger_bands_width_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, devup_range, devdn_range, device_id=0))]
-pub fn bollinger_bands_width_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    devup_range: (f64, f64, f64),
-    devdn_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = BollingerBandsWidthBatchRange {
-        period: period_range,
-        devup: devup_range,
-        devdn: devdn_range,
-    };
-
-    let (inner, dev_id, combos) = py.allow_threads(|| {
-        let cuda = CudaBbw::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let (arr, meta) = cuda
-            .bbw_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, dev_id, meta))
-    })?;
-
-    let dict = PyDict::new(py);
-    let periods: Vec<u64> = combos.iter().map(|(p, _)| *p as u64).collect();
-    let uplusd: Vec<f64> = combos.iter().map(|(_, k)| *k as f64).collect();
-    let uplusd_len = uplusd.len();
-    dict.set_item("periods", periods.into_pyarray(py))?;
-    dict.set_item("u_plus_d", uplusd.into_pyarray(py))?;
-
-    dict.set_item("ma_types", PyList::new(py, vec!["sma"; uplusd_len])?)?;
-    dict.set_item("devtypes", vec![0u64; uplusd_len].into_pyarray(py))?;
-
-    let handle = make_device_array_py(dev_id as usize, inner)?;
-    Ok((handle, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "bollinger_bands_width_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, period, devup, devdn, device_id=0))]
-pub fn bollinger_bands_width_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    devup: f64,
-    devdn: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_tm_f32.as_slice()?;
-    let (inner, dev_id) = py.allow_threads(|| {
-        let cuda = CudaBbw::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .bbw_many_series_one_param_time_major_dev(
-                slice_in,
-                cols,
-                rows,
-                period,
-                devup as f32,
-                devdn as f32,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, dev_id))
-    })?;
-    make_device_array_py(dev_id as usize, inner)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bbw_alloc(len: usize) -> *mut f64 {
-    let mut v: Vec<f64> = Vec::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bbw_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bollinger_bands_width_js(
-    data: &[f64],
-    period: usize,
-    devup: f64,
-    devdn: f64,
-    matype: Option<String>,
-    devtype: Option<usize>,
-) -> Result<Vec<f64>, JsValue> {
-    let params = BollingerBandsWidthParams {
-        period: Some(period),
-        devup: Some(devup),
-        devdn: Some(devdn),
-        matype: matype.or_else(|| Some("sma".to_string())),
-        devtype: devtype.or(Some(0)),
-    };
-    let input = BollingerBandsWidthInput::from_slice(data, params);
-    let mut out = vec![0.0; data.len()];
-    bollinger_bands_width_into_slice(&mut out, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bollinger_bands_width_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    devup_start: f64,
-    devup_end: f64,
-    devup_step: f64,
-    devdn_start: f64,
-    devdn_end: f64,
-    devdn_step: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = BollingerBandsWidthBatchRange {
-        period: (period_start, period_end, period_step),
-        devup: (devup_start, devup_end, devup_step),
-        devdn: (devdn_start, devdn_end, devdn_step),
-    };
-
-    bollinger_bands_width_batch_inner(data, &sweep, detect_best_batch_kernel(), false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bollinger_bands_width_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    devup_start: f64,
-    devup_end: f64,
-    devup_step: f64,
-    devdn_start: f64,
-    devdn_end: f64,
-    devdn_step: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = BollingerBandsWidthBatchRange {
-        period: (period_start, period_end, period_step),
-        devup: (devup_start, devup_end, devup_step),
-        devdn: (devdn_start, devdn_end, devdn_step),
-    };
-
-    let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut metadata = Vec::with_capacity(combos.len() * 3);
-
-    for combo in combos {
-        metadata.push(combo.period.unwrap() as f64);
-        metadata.push(combo.devup.unwrap());
-        metadata.push(combo.devdn.unwrap());
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BollingerBandsWidthBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub devup_range: (f64, f64, f64),
-    pub devdn_range: (f64, f64, f64),
-    pub matype: Option<String>,
-    pub devtype: Option<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BollingerBandsWidthBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<BollingerBandsWidthParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = bollinger_bands_width_batch)]
-pub fn bollinger_bands_width_batch_unified_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: BollingerBandsWidthBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = BollingerBandsWidthBatchRange {
-        period: config.period_range,
-        devup: config.devup_range,
-        devdn: config.devdn_range,
-    };
-
-    let mut output =
-        bollinger_bands_width_batch_inner(data, &sweep, detect_best_batch_kernel(), false)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    for combo in &mut output.combos {
-        combo.matype = config.matype.clone().or_else(|| Some("sma".to_string()));
-        combo.devtype = config.devtype.or(Some(0));
-    }
-
-    let js_output = BollingerBandsWidthBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bollinger_bands_width_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    devup: f64,
-    devdn: f64,
-    matype: Option<String>,
-    devtype: Option<usize>,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        let params = BollingerBandsWidthParams {
-            period: Some(period),
-            devup: Some(devup),
-            devdn: Some(devdn),
-            matype: matype.or_else(|| Some("sma".to_string())),
-            devtype: devtype.or(Some(0)),
-        };
-        let input = BollingerBandsWidthInput::from_slice(data, params);
-        if core::ptr::eq(in_ptr, out_ptr as *const f64) {
-            let mut tmp = vec![0.0; len];
-            bollinger_bands_width_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            out.copy_from_slice(&tmp);
-        } else {
-            bollinger_bands_width_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bollinger_bands_width_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    devup_start: f64,
-    devup_end: f64,
-    devup_step: f64,
-    devdn_start: f64,
-    devdn_end: f64,
-    devdn_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to bollinger_bands_width_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = BollingerBandsWidthBatchRange {
-            period: (period_start, period_end, period_step),
-            devup: (devup_start, devup_end, devup_step),
-            devdn: (devdn_start, devdn_end, devdn_step),
-        };
-
-        let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("bbw: output size overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let first = data
-            .iter()
-            .position(|x| !x.is_nan())
-            .ok_or(JsValue::from_str("All values NaN"))?;
-        for (r, combo) in combos.iter().enumerate() {
-            let warm = first + combo.period.unwrap() - 1;
-            let start = r * cols;
-            out[start..start + warm.min(cols)].fill(f64::NAN);
-        }
-
-        bollinger_bands_width_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

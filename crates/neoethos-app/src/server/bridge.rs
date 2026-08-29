@@ -512,11 +512,9 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         0.0_f64,
         |running_total, position| -> anyhow::Result<f64> {
             let margin = position.used_margin.ok_or_else(|| {
-                anyhow::Error::new(
-                    neoethos_core::BrokerFinancialTruthErrorV1::unavailable_for(
-                        neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl,
-                    ),
-                )
+                anyhow::Error::new(neoethos_core::BrokerFinancialTruthErrorV1::unavailable_for(
+                    neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl,
+                ))
             })?;
             let total = running_total + margin;
             if !total.is_finite() {

@@ -13,8 +13,8 @@
 //! returning `None` for a duration when the exit timestamp precedes the entry.
 //! Diverging would show up as a parity failure that looks like a kernel bug.
 
-use neoethos_gpu_contracts::device::NeoPopulationOutcome;
 use neoethos_gpu_contracts::POPULATION_EXIT_NONE;
+use neoethos_gpu_contracts::device::NeoPopulationOutcome;
 
 use crate::quality::Trade;
 
@@ -42,8 +42,8 @@ pub fn trades_from_outcomes(
             let exit_bar = usize::try_from(outcome.exit_bar).ok()?;
             let entry_time = timestamps.get(entry_bar).copied()?;
             let exit_time = timestamps.get(exit_bar).copied()?;
-            let duration_hours = (exit_time >= entry_time)
-                .then(|| (exit_time - entry_time) as f64 / MS_PER_HOUR);
+            let duration_hours =
+                (exit_time >= entry_time).then(|| (exit_time - entry_time) as f64 / MS_PER_HOUR);
             Some(Trade {
                 entry_time,
                 exit_time: Some(exit_time),

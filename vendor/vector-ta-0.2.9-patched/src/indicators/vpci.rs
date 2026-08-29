@@ -1,32 +1,18 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::mem::{ManuallyDrop, MaybeUninit};
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
-use crate::indicators::sma::{sma, SmaData, SmaError, SmaInput, SmaParams};
+use crate::indicators::sma::{SmaData, SmaError, SmaInput, SmaParams, sma};
 
 #[derive(Debug, Clone)]
 pub enum VpciData<'a> {
@@ -54,10 +40,6 @@ pub enum VpciOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VpciParams {
     pub short_range: Option<usize>,
     pub long_range: Option<usize>,
@@ -254,11 +236,7 @@ impl VpciStream {
 
     #[inline(always)]
     fn zf(x: f64) -> f64 {
-        if x.is_finite() {
-            x
-        } else {
-            0.0
-        }
+        if x.is_finite() { x } else { 0.0 }
     }
 
     #[inline(always)]
@@ -374,7 +352,9 @@ pub enum VpciError {
     #[error("vpci: mismatched input lengths: close = {close_len}, volume = {volume_len}")]
     MismatchedInputLengths { close_len: usize, volume_len: usize },
 
-    #[error("vpci: Mismatched output lengths: vpci_len = {vpci_len}, vpcis_len = {vpcis_len}, expected = {data_len}")]
+    #[error(
+        "vpci: Mismatched output lengths: vpci_len = {vpci_len}, vpcis_len = {vpcis_len}, expected = {data_len}"
+    )]
     MismatchedOutputLengths {
         vpci_len: usize,
         vpcis_len: usize,
@@ -507,11 +487,7 @@ fn vpci_scalar_into_from_psums(
 
     #[inline(always)]
     fn zf(x: f64) -> f64 {
-        if x.is_finite() {
-            x
-        } else {
-            0.0
-        }
+        if x.is_finite() { x } else { 0.0 }
     }
 
     let inv_long = 1.0 / (long as f64);
@@ -674,11 +650,7 @@ fn vpci_selected_vpcis_from_psums(
 
     #[inline(always)]
     fn zf(x: f64) -> f64 {
-        if x.is_finite() {
-            x
-        } else {
-            0.0
-        }
+        if x.is_finite() { x } else { 0.0 }
     }
 
     let inv_long = 1.0 / (long as f64);
@@ -856,7 +828,6 @@ pub fn vpci_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn vpci_into(
     input: &VpciInput,
@@ -1072,11 +1043,7 @@ unsafe fn vpci_avx2_into_from_psums(
 
     #[inline(always)]
     fn zf(x: f64) -> f64 {
-        if x.is_finite() {
-            x
-        } else {
-            0.0
-        }
+        if x.is_finite() { x } else { 0.0 }
     }
 
     let inv_short_s = 1.0 / (short as f64);
@@ -1223,11 +1190,7 @@ unsafe fn vpci_avx512_into_from_psums(
 
     #[inline(always)]
     fn zf(x: f64) -> f64 {
-        if x.is_finite() {
-            x
-        } else {
-            0.0
-        }
+        if x.is_finite() { x } else { 0.0 }
     }
 
     let inv_short_s = 1.0 / (short as f64);
@@ -1716,44 +1679,19 @@ pub fn expand_grid_vpci(r: &VpciBatchRange) -> Vec<VpciParams> {
     expand_grid(r)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpci_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    short_range: usize,
-    long_range: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vpci_js(close, volume, short_range, long_range)?;
-    crate::write_wasm_object_f64_outputs("vpci_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpci_batch_unified_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vpci_batch_unified_js(close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs("vpci_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_vpci_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = VpciParams {
             short_range: Some(3),
             long_range: None,
@@ -1770,8 +1708,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = VpciParams {
             short_range: Some(5),
             long_range: Some(25),
@@ -1830,8 +1768,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VpciInput::with_default_candles(&candles);
         let output = vpci_with_kernel(&input, kernel)?;
         assert_eq!(output.vpci.len(), candles.close.len());
@@ -1864,8 +1802,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             VpciParams::default(),
@@ -2293,8 +2231,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let close = &c.close;
         let volume = &c.volume;
 
@@ -2328,8 +2266,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let close = &c.close;
         let volume = &c.volume;
 
@@ -2508,15 +2446,14 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 mod tests_into {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_vpci_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = VpciParams::default();
         let input = VpciInput::from_candles(&candles, "close", "volume", params);
@@ -2553,729 +2490,5 @@ mod tests_into {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vpci")]
-#[pyo3(signature = (close, volume, short_range, long_range, kernel=None))]
-pub fn vpci_py<'py>(
-    py: Python<'py>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    short_range: usize,
-    long_range: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-
-    if close_slice.len() != volume_slice.len() {
-        return Err(PyValueError::new_err(
-            "Close and volume arrays must have the same length",
-        ));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = VpciParams {
-        short_range: Some(short_range),
-        long_range: Some(long_range),
-    };
-    let input = VpciInput::from_slices(close_slice, volume_slice, params);
-
-    let (vpci_vec, vpcis_vec) = py
-        .allow_threads(|| vpci_with_kernel(&input, kern).map(|o| (o.vpci, o.vpcis)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((vpci_vec.into_pyarray(py), vpcis_vec.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VpciStream")]
-pub struct VpciStreamPy {
-    stream: VpciStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VpciStreamPy {
-    #[new]
-    fn new(short_range: usize, long_range: usize) -> PyResult<Self> {
-        let params = VpciParams {
-            short_range: Some(short_range),
-            long_range: Some(long_range),
-        };
-        let stream =
-            VpciStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(VpciStreamPy { stream })
-    }
-
-    fn update(&mut self, close: f64, volume: f64) -> Option<(f64, f64)> {
-        self.stream.update(close, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vpci_batch")]
-#[pyo3(signature = (close, volume, short_range_tuple, long_range_tuple, kernel=None))]
-pub fn vpci_batch_py<'py>(
-    py: Python<'py>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    short_range_tuple: (usize, usize, usize),
-    long_range_tuple: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-
-    if close_slice.len() != volume_slice.len() {
-        return Err(PyValueError::new_err(
-            "Close and volume arrays must have the same length",
-        ));
-    }
-
-    let sweep = VpciBatchRange {
-        short_range: short_range_tuple,
-        long_range: long_range_tuple,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = close_slice.len();
-    if rows == 0 || cols == 0 {
-        return Err(PyValueError::new_err(
-            "no parameter combinations or empty input",
-        ));
-    }
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in vpci_batch_py"))?;
-
-    let vpci_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let vpcis_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let vpci_slice = unsafe { vpci_arr.as_slice_mut()? };
-    let vpcis_slice = unsafe { vpcis_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            vpci_batch_inner_into(
-                close_slice,
-                volume_slice,
-                &sweep,
-                simd,
-                true,
-                vpci_slice,
-                vpcis_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("vpci", vpci_arr.reshape((rows, cols))?)?;
-    dict.set_item("vpcis", vpcis_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "short_ranges",
-        combos
-            .iter()
-            .map(|p| p.short_range.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "long_ranges",
-        combos
-            .iter()
-            .map(|p| p.long_range.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpci_js(
-    close: &[f64],
-    volume: &[f64],
-    short_range: usize,
-    long_range: usize,
-) -> Result<JsValue, JsValue> {
-    let params = VpciParams {
-        short_range: Some(short_range),
-        long_range: Some(long_range),
-    };
-    let input = VpciInput::from_slices(close, volume, params);
-
-    let out = vpci(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    #[derive(Serialize)]
-    struct Out {
-        vpci: Vec<f64>,
-        vpcis: Vec<f64>,
-    }
-    serde_wasm_bindgen::to_value(&Out {
-        vpci: out.vpci,
-        vpcis: out.vpcis,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpci_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    vpci_ptr: *mut f64,
-    vpcis_ptr: *mut f64,
-    len: usize,
-    short_range: usize,
-    long_range: usize,
-) -> Result<(), JsValue> {
-    if close_ptr.is_null() || volume_ptr.is_null() || vpci_ptr.is_null() || vpcis_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to vpci_into"));
-    }
-
-    unsafe {
-        let close = core::slice::from_raw_parts(close_ptr, len);
-        let volume = core::slice::from_raw_parts(volume_ptr, len);
-        let vpci = core::slice::from_raw_parts_mut(vpci_ptr, len);
-        let vpcis = core::slice::from_raw_parts_mut(vpcis_ptr, len);
-
-        let params = VpciParams {
-            short_range: Some(short_range),
-            long_range: Some(long_range),
-        };
-        let input = VpciInput::from_slices(close, volume, params);
-
-        vpci_into_slice(vpci, vpcis, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpci_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpci_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VpciBatchConfig {
-    pub short_range: (usize, usize, usize),
-    pub long_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VpciBatchJsOutput {
-    pub vpci: Vec<f64>,
-    pub vpcis: Vec<f64>,
-    pub combos: Vec<VpciParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "vpci_batch")]
-pub fn vpci_batch_unified_js(
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: VpciBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = VpciBatchRange {
-        short_range: cfg.short_range,
-        long_range: cfg.long_range,
-    };
-    let output = vpci_batch_inner(close, volume, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js_out = VpciBatchJsOutput {
-        vpci: output.vpci,
-        vpcis: output.vpcis,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-    serde_wasm_bindgen::to_value(&js_out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::vpci_wrapper::{CudaVpci, CudaVpciBatchPlan};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::{CopyDestination, DeviceBuffer};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "VpciCudaBatchPlan", unsendable)]
-pub struct VpciCudaBatchPlanPy {
-    cuda: CudaVpci,
-    plan: CudaVpciBatchPlan,
-    device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl VpciCudaBatchPlanPy {
-    #[getter]
-    fn rows(&self) -> usize {
-        self.plan.rows()
-    }
-
-    #[getter]
-    fn cols(&self) -> usize {
-        self.plan.cols()
-    }
-
-    #[getter]
-    fn device_id(&self) -> u32 {
-        self.device_id
-    }
-
-    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        dict.set_item(
-            "short_ranges",
-            self.plan
-                .params()
-                .iter()
-                .map(|p| p.short_range.unwrap_or(5) as u64)
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        dict.set_item(
-            "long_ranges",
-            self.plan
-                .params()
-                .iter()
-                .map(|p| p.long_range.unwrap_or(25) as u64)
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        dict.set_item("rows", self.plan.rows())?;
-        dict.set_item("cols", self.plan.cols())?;
-        Ok(dict)
-    }
-
-    fn execute<'py>(
-        &mut self,
-        py: Python<'py>,
-        close_f32: numpy::PyReadonlyArray1<'py, f32>,
-        volume_f32: numpy::PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        use numpy::PyArrayMethods;
-
-        let close = close_f32.as_slice()?;
-        let volume = volume_f32.as_slice()?;
-        let rows = self.plan.rows();
-        let cols = self.plan.cols();
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("vpci CUDA plan rows*cols overflow"))?;
-        let (vpci, vpcis) = py.allow_threads(|| -> PyResult<(Vec<f32>, Vec<f32>)> {
-            let d_close = DeviceBuffer::from_slice(close)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let d_volume = DeviceBuffer::from_slice(volume)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            self.cuda
-                .launch_vpci_batch_plan(&d_close, &d_volume, &mut self.plan)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            self.cuda
-                .synchronize()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let mut vpci = vec![0f32; total];
-            let mut vpcis = vec![0f32; total];
-            let (vpci_buf, vpcis_buf) = self.plan.outputs();
-            vpci_buf
-                .copy_to(&mut vpci)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            vpcis_buf
-                .copy_to(&mut vpcis)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok((vpci, vpcis))
-        })?;
-        let dict = self.metadata(py)?;
-        let vpci_arr = vpci.into_pyarray(py);
-        let vpcis_arr = vpcis.into_pyarray(py);
-        dict.set_item("vpci", vpci_arr.reshape((rows, cols))?)?;
-        dict.set_item("vpcis", vpcis_arr.reshape((rows, cols))?)?;
-        Ok(dict)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vpci_cuda_batch_plan_create")]
-#[pyo3(signature = (series_len, first_valid, short_range_tuple, long_range_tuple, device_id=0))]
-pub fn vpci_cuda_batch_plan_create_py(
-    py: Python<'_>,
-    series_len: usize,
-    first_valid: usize,
-    short_range_tuple: (usize, usize, usize),
-    long_range_tuple: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<VpciCudaBatchPlanPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sweep = VpciBatchRange {
-        short_range: short_range_tuple,
-        long_range: long_range_tuple,
-    };
-    let (cuda, plan, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVpci::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let plan = cuda
-            .prepare_vpci_batch_plan(series_len, first_valid, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((cuda, plan, dev_id))
-    })?;
-    Ok(VpciCudaBatchPlanPy {
-        cuda,
-        plan,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vpci_cuda_batch_dev")]
-#[pyo3(signature = (close_f32, volume_f32, short_range_tuple, long_range_tuple, device_id=0))]
-pub fn vpci_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    volume_f32: numpy::PyReadonlyArray1<'py, f32>,
-    short_range_tuple: (usize, usize, usize),
-    long_range_tuple: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let c = close_f32.as_slice()?;
-    let v = volume_f32.as_slice()?;
-    if c.len() != v.len() {
-        return Err(PyValueError::new_err("length mismatch"));
-    }
-    let sweep = VpciBatchRange {
-        short_range: short_range_tuple,
-        long_range: long_range_tuple,
-    };
-    let (pair, combos, ctx, dev_id_u32) = py.allow_threads(|| {
-        let cuda = CudaVpci::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id_u32 = cuda.device_id();
-        cuda.vpci_batch_dev(c, v, &sweep)
-            .map(|(pair, combos)| (pair, combos, ctx, dev_id_u32))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "vpci",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: pair.a,
-                _ctx: Some(ctx.clone()),
-                device_id: Some(dev_id_u32),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "vpcis",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: pair.b,
-                _ctx: Some(ctx),
-                device_id: Some(dev_id_u32),
-            },
-        )?,
-    )?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", c.len())?;
-    dict.set_item(
-        "short_ranges",
-        combos
-            .iter()
-            .map(|p| p.short_range.unwrap_or(5) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "long_ranges",
-        combos
-            .iter()
-            .map(|p| p.long_range.unwrap_or(25) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vpci_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (close_tm_f32, volume_tm_f32, short_range, long_range, device_id=0))]
-pub fn vpci_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    close_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    volume_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    short_range: usize,
-    long_range: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = close_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array for close"));
-    }
-    if volume_tm_f32.shape() != shape {
-        return Err(PyValueError::new_err(
-            "input arrays must share the same shape",
-        ));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let c = close_tm_f32.as_slice()?;
-    let v = volume_tm_f32.as_slice()?;
-    let params = VpciParams {
-        short_range: Some(short_range),
-        long_range: Some(long_range),
-    };
-    let (pair, ctx, dev_id_u32) = py.allow_threads(|| {
-        let cuda = CudaVpci::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id_u32 = cuda.device_id();
-        cuda.vpci_many_series_one_param_time_major_dev(c, v, cols, rows, &params)
-            .map(|pair| (pair, ctx, dev_id_u32))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "vpci",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: pair.a,
-                _ctx: Some(ctx.clone()),
-                device_id: Some(dev_id_u32),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "vpcis",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: pair.b,
-                _ctx: Some(ctx),
-                device_id: Some(dev_id_u32),
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("short_range", short_range)?;
-    dict.set_item("long_range", long_range)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpci_batch_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    vpci_ptr: *mut f64,
-    vpcis_ptr: *mut f64,
-    len: usize,
-    short_start: usize,
-    short_end: usize,
-    short_step: usize,
-    long_start: usize,
-    long_end: usize,
-    long_step: usize,
-) -> Result<usize, JsValue> {
-    if close_ptr.is_null() || volume_ptr.is_null() || vpci_ptr.is_null() || vpcis_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to vpci_batch_into"));
-    }
-
-    unsafe {
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        let sweep = VpciBatchRange {
-            short_range: (short_start, short_end, short_step),
-            long_range: (long_start, long_end, long_step),
-        };
-
-        let combos = expand_grid_vpci(&sweep);
-        let rows = combos.len();
-        if rows == 0 {
-            return Err(JsValue::from_str(
-                "no parameter combinations for vpci_batch_into",
-            ));
-        }
-        let total_len = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*len overflow in vpci_batch_into"))?;
-
-        let need_temp = close_ptr == vpci_ptr as *const f64
-            || close_ptr == vpcis_ptr as *const f64
-            || volume_ptr == vpci_ptr as *const f64
-            || volume_ptr == vpcis_ptr as *const f64;
-
-        if need_temp {
-            let output = vpci_batch_inner(close, volume, &sweep, detect_best_kernel(), false)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let vpci_out = std::slice::from_raw_parts_mut(vpci_ptr, total_len);
-            let vpcis_out = std::slice::from_raw_parts_mut(vpcis_ptr, total_len);
-            vpci_out.copy_from_slice(&output.vpci);
-            vpcis_out.copy_from_slice(&output.vpcis);
-        } else {
-            let vpci_out = std::slice::from_raw_parts_mut(vpci_ptr, total_len);
-            let vpcis_out = std::slice::from_raw_parts_mut(vpcis_ptr, total_len);
-
-            vpci_batch_inner_into(
-                close,
-                volume,
-                &sweep,
-                detect_best_kernel(),
-                false,
-                vpci_out,
-                vpcis_out,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers or VpciStream"
-)]
-pub struct VpciContext {
-    short_range: usize,
-    long_range: usize,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl VpciContext {
-    #[wasm_bindgen(constructor)]
-    pub fn new(short_range: usize, long_range: usize) -> Result<VpciContext, JsValue> {
-        if short_range == 0 || long_range == 0 || short_range > long_range {
-            return Err(JsValue::from_str("Invalid range parameters"));
-        }
-
-        Ok(VpciContext {
-            short_range,
-            long_range,
-            kernel: detect_best_kernel(),
-        })
-    }
-
-    pub fn update_into(
-        &self,
-        close_ptr: *const f64,
-        volume_ptr: *const f64,
-        vpci_ptr: *mut f64,
-        vpcis_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if close_ptr.is_null() || volume_ptr.is_null() || vpci_ptr.is_null() || vpcis_ptr.is_null()
-        {
-            return Err(JsValue::from_str("null pointer passed to update_into"));
-        }
-
-        if len < self.long_range {
-            return Err(JsValue::from_str("Data length less than long range"));
-        }
-
-        unsafe {
-            let close = std::slice::from_raw_parts(close_ptr, len);
-            let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-            let params = VpciParams {
-                short_range: Some(self.short_range),
-                long_range: Some(self.long_range),
-            };
-            let input = VpciInput::from_slices(close, volume, params);
-
-            let need_temp = close_ptr == vpci_ptr as *const f64
-                || close_ptr == vpcis_ptr as *const f64
-                || volume_ptr == vpci_ptr as *const f64
-                || volume_ptr == vpcis_ptr as *const f64;
-
-            if need_temp {
-                let mut temp_vpci = vec![0.0; len];
-                let mut temp_vpcis = vec![0.0; len];
-                vpci_into_slice(&mut temp_vpci, &mut temp_vpcis, &input, self.kernel)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-                let vpci_out = std::slice::from_raw_parts_mut(vpci_ptr, len);
-                let vpcis_out = std::slice::from_raw_parts_mut(vpcis_ptr, len);
-                vpci_out.copy_from_slice(&temp_vpci);
-                vpcis_out.copy_from_slice(&temp_vpcis);
-            } else {
-                let vpci_out = std::slice::from_raw_parts_mut(vpci_ptr, len);
-                let vpcis_out = std::slice::from_raw_parts_mut(vpcis_ptr, len);
-                vpci_into_slice(vpci_out, vpcis_out, &input, self.kernel)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn get_warmup_period(&self) -> usize {
-        self.long_range - 1
     }
 }

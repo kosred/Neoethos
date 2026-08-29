@@ -22,10 +22,10 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::CODEX_API_BASE;
 use crate::auth_store::{AuthStore, StoredAuth};
 use crate::error::CodexError;
 use crate::oauth::refresh_token;
-use crate::CODEX_API_BASE;
 
 /// Process-stable installation ID sent on every `/codex/responses` request
 /// via the `x-codex-installation-id` header. The official Codex CLI
@@ -424,8 +424,7 @@ impl CodexClient {
 /// message. The Codex `/responses` endpoint REQUIRES a non-empty
 /// `instructions` string ("Instructions are required") so we never
 /// send an empty one.
-const DEFAULT_INSTRUCTIONS: &str =
-    "You are NeoEthos AI Helper, a concise assistant embedded in a Rust \
+const DEFAULT_INSTRUCTIONS: &str = "You are NeoEthos AI Helper, a concise assistant embedded in a Rust \
      forex trading terminal. Answer clearly and briefly. You can discuss \
      trading, markets, economics, and how to use the platform.";
 
@@ -537,11 +536,9 @@ fn parse_sse_response(body: &str) -> Result<(String, Option<ChatUsage>), String>
                 saw_terminal = true;
                 if let Some(u) = v.pointer("/response/usage") {
                     let input_tokens =
-                        u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
-                            as u32;
+                        u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                     let output_tokens =
-                        u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
-                            as u32;
+                        u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                     let total_tokens = u
                         .get("total_tokens")
                         .and_then(|x| x.as_u64())
@@ -648,7 +645,8 @@ mod tests {
         assert_eq!(a, b, "installation id must be process-stable");
         assert_eq!(a.len(), 32, "installation id must be 32 hex chars");
         assert!(
-            a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "installation id must be lowercase hex only: {a}"
         );
     }
@@ -719,7 +717,10 @@ mod tests {
             store: false,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"input\":["), "input must serialize as a list");
+        assert!(
+            json.contains("\"input\":["),
+            "input must serialize as a list"
+        );
         assert!(json.contains("\"type\":\"input_text\""));
         assert!(json.contains("\"stream\":true"));
         assert!(json.contains("\"instructions\":\""));

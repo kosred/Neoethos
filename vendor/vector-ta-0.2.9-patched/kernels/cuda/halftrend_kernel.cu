@@ -950,159 +950,203 @@ void halftrend_many_series_one_param_time_major_f32(
 
 
 // ===========================================================================
-// NEOETHOS f64 LANE  --  closer 4, round 3
+// NEOETHOS exact f64 HalfTrend authority
 //
-// CPU reference: halftrend_scalar_classic
-// (src/indicators/halftrend.rs:549-698). At the batch defaults halftrend.rs:346
-// FORCES Kernel::Scalar and :361 routes to that function, so it is the only
-// path this lane can reach -- the deque-based halftrend_scalar (:700) serves
-// non-default amplitudes only.
-//
-// OUTPUT: the HALFTREND column -- compute_halftrend_batch (cpu_batch.rs:14979)
-// resolves output_id == "value" to out.halftrend.
-//
-// PERIOD-INVARIANT: that batch reads amplitude (2), channel_deviation (2.0)
-// and atr_period (100) and NEVER `period` (cpu_batch.rs:14960-14962). A sweep
-// of five periods gets five identical CPU columns, so this kernel writes five
-// identical rows.
-//
-// FIRST-VALID: Ignored, and derived here. halftrend.rs:291 takes the MIN of
-// three INDEPENDENT first-non-NaN scans -- fh.min(fl).min(fc) -- which no
-// declared rule expresses: HlcMaxOfIndependentFirsts is the MAX and names a
-// LATER bar, and first-valid sets both the NaN prefix and the ATR/SMA seed
-// windows, so adopting it would shift the whole series.
-//
-// SHAPE: one thread per combo walking bars ASCENDING. A Wilder ATR (rma), two
-// rolling sums over the amplitude window, and a trend state machine with two
-// ratcheted extremes are carried across bars.
-//
-// NaN SEMANTICS: the true range is hl.max(hc).max(lc) (:581), which is
-// f64::max and RETURNS THE NON-NaN OPERAND. An if-chain would let a NaN
-// survive into rma and poison every later bar, so fmax is used.
+// The canonical default tuple (amplitude=2, channel_deviation=2.0,
+// atr_period=100) preserves halftrend_scalar_classic operation-for-operation.
+// Every other admitted tuple preserves the scalar ATR FMA recurrence, the two
+// compensated SMA recurrences, and the scalar HalfTrend state-machine order.
+// Both public f64 entry points below call this one row authority.
 // ===========================================================================
 
-#define HALFTREND_NEO_AMPLITUDE 2
-#define HALFTREND_NEO_ATR_PERIOD 100
-
-static __forceinline__ __device__ double halftrend_neo_qnan() {
+static __forceinline__ __device__ double halftrend_qnan_f64() {
     return __longlong_as_double(0x7ff8000000000000ULL);
 }
 
-extern "C" __global__
-void halftrend_neo_batch_f64(const double* __restrict__ high,
-                             const double* __restrict__ low,
-                             const double* __restrict__ close,
-                             int n,
-                             const int* __restrict__ periods,
-                             int n_combos,
-                             int first_valid,
-                             double* __restrict__ out) {
-    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
-    if (combo >= n_combos) return;
-    if (n <= 0) return;
-    (void)periods;      // PERIOD-INVARIANT -- see the header.
-    (void)first_valid;  // Ignored -- see the header.
+static __forceinline__ __device__ void halftrend_compensated_add_f64(
+        double* sum, double* correction, double value) {
+    const double adjusted = value - *correction;
+    const double next = *sum + adjusted;
+    *correction = (next - *sum) - adjusted;
+    *sum = next;
+}
 
-    double* __restrict__ row = out + (size_t)combo * (size_t)n;
-    const double nn = halftrend_neo_qnan();
-
-    const int amplitude = HALFTREND_NEO_AMPLITUDE;
-    const int atr_period = HALFTREND_NEO_ATR_PERIOD;
-    const double channel_deviation = 2.0;
-
-    // :291-295 -- MIN of three independent scans.
-    int fh = -1, fl = -1, fc = -1;
-    for (int i = 0; i < n; ++i) { if (!isnan(high[i])) { fh = i; break; } }
-    for (int i = 0; i < n; ++i) { if (!isnan(low[i]))  { fl = i; break; } }
-    for (int i = 0; i < n; ++i) { if (!isnan(close[i])){ fc = i; break; } }
-
-    int first = -1;
-    if (fh >= 0) first = fh;
-    if (fl >= 0 && (first < 0 || fl < first)) first = fl;
-    if (fc >= 0 && (first < 0 || fc < first)) first = fc;
-
-    bool refused = false;
-    if (first < 0) refused = true;                                   // :352
-    if (amplitude <= 0 || amplitude > n) refused = true;             // :328
-    if (atr_period <= 0 || atr_period > n) refused = true;           // :340
-    const int warmup_span = amplitude > atr_period ? amplitude : atr_period;
-    if (!refused && (n - first) < warmup_span) refused = true;       // :357
-
-    if (refused) {
-        for (int i = 0; i < n; ++i) row[i] = nn;
-        return;
+static __forceinline__ __device__ void halftrend_row_f64(
+        const double* __restrict__ high,
+        const double* __restrict__ low,
+        const double* __restrict__ close,
+        int n,
+        int amplitude,
+        double channel_deviation,
+        int atr_period,
+        double* __restrict__ halftrend_row,
+        double* __restrict__ trend_row,
+        double* __restrict__ atr_high_row,
+        double* __restrict__ atr_low_row,
+        double* __restrict__ buy_signal_row,
+        double* __restrict__ sell_signal_row) {
+    const double nn = halftrend_qnan_f64();
+    for (int i = 0; i < n; ++i) {
+        if (halftrend_row != nullptr) halftrend_row[i] = nn;
+        if (trend_row != nullptr) trend_row[i] = nn;
+        if (atr_high_row != nullptr) atr_high_row[i] = nn;
+        if (atr_low_row != nullptr) atr_low_row[i] = nn;
+        if (buy_signal_row != nullptr) buy_signal_row[i] = nn;
+        if (sell_signal_row != nullptr) sell_signal_row[i] = nn;
     }
 
-    const int warm = first + warmup_span - 1;   // :363
-    const int nan_end = warm < n ? warm : n;
-    for (int i = 0; i < nan_end; ++i) row[i] = nn;
-    // Bars past the warmup that the CPU loop does not reach are left
-    // uninitialised by alloc_with_nan_prefix; NaN is the only honest value.
-    for (int i = nan_end; i < n; ++i) row[i] = nn;
-
-    const double alpha = 1.0 / (double)atr_period;
-    const int atr_warm = first + atr_period - 1;
-
-    // :572-582 -- the ATR seed is a PLAIN SUM over the first atr_period true
-    // ranges, divided once. Not a Wilder recursion yet.
-    double sum_tr = 0.0;
-    {
-        const int last = atr_warm < (n - 1) ? atr_warm : (n - 1);
-        for (int i = first; i <= last; ++i) {
-            double tr;
-            if (i == first) {
-                tr = high[i] - low[i];
-            } else {
-                const double hl = high[i] - low[i];
-                const double hc = fabs(high[i] - close[i - 1]);
-                const double lc = fabs(low[i] - close[i - 1]);
-                tr = fmax(fmax(hl, hc), lc);
-            }
-            sum_tr += tr;
+    int first_high = -1;
+    int first_low = -1;
+    int first_close = -1;
+    int first_atr = -1;
+    for (int i = 0; i < n; ++i) {
+        if (first_high < 0 && !isnan(high[i])) first_high = i;
+        if (first_low < 0 && !isnan(low[i])) first_low = i;
+        if (first_close < 0 && !isnan(close[i])) first_close = i;
+        if (first_atr < 0 && !isnan(high[i]) && !isnan(low[i]) && !isnan(close[i])) {
+            first_atr = i;
         }
+    }
+    int first = first_high;
+    if (first_low >= 0 && (first < 0 || first_low < first)) first = first_low;
+    if (first_close >= 0 && (first < 0 || first_close < first)) first = first_close;
+
+    const bool classic_default =
+        amplitude == 2 && channel_deviation == 2.0 && atr_period == 100;
+    const bool invalid_common =
+        n <= 0 || first < 0 || amplitude <= 0 || amplitude > n || atr_period <= 0 ||
+        atr_period > n || !isfinite(channel_deviation) || channel_deviation <= 0.0 ||
+        n - first < (amplitude > atr_period ? amplitude : atr_period);
+    const bool invalid_nondefault =
+        !classic_default &&
+        (first_atr < 0 || first_high < 0 || first_low < 0 ||
+         n - first_high < amplitude || n - first_low < amplitude ||
+         n - first_atr < atr_period);
+    if (invalid_common || invalid_nondefault) return;
+
+    const int warmup_span = amplitude > atr_period ? amplitude : atr_period;
+    const int warm = first + warmup_span - 1;
+
+    const int atr_seed_first = classic_default ? first : first_atr;
+    const int atr_warm = atr_seed_first + atr_period - 1;
+    double sum_tr = 0.0;
+    for (int i = atr_seed_first; i <= atr_warm; ++i) {
+        double tr;
+        if (i == atr_seed_first) {
+            tr = high[i] - low[i];
+        } else {
+            const double hl = high[i] - low[i];
+            const double hc = fabs(high[i] - close[i - 1]);
+            const double lc = fabs(low[i] - close[i - 1]);
+            if (classic_default) {
+                tr = fmax(fmax(hl, hc), lc);
+            } else {
+                tr = hl;
+                if (hc > tr) tr = hc;
+                if (lc > tr) tr = lc;
+            }
+        }
+        sum_tr += tr;
     }
     double rma = sum_tr / (double)atr_period;
+    int atr_index = atr_warm;
+    const double alpha = 1.0 / (double)atr_period;
 
-    // :586-597 -- the amplitude SMA seed, then rolled forward to `warm`.
-    const int sma_warm = first + amplitude - 1;
-    double sum_high = 0.0, sum_low = 0.0;
-    {
-        const int last = sma_warm < (n - 1) ? sma_warm : (n - 1);
-        for (int i = first; i <= last; ++i) {
+    const int high_sma_first = classic_default ? first : first_high;
+    const int low_sma_first = classic_default ? first : first_low;
+    const int high_sma_warm = high_sma_first + amplitude - 1;
+    const int low_sma_warm = low_sma_first + amplitude - 1;
+    double sum_high = 0.0;
+    double sum_low = 0.0;
+    double correction_high = 0.0;
+    double correction_low = 0.0;
+    for (int i = high_sma_first; i <= high_sma_warm; ++i) {
+        if (classic_default) {
             sum_high += high[i];
+        } else {
+            halftrend_compensated_add_f64(&sum_high, &correction_high, high[i]);
+        }
+    }
+    for (int i = low_sma_first; i <= low_sma_warm; ++i) {
+        if (classic_default) {
             sum_low += low[i];
+        } else {
+            halftrend_compensated_add_f64(&sum_low, &correction_low, low[i]);
         }
     }
-    {
-        const int last = warm < (n - 1) ? warm : (n - 1);
-        for (int i = sma_warm + 1; i <= last; ++i) {
-            sum_high = sum_high - high[i - amplitude] + high[i];
-            sum_low = sum_low - low[i - amplitude] + low[i];
-        }
-    }
+    int high_sma_index = high_sma_warm;
+    int low_sma_index = low_sma_warm;
     const double inv_amp = 1.0 / (double)amplitude;
 
     int current_trend = 0;
     int next_trend = 0;
-    double up = 0.0, down = 0.0;
-    double max_low_price = (warm > 0) ? low[warm - 1] : low[0];
-    double min_high_price = (warm > 0) ? high[warm - 1] : high[0];
-    // trend[i-1] in the CPU is a written output column; the kernel carries it
-    // in a register because only `halftrend` is emitted.
-    double trend_prev = 0.0;
-    bool trend_prev_set = false;
-
+    double up = 0.0;
+    double down = 0.0;
+    double max_low_price = warm > 0 ? low[warm - 1] : low[0];
+    double min_high_price = warm > 0 ? high[warm - 1] : high[0];
+    double trend_previous = 0.0;
+    bool trend_previous_set = false;
     const double ch_half = channel_deviation * 0.5;
 
     for (int i = warm; i < n; ++i) {
-        const double highma_i = sum_high * inv_amp;
-        const double lowma_i = sum_low * inv_amp;
+        while (atr_index < i) {
+            const int next = atr_index + 1;
+            const double hl = high[next] - low[next];
+            const double hc = fabs(high[next] - close[next - 1]);
+            const double lc = fabs(low[next] - close[next - 1]);
+            double tr;
+            if (classic_default) {
+                tr = fmax(fmax(hl, hc), lc);
+                rma += alpha * (tr - rma);
+            } else {
+                tr = hl;
+                if (hc > tr) tr = hc;
+                if (lc > tr) tr = lc;
+                rma = fma(-alpha, rma, rma) + alpha * tr;
+            }
+            atr_index = next;
+        }
+        while (high_sma_index < i) {
+            const int next = high_sma_index + 1;
+            if (classic_default) {
+                sum_high = sum_high - high[next - amplitude] + high[next];
+            } else {
+                halftrend_compensated_add_f64(&sum_high, &correction_high,
+                                               -high[next - amplitude]);
+                halftrend_compensated_add_f64(&sum_high, &correction_high, high[next]);
+            }
+            high_sma_index = next;
+        }
+        while (low_sma_index < i) {
+            const int next = low_sma_index + 1;
+            if (classic_default) {
+                sum_low = sum_low - low[next - amplitude] + low[next];
+            } else {
+                halftrend_compensated_add_f64(&sum_low, &correction_low,
+                                               -low[next - amplitude]);
+                halftrend_compensated_add_f64(&sum_low, &correction_low, low[next]);
+            }
+            low_sma_index = next;
+        }
 
-        const double high_price = (high[i] > high[i - 1]) ? high[i] : high[i - 1];
-        const double low_price = (low[i] < low[i - 1]) ? low[i] : low[i - 1];
-
-        const double prev_low = low[i - 1];
-        const double prev_high = high[i - 1];
+        const double highma_i = i >= high_sma_warm ? sum_high * inv_amp : nn;
+        const double lowma_i = i >= low_sma_warm ? sum_low * inv_amp : nn;
+        double high_price;
+        double low_price;
+        if (classic_default) {
+            high_price = high[i] > high[i - 1] ? high[i] : high[i - 1];
+            low_price = low[i] < low[i - 1] ? low[i] : low[i - 1];
+        } else {
+            const int window_start = i + 1 - amplitude;
+            high_price = high[window_start];
+            low_price = low[window_start];
+            for (int k = window_start + 1; k <= i; ++k) {
+                if (high_price <= high[k]) high_price = high[k];
+                if (low_price >= low[k]) low_price = low[k];
+            }
+        }
+        const double prev_low = i > 0 ? low[i - 1] : low[0];
+        const double prev_high = i > 0 ? high[i - 1] : high[0];
 
         if (next_trend == 1) {
             if (low_price > max_low_price) max_low_price = low_price;
@@ -1120,46 +1164,81 @@ void halftrend_neo_batch_f64(const double* __restrict__ high,
             }
         }
 
-        const double a = rma;
+        const double a = i >= atr_warm ? rma : nn;
         const double atr2 = 0.5 * a;
-        const double dev = fma(a, ch_half, 0.0);   // :648 -- ONE rounding.
-
-        double trend_now;
+        const double dev = classic_default ? fma(a, ch_half, 0.0) : a * ch_half;
         if (current_trend == 0) {
-            if (i > warm && trend_prev_set && trend_prev != 0.0) {
+            if (i > warm && trend_previous_set && trend_previous != 0.0) {
                 up = down;
-                (void)atr2;   // buy_signal is not this lane's column
-            } else {
-                if (i == warm || up == 0.0) up = max_low_price;
-                else if (max_low_price > up) up = max_low_price;
+                if (buy_signal_row != nullptr) buy_signal_row[i] = up - atr2;
+            } else if (i == warm || up == 0.0) {
+                up = max_low_price;
+            } else if (max_low_price > up) {
+                up = max_low_price;
             }
-            row[i] = up;
-            trend_now = 0.0;
+            if (halftrend_row != nullptr) halftrend_row[i] = up;
+            if (trend_row != nullptr) trend_row[i] = 0.0;
+            if (atr_high_row != nullptr) atr_high_row[i] = up + dev;
+            if (atr_low_row != nullptr) atr_low_row[i] = up - dev;
+            trend_previous = 0.0;
         } else {
-            if (i > warm && trend_prev_set && trend_prev != 1.0) {
+            if (i > warm && trend_previous_set && trend_previous != 1.0) {
                 down = up;
-                (void)atr2;   // sell_signal is not this lane's column
-            } else {
-                if (i == warm || down == 0.0) down = min_high_price;
-                else if (min_high_price < down) down = min_high_price;
+                if (sell_signal_row != nullptr) sell_signal_row[i] = down + atr2;
+            } else if (i == warm || down == 0.0) {
+                down = min_high_price;
+            } else if (min_high_price < down) {
+                down = min_high_price;
             }
-            row[i] = down;
-            trend_now = 1.0;
+            if (halftrend_row != nullptr) halftrend_row[i] = down;
+            if (trend_row != nullptr) trend_row[i] = 1.0;
+            if (atr_high_row != nullptr) atr_high_row[i] = down + dev;
+            if (atr_low_row != nullptr) atr_low_row[i] = down - dev;
+            trend_previous = 1.0;
         }
-        (void)dev;   // atr_high / atr_low are not this lane's columns
-        trend_prev = trend_now;
-        trend_prev_set = true;
-
-        const int ni = i + 1;
-        if (ni < n) {
-            sum_high = sum_high - high[ni - amplitude] + high[ni];
-            sum_low = sum_low - low[ni - amplitude] + low[ni];
-
-            const double hl = high[ni] - low[ni];
-            const double hc = fabs(high[ni] - close[ni - 1]);
-            const double lc = fabs(low[ni] - close[ni - 1]);
-            const double tr = fmax(fmax(hl, hc), lc);
-            rma += alpha * (tr - rma);   // :693 -- ONE multiply, ONE add
-        }
+        trend_previous_set = true;
     }
+}
+
+extern "C" __global__
+void halftrend_neo_batch_f64(const double* __restrict__ high,
+                             const double* __restrict__ low,
+                             const double* __restrict__ close,
+                             int n,
+                             const int* __restrict__ periods,
+                             int n_combos,
+                             int first_valid,
+                             double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    (void)first_valid;
+    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+    halftrend_row_f64(high, low, close, n, 2, 2.0, periods[combo], row,
+                      nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
+extern "C" __global__
+void halftrend_outputs_f64(
+        const double* __restrict__ high,
+        const double* __restrict__ low,
+        const double* __restrict__ close,
+        int n,
+        const int* __restrict__ amplitudes,
+        const double* __restrict__ channel_deviations,
+        const int* __restrict__ atr_periods,
+        int n_combos,
+        double* __restrict__ halftrend_out,
+        double* __restrict__ trend_out,
+        double* __restrict__ atr_high_out,
+        double* __restrict__ atr_low_out,
+        double* __restrict__ buy_signal_out,
+        double* __restrict__ sell_signal_out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    const size_t offset = (size_t)combo * (size_t)n;
+    halftrend_row_f64(
+        high, low, close, n, amplitudes[combo], channel_deviations[combo],
+        atr_periods[combo], halftrend_out + offset, trend_out + offset,
+        atr_high_out + offset, atr_low_out + offset, buy_signal_out + offset,
+        sell_signal_out + offset);
 }

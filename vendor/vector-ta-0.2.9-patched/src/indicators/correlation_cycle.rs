@@ -1,29 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context as CudaContext;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc as StdArc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,6 +16,229 @@ use thiserror::Error;
 #[inline(always)]
 fn correlation_cycle_auto_kernel() -> Kernel {
     Kernel::Scalar
+}
+
+const CORRELATION_CYCLE_HALF_PI: f64 = f64::from_bits(0x3ff9_21fb_5444_2d18);
+const CORRELATION_CYCLE_TWO_PI: f64 = f64::from_bits(0x4019_21fb_5444_2d18);
+const CORRELATION_CYCLE_RADIANS_TO_DEGREES: f64 = f64::from_bits(0x404c_a5dc_1a63_c1f8);
+
+/* FreeBSD msun k_sin/k_cos, medium pi/2 reduction and s_atan.
+ *
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ * Developed at SunPro/SunSoft. Permission to use, copy, modify, and
+ * distribute this software is freely granted, provided this notice is
+ * preserved.
+ *
+ * Correlation Cycle evaluates sine/cosine only for finite positive weights in
+ * (0, 2*pi], while atan must cover the full signed f64 ratio domain. The CUDA
+ * f64 row mirrors every constant, branch, operation and parenthesisation below
+ * so recursive rotation cannot amplify a host-libm/libdevice ULP split.
+ */
+#[inline(always)]
+fn correlation_cycle_ms_k_cos(x: f64, y: f64) -> f64 {
+    let c1 = f64::from_bits(0x3fa5_5555_5555_554c);
+    let c2 = f64::from_bits(0xbf56_c16c_16c1_5177);
+    let c3 = f64::from_bits(0x3efa_01a0_19cb_1590);
+    let c4 = f64::from_bits(0xbe92_7e4f_809c_52ad);
+    let c5 = f64::from_bits(0x3e21_ee9e_bdb4_b1c4);
+    let c6 = f64::from_bits(0xbda8_fae9_be88_38d4);
+    let z = x * x;
+    let w2 = z * z;
+    let r = z * (c1 + z * (c2 + z * c3)) + w2 * w2 * (c4 + z * (c5 + z * c6));
+    let hz = 0.5 * z;
+    let w = 1.0 - hz;
+    w + (((1.0 - w) - hz) + (z * r - x * y))
+}
+
+#[inline(always)]
+fn correlation_cycle_ms_k_sin(x: f64, y: f64, has_tail: bool) -> f64 {
+    let s1 = f64::from_bits(0xbfc5_5555_5555_5549);
+    let s2 = f64::from_bits(0x3f81_1111_1110_f8a6);
+    let s3 = f64::from_bits(0xbf2a_01a0_19c1_61d5);
+    let s4 = f64::from_bits(0x3ec7_1de3_57b1_fe7d);
+    let s5 = f64::from_bits(0xbe5a_e5e6_8a2b_9ceb);
+    let s6 = f64::from_bits(0x3de5_d93a_5acf_d57c);
+    let z = x * x;
+    let w = z * z;
+    let r = s2 + z * (s3 + z * s4) + z * w * (s5 + z * s6);
+    let v = z * x;
+    if has_tail {
+        x - ((z * (0.5 * y - v * r) - y) - v * s1)
+    } else {
+        x + v * (s1 + z * r)
+    }
+}
+
+#[inline(always)]
+fn correlation_cycle_reduce_pio2(x: f64) -> (i32, f64, f64) {
+    let inv_pio2 = f64::from_bits(0x3fe4_5f30_6dc9_c883);
+    let to_int = f64::from_bits(0x4338_0000_0000_0000);
+    let pio2_1 = f64::from_bits(0x3ff9_21fb_5440_0000);
+    let pio2_1t = f64::from_bits(0x3dd0_b461_1a62_6331);
+    let pio2_2 = f64::from_bits(0x3dd0_b461_1a60_0000);
+    let pio2_2t = f64::from_bits(0x3ba3_198a_2e03_7073);
+    let pio2_3 = f64::from_bits(0x3ba3_198a_2e00_0000);
+    let pio2_3t = f64::from_bits(0x397b_839a_2520_49c1);
+
+    let tmp = x * inv_pio2 + to_int;
+    let f_n = tmp - to_int;
+    let n = f_n as i32;
+    let mut r = x - f_n * pio2_1;
+    let mut w = f_n * pio2_1t;
+    let mut y0 = r - w;
+    let ex = ((x.to_bits() >> 52) & 0x7ff) as i32;
+    let mut ey = ((y0.to_bits() >> 52) & 0x7ff) as i32;
+    if ex - ey > 16 {
+        let t = r;
+        w = f_n * pio2_2;
+        r = t - w;
+        w = f_n * pio2_2t - ((t - r) - w);
+        y0 = r - w;
+        ey = ((y0.to_bits() >> 52) & 0x7ff) as i32;
+        if ex - ey > 49 {
+            let t = r;
+            w = f_n * pio2_3;
+            r = t - w;
+            w = f_n * pio2_3t - ((t - r) - w);
+            y0 = r - w;
+        }
+    }
+    (n, y0, (r - y0) - w)
+}
+
+#[inline(always)]
+fn correlation_cycle_deterministic_sin_cos(x: f64) -> (f64, f64) {
+    debug_assert!(x.is_finite() && (0.0..=7.0).contains(&x));
+    let high = ((x.to_bits() >> 32) as u32) & 0x7fff_ffff;
+    if high <= 0x3fe9_21fb {
+        return (
+            correlation_cycle_ms_k_sin(x, 0.0, false),
+            correlation_cycle_ms_k_cos(x, 0.0),
+        );
+    }
+
+    let (quadrant, y0, y1) = correlation_cycle_reduce_pio2(x);
+    let sin = correlation_cycle_ms_k_sin(y0, y1, true);
+    let cos = correlation_cycle_ms_k_cos(y0, y1);
+    match quadrant & 3 {
+        0 => (sin, cos),
+        1 => (cos, -sin),
+        2 => (-sin, -cos),
+        _ => (-cos, sin),
+    }
+}
+
+#[inline(always)]
+fn correlation_cycle_deterministic_weight(w: f64, j: usize) -> (f64, f64) {
+    let group_start = j & !3usize;
+    let mut angle = w * ((group_start as f64) + 1.0);
+    let mut offset = j & 3usize;
+    while offset != 0 {
+        angle += w;
+        offset -= 1;
+    }
+    let (sin, cos) = correlation_cycle_deterministic_sin_cos(angle);
+    (cos, -sin)
+}
+
+#[inline(always)]
+fn correlation_cycle_deterministic_atan(input: f64) -> f64 {
+    let atan_hi = [
+        f64::from_bits(0x3fdd_ac67_0561_bb4f),
+        f64::from_bits(0x3fe9_21fb_5444_2d18),
+        f64::from_bits(0x3fef_730b_d281_f69b),
+        f64::from_bits(0x3ff9_21fb_5444_2d18),
+    ];
+    let atan_lo = [
+        f64::from_bits(0x3c7a_2b7f_222f_65e2),
+        f64::from_bits(0x3c81_a626_3314_5c07),
+        f64::from_bits(0x3c70_0788_7af0_cbbd),
+        f64::from_bits(0x3c91_a626_3314_5c07),
+    ];
+    let coefficients = [
+        f64::from_bits(0x3fd5_5555_5555_550d),
+        f64::from_bits(0xbfc9_9999_9998_ebc4),
+        f64::from_bits(0x3fc2_4924_9200_83ff),
+        f64::from_bits(0xbfbc_71c6_fe23_1671),
+        f64::from_bits(0x3fb7_45cd_c54c_206e),
+        f64::from_bits(0xbfb3_b0f2_af74_9a6d),
+        f64::from_bits(0x3fb1_0d66_a0d0_3d51),
+        f64::from_bits(0xbfad_de2d_52de_fd9a),
+        f64::from_bits(0x3fa9_7b4b_2476_0deb),
+        f64::from_bits(0xbfa2_b444_2c6a_6c2f),
+        f64::from_bits(0x3f90_ad3a_e322_da11),
+    ];
+
+    let mut x = input;
+    let mut high = (x.to_bits() >> 32) as u32;
+    let sign = high >> 31;
+    high &= 0x7fff_ffff;
+    if high >= 0x4410_0000 {
+        if x.is_nan() {
+            return x;
+        }
+        return if sign != 0 {
+            -CORRELATION_CYCLE_HALF_PI
+        } else {
+            CORRELATION_CYCLE_HALF_PI
+        };
+    }
+
+    let reduction = if high < 0x3fdc_0000 {
+        if high < 0x3e40_0000 {
+            return x;
+        }
+        -1
+    } else {
+        x = f64::from_bits(x.to_bits() & 0x7fff_ffff_ffff_ffff);
+        if high < 0x3ff3_0000 {
+            if high < 0x3fe6_0000 {
+                x = (2.0 * x - 1.0) / (2.0 + x);
+                0
+            } else {
+                x = (x - 1.0) / (x + 1.0);
+                1
+            }
+        } else if high < 0x4003_8000 {
+            x = (x - 1.5) / (1.0 + 1.5 * x);
+            2
+        } else {
+            x = -1.0 / x;
+            3
+        }
+    };
+
+    let z = x * x;
+    let w = z * z;
+    let s1 = z
+        * (coefficients[0]
+            + w * (coefficients[2]
+                + w * (coefficients[4]
+                    + w * (coefficients[6] + w * (coefficients[8] + w * coefficients[10])))));
+    let s2 = w
+        * (coefficients[1]
+            + w * (coefficients[3]
+                + w * (coefficients[5] + w * (coefficients[7] + w * coefficients[9]))));
+    if reduction < 0 {
+        return x - x * (s1 + s2);
+    }
+
+    let index = reduction as usize;
+    let result = atan_hi[index] - ((x * (s1 + s2) - atan_lo[index]) - x);
+    if sign != 0 { -result } else { result }
+}
+
+#[inline(always)]
+fn correlation_cycle_deterministic_angle(real: f64, imag: f64) -> f64 {
+    if imag == 0.0 {
+        return 0.0;
+    }
+    let mut angle = (correlation_cycle_deterministic_atan(real / imag) + CORRELATION_CYCLE_HALF_PI)
+        * CORRELATION_CYCLE_RADIANS_TO_DEGREES;
+    if imag > 0.0 {
+        angle -= 180.0;
+    }
+    angle
 }
 
 impl<'a> AsRef<[f64]> for CorrelationCycleInput<'a> {
@@ -66,10 +269,6 @@ pub struct CorrelationCycleOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct CorrelationCycleParams {
     pub period: Option<usize>,
     pub threshold: Option<f64>,
@@ -293,7 +492,6 @@ pub fn correlation_cycle_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn correlation_cycle_into(
     input: &CorrelationCycleInput,
     out_real: &mut [f64],
@@ -572,11 +770,8 @@ unsafe fn correlation_cycle_compute_into(
     angle: &mut [f64],
     state: &mut [f64],
 ) {
-    let half_pi = f64::asin(1.0);
-    let two_pi = 4.0 * f64::asin(1.0);
-
     let n = period as f64;
-    let w = two_pi / n;
+    let w = CORRELATION_CYCLE_TWO_PI / n;
 
     let mut cos_table = vec![0.0f64; period];
     let mut sin_table = vec![0.0f64; period];
@@ -589,9 +784,7 @@ unsafe fn correlation_cycle_compute_into(
     {
         let mut j = 0usize;
         while j + 4 <= period {
-            let a0 = w * ((j as f64) + 1.0);
-            let (s0, c0) = a0.sin_cos();
-            let ys0 = -s0;
+            let (c0, ys0) = correlation_cycle_deterministic_weight(w, j);
             *cos_table.get_unchecked_mut(j) = c0;
             *sin_table.get_unchecked_mut(j) = ys0;
             sum_cos += c0;
@@ -599,9 +792,7 @@ unsafe fn correlation_cycle_compute_into(
             sum_cos2 += c0 * c0;
             sum_sin2 += ys0 * ys0;
 
-            let a1 = a0 + w;
-            let (s1, c1) = a1.sin_cos();
-            let ys1 = -s1;
+            let (c1, ys1) = correlation_cycle_deterministic_weight(w, j + 1);
             *cos_table.get_unchecked_mut(j + 1) = c1;
             *sin_table.get_unchecked_mut(j + 1) = ys1;
             sum_cos += c1;
@@ -609,9 +800,7 @@ unsafe fn correlation_cycle_compute_into(
             sum_cos2 += c1 * c1;
             sum_sin2 += ys1 * ys1;
 
-            let a2 = a1 + w;
-            let (s2, c2) = a2.sin_cos();
-            let ys2 = -s2;
+            let (c2, ys2) = correlation_cycle_deterministic_weight(w, j + 2);
             *cos_table.get_unchecked_mut(j + 2) = c2;
             *sin_table.get_unchecked_mut(j + 2) = ys2;
             sum_cos += c2;
@@ -619,9 +808,7 @@ unsafe fn correlation_cycle_compute_into(
             sum_cos2 += c2 * c2;
             sum_sin2 += ys2 * ys2;
 
-            let a3 = a2 + w;
-            let (s3, c3) = a3.sin_cos();
-            let ys3 = -s3;
+            let (c3, ys3) = correlation_cycle_deterministic_weight(w, j + 3);
             *cos_table.get_unchecked_mut(j + 3) = c3;
             *sin_table.get_unchecked_mut(j + 3) = ys3;
             sum_cos += c3;
@@ -632,9 +819,7 @@ unsafe fn correlation_cycle_compute_into(
             j += 4;
         }
         while j < period {
-            let a = w * ((j as f64) + 1.0);
-            let (s, c) = a.sin_cos();
-            let ys = -s;
+            let (c, ys) = correlation_cycle_deterministic_weight(w, j);
             *cos_table.get_unchecked_mut(j) = c;
             *sin_table.get_unchecked_mut(j) = ys;
             sum_cos += c;
@@ -702,26 +887,13 @@ unsafe fn correlation_cycle_compute_into(
         *real.get_unchecked_mut(i) = r_val;
         *imag.get_unchecked_mut(i) = i_val;
 
-        let a = if i_val == 0.0 {
-            0.0
-        } else {
-            let mut a = (r_val / i_val).atan() + half_pi;
-            a = a.to_degrees();
-            if i_val > 0.0 {
-                a -= 180.0;
-            }
-            a
-        };
+        let a = correlation_cycle_deterministic_angle(r_val, i_val);
         *angle.get_unchecked_mut(i) = a;
 
         if i >= start_s {
             let prev = prev_angle;
             let st = if !prev.is_nan() && (a - prev).abs() < threshold {
-                if a >= 0.0 {
-                    1.0
-                } else {
-                    -1.0
-                }
+                if a >= 0.0 { 1.0 } else { -1.0 }
             } else {
                 0.0
             };
@@ -776,10 +948,8 @@ pub unsafe fn correlation_cycle_avx2(
 ) {
     use core::arch::x86_64::*;
 
-    let half_pi = f64::asin(1.0);
-    let two_pi = 4.0 * f64::asin(1.0);
     let n = period as f64;
-    let w = two_pi / n;
+    let w = CORRELATION_CYCLE_TWO_PI / n;
 
     let mut cos_table = vec![0.0f64; period];
     let mut sin_table = vec![0.0f64; period];
@@ -790,9 +960,7 @@ pub unsafe fn correlation_cycle_avx2(
     let mut sum_sin2 = 0.0f64;
 
     for j in 0..period {
-        let a = w * ((j as f64) + 1.0);
-        let (s, c) = a.sin_cos();
-        let ys = -s;
+        let (c, ys) = correlation_cycle_deterministic_weight(w, j);
         *cos_table.get_unchecked_mut(j) = c;
         *sin_table.get_unchecked_mut(j) = ys;
         sum_cos += c;
@@ -898,26 +1066,13 @@ pub unsafe fn correlation_cycle_avx2(
         *real.get_unchecked_mut(i) = r_val;
         *imag.get_unchecked_mut(i) = i_val;
 
-        let a = if i_val == 0.0 {
-            0.0
-        } else {
-            let mut a = (r_val / i_val).atan() + half_pi;
-            a = a.to_degrees();
-            if i_val > 0.0 {
-                a -= 180.0;
-            }
-            a
-        };
+        let a = correlation_cycle_deterministic_angle(r_val, i_val);
         *angle.get_unchecked_mut(i) = a;
 
         if i >= start_s {
             let prev = prev_angle;
             let st = if !prev.is_nan() && (a - prev).abs() < threshold {
-                if a >= 0.0 {
-                    1.0
-                } else {
-                    -1.0
-                }
+                if a >= 0.0 { 1.0 } else { -1.0 }
             } else {
                 0.0
             };
@@ -943,10 +1098,8 @@ pub unsafe fn correlation_cycle_avx512(
 ) {
     use core::arch::x86_64::*;
 
-    let half_pi = f64::asin(1.0);
-    let two_pi = 4.0 * f64::asin(1.0);
     let n = period as f64;
-    let w = two_pi / n;
+    let w = CORRELATION_CYCLE_TWO_PI / n;
 
     let mut cos_table = vec![0.0f64; period];
     let mut sin_table = vec![0.0f64; period];
@@ -957,9 +1110,7 @@ pub unsafe fn correlation_cycle_avx512(
     let mut sum_sin2 = 0.0f64;
 
     for j in 0..period {
-        let a = w * ((j as f64) + 1.0);
-        let (s, c) = a.sin_cos();
-        let ys = -s;
+        let (c, ys) = correlation_cycle_deterministic_weight(w, j);
         *cos_table.get_unchecked_mut(j) = c;
         *sin_table.get_unchecked_mut(j) = ys;
         sum_cos += c;
@@ -1073,26 +1224,13 @@ pub unsafe fn correlation_cycle_avx512(
         *real.get_unchecked_mut(i) = r_val;
         *imag.get_unchecked_mut(i) = i_val;
 
-        let a = if i_val == 0.0 {
-            0.0
-        } else {
-            let mut a = (r_val / i_val).atan() + half_pi;
-            a = a.to_degrees();
-            if i_val > 0.0 {
-                a -= 180.0;
-            }
-            a
-        };
+        let a = correlation_cycle_deterministic_angle(r_val, i_val);
         *angle.get_unchecked_mut(i) = a;
 
         if i >= start_s {
             let prev = prev_angle;
             let st = if !prev.is_nan() && (a - prev).abs() < threshold {
-                if a >= 0.0 {
-                    1.0
-                } else {
-                    -1.0
-                }
+                if a >= 0.0 { 1.0 } else { -1.0 }
             } else {
                 0.0
             };
@@ -1197,7 +1335,6 @@ pub struct CorrelationCycleStream {
     prev_angle: f64,
 
     n: f64,
-    half_pi: f64,
     z_re: f64,
     z_im: f64,
     sum_cos: f64,
@@ -1219,14 +1356,10 @@ impl CorrelationCycleStream {
         }
         let threshold = params.threshold.unwrap_or(9.0);
 
-        let half_pi = f64::asin(1.0);
-        let two_pi = 4.0 * half_pi;
         let n = period as f64;
-        let w = two_pi / n;
+        let w = CORRELATION_CYCLE_TWO_PI / n;
 
-        let (s_w, c_w) = w.sin_cos();
-        let z_re = c_w;
-        let z_im = -s_w;
+        let (z_re, z_im) = correlation_cycle_deterministic_weight(w, 0);
 
         let mut sum_cos = 0.0f64;
         let mut sum_sin = 0.0f64;
@@ -1235,21 +1368,10 @@ impl CorrelationCycleStream {
 
         let mut j = 0usize;
         while j + 4 <= period {
-            let a0 = w * ((j as f64) + 1.0);
-            let (s0, c0) = a0.sin_cos();
-            let ys0 = -s0;
-
-            let a1 = a0 + w;
-            let (s1, c1) = a1.sin_cos();
-            let ys1 = -s1;
-
-            let a2 = a1 + w;
-            let (s2, c2) = a2.sin_cos();
-            let ys2 = -s2;
-
-            let a3 = a2 + w;
-            let (s3, c3) = a3.sin_cos();
-            let ys3 = -s3;
+            let (c0, ys0) = correlation_cycle_deterministic_weight(w, j);
+            let (c1, ys1) = correlation_cycle_deterministic_weight(w, j + 1);
+            let (c2, ys2) = correlation_cycle_deterministic_weight(w, j + 2);
+            let (c3, ys3) = correlation_cycle_deterministic_weight(w, j + 3);
 
             sum_cos += c0 + c1 + c2 + c3;
             sum_sin += ys0 + ys1 + ys2 + ys3;
@@ -1259,9 +1381,7 @@ impl CorrelationCycleStream {
             j += 4;
         }
         while j < period {
-            let a = w * ((j as f64) + 1.0);
-            let (s, c) = a.sin_cos();
-            let ys = -s;
+            let (c, ys) = correlation_cycle_deterministic_weight(w, j);
             sum_cos += c;
             sum_sin += ys;
             sum_cos2 += c * c;
@@ -1291,7 +1411,6 @@ impl CorrelationCycleStream {
             prev_angle: f64::NAN,
 
             n,
-            half_pi,
             z_re,
             z_im,
             sum_cos,
@@ -1384,23 +1503,10 @@ impl CorrelationCycleStream {
             }
         }
 
-        let mut ang = if i_val == 0.0 {
-            0.0
-        } else {
-            let mut a = (r_val / i_val).atan() + self.half_pi;
-            a = a.to_degrees();
-            if i_val > 0.0 {
-                a -= 180.0;
-            }
-            a
-        };
+        let ang = correlation_cycle_deterministic_angle(r_val, i_val);
 
         let st = if self.prev_angle.is_finite() && (ang - self.prev_angle).abs() < self.threshold {
-            if ang >= 0.0 {
-                1.0
-            } else {
-                -1.0
-            }
+            if ang >= 0.0 { 1.0 } else { -1.0 }
         } else if self.prev_angle.is_finite() {
             0.0
         } else {
@@ -1412,11 +1518,7 @@ impl CorrelationCycleStream {
         let to_emit = self.last.take();
         self.last = Some((r_val, i_val, ang, st));
 
-        if first_wrap_now {
-            None
-        } else {
-            to_emit
-        }
+        if first_wrap_now { None } else { to_emit }
     }
 }
 
@@ -1977,57 +2079,102 @@ fn correlation_cycle_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn correlation_cycle_output_into_js(
-    data: &[f64],
-    period: Option<usize>,
-    threshold: Option<f64>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = correlation_cycle_js(data, period, threshold)?;
-    crate::write_wasm_object_f64_outputs("correlation_cycle_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn correlation_cycle_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    threshold_start: f64,
-    threshold_end: f64,
-    threshold_step: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = correlation_cycle_batch_js(
-        data,
-        period_start,
-        period_end,
-        period_step,
-        threshold_start,
-        threshold_end,
-        threshold_step,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "correlation_cycle_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
+
+    #[test]
+    fn correlation_cycle_deterministic_sin_cos_pins_the_complete_weight_domain() {
+        assert_eq!(CORRELATION_CYCLE_HALF_PI.to_bits(), 0x3ff9_21fb_5444_2d18);
+        assert_eq!(CORRELATION_CYCLE_TWO_PI.to_bits(), 0x4019_21fb_5444_2d18);
+        assert_eq!(
+            CORRELATION_CYCLE_RADIANS_TO_DEGREES.to_bits(),
+            0x404c_a5dc_1a63_c1f8
+        );
+
+        let cases = [
+            (
+                0x0000_0000_0000_0000,
+                0x0000_0000_0000_0000,
+                0x3ff0_0000_0000_0000,
+            ),
+            (
+                0x3fe0_c152_382d_7365,
+                0x3fdf_ffff_ffff_ffff,
+                0x3feb_b67a_e858_4cab,
+            ),
+            (
+                0x3fe9_21fb_5444_2d18,
+                0x3fe6_a09e_667f_3bcc,
+                0x3fe6_a09e_667f_3bcd,
+            ),
+            (
+                0x3ff9_21fb_5444_2d18,
+                0x3ff0_0000_0000_0000,
+                0x3c91_a626_3314_5c07,
+            ),
+            (
+                0x4000_c152_382d_7365,
+                0x3feb_b67a_e858_4cab,
+                0xbfdf_ffff_ffff_fffc,
+            ),
+            (
+                0x4009_21fb_5444_2d18,
+                0x3ca1_a626_3314_5c07,
+                0xbff0_0000_0000_0000,
+            ),
+            (
+                0x4012_d97c_7f33_21d2,
+                0xbff0_0000_0000_0000,
+                0xbcaa_7939_4c9e_8a0a,
+            ),
+            (
+                0x4019_21fb_5444_2d18,
+                0xbcb1_a626_3314_5c07,
+                0x3ff0_0000_0000_0000,
+            ),
+        ];
+
+        for (input_bits, expected_sin_bits, expected_cos_bits) in cases {
+            let (sin, cos) = correlation_cycle_deterministic_sin_cos(f64::from_bits(input_bits));
+            assert_eq!(sin.to_bits(), expected_sin_bits, "sin({input_bits:#018x})");
+            assert_eq!(cos.to_bits(), expected_cos_bits, "cos({input_bits:#018x})");
+        }
+    }
+
+    #[test]
+    fn correlation_cycle_deterministic_atan_pins_every_reduction_branch_and_sign() {
+        let cases = [
+            (0x0000_0000_0000_0000, 0x0000_0000_0000_0000),
+            (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+            (0x3fd0_0000_0000_0000, 0x3fcf_5b75_f92c_80dd),
+            (0xbfd0_0000_0000_0000, 0xbfcf_5b75_f92c_80dd),
+            (0x3fe0_0000_0000_0000, 0x3fdd_ac67_0561_bb4f),
+            (0xbfe0_0000_0000_0000, 0xbfdd_ac67_0561_bb4f),
+            (0x3ff0_0000_0000_0000, 0x3fe9_21fb_5444_2d18),
+            (0xbff0_0000_0000_0000, 0xbfe9_21fb_5444_2d18),
+            (0x3ff8_0000_0000_0000, 0x3fef_730b_d281_f69b),
+            (0xbff8_0000_0000_0000, 0xbfef_730b_d281_f69b),
+            (0x4008_0000_0000_0000, 0x3ff3_fc17_6b7a_8560),
+            (0xc008_0000_0000_0000, 0xbff3_fc17_6b7a_8560),
+            (0x7ff0_0000_0000_0000, 0x3ff9_21fb_5444_2d18),
+            (0xfff0_0000_0000_0000, 0xbff9_21fb_5444_2d18),
+            (0x7ff8_1234_5678_9abc, 0x7ff8_1234_5678_9abc),
+        ];
+
+        for (input_bits, expected_bits) in cases {
+            let actual = correlation_cycle_deterministic_atan(f64::from_bits(input_bits));
+            assert_eq!(actual.to_bits(), expected_bits, "atan({input_bits:#018x})");
+        }
+    }
 
     fn check_cc_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = CorrelationCycleParams {
             period: None,
             threshold: None,
@@ -2040,8 +2187,8 @@ mod tests {
 
     fn check_cc_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = CorrelationCycleParams {
             period: Some(20),
             threshold: Some(9.0),
@@ -2107,8 +2254,8 @@ mod tests {
 
     fn check_cc_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = CorrelationCycleInput::with_default_candles(&candles);
         match input.data {
             CorrelationCycleData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -2191,8 +2338,8 @@ mod tests {
 
     fn check_cc_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = CorrelationCycleInput::from_candles(
             &candles,
             "close",
@@ -2218,8 +2365,8 @@ mod tests {
 
     fn check_cc_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 20;
         let threshold = 9.0;
         let input = CorrelationCycleInput::from_candles(
@@ -2278,8 +2425,8 @@ mod tests {
     fn check_cc_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             CorrelationCycleParams {
@@ -2388,11 +2535,10 @@ mod tests {
         check_cc_no_poison
     );
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_correlation_cycle_into_matches_api_v2() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = CorrelationCycleInput::from_candles(
             &candles,
@@ -2709,8 +2855,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = CorrelationCycleBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2749,8 +2895,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = CorrelationCycleBatchBuilder::new()
             .kernel(kernel)
@@ -2829,13 +2975,8 @@ mod tests {
         let mut out_a = vec![0.0; n];
         let mut out_s = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             correlation_cycle_into(&input, &mut out_r, &mut out_i, &mut out_a, &mut out_s)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            return Ok(());
         }
 
         assert_eq!(base.real.len(), n);
@@ -2876,542 +3017,6 @@ mod tests {
                 base.state[i],
                 out_s[i]
             );
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(
-    module = "vector_ta",
-    name = "DeviceArrayF32CorrelationCycle",
-    unsendable
-)]
-pub struct DeviceArrayF32CcPy {
-    pub(crate) inner: crate::cuda::moving_averages::DeviceArrayF32,
-
-    pub(crate) _ctx: StdArc<CudaContext>,
-    pub(crate) device_id: i32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32CcPy {
-    #[new]
-    fn py_new() -> PyResult<Self> {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "use correlation_cycle_cuda_* factory functions to create this type",
-        ))
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let inner = &self.inner;
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr_val: usize = if inner.rows == 0 || inner.cols == 0 {
-            0
-        } else {
-            inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        Ok((2, self.device_id))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        if let Some(obj) = &stream {
-            if let Ok(s) = obj.extract::<i64>(py) {
-                if s == 0 {
-                    return Err(PyValueError::new_err(
-                        "stream=0 is reserved and not supported by this producer",
-                    ));
-                }
-            }
-        }
-
-        let dummy = cust::memory::DeviceBuffer::<f32>::from_slice(&[])
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            crate::cuda::moving_averages::DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32CcPy {
-    pub fn new_from_rust(
-        inner: crate::cuda::moving_averages::DeviceArrayF32,
-        ctx: StdArc<CudaContext>,
-        device_id: u32,
-    ) -> Self {
-        Self {
-            inner,
-            _ctx: ctx,
-            device_id: device_id as i32,
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "correlation_cycle_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, threshold_range, device_id=0))]
-pub fn correlation_cycle_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    threshold_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(
-    DeviceArrayF32CcPy,
-    DeviceArrayF32CcPy,
-    DeviceArrayF32CcPy,
-    DeviceArrayF32CcPy,
-)> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::CudaCorrelationCycle;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = CorrelationCycleBatchRange {
-        period: period_range,
-        threshold: threshold_range,
-    };
-    let (quad, ctx, dev_id) = py.allow_threads(|| {
-        let mut cuda = CudaCorrelationCycle::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let quad = cuda
-            .correlation_cycle_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((quad, ctx, dev_id))
-    })?;
-    Ok((
-        DeviceArrayF32CcPy::new_from_rust(quad.real, ctx.clone(), dev_id),
-        DeviceArrayF32CcPy::new_from_rust(quad.imag, ctx.clone(), dev_id),
-        DeviceArrayF32CcPy::new_from_rust(quad.angle, ctx.clone(), dev_id),
-        DeviceArrayF32CcPy::new_from_rust(quad.state, ctx, dev_id),
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "correlation_cycle_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, threshold, device_id=0))]
-pub fn correlation_cycle_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    threshold: f64,
-    device_id: usize,
-) -> PyResult<(
-    DeviceArrayF32CcPy,
-    DeviceArrayF32CcPy,
-    DeviceArrayF32CcPy,
-    DeviceArrayF32CcPy,
-)> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::CudaCorrelationCycle;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if flat.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let params = CorrelationCycleParams {
-        period: Some(period),
-        threshold: Some(threshold),
-    };
-    let (quad, ctx, dev_id) = py.allow_threads(|| {
-        let mut cuda = CudaCorrelationCycle::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let quad = cuda
-            .correlation_cycle_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((quad, ctx, dev_id))
-    })?;
-    Ok((
-        DeviceArrayF32CcPy::new_from_rust(quad.real, ctx.clone(), dev_id),
-        DeviceArrayF32CcPy::new_from_rust(quad.imag, ctx.clone(), dev_id),
-        DeviceArrayF32CcPy::new_from_rust(quad.angle, ctx.clone(), dev_id),
-        DeviceArrayF32CcPy::new_from_rust(quad.state, ctx, dev_id),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "correlation_cycle")]
-#[pyo3(signature = (data, period=None, threshold=None, kernel=None))]
-pub fn correlation_cycle_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: Option<usize>,
-    threshold: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArrayMethods;
-
-    let data_slice = data.as_slice()?;
-    let kern = match kernel {
-        Some(k) => crate::utilities::kernel_validation::validate_kernel(Some(k), false)?,
-        None => Kernel::Auto,
-    };
-
-    let params = CorrelationCycleParams { period, threshold };
-    let input = CorrelationCycleInput::from_slice(data_slice, params);
-
-    let output = py
-        .allow_threads(|| correlation_cycle_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("real", output.real.into_pyarray(py))?;
-    dict.set_item("imag", output.imag.into_pyarray(py))?;
-    dict.set_item("angle", output.angle.into_pyarray(py))?;
-    dict.set_item("state", output.state.into_pyarray(py))?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "correlation_cycle_batch")]
-#[pyo3(signature = (data, period_range=None, threshold_range=None, kernel=None))]
-pub fn correlation_cycle_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: Option<(usize, usize, usize)>,
-    threshold_range: Option<(f64, f64, f64)>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArrayMethods;
-
-    let slice_in = data.as_slice()?;
-
-    let sweep = CorrelationCycleBatchRange {
-        period: period_range.unwrap_or((20, 100, 1)),
-        threshold: threshold_range.unwrap_or((9.0, 9.0, 0.0)),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_real = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_imag = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_angle = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_state = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let mut_r = unsafe { out_real.as_slice_mut()? };
-    let mut_im = unsafe { out_imag.as_slice_mut()? };
-    let mut_an = unsafe { out_angle.as_slice_mut()? };
-    let mut_st = unsafe { out_state.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let simd = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        let row_k = match simd {
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512Batch => Kernel::Avx512,
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => Kernel::Scalar,
-        };
-        correlation_cycle_batch_inner_into(
-            slice_in, &sweep, row_k, true, mut_r, mut_im, mut_an, mut_st,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("real", out_real.reshape((rows, cols))?)?;
-    dict.set_item("imag", out_imag.reshape((rows, cols))?)?;
-    dict.set_item("angle", out_angle.reshape((rows, cols))?)?;
-    dict.set_item("state", out_state.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "thresholds",
-        combos
-            .iter()
-            .map(|p| p.threshold.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "CorrelationCycleStream")]
-pub struct CorrelationCycleStreamPy {
-    inner: CorrelationCycleStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl CorrelationCycleStreamPy {
-    #[new]
-    #[pyo3(signature = (period=None, threshold=None))]
-    pub fn new(period: Option<usize>, threshold: Option<f64>) -> PyResult<Self> {
-        let params = CorrelationCycleParams { period, threshold };
-        let inner = CorrelationCycleStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<(f64, f64, f64, f64)> {
-        self.inner.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CorrelationCycleJsOutput {
-    pub real: Vec<f64>,
-    pub imag: Vec<f64>,
-    pub angle: Vec<f64>,
-    pub state: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn correlation_cycle_js(
-    data: &[f64],
-    period: Option<usize>,
-    threshold: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    let params = CorrelationCycleParams { period, threshold };
-    let input = CorrelationCycleInput::from_slice(data, params);
-
-    let output = correlation_cycle(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = CorrelationCycleJsOutput {
-        real: output.real,
-        imag: output.imag,
-        angle: output.angle,
-        state: output.state,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CorrelationCycleBatchJsOutput {
-    pub real: Vec<f64>,
-    pub imag: Vec<f64>,
-    pub angle: Vec<f64>,
-    pub state: Vec<f64>,
-    pub combos: Vec<CorrelationCycleParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn correlation_cycle_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    threshold_start: f64,
-    threshold_end: f64,
-    threshold_step: f64,
-) -> Result<JsValue, JsValue> {
-    let sweep = CorrelationCycleBatchRange {
-        period: (period_start, period_end, period_step),
-        threshold: (threshold_start, threshold_end, threshold_step),
-    };
-
-    let output = correlation_cycle_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = CorrelationCycleBatchJsOutput {
-        real: output.real,
-        imag: output.imag,
-        angle: output.angle,
-        state: output.state,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn correlation_cycle_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn correlation_cycle_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn correlation_cycle_into(
-    in_ptr: *const f64,
-    real_ptr: *mut f64,
-    imag_ptr: *mut f64,
-    angle_ptr: *mut f64,
-    state_ptr: *mut f64,
-    len: usize,
-    period: Option<usize>,
-    threshold: Option<f64>,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null()
-        || real_ptr.is_null()
-        || imag_ptr.is_null()
-        || angle_ptr.is_null()
-        || state_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = CorrelationCycleParams { period, threshold };
-        let input = CorrelationCycleInput::from_slice(data, params);
-
-        let has_aliasing = in_ptr == real_ptr as *const f64
-            || in_ptr == imag_ptr as *const f64
-            || in_ptr == angle_ptr as *const f64
-            || in_ptr == state_ptr as *const f64;
-
-        if has_aliasing {
-            let mut temp_real = vec![0.0; len];
-            let mut temp_imag = vec![0.0; len];
-            let mut temp_angle = vec![0.0; len];
-            let mut temp_state = vec![0.0; len];
-
-            correlation_cycle_into_slices(
-                &mut temp_real,
-                &mut temp_imag,
-                &mut temp_angle,
-                &mut temp_state,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let real_out = std::slice::from_raw_parts_mut(real_ptr, len);
-            let imag_out = std::slice::from_raw_parts_mut(imag_ptr, len);
-            let angle_out = std::slice::from_raw_parts_mut(angle_ptr, len);
-            let state_out = std::slice::from_raw_parts_mut(state_ptr, len);
-
-            real_out.copy_from_slice(&temp_real);
-            imag_out.copy_from_slice(&temp_imag);
-            angle_out.copy_from_slice(&temp_angle);
-            state_out.copy_from_slice(&temp_state);
-        } else {
-            let real_out = std::slice::from_raw_parts_mut(real_ptr, len);
-            let imag_out = std::slice::from_raw_parts_mut(imag_ptr, len);
-            let angle_out = std::slice::from_raw_parts_mut(angle_ptr, len);
-            let state_out = std::slice::from_raw_parts_mut(state_ptr, len);
-
-            correlation_cycle_into_slices(
-                real_out,
-                imag_out,
-                angle_out,
-                state_out,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         }
 
         Ok(())

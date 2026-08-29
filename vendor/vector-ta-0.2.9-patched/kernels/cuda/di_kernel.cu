@@ -398,11 +398,10 @@ void di_many_series_one_param_f32(const float* __restrict__ high_tm,
 //   di_scalar_into (:406)          — the arithmetic
 // Batch default period 14, input high/low/close.
 //
-// WHICH OUTPUT. `di` is multi-output (plus / minus) and the lane emits ONE
-// matrix. compute_di_batch (cpu_batch.rs) maps output_id "value" — the id the
-// f64 lane requests — to PLUS: `if output_id == "plus" || output_id == "value"
-// { 1u8 }`. So this kernel is +DI, matching the column the CPU emits for the
-// same request. -DI is a second entry point's job, not a silent alternative.
+// WHICH OUTPUT. `di` is multi-output (plus / minus). The preserved primary ABI
+// emits canonical `plus`; the production pair ABI emits canonical `plus` and
+// `minus` from the same row authority and one launch. Retired `value` is not a
+// registry or dispatcher spelling.
 //
 // FIRST-VALID IS THE SIMULTANEOUS RULE (:225):
 //   (0..n).find(|i| !(high[i].is_nan() || low[i].is_nan() || close[i].is_nan()))
@@ -442,34 +441,34 @@ __device__ __forceinline__ double neo_s3_qnan() {
     return __longlong_as_double(0x7ff8000000000000LL);
 }
 
-extern "C" __global__ void neoethos_di_batch_f64(
+__device__ __forceinline__ void di_row_f64(
     const double* __restrict__ high,
     const double* __restrict__ low,
     const double* __restrict__ close,
     int n,
-    const int* __restrict__ periods,
-    int n_combos,
+    int period,
     int first_valid,
-    double* __restrict__ out)
+    double* __restrict__ row_plus,
+    double* __restrict__ row_minus)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= n_combos) return;
-
-    double* __restrict__ row = out + (size_t)r * (size_t)n;
-    const int period = periods[r];
-
     const bool declined =
         (n <= 0) ||
         (first_valid < 0) || (first_valid >= n) ||
         (period == 0) || (period > n) ||
         ((n - first_valid) < period);
     if (declined) {
-        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
+        for (int i = 0; i < n; ++i) {
+            if (row_plus != nullptr) row_plus[i] = neo_s3_qnan();
+            if (row_minus != nullptr) row_minus[i] = neo_s3_qnan();
+        }
         return;
     }
 
     const int warm = first_valid + period - 1;
-    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s3_qnan();
+    for (int i = 0; i < warm && i < n; ++i) {
+        if (row_plus != nullptr) row_plus[i] = neo_s3_qnan();
+        if (row_minus != nullptr) row_minus[i] = neo_s3_qnan();
+    }
 
     const double pf = (double)period;
     const double invp = 1.0 / pf;
@@ -483,6 +482,7 @@ extern "C" __global__ void neoethos_di_batch_f64(
     const int stop  = first_valid + period;
 
     double plus_dm_sum = 0.0;
+    double minus_dm_sum = 0.0;
     double tr_sum = 0.0;
 
     for (int i = start; i < stop; ++i) {
@@ -493,6 +493,7 @@ extern "C" __global__ void neoethos_di_batch_f64(
         const double dp = ch - prev_h;
         const double dm = prev_l - cl;
         if (dp > dm && dp > 0.0) plus_dm_sum += dp;
+        if (dm > dp && dm > 0.0) minus_dm_sum += dm;
 
         double tr = ch - cl;
         const double tr2 = fabs(ch - prev_c);
@@ -507,11 +508,13 @@ extern "C" __global__ void neoethos_di_batch_f64(
     }
 
     double cur_plus = plus_dm_sum;
+    double cur_minus = minus_dm_sum;
     double cur_tr = tr_sum;
 
     int idx = stop - 1;
     double scale = (cur_tr == 0.0) ? 0.0 : (100.0 / cur_tr);
-    row[idx] = cur_plus * scale;
+    if (row_plus != nullptr) row_plus[idx] = cur_plus * scale;
+    if (row_minus != nullptr) row_minus[idx] = cur_minus * scale;
     idx += 1;
 
     for (; idx < n; ++idx) {
@@ -522,8 +525,10 @@ extern "C" __global__ void neoethos_di_batch_f64(
         const double dp = ch - prev_h;
         const double dm = prev_l - cl;
         const double inc_p = (dp > dm && dp > 0.0) ? dp : 0.0;
+        const double inc_m = (dm > dp && dm > 0.0) ? dm : 0.0;
 
         cur_plus = fma(cur_plus, keep, inc_p);
+        cur_minus = fma(cur_minus, keep, inc_m);
 
         double tr = ch - cl;
         const double tr2 = fabs(ch - prev_c);
@@ -533,10 +538,63 @@ extern "C" __global__ void neoethos_di_batch_f64(
         cur_tr = fma(cur_tr, keep, tr);
 
         scale = (cur_tr == 0.0) ? 0.0 : (100.0 / cur_tr);
-        row[idx] = cur_plus * scale;
+        if (row_plus != nullptr) row_plus[idx] = cur_plus * scale;
+        if (row_minus != nullptr) row_minus[idx] = cur_minus * scale;
 
         prev_h = ch;
         prev_l = cl;
         prev_c = cc;
     }
+}
+
+extern "C" __global__ void neoethos_di_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+
+    double* __restrict__ row_plus = out + (size_t)combo * (size_t)n;
+    di_row_f64(
+        high,
+        low,
+        close,
+        n,
+        periods[combo],
+        first_valid,
+        row_plus,
+        nullptr);
+}
+
+extern "C" __global__ void di_outputs_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out_plus,
+    double* __restrict__ out_minus)
+{
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos) return;
+
+    double* __restrict__ row_plus = out_plus + (size_t)combo * (size_t)n;
+    double* __restrict__ row_minus = out_minus + (size_t)combo * (size_t)n;
+    di_row_f64(
+        high,
+        low,
+        close,
+        n,
+        periods[combo],
+        first_valid,
+        row_plus,
+        row_minus);
 }

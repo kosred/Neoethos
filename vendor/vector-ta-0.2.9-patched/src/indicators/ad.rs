@@ -1,22 +1,10 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaAd;
 use crate::utilities::data_loader::Candles;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, make_uninit_matrix,
 };
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyReadonlyArray1;
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList, PyListMethods};
-#[cfg(feature = "python")]
-use pyo3::{pyfunction, Bound, PyResult, Python};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use thiserror::Error;
@@ -221,7 +209,6 @@ pub fn ad_with_kernel(input: &AdInput, kernel: Kernel) -> Result<AdOutput, AdErr
     Ok(AdOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ad_into(input: &AdInput, out: &mut [f64]) -> Result<(), AdError> {
     ad_into_slice(out, input, Kernel::Auto)
@@ -296,6 +283,9 @@ pub fn ad_into_slice(dst: &mut [f64], input: &AdInput, kern: Kernel) -> Result<(
 
 #[inline]
 pub fn ad_scalar(high: &[f64], low: &[f64], close: &[f64], volume: &[f64], out: &mut [f64]) {
+    // Official TA-Lib authority: range must be strictly positive; zero or
+    // inverted bars contribute nothing and carry the accumulator unchanged.
+    // https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_AD.c
     debug_assert_eq!(high.len(), low.len());
     debug_assert_eq!(high.len(), close.len());
     debug_assert_eq!(high.len(), volume.len());
@@ -310,7 +300,7 @@ pub fn ad_scalar(high: &[f64], low: &[f64], close: &[f64], volume: &[f64], out: 
         .zip(out.iter_mut())
     {
         let hl = h - l;
-        if hl != 0.0 {
+        if hl > 0.0 {
             let num = (c - l) - (h - c);
             sum += (num / hl) * v;
         }
@@ -351,7 +341,7 @@ unsafe fn ad_avx2_inner(high: &[f64], low: &[f64], close: &[f64], volume: &[f64]
         let mfv_unmasked = _mm256_mul_pd(mfm, vv);
 
         let z = _mm256_set1_pd(0.0);
-        let mask = _mm256_cmp_pd(hl, z, _CMP_NEQ_OQ);
+        let mask = _mm256_cmp_pd(hl, z, _CMP_GT_OQ);
         let mfv = _mm256_and_pd(mfv_unmasked, mask);
 
         let mut tmp: [f64; 4] = core::mem::zeroed();
@@ -382,7 +372,7 @@ unsafe fn ad_avx2_inner(high: &[f64], low: &[f64], close: &[f64], volume: &[f64]
         let cl = *c.add(i);
         let vo = *v.add(i);
         let hl = hi - lo;
-        if hl != 0.0 {
+        if hl > 0.0 {
             let num = (cl - lo) - (hi - cl);
             base += (num / hl) * vo;
         }
@@ -429,7 +419,7 @@ unsafe fn ad_avx512_inner(
         let mfm = _mm512_div_pd(num, hl);
         let mfv_unmasked = _mm512_mul_pd(mfm, vv);
 
-        let mask = _mm512_cmpneq_pd_mask(hl, _mm512_set1_pd(0.0));
+        let mask = _mm512_cmp_pd_mask(hl, _mm512_set1_pd(0.0), _CMP_GT_OQ);
         let mfv = _mm512_maskz_mov_pd(mask, mfv_unmasked);
 
         let mut tmp = core::mem::MaybeUninit::<[f64; 8]>::uninit();
@@ -478,7 +468,7 @@ unsafe fn ad_avx512_inner(
         let cl = *c.add(i);
         let vo = *v.add(i);
         let hl = hi - lo;
-        if hl != 0.0 {
+        if hl > 0.0 {
             let num = (cl - lo) - (hi - cl);
             base += (num / hl) * vo;
         }
@@ -758,182 +748,13 @@ impl AdStream {
         }
 
         let hl = high - low;
-        if hl != 0.0 {
+        if hl > 0.0 {
             let num = (close - low) - (high - close);
 
             self.sum += (num / hl) * volume;
         }
         self.sum
     }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct AdDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl AdDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ad_cuda_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, volume_f32, device_id=0))]
-pub fn ad_cuda_dev_py(
-    py: Python<'_>,
-    high_f32: PyReadonlyArray1<'_, f32>,
-    low_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    volume_f32: PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<AdDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high = high_f32.as_slice()?;
-    let low = low_f32.as_slice()?;
-    let close = close_f32.as_slice()?;
-    let volume = volume_f32.as_slice()?;
-
-    let (buf, rows, cols, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .ad_series_dev(high, low, close, volume)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        Ok::<_, pyo3::PyErr>((out.buf, out.rows, out.cols, ctx, cuda.device_id()))
-    })?;
-
-    Ok(AdDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ad_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, volume_tm_f32, cols, rows, device_id=0))]
-pub fn ad_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: PyReadonlyArray1<'_, f32>,
-    low_tm_f32: PyReadonlyArray1<'_, f32>,
-    close_tm_f32: PyReadonlyArray1<'_, f32>,
-    volume_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    device_id: usize,
-) -> PyResult<AdDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high_tm = high_tm_f32.as_slice()?;
-    let low_tm = low_tm_f32.as_slice()?;
-    let close_tm = close_tm_f32.as_slice()?;
-    let volume_tm = volume_tm_f32.as_slice()?;
-
-    let (buf, r_out, c_out, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .ad_many_series_one_param_time_major_dev(
-                high_tm, low_tm, close_tm, volume_tm, cols, rows,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        Ok::<_, pyo3::PyErr>((out.buf, out.rows, out.cols, ctx, cuda.device_id()))
-    })?;
-
-    Ok(AdDeviceArrayF32Py {
-        buf: Some(buf),
-        rows: r_out,
-        cols: c_out,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -969,483 +790,45 @@ impl AdBatchBuilder {
     }
 }
 
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ad")]
-#[pyo3(signature = (high, low, close, volume, kernel=None))]
-
-pub fn ad_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    volume: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-
-    if high_slice.is_empty()
-        || low_slice.is_empty()
-        || close_slice.is_empty()
-        || volume_slice.is_empty()
-    {
-        return Err(PyValueError::new_err("Not enough data"));
-    }
-
-    let kern = crate::utilities::kernel_validation::validate_kernel(kernel, false)?;
-
-    let input = AdInput::from_slices(
-        high_slice,
-        low_slice,
-        close_slice,
-        volume_slice,
-        AdParams::default(),
-    );
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| ad_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdStream")]
-pub struct AdStreamPy {
-    stream: AdStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        let stream = AdStream::try_new().map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AdStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64, volume: f64) -> f64 {
-        self.stream.update(high, low, close, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ad_batch")]
-#[pyo3(signature = (highs, lows, closes, volumes, kernel=None))]
-
-pub fn ad_batch_py<'py>(
-    py: Python<'py>,
-    highs: &Bound<'py, PyList>,
-    lows: &Bound<'py, PyList>,
-    closes: &Bound<'py, PyList>,
-    volumes: &Bound<'py, PyList>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
-    use pyo3::types::PyDict;
-
-    let rows = highs.len();
-    if lows.len() != rows || closes.len() != rows || volumes.len() != rows {
-        return Err(PyValueError::new_err(
-            "All input lists must have the same length",
-        ));
-    }
-
-    let mut high_arrays: Vec<PyReadonlyArray1<f64>> = Vec::with_capacity(rows);
-    let mut low_arrays: Vec<PyReadonlyArray1<f64>> = Vec::with_capacity(rows);
-    let mut close_arrays: Vec<PyReadonlyArray1<f64>> = Vec::with_capacity(rows);
-    let mut volume_arrays: Vec<PyReadonlyArray1<f64>> = Vec::with_capacity(rows);
-
-    for i in 0..rows {
-        let h = highs.get_item(i)?.extract::<PyReadonlyArray1<f64>>()?;
-        let l = lows.get_item(i)?.extract::<PyReadonlyArray1<f64>>()?;
-        let c = closes.get_item(i)?.extract::<PyReadonlyArray1<f64>>()?;
-        let v = volumes.get_item(i)?.extract::<PyReadonlyArray1<f64>>()?;
-
-        let n = h.len()?;
-        if l.len()? != n || c.len()? != n || v.len()? != n {
-            return Err(PyValueError::new_err(
-                "Rows must have equal lengths across OHLCV arrays",
-            ));
-        }
-        high_arrays.push(h);
-        low_arrays.push(l);
-        close_arrays.push(c);
-        volume_arrays.push(v);
-    }
-
-    let high_slices: Vec<&[f64]> = high_arrays.iter().map(|a| a.as_slice().unwrap()).collect();
-    let low_slices: Vec<&[f64]> = low_arrays.iter().map(|a| a.as_slice().unwrap()).collect();
-    let close_slices: Vec<&[f64]> = close_arrays.iter().map(|a| a.as_slice().unwrap()).collect();
-    let volume_slices: Vec<&[f64]> = volume_arrays
-        .iter()
-        .map(|a| a.as_slice().unwrap())
-        .collect();
-
-    let cols = if rows > 0 { high_slices[0].len() } else { 0 };
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in ad_batch"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = crate::utilities::kernel_validation::validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| -> Result<(), AdError> {
-        let batch_input = AdBatchInput {
-            highs: &high_slices,
-            lows: &low_slices,
-            closes: &close_slices,
-            volumes: &volume_slices,
-        };
-
-        let actual = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        ad_batch_inner_into(&batch_input, actual, true, out_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-) -> Result<Vec<f64>, JsValue> {
-    if high.is_empty() || low.is_empty() || close.is_empty() || volume.is_empty() {
-        return Err(JsValue::from_str("Not enough data"));
-    }
-
-    let input = AdInput::from_slices(high, low, close, volume, AdParams::default());
-
-    let mut output = vec![0.0; high.len()];
-    ad_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_batch_js(
-    highs_flat: &[f64],
-    lows_flat: &[f64],
-    closes_flat: &[f64],
-    volumes_flat: &[f64],
-    rows: usize,
-) -> Result<Vec<f64>, JsValue> {
-    if highs_flat.is_empty() || rows == 0 {
-        return Err(JsValue::from_str("Empty input data"));
-    }
-
-    let cols = highs_flat.len() / rows;
-    let check = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    if highs_flat.len() != check
-        || lows_flat.len() != check
-        || closes_flat.len() != check
-        || volumes_flat.len() != check
-    {
-        return Err(JsValue::from_str(
-            "Input arrays must have rows*cols elements",
-        ));
-    }
-
-    let mut high_slices = Vec::with_capacity(rows);
-    let mut low_slices = Vec::with_capacity(rows);
-    let mut close_slices = Vec::with_capacity(rows);
-    let mut volume_slices = Vec::with_capacity(rows);
-
-    for i in 0..rows {
-        let start = i * cols;
-        let end = start + cols;
-        high_slices.push(&highs_flat[start..end]);
-        low_slices.push(&lows_flat[start..end]);
-        close_slices.push(&closes_flat[start..end]);
-        volume_slices.push(&volumes_flat[start..end]);
-    }
-
-    let batch_input = AdBatchInput {
-        highs: &high_slices,
-        lows: &low_slices,
-        closes: &close_slices,
-        volumes: &volume_slices,
-    };
-
-    ad_batch_with_kernel(&batch_input, Kernel::ScalarBatch)
-        .map(|o| o.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_batch_metadata_js(rows: usize, cols: usize) -> Vec<f64> {
-    vec![rows as f64, cols as f64]
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        let input = AdInput::from_slices(high, low, close, volume, AdParams::default());
-
-        if high_ptr as *const f64 == out_ptr
-            || low_ptr as *const f64 == out_ptr
-            || close_ptr as *const f64 == out_ptr
-            || volume_ptr as *const f64 == out_ptr
-        {
-            let mut temp = vec![0.0; len];
-            ad_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ad_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ad_batch")]
-pub fn ad_batch_unified_js(
-    highs_flat: &[f64],
-    lows_flat: &[f64],
-    closes_flat: &[f64],
-    volumes_flat: &[f64],
-    rows: usize,
-) -> Result<JsValue, JsValue> {
-    if rows == 0 {
-        return Err(JsValue::from_str("rows must be > 0"));
-    }
-    if highs_flat.is_empty() {
-        return Err(JsValue::from_str("empty inputs"));
-    }
-    let cols = highs_flat.len() / rows;
-    let check = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    if lows_flat.len() != check || closes_flat.len() != check || volumes_flat.len() != check {
-        return Err(JsValue::from_str(
-            "Input arrays must have rows*cols elements",
-        ));
-    }
-
-    let mut highs = Vec::with_capacity(rows);
-    let mut lows = Vec::with_capacity(rows);
-    let mut closes = Vec::with_capacity(rows);
-    let mut volumes = Vec::with_capacity(rows);
-    for r in 0..rows {
-        let s = r * cols;
-        let e = s + cols;
-        highs.push(&highs_flat[s..e]);
-        lows.push(&lows_flat[s..e]);
-        closes.push(&closes_flat[s..e]);
-        volumes.push(&volumes_flat[s..e]);
-    }
-
-    let batch = AdBatchInput {
-        highs: &highs,
-        lows: &lows,
-        closes: &closes,
-        volumes: &volumes,
-    };
-    let out = ad_batch_with_kernel(&batch, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let packed = AdBatchJsOutput {
-        values: out.values,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&packed)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_batch_into(
-    highs_ptr: *const f64,
-    lows_ptr: *const f64,
-    closes_ptr: *const f64,
-    volumes_ptr: *const f64,
-    out_ptr: *mut f64,
-    rows: usize,
-    cols: usize,
-) -> Result<(), JsValue> {
-    if highs_ptr.is_null()
-        || lows_ptr.is_null()
-        || closes_ptr.is_null()
-        || volumes_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let check = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let highs_flat = std::slice::from_raw_parts(highs_ptr, check);
-        let lows_flat = std::slice::from_raw_parts(lows_ptr, check);
-        let closes_flat = std::slice::from_raw_parts(closes_ptr, check);
-        let volumes_flat = std::slice::from_raw_parts(volumes_ptr, check);
-        let out = std::slice::from_raw_parts_mut(out_ptr, check);
-
-        let mut highs = Vec::with_capacity(rows);
-        let mut lows = Vec::with_capacity(rows);
-        let mut closes = Vec::with_capacity(rows);
-        let mut volumes = Vec::with_capacity(rows);
-        for r in 0..rows {
-            let s = r * cols;
-            let e = s + cols;
-            highs.push(&highs_flat[s..e]);
-            lows.push(&lows_flat[s..e]);
-            closes.push(&closes_flat[s..e]);
-            volumes.push(&volumes_flat[s..e]);
-        }
-        let batch = AdBatchInput {
-            highs: &highs,
-            lows: &lows,
-            closes: &closes,
-            volumes: &volumes,
-        };
-
-        ad_batch_inner_into(&batch, detect_best_batch_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ad_js(high, low, close, volume)?;
-    crate::write_wasm_f64_output("ad_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_batch_output_into_js(
-    highs_flat: &[f64],
-    lows_flat: &[f64],
-    closes_flat: &[f64],
-    volumes_flat: &[f64],
-    rows: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ad_batch_js(highs_flat, lows_flat, closes_flat, volumes_flat, rows)?;
-    crate::write_wasm_f64_output("ad_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ad_batch_unified_output_into_js(
-    highs_flat: &[f64],
-    lows_flat: &[f64],
-    closes_flat: &[f64],
-    volumes_flat: &[f64],
-    rows: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ad_batch_unified_js(highs_flat, lows_flat, closes_flat, volumes_flat, rows)?;
-    crate::write_wasm_selected_object_f64_outputs("ad_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::{read_candles_from_csv, Candles};
+    use crate::utilities::data_loader::{Candles, read_candles_from_vortex};
     use crate::utilities::enums::Kernel;
+
+    #[test]
+    fn talib_nonpositive_range_carries_scalar_and_stream() {
+        let high = [2.0, 1.0, 2.0];
+        let low = [1.0, 2.0, 2.0];
+        let close = [1.75, 1.75, 2.0];
+        let volume = [8.0, 8.0, 8.0];
+        let mut out = [f64::NAN; 3];
+        ad_scalar(&high, &low, &close, &volume, &mut out);
+        assert_eq!(out.map(f64::to_bits), [4.0f64.to_bits(); 3]);
+
+        let mut stream = AdStream::try_new().expect("valid AD stream");
+        assert_eq!(
+            stream.update(2.0, 1.0, 1.75, 8.0).to_bits(),
+            4.0f64.to_bits()
+        );
+        assert_eq!(
+            stream.update(1.0, 2.0, 1.75, 8.0).to_bits(),
+            4.0f64.to_bits()
+        );
+        assert_eq!(
+            stream.update(2.0, 2.0, 2.0, 8.0).to_bits(),
+            4.0f64.to_bits()
+        );
+    }
 
     fn check_ad_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = AdParams::default();
         let input = AdInput::from_candles(&candles, default_params);
         let output = ad_with_kernel(&input, kernel)?;
@@ -1458,8 +841,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdInput::with_default_candles(&candles);
         let ad_result = ad_with_kernel(&input, kernel)?;
         assert_eq!(ad_result.values.len(), candles.close.len());
@@ -1484,8 +867,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_input = AdInput::with_default_candles(&candles);
         let first_result = ad_with_kernel(&first_input, kernel)?;
         let second_input = AdInput::from_slices(
@@ -1508,8 +891,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdInput::with_default_candles(&candles);
         match input.data {
             AdData::Candles { .. } => {}
@@ -1523,8 +906,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdInput::with_default_candles(&candles);
         let ad_result = ad_with_kernel(&input, kernel)?;
         assert_eq!(ad_result.values.len(), candles.close.len());
@@ -1546,8 +929,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdInput::with_default_candles(&candles);
         let batch = ad_with_kernel(&input, kernel)?.values;
         let mut stream = AdStream::try_new()?;
@@ -1582,8 +965,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AdInput::with_default_candles(&candles);
         let output = ad_with_kernel(&input, kernel)?;
@@ -1635,23 +1018,23 @@ mod tests {
 
             if bits == 0x11111111_11111111 {
                 panic!(
-					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} (slice test)",
-					test_name, val, bits, i
-				);
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} (slice test)",
+                    test_name, val, bits, i
+                );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
-					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} (slice test)",
-					test_name, val, bits, i
-				);
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} (slice test)",
+                    test_name, val, bits, i
+                );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
-					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} (slice test)",
-					test_name, val, bits, i
-				);
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} (slice test)",
+                    test_name, val, bits, i
+                );
             }
         }
 
@@ -1825,7 +1208,7 @@ mod tests {
                 let mut expected_ad = 0.0;
                 for i in 0..highs.len() {
                     let hl = highs[i] - lows[i];
-                    if hl != 0.0 {
+                    if hl > 0.0 {
                         let mfm = ((closes[i] - lows[i]) - (highs[i] - closes[i])) / hl;
                         let mfv = mfm * volumes[i];
                         expected_ad += mfv;
@@ -1841,7 +1224,7 @@ mod tests {
 
                 if !highs.is_empty() {
                     let hl = highs[0] - lows[0];
-                    let expected_first = if hl != 0.0 {
+                    let expected_first = if hl > 0.0 {
                         ((closes[0] - lows[0]) - (highs[0] - closes[0])) / hl * volumes[0]
                     } else {
                         0.0
@@ -1907,8 +1290,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let highs: Vec<&[f64]> = vec![&candles.high];
         let lows: Vec<&[f64]> = vec![&candles.low];
@@ -1944,8 +1327,8 @@ mod tests {
 
     fn check_batch_multi_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let highs: Vec<&[f64]> = vec![&candles.high, &candles.high, &candles.high];
         let lows: Vec<&[f64]> = vec![&candles.low, &candles.low, &candles.low];
@@ -2008,8 +1391,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let mut highs: Vec<&[f64]> = vec![];
         let mut lows: Vec<&[f64]> = vec![];
@@ -2053,23 +1436,23 @@ mod tests {
 
             if bits == 0x11111111_11111111 {
                 panic!(
-					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
-					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
-					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
-					test, val, bits, row, col, idx
-				);
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {})",
+                    test, val, bits, row, col, idx
+                );
             }
         }
 
@@ -2088,7 +1471,6 @@ mod tests {
     gen_batch_tests!(check_batch_multi_row);
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_ad_into_matches_api() {
         let n = 256usize;

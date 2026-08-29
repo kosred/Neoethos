@@ -2,8 +2,9 @@
 //
 // One session owns one non-default stream, one logical dataset upload and every
 // device workspace. `evaluate` runs the complete canonical chain on that
-// stream. The host boundary is the compact metric readback; no
-// candidate-dependent work returns to the CPU.
+// stream. P1-C still reads every population metric row back to the host and
+// records that intermediate D2H boundary explicitly; P1-E must remove it
+// before the run can claim final-result-only readback.
 //
 // The chain used to be five kernels passing `population * bars` arrays between
 // them. It is now two: a bar-parallel gap-flag pass, and ONE walk kernel that
@@ -13,19 +14,19 @@
 // from 4 811 048 B to 593 768 B and let the population stop being bounded by
 // memory at all.
 //
-// The indicator matrix is uploaded feature-major (the host contract) and
-// transposed once, on the device, into bar-major (what the walk reads).
+// The sealed V1 parent keeps the exact feature-major matrix resident and the
+// walk indexes it through the bound parent/view descriptor. The legacy upload
+// ABI still transposes its compatibility-only dataset into bar-major storage.
 //
 // The semantics reproduced here are the canonical ones expressed by the
 // validation oracle in `prototype_population_oracle.rs`. Any divergence is a
 // correctness failure, not a tuning opportunity.
 
-#include <cstdio>
-#include <cstdlib>
 #include "neoethos_gpu_cuda.h"
 
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cstring>
 #include <new>
 
@@ -45,12 +46,12 @@ namespace {
 /// With no profile the host writes `spread_pips` into all three buckets, so
 /// this returns the scalar and the result is bit-identical.
 __device__ inline double spread_pips_for_bar(const NeoPopulationSettings& settings,
-                                             long long timestamp_ms) {
+                                             std::int64_t timestamp_ms) {
   if (timestamp_ms <= 0) {
     return settings.spread_pips;
   }
-  const long long secs = timestamp_ms / 1000LL - (timestamp_ms % 1000LL < 0 ? 1LL : 0LL);
-  long long hour = secs / 3600LL - (secs % 3600LL < 0 ? 1LL : 0LL);
+  const std::int64_t secs = timestamp_ms / 1000LL - (timestamp_ms % 1000LL < 0 ? 1LL : 0LL);
+  std::int64_t hour = secs / 3600LL - (secs % 3600LL < 0 ? 1LL : 0LL);
   hour = ((hour % 24LL) + 24LL) % 24LL;
   if (hour >= 7 && hour < 16) {
     return settings.spread_pips_overlap;
@@ -253,6 +254,10 @@ __device__ inline double sanitize(double value) {
   return isfinite(value) ? value : 0.0;
 }
 
+__device__ inline double invalid_monthly_return_sharpe_v1() {
+  return -__longlong_as_double(static_cast<long long>(0x7ff0000000000000ULL));
+}
+
 struct DeviceDataset {
   const double* close;
   const double* high;
@@ -270,31 +275,65 @@ struct DeviceDataset {
   // logic changes WHAT is computed, not WHICH bar), and each thread wants up to
   // 16 features of that bar. Feature-major puts those at a 3.37 MB stride —
   // 64 distinct cache lines per warp-bar. Bar-major makes the whole feature row
-  // of one bar a single contiguous 256-byte run that the warp shares.
-  const float* indicators_bar_major;
-  const long long* months;
-  const long long* days;
-  const long long* timestamps;
+  // of one bar a single contiguous 512-byte run that the warp shares.
+  const double* indicators_bar_major;
+  const double* indicators_feature_major;
+  const std::int64_t* months;
+  const std::int64_t* days;
+  const std::int64_t* timestamps;
   const signed char* smc_rows;
+  const unsigned long long* view_indices;
   const double* adaptive_base_pips;
   int has_adaptive_base;
   int bars;
+  int parent_rows;
   int feature_count;
+  int view_kind;
+  int view_start;
+  int timestamp_mode;
 };
+
+__device__ inline int population_parent_row(const DeviceDataset& dataset, int view_row) {
+  if (dataset.view_kind == static_cast<int>(NEO_POPULATION_VIEW_ORDERED_INDICES)) {
+    return static_cast<int>(dataset.view_indices[view_row]);
+  }
+  return dataset.view_start + view_row;
+}
+
+__device__ inline std::int64_t population_timestamp_at(const DeviceDataset& dataset,
+                                                       int view_row) {
+  if (dataset.timestamp_mode ==
+      static_cast<int>(NEO_POPULATION_TIMESTAMP_DISABLED_INDEX_DELTA)) {
+    return 0ll;
+  }
+  return dataset.timestamps[population_parent_row(dataset, view_row)];
+}
+
+__device__ inline double population_feature_at(const DeviceDataset& dataset,
+                                                int view_row,
+                                                int feature) {
+  const int parent_row = population_parent_row(dataset, view_row);
+  if (dataset.indicators_feature_major != nullptr) {
+    return dataset.indicators_feature_major[
+        static_cast<long long>(feature) * dataset.parent_rows + parent_row];
+  }
+  return dataset.indicators_bar_major[
+      static_cast<long long>(parent_row) * dataset.feature_count + feature];
+}
 
 struct DeviceGenes {
   const unsigned long long* candidate_ids;
   const int* offsets;
   const int* indices;
-  const float* weights;
-  const float* long_thresholds;
-  const float* short_thresholds;
+  const double* weights;
+  const double* long_thresholds;
+  const double* short_thresholds;
   const double* stop_pips;
   const double* target_pips;
   const double* stop_vol_multipliers;
   const signed char* smc_flags;
-  const float* smc_weights;
-  float gate_threshold;
+  const double* smc_weights;
+  double gate_threshold;
   int smc_gate_disabled;
   // No `population`. It bounded the old `candidate >= genes.population` early
   // return, and the thread's identity is the SCENARIO now — the gene index
@@ -343,15 +382,15 @@ struct DeviceScenarios {
 
 /// `dst[bar * features + feature] = src[feature * bars + bar]`.
 ///
-/// Pure data movement: no arithmetic touches the values, so every float the
+/// Pure data movement: no arithmetic touches the values, so every double the
 /// walk later reads is bit-identical to the one the feature-major kernel read.
 /// Runs once per dataset upload, on the session stream, before anything else
 /// can observe the matrix.
-__global__ void transpose_indicators_to_bar_major(const float* __restrict__ source,
-                                                  float* __restrict__ destination,
+__global__ void transpose_indicators_to_bar_major(const double* __restrict__ source,
+                                                  double* __restrict__ destination,
                                                   int bars,
                                                   int features) {
-  __shared__ float tile[kTransposeTile][kTransposeTile + 1];
+  __shared__ double tile[kTransposeTile][kTransposeTile + 1];
 
   const int bar_base = static_cast<int>(blockIdx.x) * kTransposeTile;
   const int feature_base = static_cast<int>(blockIdx.y) * kTransposeTile;
@@ -395,7 +434,7 @@ __global__ void transpose_indicators_to_bar_major(const float* __restrict__ sour
 // slots kept (3 944 B if they are ever dropped).
 //
 // PARITY. The fusion is bit-identical BY CONSTRUCTION, not by measurement:
-//   * the CSR terms accumulate in the same ascending order into the same f32
+//   * the CSR terms accumulate in the same ascending order into the same f64
 //     accumulator — no reassociation, no tree reduction, no lane splitting;
 //   * `-fmad=false` (build.rs:92, with its own measured justification) forbids
 //     the compiler from contracting `weights[t] * indicator + acc` into an FMA,
@@ -403,7 +442,7 @@ __global__ void transpose_indicators_to_bar_major(const float* __restrict__ sour
 //     different bit pattern;
 //   * the threshold comparisons, the confidence clamp, the SMC active sum and
 //     the SMC score loop are transcribed term for term, slot order included;
-//   * bar-major is a transpose of the input, so the float VALUE at every
+//   * bar-major is a transpose of the input, so the double VALUE at every
 //     (bar, feature) is unchanged.
 //
 // What IS hoisted out of the bar loop is exactly the part that has no bar in
@@ -416,14 +455,14 @@ __global__ void transpose_indicators_to_bar_major(const float* __restrict__ sour
 struct SignalPlan {
   int term_start;
   int term_end;
-  float long_threshold;
-  float short_threshold;
-  /// `fabsf(long - short)`, clamped exactly as the original did.
-  float gap;
+  double long_threshold;
+  double short_threshold;
+  /// `fabs(long - short)` in the canonical f64 threshold domain.
+  double gap;
   /// Sum of the weights of this candidate's active SMC slots, ascending.
-  float active_sum;
-  /// `fminf(gate_threshold, active_sum)`.
-  float gate;
+  double active_sum;
+  /// `fmin(gate_threshold, active_sum)`.
+  double gate;
   /// Bit `s` set iff `smc_flags[candidate * kSmcSlots + s] != 0`. Read once
   /// instead of eleven strided bytes per bar.
   unsigned smc_mask;
@@ -453,26 +492,22 @@ __device__ inline SignalPlan build_signal_plan(const DeviceGenes& genes,
   plan.perturbed = perturbed;
   plan.rng_counter = counter;
   if (perturbed != 0) {
-    // Formed in double and narrowed once, exactly as the Rust mirror does:
-    // both lanes hold the parameter in f32 and the factor in f64.
-    plan.long_threshold = static_cast<float>(
-        static_cast<double>(plan.long_threshold) *
-        perturb_factor(counter, kDrawLongThreshold, kMcThresholdAmplitude));
-    plan.short_threshold = static_cast<float>(
-        static_cast<double>(plan.short_threshold) *
-        perturb_factor(counter, kDrawShortThreshold, kMcThresholdAmplitude));
+    plan.long_threshold *=
+        perturb_factor(counter, kDrawLongThreshold, kMcThresholdAmplitude);
+    plan.short_threshold *=
+        perturb_factor(counter, kDrawShortThreshold, kMcThresholdAmplitude);
   }
 
-  float gap = fabsf(plan.long_threshold - plan.short_threshold);
-  if (!(gap > 1.0e-6f)) {
-    gap = 1.0e-6f;
+  double gap = fabs(plan.long_threshold - plan.short_threshold);
+  if (!(gap > 1.0e-6)) {
+    gap = 1.0e-6;
   }
   plan.gap = gap;
 
-  // Same ascending slot order and the same f32 accumulator as the kernel this
+  // Same ascending slot order and the same f64 accumulator as the kernel this
   // replaces; only the number of times it runs changed.
   unsigned mask = 0u;
-  float active_sum = 0.0f;
+  double active_sum = 0.0;
   for (int slot = 0; slot < kSmcSlots; ++slot) {
     if (genes.smc_flags[static_cast<long long>(candidate) * kSmcSlots + slot] != 0) {
       mask |= (1u << slot);
@@ -480,11 +515,11 @@ __device__ inline SignalPlan build_signal_plan(const DeviceGenes& genes,
     }
   }
   if (genes.smc_gate_disabled != 0) {
-    active_sum = 0.0f;
+    active_sum = 0.0;
   }
   plan.smc_mask = mask;
   plan.active_sum = active_sum;
-  plan.gate = fminf(genes.gate_threshold, active_sum);
+  plan.gate = fmin(genes.gate_threshold, active_sum);
   return plan;
 }
 
@@ -494,24 +529,21 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
                                                 const DeviceGenes& genes,
                                                 const SignalPlan& plan,
                                                 int bar,
-                                                float* confidence_out) {
-  // Terms accumulate in ascending CSR order, matching the canonical f32
+                                                double* confidence_out) {
+  // Terms accumulate in ascending CSR order, matching the canonical f64
   // accumulation order bit for bit.
-  float combined = 0.0f;
-  const long long feature_row = static_cast<long long>(bar) * dataset.feature_count;
+  double combined = 0.0;
   if (plan.perturbed == 0) {
     for (int term = plan.term_start; term < plan.term_end; ++term) {
       const int feature = genes.indices[term];
-      combined += genes.weights[term] * dataset.indicators_bar_major[feature_row + feature];
+      combined += genes.weights[term] * population_feature_at(dataset, bar, feature);
     }
   } else {
     // The perturbed loop is written out rather than folded into the one above
     // with a conditional factor, so the unperturbed path — every existing
     // caller, and the one the 147 parity tests exercise — keeps EXACTLY the
-    // instruction sequence it had. A `weight * factor` with `factor == 1.0`
-    // is not the identity on a float: it forces a round trip through double
-    // and back, and `-fmad=false` cannot help with a rounding that the source
-    // asked for.
+    // instruction sequence it had and performs no unnecessary perturbation
+    // arithmetic.
     //
     // Term ordinal, not term index: the draw stream is per gene, so a gene's
     // first term is always draw 2 whatever its offset into the shared CSR
@@ -521,10 +553,10 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
       const int feature = genes.indices[term];
       const unsigned long long ordinal =
           static_cast<unsigned long long>(term - plan.term_start);
-      const float weight = static_cast<float>(
-          static_cast<double>(genes.weights[term]) *
-          perturb_factor(plan.rng_counter, kDrawWeightBase + ordinal, kMcWeightAmplitude));
-      combined += weight * dataset.indicators_bar_major[feature_row + feature];
+      const double weight = genes.weights[term] *
+                            perturb_factor(plan.rng_counter, kDrawWeightBase + ordinal,
+                                           kMcWeightAmplitude);
+      combined += weight * population_feature_at(dataset, bar, feature);
     }
   }
 
@@ -536,22 +568,24 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
   }
 
   if (signal == 0) {
-    *confidence_out = 0.0f;
+    *confidence_out = 0.0;
     return 0;
   }
 
-  const float margin =
+  const double margin =
       (signal == 1) ? (combined - plan.long_threshold) : (plan.short_threshold - combined);
-  float confidence = fminf(fmaxf(margin / plan.gap, 0.0f), 1.0f);
+  const double confidence = fmin(fmax(margin / plan.gap, 0.0), 1.0);
 
   bool passes_gate = true;
-  if (plan.active_sum > 0.0f) {
-    float score = 0.0f;
+  if (plan.active_sum > 0.0) {
+    double score = 0.0;
     for (int slot = 0; slot < kSmcSlots; ++slot) {
       if (((plan.smc_mask >> slot) & 1u) == 0u) {
         continue;
       }
-      const signed char row = dataset.smc_rows[static_cast<long long>(bar) * kSmcSlots + slot];
+      const int parent_row = population_parent_row(dataset, bar);
+      const signed char row =
+          dataset.smc_rows[static_cast<long long>(parent_row) * kSmcSlots + slot];
       if (slot == 5) {
         if (row == 1) {
           score += genes.smc_weights[slot];
@@ -564,7 +598,7 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
   }
 
   if (!passes_gate) {
-    *confidence_out = 0.0f;
+    *confidence_out = 0.0;
     return 0;
   }
   *confidence_out = confidence;
@@ -641,8 +675,8 @@ __global__ void population_gap_flags_kernel(DeviceDataset dataset,
        bar += blockDim.x * gridDim.x) {
     unsigned char flag = 0u;
     if (bar > 0 && settings.gap_threshold_ms > 0) {
-      const long long previous = dataset.timestamps[bar - 1];
-      const long long current = dataset.timestamps[bar];
+      const std::int64_t previous = population_timestamp_at(dataset, bar - 1);
+      const std::int64_t current = population_timestamp_at(dataset, bar);
       if (current > previous && (current - previous) >= settings.gap_threshold_ms) {
         flag = 1u;
       }
@@ -726,8 +760,8 @@ __device__ inline double risk_based_position_lots(double confidence,
 __device__ inline double apply_carry_and_conversion(double gross_pnl_scaled,
                                                     double lots,
                                                     int direction,
-                                                    long long entry_timestamp,
-                                                    long long exit_timestamp,
+                                                    std::int64_t entry_timestamp,
+                                                    std::int64_t exit_timestamp,
                                                     const NeoPopulationSettings& settings) {
   double overnight_days = 0.0;
   if (exit_timestamp > entry_timestamp && entry_timestamp > 0) {
@@ -748,7 +782,7 @@ __device__ inline double apply_carry_and_conversion(double gross_pnl_scaled,
 // trades, and a candidate entry that never opens a position must still read as
 // "no exit" rather than as whatever the buffer held last generation.
 __global__ void population_seed_outcomes_kernel(NeoPopulationOutcome* outcomes,
-                                                unsigned long long event_count) {
+                                                 unsigned long long event_count) {
   const unsigned long long index =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= event_count) {
@@ -767,6 +801,16 @@ __global__ void population_seed_outcomes_kernel(NeoPopulationOutcome* outcomes,
   outcome.pnl = 0.0;
   outcome.r_multiple = 0.0;
   outcomes[index] = outcome;
+}
+
+__device__ NeoPopulationOutcome* diagnostic_outcome_slot_v1(
+    NeoPopulationOutcome* outcomes,
+    unsigned long long position_index,
+    unsigned long long range_end) {
+  if (outcomes == nullptr || position_index >= range_end) {
+    return nullptr;
+  }
+  return outcomes + position_index;
 }
 
 // ── One thread per scenario, and the synthesis is inside it ─────────────────
@@ -809,6 +853,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   const int candidate = static_cast<int>(scenarios.base_candidate_ids[scenario]);
   const unsigned scenario_type = scenarios.types[scenario];
   const unsigned long long scenario_id = scenarios.ids[scenario];
+  const bool diagnostics_enabled = outcomes != nullptr;
 
   // Perturbation is a property of the SCENARIO. `kScenarioPerturb` is the only
   // type that reads `rng_counters`, and no existing caller emits it: the shipped
@@ -904,12 +949,12 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   double gross_loss = 0.0;
   unsigned long long accepted_trades = 0ull;
 
-  long long last_month = -1;
+  std::int64_t last_month = -1;
   double current_month_pnl = 0.0;
   double current_month_start_equity = initial_equity;
-  long long month_ptr = -1;
+  std::int64_t month_ptr = -1;
 
-  long long last_day = -1;
+  std::int64_t last_day = -1;
   double day_peak = equity;
   double day_low = equity;
   double max_daily_drawdown = 0.0;
@@ -952,11 +997,12 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
     // unset, which resolves to that scalar at every hour.
     const double bar_spread_pips =
         has_spread_override ? spread_override_pips
-                            : spread_pips_for_bar(settings, dataset.timestamps[bar]);
+                            : spread_pips_for_bar(settings, population_timestamp_at(dataset, bar));
     const double half_spread_price = bar_spread_pips * 0.5 * pip;
     const double half_spread_cost = bar_spread_pips * 0.5 * settings.pip_value_per_lot;
 
-    const long long month = dataset.months[bar];
+    const int parent_bar = population_parent_row(dataset, bar);
+    const std::int64_t month = dataset.months[parent_bar];
     if (month != last_month) {
       if (last_month != -1) {
         month_ptr += 1;
@@ -970,7 +1016,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       last_month = month;
     }
 
-    const long long day = dataset.days[bar];
+    const std::int64_t day = dataset.days[parent_bar];
     if (day != last_day) {
       if (last_day != -1) {
         finalize_daily_drawdown_segment(day_peak, day_low, &max_daily_drawdown);
@@ -987,7 +1033,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       // to name this bar was only ever a proxy for reading it.
       const bool exited_on_gap = gap_flags[bar] != 0u;
       if (exited_on_gap) {
-        double exit_price = dataset.close[bar];
+        double exit_price = dataset.close[parent_bar];
         // Adverse by construction: a long is filled lower than it asked, a
         // short higher. Guarded rather than added-with-zero so a scenario that
         // wants no slippage — which is every scenario the CPU engine can
@@ -1004,8 +1050,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         const double gross_scaled =
             price_pnl * position_lots -
             (commission_per_trade + half_spread_cost) * position_lots;
-        const long long entry_timestamp = dataset.timestamps[position_event.entry_bar];
-        const long long exit_timestamp = dataset.timestamps[bar];
+        const std::int64_t entry_timestamp =
+            population_timestamp_at(dataset, position_event.entry_bar);
+        const std::int64_t exit_timestamp = population_timestamp_at(dataset, bar);
         const double pnl = apply_carry_and_conversion(gross_scaled, position_lots,
                                                       position_event.direction, entry_timestamp,
                                                       exit_timestamp, settings);
@@ -1015,17 +1062,21 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         // mirrors eval.rs exactly — realised P&L over the entry stop distance,
         // guarded against a zero denominator — so it stays comparable with the
         // CPU trade list rather than merely plausible.
-        outcomes[position_index].exit_bar = bar;
-        outcomes[position_index].exit_reason = kExitGap;
-        outcomes[position_index].entry_bar = position_event.entry_bar;
-        outcomes[position_index].exit_price = exit_price;
-        outcomes[position_index].mfe =
-            position_fav > 0.0 ? position_fav / pip * settings.pip_value_per_lot : 0.0;
-        outcomes[position_index].mae =
-            position_adv > 0.0 ? position_adv / pip * settings.pip_value_per_lot : 0.0;
-        outcomes[position_index].pnl = pnl;
-        outcomes[position_index].r_multiple =
-            pnl / fmax(position_stop_pips * settings.pip_value_per_lot, 1.0e-9);
+        NeoPopulationOutcome* diagnostic_outcome =
+            diagnostic_outcome_slot_v1(outcomes, position_index, range_end);
+        if (diagnostic_outcome != nullptr) {
+          diagnostic_outcome->exit_bar = bar;
+          diagnostic_outcome->exit_reason = kExitGap;
+          diagnostic_outcome->entry_bar = position_event.entry_bar;
+          diagnostic_outcome->exit_price = exit_price;
+          diagnostic_outcome->mfe =
+              position_fav > 0.0 ? position_fav / pip * settings.pip_value_per_lot : 0.0;
+          diagnostic_outcome->mae =
+              position_adv > 0.0 ? position_adv / pip * settings.pip_value_per_lot : 0.0;
+          diagnostic_outcome->pnl = pnl;
+          diagnostic_outcome->r_multiple =
+              pnl / fmax(position_stop_pips * settings.pip_value_per_lot, 1.0e-9);
+        }
         current_month_pnl += pnl;
         trade_count += 1;
         if (pnl > 0.0) {
@@ -1038,8 +1089,8 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                              &max_daily_drawdown);
         has_position = false;
       } else {
-        const double low = dataset.low[bar];
-        const double high = dataset.high[bar];
+        const double low = dataset.low[parent_bar];
+        const double high = dataset.high[parent_bar];
         double worst = 0.0;
         double best = 0.0;
         if (position_event.direction == kDirectionLong) {
@@ -1097,7 +1148,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         if (exit_reason_now == kExitNone && position_max_hold_bar >= 0 &&
             bar >= position_max_hold_bar) {
           exit_reason_now = kExitMaxHold;
-          exit_price_now = dataset.close[bar];
+          exit_price_now = dataset.close[parent_bar];
         }
         // Excursion accumulates on every open bar including this one, matching
         // the CPU, which updates before testing for an exit.
@@ -1149,8 +1200,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
             const double gross_scaled =
                 price_pnl * position_lots -
                 (commission_per_trade + half_spread_cost) * position_lots;
-            const long long entry_timestamp = dataset.timestamps[position_event.entry_bar];
-            const long long exit_timestamp = dataset.timestamps[bar];
+            const std::int64_t entry_timestamp =
+                population_timestamp_at(dataset, position_event.entry_bar);
+            const std::int64_t exit_timestamp = population_timestamp_at(dataset, bar);
             const double pnl =
                 apply_carry_and_conversion(gross_scaled, position_lots, position_event.direction,
                                            entry_timestamp, exit_timestamp, settings);
@@ -1165,17 +1217,21 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
             }
             // The whole trade record is written here now. Nothing upstream knows
             // the exit any more, so nothing upstream can fill this in.
-            outcomes[position_index].exit_bar = bar;
-            outcomes[position_index].exit_reason = exit_reason_now;
-            outcomes[position_index].entry_bar = position_event.entry_bar;
-            outcomes[position_index].exit_price = exit_price;
-            outcomes[position_index].mfe =
-                position_fav > 0.0 ? position_fav / pip * settings.pip_value_per_lot : 0.0;
-            outcomes[position_index].mae =
-                position_adv > 0.0 ? position_adv / pip * settings.pip_value_per_lot : 0.0;
-            outcomes[position_index].pnl = pnl;
-            outcomes[position_index].r_multiple =
-                pnl / fmax(position_stop_pips * settings.pip_value_per_lot, 1.0e-9);
+            NeoPopulationOutcome* diagnostic_outcome =
+                diagnostic_outcome_slot_v1(outcomes, position_index, range_end);
+            if (diagnostic_outcome != nullptr) {
+              diagnostic_outcome->exit_bar = bar;
+              diagnostic_outcome->exit_reason = exit_reason_now;
+              diagnostic_outcome->entry_bar = position_event.entry_bar;
+              diagnostic_outcome->exit_price = exit_price;
+              diagnostic_outcome->mfe =
+                  position_fav > 0.0 ? position_fav / pip * settings.pip_value_per_lot : 0.0;
+              diagnostic_outcome->mae =
+                  position_adv > 0.0 ? position_adv / pip * settings.pip_value_per_lot : 0.0;
+              diagnostic_outcome->pnl = pnl;
+              diagnostic_outcome->r_multiple =
+                  pnl / fmax(position_stop_pips * settings.pip_value_per_lot, 1.0e-9);
+            }
           }
           update_realized_risk(equity, &peak_equity, &day_peak, &day_low, &max_drawdown,
                                &max_daily_drawdown);
@@ -1194,7 +1250,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
     // array whose only purpose was to bring this one byte from another kernel,
     // with `signal_confidences` (11.1 GB) alongside it for the sizing call
     // below. Both are gone; the value is computed in registers at the moment it
-    // is used, from the same CSR terms in the same ascending f32 order.
+    // is used, from the same CSR terms in the same ascending f64 order.
     //
     // Computed HERE, after the exit block, rather than at the top of the loop:
     // synthesis is a pure function of (candidate, bar) with no side effects, so
@@ -1208,17 +1264,19 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
     // therefore never synthesised, which is correct — an entry there would have
     // no bar to fill on. The old kernel computed it and nothing read it.
     const int signal_bar = bar - 1;
-    float signal_confidence_here = 0.0f;
+    double signal_confidence_here = 0.0;
     const signed char signal_here =
         synthesize_signal(dataset, genes, signal_plan, signal_bar, &signal_confidence_here);
     if (signal_here != 0) {
-      ++cursor;
+      if (diagnostics_enabled) {
+        ++cursor;
+      }
       if (settings.max_trades_per_day > 0u && day_trade_count >= settings.max_trades_per_day) {
         continue;
       }
       const int direction = signal_here > 0 ? kDirectionLong : kDirectionShort;
       double entry_price =
-          dataset.close[bar] + static_cast<double>(direction) * half_spread_price;
+          dataset.close[parent_bar] + static_cast<double>(direction) * half_spread_price;
       if (has_slippage) {
         entry_price += static_cast<double>(direction) * slippage_price;
       }
@@ -1243,22 +1301,20 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       const double stop_pips = entry_stop_pips;
       double lots = 1.0;
       if ((settings.flags & kFlagRiskBasedSizing) != 0u) {
-        // Same widening the array read performed: the confidence is produced as
-        // f32 and consumed as f64, so the f32 value and the conversion are both
-        // where they were.
-        lots = risk_based_position_lots(static_cast<double>(signal_confidence_here), equity,
-                                        stop_pips, settings);
+        lots = risk_based_position_lots(signal_confidence_here, equity, stop_pips, settings);
       }
       position_event = event;
       position_entry_price = entry_price;
       position_lots = lots;
-      // `cursor` already advanced past this trade's slot.
-      position_index = cursor - 1ull;
-      if (position_index >= range_end) {
-        // Out of slots. Keep simulating so equity and drawdown stay honest —
-        // the trade still happened — but do not write past this candidate's
-        // slice into the next one's.
-        position_index = range_end - 1ull;
+      if (diagnostics_enabled) {
+        // `cursor` already advanced past this trade's slot.
+        position_index = cursor - 1ull;
+        if (position_index >= range_end) {
+          // Out of slots. Keep simulating so equity and drawdown stay honest —
+          // the trade still happened — but do not write past this candidate's
+          // slice into the next one's.
+          position_index = range_end - 1ull;
+        }
       }
       position_stop_pips = stop_pips;
       position_trail = 0.0;
@@ -1278,7 +1334,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       }
       has_position = true;
       day_trade_count += 1u;
-      accepted_trades += 1ull;
+      if (accepted_trade_total != nullptr) {
+        accepted_trades += 1ull;
+      }
     }
   }
 
@@ -1338,7 +1396,68 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
     monthly_std = 0.0;
   }
 
-  const double sharpe = monthly_std > 0.0 ? (monthly_mean / monthly_std) * 3.4641 : 0.0;
+  bool monthly_return_inputs_valid = true;
+  double monthly_return_mean = 0.0;
+  double monthly_return_std = 0.0;
+  if (limit >= 0) {
+    const long long count = limit + 1;
+    double monthly_return_sum = 0.0;
+    for (long long index = 0; index <= limit; ++index) {
+      const double start_equity = month_start[index];
+      if (!isfinite(monthly[index]) || !isfinite(start_equity) || start_equity <= 0.0) {
+        monthly_return_inputs_valid = false;
+      } else {
+        const double period_return = monthly[index] / start_equity;
+        if (!isfinite(period_return)) {
+          monthly_return_inputs_valid = false;
+        } else {
+          monthly_return_sum += period_return;
+          if (!isfinite(monthly_return_sum)) {
+            monthly_return_inputs_valid = false;
+          }
+        }
+      }
+    }
+    if (monthly_return_inputs_valid && count >= 2) {
+      monthly_return_mean = monthly_return_sum / static_cast<double>(count);
+      if (!isfinite(monthly_return_mean)) {
+        monthly_return_inputs_valid = false;
+      }
+    }
+    if (monthly_return_inputs_valid && count >= 2) {
+      double monthly_return_variance = 0.0;
+      for (long long index = 0; index <= limit; ++index) {
+        const double start_equity = month_start[index];
+        const double period_return = monthly[index] / start_equity;
+        const double delta = period_return - monthly_return_mean;
+        const double squared_delta = delta * delta;
+        if (!isfinite(squared_delta)) {
+          monthly_return_inputs_valid = false;
+        } else {
+          monthly_return_variance += squared_delta;
+          if (!isfinite(monthly_return_variance)) {
+            monthly_return_inputs_valid = false;
+          }
+        }
+      }
+      if (monthly_return_inputs_valid) {
+        monthly_return_std =
+            sqrt(fmax(monthly_return_variance / static_cast<double>(count - 1), 0.0));
+        if (!isfinite(monthly_return_std)) {
+          monthly_return_inputs_valid = false;
+        }
+      }
+    }
+  }
+
+  double sharpe = monthly_return_inputs_valid
+                       ? (monthly_return_std > 0.0
+                              ? (monthly_return_mean / monthly_return_std) * 3.4641
+                              : 0.0)
+                       : invalid_monthly_return_sharpe_v1();
+  if (!isfinite(sharpe) && sharpe != invalid_monthly_return_sharpe_v1()) {
+    sharpe = invalid_monthly_return_sharpe_v1();
+  }
   double consistency = 0.0;
   if (monthly_std > 0.0) {
     consistency = fmin(fmax(monthly_mean / monthly_std, 0.0), 1.0);
@@ -1371,7 +1490,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   row.candidate_id = genes.candidate_ids[candidate];
   row.scenario_id = scenario_id;
   row.values[0] = sanitize(net_profit);
-  row.values[1] = sanitize(sharpe);
+  row.values[1] = sharpe;
   row.values[2] = sanitize(peak_equity);
   row.values[3] = sanitize(max_drawdown);
   row.values[4] = sanitize(win_rate);
@@ -1383,7 +1502,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   row.values[10] = sanitize(max_daily_drawdown);
   rows[scenario] = row;
 
-  atomicAdd(reinterpret_cast<unsigned long long*>(accepted_trade_total), accepted_trades);
+  if (accepted_trade_total != nullptr) {
+    atomicAdd(reinterpret_cast<unsigned long long*>(accepted_trade_total), accepted_trades);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,6 +1516,10 @@ std::int32_t device_alloc(T** pointer, std::size_t count) {
   if (count == 0) {
     *pointer = nullptr;
     return NEO_POPULATION_STATUS_OK;
+  }
+  if (count > SIZE_MAX / sizeof(T)) {
+    *pointer = nullptr;
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
   if (cudaMalloc(reinterpret_cast<void**>(pointer), count * sizeof(T)) != cudaSuccess) {
     *pointer = nullptr;
@@ -1413,9 +1538,23 @@ void device_free(T*& pointer) {
 
 }  // namespace
 
+enum class PopulationWorkspaceModeV1 : std::uint32_t {
+  Uninitialized = 0u,
+  CompatibilityDeviceParityOnly = 1u,
+  StrictMetricsOnly = 2u,
+};
+
+enum class PopulationStrictExecutionStateV1 : std::uint32_t {
+  StrictIdle = 0u,
+  InFlight = 1u,
+  Poisoned = 2u,
+};
+
 struct NeoCudaPopulationSession {
   int device = 0;
   cudaStream_t stream = nullptr;
+  std::uint32_t stream_ownership = NEO_POPULATION_STREAM_OWNED;
+  std::uint32_t parent_ownership = NEO_POPULATION_PARENT_OWNED_V1;
   cudaEvent_t event = nullptr;
   // No `max_events`. The session used to carry the event-buffer capacity the
   // creator asked for, but the buffer it sized has not been allocated since the
@@ -1424,12 +1563,17 @@ struct NeoCudaPopulationSession {
   // stores it, because a field nothing reads is how a phantom budget survives.
   unsigned long long next_event_id = 1ull;
   unsigned long long pending_event_id = 0ull;
+  bool has_parent_v1 = false;
   bool has_dataset = false;
   bool has_genes = false;
   bool has_scenarios = false;
   bool metrics_ready = false;
   int bars = 0;
+  int parent_rows = 0;
   int feature_count = 0;
+  int view_kind = static_cast<int>(NEO_POPULATION_VIEW_FULL);
+  int view_start = 0;
+  int timestamp_mode = static_cast<int>(NEO_POPULATION_TIMESTAMP_CANONICAL);
   int population = 0;
   /// Threads the walk launches, and the extent of every workspace array.
   ///
@@ -1455,6 +1599,9 @@ struct NeoCudaPopulationSession {
   // non-finite consequence into 0.0.
   int workspace_scenarios = 0;
   int workspace_bars = 0;
+  PopulationWorkspaceModeV1 workspace_mode = PopulationWorkspaceModeV1::Uninitialized;
+  PopulationStrictExecutionStateV1 strict_execution_state =
+      PopulationStrictExecutionStateV1::StrictIdle;
   // How many outcome records `read_diagnostics` may copy back.
   //
   // Named for an event stream that no longer exists. It is NOT a count of
@@ -1470,6 +1617,8 @@ struct NeoCudaPopulationSession {
   std::uint64_t scenario_upload_bytes = 0ull;
   std::uint64_t kernel_submissions = 0ull;
   std::uint64_t synchronization_events = 0ull;
+  NeoPopulationResidencyCountersV1 residency_counters{};
+  NeoPopulationDeviceIdentityV1 device_identity{};
 
   double* close = nullptr;
   double* high = nullptr;
@@ -1479,27 +1628,39 @@ struct NeoCudaPopulationSession {
   // frees the feature-major staging copy, so nothing feature-major stays
   // resident. Renamed from `indicators` deliberately: a reader that was not
   // updated must fail to compile rather than silently stride the wrong way.
-  float* indicators_bar_major = nullptr;
-  long long* months = nullptr;
-  long long* days = nullptr;
-  long long* timestamps = nullptr;
+  double* indicators_bar_major = nullptr;
+  // Packed two-u4 validity codes are retained with the sealed V3 parent. The
+  // current population kernel reads values only, but the pointer and exact
+  // extent remain bound so later strict validation cannot detach validity from
+  // the feature matrix it describes.
+  unsigned char* indicators_validity_u4 = nullptr;
+  std::size_t indicators_validity_u4_bytes = 0;
+  // Feature-major immutable parent for the V1 route. It is consumed directly
+  // through `population_feature_at`; no staging transpose or second copy.
+  double* indicators_feature_major = nullptr;
+  std::int64_t* months = nullptr;
+  std::int64_t* days = nullptr;
+  std::int64_t* timestamps = nullptr;
   signed char* smc_rows = nullptr;
+  unsigned long long* view_indices = nullptr;
+  std::size_t view_indices_capacity = 0;
   double* adaptive_base_pips = nullptr;
+  std::size_t adaptive_base_pips_capacity = 0;
   int has_adaptive_base = 0;
   unsigned char* gap_flags = nullptr;
 
   unsigned long long* candidate_ids = nullptr;
   int* gene_offsets = nullptr;
   int* gene_indices = nullptr;
-  float* gene_weights = nullptr;
-  float* long_thresholds = nullptr;
-  float* short_thresholds = nullptr;
+  double* gene_weights = nullptr;
+  double* long_thresholds = nullptr;
+  double* short_thresholds = nullptr;
   double* stop_pips = nullptr;
   double* target_pips = nullptr;
   double* stop_vol_multipliers = nullptr;
   signed char* smc_flags = nullptr;
-  float* smc_weights = nullptr;
-  float gate_threshold = 0.0f;
+  double* smc_weights = nullptr;
+  double gate_threshold = 0.0;
   int smc_gate_disabled = 0;
 
   // The work list, unpacked from `NeoScenarioDescriptor` into struct-of-arrays
@@ -1566,19 +1727,40 @@ struct NeoCudaPopulationSession {
     workspace_scenarios = 0;
     workspace_bars = 0;
     month_capacity = 0;
+    // Deliberately retain `workspace_mode`. A run-owned session may grow or be
+    // destroyed, but it may never relabel compatibility allocations as strict
+    // resident authority (or vice versa).
   }
 
   void release() {
     release_workspace();
-    device_free(close);
-    device_free(high);
-    device_free(low);
-    device_free(indicators_bar_major);
-    device_free(months);
-    device_free(days);
-    device_free(timestamps);
-    device_free(smc_rows);
+    if (parent_ownership == NEO_POPULATION_PARENT_OWNED_V1) {
+      device_free(close);
+      device_free(high);
+      device_free(low);
+      device_free(indicators_bar_major);
+      device_free(indicators_feature_major);
+      device_free(months);
+      device_free(days);
+      device_free(timestamps);
+      device_free(smc_rows);
+    } else {
+      close = nullptr;
+      high = nullptr;
+      low = nullptr;
+      indicators_bar_major = nullptr;
+      indicators_feature_major = nullptr;
+      months = nullptr;
+      days = nullptr;
+      timestamps = nullptr;
+      smc_rows = nullptr;
+    }
+    indicators_validity_u4 = nullptr;
+    indicators_validity_u4_bytes = 0;
+    device_free(view_indices);
+    view_indices_capacity = 0;
     device_free(adaptive_base_pips);
+    adaptive_base_pips_capacity = 0;
     device_free(gap_flags);
     device_free(candidate_ids);
     device_free(gene_offsets);
@@ -1596,14 +1778,101 @@ struct NeoCudaPopulationSession {
       cudaEventDestroy(event);
       event = nullptr;
     }
-    if (stream != nullptr) {
+    if (stream != nullptr && stream_ownership == NEO_POPULATION_STREAM_OWNED) {
       cudaStreamDestroy(stream);
-      stream = nullptr;
     }
+    stream = nullptr;
   }
 };
 
 namespace {
+
+bool strict_population_work_blocks_host_boundary_v1(const NeoCudaPopulationSession* session) {
+  return session != nullptr &&
+         session->strict_execution_state != PopulationStrictExecutionStateV1::StrictIdle;
+}
+
+std::int32_t strict_population_host_boundary_status_v1(
+    const NeoCudaPopulationSession* session) {
+  return session->strict_execution_state == PopulationStrictExecutionStateV1::Poisoned
+             ? NEO_POPULATION_STATUS_STRICT_RESIDENT_POISONED
+             : NEO_POPULATION_STATUS_STRICT_RESIDENT_IN_FLIGHT;
+}
+
+struct GeneHostStagingV1 {
+  unsigned long long* candidate_ids = nullptr;
+  int* offsets = nullptr;
+  int* indices = nullptr;
+  double* weights = nullptr;
+  double* long_thresholds = nullptr;
+  double* short_thresholds = nullptr;
+  double* stop_pips = nullptr;
+  double* target_pips = nullptr;
+  double* stop_vol_multipliers = nullptr;
+  signed char* smc_flags = nullptr;
+  double* smc_weights = nullptr;
+
+  ~GeneHostStagingV1() {
+    delete[] candidate_ids;
+    delete[] offsets;
+    delete[] indices;
+    delete[] weights;
+    delete[] long_thresholds;
+    delete[] short_thresholds;
+    delete[] stop_pips;
+    delete[] target_pips;
+    delete[] stop_vol_multipliers;
+    delete[] smc_flags;
+    delete[] smc_weights;
+  }
+};
+
+struct ScenarioHostStagingV1 {
+  unsigned long long* base_ids = nullptr;
+  unsigned long long* ids = nullptr;
+  unsigned long long* counters = nullptr;
+  unsigned long long* offsets = nullptr;
+  unsigned int* lens = nullptr;
+  unsigned int* types = nullptr;
+  int* spreads = nullptr;
+  int* slippages = nullptr;
+  long long* commissions = nullptr;
+
+  ~ScenarioHostStagingV1() {
+    delete[] base_ids;
+    delete[] ids;
+    delete[] counters;
+    delete[] offsets;
+    delete[] lens;
+    delete[] types;
+    delete[] spreads;
+    delete[] slippages;
+    delete[] commissions;
+  }
+};
+
+void CUDART_CB release_gene_host_staging_v1(void* opaque) {
+  delete static_cast<GeneHostStagingV1*>(opaque);
+}
+
+void CUDART_CB release_scenario_host_staging_v1(void* opaque) {
+  delete static_cast<ScenarioHostStagingV1*>(opaque);
+}
+
+template <typename T>
+std::int32_t release_staging_after_stream_v1(cudaStream_t stream,
+                                             T* staging,
+                                             cudaHostFn_t release) {
+  if (cudaLaunchHostFunc(stream, release, staging) == cudaSuccess) {
+    return NEO_POPULATION_STATUS_OK;
+  }
+  // The enqueue failed after earlier copies may have been accepted. This is an
+  // error-only teardown barrier: never free a host source while DMA can still
+  // read it, and never count the failed path as resident success evidence.
+  cudaStreamSynchronize(stream);
+  delete staging;
+  return NEO_POPULATION_STATUS_TRANSFER_FAILED;
+}
 
 std::int32_t copy_to_device(void* destination,
                             const void* source,
@@ -1617,6 +1886,42 @@ std::int32_t copy_to_device(void* destination,
     return NEO_POPULATION_STATUS_TRANSFER_FAILED;
   }
   return NEO_POPULATION_STATUS_OK;
+}
+
+bool checked_add_u64(std::uint64_t& total, std::uint64_t value) {
+  if (value > UINT64_MAX - total) {
+    return false;
+  }
+  total += value;
+  return true;
+}
+
+bool hash_is_nonzero_v3(const std::uint8_t* hash, std::size_t bytes) {
+  if (hash == nullptr || bytes == 0) {
+    return false;
+  }
+  for (std::size_t index = 0; index < bytes; ++index) {
+    if (hash[index] != 0u) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <typename T>
+std::int32_t ensure_device_capacity_v3(T** pointer,
+                                       std::size_t* capacity,
+                                       std::size_t required) {
+  if (required <= *capacity) {
+    return NEO_POPULATION_STATUS_OK;
+  }
+  device_free(*pointer);
+  *capacity = 0;
+  const auto status = device_alloc(pointer, required);
+  if (status == NEO_POPULATION_STATUS_OK) {
+    *capacity = required;
+  }
+  return status;
 }
 
 }  // namespace
@@ -1657,26 +1962,178 @@ extern "C" NeoCudaPopulationSession* neoethos_gpu_cuda_population_create(
     return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
   }
 
+  cudaDeviceProp properties{};
+  if (cudaGetDeviceProperties(&properties, device) != cudaSuccess ||
+      properties.major < 0 || properties.minor < 0 || properties.multiProcessorCount <= 0 ||
+      properties.totalGlobalMem == 0) {
+    return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+
   auto* session = new (std::nothrow) NeoCudaPopulationSession();
   if (session == nullptr) {
     return fail(NEO_POPULATION_STATUS_ALLOCATION_FAILED);
   }
   session->device = device;
-  // Read once. `choose_reduce_block` needs it on every launch and it cannot
-  // change; a failed query leaves 0, which that function treats as 1 and so
-  // degrades to the smallest block rather than to an undefined grid.
-  {
-    int sm_count = 0;
-    if (cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device) ==
-        cudaSuccess) {
-      session->sm_count = sm_count;
-    }
-  }
+  session->sm_count = properties.multiProcessorCount;
+  session->device_identity.selected_device_ordinal = static_cast<std::uint32_t>(device);
+  session->device_identity.compute_capability_major =
+      static_cast<std::uint32_t>(properties.major);
+  session->device_identity.compute_capability_minor =
+      static_cast<std::uint32_t>(properties.minor);
+  session->device_identity.multiprocessor_count =
+      static_cast<std::uint32_t>(properties.multiProcessorCount);
+  session->device_identity.total_global_memory_bytes =
+      static_cast<std::uint64_t>(properties.totalGlobalMem);
+  session->device_identity.pci_domain_id = properties.pciDomainID;
+  session->device_identity.pci_bus_id = properties.pciBusID;
+  session->device_identity.pci_device_id = properties.pciDeviceID;
+#if CUDART_VERSION >= 10000
+  std::memcpy(session->device_identity.uuid,
+              properties.uuid.bytes,
+              sizeof(session->device_identity.uuid));
+#endif
+  std::memcpy(session->device_identity.name,
+              properties.name,
+              sizeof(session->device_identity.name));
   if (cudaStreamCreateWithFlags(&session->stream, cudaStreamNonBlocking) != cudaSuccess ||
       cudaEventCreateWithFlags(&session->event, cudaEventDisableTiming) != cudaSuccess) {
     session->release();
     delete session;
     return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+  session->residency_counters.stream_creation_count = 1ull;
+  if (status != nullptr) {
+    *status = NEO_POPULATION_STATUS_OK;
+  }
+  return session;
+}
+
+extern "C" NeoCudaPopulationSession*
+neoethos_gpu_cuda_population_bind_resident_feature_store_v3(
+    const NeoPopulationResidentFeatureStoreV3* resident,
+    std::int32_t* status) {
+  const auto fail = [&](std::int32_t code) -> NeoCudaPopulationSession* {
+    if (status != nullptr) {
+      *status = code;
+    }
+    return nullptr;
+  };
+  if (resident == nullptr || resident->abi_version != NEOETHOS_GPU_ABI_VERSION) {
+    return fail(resident == nullptr ? NEO_POPULATION_STATUS_INVALID_ARGUMENT
+                                    : NEO_POPULATION_STATUS_ABI_MISMATCH);
+  }
+  if (resident->reserved != 0u || resident->row_count == 0ull ||
+      resident->feature_count == 0u || resident->smc_slots != kSmcSlots ||
+      resident->row_count > static_cast<std::uint64_t>(INT_MAX) ||
+      resident->feature_count > static_cast<std::uint32_t>(INT_MAX) ||
+      resident->row_count > static_cast<std::uint64_t>(SIZE_MAX) /
+                                static_cast<std::uint64_t>(resident->feature_count) ||
+      resident->row_count * static_cast<std::uint64_t>(resident->feature_count) >
+          static_cast<std::uint64_t>(SIZE_MAX) ||
+      resident->close == nullptr || resident->high == nullptr || resident->low == nullptr ||
+      resident->indicators_bar_major == nullptr ||
+      resident->indicators_validity_u4 == nullptr || resident->months == nullptr ||
+      resident->days == nullptr || resident->timestamps == nullptr ||
+      resident->smc_rows == nullptr || resident->admitted_primary_context == nullptr ||
+      resident->admitted_run_stream == nullptr || resident->ready_event == nullptr ||
+      !hash_is_nonzero_v3(resident->admission_identity_sha256,
+                          sizeof(resident->admission_identity_sha256)) ||
+      !hash_is_nonzero_v3(resident->canonical_content_merkle,
+                          sizeof(resident->canonical_content_merkle)) ||
+      !hash_is_nonzero_v3(resident->device_uuid, sizeof(resident->device_uuid))) {
+    return fail(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  }
+  const std::uint64_t cells =
+      resident->row_count * static_cast<std::uint64_t>(resident->feature_count);
+  const std::uint64_t logical_validity_bytes = cells / 2ull + cells % 2ull;
+  if (logical_validity_bytes > UINT64_MAX - 3ull ||
+      resident->packed_validity_bytes != (logical_validity_bytes + 3ull) / 4ull * 4ull) {
+    return fail(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  }
+
+  int current_device = -1;
+  if (cudaGetDevice(&current_device) != cudaSuccess || current_device < 0 ||
+      static_cast<std::uint32_t>(current_device) != resident->selected_device_ordinal) {
+    return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+  cudaDeviceProp properties{};
+  if (cudaGetDeviceProperties(&properties, current_device) != cudaSuccess ||
+      properties.multiProcessorCount <= 0 || properties.totalGlobalMem == 0 ||
+      properties.major != static_cast<int>(resident->compute_capability_major) ||
+      properties.minor != static_cast<int>(resident->compute_capability_minor)) {
+    return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+#if CUDART_VERSION >= 10000
+  if (std::memcmp(properties.uuid.bytes, resident->device_uuid, sizeof(resident->device_uuid)) !=
+      0) {
+    return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+#else
+  return fail(NEO_POPULATION_STATUS_UNSUPPORTED);
+#endif
+
+  auto* session = new (std::nothrow) NeoCudaPopulationSession();
+  if (session == nullptr) {
+    return fail(NEO_POPULATION_STATUS_ALLOCATION_FAILED);
+  }
+  session->device = current_device;
+  session->stream = resident->admitted_run_stream;
+  session->stream_ownership = NEO_POPULATION_STREAM_BORROWED;
+  session->parent_ownership = NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3;
+  const auto fail_session = [&](std::int32_t code) -> NeoCudaPopulationSession* {
+    session->release();
+    delete session;
+    return fail(code);
+  };
+  if (cudaEventCreateWithFlags(&session->event, cudaEventDisableTiming) != cudaSuccess) {
+    return fail_session(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+  const auto parent_rows = static_cast<std::size_t>(resident->row_count);
+  const auto gap_status = device_alloc(&session->gap_flags, parent_rows);
+  if (gap_status != NEO_POPULATION_STATUS_OK) {
+    return fail_session(gap_status);
+  }
+
+  session->close = const_cast<double*>(resident->close);
+  session->high = const_cast<double*>(resident->high);
+  session->low = const_cast<double*>(resident->low);
+  session->indicators_bar_major =
+      const_cast<double*>(resident->indicators_bar_major);
+  session->indicators_validity_u4 =
+      const_cast<unsigned char*>(resident->indicators_validity_u4);
+  session->indicators_validity_u4_bytes =
+      static_cast<std::size_t>(resident->packed_validity_bytes);
+  session->months = const_cast<std::int64_t*>(resident->months);
+  session->days = const_cast<std::int64_t*>(resident->days);
+  session->timestamps = const_cast<std::int64_t*>(resident->timestamps);
+  session->smc_rows = const_cast<signed char*>(resident->smc_rows);
+  session->parent_rows = static_cast<int>(resident->row_count);
+  session->feature_count = static_cast<int>(resident->feature_count);
+  session->sm_count = properties.multiProcessorCount;
+  session->has_parent_v1 = true;
+  session->device_identity.selected_device_ordinal = resident->selected_device_ordinal;
+  session->device_identity.compute_capability_major = resident->compute_capability_major;
+  session->device_identity.compute_capability_minor = resident->compute_capability_minor;
+  session->device_identity.multiprocessor_count =
+      static_cast<std::uint32_t>(properties.multiProcessorCount);
+  session->device_identity.total_global_memory_bytes =
+      static_cast<std::uint64_t>(properties.totalGlobalMem);
+  session->device_identity.pci_domain_id = properties.pciDomainID;
+  session->device_identity.pci_bus_id = properties.pciBusID;
+  session->device_identity.pci_device_id = properties.pciDeviceID;
+  std::memcpy(session->device_identity.uuid,
+              resident->device_uuid,
+              sizeof(session->device_identity.uuid));
+  std::memcpy(session->device_identity.name,
+              properties.name,
+              sizeof(session->device_identity.name));
+
+  // This is deliberately the final fallible operation. Once the ready-event
+  // dependency is accepted, returning the armed session transfers all native
+  // and imported lifetimes together to Rust; no error path can free borrowed
+  // parent storage after queuing a possible read.
+  if (cudaStreamWaitEvent(session->stream, resident->ready_event, 0) != cudaSuccess) {
+    return fail_session(NEO_POPULATION_STATUS_SYNC_FAILED);
   }
   if (status != nullptr) {
     *status = NEO_POPULATION_STATUS_OK;
@@ -1689,6 +2146,12 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
     const NeoPopulationDatasetView* dataset) {
   if (session == nullptr) {
     return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (session->parent_ownership == NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
   if (dataset == nullptr || dataset->close == nullptr || dataset->high == nullptr ||
       dataset->low == nullptr || dataset->indicators == nullptr || dataset->months == nullptr ||
@@ -1713,6 +2176,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
   if (cudaSetDevice(session->device) != cudaSuccess) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
+  session->parent_ownership = NEO_POPULATION_PARENT_OWNED_V1;
 
   std::int32_t status = NEO_POPULATION_STATUS_OK;
   status = device_alloc(&session->close, bars);
@@ -1739,7 +2203,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
   }
 
   const std::size_t double_bytes = bars * sizeof(double);
-  const std::size_t i64_bytes = bars * sizeof(long long);
+  const std::size_t i64_bytes = bars * sizeof(std::int64_t);
   std::uint64_t uploaded = 0;
   status = copy_to_device(session->close, dataset->close, double_bytes, session->stream);
   if (status != NEO_POPULATION_STATUS_OK) return status;
@@ -1757,7 +2221,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
   // The device wants the opposite. Every thread of a reduce block is at the
   // same bar and each wants up to 16 of that bar's features; feature-major puts
   // those 3.37 MB apart, which is up to 64 distinct cache lines per warp-bar.
-  // Bar-major makes the whole feature row of a bar one contiguous 256-byte run
+  // Bar-major makes the whole feature row of a bar one contiguous 512-byte run
   // that the warp shares.
   //
   // So the feature-major bytes land in a STAGING buffer, one kernel transposes
@@ -1767,10 +2231,10 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
   // has just been asked for the same amount again for the permanent buffer, so
   // if the transient one cannot be had, the dataset was never going to fit.
   {
-    float* staging = nullptr;
+    double* staging = nullptr;
     status = device_alloc(&staging, features * bars);
     if (status != NEO_POPULATION_STATUS_OK) return status;
-    status = copy_to_device(staging, dataset->indicators, features * bars * sizeof(float),
+    status = copy_to_device(staging, dataset->indicators, features * bars * sizeof(double),
                             session->stream);
     if (status != NEO_POPULATION_STATUS_OK) {
       device_free(staging);
@@ -1807,7 +2271,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
                           bars * kSmcSlots * sizeof(signed char), session->stream);
   if (status != NEO_POPULATION_STATUS_OK) return status;
   uploaded = static_cast<std::uint64_t>(3 * double_bytes + 3 * i64_bytes +
-                                        features * bars * sizeof(float) +
+                                        features * bars * sizeof(double) +
                                         bars * kSmcSlots * sizeof(signed char));
   if (dataset->adaptive_base_pips != nullptr) {
     status = copy_to_device(session->adaptive_base_pips, dataset->adaptive_base_pips,
@@ -1818,9 +2282,285 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
   }
 
   session->bars = static_cast<int>(bars);
+  session->parent_rows = static_cast<int>(bars);
   session->feature_count = static_cast<int>(features);
+  session->view_kind = static_cast<int>(NEO_POPULATION_VIEW_FULL);
+  session->view_start = 0;
+  session->timestamp_mode = static_cast<int>(NEO_POPULATION_TIMESTAMP_CANONICAL);
   session->dataset_upload_bytes = uploaded;
   session->has_dataset = true;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_upload_parent_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationParentDatasetV1* parent) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (session->parent_ownership == NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (parent == nullptr || parent->close == nullptr || parent->high == nullptr ||
+      parent->low == nullptr || parent->indicators_feature_major == nullptr ||
+      parent->months == nullptr || parent->days == nullptr || parent->timestamps == nullptr ||
+      parent->smc_rows == nullptr) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (parent->header.abi_version != NEOETHOS_GPU_ABI_VERSION) {
+    return NEO_POPULATION_STATUS_ABI_MISMATCH;
+  }
+  if (session->has_parent_v1 || session->has_dataset) {
+    return NEO_POPULATION_STATUS_DATASET_REUPLOAD;
+  }
+  const std::uint64_t parent_rows_u64 = parent->header.row_count;
+  const std::uint64_t features_u64 = parent->header.feature_count;
+  if (parent_rows_u64 == 0ull || features_u64 == 0ull ||
+      parent_rows_u64 > static_cast<std::uint64_t>(INT_MAX) ||
+      features_u64 > static_cast<std::uint64_t>(INT_MAX) ||
+      features_u64 > static_cast<std::uint64_t>(SIZE_MAX) / parent_rows_u64 ||
+      features_u64 * parent_rows_u64 >
+          static_cast<std::uint64_t>(SIZE_MAX / sizeof(double)) ||
+      parent_rows_u64 > static_cast<std::uint64_t>(SIZE_MAX / kSmcSlots)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  session->parent_ownership = NEO_POPULATION_PARENT_OWNED_V1;
+
+  const std::size_t parent_rows = static_cast<std::size_t>(parent_rows_u64);
+  const std::size_t features = static_cast<std::size_t>(features_u64);
+  const std::size_t feature_values = features * parent_rows;
+  std::int32_t status = device_alloc(&session->close, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = device_alloc(&session->high, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = device_alloc(&session->low, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = device_alloc(&session->indicators_feature_major, feature_values);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = device_alloc(&session->months, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = device_alloc(&session->days, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = device_alloc(&session->timestamps, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = device_alloc(&session->smc_rows, parent_rows * kSmcSlots);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = device_alloc(&session->view_indices, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  session->view_indices_capacity = parent_rows;
+  status = device_alloc(&session->adaptive_base_pips, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  session->adaptive_base_pips_capacity = parent_rows;
+  status = device_alloc(&session->gap_flags, parent_rows);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+
+  const std::size_t price_bytes = parent_rows * sizeof(double);
+  const std::size_t index_bytes = parent_rows * sizeof(std::int64_t);
+  const std::size_t feature_bytes = feature_values * sizeof(double);
+  const std::size_t smc_bytes = parent_rows * kSmcSlots * sizeof(signed char);
+  status = copy_to_device(session->close, parent->close, price_bytes, session->stream);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = copy_to_device(session->high, parent->high, price_bytes, session->stream);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = copy_to_device(session->low, parent->low, price_bytes, session->stream);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = copy_to_device(session->indicators_feature_major,
+                          parent->indicators_feature_major,
+                          feature_bytes,
+                          session->stream);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = copy_to_device(session->months, parent->months, index_bytes, session->stream);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = copy_to_device(session->days, parent->days, index_bytes, session->stream);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = copy_to_device(session->timestamps, parent->timestamps, index_bytes, session->stream);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  status = copy_to_device(session->smc_rows, parent->smc_rows, smc_bytes, session->stream);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+
+  std::uint64_t parent_upload_bytes = 0ull;
+  if (!checked_add_u64(parent_upload_bytes, static_cast<std::uint64_t>(price_bytes)) ||
+      !checked_add_u64(parent_upload_bytes, static_cast<std::uint64_t>(price_bytes)) ||
+      !checked_add_u64(parent_upload_bytes, static_cast<std::uint64_t>(price_bytes)) ||
+      !checked_add_u64(parent_upload_bytes, static_cast<std::uint64_t>(index_bytes)) ||
+      !checked_add_u64(parent_upload_bytes, static_cast<std::uint64_t>(index_bytes)) ||
+      !checked_add_u64(parent_upload_bytes, static_cast<std::uint64_t>(index_bytes)) ||
+      !checked_add_u64(parent_upload_bytes, static_cast<std::uint64_t>(feature_bytes)) ||
+      !checked_add_u64(parent_upload_bytes, static_cast<std::uint64_t>(smc_bytes))) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  session->parent_rows = static_cast<int>(parent_rows);
+  session->feature_count = static_cast<int>(features);
+  session->dataset_upload_bytes = parent_upload_bytes;
+  session->has_parent_v1 = true;
+  session->residency_counters.parent_upload_count = 1ull;
+  session->residency_counters.parent_upload_bytes = parent_upload_bytes;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_bind_view_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationEvaluationViewV1* view) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (view == nullptr || !session->has_parent_v1) {
+    return NEO_POPULATION_STATUS_MISSING_UPLOAD;
+  }
+  if (view->abi_version != NEOETHOS_GPU_ABI_VERSION) {
+    return NEO_POPULATION_STATUS_ABI_MISMATCH;
+  }
+  if (view->parent_row_count != static_cast<std::uint64_t>(session->parent_rows) ||
+      view->row_count == 0ull || view->row_count > static_cast<std::uint64_t>(INT_MAX) ||
+      view->timestamp_mode > NEO_POPULATION_TIMESTAMP_DISABLED_INDEX_DELTA ||
+      (view->adaptive_base_pips == nullptr && view->adaptive_base_pips_len != 0) ||
+      (view->adaptive_base_pips != nullptr &&
+       view->adaptive_base_pips_len != static_cast<std::size_t>(view->row_count))) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (session->pending_event_id != 0ull && !session->metrics_ready) {
+    return NEO_POPULATION_STATUS_SYNC_FAILED;
+  }
+
+  const std::size_t rows = static_cast<std::size_t>(view->row_count);
+  switch (view->view_kind) {
+    case NEO_POPULATION_VIEW_FULL:
+      if (view->range_start != 0ull || view->row_count != view->parent_row_count ||
+          view->ordered_indices != nullptr || view->ordered_index_count != 0) {
+        return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+      }
+      break;
+    case NEO_POPULATION_VIEW_CONTIGUOUS_RANGE:
+      if (view->range_start >= view->parent_row_count ||
+          view->row_count > view->parent_row_count - view->range_start ||
+          view->ordered_indices != nullptr || view->ordered_index_count != 0) {
+        return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+      }
+      break;
+    case NEO_POPULATION_VIEW_ORDERED_INDICES:
+      if (view->range_start != 0ull || view->ordered_indices == nullptr ||
+          view->ordered_index_count != rows) {
+        return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+      }
+      for (std::size_t index = 0; index < rows; ++index) {
+        if (view->ordered_indices[index] >= view->parent_row_count ||
+            (index > 0 && view->ordered_indices[index - 1] >= view->ordered_indices[index])) {
+          return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+        }
+      }
+      break;
+    default:
+      return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  const std::uint64_t ordered_upload_bytes =
+      view->view_kind == NEO_POPULATION_VIEW_ORDERED_INDICES
+          ? static_cast<std::uint64_t>(rows * sizeof(unsigned long long))
+          : 0ull;
+  const std::uint64_t adaptive_upload_bytes =
+      view->adaptive_base_pips != nullptr
+          ? static_cast<std::uint64_t>(rows * sizeof(double))
+          : 0ull;
+  const std::uint64_t kind_binding_count =
+      view->view_kind == NEO_POPULATION_VIEW_FULL
+          ? session->residency_counters.full_binding_count
+          : (view->view_kind == NEO_POPULATION_VIEW_CONTIGUOUS_RANGE
+                 ? session->residency_counters.range_binding_count
+                 : session->residency_counters.ordered_binding_count);
+  if (session->residency_counters.view_binding_count == UINT64_MAX ||
+      kind_binding_count == UINT64_MAX ||
+      ordered_upload_bytes >
+          UINT64_MAX - session->residency_counters.ordered_index_upload_bytes ||
+      adaptive_upload_bytes >
+          UINT64_MAX - session->residency_counters.adaptive_upload_bytes) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  std::int32_t status = NEO_POPULATION_STATUS_OK;
+  if (view->view_kind == NEO_POPULATION_VIEW_ORDERED_INDICES) {
+    status = ensure_device_capacity_v3(&session->view_indices,
+                                       &session->view_indices_capacity,
+                                       rows);
+    if (status != NEO_POPULATION_STATUS_OK) return status;
+    const std::size_t bytes = rows * sizeof(unsigned long long);
+    status = copy_to_device(session->view_indices, view->ordered_indices, bytes, session->stream);
+    if (status != NEO_POPULATION_STATUS_OK) return status;
+    session->residency_counters.ordered_index_upload_bytes += ordered_upload_bytes;
+  }
+  if (view->adaptive_base_pips != nullptr) {
+    status = ensure_device_capacity_v3(&session->adaptive_base_pips,
+                                       &session->adaptive_base_pips_capacity,
+                                       rows);
+    if (status != NEO_POPULATION_STATUS_OK) return status;
+    const std::size_t bytes = rows * sizeof(double);
+    status = copy_to_device(session->adaptive_base_pips,
+                            view->adaptive_base_pips,
+                            bytes,
+                            session->stream);
+    if (status != NEO_POPULATION_STATUS_OK) return status;
+    session->residency_counters.adaptive_upload_bytes += adaptive_upload_bytes;
+  }
+
+  session->view_kind = static_cast<int>(view->view_kind);
+  session->view_start = static_cast<int>(view->range_start);
+  session->timestamp_mode = static_cast<int>(view->timestamp_mode);
+  session->bars = static_cast<int>(rows);
+  session->has_adaptive_base = view->adaptive_base_pips != nullptr ? 1 : 0;
+  session->has_dataset = true;
+  session->has_scenarios = false;
+  session->scenario_count = 0;
+  session->metrics_ready = false;
+  session->pending_event_id = 0ull;
+  session->residency_counters.view_binding_count += 1ull;
+  if (view->view_kind == NEO_POPULATION_VIEW_FULL) {
+    session->residency_counters.full_binding_count += 1ull;
+  } else if (view->view_kind == NEO_POPULATION_VIEW_CONTIGUOUS_RANGE) {
+    session->residency_counters.range_binding_count += 1ull;
+  } else {
+    session->residency_counters.ordered_binding_count += 1ull;
+  }
+  return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_read_residency_counters_v1(
+    NeoCudaPopulationSession* session,
+    NeoPopulationResidencyCountersV1* counters) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (counters == nullptr) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  *counters = session->residency_counters;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_read_device_identity_v1(
+    NeoCudaPopulationSession* session,
+    NeoPopulationDeviceIdentityV1* identity) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (identity == nullptr) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  *identity = session->device_identity;
   return NEO_POPULATION_STATUS_OK;
 }
 
@@ -1829,6 +2569,9 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
     const NeoPopulationGeneView* genes) {
   if (session == nullptr) {
     return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
   }
   if (!session->has_dataset) {
     return NEO_POPULATION_STATUS_MISSING_UPLOAD;
@@ -1848,6 +2591,10 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
 
   const std::size_t population = genes->count;
   const std::size_t terms = genes->term_count;
+  if (population == SIZE_MAX || population > SIZE_MAX / kSmcSlots ||
+      terms > SIZE_MAX / sizeof(double)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
   // Bar-major turned an out-of-range feature index from LOUD into SILENT.
   //
   // Feature-major addressed `indicators[feature * bars + bar]`, so a `feature`
@@ -1855,7 +2602,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
   // buffer — an out-of-bounds access compute-sanitizer catches immediately.
   // Bar-major addresses `indicators_bar_major[bar * feature_count + feature]`,
   // where the same index resolves to `(bar + 1) * feature_count + 0`: in
-  // bounds, a perfectly plausible float belonging to the NEXT bar, and nobody
+  // bounds, a perfectly plausible double belonging to the NEXT bar, and nobody
   // ever knows. The hardware was a second, independent detector and it is gone.
   //
   // So the check moves here, once per upload rather than once per term-read.
@@ -1869,26 +2616,51 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
   }
   // Host-side staging of the descriptor-derived arrays keeps the device layout
   // flat and coalesced without changing canonical identity or ordering.
-  auto* candidate_ids = new (std::nothrow) unsigned long long[population];
-  auto* long_thresholds = new (std::nothrow) float[population];
-  auto* short_thresholds = new (std::nothrow) float[population];
-  if (candidate_ids == nullptr || long_thresholds == nullptr || short_thresholds == nullptr) {
-    delete[] candidate_ids;
-    delete[] long_thresholds;
-    delete[] short_thresholds;
+  auto* staging = new (std::nothrow) GeneHostStagingV1();
+  if (staging == nullptr) {
+    return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+  }
+  staging->candidate_ids = new (std::nothrow) unsigned long long[population];
+  staging->offsets = new (std::nothrow) int[population + 1];
+  if (terms > 0) {
+    staging->indices = new (std::nothrow) int[terms];
+    staging->weights = new (std::nothrow) double[terms];
+  }
+  staging->long_thresholds = new (std::nothrow) double[population];
+  staging->short_thresholds = new (std::nothrow) double[population];
+  staging->stop_pips = new (std::nothrow) double[population];
+  staging->target_pips = new (std::nothrow) double[population];
+  staging->stop_vol_multipliers = new (std::nothrow) double[population];
+  staging->smc_flags = new (std::nothrow) signed char[population * kSmcSlots];
+  staging->smc_weights = new (std::nothrow) double[kSmcSlots];
+  if (staging->candidate_ids == nullptr || staging->offsets == nullptr ||
+      (terms > 0 && (staging->indices == nullptr || staging->weights == nullptr)) ||
+      staging->long_thresholds == nullptr || staging->short_thresholds == nullptr ||
+      staging->stop_pips == nullptr || staging->target_pips == nullptr ||
+      staging->stop_vol_multipliers == nullptr || staging->smc_flags == nullptr ||
+      staging->smc_weights == nullptr) {
+    delete staging;
     return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
   }
   for (std::size_t index = 0; index < population; ++index) {
-    candidate_ids[index] = genes->descriptors[index].candidate_id;
-    long_thresholds[index] = genes->descriptors[index].long_threshold;
-    short_thresholds[index] = genes->descriptors[index].short_threshold;
+    staging->candidate_ids[index] = genes->descriptors[index].candidate_id;
+    staging->long_thresholds[index] = genes->descriptors[index].long_threshold;
+    staging->short_thresholds[index] = genes->descriptors[index].short_threshold;
   }
-
-  const auto cleanup_host = [&]() {
-    delete[] candidate_ids;
-    delete[] long_thresholds;
-    delete[] short_thresholds;
-  };
+  std::memcpy(staging->offsets, genes->offsets, (population + 1) * sizeof(int));
+  if (terms > 0) {
+    std::memcpy(staging->indices, genes->indices, terms * sizeof(int));
+    std::memcpy(staging->weights, genes->weights, terms * sizeof(double));
+  }
+  std::memcpy(staging->stop_pips, genes->stop_pips, population * sizeof(double));
+  std::memcpy(staging->target_pips, genes->target_pips, population * sizeof(double));
+  std::memcpy(staging->stop_vol_multipliers,
+              genes->stop_vol_multipliers,
+              population * sizeof(double));
+  std::memcpy(staging->smc_flags,
+              genes->smc_flags,
+              population * kSmcSlots * sizeof(signed char));
+  std::memcpy(staging->smc_weights, genes->smc_weights, kSmcSlots * sizeof(double));
 
   device_free(session->candidate_ids);
   device_free(session->gene_offsets);
@@ -1921,50 +2693,50 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
       !guard(device_alloc(&session->stop_vol_multipliers, population)) ||
       !guard(device_alloc(&session->smc_flags, population * kSmcSlots)) ||
       !guard(device_alloc(&session->smc_weights, kSmcSlots))) {
-    cleanup_host();
+    delete staging;
     return status;
   }
 
-  if (!guard(copy_to_device(session->candidate_ids, candidate_ids,
+  if (!guard(copy_to_device(session->candidate_ids, staging->candidate_ids,
                             population * sizeof(unsigned long long), session->stream)) ||
-      !guard(copy_to_device(session->gene_offsets, genes->offsets,
+      !guard(copy_to_device(session->gene_offsets, staging->offsets,
                             (population + 1) * sizeof(int), session->stream)) ||
-      !guard(copy_to_device(session->gene_indices, genes->indices, terms * sizeof(int),
+      !guard(copy_to_device(session->gene_indices, staging->indices, terms * sizeof(int),
                             session->stream)) ||
-      !guard(copy_to_device(session->gene_weights, genes->weights, terms * sizeof(float),
+      !guard(copy_to_device(session->gene_weights, staging->weights, terms * sizeof(double),
                             session->stream)) ||
-      !guard(copy_to_device(session->long_thresholds, long_thresholds,
-                            population * sizeof(float), session->stream)) ||
-      !guard(copy_to_device(session->short_thresholds, short_thresholds,
-                            population * sizeof(float), session->stream)) ||
-      !guard(copy_to_device(session->stop_pips, genes->stop_pips, population * sizeof(double),
-                            session->stream)) ||
-      !guard(copy_to_device(session->target_pips, genes->target_pips,
+      !guard(copy_to_device(session->long_thresholds, staging->long_thresholds,
                             population * sizeof(double), session->stream)) ||
-      !guard(copy_to_device(session->stop_vol_multipliers, genes->stop_vol_multipliers,
+      !guard(copy_to_device(session->short_thresholds, staging->short_thresholds,
                             population * sizeof(double), session->stream)) ||
-      !guard(copy_to_device(session->smc_flags, genes->smc_flags,
+      !guard(copy_to_device(session->stop_pips, staging->stop_pips,
+                            population * sizeof(double),
+                            session->stream)) ||
+      !guard(copy_to_device(session->target_pips, staging->target_pips,
+                            population * sizeof(double), session->stream)) ||
+      !guard(copy_to_device(session->stop_vol_multipliers,
+                            staging->stop_vol_multipliers,
+                            population * sizeof(double), session->stream)) ||
+      !guard(copy_to_device(session->smc_flags, staging->smc_flags,
                             population * kSmcSlots * sizeof(signed char), session->stream)) ||
-      !guard(copy_to_device(session->smc_weights, genes->smc_weights,
-                            kSmcSlots * sizeof(float), session->stream))) {
-    cleanup_host();
+      !guard(copy_to_device(session->smc_weights, staging->smc_weights,
+                            kSmcSlots * sizeof(double), session->stream))) {
+    cudaStreamSynchronize(session->stream);
+    delete staging;
     return status;
   }
-
-  if (cudaStreamSynchronize(session->stream) != cudaSuccess) {
-    cleanup_host();
-    return NEO_POPULATION_STATUS_TRANSFER_FAILED;
-  }
-  cleanup_host();
+  status = release_staging_after_stream_v1(session->stream, staging,
+                                            release_gene_host_staging_v1);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
 
   session->population = static_cast<int>(population);
   session->gate_threshold = genes->gate_threshold;
   session->smc_gate_disabled = static_cast<int>(genes->smc_gate_disabled);
   session->gene_upload_bytes = static_cast<std::uint64_t>(
-      population * (sizeof(unsigned long long) + 2 * sizeof(float) + 3 * sizeof(double) +
+      population * (sizeof(unsigned long long) + 5 * sizeof(double) +
                     kSmcSlots * sizeof(signed char)) +
-      (population + 1) * sizeof(int) + terms * (sizeof(int) + sizeof(float)) +
-      kSmcSlots * sizeof(float));
+      (population + 1) * sizeof(int) + terms * (sizeof(int) + sizeof(double)) +
+      kSmcSlots * sizeof(double));
   session->has_genes = true;
   session->has_scenarios = false;
   session->metrics_ready = false;
@@ -1976,6 +2748,9 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
     const NeoPopulationScenarioView* scenarios) {
   if (session == nullptr) {
     return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
   }
   if (!session->has_genes) {
     return NEO_POPULATION_STATUS_MISSING_UPLOAD;
@@ -2038,43 +2813,37 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
   // Host staging, struct-of-arrays, exactly as `upload_genes` stages its
   // descriptor-derived arrays: the device wants each field contiguous so a warp
   // reads one cache line per field instead of one per lane.
-  auto* base_ids = new (std::nothrow) unsigned long long[count];
-  auto* ids = new (std::nothrow) unsigned long long[count];
-  auto* counters = new (std::nothrow) unsigned long long[count];
-  auto* offsets = new (std::nothrow) unsigned long long[count];
-  auto* lens = new (std::nothrow) unsigned int[count];
-  auto* types = new (std::nothrow) unsigned int[count];
-  auto* spreads = new (std::nothrow) int[count];
-  auto* slippages = new (std::nothrow) int[count];
-  auto* commissions = new (std::nothrow) long long[count];
-  const auto cleanup_host = [&]() {
-    delete[] base_ids;
-    delete[] ids;
-    delete[] counters;
-    delete[] offsets;
-    delete[] lens;
-    delete[] types;
-    delete[] spreads;
-    delete[] slippages;
-    delete[] commissions;
-  };
-  if (base_ids == nullptr || ids == nullptr || counters == nullptr || offsets == nullptr ||
-      lens == nullptr || types == nullptr || spreads == nullptr || slippages == nullptr ||
-      commissions == nullptr) {
-    cleanup_host();
+  auto* staging = new (std::nothrow) ScenarioHostStagingV1();
+  if (staging == nullptr) {
+    return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+  }
+  staging->base_ids = new (std::nothrow) unsigned long long[count];
+  staging->ids = new (std::nothrow) unsigned long long[count];
+  staging->counters = new (std::nothrow) unsigned long long[count];
+  staging->offsets = new (std::nothrow) unsigned long long[count];
+  staging->lens = new (std::nothrow) unsigned int[count];
+  staging->types = new (std::nothrow) unsigned int[count];
+  staging->spreads = new (std::nothrow) int[count];
+  staging->slippages = new (std::nothrow) int[count];
+  staging->commissions = new (std::nothrow) long long[count];
+  if (staging->base_ids == nullptr || staging->ids == nullptr || staging->counters == nullptr ||
+      staging->offsets == nullptr || staging->lens == nullptr || staging->types == nullptr ||
+      staging->spreads == nullptr || staging->slippages == nullptr ||
+      staging->commissions == nullptr) {
+    delete staging;
     return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
   }
   for (std::size_t index = 0; index < count; ++index) {
     const NeoScenarioDescriptor& descriptor = scenarios->descriptors[index];
-    base_ids[index] = descriptor.base_candidate_id;
-    ids[index] = descriptor.scenario_id;
-    counters[index] = descriptor.rng_counter;
-    offsets[index] = descriptor.window_offset;
-    lens[index] = descriptor.window_len;
-    types[index] = descriptor.scenario_type;
-    spreads[index] = descriptor.spread_ticks;
-    slippages[index] = descriptor.slippage_ticks;
-    commissions[index] = descriptor.commission_micros;
+    staging->base_ids[index] = descriptor.base_candidate_id;
+    staging->ids[index] = descriptor.scenario_id;
+    staging->counters[index] = descriptor.rng_counter;
+    staging->offsets[index] = descriptor.window_offset;
+    staging->lens[index] = descriptor.window_len;
+    staging->types[index] = descriptor.scenario_type;
+    staging->spreads[index] = descriptor.spread_ticks;
+    staging->slippages[index] = descriptor.slippage_ticks;
+    staging->commissions[index] = descriptor.commission_micros;
   }
 
   session->release_scenarios();
@@ -2094,7 +2863,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
       !guard(device_alloc(&session->scenario_spread_ticks, count)) ||
       !guard(device_alloc(&session->scenario_slippage_ticks, count)) ||
       !guard(device_alloc(&session->scenario_commission_micros, count))) {
-    cleanup_host();
+    delete staging;
     session->release_scenarios();
     return status;
   }
@@ -2103,29 +2872,30 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
   const std::size_t u32_bytes = count * sizeof(unsigned int);
   const std::size_t i32_bytes = count * sizeof(int);
   const std::size_t i64_bytes = count * sizeof(long long);
-  if (!guard(copy_to_device(session->scenario_base_candidate_ids, base_ids, u64_bytes,
+  if (!guard(copy_to_device(session->scenario_base_candidate_ids, staging->base_ids, u64_bytes,
                             session->stream)) ||
-      !guard(copy_to_device(session->scenario_ids, ids, u64_bytes, session->stream)) ||
-      !guard(copy_to_device(session->scenario_rng_counters, counters, u64_bytes,
+      !guard(copy_to_device(session->scenario_ids, staging->ids, u64_bytes, session->stream)) ||
+      !guard(copy_to_device(session->scenario_rng_counters, staging->counters, u64_bytes,
                             session->stream)) ||
-      !guard(copy_to_device(session->scenario_window_offsets, offsets, u64_bytes,
+      !guard(copy_to_device(session->scenario_window_offsets, staging->offsets, u64_bytes,
                             session->stream)) ||
-      !guard(copy_to_device(session->scenario_window_lens, lens, u32_bytes, session->stream)) ||
-      !guard(copy_to_device(session->scenario_types, types, u32_bytes, session->stream)) ||
-      !guard(copy_to_device(session->scenario_spread_ticks, spreads, i32_bytes,
+      !guard(copy_to_device(session->scenario_window_lens, staging->lens, u32_bytes,
                             session->stream)) ||
-      !guard(copy_to_device(session->scenario_slippage_ticks, slippages, i32_bytes,
+      !guard(copy_to_device(session->scenario_types, staging->types, u32_bytes,
                             session->stream)) ||
-      !guard(copy_to_device(session->scenario_commission_micros, commissions, i64_bytes,
+      !guard(copy_to_device(session->scenario_spread_ticks, staging->spreads, i32_bytes,
+                            session->stream)) ||
+      !guard(copy_to_device(session->scenario_slippage_ticks, staging->slippages, i32_bytes,
+                            session->stream)) ||
+      !guard(copy_to_device(session->scenario_commission_micros, staging->commissions, i64_bytes,
                             session->stream))) {
-    cleanup_host();
+    cudaStreamSynchronize(session->stream);
+    delete staging;
     return status;
   }
-  if (cudaStreamSynchronize(session->stream) != cudaSuccess) {
-    cleanup_host();
-    return NEO_POPULATION_STATUS_TRANSFER_FAILED;
-  }
-  cleanup_host();
+  status = release_staging_after_stream_v1(session->stream, staging,
+                                            release_scenario_host_staging_v1);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
 
   session->scenario_count = static_cast<int>(count);
   session->scenario_upload_bytes =
@@ -2135,77 +2905,84 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
   return NEO_POPULATION_STATUS_OK;
 }
 
-extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
-    NeoCudaPopulationSession* session,
-    const NeoPopulationSettings* settings,
-    std::uint64_t* event_id,
-    NeoPopulationCounters* counters) {
-  if (session == nullptr) {
-    return NEO_POPULATION_STATUS_NULL_SESSION;
+namespace {
+
+enum class PopulationEvaluationModeV1 : std::uint32_t {
+  CompatibilityDeviceParity = 0u,
+  StrictMetricsOnly = 1u,
+};
+
+constexpr std::uint64_t kPopulationScenarioDeviceBytesV1 =
+    4ull * sizeof(unsigned long long) + 2ull * sizeof(unsigned int) + 2ull * sizeof(int) +
+    sizeof(long long);
+static_assert(kPopulationScenarioDeviceBytesV1 == 56ull);
+
+struct MetricsOnlyBytePlanV1 {
+  std::uint64_t metric_rows_bytes = 0ull;
+  std::uint64_t monthly_pnls_bytes = 0ull;
+  std::uint64_t month_start_equities_bytes = 0ull;
+  std::uint64_t scenario_descriptor_bytes = 0ull;
+  std::uint64_t total_device_bytes = 0ull;
+};
+
+bool checked_mul_u64(std::uint64_t lhs, std::uint64_t rhs, std::uint64_t* product) {
+  if (product == nullptr || (rhs != 0ull && lhs > UINT64_MAX / rhs)) {
+    return false;
   }
-  if (settings == nullptr || event_id == nullptr) {
-    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  *product = lhs * rhs;
+  return true;
+}
+
+bool metrics_only_byte_plan_v1(int scenario_count,
+                               int month_capacity,
+                               MetricsOnlyBytePlanV1* plan) {
+  if (plan == nullptr || scenario_count <= 0 || month_capacity <= 0) {
+    return false;
   }
-  if (!session->has_dataset || !session->has_genes || !session->has_scenarios) {
-    return NEO_POPULATION_STATUS_MISSING_UPLOAD;
+  const auto scenarios = static_cast<std::uint64_t>(scenario_count);
+  const auto months = static_cast<std::uint64_t>(month_capacity);
+  std::uint64_t monthly_elements = 0ull;
+  if (!checked_mul_u64(scenarios, months, &monthly_elements) ||
+      !checked_mul_u64(scenarios, sizeof(NeoPopulationMetricRow), &plan->metric_rows_bytes) ||
+      !checked_mul_u64(monthly_elements, sizeof(double), &plan->monthly_pnls_bytes) ||
+      !checked_mul_u64(monthly_elements, sizeof(double), &plan->month_start_equities_bytes) ||
+      !checked_mul_u64(scenarios, kPopulationScenarioDeviceBytesV1,
+                       &plan->scenario_descriptor_bytes)) {
+    return false;
   }
-  if (settings->abi_version != NEOETHOS_GPU_ABI_VERSION) {
-    return NEO_POPULATION_STATUS_ABI_MISMATCH;
+  plan->total_device_bytes = 0ull;
+  return checked_add_u64(plan->total_device_bytes, plan->metric_rows_bytes) &&
+         checked_add_u64(plan->total_device_bytes, plan->monthly_pnls_bytes) &&
+         checked_add_u64(plan->total_device_bytes, plan->month_start_equities_bytes) &&
+         checked_add_u64(plan->total_device_bytes, plan->scenario_descriptor_bytes);
+}
+
+std::int32_t ensure_compatibility_workspace_v1(NeoCudaPopulationSession* session,
+                                               int scenario_count,
+                                               int month_capacity,
+                                               int bars) {
+  if (session->workspace_mode == PopulationWorkspaceModeV1::StrictMetricsOnly) {
+    return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
   }
-  if (settings->month_capacity == 0u) {
-    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  if (session->workspace_mode == PopulationWorkspaceModeV1::Uninitialized) {
+    session->workspace_mode = PopulationWorkspaceModeV1::CompatibilityDeviceParityOnly;
   }
-  if (cudaSetDevice(session->device) != cudaSuccess) {
-    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  if (session->workspace_mode != PopulationWorkspaceModeV1::CompatibilityDeviceParityOnly) {
+    return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
   }
 
-  const int bars = session->bars;
-  const int population = session->population;
-  // What the launch is SIZED by. Equal to `population` for every caller that
-  // uploads one scenario per gene, which is what makes that case identical to
-  // the pre-scenario engine; larger for a quality screen that asks for many
-  // treatments of the same genes.
-  const int scenario_count = session->scenario_count;
-  const int month_capacity = static_cast<int>(settings->month_capacity);
-
-  // Grow the workspace; never merely match it.
-  //
-  // This read `workspace_population != population`. The host sizes a launch to
-  // free VRAM and then splits recursively, so the launch size changes on almost
-  // every call — and an equality test turns every one of those into
-  // `release_workspace()` followed by a full re-allocation. At 843 456 bars
-  // and ~3 300 candidates that was signal_values 2.78 GB, signal_confidences
-  // 11.1 GB and outcomes 1.95 GB freed and taken again, 15.9 GB of churn where
-  // each `cudaFree` is an implicit device-wide synchronise. Nothing about the
-  // work required it. Two of those three arrays no longer exist at all, so the
-  // worst case this guards is now 1.95 GB — but the guard is what makes the
-  // recursive split free, and it is what lets the split happen at all.
-  //
-  // A SMALLER workload is safe inside a workspace built for a larger one
-  // precisely because every kernel indexes by the CURRENT scenario count: the
-  // reduce returns early for `scenario >= scenarios.count`, `read_metrics`
-  // copies `session->scenario_count` rows, and the outcome slice is
-  // `scenario * kMaxTradesPerCandidate`. All of them address a PREFIX of the
-  // resident arrays, which is in bounds by construction.
-  //
-  // The direction is the whole point, and only one direction is sound. Reusing
-  // a workspace for MORE scenarios is the out-of-bounds write this field was
-  // introduced to stop (see the field comment on `workspace_scenarios`) — a
-  // session built for 256 once ran 25 600. So the test is `<`, never `!=` and
-  // never `>`.
-  //
-  // `month_capacity` and `bars` stay EXACT comparisons on purpose: they are
-  // strides, not extents. `monthly_pnls` is indexed `candidate *
-  // month_capacity`, so a changed stride re-addresses the entire array rather
-  // than shortening it, and having spare room at the end proves nothing about
-  // where element (c, i) lands. `bars` no longer strides any workspace array —
-  // deleting the signal columns removed the only two — but it still decides
-  // what the walk reads, so a changed bar count is still a different workspace.
-  //
-  // The existence probe moved from `signal_values` to `metric_rows` for the
-  // obvious reason: the array it used to name is gone.
-  if (session->metric_rows == nullptr || session->month_capacity != month_capacity ||
-      session->workspace_scenarios < scenario_count || session->workspace_bars != bars) {
+  const auto scenarios = static_cast<std::size_t>(scenario_count);
+  const auto months = static_cast<std::size_t>(month_capacity);
+  if (scenarios > SIZE_MAX / static_cast<std::size_t>(kMaxTradesPerCandidate) ||
+      scenarios > SIZE_MAX / months) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  const bool incomplete = session->outcomes == nullptr || session->monthly_pnls == nullptr ||
+                          session->month_start_equities == nullptr ||
+                          session->metric_rows == nullptr ||
+                          session->accepted_trade_total == nullptr;
+  if (incomplete || session->month_capacity != month_capacity ||
+      session->workspace_scenarios < scenario_count) {
     session->release_workspace();
     std::int32_t status = NEO_POPULATION_STATUS_OK;
     const auto guard = [&](std::int32_t code) {
@@ -2214,19 +2991,11 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
       }
       return status == NEO_POPULATION_STATUS_OK;
     };
-    if (// No signal or confidence columns, no event buffer, and outcomes sized
-        // by the trades a candidate can record rather than by every bar it
-        // might have entered on. The per-scenario device cost is now
-        // 8192 * 72 + 3 944 = 593 768 B, of which the 3 944 B is the monthly
-        // buckets and the metric row; it was 4 811 048 B.
-        !guard(device_alloc(&session->outcomes,
-                            static_cast<std::size_t>(scenario_count) *
-                                static_cast<std::size_t>(kMaxTradesPerCandidate))) ||
-        !guard(device_alloc(&session->monthly_pnls,
-                            static_cast<std::size_t>(scenario_count) * month_capacity)) ||
-        !guard(device_alloc(&session->month_start_equities,
-                            static_cast<std::size_t>(scenario_count) * month_capacity)) ||
-        !guard(device_alloc(&session->metric_rows, static_cast<std::size_t>(scenario_count))) ||
+    if (!guard(device_alloc(&session->outcomes,
+                            scenarios * static_cast<std::size_t>(kMaxTradesPerCandidate))) ||
+        !guard(device_alloc(&session->monthly_pnls, scenarios * months)) ||
+        !guard(device_alloc(&session->month_start_equities, scenarios * months)) ||
+        !guard(device_alloc(&session->metric_rows, scenarios)) ||
         !guard(device_alloc(&session->accepted_trade_total, 1))) {
       session->release_workspace();
       return status;
@@ -2235,25 +3004,123 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
     session->workspace_scenarios = scenario_count;
     session->workspace_bars = bars;
   }
+  return NEO_POPULATION_STATUS_OK;
+}
 
-  if (cudaMemsetAsync(session->accepted_trade_total, 0, sizeof(unsigned long long),
-                      session->stream) != cudaSuccess) {
-    return NEO_POPULATION_STATUS_TRANSFER_FAILED;
+std::int32_t ensure_metrics_only_workspace_v1(NeoCudaPopulationSession* session,
+                                              int scenario_count,
+                                              int month_capacity,
+                                              int bars) {
+  if (session->workspace_mode == PopulationWorkspaceModeV1::CompatibilityDeviceParityOnly) {
+    return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
   }
+  if (session->workspace_mode == PopulationWorkspaceModeV1::Uninitialized) {
+    session->workspace_mode = PopulationWorkspaceModeV1::StrictMetricsOnly;
+  }
+  if (session->workspace_mode != PopulationWorkspaceModeV1::StrictMetricsOnly) {
+    return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
+  }
+
+  if (session->metric_rows != nullptr) {
+    if (session->workspace_scenarios != scenario_count ||
+        session->month_capacity != month_capacity) {
+      return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
+    }
+    if (session->monthly_pnls == nullptr || session->month_start_equities == nullptr ||
+        session->outcomes != nullptr || session->accepted_trade_total != nullptr) {
+      return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
+    }
+    return NEO_POPULATION_STATUS_OK;
+  }
+  if (session->monthly_pnls != nullptr || session->month_start_equities != nullptr ||
+      session->outcomes != nullptr || session->accepted_trade_total != nullptr ||
+      session->workspace_scenarios != 0 || session->month_capacity != 0) {
+    return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
+  }
+
+  const auto scenarios = static_cast<std::size_t>(scenario_count);
+  const auto months = static_cast<std::size_t>(month_capacity);
+  if (scenarios > SIZE_MAX / months) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  std::int32_t status = NEO_POPULATION_STATUS_OK;
+  const auto guard = [&](std::int32_t code) {
+    if (code != NEO_POPULATION_STATUS_OK) {
+      status = code;
+    }
+    return status == NEO_POPULATION_STATUS_OK;
+  };
+  if (!guard(device_alloc(&session->monthly_pnls, scenarios * months)) ||
+      !guard(device_alloc(&session->month_start_equities, scenarios * months)) ||
+      !guard(device_alloc(&session->metric_rows, scenarios))) {
+    session->release_workspace();
+    return status;
+  }
+  session->month_capacity = month_capacity;
+  session->workspace_scenarios = scenario_count;
+  session->workspace_bars = bars;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+std::int32_t enqueue_population_evaluation_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationSettings* settings,
+    PopulationEvaluationModeV1 mode,
+    NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    std::uint64_t* compatibility_event_id,
+    NeoPopulationCounters* counters) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (settings == nullptr ||
+      (mode == PopulationEvaluationModeV1::StrictMetricsOnly && resident_metrics == nullptr) ||
+      (mode == PopulationEvaluationModeV1::CompatibilityDeviceParity &&
+       compatibility_event_id == nullptr)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (!session->has_dataset || !session->has_genes || !session->has_scenarios) {
+    return NEO_POPULATION_STATUS_MISSING_UPLOAD;
+  }
+  if (settings->abi_version != NEOETHOS_GPU_ABI_VERSION) {
+    return NEO_POPULATION_STATUS_ABI_MISMATCH;
+  }
+  if (settings->month_capacity == 0u || settings->month_capacity > INT_MAX) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+
+  const int bars = session->bars;
+  // What the launch is SIZED by. Equal to `population` for every caller that
+  // uploads one scenario per gene, which is what makes that case identical to
+  // the pre-scenario engine; larger for a quality screen that asks for many
+  // treatments of the same genes.
+  const int scenario_count = session->scenario_count;
+  const int month_capacity = static_cast<int>(settings->month_capacity);
 
   DeviceDataset dataset;
   dataset.close = session->close;
   dataset.high = session->high;
   dataset.low = session->low;
   dataset.indicators_bar_major = session->indicators_bar_major;
+  dataset.indicators_feature_major = session->indicators_feature_major;
   dataset.months = session->months;
   dataset.days = session->days;
   dataset.timestamps = session->timestamps;
   dataset.smc_rows = session->smc_rows;
+  dataset.view_indices = session->view_indices;
   dataset.adaptive_base_pips = session->adaptive_base_pips;
   dataset.has_adaptive_base = session->has_adaptive_base;
   dataset.bars = bars;
+  dataset.parent_rows = session->parent_rows;
   dataset.feature_count = session->feature_count;
+  dataset.view_kind = session->view_kind;
+  dataset.view_start = session->view_start;
+  dataset.timestamp_mode = session->timestamp_mode;
 
   DeviceGenes genes;
   genes.candidate_ids = session->candidate_ids;
@@ -2282,101 +3149,79 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
   scenario_view.commission_micros = session->scenario_commission_micros;
   scenario_view.count = scenario_count;
 
-  // ── Per-stage timing ────────────────────────────────────────────────────
-  //
-  // Three times a bottleneck was named from reading the code and twice it was
-  // the wrong one. Wall-clock for the whole evaluation cannot tell one stage
-  // from another, so every guess costs a rebuild and a rented card. This costs
-  // one env var and a handful of events.
-  //
-  // Off unless NEOETHOS_GPU_STAGE_TIMING is set: the syncs it needs would
-  // serialise the stream, which is exactly what you do not want in production
-  // and exactly what you do want when measuring.
-  //
-  // Three stages are gone from the table because they are gone from the file:
-  // signal synthesis is now inside the reduce, and count/scan/emit had no
-  // launch site. What remains is what actually runs.
-  const bool stage_timing = (std::getenv("NEOETHOS_GPU_STAGE_TIMING") != nullptr);
-  cudaEvent_t stage_marks[4];
-  int stage_mark = 0;
-  auto mark_stage = [&]() {
-    if (!stage_timing || stage_mark >= 4) {
-      return;
-    }
-    cudaEventCreate(&stage_marks[stage_mark]);
-    cudaEventRecord(stage_marks[stage_mark], session->stream);
-    stage_mark += 1;
-  };
-  mark_stage();
-
   const unsigned int gap_blocks = static_cast<unsigned int>((bars + 255) / 256);
-  population_gap_flags_kernel<<<gap_blocks == 0u ? 1u : gap_blocks, 256, 0, session->stream>>>(
-      dataset, *settings, session->gap_flags);
-  session->kernel_submissions += 1;
-  mark_stage();
+  const int reduce_block = choose_reduce_block(scenario_count, session->sm_count);
+  const unsigned int reduce_blocks =
+      static_cast<unsigned int>((scenario_count + reduce_block - 1) / reduce_block);
+  unsigned long long trade_slots = 0ull;
+  MetricsOnlyBytePlanV1 resident_plan;
 
-  // No event total to read and no capacity to guard: the reduce opens positions
-  // from the signal, so there is nothing whose size the host has to check before
-  // launching. That readback was a stream synchronization every generation, and
-  // the capacity it guarded is what split the population 4 096 -> 128 on M3.
-  //
-  // The overflow flag still matters — it reports a gene whose trades exceeded
-  // its slice — but it is read with the metrics at the end rather than blocking
-  // here.
-  const unsigned long long trade_slots =
-      static_cast<unsigned long long>(scenario_count) * kMaxTradesPerCandidate;
-  {
+  if (mode == PopulationEvaluationModeV1::StrictMetricsOnly) {
+    const std::int32_t status =
+        ensure_metrics_only_workspace_v1(session, scenario_count, month_capacity, bars);
+    if (status != NEO_POPULATION_STATUS_OK) {
+      return status;
+    }
+    if (!metrics_only_byte_plan_v1(session->workspace_scenarios, session->month_capacity,
+                                   &resident_plan)) {
+      return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+    }
+    if (resident_plan.scenario_descriptor_bytes != session->scenario_upload_bytes) {
+      return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
+    }
+    session->strict_execution_state = PopulationStrictExecutionStateV1::InFlight;
+    population_gap_flags_kernel<<<gap_blocks == 0u ? 1u : gap_blocks, 256, 0,
+                                  session->stream>>>(dataset, *settings, session->gap_flags);
+    session->kernel_submissions += 1;
+    population_reduce_kernel<<<reduce_blocks == 0u ? 1u : reduce_blocks, reduce_block, 0,
+                               session->stream>>>(dataset, genes, scenario_view, *settings,
+                                                  session->gap_flags, nullptr,
+                                                  session->monthly_pnls,
+                                                  session->month_start_equities,
+                                                  session->metric_rows, nullptr);
+    session->kernel_submissions += 1;
+  } else {
+    if (session->workspace_mode == PopulationWorkspaceModeV1::StrictMetricsOnly) {
+      return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
+    }
+    const std::int32_t status =
+        ensure_compatibility_workspace_v1(session, scenario_count, month_capacity, bars);
+    if (status != NEO_POPULATION_STATUS_OK) {
+      return status;
+    }
+    if (cudaMemsetAsync(session->accepted_trade_total, 0, sizeof(unsigned long long),
+                        session->stream) != cudaSuccess) {
+      return NEO_POPULATION_STATUS_TRANSFER_FAILED;
+    }
+    population_gap_flags_kernel<<<gap_blocks == 0u ? 1u : gap_blocks, 256, 0,
+                                  session->stream>>>(dataset, *settings, session->gap_flags);
+    session->kernel_submissions += 1;
+    trade_slots = static_cast<unsigned long long>(scenario_count) * kMaxTradesPerCandidate;
     const unsigned int seed_threads = 256u;
     const unsigned long long seed_blocks = (trade_slots + seed_threads - 1ull) / seed_threads;
     population_seed_outcomes_kernel<<<static_cast<unsigned int>(seed_blocks), seed_threads, 0,
                                       session->stream>>>(session->outcomes, trade_slots);
     session->kernel_submissions += 1;
+    population_reduce_kernel<<<reduce_blocks == 0u ? 1u : reduce_blocks, reduce_block, 0,
+                               session->stream>>>(dataset, genes, scenario_view, *settings,
+                                                  session->gap_flags, session->outcomes,
+                                                  session->monthly_pnls,
+                                                  session->month_start_equities,
+                                                  session->metric_rows,
+                                                  session->accepted_trade_total);
+    session->kernel_submissions += 1;
   }
-  mark_stage();
-
-  // Block size chosen from the population and the card, not fixed at 128.
-  // See `choose_reduce_block`: 128 left 56 of an RTX 3090's 82 SMs with no
-  // block at all at the populations the old memory budget allowed.
-  const int reduce_block = choose_reduce_block(scenario_count, session->sm_count);
-  const unsigned int reduce_blocks =
-      static_cast<unsigned int>((scenario_count + reduce_block - 1) / reduce_block);
-  population_reduce_kernel<<<reduce_blocks == 0u ? 1u : reduce_blocks, reduce_block, 0,
-                             session->stream>>>(dataset, genes, scenario_view, *settings,
-                                                session->gap_flags, session->outcomes,
-                                                session->monthly_pnls,
-                                                session->month_start_equities,
-                                                session->metric_rows,
-                                                session->accepted_trade_total);
-  mark_stage();
-  if (stage_timing) {
-    cudaStreamSynchronize(session->stream);
-    static const char* kStageNames[3] = {"gap_flags", "seed_outcomes", "reduce+signal"};
-    // Both counts, because they are no longer the same number and the ratio is
-    // the whole point: 174 genes carrying 17 574 scenarios is one launch where
-    // it used to be seven.
-    std::fprintf(stderr,
-                 "[gpu-stage-timing] genes=%lld scenarios=%lld bars=%lld trade_slots=%llu "
-                 "block=%d grid=%u sms=%d\n",
-                 static_cast<long long>(population), static_cast<long long>(scenario_count),
-                 static_cast<long long>(bars),
-                 static_cast<unsigned long long>(trade_slots), reduce_block, reduce_blocks,
-                 session->sm_count);
-    for (int i = 1; i < stage_mark; ++i) {
-      float ms = 0.0f;
-      cudaEventElapsedTime(&ms, stage_marks[i - 1], stage_marks[i]);
-      std::fprintf(stderr, "[gpu-stage-timing]   %-14s %8.1f ms\n",
-                   (i - 1) < 3 ? kStageNames[i - 1] : "?", ms);
-    }
-    for (int i = 0; i < stage_mark; ++i) {
-      cudaEventDestroy(stage_marks[i]);
-    }
-  }
-  session->kernel_submissions += 1;
 
   if (cudaEventRecord(session->event, session->stream) != cudaSuccess) {
+    if (mode == PopulationEvaluationModeV1::StrictMetricsOnly) {
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    }
     return NEO_POPULATION_STATUS_LAUNCH_FAILED;
   }
   if (cudaGetLastError() != cudaSuccess) {
+    if (mode == PopulationEvaluationModeV1::StrictMetricsOnly) {
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    }
     return NEO_POPULATION_STATUS_LAUNCH_FAILED;
   }
 
@@ -2389,7 +3234,23 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
   session->pending_event_id = session->next_event_id;
   session->next_event_id += 1ull;
   session->metrics_ready = false;
-  *event_id = session->pending_event_id;
+
+  if (mode == PopulationEvaluationModeV1::StrictMetricsOnly) {
+    std::memset(resident_metrics, 0, sizeof(NeoPopulationResidentMetricsHandleV1));
+    resident_metrics->abi_version = NEOETHOS_GPU_ABI_VERSION;
+    resident_metrics->event_id = session->pending_event_id;
+    resident_metrics->scenario_count = static_cast<std::uint64_t>(session->workspace_scenarios);
+    resident_metrics->month_capacity = static_cast<std::uint64_t>(session->month_capacity);
+    resident_metrics->metric_rows_bytes = resident_plan.metric_rows_bytes;
+    resident_metrics->monthly_pnls_bytes = resident_plan.monthly_pnls_bytes;
+    resident_metrics->month_start_equities_bytes = resident_plan.month_start_equities_bytes;
+    resident_metrics->scenario_descriptor_bytes = resident_plan.scenario_descriptor_bytes;
+    resident_metrics->total_device_bytes = resident_plan.total_device_bytes;
+    resident_metrics->outcome_bytes = 0ull;
+    resident_metrics->accepted_trade_total_bytes = 0ull;
+  } else {
+    *compatibility_event_id = session->pending_event_id;
+  }
 
   if (counters != nullptr) {
     std::memset(counters, 0, sizeof(NeoPopulationCounters));
@@ -2403,10 +3264,110 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
   return NEO_POPULATION_STATUS_OK;
 }
 
-extern "C" std::int32_t neoethos_gpu_cuda_population_wait(NeoCudaPopulationSession* session,
-                                                          std::uint64_t event_id) {
+}  // namespace
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_b_enqueue_metrics_only_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationSettings* settings,
+    NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    NeoPopulationCounters* counters) {
+  return enqueue_population_evaluation_v1(session, settings,
+                                          PopulationEvaluationModeV1::StrictMetricsOnly,
+                                          resident_metrics, nullptr, counters);
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_consume_terminal_compact_result_v1(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationResidentMetricsHandleV1* resident_metrics,
+    NeoPopulationTerminalCompactResultV1* compact_result) {
   if (session == nullptr) {
     return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  const auto poison = [&](std::int32_t status) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return status;
+  };
+  if (session->strict_execution_state != PopulationStrictExecutionStateV1::InFlight) {
+    return session->strict_execution_state == PopulationStrictExecutionStateV1::Poisoned
+               ? NEO_POPULATION_STATUS_STRICT_RESIDENT_POISONED
+               : NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  if (resident_metrics == nullptr || compact_result == nullptr) {
+    return poison(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  }
+  MetricsOnlyBytePlanV1 expected_plan;
+  if (session->workspace_mode != PopulationWorkspaceModeV1::StrictMetricsOnly ||
+      session->workspace_scenarios != 1 || session->scenario_count != 1 ||
+      session->month_capacity <= 0 || session->metric_rows == nullptr ||
+      session->monthly_pnls == nullptr || session->month_start_equities == nullptr ||
+      session->outcomes != nullptr || session->accepted_trade_total != nullptr ||
+      session->event == nullptr ||
+      !metrics_only_byte_plan_v1(1, session->month_capacity, &expected_plan) ||
+      resident_metrics->abi_version != NEOETHOS_GPU_ABI_VERSION ||
+      resident_metrics->reserved != 0u || resident_metrics->event_id == 0ull ||
+      resident_metrics->event_id != session->pending_event_id ||
+      resident_metrics->scenario_count != 1ull ||
+      resident_metrics->month_capacity !=
+          static_cast<std::uint64_t>(session->month_capacity) ||
+      resident_metrics->metric_rows_bytes != sizeof(NeoPopulationMetricRow) ||
+      resident_metrics->metric_rows_bytes != expected_plan.metric_rows_bytes ||
+      resident_metrics->monthly_pnls_bytes != expected_plan.monthly_pnls_bytes ||
+      resident_metrics->month_start_equities_bytes !=
+          expected_plan.month_start_equities_bytes ||
+      resident_metrics->scenario_descriptor_bytes !=
+          expected_plan.scenario_descriptor_bytes ||
+      resident_metrics->total_device_bytes != expected_plan.total_device_bytes ||
+      resident_metrics->outcome_bytes != 0ull ||
+      resident_metrics->accepted_trade_total_bytes != 0ull) {
+    return poison(NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH);
+  }
+  if (cudaSetDevice(session->device) != cudaSuccess) {
+    return poison(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+  if (cudaEventSynchronize(session->event) != cudaSuccess) {
+    return poison(NEO_POPULATION_STATUS_SYNC_FAILED);
+  }
+  if (cudaGetLastError() != cudaSuccess) {
+    return poison(NEO_POPULATION_STATUS_LAUNCH_FAILED);
+  }
+  std::memset(compact_result, 0, sizeof(NeoPopulationTerminalCompactResultV1));
+  if (cudaMemcpy(&compact_result->metric_row, session->metric_rows,
+                 sizeof(NeoPopulationMetricRow), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return poison(NEO_POPULATION_STATUS_TRANSFER_FAILED);
+  }
+  compact_result->abi_version = NEOETHOS_GPU_ABI_VERSION;
+  compact_result->event_id = resident_metrics->event_id;
+  compact_result->scenario_count = 1ull;
+  compact_result->terminal_synchronization_count = 1ull;
+  compact_result->terminal_readback_count = 1ull;
+  compact_result->terminal_readback_rows = 1ull;
+  compact_result->terminal_readback_bytes = sizeof(NeoPopulationMetricRow);
+  session->metrics_ready = false;
+  session->pending_event_id = 0ull;
+  session->strict_execution_state = PopulationStrictExecutionStateV1::StrictIdle;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_b_evaluate(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationSettings* settings,
+    std::uint64_t* event_id,
+    NeoPopulationCounters* counters) {
+  return enqueue_population_evaluation_v1(session, settings,
+                                          PopulationEvaluationModeV1::CompatibilityDeviceParity,
+                                          nullptr, event_id, counters);
+}
+
+extern "C" std::int32_t neoethos_gpu_cuda_population_wait(NeoCudaPopulationSession* session,
+                                                           std::uint64_t event_id) {
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (session->workspace_mode != PopulationWorkspaceModeV1::CompatibilityDeviceParityOnly) {
+    return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
   }
   if (event_id == 0ull || event_id != session->pending_event_id) {
     return NEO_POPULATION_STATUS_UNKNOWN_EVENT;
@@ -2414,12 +3375,23 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_wait(NeoCudaPopulationSessi
   if (cudaSetDevice(session->device) != cudaSuccess) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
+  constexpr std::uint64_t accepted_readback_bytes = sizeof(unsigned long long);
+  if (session->synchronization_events == UINT64_MAX ||
+      session->residency_counters.explicit_synchronization_count == UINT64_MAX ||
+      session->residency_counters.accepted_trade_total_readback_count == UINT64_MAX ||
+      accepted_readback_bytes >
+          UINT64_MAX - session->residency_counters.accepted_trade_total_readback_bytes) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
   if (cudaEventSynchronize(session->event) != cudaSuccess) {
     return NEO_POPULATION_STATUS_SYNC_FAILED;
   }
   if (cudaGetLastError() != cudaSuccess) {
     return NEO_POPULATION_STATUS_LAUNCH_FAILED;
   }
+  // P1-C accounts for this per-evaluation scalar D2H exactly. It is not a
+  // final compact result: P1-E must remove this host barrier so resident
+  // evaluation can flow directly into device-side rank/select/evolution.
   unsigned long long accepted = 0ull;
   if (cudaMemcpy(&accepted, session->accepted_trade_total, sizeof(unsigned long long),
                  cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -2427,6 +3399,10 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_wait(NeoCudaPopulationSessi
   }
   session->accepted_trades = accepted;
   session->synchronization_events += 1;
+  session->residency_counters.explicit_synchronization_count += 1ull;
+  session->residency_counters.accepted_trade_total_readback_count += 1ull;
+  session->residency_counters.accepted_trade_total_readback_bytes +=
+      accepted_readback_bytes;
   session->metrics_ready = true;
   return NEO_POPULATION_STATUS_OK;
 }
@@ -2437,26 +3413,49 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_read_metrics(
   if (session == nullptr) {
     return NEO_POPULATION_STATUS_NULL_SESSION;
   }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (session->workspace_mode != PopulationWorkspaceModeV1::CompatibilityDeviceParityOnly) {
+    return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
+  }
   if (readback == nullptr || readback->rows == nullptr || readback->written == nullptr) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
   if (!session->metrics_ready) {
     return NEO_POPULATION_STATUS_MISSING_UPLOAD;
   }
-  // One row per SCENARIO, not per gene. Equal for a caller that uploads the
-  // identity descriptor array; 17 574 rows for 174 genes in the quality screen.
+  // One row per SCENARIO, not per gene. This is an intermediate full-population
+  // D2H boundary, not a compact-final readback: 17 574 rows for 174 genes in
+  // the quality screen.
   const std::size_t rows = static_cast<std::size_t>(session->scenario_count);
   if (readback->capacity < rows) {
     return NEO_POPULATION_STATUS_READBACK_CAPACITY;
   }
+  if (rows > SIZE_MAX / sizeof(NeoPopulationMetricRow)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  const std::size_t bytes = rows * sizeof(NeoPopulationMetricRow);
+  const auto rows_u64 = static_cast<std::uint64_t>(rows);
+  const auto bytes_u64 = static_cast<std::uint64_t>(bytes);
+  if (static_cast<std::size_t>(rows_u64) != rows ||
+      static_cast<std::size_t>(bytes_u64) != bytes ||
+      session->residency_counters.metric_rows_readback_count == UINT64_MAX ||
+      rows_u64 > UINT64_MAX - session->residency_counters.metric_rows_readback_rows ||
+      bytes_u64 > UINT64_MAX - session->residency_counters.metric_rows_readback_bytes) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
   if (cudaSetDevice(session->device) != cudaSuccess) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
-  if (cudaMemcpy(readback->rows, session->metric_rows, rows * sizeof(NeoPopulationMetricRow),
+  if (cudaMemcpy(readback->rows, session->metric_rows, bytes,
                  cudaMemcpyDeviceToHost) != cudaSuccess) {
     return NEO_POPULATION_STATUS_TRANSFER_FAILED;
   }
   *readback->written = rows;
+  session->residency_counters.metric_rows_readback_count += 1ull;
+  session->residency_counters.metric_rows_readback_rows += rows_u64;
+  session->residency_counters.metric_rows_readback_bytes += bytes_u64;
   return NEO_POPULATION_STATUS_OK;
 }
 
@@ -2465,6 +3464,12 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_read_diagnostics(
     NeoPopulationDiagnosticReadback* readback) {
   if (session == nullptr) {
     return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (session->workspace_mode != PopulationWorkspaceModeV1::CompatibilityDeviceParityOnly) {
+    return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
   }
   if (readback == nullptr || readback->outcomes == nullptr || readback->written == nullptr) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
@@ -2481,6 +3486,19 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_read_diagnostics(
   // vectors, on the rented box where a parity failure is investigated.
   const std::size_t available = static_cast<std::size_t>(session->emitted_events);
   const std::size_t count = readback->capacity < available ? readback->capacity : available;
+  if (count > SIZE_MAX / sizeof(NeoPopulationOutcome)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  const std::size_t bytes = count * sizeof(NeoPopulationOutcome);
+  const auto count_u64 = static_cast<std::uint64_t>(count);
+  const auto bytes_u64 = static_cast<std::uint64_t>(bytes);
+  if (static_cast<std::size_t>(count_u64) != count ||
+      static_cast<std::size_t>(bytes_u64) != bytes ||
+      session->residency_counters.diagnostic_readback_count == UINT64_MAX ||
+      count_u64 > UINT64_MAX - session->residency_counters.diagnostic_readback_rows ||
+      bytes_u64 > UINT64_MAX - session->residency_counters.diagnostic_readback_bytes) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
   if (cudaSetDevice(session->device) != cudaSuccess) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
@@ -2493,17 +3511,26 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_read_diagnostics(
     if (readback->events != nullptr) {
       std::memset(readback->events, 0, count * sizeof(NeoPopulationEvent));
     }
-    if (cudaMemcpy(readback->outcomes, session->outcomes, count * sizeof(NeoPopulationOutcome),
-                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+    if (cudaMemcpy(readback->outcomes, session->outcomes, bytes, cudaMemcpyDeviceToHost) !=
+        cudaSuccess) {
       return NEO_POPULATION_STATUS_TRANSFER_FAILED;
     }
   }
   *readback->written = count;
+  session->residency_counters.diagnostic_readback_count += 1ull;
+  session->residency_counters.diagnostic_readback_rows += count_u64;
+  session->residency_counters.diagnostic_readback_bytes += bytes_u64;
   return NEO_POPULATION_STATUS_OK;
 }
 
 extern "C" void neoethos_gpu_cuda_population_destroy(NeoCudaPopulationSession* session) {
   if (session == nullptr) {
+    return;
+  }
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    // Leak-only fail-closed teardown. `release()` uses synchronous CUDA frees;
+    // those cannot run until a future resident stage consumes the event on the
+    // same stream and atomically clears strict execution state.
     return;
   }
   cudaSetDevice(session->device);

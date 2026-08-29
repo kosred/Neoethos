@@ -11,15 +11,18 @@ pub mod execution_admission;
 // crate USED to read is named here, and a name still exported at startup
 // produces an ERROR saying it was ignored and which config key replaced it.
 // Non-negotiable #4: a deleted lever must announce itself, not fall silent.
-pub mod retired_env;
 pub mod broker_config;
+pub mod broker_deal_economics;
 pub mod broker_persistence;
 pub mod ctrader_account;
 pub mod ctrader_auth;
-pub mod ctrader_bootstrap;
 pub mod ctrader_data;
 pub mod ctrader_errors;
 pub mod ctrader_execution;
+mod ctrader_historical_admission;
+mod ctrader_historical_page;
+mod ctrader_tick_delta;
+pub mod retired_env;
 // 2026-08-09 dead-code purge (batch D2): `ctrader_history` (1,164 lines) was
 // deleted. Every one of its public items had zero callers; the production
 // history path is `broker_api::download_history_blocking` (POST /data/fetch,
@@ -37,9 +40,9 @@ pub mod ctrader_money;
 // `protobuf` / `protoc-bin-vendored` / `cc` build dependencies. Not one
 // generated type was ever referenced — the cTrader wire format is hand-rolled
 // JSON in `ctrader_messages.rs`.
+pub mod broker_api;
 pub mod ctrader_tls;
 pub mod discovery;
-pub mod broker_api;
 // Phase C (2026-05-28) — one-shot tool that captures real
 // `ProtoOASymbolByIdRes` payloads from the configured cTrader
 // account and writes them as fixtures under tests/fixtures/. Used
@@ -48,21 +51,22 @@ pub mod broker_api;
 pub mod capture_symbols;
 pub mod challenge_sim;
 pub mod embedded_credentials;
-pub mod jobs;
-pub mod journal_reconcile;
-pub mod journal_store;
-pub mod journal_analytics;
-pub mod journal_stats;
-pub mod live_journal;
-pub mod live_gate;
-pub mod reauth;
-pub mod live_spots;
-pub mod live_spots_streamer;
 pub mod experience_store;
 pub mod experience_train;
 pub mod federation;
+pub mod jobs;
+pub mod journal_analytics;
+pub mod journal_money_v3;
+pub mod journal_reconcile;
+pub mod journal_stats;
+pub mod journal_store;
+pub mod live_gate;
+pub mod live_journal;
 pub mod live_parity;
+pub mod live_spots;
+pub mod live_spots_streamer;
 pub mod live_trading;
+pub mod reauth;
 // 2026-08-09 (#238, audit §2.11): the reader the broker's margin-call feed
 // never had. `ctrader_messages::build_margin_call_list_request` had zero
 // callers outside its own test, so an UNREALISED margin emergency reached the

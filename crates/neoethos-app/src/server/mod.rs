@@ -40,9 +40,10 @@ pub mod chart;
 pub mod chart_cache;
 pub mod codex;
 pub mod data_control;
-pub mod errors;
 pub mod diagnostics;
 pub mod engines_control;
+pub mod errors;
+mod feature_store_disk;
 pub mod federation;
 pub mod hardware;
 pub mod health;
@@ -56,13 +57,13 @@ pub mod news;
 pub mod orders;
 pub mod pending_actions;
 pub mod portfolios;
-pub mod storage;
-pub mod strategy_report;
 pub mod risk;
 pub mod risky;
 pub mod settings;
 pub mod state;
+pub mod storage;
 pub mod strategy_lab;
+pub mod strategy_report;
 pub mod supervisor;
 pub mod system_status;
 pub mod watchlist;
@@ -116,9 +117,8 @@ use self::state::AppApiState;
 /// ERROR at startup naming it and saying the value was ignored. Nothing here
 /// reads it.
 fn cors_layer() -> CorsLayer {
-    let allowed = AllowOrigin::predicate(|origin, _| {
-        origin.to_str().map(origin_is_allowed).unwrap_or(false)
-    });
+    let allowed =
+        AllowOrigin::predicate(|origin, _| origin.to_str().map(origin_is_allowed).unwrap_or(false));
     CorsLayer::new()
         .allow_origin(allowed)
         .allow_methods(Any)
@@ -136,7 +136,10 @@ fn origin_is_allowed(origin: &str) -> bool {
         _ => return false,
     };
     let host = rest.split([':', '/']).next().unwrap_or("");
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "tauri.localhost")
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "[::1]" | "tauri.localhost"
+    )
 }
 
 #[cfg(test)]
@@ -164,10 +167,10 @@ mod cors_tests {
         for origin in [
             "https://evil.example.com",
             "http://attacker.io",
-            "https://localhost.evil.com",   // suffix trick
-            "http://127.0.0.1.evil.com",    // prefix trick
-            "file://localhost",             // wrong scheme
-            "null",                         // sandboxed iframe origin
+            "https://localhost.evil.com", // suffix trick
+            "http://127.0.0.1.evil.com",  // prefix trick
+            "file://localhost",           // wrong scheme
+            "null",                       // sandboxed iframe origin
             "",
         ] {
             assert!(!origin_is_allowed(origin), "{origin} must be denied");
@@ -287,7 +290,10 @@ pub fn router(state: AppApiState) -> Router {
         .route("/federation/jobs", post(federation::fed_set_jobs))
         .route("/federation/job", get(federation::fed_next_job))
         .route("/federation/submit", post(federation::fed_submit))
-        .route("/federation/worker/start", post(federation::fed_worker_start))
+        .route(
+            "/federation/worker/start",
+            post(federation::fed_worker_start),
+        )
         .route("/federation/worker/stop", post(federation::fed_worker_stop))
         // Aggregated swarm capacity (the network as one machine) from the mesh.
         .route("/mesh/swarm", get(federation::swarm_capacity))
@@ -300,7 +306,9 @@ pub fn router(state: AppApiState) -> Router {
         // POST accepted alongside PUT (the web client only speaks GET/POST).
         .route(
             "/mcp/config",
-            get(mcp::config_get).put(mcp::config_put).post(mcp::config_put),
+            get(mcp::config_get)
+                .put(mcp::config_put)
+                .post(mcp::config_put),
         )
         .route("/mcp/status", get(mcp::status))
         // Offline learning report from live experience (never touches live).
@@ -330,9 +338,7 @@ pub fn router(state: AppApiState) -> Router {
         // Session-aware spread stats recorded from the broker's own ticks.
         .route(
             "/data/spread-stats",
-            get(|| async {
-                axum::Json(crate::app_services::spread_stats::snapshot())
-            }),
+            get(|| async { axum::Json(crate::app_services::spread_stats::snapshot()) }),
         )
         // Autonomous LLM supervisor (observe/diagnose + tiered actions).
         .route("/supervisor/status", get(supervisor::status))
@@ -351,7 +357,10 @@ pub fn router(state: AppApiState) -> Router {
         // 2026-06-10 cTrader Open API history / margin / profile consumers.
         .route("/broker/orders/history", get(data_control::order_history))
         .route("/broker/cashflow", get(data_control::cash_flow_history))
-        .route("/broker/margin/expected", get(data_control::expected_margin))
+        .route(
+            "/broker/margin/expected",
+            get(data_control::expected_margin),
+        )
         .route("/broker/profile", get(data_control::ctid_profile))
         .route("/broker/version", get(data_control::server_version))
         // `POST /broker/account/select` DELETED 2026-08-10 (audit #120). It was
@@ -366,9 +375,10 @@ pub fn router(state: AppApiState) -> Router {
         // that true rather than merely intended.
         .route("/data/bootstrap", get(system_status::data_bootstrap))
         .route("/data/fetch", post(data_control::fetch))
-        // #192: import user-provided CSV/Parquet/Arrow/JSON/JSONL/TSV
-        // files into the canonical Vortex layout. Routes through
-        // `neoethos_data::convert_to_vortex` for the actual conversion.
+        .route("/data/fetch/status", get(data_control::fetch_status))
+        .route("/data/fetch/stop", post(data_control::stop_fetch))
+        // Explicit user source -> sealed immutable snapshot -> verified
+        // canonical Vortex generation. No runtime format auto-conversion.
         .route("/data/import", post(data_control::import_file))
         .route("/orders", post(orders::place))
         // Conditional (limit/stop) orders: GET lists resting broker orders,
@@ -534,10 +544,7 @@ pub async fn serve(state: AppApiState) -> anyhow::Result<()> {
 /// port itself — so it knows the port *before* the window loads — and hands
 /// the listener here. Same router, same handlers, same loopback-only security
 /// model as [`serve`]; the only difference is who owns the socket.
-pub async fn serve_on(
-    listener: std::net::TcpListener,
-    state: AppApiState,
-) -> anyhow::Result<()> {
+pub async fn serve_on(listener: std::net::TcpListener, state: AppApiState) -> anyhow::Result<()> {
     let addr = listener.local_addr().ok();
     // Audit S01: the desktop shell always binds an ephemeral loopback port, so
     // there is no non-loopback case to fail closed on here; honor an operator

@@ -1,22 +1,6 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{alloc_uninit_f64, detect_best_batch_kernel};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use thiserror::Error;
@@ -53,10 +37,6 @@ pub struct MesaStochasticMultiLengthOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MesaStochasticMultiLengthParams {
     pub length_1: Option<usize>,
     pub length_2: Option<usize>,
@@ -175,9 +155,7 @@ pub enum MesaStochasticMultiLengthError {
     AllValuesNaN,
     #[error("mesa_stochastic_multi_length: Invalid period `{name}`: {value}")]
     InvalidPeriod { name: String, value: usize },
-    #[error(
-        "mesa_stochastic_multi_length: Output length mismatch: expected={expected}, got={got}"
-    )]
+    #[error("mesa_stochastic_multi_length: Output length mismatch: expected={expected}, got={got}")]
     OutputLengthMismatch { expected: usize, got: usize },
     #[error("mesa_stochastic_multi_length: Invalid range: start={start}, end={end}, step={step}")]
     InvalidRange {
@@ -342,11 +320,7 @@ impl MesaStochasticMultiLengthBuilder {
 
 #[inline(always)]
 fn nz(value: f64) -> f64 {
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
+    if value.is_finite() { value } else { 0.0 }
 }
 
 #[derive(Clone, Debug)]
@@ -699,7 +673,6 @@ pub fn mesa_stochastic_multi_length_with_kernel(
     Ok(out)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[allow(clippy::too_many_arguments)]
 pub fn mesa_stochastic_multi_length_into(
     mesa_1_out: &mut [f64],
@@ -1049,7 +1022,7 @@ pub fn mesa_stochastic_multi_length_batch_with_kernel(
         _ => {
             return Err(MesaStochasticMultiLengthError::InvalidKernelForBatch(
                 kernel,
-            ))
+            ));
         }
     };
     mesa_stochastic_multi_length_batch_par_slice(source, sweep, batch_kernel.to_non_batch())
@@ -1175,587 +1148,10 @@ pub fn mesa_stochastic_multi_length_batch_into_slice(
     Ok(())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "mesa_stochastic_multi_length")]
-#[pyo3(signature = (
-    source,
-    length_1=48,
-    length_2=21,
-    length_3=9,
-    length_4=6,
-    trigger_length=2,
-    kernel=None
-))]
-pub fn mesa_stochastic_multi_length_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    length_1: usize,
-    length_2: usize,
-    length_3: usize,
-    length_4: usize,
-    trigger_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let source = source.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = MesaStochasticMultiLengthInput::from_slice(
-        source,
-        MesaStochasticMultiLengthParams {
-            length_1: Some(length_1),
-            length_2: Some(length_2),
-            length_3: Some(length_3),
-            length_4: Some(length_4),
-            trigger_length: Some(trigger_length),
-        },
-    );
-    let out = py
-        .allow_threads(|| mesa_stochastic_multi_length_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("mesa_1", out.mesa_1.into_pyarray(py))?;
-    dict.set_item("mesa_2", out.mesa_2.into_pyarray(py))?;
-    dict.set_item("mesa_3", out.mesa_3.into_pyarray(py))?;
-    dict.set_item("mesa_4", out.mesa_4.into_pyarray(py))?;
-    dict.set_item("trigger_1", out.trigger_1.into_pyarray(py))?;
-    dict.set_item("trigger_2", out.trigger_2.into_pyarray(py))?;
-    dict.set_item("trigger_3", out.trigger_3.into_pyarray(py))?;
-    dict.set_item("trigger_4", out.trigger_4.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MesaStochasticMultiLengthStream")]
-pub struct MesaStochasticMultiLengthStreamPy {
-    stream: MesaStochasticMultiLengthStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MesaStochasticMultiLengthStreamPy {
-    #[new]
-    #[pyo3(signature = (
-        length_1=48,
-        length_2=21,
-        length_3=9,
-        length_4=6,
-        trigger_length=2
-    ))]
-    fn new(
-        length_1: usize,
-        length_2: usize,
-        length_3: usize,
-        length_4: usize,
-        trigger_length: usize,
-    ) -> PyResult<Self> {
-        let stream = MesaStochasticMultiLengthStream::try_new(MesaStochasticMultiLengthParams {
-            length_1: Some(length_1),
-            length_2: Some(length_2),
-            length_3: Some(length_3),
-            length_4: Some(length_4),
-            trigger_length: Some(trigger_length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update<'py>(&mut self, py: Python<'py>, source: f64) -> PyResult<Bound<'py, PyDict>> {
-        let values = self.stream.update(source);
-        let dict = PyDict::new(py);
-        dict.set_item("mesa_1", values.0)?;
-        dict.set_item("mesa_2", values.1)?;
-        dict.set_item("mesa_3", values.2)?;
-        dict.set_item("mesa_4", values.3)?;
-        dict.set_item("trigger_1", values.4)?;
-        dict.set_item("trigger_2", values.5)?;
-        dict.set_item("trigger_3", values.6)?;
-        dict.set_item("trigger_4", values.7)?;
-        Ok(dict)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "mesa_stochastic_multi_length_batch")]
-#[pyo3(signature = (
-    source,
-    length_1_range=(48,48,0),
-    length_2_range=(21,21,0),
-    length_3_range=(9,9,0),
-    length_4_range=(6,6,0),
-    trigger_length_range=(2,2,0),
-    kernel=None
-))]
-pub fn mesa_stochastic_multi_length_batch_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    length_1_range: (usize, usize, usize),
-    length_2_range: (usize, usize, usize),
-    length_3_range: (usize, usize, usize),
-    length_4_range: (usize, usize, usize),
-    trigger_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let source = source.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = MesaStochasticMultiLengthBatchRange {
-        length_1: length_1_range,
-        length_2: length_2_range,
-        length_3: length_3_range,
-        length_4: length_4_range,
-        trigger_length: trigger_length_range,
-    };
-    let out = py
-        .allow_threads(|| mesa_stochastic_multi_length_batch_with_kernel(source, &sweep, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "mesa_1",
-        out.mesa_1.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mesa_2",
-        out.mesa_2.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mesa_3",
-        out.mesa_3.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "mesa_4",
-        out.mesa_4.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "trigger_1",
-        out.trigger_1
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "trigger_2",
-        out.trigger_2
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "trigger_3",
-        out.trigger_3
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "trigger_4",
-        out.trigger_4
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "length_1",
-        out.combos
-            .iter()
-            .map(|p| p.length_1.unwrap())
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "length_2",
-        out.combos
-            .iter()
-            .map(|p| p.length_2.unwrap())
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "length_3",
-        out.combos
-            .iter()
-            .map(|p| p.length_3.unwrap())
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "length_4",
-        out.combos
-            .iter()
-            .map(|p| p.length_4.unwrap())
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "trigger_length",
-        out.combos
-            .iter()
-            .map(|p| p.trigger_length.unwrap())
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", out.rows)?;
-    dict.set_item("cols", out.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_mesa_stochastic_multi_length_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(mesa_stochastic_multi_length_py, m)?)?;
-    m.add_function(wrap_pyfunction!(mesa_stochastic_multi_length_batch_py, m)?)?;
-    m.add_class::<MesaStochasticMultiLengthStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MesaStochasticMultiLengthJsOutput {
-    pub mesa_1: Vec<f64>,
-    pub mesa_2: Vec<f64>,
-    pub mesa_3: Vec<f64>,
-    pub mesa_4: Vec<f64>,
-    pub trigger_1: Vec<f64>,
-    pub trigger_2: Vec<f64>,
-    pub trigger_3: Vec<f64>,
-    pub trigger_4: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MesaStochasticMultiLengthBatchConfig {
-    pub length_1_range: Vec<f64>,
-    pub length_2_range: Vec<f64>,
-    pub length_3_range: Vec<f64>,
-    pub length_4_range: Vec<f64>,
-    pub trigger_length_range: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MesaStochasticMultiLengthBatchJsOutput {
-    pub mesa_1: Vec<f64>,
-    pub mesa_2: Vec<f64>,
-    pub mesa_3: Vec<f64>,
-    pub mesa_4: Vec<f64>,
-    pub trigger_1: Vec<f64>,
-    pub trigger_2: Vec<f64>,
-    pub trigger_3: Vec<f64>,
-    pub trigger_4: Vec<f64>,
-    pub length_1: Vec<usize>,
-    pub length_2: Vec<usize>,
-    pub length_3: Vec<usize>,
-    pub length_4: Vec<usize>,
-    pub trigger_length: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_usize(name: &str, values: &[f64]) -> Result<(usize, usize, usize), JsValue> {
-    if values.len() != 3 {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 elements [start, end, step]"
-        )));
-    }
-    let mut out = [0usize; 3];
-    for (i, value) in values.iter().copied().enumerate() {
-        if !value.is_finite() || value < 0.0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid config: {name}[{i}] must be a finite non-negative whole number"
-            )));
-        }
-        let rounded = value.round();
-        if (value - rounded).abs() > 1e-9 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid config: {name}[{i}] must be a whole number"
-            )));
-        }
-        out[i] = rounded as usize;
-    }
-    Ok((out[0], out[1], out[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "mesa_stochastic_multi_length_js")]
-pub fn mesa_stochastic_multi_length_js(
-    source: &[f64],
-    length_1: usize,
-    length_2: usize,
-    length_3: usize,
-    length_4: usize,
-    trigger_length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = MesaStochasticMultiLengthInput::from_slice(
-        source,
-        MesaStochasticMultiLengthParams {
-            length_1: Some(length_1),
-            length_2: Some(length_2),
-            length_3: Some(length_3),
-            length_4: Some(length_4),
-            trigger_length: Some(trigger_length),
-        },
-    );
-    let out = mesa_stochastic_multi_length_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&MesaStochasticMultiLengthJsOutput {
-        mesa_1: out.mesa_1,
-        mesa_2: out.mesa_2,
-        mesa_3: out.mesa_3,
-        mesa_4: out.mesa_4,
-        trigger_1: out.trigger_1,
-        trigger_2: out.trigger_2,
-        trigger_3: out.trigger_3,
-        trigger_4: out.trigger_4,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "mesa_stochastic_multi_length_batch_js")]
-pub fn mesa_stochastic_multi_length_batch_js(
-    source: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: MesaStochasticMultiLengthBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let sweep = MesaStochasticMultiLengthBatchRange {
-        length_1: js_vec3_to_usize("length_1_range", &config.length_1_range)?,
-        length_2: js_vec3_to_usize("length_2_range", &config.length_2_range)?,
-        length_3: js_vec3_to_usize("length_3_range", &config.length_3_range)?,
-        length_4: js_vec3_to_usize("length_4_range", &config.length_4_range)?,
-        trigger_length: js_vec3_to_usize("trigger_length_range", &config.trigger_length_range)?,
-    };
-    let out = mesa_stochastic_multi_length_batch_with_kernel(source, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&MesaStochasticMultiLengthBatchJsOutput {
-        mesa_1: out.mesa_1,
-        mesa_2: out.mesa_2,
-        mesa_3: out.mesa_3,
-        mesa_4: out.mesa_4,
-        trigger_1: out.trigger_1,
-        trigger_2: out.trigger_2,
-        trigger_3: out.trigger_3,
-        trigger_4: out.trigger_4,
-        length_1: out.combos.iter().map(|p| p.length_1.unwrap()).collect(),
-        length_2: out.combos.iter().map(|p| p.length_2.unwrap()).collect(),
-        length_3: out.combos.iter().map(|p| p.length_3.unwrap()).collect(),
-        length_4: out.combos.iter().map(|p| p.length_4.unwrap()).collect(),
-        trigger_length: out
-            .combos
-            .iter()
-            .map(|p| p.trigger_length.unwrap())
-            .collect(),
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mesa_stochastic_multi_length_alloc(len: usize) -> *mut f64 {
-    let mut buf = vec![0.0; len];
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mesa_stochastic_multi_length_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
-    unsafe {
-        drop(Vec::from_raw_parts(ptr, 0, len));
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "mesa_stochastic_multi_length_into")]
-#[allow(clippy::too_many_arguments)]
-pub fn mesa_stochastic_multi_length_into(
-    source_ptr: *const f64,
-    mesa_1_ptr: *mut f64,
-    mesa_2_ptr: *mut f64,
-    mesa_3_ptr: *mut f64,
-    mesa_4_ptr: *mut f64,
-    trigger_1_ptr: *mut f64,
-    trigger_2_ptr: *mut f64,
-    trigger_3_ptr: *mut f64,
-    trigger_4_ptr: *mut f64,
-    len: usize,
-    length_1: usize,
-    length_2: usize,
-    length_3: usize,
-    length_4: usize,
-    trigger_length: usize,
-) -> Result<(), JsValue> {
-    if source_ptr.is_null()
-        || mesa_1_ptr.is_null()
-        || mesa_2_ptr.is_null()
-        || mesa_3_ptr.is_null()
-        || mesa_4_ptr.is_null()
-        || trigger_1_ptr.is_null()
-        || trigger_2_ptr.is_null()
-        || trigger_3_ptr.is_null()
-        || trigger_4_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to mesa_stochastic_multi_length_into",
-        ));
-    }
-    let source = unsafe { std::slice::from_raw_parts(source_ptr, len) };
-    let mesa_1_out = unsafe { std::slice::from_raw_parts_mut(mesa_1_ptr, len) };
-    let mesa_2_out = unsafe { std::slice::from_raw_parts_mut(mesa_2_ptr, len) };
-    let mesa_3_out = unsafe { std::slice::from_raw_parts_mut(mesa_3_ptr, len) };
-    let mesa_4_out = unsafe { std::slice::from_raw_parts_mut(mesa_4_ptr, len) };
-    let trigger_1_out = unsafe { std::slice::from_raw_parts_mut(trigger_1_ptr, len) };
-    let trigger_2_out = unsafe { std::slice::from_raw_parts_mut(trigger_2_ptr, len) };
-    let trigger_3_out = unsafe { std::slice::from_raw_parts_mut(trigger_3_ptr, len) };
-    let trigger_4_out = unsafe { std::slice::from_raw_parts_mut(trigger_4_ptr, len) };
-    let input = MesaStochasticMultiLengthInput::from_slice(
-        source,
-        MesaStochasticMultiLengthParams {
-            length_1: Some(length_1),
-            length_2: Some(length_2),
-            length_3: Some(length_3),
-            length_4: Some(length_4),
-            trigger_length: Some(trigger_length),
-        },
-    );
-    mesa_stochastic_multi_length_into_slice(
-        mesa_1_out,
-        mesa_2_out,
-        mesa_3_out,
-        mesa_4_out,
-        trigger_1_out,
-        trigger_2_out,
-        trigger_3_out,
-        trigger_4_out,
-        &input,
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "mesa_stochastic_multi_length_batch_into")]
-#[allow(clippy::too_many_arguments)]
-pub fn mesa_stochastic_multi_length_batch_into(
-    source_ptr: *const f64,
-    mesa_1_ptr: *mut f64,
-    mesa_2_ptr: *mut f64,
-    mesa_3_ptr: *mut f64,
-    mesa_4_ptr: *mut f64,
-    trigger_1_ptr: *mut f64,
-    trigger_2_ptr: *mut f64,
-    trigger_3_ptr: *mut f64,
-    trigger_4_ptr: *mut f64,
-    len: usize,
-    length_1_start: usize,
-    length_1_end: usize,
-    length_1_step: usize,
-    length_2_start: usize,
-    length_2_end: usize,
-    length_2_step: usize,
-    length_3_start: usize,
-    length_3_end: usize,
-    length_3_step: usize,
-    length_4_start: usize,
-    length_4_end: usize,
-    length_4_step: usize,
-    trigger_length_start: usize,
-    trigger_length_end: usize,
-    trigger_length_step: usize,
-) -> Result<usize, JsValue> {
-    if source_ptr.is_null()
-        || mesa_1_ptr.is_null()
-        || mesa_2_ptr.is_null()
-        || mesa_3_ptr.is_null()
-        || mesa_4_ptr.is_null()
-        || trigger_1_ptr.is_null()
-        || trigger_2_ptr.is_null()
-        || trigger_3_ptr.is_null()
-        || trigger_4_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to mesa_stochastic_multi_length_batch_into",
-        ));
-    }
-    let source = unsafe { std::slice::from_raw_parts(source_ptr, len) };
-    let sweep = MesaStochasticMultiLengthBatchRange {
-        length_1: (length_1_start, length_1_end, length_1_step),
-        length_2: (length_2_start, length_2_end, length_2_step),
-        length_3: (length_3_start, length_3_end, length_3_step),
-        length_4: (length_4_start, length_4_end, length_4_step),
-        trigger_length: (
-            trigger_length_start,
-            trigger_length_end,
-            trigger_length_step,
-        ),
-    };
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows.checked_mul(len).ok_or_else(|| {
-        JsValue::from_str("rows*cols overflow in mesa_stochastic_multi_length_batch_into")
-    })?;
-    let mesa_1_out = unsafe { std::slice::from_raw_parts_mut(mesa_1_ptr, total) };
-    let mesa_2_out = unsafe { std::slice::from_raw_parts_mut(mesa_2_ptr, total) };
-    let mesa_3_out = unsafe { std::slice::from_raw_parts_mut(mesa_3_ptr, total) };
-    let mesa_4_out = unsafe { std::slice::from_raw_parts_mut(mesa_4_ptr, total) };
-    let trigger_1_out = unsafe { std::slice::from_raw_parts_mut(trigger_1_ptr, total) };
-    let trigger_2_out = unsafe { std::slice::from_raw_parts_mut(trigger_2_ptr, total) };
-    let trigger_3_out = unsafe { std::slice::from_raw_parts_mut(trigger_3_ptr, total) };
-    let trigger_4_out = unsafe { std::slice::from_raw_parts_mut(trigger_4_ptr, total) };
-    mesa_stochastic_multi_length_batch_into_slice(
-        mesa_1_out,
-        mesa_2_out,
-        mesa_3_out,
-        mesa_4_out,
-        trigger_1_out,
-        trigger_2_out,
-        trigger_3_out,
-        trigger_4_out,
-        source,
-        &sweep,
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mesa_stochastic_multi_length_output_into_js(
-    source: &[f64],
-    length_1: usize,
-    length_2: usize,
-    length_3: usize,
-    length_4: usize,
-    trigger_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = mesa_stochastic_multi_length_js(
-        source,
-        length_1,
-        length_2,
-        length_3,
-        length_4,
-        trigger_length,
-    )?;
-    crate::write_wasm_object_f64_outputs("mesa_stochastic_multi_length_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mesa_stochastic_multi_length_batch_output_into_js(
-    source: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = mesa_stochastic_multi_length_batch_js(source, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "mesa_stochastic_multi_length_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn manual_sma(values: &[f64], length: usize) -> Vec<f64> {
         let mut out = vec![f64::NAN; values.len()];
@@ -1877,7 +1273,7 @@ mod tests {
     #[test]
     fn manual_reference_matches_core() {
         let candles =
-            read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let source = &candles.close[..160];
         let params = MesaStochasticMultiLengthParams::default();
         let input = MesaStochasticMultiLengthInput::from_slice(source, params.clone());
@@ -1896,7 +1292,7 @@ mod tests {
     #[test]
     fn stream_matches_batch() {
         let candles =
-            read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let source = &candles.close[..160];
         let input = MesaStochasticMultiLengthInput::from_slice(
             source,
@@ -1956,7 +1352,7 @@ mod tests {
     #[test]
     fn batch_first_row_matches_single() {
         let candles =
-            read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let source = &candles.close[..128];
         let single = mesa_stochastic_multi_length(&MesaStochasticMultiLengthInput::from_slice(
             source,
@@ -1984,7 +1380,7 @@ mod tests {
     #[test]
     fn into_slice_matches_owned_output() {
         let candles =
-            read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let source = &candles.close[..128];
         let input = MesaStochasticMultiLengthInput::from_slice(
             source,
@@ -2025,7 +1421,7 @@ mod tests {
     #[test]
     fn rejects_invalid_period() {
         let candles =
-            read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let input = MesaStochasticMultiLengthInput::from_slice(
             &candles.close[..64],
             MesaStochasticMultiLengthParams {

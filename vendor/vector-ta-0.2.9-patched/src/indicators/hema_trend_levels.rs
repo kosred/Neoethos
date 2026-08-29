@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::mem::ManuallyDrop;
@@ -124,10 +106,6 @@ impl HemaTrendLevelsPoint {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct HemaTrendLevelsParams {
     pub fast_length: Option<usize>,
     pub slow_length: Option<usize>,
@@ -942,7 +920,6 @@ pub fn hema_trend_levels_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[allow(clippy::too_many_arguments)]
 pub fn hema_trend_levels_into(
     fast_hema_out: &mut [f64],
@@ -1428,889 +1405,6 @@ pub fn hema_trend_levels_batch_inner_into(
     Ok(out.combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "hema_trend_levels")]
-#[pyo3(signature = (open, high, low, close, fast_length=DEFAULT_FAST_LENGTH, slow_length=DEFAULT_SLOW_LENGTH, kernel=None))]
-pub fn hema_trend_levels_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    fast_length: usize,
-    slow_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let kernel = validate_kernel(kernel, false)?;
-    let input = HemaTrendLevelsInput::from_slices(
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        HemaTrendLevelsParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-        },
-    );
-    let out = py
-        .allow_threads(|| hema_trend_levels_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    hema_trend_levels_output_to_pydict(py, out)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "HemaTrendLevelsStream")]
-pub struct HemaTrendLevelsStreamPy {
-    stream: HemaTrendLevelsStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl HemaTrendLevelsStreamPy {
-    #[new]
-    #[pyo3(signature = (fast_length=DEFAULT_FAST_LENGTH, slow_length=DEFAULT_SLOW_LENGTH))]
-    fn new(fast_length: usize, slow_length: usize) -> PyResult<Self> {
-        Ok(Self {
-            stream: HemaTrendLevelsStream::try_new(HemaTrendLevelsParams {
-                fast_length: Some(fast_length),
-                slow_length: Some(slow_length),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-
-    fn update<'py>(
-        &mut self,
-        py: Python<'py>,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.stream
-            .update(open, high, low, close)
-            .map(|point| hema_trend_levels_point_to_pydict(py, point))
-            .transpose()
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.stream.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "hema_trend_levels_batch")]
-#[pyo3(signature = (open, high, low, close, fast_length_range=(DEFAULT_FAST_LENGTH, DEFAULT_FAST_LENGTH, 0), slow_length_range=(DEFAULT_SLOW_LENGTH, DEFAULT_SLOW_LENGTH, 0), kernel=None))]
-pub fn hema_trend_levels_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    fast_length_range: (usize, usize, usize),
-    slow_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = HemaTrendLevelsBatchRange {
-        fast_length: fast_length_range,
-        slow_length: slow_length_range,
-    };
-    let combos =
-        expand_grid_hema_trend_levels(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    macro_rules! arr {
-        ($name:ident) => {
-            let $name = unsafe { PyArray1::<f64>::new(py, [total], false) };
-        };
-    }
-    arr!(fast_arr);
-    arr!(slow_arr);
-    arr!(trend_arr);
-    arr!(bar_arr);
-    arr!(bull_cross_arr);
-    arr!(bear_cross_arr);
-    arr!(offset_arr);
-    arr!(bull_top_arr);
-    arr!(bull_bottom_arr);
-    arr!(bear_top_arr);
-    arr!(bear_bottom_arr);
-    arr!(bull_test_arr);
-    arr!(bear_test_arr);
-    arr!(bull_test_level_arr);
-    arr!(bear_test_level_arr);
-    let fast_slice = unsafe { fast_arr.as_slice_mut()? };
-    let slow_slice = unsafe { slow_arr.as_slice_mut()? };
-    let trend_slice = unsafe { trend_arr.as_slice_mut()? };
-    let bar_slice = unsafe { bar_arr.as_slice_mut()? };
-    let bull_cross_slice = unsafe { bull_cross_arr.as_slice_mut()? };
-    let bear_cross_slice = unsafe { bear_cross_arr.as_slice_mut()? };
-    let offset_slice = unsafe { offset_arr.as_slice_mut()? };
-    let bull_top_slice = unsafe { bull_top_arr.as_slice_mut()? };
-    let bull_bottom_slice = unsafe { bull_bottom_arr.as_slice_mut()? };
-    let bear_top_slice = unsafe { bear_top_arr.as_slice_mut()? };
-    let bear_bottom_slice = unsafe { bear_bottom_arr.as_slice_mut()? };
-    let bull_test_slice = unsafe { bull_test_arr.as_slice_mut()? };
-    let bear_test_slice = unsafe { bear_test_arr.as_slice_mut()? };
-    let bull_test_level_slice = unsafe { bull_test_level_arr.as_slice_mut()? };
-    let bear_test_level_slice = unsafe { bear_test_level_arr.as_slice_mut()? };
-    let combos = py
-        .allow_threads(|| {
-            let batch_kernel = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            hema_trend_levels_batch_inner_into(
-                open,
-                high,
-                low,
-                close,
-                &sweep,
-                batch_kernel.to_non_batch(),
-                true,
-                fast_slice,
-                slow_slice,
-                trend_slice,
-                bar_slice,
-                bull_cross_slice,
-                bear_cross_slice,
-                offset_slice,
-                bull_top_slice,
-                bull_bottom_slice,
-                bear_top_slice,
-                bear_bottom_slice,
-                bull_test_slice,
-                bear_test_slice,
-                bull_test_level_slice,
-                bear_test_level_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("fast_hema", fast_arr.reshape((rows, cols))?)?;
-    dict.set_item("slow_hema", slow_arr.reshape((rows, cols))?)?;
-    dict.set_item("trend_direction", trend_arr.reshape((rows, cols))?)?;
-    dict.set_item("bar_state", bar_arr.reshape((rows, cols))?)?;
-    dict.set_item("bullish_crossover", bull_cross_arr.reshape((rows, cols))?)?;
-    dict.set_item("bearish_crossunder", bear_cross_arr.reshape((rows, cols))?)?;
-    dict.set_item("box_offset", offset_arr.reshape((rows, cols))?)?;
-    dict.set_item("bull_box_top", bull_top_arr.reshape((rows, cols))?)?;
-    dict.set_item("bull_box_bottom", bull_bottom_arr.reshape((rows, cols))?)?;
-    dict.set_item("bear_box_top", bear_top_arr.reshape((rows, cols))?)?;
-    dict.set_item("bear_box_bottom", bear_bottom_arr.reshape((rows, cols))?)?;
-    dict.set_item("bullish_test", bull_test_arr.reshape((rows, cols))?)?;
-    dict.set_item("bearish_test", bear_test_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "bullish_test_level",
-        bull_test_level_arr.reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "bearish_test_level",
-        bear_test_level_arr.reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "fast_lengths",
-        combos
-            .iter()
-            .map(|c| c.fast_length.unwrap_or(DEFAULT_FAST_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_lengths",
-        combos
-            .iter()
-            .map(|c| c.slow_length.unwrap_or(DEFAULT_SLOW_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_hema_trend_levels_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(hema_trend_levels_py, module)?)?;
-    module.add_function(wrap_pyfunction!(hema_trend_levels_batch_py, module)?)?;
-    module.add_class::<HemaTrendLevelsStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(feature = "python")]
-fn hema_trend_levels_output_to_pydict<'py>(
-    py: Python<'py>,
-    out: HemaTrendLevelsOutput,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("fast_hema", out.fast_hema.into_pyarray(py))?;
-    dict.set_item("slow_hema", out.slow_hema.into_pyarray(py))?;
-    dict.set_item("trend_direction", out.trend_direction.into_pyarray(py))?;
-    dict.set_item("bar_state", out.bar_state.into_pyarray(py))?;
-    dict.set_item("bullish_crossover", out.bullish_crossover.into_pyarray(py))?;
-    dict.set_item(
-        "bearish_crossunder",
-        out.bearish_crossunder.into_pyarray(py),
-    )?;
-    dict.set_item("box_offset", out.box_offset.into_pyarray(py))?;
-    dict.set_item("bull_box_top", out.bull_box_top.into_pyarray(py))?;
-    dict.set_item("bull_box_bottom", out.bull_box_bottom.into_pyarray(py))?;
-    dict.set_item("bear_box_top", out.bear_box_top.into_pyarray(py))?;
-    dict.set_item("bear_box_bottom", out.bear_box_bottom.into_pyarray(py))?;
-    dict.set_item("bullish_test", out.bullish_test.into_pyarray(py))?;
-    dict.set_item("bearish_test", out.bearish_test.into_pyarray(py))?;
-    dict.set_item(
-        "bullish_test_level",
-        out.bullish_test_level.into_pyarray(py),
-    )?;
-    dict.set_item(
-        "bearish_test_level",
-        out.bearish_test_level.into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-fn hema_trend_levels_point_to_pydict<'py>(
-    py: Python<'py>,
-    point: HemaTrendLevelsPoint,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("fast_hema", point.fast_hema)?;
-    dict.set_item("slow_hema", point.slow_hema)?;
-    dict.set_item("trend_direction", point.trend_direction)?;
-    dict.set_item("bar_state", point.bar_state)?;
-    dict.set_item("bullish_crossover", point.bullish_crossover)?;
-    dict.set_item("bearish_crossunder", point.bearish_crossunder)?;
-    dict.set_item("box_offset", point.box_offset)?;
-    dict.set_item("bull_box_top", point.bull_box_top)?;
-    dict.set_item("bull_box_bottom", point.bull_box_bottom)?;
-    dict.set_item("bear_box_top", point.bear_box_top)?;
-    dict.set_item("bear_box_bottom", point.bear_box_bottom)?;
-    dict.set_item("bullish_test", point.bullish_test)?;
-    dict.set_item("bearish_test", point.bearish_test)?;
-    dict.set_item("bullish_test_level", point.bullish_test_level)?;
-    dict.set_item("bearish_test_level", point.bearish_test_level)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HemaTrendLevelsJsOutput {
-    pub fast_hema: Vec<f64>,
-    pub slow_hema: Vec<f64>,
-    pub trend_direction: Vec<f64>,
-    pub bar_state: Vec<f64>,
-    pub bullish_crossover: Vec<f64>,
-    pub bearish_crossunder: Vec<f64>,
-    pub box_offset: Vec<f64>,
-    pub bull_box_top: Vec<f64>,
-    pub bull_box_bottom: Vec<f64>,
-    pub bear_box_top: Vec<f64>,
-    pub bear_box_bottom: Vec<f64>,
-    pub bullish_test: Vec<f64>,
-    pub bearish_test: Vec<f64>,
-    pub bullish_test_level: Vec<f64>,
-    pub bearish_test_level: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "hema_trend_levels_js")]
-pub fn hema_trend_levels_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fast_length: usize,
-    slow_length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = HemaTrendLevelsInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        HemaTrendLevelsParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-        },
-    );
-    let out = hema_trend_levels(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&HemaTrendLevelsJsOutput {
-        fast_hema: out.fast_hema,
-        slow_hema: out.slow_hema,
-        trend_direction: out.trend_direction,
-        bar_state: out.bar_state,
-        bullish_crossover: out.bullish_crossover,
-        bearish_crossunder: out.bearish_crossunder,
-        box_offset: out.box_offset,
-        bull_box_top: out.bull_box_top,
-        bull_box_bottom: out.bull_box_bottom,
-        bear_box_top: out.bear_box_top,
-        bear_box_bottom: out.bear_box_bottom,
-        bullish_test: out.bullish_test,
-        bearish_test: out.bearish_test,
-        bullish_test_level: out.bullish_test_level,
-        bearish_test_level: out.bearish_test_level,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hema_trend_levels_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hema_trend_levels_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn has_duplicate_ptrs(ptrs: &[usize]) -> bool {
-    for i in 0..ptrs.len() {
-        for j in (i + 1)..ptrs.len() {
-            if ptrs[i] == ptrs[j] {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[allow(clippy::too_many_arguments)]
-unsafe fn hema_trend_levels_into_raw(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    fast_hema_ptr: *mut f64,
-    slow_hema_ptr: *mut f64,
-    trend_direction_ptr: *mut f64,
-    bar_state_ptr: *mut f64,
-    bullish_crossover_ptr: *mut f64,
-    bearish_crossunder_ptr: *mut f64,
-    box_offset_ptr: *mut f64,
-    bull_box_top_ptr: *mut f64,
-    bull_box_bottom_ptr: *mut f64,
-    bear_box_top_ptr: *mut f64,
-    bear_box_bottom_ptr: *mut f64,
-    bullish_test_ptr: *mut f64,
-    bearish_test_ptr: *mut f64,
-    bullish_test_level_ptr: *mut f64,
-    bearish_test_level_ptr: *mut f64,
-    len: usize,
-    fast_length: usize,
-    slow_length: usize,
-    kernel: Kernel,
-) -> Result<(), JsValue> {
-    let input = HemaTrendLevelsInput::from_slices(
-        std::slice::from_raw_parts(open_ptr, len),
-        std::slice::from_raw_parts(high_ptr, len),
-        std::slice::from_raw_parts(low_ptr, len),
-        std::slice::from_raw_parts(close_ptr, len),
-        HemaTrendLevelsParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-        },
-    );
-    let output_ptrs = [
-        fast_hema_ptr as usize,
-        slow_hema_ptr as usize,
-        trend_direction_ptr as usize,
-        bar_state_ptr as usize,
-        bullish_crossover_ptr as usize,
-        bearish_crossunder_ptr as usize,
-        box_offset_ptr as usize,
-        bull_box_top_ptr as usize,
-        bull_box_bottom_ptr as usize,
-        bear_box_top_ptr as usize,
-        bear_box_bottom_ptr as usize,
-        bullish_test_ptr as usize,
-        bearish_test_ptr as usize,
-        bullish_test_level_ptr as usize,
-        bearish_test_level_ptr as usize,
-    ];
-    let need_temp = output_ptrs.iter().any(|&p| {
-        p == open_ptr as usize
-            || p == high_ptr as usize
-            || p == low_ptr as usize
-            || p == close_ptr as usize
-    }) || has_duplicate_ptrs(&output_ptrs);
-    macro_rules! run_into {
-        ($fast:expr,$slow:expr,$trend:expr,$bar:expr,$bull_cross:expr,$bear_cross:expr,$offset:expr,$bull_top:expr,$bull_bottom:expr,$bear_top:expr,$bear_bottom:expr,$bull_test:expr,$bear_test:expr,$bull_test_level:expr,$bear_test_level:expr) => {
-            hema_trend_levels_into_slices(
-                $fast,
-                $slow,
-                $trend,
-                $bar,
-                $bull_cross,
-                $bear_cross,
-                $offset,
-                $bull_top,
-                $bull_bottom,
-                $bear_top,
-                $bear_bottom,
-                $bull_test,
-                $bear_test,
-                $bull_test_level,
-                $bear_test_level,
-                &input,
-                kernel,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-        };
-    }
-    if need_temp {
-        let mut fast = vec![0.0; len];
-        let mut slow = vec![0.0; len];
-        let mut trend = vec![0.0; len];
-        let mut bar = vec![0.0; len];
-        let mut bull_cross = vec![0.0; len];
-        let mut bear_cross = vec![0.0; len];
-        let mut offset = vec![0.0; len];
-        let mut bull_top = vec![0.0; len];
-        let mut bull_bottom = vec![0.0; len];
-        let mut bear_top = vec![0.0; len];
-        let mut bear_bottom = vec![0.0; len];
-        let mut bull_test = vec![0.0; len];
-        let mut bear_test = vec![0.0; len];
-        let mut bull_test_level = vec![0.0; len];
-        let mut bear_test_level = vec![0.0; len];
-        run_into!(
-            &mut fast,
-            &mut slow,
-            &mut trend,
-            &mut bar,
-            &mut bull_cross,
-            &mut bear_cross,
-            &mut offset,
-            &mut bull_top,
-            &mut bull_bottom,
-            &mut bear_top,
-            &mut bear_bottom,
-            &mut bull_test,
-            &mut bear_test,
-            &mut bull_test_level,
-            &mut bear_test_level
-        )?;
-        std::slice::from_raw_parts_mut(fast_hema_ptr, len).copy_from_slice(&fast);
-        std::slice::from_raw_parts_mut(slow_hema_ptr, len).copy_from_slice(&slow);
-        std::slice::from_raw_parts_mut(trend_direction_ptr, len).copy_from_slice(&trend);
-        std::slice::from_raw_parts_mut(bar_state_ptr, len).copy_from_slice(&bar);
-        std::slice::from_raw_parts_mut(bullish_crossover_ptr, len).copy_from_slice(&bull_cross);
-        std::slice::from_raw_parts_mut(bearish_crossunder_ptr, len).copy_from_slice(&bear_cross);
-        std::slice::from_raw_parts_mut(box_offset_ptr, len).copy_from_slice(&offset);
-        std::slice::from_raw_parts_mut(bull_box_top_ptr, len).copy_from_slice(&bull_top);
-        std::slice::from_raw_parts_mut(bull_box_bottom_ptr, len).copy_from_slice(&bull_bottom);
-        std::slice::from_raw_parts_mut(bear_box_top_ptr, len).copy_from_slice(&bear_top);
-        std::slice::from_raw_parts_mut(bear_box_bottom_ptr, len).copy_from_slice(&bear_bottom);
-        std::slice::from_raw_parts_mut(bullish_test_ptr, len).copy_from_slice(&bull_test);
-        std::slice::from_raw_parts_mut(bearish_test_ptr, len).copy_from_slice(&bear_test);
-        std::slice::from_raw_parts_mut(bullish_test_level_ptr, len)
-            .copy_from_slice(&bull_test_level);
-        std::slice::from_raw_parts_mut(bearish_test_level_ptr, len)
-            .copy_from_slice(&bear_test_level);
-    } else {
-        run_into!(
-            std::slice::from_raw_parts_mut(fast_hema_ptr, len),
-            std::slice::from_raw_parts_mut(slow_hema_ptr, len),
-            std::slice::from_raw_parts_mut(trend_direction_ptr, len),
-            std::slice::from_raw_parts_mut(bar_state_ptr, len),
-            std::slice::from_raw_parts_mut(bullish_crossover_ptr, len),
-            std::slice::from_raw_parts_mut(bearish_crossunder_ptr, len),
-            std::slice::from_raw_parts_mut(box_offset_ptr, len),
-            std::slice::from_raw_parts_mut(bull_box_top_ptr, len),
-            std::slice::from_raw_parts_mut(bull_box_bottom_ptr, len),
-            std::slice::from_raw_parts_mut(bear_box_top_ptr, len),
-            std::slice::from_raw_parts_mut(bear_box_bottom_ptr, len),
-            std::slice::from_raw_parts_mut(bullish_test_ptr, len),
-            std::slice::from_raw_parts_mut(bearish_test_ptr, len),
-            std::slice::from_raw_parts_mut(bullish_test_level_ptr, len),
-            std::slice::from_raw_parts_mut(bearish_test_level_ptr, len)
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct HemaTrendLevelsContext {
-    fast_length: usize,
-    slow_length: usize,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl HemaTrendLevelsContext {
-    #[wasm_bindgen(constructor)]
-    pub fn new(fast_length: usize, slow_length: usize) -> Result<HemaTrendLevelsContext, JsValue> {
-        resolve_params(&HemaTrendLevelsParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(Self {
-            fast_length,
-            slow_length,
-            kernel: detect_best_kernel(),
-        })
-    }
-    #[wasm_bindgen]
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_into(
-        &self,
-        open_ptr: *const f64,
-        high_ptr: *const f64,
-        low_ptr: *const f64,
-        close_ptr: *const f64,
-        fast_hema_ptr: *mut f64,
-        slow_hema_ptr: *mut f64,
-        trend_direction_ptr: *mut f64,
-        bar_state_ptr: *mut f64,
-        bullish_crossover_ptr: *mut f64,
-        bearish_crossunder_ptr: *mut f64,
-        box_offset_ptr: *mut f64,
-        bull_box_top_ptr: *mut f64,
-        bull_box_bottom_ptr: *mut f64,
-        bear_box_top_ptr: *mut f64,
-        bear_box_bottom_ptr: *mut f64,
-        bullish_test_ptr: *mut f64,
-        bearish_test_ptr: *mut f64,
-        bullish_test_level_ptr: *mut f64,
-        bearish_test_level_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if open_ptr.is_null()
-            || high_ptr.is_null()
-            || low_ptr.is_null()
-            || close_ptr.is_null()
-            || fast_hema_ptr.is_null()
-            || slow_hema_ptr.is_null()
-            || trend_direction_ptr.is_null()
-            || bar_state_ptr.is_null()
-            || bullish_crossover_ptr.is_null()
-            || bearish_crossunder_ptr.is_null()
-            || box_offset_ptr.is_null()
-            || bull_box_top_ptr.is_null()
-            || bull_box_bottom_ptr.is_null()
-            || bear_box_top_ptr.is_null()
-            || bear_box_bottom_ptr.is_null()
-            || bullish_test_ptr.is_null()
-            || bearish_test_ptr.is_null()
-            || bullish_test_level_ptr.is_null()
-            || bearish_test_level_ptr.is_null()
-        {
-            return Err(JsValue::from_str("Null pointer provided"));
-        }
-        unsafe {
-            hema_trend_levels_into_raw(
-                open_ptr,
-                high_ptr,
-                low_ptr,
-                close_ptr,
-                fast_hema_ptr,
-                slow_hema_ptr,
-                trend_direction_ptr,
-                bar_state_ptr,
-                bullish_crossover_ptr,
-                bearish_crossunder_ptr,
-                box_offset_ptr,
-                bull_box_top_ptr,
-                bull_box_bottom_ptr,
-                bear_box_top_ptr,
-                bear_box_bottom_ptr,
-                bullish_test_ptr,
-                bearish_test_ptr,
-                bullish_test_level_ptr,
-                bearish_test_level_ptr,
-                len,
-                self.fast_length,
-                self.slow_length,
-                self.kernel,
-            )
-        }
-    }
-    pub fn get_warmup_period(&self) -> usize {
-        0
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn hema_trend_levels_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    fast_hema_ptr: *mut f64,
-    slow_hema_ptr: *mut f64,
-    trend_direction_ptr: *mut f64,
-    bar_state_ptr: *mut f64,
-    bullish_crossover_ptr: *mut f64,
-    bearish_crossunder_ptr: *mut f64,
-    box_offset_ptr: *mut f64,
-    bull_box_top_ptr: *mut f64,
-    bull_box_bottom_ptr: *mut f64,
-    bear_box_top_ptr: *mut f64,
-    bear_box_bottom_ptr: *mut f64,
-    bullish_test_ptr: *mut f64,
-    bearish_test_ptr: *mut f64,
-    bullish_test_level_ptr: *mut f64,
-    bearish_test_level_ptr: *mut f64,
-    len: usize,
-    fast_length: usize,
-    slow_length: usize,
-) -> Result<(), JsValue> {
-    unsafe {
-        hema_trend_levels_into_raw(
-            open_ptr,
-            high_ptr,
-            low_ptr,
-            close_ptr,
-            fast_hema_ptr,
-            slow_hema_ptr,
-            trend_direction_ptr,
-            bar_state_ptr,
-            bullish_crossover_ptr,
-            bearish_crossunder_ptr,
-            box_offset_ptr,
-            bull_box_top_ptr,
-            bull_box_bottom_ptr,
-            bear_box_top_ptr,
-            bear_box_bottom_ptr,
-            bullish_test_ptr,
-            bearish_test_ptr,
-            bullish_test_level_ptr,
-            bearish_test_level_ptr,
-            len,
-            fast_length,
-            slow_length,
-            Kernel::Auto,
-        )
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HemaTrendLevelsBatchJsConfig {
-    pub fast_length_range: Option<(usize, usize, usize)>,
-    pub slow_length_range: Option<(usize, usize, usize)>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HemaTrendLevelsBatchJsOutput {
-    pub fast_hema: Vec<f64>,
-    pub slow_hema: Vec<f64>,
-    pub trend_direction: Vec<f64>,
-    pub bar_state: Vec<f64>,
-    pub bullish_crossover: Vec<f64>,
-    pub bearish_crossunder: Vec<f64>,
-    pub box_offset: Vec<f64>,
-    pub bull_box_top: Vec<f64>,
-    pub bull_box_bottom: Vec<f64>,
-    pub bear_box_top: Vec<f64>,
-    pub bear_box_bottom: Vec<f64>,
-    pub bullish_test: Vec<f64>,
-    pub bearish_test: Vec<f64>,
-    pub bullish_test_level: Vec<f64>,
-    pub bearish_test_level: Vec<f64>,
-    pub combos: Vec<HemaTrendLevelsParams>,
-    pub fast_lengths: Vec<usize>,
-    pub slow_lengths: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "hema_trend_levels_batch_js")]
-pub fn hema_trend_levels_batch_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: HemaTrendLevelsBatchJsConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = HemaTrendLevelsBatchRange {
-        fast_length: config.fast_length_range.unwrap_or((
-            DEFAULT_FAST_LENGTH,
-            DEFAULT_FAST_LENGTH,
-            0,
-        )),
-        slow_length: config.slow_length_range.unwrap_or((
-            DEFAULT_SLOW_LENGTH,
-            DEFAULT_SLOW_LENGTH,
-            0,
-        )),
-    };
-    let out = hema_trend_levels_batch_with_kernel(open, high, low, close, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&HemaTrendLevelsBatchJsOutput {
-        fast_lengths: out
-            .combos
-            .iter()
-            .map(|c| c.fast_length.unwrap_or(DEFAULT_FAST_LENGTH))
-            .collect(),
-        slow_lengths: out
-            .combos
-            .iter()
-            .map(|c| c.slow_length.unwrap_or(DEFAULT_SLOW_LENGTH))
-            .collect(),
-        fast_hema: out.fast_hema,
-        slow_hema: out.slow_hema,
-        trend_direction: out.trend_direction,
-        bar_state: out.bar_state,
-        bullish_crossover: out.bullish_crossover,
-        bearish_crossunder: out.bearish_crossunder,
-        box_offset: out.box_offset,
-        bull_box_top: out.bull_box_top,
-        bull_box_bottom: out.bull_box_bottom,
-        bear_box_top: out.bear_box_top,
-        bear_box_bottom: out.bear_box_bottom,
-        bullish_test: out.bullish_test,
-        bearish_test: out.bearish_test,
-        bullish_test_level: out.bullish_test_level,
-        bearish_test_level: out.bearish_test_level,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn hema_trend_levels_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    fast_hema_ptr: *mut f64,
-    slow_hema_ptr: *mut f64,
-    trend_direction_ptr: *mut f64,
-    bar_state_ptr: *mut f64,
-    bullish_crossover_ptr: *mut f64,
-    bearish_crossunder_ptr: *mut f64,
-    box_offset_ptr: *mut f64,
-    bull_box_top_ptr: *mut f64,
-    bull_box_bottom_ptr: *mut f64,
-    bear_box_top_ptr: *mut f64,
-    bear_box_bottom_ptr: *mut f64,
-    bullish_test_ptr: *mut f64,
-    bearish_test_ptr: *mut f64,
-    bullish_test_level_ptr: *mut f64,
-    bearish_test_level_ptr: *mut f64,
-    len: usize,
-    fast_start: usize,
-    fast_end: usize,
-    fast_step: usize,
-    slow_start: usize,
-    slow_end: usize,
-    slow_step: usize,
-) -> Result<usize, JsValue> {
-    let sweep = HemaTrendLevelsBatchRange {
-        fast_length: (fast_start, fast_end, fast_step),
-        slow_length: (slow_start, slow_end, slow_step),
-    };
-    unsafe {
-        let rows = expand_grid_hema_trend_levels(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?
-            .len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        hema_trend_levels_batch_inner_into(
-            std::slice::from_raw_parts(open_ptr, len),
-            std::slice::from_raw_parts(high_ptr, len),
-            std::slice::from_raw_parts(low_ptr, len),
-            std::slice::from_raw_parts(close_ptr, len),
-            &sweep,
-            Kernel::Auto,
-            false,
-            std::slice::from_raw_parts_mut(fast_hema_ptr, total),
-            std::slice::from_raw_parts_mut(slow_hema_ptr, total),
-            std::slice::from_raw_parts_mut(trend_direction_ptr, total),
-            std::slice::from_raw_parts_mut(bar_state_ptr, total),
-            std::slice::from_raw_parts_mut(bullish_crossover_ptr, total),
-            std::slice::from_raw_parts_mut(bearish_crossunder_ptr, total),
-            std::slice::from_raw_parts_mut(box_offset_ptr, total),
-            std::slice::from_raw_parts_mut(bull_box_top_ptr, total),
-            std::slice::from_raw_parts_mut(bull_box_bottom_ptr, total),
-            std::slice::from_raw_parts_mut(bear_box_top_ptr, total),
-            std::slice::from_raw_parts_mut(bear_box_bottom_ptr, total),
-            std::slice::from_raw_parts_mut(bullish_test_ptr, total),
-            std::slice::from_raw_parts_mut(bearish_test_ptr, total),
-            std::slice::from_raw_parts_mut(bullish_test_level_ptr, total),
-            std::slice::from_raw_parts_mut(bearish_test_level_ptr, total),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hema_trend_levels_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fast_length: usize,
-    slow_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = hema_trend_levels_js(open, high, low, close, fast_length, slow_length)?;
-    crate::write_wasm_object_f64_outputs("hema_trend_levels_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hema_trend_levels_batch_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = hema_trend_levels_batch_js(open, high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "hema_trend_levels_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2341,6 +1435,149 @@ mod tests {
     }
 
     #[test]
+    fn hema_trend_levels_matches_hand_derived_cross_box_and_reset_vector() {
+        // Published HEMA definition: EMA(2*EMA(close, length/2) -
+        // EMA(close, length), sqrt(length)).  Choosing fast=1 and slow=2
+        // makes the independent arithmetic especially transparent:
+        // fast=close and slow=2*close-EMA_2(close), alpha(EMA_2)=2/3.
+        // Fourteen flat true ranges seed ATR=2 before the two deliberate
+        // direction changes create first a bear box, then a bull box.
+        let mut open = vec![100.0; 19];
+        let mut high = vec![101.0; 19];
+        let mut low = vec![99.0; 19];
+        let mut close = vec![100.0; 19];
+
+        open[14] = 102.0;
+        high[14] = 103.0;
+        low[14] = 101.0;
+        close[14] = 102.0;
+
+        open[15] = 101.0;
+        high[15] = 103.0;
+        low[15] = 100.0;
+        close[15] = 101.0;
+
+        open[16] = 102.0;
+        high[16] = 103.0;
+        low[16] = 100.0;
+        close[16] = 102.0;
+
+        open[17] = f64::NAN;
+        high[17] = f64::NAN;
+        low[17] = f64::NAN;
+        close[17] = f64::NAN;
+
+        let out = hema_trend_levels(&HemaTrendLevelsInput::from_slices(
+            &open,
+            &high,
+            &low,
+            &close,
+            HemaTrendLevelsParams {
+                fast_length: Some(1),
+                slow_length: Some(2),
+            },
+        ))
+        .unwrap();
+
+        let close_enough = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() <= 1.0e-12,
+                "actual={actual:.17} expected={expected:.17}"
+            );
+        };
+
+        // ATR seed: fourteen ranges of exactly 2, therefore offset=ATR/2=1.
+        close_enough(out.fast_hema[13], 100.0);
+        close_enough(out.slow_hema[13], 100.0);
+        close_enough(out.box_offset[13], 1.0);
+
+        // Bar 14: EMA_2=304/3, slow=308/3. A bearish cross seeds the
+        // resistance box at high - (29/14)/2 = 2855/28.
+        close_enough(out.fast_hema[14], 102.0);
+        close_enough(out.slow_hema[14], 308.0 / 3.0);
+        assert_eq!(out.trend_direction[14], -1.0);
+        assert_eq!(out.bar_state[14], 0.0);
+        assert_eq!(out.bullish_crossover[14], 0.0);
+        assert_eq!(out.bearish_crossunder[14], 1.0);
+        close_enough(out.box_offset[14], 29.0 / 28.0);
+        assert!(out.bull_box_top[14].is_nan());
+        assert!(out.bull_box_bottom[14].is_nan());
+        close_enough(out.bear_box_top[14], 2855.0 / 28.0);
+        close_enough(out.bear_box_bottom[14], 103.0);
+        assert_eq!(out.bullish_test[14], 0.0);
+        assert_eq!(out.bearish_test[14], 0.0);
+        assert!(out.bullish_test_level[14].is_nan());
+        assert!(out.bearish_test_level[14].is_nan());
+
+        // Bar 15: EMA_2=910/9, slow=908/9. The bullish cross seeds a
+        // support box. The same candle cleanly retests the still-live bear
+        // box, whose reported test level is its 103 bottom.
+        close_enough(out.fast_hema[15], 101.0);
+        close_enough(out.slow_hema[15], 908.0 / 9.0);
+        assert_eq!(out.trend_direction[15], 1.0);
+        assert_eq!(out.bullish_crossover[15], 1.0);
+        assert_eq!(out.bearish_crossunder[15], 0.0);
+        close_enough(out.box_offset[15], 419.0 / 392.0);
+        close_enough(out.bull_box_top[15], 100.0 + 419.0 / 392.0);
+        close_enough(out.bull_box_bottom[15], 100.0);
+        close_enough(out.bear_box_top[15], 2855.0 / 28.0);
+        close_enough(out.bear_box_bottom[15], 103.0);
+        assert_eq!(out.bullish_test[15], 0.0);
+        assert_eq!(out.bearish_test[15], 1.0);
+        assert!(out.bullish_test_level[15].is_nan());
+        close_enough(out.bearish_test_level[15], 103.0);
+
+        // Bar 16 reverses again, replaces the bear box and cleanly retests
+        // the persistent bull box from bar 15.
+        close_enough(out.fast_hema[16], 102.0);
+        close_enough(out.slow_hema[16], 2762.0 / 27.0);
+        assert_eq!(out.trend_direction[16], -1.0);
+        assert_eq!(out.bullish_crossover[16], 0.0);
+        assert_eq!(out.bearish_crossunder[16], 1.0);
+        close_enough(out.box_offset[16], 6035.0 / 5488.0);
+        close_enough(out.bear_box_top[16], 103.0 - 6035.0 / 5488.0);
+        close_enough(out.bear_box_bottom[16], 103.0);
+        assert_eq!(out.bullish_test[16], 1.0);
+        assert_eq!(out.bearish_test[16], 0.0);
+        close_enough(out.bullish_test_level[16], 100.0);
+        assert!(out.bearish_test_level[16].is_nan());
+
+        // A non-finite OHLC bar invalidates every output and clears every
+        // recurrence/box. The next finite bar restarts both HEMAs from close,
+        // with no stale crossover, ATR or box state leaking across the gap.
+        for series in [
+            &out.fast_hema,
+            &out.slow_hema,
+            &out.trend_direction,
+            &out.bar_state,
+            &out.bullish_crossover,
+            &out.bearish_crossunder,
+            &out.box_offset,
+            &out.bull_box_top,
+            &out.bull_box_bottom,
+            &out.bear_box_top,
+            &out.bear_box_bottom,
+            &out.bullish_test,
+            &out.bearish_test,
+            &out.bullish_test_level,
+            &out.bearish_test_level,
+        ] {
+            assert!(series[17].is_nan());
+        }
+        close_enough(out.fast_hema[18], 100.0);
+        close_enough(out.slow_hema[18], 100.0);
+        assert_eq!(out.trend_direction[18], 0.0);
+        assert_eq!(out.bar_state[18], 0.0);
+        assert_eq!(out.bullish_crossover[18], 0.0);
+        assert_eq!(out.bearish_crossunder[18], 0.0);
+        assert!(out.box_offset[18].is_nan());
+        assert!(out.bull_box_top[18].is_nan());
+        assert!(out.bear_box_top[18].is_nan());
+        assert_eq!(out.bullish_test[18], 0.0);
+        assert_eq!(out.bearish_test[18], 0.0);
+    }
+
+    #[test]
     fn hema_trend_levels_output_contract() {
         let (open, high, low, close) = sample_ohlc(240);
         let out = hema_trend_levels(&HemaTrendLevelsInput::from_slices(
@@ -2353,10 +1590,11 @@ mod tests {
         .unwrap();
         assert_eq!(out.fast_hema.len(), close.len());
         assert!(out.fast_hema.iter().any(|v| v.is_finite()));
-        assert!(out
-            .bullish_crossover
-            .iter()
-            .all(|v| v.is_nan() || *v == 0.0 || *v == 1.0));
+        assert!(
+            out.bullish_crossover
+                .iter()
+                .all(|v| v.is_nan() || *v == 0.0 || *v == 1.0)
+        );
     }
 
     #[test]

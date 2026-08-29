@@ -5,6 +5,9 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+// External formula/edge authority (audit oracle only; never a runtime backend):
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_ADOSC.c
+
 
 struct KahanF32 {
     float sum;
@@ -22,7 +25,7 @@ __device__ __forceinline__ void kahan_add(KahanF32& s, float x) {
 
 __device__ __forceinline__ float mfm_from_hlc(float h, float l, float c) {
     const float hl = h - l;
-    if (hl == 0.0f) return 0.0f;
+    if (!(hl > 0.0f)) return 0.0f;
     const float num = (c - l) - (h - c);
     return num / hl;
 }
@@ -187,19 +190,16 @@ extern "C" __global__ void adosc_many_series_one_param_f32(
 /* ===========================================================================
  * NEOETHOS f64 LANE — adosc
  * ---------------------------------------------------------------------------
- * CPU oracle: src/indicators/adosc.rs:431 adosc_scalar_3_10 — the
- *   specialisation adosc_scalar (:360) dispatches to whenever short == 3 and
- *   long == 10 (:372), which is exactly what the batch defaults pin. Its
- *   short EMA is written as 0.5 * sum + 0.5 * prev because alpha = 2/(3+1) is
- *   EXACTLY 0.5, and the long EMA keeps 2/11 and 1 - 2/11 as separate
- *   constants (:462-463).
+ * Creator source oracle (the exact vendored release commit):
+ * https://raw.githubusercontent.com/VectorAlpha-dev/VectorTA/e6197777837a18b88e43ce5c163b2e0023f73a2a/src/indicators/adosc.rs
  *
  * Column: output_id "value" — compute_adosc_batch calls expect_value_output
  *   (cpu_batch.rs:2666) and returns out.values.
  *
- * PERIOD-INVARIANT: that batch reads short_period (3) and long_period (10) and
- *   NEVER period (cpu_batch.rs:2670-2671). Five swept periods give five
- *   identical CPU columns, so this kernel emits five identical rows.
+ * PARAMETER ROUTING: NeoEthos' generic f64 ABI carries the sweep's long-period
+ *   anchor in periods[combo]. The CPU plan scales VectorTA's default 3:10 tuple
+ *   with positive integer half-up rounding. Reconstructing that exact tuple is
+ *   required here: 7/21/50/100/200 map to short 2/6/15/30/60 respectively.
  *
  * FIRST-VALID IGNORED: adosc_prepare returns `first = 0` OUTRIGHT (:331) and
  *   the scalar walks every bar from index 0 with no reset and no warmup
@@ -215,12 +215,12 @@ extern "C" __global__ void adosc_many_series_one_param_f32(
  *
  * ARITHMETIC taken verbatim:
  *   * the money-flow multiplier is ((c - l) - (h - c)) / hl with the exact
- *     guard hl != 0.0 and the exact substitute 0.0 (:451-455) — no epsilon,
+ *     guard hl > 0.0 and the exact substitute 0.0 (:451-455) — no epsilon,
  *     because introducing one would change the answer.
- *   * both EMAs are written as alpha * sum + (1 - alpha) * prev (:480-481) —
+ *   * both EMAs are written as alpha * sum + (1 - alpha) * prev —
  *     TWO products and one add, NOT a fused prev + alpha*(sum - prev).
- *   * 2.0/11.0 and 1.0 - 2.0/11.0 are formed once, exactly as the CPU forms
- *     them, rather than being folded into literals.
+ *   * both 2/(period+1) alphas and their complements are formed once, exactly
+ *     as the CPU forms them, rather than being folded into literals.
  *
  * This file previously contained ZERO double-pointer entry points — every
  * kernel in it was f32. This is the file's f64 lane.
@@ -229,11 +229,6 @@ extern "C" __global__ void adosc_many_series_one_param_f32(
 #ifndef NEO_F64_NAN
 #define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
 #endif
-
-/* Defaults from cpu_batch.rs:2670-2671. They are what selects the 3/10
- * specialisation in adosc_scalar (:372). */
-#define NEO_ADOSC_SHORT_PERIOD 3
-#define NEO_ADOSC_LONG_PERIOD  10
 
 extern "C" __global__
 void adosc_neo_batch_f64(const double* __restrict__ high,
@@ -248,23 +243,29 @@ void adosc_neo_batch_f64(const double* __restrict__ high,
 {
     const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (combo >= n_combos || n <= 0) return;
-    (void)periods;     /* period-invariant — see header */
     (void)first_valid; /* adosc_prepare returns 0 outright — see header */
 
     double* __restrict__ o = out + (size_t)combo * (size_t)n;
 
-    /* adosc_prepare (:308) refuses long_period > len before a column exists. */
-    if (NEO_ADOSC_LONG_PERIOD > n) {
+    const int long_period = periods[combo];
+    const long long scaled_short =
+        (3LL * (long long)long_period + 5LL) / 10LL;
+    const int short_period = (scaled_short < 1LL) ? 1 : (int)scaled_short;
+
+    /* Mirror the CPU request validation before any row arithmetic. */
+    if (long_period <= 0 || short_period >= long_period || long_period > n) {
         for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
         return;
     }
 
-    const double alpha_long           = 2.0 / 11.0;
+    const double alpha_short = 2.0 / ((double)short_period + 1.0);
+    const double alpha_long = 2.0 / ((double)long_period + 1.0);
+    const double one_minus_alpha_short = 1.0 - alpha_short;
     const double one_minus_alpha_long = 1.0 - alpha_long;
 
     const double h0 = high[0], l0 = low[0], c0 = close[0], v0 = volume[0];
     const double hl0 = h0 - l0;
-    const double mfm0 = (hl0 != 0.0) ? (((c0 - l0) - (h0 - c0)) / hl0) : 0.0;
+    const double mfm0 = (hl0 > 0.0) ? (((c0 - l0) - (h0 - c0)) / hl0) : 0.0;
     const double mfv0 = mfm0 * v0;
 
     double sum_ad    = mfv0;
@@ -275,11 +276,11 @@ void adosc_neo_batch_f64(const double* __restrict__ high,
     for (int i = 1; i < n; ++i) {
         const double h = high[i], l = low[i], c = close[i], v = volume[i];
         const double hl  = h - l;
-        const double mfm = (hl != 0.0) ? (((c - l) - (h - c)) / hl) : 0.0;
+        const double mfm = (hl > 0.0) ? (((c - l) - (h - c)) / hl) : 0.0;
         const double mfv = mfm * v;
 
         sum_ad   += mfv;
-        short_ema = 0.5 * sum_ad + 0.5 * short_ema;
+        short_ema = alpha_short * sum_ad + one_minus_alpha_short * short_ema;
         long_ema  = alpha_long * sum_ad + one_minus_alpha_long * long_ema;
         o[i] = short_ema - long_ema;
     }

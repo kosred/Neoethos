@@ -1,17 +1,3 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::indicators::moving_averages::ema::{EmaParams, EmaStream};
 use crate::indicators::moving_averages::hma::{HmaParams, HmaStream};
 use crate::indicators::moving_averages::sma::{SmaParams, SmaStream};
@@ -19,13 +5,11 @@ use crate::indicators::moving_averages::vwma::{VwmaParams, VwmaStream};
 use crate::indicators::moving_averages::wma::{WmaParams, WmaStream};
 use crate::indicators::moving_averages::zlema::{ZlemaParams, ZlemaStream};
 use crate::indicators::tsf::{TsfParams, TsfStream};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
@@ -49,10 +33,6 @@ pub struct KairiRelativeIndexOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct KairiRelativeIndexParams {
     pub length: Option<usize>,
     pub ma_type: Option<String>,
@@ -829,7 +809,6 @@ pub fn kairi_relative_index_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn kairi_relative_index_into(
     input: &KairiRelativeIndexInput,
@@ -839,10 +818,6 @@ pub fn kairi_relative_index_into(
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct KairiRelativeIndexBatchRange {
     pub length: (usize, usize, usize),
     pub ma_type: String,
@@ -1104,311 +1079,11 @@ fn kairi_relative_index_batch_inner_into(
     Ok(())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "kairi_relative_index")]
-#[pyo3(signature = (source, volume, length=50, ma_type="SMA", kernel=None))]
-pub fn kairi_relative_index_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let source = source.as_slice()?;
-    let volume = volume.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = KairiRelativeIndexInput::from_slices(
-        source,
-        volume,
-        KairiRelativeIndexParams {
-            length: Some(length),
-            ma_type: Some(ma_type.to_string()),
-        },
-    );
-    let out = py
-        .allow_threads(|| kairi_relative_index_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "KairiRelativeIndexStream")]
-pub struct KairiRelativeIndexStreamPy {
-    stream: KairiRelativeIndexStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl KairiRelativeIndexStreamPy {
-    #[new]
-    #[pyo3(signature = (length=50, ma_type="SMA"))]
-    fn new(length: usize, ma_type: &str) -> PyResult<Self> {
-        let stream = KairiRelativeIndexStream::try_new(KairiRelativeIndexParams {
-            length: Some(length),
-            ma_type: Some(ma_type.to_string()),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, source: f64, volume: f64) -> Option<f64> {
-        self.stream.update(source, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kairi_relative_index_batch")]
-#[pyo3(signature = (source, volume, length_range=(50,50,0), ma_type="SMA", kernel=None))]
-pub fn kairi_relative_index_batch_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let source = source.as_slice()?;
-    let volume = volume.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            kairi_relative_index_batch_with_kernel(
-                source,
-                volume,
-                &KairiRelativeIndexBatchRange {
-                    length: length_range,
-                    ma_type: ma_type.to_string(),
-                },
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = output.rows;
-    let cols = output.cols;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "values",
-        output.values.into_pyarray(py).reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.length.unwrap_or(50) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("ma_type", ma_type)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_kairi_relative_index_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(kairi_relative_index_py, m)?)?;
-    m.add_function(wrap_pyfunction!(kairi_relative_index_batch_py, m)?)?;
-    m.add_class::<KairiRelativeIndexStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KairiRelativeIndexBatchConfig {
-    pub length_range: Vec<usize>,
-    pub ma_type: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = kairi_relative_index_js)]
-pub fn kairi_relative_index_js(
-    source: &[f64],
-    volume: &[f64],
-    length: usize,
-    ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    let input = KairiRelativeIndexInput::from_slices(
-        source,
-        volume,
-        KairiRelativeIndexParams {
-            length: Some(length),
-            ma_type: Some(ma_type.to_string()),
-        },
-    );
-    let out = kairi_relative_index_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&out.values).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = kairi_relative_index_batch_js)]
-pub fn kairi_relative_index_batch_js(
-    source: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: KairiRelativeIndexBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: length_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let out = kairi_relative_index_batch_with_kernel(
-        source,
-        volume,
-        &KairiRelativeIndexBatchRange {
-            length: (
-                config.length_range[0],
-                config.length_range[1],
-                config.length_range[2],
-            ),
-            ma_type: config.ma_type.unwrap_or_else(|| "SMA".to_string()),
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("values"),
-        &serde_wasm_bindgen::to_value(&out.values).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kairi_relative_index_alloc(len: usize) -> *mut f64 {
-    let mut buf = Vec::<f64>::with_capacity(len);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kairi_relative_index_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kairi_relative_index_into(
-    source_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if source_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    let source = unsafe { std::slice::from_raw_parts(source_ptr, len) };
-    let volume = unsafe { std::slice::from_raw_parts(volume_ptr, len) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, len) };
-    let input = KairiRelativeIndexInput::from_slices(
-        source,
-        volume,
-        KairiRelativeIndexParams {
-            length: Some(length),
-            ma_type: Some(ma_type.to_string()),
-        },
-    );
-    kairi_relative_index_into_slice(out, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kairi_relative_index_batch_into(
-    source_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    start: usize,
-    end: usize,
-    step: usize,
-    ma_type: &str,
-) -> Result<usize, JsValue> {
-    if source_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    let source = unsafe { std::slice::from_raw_parts(source_ptr, len) };
-    let volume = unsafe { std::slice::from_raw_parts(volume_ptr, len) };
-    let sweep = KairiRelativeIndexBatchRange {
-        length: (start, end, step),
-        ma_type: ma_type.to_string(),
-    };
-    let combos =
-        expand_grid_kairi_relative_index(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, rows * len) };
-    kairi_relative_index_batch_inner_into(source, volume, &combos, Kernel::Auto, false, out)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kairi_relative_index_output_into_js(
-    source: &[f64],
-    volume: &[f64],
-    length: usize,
-    ma_type: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kairi_relative_index_js(source, volume, length, ma_type)?;
-    crate::write_wasm_object_f64_outputs("kairi_relative_index_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kairi_relative_index_batch_output_into_js(
-    source: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kairi_relative_index_batch_js(source, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "kairi_relative_index_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu, IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue,
+        IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue, compute_cpu,
     };
 
     fn sample_source_volume(len: usize) -> (Vec<f64>, Vec<f64>) {

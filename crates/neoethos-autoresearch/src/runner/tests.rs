@@ -25,6 +25,60 @@ fn base_config() -> DiscoveryConfig {
 }
 
 #[test]
+fn public_runner_identity_guard_rejects_symbol_and_timeframe_drift() {
+    let config = base_config();
+    let wrong_symbol = neoethos_data::CanonicalDatasetIdentity::external(
+        "runner-identity-test",
+        "GBPUSD",
+        neoethos_data::CanonicalTimeframe::M1,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .unwrap();
+    assert!(assert_identity_matches_config(&wrong_symbol, &config).is_err());
+
+    let wrong_timeframe = neoethos_data::CanonicalDatasetIdentity::external(
+        "runner-identity-test",
+        "EURUSD",
+        neoethos_data::CanonicalTimeframe::H1,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .unwrap();
+    assert!(assert_identity_matches_config(&wrong_timeframe, &config).is_err());
+}
+
+fn test_dataset_receipt() -> DatasetReceiptV1 {
+    let identity = neoethos_data::CanonicalDatasetIdentity::external(
+        "autoresearch-runner-test",
+        "EURUSD",
+        neoethos_data::CanonicalTimeframe::M1,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .expect("test identity");
+    DatasetReceiptV1::new(
+        identity.clone(),
+        vec![crate::session::DirectTimeframeReceiptV1 {
+            dataset_identity: identity,
+            manifest_schema_id: "neoethos.dataset-manifest.v1".to_owned(),
+            manifest_sha256: [3; 32],
+            generation_id: "generation-test".to_owned(),
+            vortex_sha256: [4; 32],
+            row_count: 1_001,
+            timestamp_start_ms: 0,
+            timestamp_end_ms: 1_000,
+        }],
+        crate::session::InSampleWindowV1 {
+            start_ms: 0,
+            end_exclusive_ms: 801,
+        },
+        OosWindow {
+            start_ms: 801,
+            end_ms: 1_000,
+        },
+    )
+    .expect("test dataset receipt")
+}
+
+#[test]
 fn the_cost_hash_moves_when_the_cost_model_moves() {
     // A resumed session whose cost model moved is judging two sets of numbers
     // that do not mean the same thing. The hash is what catches it.
@@ -160,6 +214,8 @@ fn the_identity_source_says_out_loud_that_replicates_need_an_external_seed() {
 fn the_refusing_executor_refuses_rather_than_returning_an_empty_sweep() {
     // An empty outcome is indistinguishable from a sweep that found nothing,
     // which is exactly the silent no-op §13 exists to forbid.
+    let dataset_receipt = test_dataset_receipt();
+    let session_id = SessionId::parse("ar-test-refusing").unwrap();
     let mut executor = RefusingExecutor::new(
         (0, 800),
         OosWindow {
@@ -168,10 +224,13 @@ fn the_refusing_executor_refuses_rather_than_returning_an_empty_sweep() {
         },
         1_000,
         100.0,
+        dataset_receipt.clone(),
     );
     let config = base_config();
     let err = executor
         .execute(&SearchRequest {
+            session_id: &session_id,
+            dataset_receipt: &dataset_receipt,
             sweep: SweepId(1),
             slot: 0,
             config: &config,
@@ -185,13 +244,15 @@ fn the_refusing_executor_refuses_rather_than_returning_an_empty_sweep() {
 
     let portfolio = PromotionPortfolio {
         schema: PROMOTION_EVIDENCE_SCHEMA.to_string(),
+        session_id,
         sweep: SweepId(1),
         slot: 0,
         config_hash: "fnv64:test".to_string(),
-        feature_names: vec!["rsi_14".to_string()],
-        genes: vec![neoethos_search::genetic::Gene::default()],
+        dataset_receipt,
         streamed: false,
-        batches: 1,
+        batch_count: 0,
+        gene_count: 0,
+        batch_bindings: Vec::new(),
     };
     // It refuses in the PREFLIGHT — before the runner journals the touch as
     // spent — and again in the evaluation, so the window survives an executor
@@ -229,11 +290,24 @@ fn every_slot_offers_its_own_row_and_the_runner_selects_none_of_them() {
         },
     ];
     let rows = champion_rows(SweepId(7), &outcomes);
-    assert_eq!(rows.len(), outcomes.len(), "one row slot per search, always");
+    assert_eq!(
+        rows.len(),
+        outcomes.len(),
+        "one row slot per search, always"
+    );
     // The LOSER still offers its row. It is the judge's job to leave it there.
-    assert_eq!(rows[0].as_ref().expect("slot 0 offers a row").strategy_id, "a");
-    assert_eq!(rows[1].as_ref().expect("slot 1 offers a row").strategy_id, "b");
-    assert_eq!(rows[2].as_ref().expect("slot 2 offers a row").strategy_id, "c");
+    assert_eq!(
+        rows[0].as_ref().expect("slot 0 offers a row").strategy_id,
+        "a"
+    );
+    assert_eq!(
+        rows[1].as_ref().expect("slot 1 offers a row").strategy_id,
+        "b"
+    );
+    assert_eq!(
+        rows[2].as_ref().expect("slot 2 offers a row").strategy_id,
+        "c"
+    );
     assert!(rows[3].is_none(), "an errored search offers no row");
     assert_eq!(rows[1].as_ref().unwrap().sweep, SweepId(7));
     assert!((rows[1].as_ref().unwrap().e_screen_pess - 0.42).abs() < 1e-12);
@@ -425,11 +499,18 @@ fn a_slot_that_never_ran_is_named_kept_and_never_credited_to_the_posterior() {
         "the proposal carries a streaming plan, which is not a DiscoveryConfig field",
     );
     assert_eq!(refused.slot, 1);
-    assert_eq!(refused.trials_offered, 0, "a row that never ran offers no trials");
+    assert_eq!(
+        refused.trials_offered, 0,
+        "a row that never ran offers no trials"
+    );
     assert!(refused.e_screen_pess.is_none());
     assert!(!refused.cost_band.discriminates);
     assert!(
-        refused.error.as_deref().unwrap().starts_with(NOT_RUN_PREFIX),
+        refused
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with(NOT_RUN_PREFIX),
         "a census reader must be able to tell 'failed' from 'never happened'"
     );
     // It offers no champion row, whatever else is in the sweep.

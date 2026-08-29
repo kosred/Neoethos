@@ -1,17 +1,23 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::cci_cycle::{CciCycleBatchRange, CciCycleParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
 use std::fmt;
 use std::sync::Arc;
+
+/// The public f32 CUDA wrapper remains the pre-v9 VectorTA implementation.
+/// Classic semantic-v9 artifacts must use the strict f64 dispatcher and must
+/// never treat this route as creator-aligned.
+pub const CCI_CYCLE_F32_SEMANTIC_VERSION: u32 = 8;
+pub const CCI_CYCLE_F32_SEMANTIC_IDENTITY: &str = "cci-cycle-vector-ta-legacy-f32-v8";
 
 #[derive(thiserror::Error, Debug)]
 pub enum CudaCciCycleError {
@@ -59,12 +65,6 @@ impl CudaCciCycle {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/cci_cycle_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("cci_cycle_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -643,14 +643,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "cci_cycle",
-            "one_series_many_params",
-            "cci_cycle_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(mem_bytes())]
+        vec![
+            CudaBenchScenario::new(
+                "cci_cycle",
+                "one_series_many_params",
+                "cci_cycle_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(mem_bytes()),
+        ]
     }
 }

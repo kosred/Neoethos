@@ -1,24 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -70,10 +55,6 @@ pub struct DecOscOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DecOscParams {
     pub hp_period: Option<usize>,
     pub k: Option<f64>,
@@ -298,7 +279,6 @@ pub fn dec_osc_with_kernel(
     Ok(DecOscOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn dec_osc_into(out: &mut [f64], input: &DecOscInput) -> Result<(), DecOscError> {
     dec_osc_into_slice(out, input, Kernel::Auto)
@@ -1028,42 +1008,19 @@ impl DecOscStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dec_osc_output_into_js(
-    data: &[f64],
-    hp_period: usize,
-    k: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = dec_osc_js(data, hp_period, k)?;
-    crate::write_wasm_f64_output("dec_osc_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dec_osc_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dec_osc_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("dec_osc_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_dec_osc_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = DecOscParams {
             hp_period: None,
@@ -1081,8 +1038,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DecOscInput::from_candles(&candles, "close", DecOscParams::default());
         let result = dec_osc_with_kernel(&input, kernel)?;
 
@@ -1116,8 +1073,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DecOscInput::with_default_candles(&candles);
         match input.data {
             DecOscData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1193,8 +1150,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = DecOscParams {
             hp_period: Some(50),
             k: Some(1.0),
@@ -1218,8 +1175,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DecOscParams::default(),
@@ -1382,8 +1339,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = DecOscBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1434,8 +1391,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 1.0, 1.0, 0.0),
@@ -1741,7 +1698,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_dec_osc_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let n = 256usize;
@@ -1776,468 +1732,5 @@ mod tests {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dec_osc")]
-#[pyo3(signature = (data, hp_period=125, k=1.0, kernel=None))]
-pub fn dec_osc_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    hp_period: usize,
-    k: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = DecOscParams {
-        hp_period: Some(hp_period),
-        k: Some(k),
-    };
-    let input = DecOscInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| dec_osc_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DecOscStream")]
-pub struct DecOscStreamPy {
-    stream: DecOscStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DecOscStreamPy {
-    #[new]
-    fn new(hp_period: usize, k: f64) -> PyResult<Self> {
-        let params = DecOscParams {
-            hp_period: Some(hp_period),
-            k: Some(k),
-        };
-        let stream =
-            DecOscStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(DecOscStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dec_osc_batch")]
-#[pyo3(signature = (data, hp_period_range, k_range, kernel=None))]
-pub fn dec_osc_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    hp_period_range: (usize, usize, usize),
-    k_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = DecOscBatchRange {
-        hp_period: hp_period_range,
-        k: k_range,
-    };
-
-    let rows = expand_grid_checked(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?
-        .len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in dec_osc_batch"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            dec_osc_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "hp_periods",
-        combos
-            .iter()
-            .map(|p| p.hp_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ks",
-        combos
-            .iter()
-            .map(|p| p.k.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaDecOsc;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dec_osc_cuda_batch_dev")]
-#[pyo3(signature = (data, hp_period_range, k_range))]
-pub fn dec_osc_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: PyReadonlyArray1<'_, f64>,
-    hp_period_range: (usize, usize, usize),
-    k_range: (f64, f64, f64),
-) -> PyResult<DecOscDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA device not available"));
-    }
-    let slice_in = data.as_slice()?;
-    let data_f32: Vec<f32> = slice_in.iter().map(|&v| v as f32).collect();
-    let sweep = DecOscBatchRange {
-        hp_period: hp_period_range,
-        k: k_range,
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDecOsc::new(0).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let ctx = cuda.context_arc();
-        let inner = cuda
-            .dec_osc_batch_dev(&data_f32, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((inner, ctx, dev_id))
-    })?;
-    Ok(DecOscDeviceArrayF32Py {
-        inner: Some(inner),
-        _ctx_guard: ctx,
-        _device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dec_osc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm, cols, rows, hp_period, k))]
-pub fn dec_osc_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm: PyReadonlyArray1<'_, f64>,
-    cols: usize,
-    rows: usize,
-    hp_period: usize,
-    k: f64,
-) -> PyResult<DecOscDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA device not available"));
-    }
-    let slice = data_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("cols*rows overflow"))?;
-    if slice.len() != expected {
-        return Err(PyValueError::new_err(
-            "time-major array length != cols*rows",
-        ));
-    }
-    let data_f32: Vec<f32> = slice.iter().map(|&v| v as f32).collect();
-    let params = DecOscParams {
-        hp_period: Some(hp_period),
-        k: Some(k),
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDecOsc::new(0).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let ctx = cuda.context_arc();
-        let inner = cuda
-            .dec_osc_many_series_one_param_time_major_dev(&data_f32, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((inner, ctx, dev_id))
-    })?;
-    Ok(DecOscDeviceArrayF32Py {
-        inner: Some(inner),
-        _ctx_guard: ctx,
-        _device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DecOscDeviceArrayF32")]
-pub struct DecOscDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32>,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DecOscDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let itemsize = std::mem::size_of::<f32>();
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (inner.cols * itemsize, itemsize))?;
-        let nelems = inner.rows.saturating_mul(inner.cols);
-        let ptr_val: usize = if nelems == 0 {
-            0
-        } else {
-            inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dec_osc_js(data: &[f64], hp_period: usize, k: f64) -> Result<Vec<f64>, JsValue> {
-    let params = DecOscParams {
-        hp_period: Some(hp_period),
-        k: Some(k),
-    };
-    let input = DecOscInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    #[cfg(target_arch = "wasm32")]
-    let kernel = detect_best_kernel();
-    #[cfg(not(target_arch = "wasm32"))]
-    let kernel = Kernel::Auto;
-
-    dec_osc_into_slice(&mut output, &input, kernel)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dec_osc_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    hp_period: usize,
-    k: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = DecOscParams {
-            hp_period: Some(hp_period),
-            k: Some(k),
-        };
-        let input = DecOscInput::from_slice(data, params);
-
-        #[cfg(target_arch = "wasm32")]
-        let kernel = detect_best_kernel();
-        #[cfg(not(target_arch = "wasm32"))]
-        let kernel = Kernel::Auto;
-
-        if in_ptr == out_ptr as *const f64 {
-            let mut temp = vec![0.0; len];
-            dec_osc_into_slice(&mut temp, &input, kernel)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            dec_osc_into_slice(out, &input, kernel)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dec_osc_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dec_osc_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DecOscBatchConfig {
-    pub hp_period_range: (usize, usize, usize),
-    pub k_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DecOscBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<DecOscParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dec_osc_batch)]
-pub fn dec_osc_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: DecOscBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = DecOscBatchRange {
-        hp_period: config.hp_period_range,
-        k: config.k_range,
-    };
-
-    #[cfg(target_arch = "wasm32")]
-    let output = dec_osc_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let output = dec_osc_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = DecOscBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dec_osc_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    hp_start: usize,
-    hp_end: usize,
-    hp_step: usize,
-    k_start: f64,
-    k_end: f64,
-    k_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = DecOscBatchRange {
-            hp_period: (hp_start, hp_end, hp_step),
-            k: (k_start, k_end, k_step),
-        };
-
-        let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        dec_osc_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
     }
 }

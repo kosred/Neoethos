@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::macz::{MaczBatchRange, MaczParams};
@@ -6,8 +6,8 @@ use cust::context::Context;
 use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys as cu;
@@ -88,11 +88,6 @@ impl CudaMacz {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/macz_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("macz_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -1306,7 +1301,7 @@ impl CudaMacz {
     }
 }
 
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda-build-native"))]
 pub mod benches {
     use super::*;
     use crate::cuda::bench::{CudaBenchScenario, CudaBenchState};
@@ -1480,13 +1475,15 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "macz",
-            "one_series_many_params",
-            "macz_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "macz",
+                "one_series_many_params",
+                "macz_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }

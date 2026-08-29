@@ -1,14 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
-use crate::indicators::ema::{ema_with_kernel, EmaData, EmaInput, EmaParams};
-use crate::indicators::emd_trend::{expand_grid_emd_trend, EmdTrendBatchRange, EmdTrendParams};
-use crate::indicators::moving_averages::ma::{ma_with_kernel, MaData};
+use crate::indicators::ema::{EmaData, EmaInput, EmaParams, ema_with_kernel};
+use crate::indicators::emd_trend::{EmdTrendBatchRange, EmdTrendParams, expand_grid_emd_trend};
+use crate::indicators::moving_averages::ma::{MaData, ma_with_kernel};
 use crate::utilities::enums::Kernel;
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};

@@ -4,8 +4,8 @@
 // ------------------
 // One line: extern "C" __global__ void
 //           kase_peak_oscillator_with_divergences_batch_f64() {}
-// plus a wrapper that resolved the empty symbol, computed all ELEVEN output
-// series on the host, and uploaded them.
+// plus the now-deleted wrapper that resolved the empty symbol, computed all
+// eleven public-library series on the host, and uploaded them.
 //
 // CPU REFERENCE
 // -------------
@@ -201,7 +201,6 @@ extern "C" __global__ void kase_peak_oscillator_with_divergences_batch_f64(
     int long_cycle_cap,
     double* scratch,
     double* __restrict__ out_oscillator,
-    double* __restrict__ out_histogram,
     double* __restrict__ out_max_peak,
     double* __restrict__ out_min_peak,
     double* __restrict__ out_market_extreme,
@@ -266,7 +265,6 @@ extern "C" __global__ void kase_peak_oscillator_with_divergences_batch_f64(
 
         size_t row_base = static_cast<size_t>(row) * static_cast<size_t>(len);
         double* o_osc = out_oscillator + row_base;
-        double* o_hist = out_histogram + row_base;
         double* o_maxp = out_max_peak + row_base;
         double* o_minp = out_min_peak + row_base;
         double* o_ext = out_market_extreme + row_base;
@@ -283,9 +281,9 @@ extern "C" __global__ void kase_peak_oscillator_with_divergences_batch_f64(
             double c = close[i];
 
             // Every early return in `Stream::update` produces NaN across all
-            // eleven outputs (`row_from_slices_resolved`, :1161).
+            // ten mathematically distinct production outputs. The scalar
+            // library's histogram display alias is not allocated here.
             o_osc[i] = nan_value;
-            o_hist[i] = nan_value;
             o_maxp[i] = nan_value;
             o_minp[i] = nan_value;
             o_ext[i] = nan_value;
@@ -367,14 +365,10 @@ extern "C" __global__ void kase_peak_oscillator_with_divergences_batch_f64(
                 }
             }
 
-            double x1_avg;
-            if (!kpo_sma_update(&x1_sma, max1 / avg_value, &x1_avg) || !isfinite(x1_avg)) {
-                osc_history[hist_len] = nan_value;
-                hist_len += 1;
-                continue;
-            }
-            double xs_avg;
-            if (!kpo_sma_update(&xs_sma, maxs / avg_value, &xs_avg) || !isfinite(xs_avg)) {
+            double x1_avg, xs_avg;
+            int have_x1 = kpo_sma_update(&x1_sma, max1 / avg_value, &x1_avg);
+            int have_xs = kpo_sma_update(&xs_sma, maxs / avg_value, &xs_avg);
+            if (!have_x1 || !have_xs || !isfinite(x1_avg) || !isfinite(xs_avg)) {
                 osc_history[hist_len] = nan_value;
                 hist_len += 1;
                 continue;
@@ -508,7 +502,6 @@ extern "C" __global__ void kase_peak_oscillator_with_divergences_batch_f64(
             }
 
             o_osc[i] = oscillator;
-            o_hist[i] = oscillator;
             o_maxp[i] = max_peak_value;
             o_minp[i] = min_peak_value;
             o_ext[i] = market_extreme;
@@ -528,9 +521,11 @@ extern "C" __global__ void kase_peak_oscillator_with_divergences_batch_f64(
 // The entry point above, `kase_peak_oscillator_with_divergences_batch_f64`, is
 // a full all-double port of
 // src/indicators/kase_peak_oscillator_with_divergences.rs written by this same
-// workflow -- but its ABI is the CRATE's batch ABI: four parameter arrays,
-// eight divergence flags, a caller-allocated `scratch` pointer and ELEVEN
-// output matrices. The f64 lane launches exactly one shape,
+// workflow. Its production ABI takes four parameter arrays, eight divergence
+// flags, a caller-allocated `scratch` pointer and ten mathematically distinct
+// output matrices. The scalar library's
+// `histogram` remains a display alias of `oscillator` and is deliberately not
+// part of this production CUDA ABI. The f64 lane launches exactly one shape,
 //     (high, low, close, n, periods, n_combos, first_valid, out)
 // so a variant pointing at that symbol would read the stack. This entry point
 // is the lane-shaped one, and it reuses the device helpers above -- kpo_qnan,
@@ -685,13 +680,10 @@ extern "C" __global__ void kase_peak_oscillator_with_divergences_neo_batch_f64(
       if (isfinite(vs) && vs > maxs) maxs = vs;
     }
 
-    double x1_avg;
-    if (!kpo_sma_update(&x1_sma, max1 / avg_value, &x1_avg) || !isfinite(x1_avg)) {
-      hist_len += 1;
-      continue;
-    }
-    double xs_avg;
-    if (!kpo_sma_update(&xs_sma, maxs / avg_value, &xs_avg) || !isfinite(xs_avg)) {
+    double x1_avg, xs_avg;
+    const int have_x1 = kpo_sma_update(&x1_sma, max1 / avg_value, &x1_avg);
+    const int have_xs = kpo_sma_update(&xs_sma, maxs / avg_value, &xs_avg);
+    if (!have_x1 || !have_xs || !isfinite(x1_avg) || !isfinite(xs_avg)) {
       hist_len += 1;
       continue;
     }

@@ -173,7 +173,9 @@ pub fn ctrader_stream_max_attempts() -> u32 {
 /// Backoff base (ms) for the live trading bar-fetch retries and spot-stream
 /// reconnect. Clamped `[10, 2000]`.
 pub fn ctrader_stream_backoff_base_ms() -> u64 {
-    app_runtime().ctrader_stream_backoff_base_ms.clamp(10, 2_000)
+    app_runtime()
+        .ctrader_stream_backoff_base_ms
+        .clamp(10, 2_000)
 }
 
 /// Chart-merge quote side (`mid`/`bid`/`ask`); `None` when the configured
@@ -357,23 +359,14 @@ mod tests {
     fn env_var_names_are_stable() {
         assert_eq!(ENV_LIVE_JOURNAL_PATH, "NEOETHOS_BOT_LIVE_JOURNAL_PATH");
         assert_eq!(ENV_PENDING_ACTIONS_PATH, "NEOETHOS_PENDING_ACTIONS_PATH");
-        assert_eq!(
-            ENV_RISKY_MODE_STATE_PATH,
-            "NEOETHOS_RISKY_MODE_STATE_PATH"
-        );
-        assert_eq!(
-            ENV_CAPTURE_FIXTURES_DIR,
-            "NEOETHOS_CAPTURE_FIXTURES_DIR"
-        );
+        assert_eq!(ENV_RISKY_MODE_STATE_PATH, "NEOETHOS_RISKY_MODE_STATE_PATH");
+        assert_eq!(ENV_CAPTURE_FIXTURES_DIR, "NEOETHOS_CAPTURE_FIXTURES_DIR");
     }
 
     #[test]
     fn defaults_are_sensible() {
         // Sanity-check the defaults against operator-documented values.
-        assert_eq!(
-            DEFAULT_BIND_ADDR.to_string(),
-            "127.0.0.1:7423"
-        );
+        assert_eq!(DEFAULT_BIND_ADDR.to_string(), "127.0.0.1:7423");
     }
 
     #[test]

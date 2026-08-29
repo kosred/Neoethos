@@ -22,7 +22,9 @@ struct LinWmaState {
     __device__ void init(double* buffer_ptr, int period_value) {
         buffer = buffer_ptr;
         period = period_value;
-        inv_norm = 2.0 / (static_cast<double>(period) * static_cast<double>(period + 1));
+        const double norm = static_cast<double>(period) *
+            (static_cast<double>(period) + 1.0) * 0.5;
+        inv_norm = 1.0 / norm;
         reset();
     }
 
@@ -50,7 +52,7 @@ struct LinWmaState {
                 nan_count += 1;
             } else {
                 sum += v;
-                wsum += static_cast<double>(i + 1) * v;
+                wsum = fma(static_cast<double>(i) + 1.0, v, wsum);
             }
             idx = idx + 1 == period ? 0 : idx + 1;
         }
@@ -69,7 +71,7 @@ struct LinWmaState {
                 dirty = true;
             } else {
                 sum += value;
-                wsum += static_cast<double>(count) * value;
+                wsum = fma(static_cast<double>(count), value, wsum);
             }
             if (count == period) {
                 filled = true;
@@ -102,7 +104,7 @@ struct LinWmaState {
 
         const double prev_sum = sum;
         sum = prev_sum + value - old;
-        wsum = n * value + wsum - prev_sum;
+        wsum = fma(n, value, wsum - prev_sum);
         *out = wsum * inv_norm;
         return true;
     }
@@ -148,7 +150,7 @@ struct HmaState {
         if (!(full_ready && half_ready)) {
             return false;
         }
-        return wma_sqrt.update(2.0 * half - full, out);
+        return wma_sqrt.update(fma(2.0, half, -full), out);
     }
 };
 
@@ -186,9 +188,10 @@ struct EmaState {
         if (count == 1) {
             mean = value;
         } else if (count <= period) {
-            mean += (value - mean) / static_cast<double>(count);
+            const double inv = 1.0 / static_cast<double>(count);
+            mean = fma(value - mean, inv, mean);
         } else {
-            mean = beta * mean + alpha * value;
+            mean = fma(beta, mean, alpha * value);
         }
 
         if (!filled && count >= period) {
@@ -510,7 +513,7 @@ extern "C" __global__ void trend_flow_trail_batch_f64(
         double alpha_dir = 1.0;
         if (!prev_trail_ready) {
             alpha_dir = 1.0;
-        } else if (prev_alpha_dir_ready && prev_alpha_dir_value > 0.0) {
+        } else if (prev_trail_value == prev_upper_value) {
             alpha_dir = c > upper ? -1.0 : 1.0;
         } else if (c < lower) {
             alpha_dir = 1.0;

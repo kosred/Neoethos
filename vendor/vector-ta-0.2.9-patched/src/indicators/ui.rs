@@ -1,17 +1,4 @@
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -24,11 +11,6 @@ use core::arch::x86_64::*;
 use rayon::prelude::*;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaUi;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
 
 impl<'a> AsRef<[f64]> for UiInput<'a> {
     #[inline(always)]
@@ -58,10 +40,6 @@ pub struct UiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct UiParams {
     pub period: Option<usize>,
     pub scalar: Option<f64>,
@@ -272,7 +250,6 @@ pub fn ui_with_kernel(input: &UiInput, kernel: Kernel) -> Result<UiOutput, UiErr
     Ok(UiOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn ui_into(input: &UiInput, out: &mut [f64]) -> Result<(), UiError> {
     let data: &[f64] = input.as_ref();
     let len = data.len();
@@ -1117,129 +1094,6 @@ fn ui_row_avx512_long(data: &[f64], first: usize, period: usize, scalar: f64, ou
     ui_row_scalar(data, first, period, scalar, out)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ui")]
-#[pyo3(signature = (data, period, scalar=100.0, kernel=None))]
-pub fn ui_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    scalar: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = UiParams {
-        period: Some(period),
-        scalar: Some(scalar),
-    };
-    let input = UiInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| ui_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ui_batch")]
-#[pyo3(signature = (data, period_range, scalar_range=(100.0, 100.0, 0.0), kernel=None))]
-pub fn ui_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    scalar_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-
-    let sweep = UiBatchRange {
-        period: period_range,
-        scalar: scalar_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("ui_batch: rows * cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => Kernel::Scalar,
-            };
-            ui_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "scalars",
-        combos
-            .iter()
-            .map(|p| p.scalar.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "UiStream")]
-pub struct UiStreamPy {
-    inner: UiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl UiStreamPy {
-    #[new]
-    pub fn new(period: usize, scalar: f64) -> PyResult<Self> {
-        let params = UiParams {
-            period: Some(period),
-            scalar: Some(scalar),
-        };
-        let inner = UiStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(UiStreamPy { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-}
-
 #[inline(always)]
 fn ui_batch_inner_into(
     data: &[f64],
@@ -1394,323 +1248,19 @@ fn ui_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-pub fn ui_into_slice(dst: &mut [f64], input: &UiInput, kern: Kernel) -> Result<(), UiError> {
-    let data: &[f64] = input.as_ref();
-    let len = data.len();
-    if len == 0 {
-        return Err(UiError::EmptyInputData);
-    }
-
-    if dst.len() != len {
-        return Err(UiError::OutputLengthMismatch {
-            expected: len,
-            got: dst.len(),
-        });
-    }
-
-    let period = input.get_period();
-    let scalar = input.get_scalar();
-    if period == 0 || period > len {
-        return Err(UiError::InvalidPeriod {
-            period,
-            data_len: len,
-        });
-    }
-    if !scalar.is_finite() {
-        return Err(UiError::InvalidScalar { scalar });
-    }
-
-    let first = data
-        .iter()
-        .position(|x| x.is_finite())
-        .ok_or(UiError::AllValuesNaN)?;
-    if (len - first) < period {
-        return Err(UiError::NotEnoughValidData {
-            needed: period,
-            valid: len - first,
-        });
-    }
-
-    let chosen = match kern {
-        Kernel::Auto => detect_best_kernel(),
-        other => other,
-    };
-
-    let warmup = first + (period * 2 - 2);
-    for v in &mut dst[..warmup.min(len)] {
-        *v = f64::NAN;
-    }
-
-    match chosen {
-        Kernel::Scalar | Kernel::ScalarBatch => ui_scalar(data, period, scalar, first, dst),
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx2 | Kernel::Avx2Batch => ui_avx2(data, period, scalar, first, dst),
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx512 | Kernel::Avx512Batch => ui_avx512(data, period, scalar, first, dst),
-        _ => ui_scalar(data, period, scalar, first, dst),
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ui_js(data: &[f64], period: usize, scalar: f64) -> Result<Vec<f64>, JsValue> {
-    if !scalar.is_finite() {
-        return Err(JsValue::from_str(&format!("Invalid scalar: {}", scalar)));
-    }
-    let params = UiParams {
-        period: Some(period),
-        scalar: Some(scalar),
-    };
-    let input = UiInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    ui_into_slice(&mut output, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ui_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    scalar: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    if !scalar.is_finite() {
-        return Err(JsValue::from_str(&format!("Invalid scalar: {}", scalar)));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = UiParams {
-            period: Some(period),
-            scalar: Some(scalar),
-        };
-        let input = UiInput::from_slice(data, params);
-
-        if in_ptr == out_ptr.cast_const() {
-            let mut temp = vec![0.0; len];
-            ui_into_slice(&mut temp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ui_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ui_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ui_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct UiBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub scalar_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct UiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<UiParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ui_batch)]
-pub fn ui_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: UiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = UiBatchRange {
-        period: config.period_range,
-        scalar: config.scalar_range,
-    };
-
-    let output = ui_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = UiBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ui_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, scalar_range=(100.0, 100.0, 0.0), device_id=0))]
-pub fn ui_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    scalar_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = UiBatchRange {
-        period: period_range,
-        scalar: scalar_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaUi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.ui_batch_dev(slice_in, &sweep)
-            .map(|(arr, _)| arr)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    make_device_array_py(device_id, inner)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ui_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, scalar=100.0, device_id=0))]
-pub fn ui_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    scalar: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let flat_in: &[f32] = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = UiParams {
-        period: Some(period),
-        scalar: Some(scalar),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaUi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.ui_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    make_device_array_py(device_id, inner)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ui_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    scalar_start: f64,
-    scalar_end: f64,
-    scalar_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ui_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = UiBatchRange {
-            period: (period_start, period_end, period_step),
-            scalar: (scalar_start, scalar_end, scalar_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("ui_batch_into: rows * cols overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        ui_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ui_output_into_js(
-    data: &[f64],
-    period: usize,
-    scalar: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ui_js(data, period, scalar)?;
-    crate::write_wasm_f64_output("ui_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ui_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ui_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("ui_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_ui_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = UiParams {
             period: None,
             scalar: None,
@@ -1726,8 +1276,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = UiParams {
             period: Some(14),
             scalar: Some(100.0),
@@ -1767,8 +1317,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = UiInput::with_default_candles(&candles);
         match input.data {
             UiData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1834,8 +1384,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             UiParams::default(),
@@ -2291,8 +1841,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = UiBatchBuilder::new()
             .kernel(kernel)
@@ -2324,8 +1874,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 100.0, 100.0, 0.0),
@@ -2445,20 +1995,15 @@ mod tests {
 
     #[test]
     fn test_ui_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = UiInput::with_default_candles(&candles);
 
         let baseline = ui(&input)?.values;
 
         let mut out = vec![0.0; baseline.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             ui_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            ui_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());

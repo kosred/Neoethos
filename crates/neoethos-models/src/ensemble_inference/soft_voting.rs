@@ -20,17 +20,17 @@
 //! Following the user's research-backed direction (2026-05-17
 //! correspondence + the 2025 ensemble-learning survey):
 //!
-//! - All experts see the same input features. Diversity comes from
-//!   their distinct architectures and learning algorithms, NOT
-//!   from artificial feature restrictions.
+//! - The combiner receives one canonical [`neoethos_data::FeatureFrame`]. Each
+//!   expert adapter projects the exact ordered feature columns recorded in its
+//!   artifact without copying or privately recomputing market features.
 //! - Each expert produces a Classification3 vote.
 //! - Soft voting averages those votes — equivalent to assuming
 //!   every expert is equally trustworthy. This is the simplest
 //!   diversity-aware combiner and ships TODAY against whatever
 //!   experts are already trained.
-//! - The MoE gate (D1.5+) replaces this layer with a learnt
-//!   gating network that decides who-to-trust-when. SoftVoting
-//!   stays as a fallback when the MoE artifact isn't on disk.
+//! - A future MoE gate may replace this layer only through an explicit,
+//!   versioned selector. Missing artifacts never trigger an implicit change of
+//!   inference semantics.
 //!
 //! Soft voting is **not a scaffold**: it is a real production
 //! aggregation strategy used by widely-deployed ensembles (sklearn
@@ -66,7 +66,8 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use polars::prelude::DataFrame;
+use neoethos_data::{FeatureCellValidity, FeatureFrame};
+use neoethos_execution_budget::CpuLease;
 
 use super::{
     EnsembleDecision, EnsemblePredictor, ExpertLoadOutcome, ExpertOutputKind, ExpertPrediction,
@@ -85,7 +86,7 @@ pub struct SoftVotingEnsembleConfig {
     /// time so the output is always a valid probability vector.
     /// Useful when the operator has validation accuracy data and
     /// wants to bias the average toward better-performing experts.
-    pub expert_weights: std::collections::HashMap<String, f32>,
+    pub expert_weights: std::collections::HashMap<String, f64>,
     /// Expert canonical names that must NOT participate in voting
     /// even when present in the load outcome.
     ///
@@ -104,10 +105,10 @@ pub struct SoftVotingEnsembleConfig {
     pub excluded_names: std::collections::HashSet<String>,
     /// v0.5 ML-integration Stage 2: anomaly-score lower knee. Raw
     /// `isolation_forest` scores below this get no size penalty (scale 1.0).
-    pub anomaly_lo: f32,
+    pub anomaly_lo: f64,
     /// Anomaly-score upper knee — at/above this the anomaly scale hard-vetoes
     /// to 0.0. Default 0.9 (matches the trained ~0.95-quantile threshold).
-    pub anomaly_hi: f32,
+    pub anomaly_hi: f64,
 }
 
 impl Default for SoftVotingEnsembleConfig {
@@ -208,19 +209,26 @@ impl SoftVotingEnsemble {
     /// pool ends up empty (re-roling must never strip every directional voter).
     /// The two gate factors are bounded [0,1], so the ensemble can only SHRINK
     /// conviction or veto — never flip direction or manufacture a trade.
-    pub fn predict_with_roles(&self, df: &DataFrame) -> Result<Vec<EnsembleDecision>> {
-        let n_rows = df.height();
+    pub fn predict_with_roles(
+        &self,
+        frame: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<EnsembleDecision>> {
+        let n_rows = frame.n_samples();
         if n_rows == 0 {
             return Ok(Vec::new());
         }
 
         // Direction vote accumulator (weighted, per row).
-        let mut dir_sums: Vec<[f32; 3]> = vec![[0.0; 3]; n_rows];
-        let mut dir_weight_totals: Vec<f32> = vec![0.0; n_rows];
+        let mut dir_sums: Vec<[f64; 3]> = vec![[0.0; 3]; n_rows];
+        let mut dir_weight_totals: Vec<f64> = vec![0.0; n_rows];
+        let mut row_validity = vec![FeatureCellValidity::Valid; n_rows];
         let mut direction_voters = 0usize;
         // Optional per-row regime posterior + anomaly score.
-        let mut regime_posterior: Option<Vec<[f32; 3]>> = None;
-        let mut anomaly_scores: Option<Vec<f32>> = None;
+        let mut regime_posterior: Option<Vec<[f64; 3]>> = None;
+        let mut regime_validity: Option<Vec<FeatureCellValidity>> = None;
+        let mut anomaly_scores: Option<Vec<f64>> = None;
+        let mut anomaly_validity: Option<Vec<FeatureCellValidity>> = None;
 
         for expert in &self.outcome.loaded {
             let name = expert.name();
@@ -240,10 +248,10 @@ impl SoftVotingEnsemble {
                 );
             };
 
-            let preds: Vec<ExpertPrediction> = expert.predict(df)?;
+            let preds: Vec<ExpertPrediction> = expert.predict(frame, lease)?;
             if preds.len() != n_rows {
                 anyhow::bail!(
-                    "expert '{}' returned {} predictions for a {}-row DataFrame",
+                    "expert '{}' returned {} predictions for a {}-row FeatureFrame",
                     name,
                     preds.len(),
                     n_rows
@@ -252,19 +260,26 @@ impl SoftVotingEnsemble {
 
             match role {
                 ExpertRole::Direction | ExpertRole::DirectionalConfirm => {
-                    let weight = self
-                        .config
-                        .expert_weights
-                        .get(name)
-                        .copied()
-                        .unwrap_or(1.0);
-                    if weight <= 0.0 {
+                    let weight = self.config.expert_weights.get(name).copied().unwrap_or(1.0);
+                    if !weight.is_finite() || weight < 0.0 {
+                        anyhow::bail!("expert '{name}' has invalid voting weight {weight}");
+                    }
+                    if weight == 0.0 {
                         continue;
                     }
                     direction_voters += 1;
                     for (row_idx, p) in preds.iter().enumerate() {
-                        if p.kind != ExpertOutputKind::Classification3 || p.values.len() != 3 {
+                        p.validate()?;
+                        if !p.validity.is_valid() {
+                            if row_validity[row_idx].is_valid() {
+                                row_validity[row_idx] = p.validity;
+                            }
                             continue;
+                        }
+                        if p.kind != ExpertOutputKind::Classification3 || p.values.len() != 3 {
+                            anyhow::bail!(
+                                "direction expert '{name}' returned incompatible output at row {row_idx}"
+                            );
                         }
                         dir_sums[row_idx][0] += weight * p.values[0];
                         dir_sums[row_idx][1] += weight * p.values[1];
@@ -274,24 +289,42 @@ impl SoftVotingEnsemble {
                 }
                 ExpertRole::RegimeGate => {
                     // hmm_regime posterior: col0=P(range), col1=P(buy), col2=P(sell).
-                    let mut post = vec![[1.0 / 3.0_f32; 3]; n_rows];
+                    let mut post = vec![[f64::NAN; 3]; n_rows];
+                    let mut validity = vec![FeatureCellValidity::ComputeFailure; n_rows];
                     for (row_idx, p) in preds.iter().enumerate() {
-                        if p.values.len() == 3 {
+                        p.validate()?;
+                        validity[row_idx] = p.validity;
+                        if p.validity.is_valid() {
+                            if p.values.len() != 3 {
+                                anyhow::bail!(
+                                    "regime expert '{name}' returned incompatible output at row {row_idx}"
+                                );
+                            }
                             post[row_idx] = [p.values[0], p.values[1], p.values[2]];
                         }
                     }
                     regime_posterior = Some(post);
+                    regime_validity = Some(validity);
                 }
                 ExpertRole::AnomalyScale => {
                     // isolation_forest emits [anomaly, (1-a)/2, (1-a)/2] -> col0
                     // is the raw anomaly score (no retrain / new artifact needed).
-                    let mut scores = vec![0.0_f32; n_rows];
+                    let mut scores = vec![f64::NAN; n_rows];
+                    let mut validity = vec![FeatureCellValidity::ComputeFailure; n_rows];
                     for (row_idx, p) in preds.iter().enumerate() {
-                        if !p.values.is_empty() {
+                        p.validate()?;
+                        validity[row_idx] = p.validity;
+                        if p.validity.is_valid() {
+                            if p.values.is_empty() {
+                                anyhow::bail!(
+                                    "anomaly expert '{name}' returned an empty output at row {row_idx}"
+                                );
+                            }
                             scores[row_idx] = p.values[0];
                         }
                     }
                     anomaly_scores = Some(scores);
+                    anomaly_validity = Some(validity);
                 }
             }
         }
@@ -306,16 +339,34 @@ impl SoftVotingEnsemble {
 
         let mut out = Vec::with_capacity(n_rows);
         for row_idx in 0..n_rows {
+            if row_validity[row_idx].is_valid()
+                && let Some(validity) = &regime_validity
+                && !validity[row_idx].is_valid()
+            {
+                row_validity[row_idx] = validity[row_idx];
+            }
+            if row_validity[row_idx].is_valid()
+                && let Some(validity) = &anomaly_validity
+                && !validity[row_idx].is_valid()
+            {
+                row_validity[row_idx] = validity[row_idx];
+            }
+            if !row_validity[row_idx].is_valid() {
+                out.push(EnsembleDecision::invalid(row_validity[row_idx]));
+                continue;
+            }
             let total = dir_weight_totals[row_idx];
-            let dir_probs = if total <= 0.0 {
-                [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
-            } else {
-                [
-                    dir_sums[row_idx][0] / total,
-                    dir_sums[row_idx][1] / total,
-                    dir_sums[row_idx][2] / total,
-                ]
-            };
+            if !total.is_finite() || total <= 0.0 {
+                out.push(EnsembleDecision::invalid(
+                    FeatureCellValidity::ComputeFailure,
+                ));
+                continue;
+            }
+            let dir_probs = [
+                dir_sums[row_idx][0] / total,
+                dir_sums[row_idx][1] / total,
+                dir_sums[row_idx][2] / total,
+            ];
             let regime_gate = match &regime_posterior {
                 Some(post) => regime_gate_from_posterior(dir_probs, post[row_idx]),
                 None => 1.0,
@@ -332,6 +383,7 @@ impl SoftVotingEnsemble {
                 dir_probs,
                 regime_gate,
                 anomaly_scale,
+                validity: FeatureCellValidity::Valid,
             });
         }
         Ok(out)
@@ -352,7 +404,6 @@ impl EnsemblePredictor for SoftVotingEnsemble {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -365,13 +416,14 @@ mod tests {
     };
     use crate::runtime::capabilities::ModelFamily;
     use anyhow::Result;
-    use polars::prelude::*;
+    use neoethos_data::{FeatureColumnF64, FeatureFrame};
+    use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
 
     /// In-test ExpertModel that emits a constant Classification3
     /// prediction for every row.
     struct ConstantClassifier {
         name: String,
-        probs: [f32; 3],
+        probs: [f64; 3],
     }
 
     impl ExpertModel for ConstantClassifier {
@@ -387,14 +439,18 @@ mod tests {
         fn feature_columns(&self) -> &[String] {
             &[]
         }
-        fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
-            let n = df.height();
+        fn predict(
+            &self,
+            frame: &FeatureFrame,
+            _lease: &CpuLease,
+        ) -> Result<Vec<ExpertPrediction>> {
+            let n = frame.n_samples();
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
-                out.push(ExpertPrediction {
-                    kind: ExpertOutputKind::Classification3,
-                    values: self.probs.to_vec(),
-                });
+                out.push(ExpertPrediction::valid(
+                    ExpertOutputKind::Classification3,
+                    self.probs.to_vec(),
+                )?);
             }
             Ok(out)
         }
@@ -415,13 +471,47 @@ mod tests {
         fn feature_columns(&self) -> &[String] {
             &[]
         }
-        fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
-            Ok((0..df.height())
-                .map(|_| ExpertPrediction {
-                    kind: ExpertOutputKind::Forecast1,
-                    values: vec![0.5],
-                })
-                .collect())
+        fn predict(
+            &self,
+            frame: &FeatureFrame,
+            _lease: &CpuLease,
+        ) -> Result<Vec<ExpertPrediction>> {
+            (0..frame.n_samples())
+                .map(|_| ExpertPrediction::valid(ExpertOutputKind::Forecast1, vec![0.5]))
+                .collect()
+        }
+    }
+
+    struct InvalidClassifier {
+        name: String,
+        reason: FeatureCellValidity,
+    }
+
+    impl ExpertModel for InvalidClassifier {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn family(&self) -> ModelFamily {
+            ModelFamily::Meta
+        }
+
+        fn output_kind(&self) -> ExpertOutputKind {
+            ExpertOutputKind::Classification3
+        }
+
+        fn feature_columns(&self) -> &[String] {
+            &[]
+        }
+
+        fn predict(
+            &self,
+            frame: &FeatureFrame,
+            _lease: &CpuLease,
+        ) -> Result<Vec<ExpertPrediction>> {
+            (0..frame.n_samples())
+                .map(|_| ExpertPrediction::invalid(ExpertOutputKind::Classification3, self.reason))
+                .collect()
         }
     }
 
@@ -433,9 +523,32 @@ mod tests {
         }
     }
 
-    fn small_df(rows: usize) -> DataFrame {
-        let v: Vec<f32> = (0..rows).map(|i| i as f32).collect();
-        df!("f1" => v).expect("df")
+    fn small_frame(rows: usize) -> FeatureFrame {
+        assert!(rows > 0, "canonical FeatureFrame cannot be empty");
+        let column = FeatureColumnF64::new(
+            "f1",
+            (0..rows).map(|row| row as f64 + 1.0).collect(),
+            vec![FeatureCellValidity::Valid; rows],
+        )
+        .expect("valid f64 test column");
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            vec![column],
+        )
+        .expect("valid canonical test frame")
+    }
+
+    fn one_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("test CPU lease")
+    }
+
+    fn predict_rows(ensemble: &SoftVotingEnsemble, rows: usize) -> Result<Vec<EnsembleDecision>> {
+        let frame = small_frame(rows);
+        let lease = one_worker_lease();
+        ensemble.predict_with_roles(&frame, &lease)
     }
 
     /// Replaces the deleted `SoftVotingEnsemble::with_default_config`, which
@@ -483,7 +596,10 @@ mod tests {
             );
         }
         assert_eq!(expert_role("hmm_regime"), Some(ExpertRole::RegimeGate));
-        assert_eq!(expert_role("isolation_forest"), Some(ExpertRole::AnomalyScale));
+        assert_eq!(
+            expert_role("isolation_forest"),
+            Some(ExpertRole::AnomalyScale)
+        );
         assert_eq!(expert_role("dqn"), Some(ExpertRole::DirectionalConfirm));
         assert_eq!(expert_role("sac"), Some(ExpertRole::DirectionalConfirm));
         assert_eq!(expert_role("xgboost"), Some(ExpertRole::Direction));
@@ -509,7 +625,10 @@ mod tests {
         assert_eq!(anomaly_scale_from_score(0.9, 0.5, 0.9), 0.0); // at hi -> veto
         assert_eq!(anomaly_scale_from_score(0.95, 0.5, 0.9), 0.0); // above hi
         let mid = anomaly_scale_from_score(0.7, 0.5, 0.9); // halfway -> 0.5
-        assert!((mid - 0.5).abs() < 1e-6, "mid ramp should be 0.5, got {mid}");
+        assert!(
+            (mid - 0.5).abs() < 1e-6,
+            "mid ramp should be 0.5, got {mid}"
+        );
     }
 
     #[test]
@@ -531,13 +650,39 @@ mod tests {
             }),
         ]);
         let ens = default_ensemble(outcome).expect("ok");
-        let decisions = ens.predict_with_roles(&small_df(2)).expect("roles");
+        let decisions = predict_rows(&ens, 2).expect("roles");
         assert_eq!(decisions.len(), 2);
         for d in &decisions {
             // dir_probs == the SOLE directional voter, gates removed.
-            assert!((d.dir_probs[1] - 0.8).abs() < 1e-6, "dir vote polluted: {d:?}");
+            assert!(
+                (d.dir_probs[1] - 0.8).abs() < 1e-6,
+                "dir vote polluted: {d:?}"
+            );
             assert!(d.regime_gate > 0.8, "agreeing regime gate: {d:?}");
             assert_eq!(d.anomaly_scale, 1.0, "low anomaly -> no penalty: {d:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_gate_invalidates_row_instead_of_becoming_neutral_numeric_data() {
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "xgboost".into(),
+                probs: [0.1, 0.8, 0.1],
+            }),
+            Box::new(InvalidClassifier {
+                name: "hmm_regime".into(),
+                reason: FeatureCellValidity::Warmup,
+            }),
+        ]);
+        let ensemble = default_ensemble(outcome).expect("valid ensemble");
+        let decisions = predict_rows(&ensemble, 2).expect("role-aware inference");
+
+        for decision in decisions {
+            assert_eq!(decision.validity, FeatureCellValidity::Warmup);
+            assert!(decision.dir_probs.iter().all(|value| value.is_nan()));
+            assert!(decision.regime_gate.is_nan());
+            assert!(decision.anomaly_scale.is_nan());
         }
     }
 
@@ -556,7 +701,7 @@ mod tests {
             }),
         ]);
         let ens = default_ensemble(outcome).expect("ok");
-        match ens.predict_with_roles(&small_df(1)) {
+        match predict_rows(&ens, 1) {
             Ok(_) => panic!("must bail when no directional voter remains"),
             Err(err) => assert!(err.to_string().contains("no directional voters")),
         }
@@ -575,7 +720,7 @@ mod tests {
             }),
         ]);
         let ens = default_ensemble(outcome).expect("ok");
-        match ens.predict_with_roles(&small_df(1)) {
+        match predict_rows(&ens, 1) {
             Ok(_) => panic!("must fail loud on an unmapped expert"),
             Err(err) => assert!(err.to_string().contains("no role mapping")),
         }
@@ -597,7 +742,7 @@ mod tests {
             probs: [0.1, 0.7, 0.2],
         })]);
         let ens = default_ensemble(outcome).expect("ok");
-        let decisions = ens.predict_with_roles(&small_df(3)).expect("roles");
+        let decisions = predict_rows(&ens, 3).expect("roles");
         assert_eq!(decisions.len(), 3);
         for d in &decisions {
             assert!((d.dir_probs[0] - 0.1).abs() < 1e-6);
@@ -622,7 +767,7 @@ mod tests {
             }),
         ]);
         let ens = default_ensemble(outcome).expect("ok");
-        let decisions = ens.predict_with_roles(&small_df(2)).expect("roles");
+        let decisions = predict_rows(&ens, 2).expect("roles");
         // Average of (0.8,0.1,0.1) + (0.2,0.6,0.2) = (0.5,0.35,0.15)
         for d in &decisions {
             assert!((d.dir_probs[0] - 0.5).abs() < 1e-5);
@@ -647,7 +792,7 @@ mod tests {
         cfg.expert_weights.insert("xgboost".into(), 3.0);
         cfg.expert_weights.insert("lightgbm".into(), 1.0);
         let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
-        let decisions = ens.predict_with_roles(&small_df(1)).expect("roles");
+        let decisions = predict_rows(&ens, 1).expect("roles");
         // Weighted: (3*0.8 + 1*0.2)/4, (3*0.1+1*0.6)/4, (3*0.1+1*0.2)/4
         //         = (0.65, 0.225, 0.125)
         let d = decisions[0];
@@ -666,7 +811,7 @@ mod tests {
             Box::new(ForecastEmitter),
         ]);
         let ens = default_ensemble(outcome).expect("ok");
-        let decisions = ens.predict_with_roles(&small_df(1)).expect("roles");
+        let decisions = predict_rows(&ens, 1).expect("roles");
         // ForecastEmitter must not have contributed — and must not have
         // tripped the unmapped-expert bail either.
         let d = decisions[0];
@@ -728,7 +873,7 @@ mod tests {
         assert_eq!(ens.voting_expert_count(), 1);
         assert!(ens.experts_unused_for_voting().contains(&"neuro_evo"));
         // The vote must reflect ONLY the regular expert, not an average.
-        let d = ens.predict_with_roles(&small_df(1)).expect("roles")[0];
+        let d = predict_rows(&ens, 1).expect("roles")[0];
         assert!((d.dir_probs[0] - 0.1).abs() < 1e-6);
         assert!((d.dir_probs[1] - 0.7).abs() < 1e-6);
         assert!((d.dir_probs[2] - 0.2).abs() < 1e-6);
@@ -747,7 +892,7 @@ mod tests {
         cfg.excluded_names.clear();
         let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
         assert_eq!(ens.voting_expert_count(), 1);
-        let d = ens.predict_with_roles(&small_df(1)).expect("roles")[0];
+        let d = predict_rows(&ens, 1).expect("roles")[0];
         assert!((d.dir_probs[1] - 0.7).abs() < 1e-6);
     }
 
@@ -767,7 +912,7 @@ mod tests {
         let mut cfg = SoftVotingEnsembleConfig::default();
         cfg.expert_weights.insert("lightgbm".into(), 0.0);
         let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
-        let d = ens.predict_with_roles(&small_df(1)).expect("roles")[0];
+        let d = predict_rows(&ens, 1).expect("roles")[0];
         assert!(
             (d.dir_probs[1] - 0.7).abs() < 1e-6,
             "a zero-weight expert must not pull the vote, got {:?}",
@@ -776,13 +921,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_dataframe_returns_empty_predictions() {
-        let outcome = outcome_with(vec![Box::new(ConstantClassifier {
-            name: "xgboost".into(),
-            probs: [0.2, 0.6, 0.2],
-        })]);
-        let ens = default_ensemble(outcome).expect("ok");
-        let decisions = ens.predict_with_roles(&small_df(0)).expect("roles");
-        assert!(decisions.is_empty());
+    fn canonical_feature_frame_rejects_empty_rows_before_ensemble_inference() {
+        let column = FeatureColumnF64::new("f1", Vec::new(), Vec::new())
+            .expect("empty column shape is internally consistent");
+        let error = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            Vec::new(),
+            vec![column],
+        )
+        .expect_err("canonical feature frames cannot be empty");
+        assert!(error.to_string().contains("must not be empty"));
     }
 }

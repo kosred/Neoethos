@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -55,10 +39,6 @@ pub struct RviOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RviParams {
     pub period: Option<usize>,
     pub ma_len: Option<usize>,
@@ -390,7 +370,6 @@ pub fn rvi_into_slice(dst: &mut [f64], input: &RviInput, kern: Kernel) -> Result
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn rvi_into(input: &RviInput, out: &mut [f64]) -> Result<(), RviError> {
     rvi_into_slice(out, input, Kernel::Auto)
@@ -2635,44 +2614,19 @@ unsafe fn rvi_row_avx512_long(data: &[f64], first: usize, params: &RviParams, ou
     )
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rvi_output_into_js(
-    data: &[f64],
-    period: usize,
-    ma_len: usize,
-    matype: usize,
-    devtype: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = rvi_js(data, period, ma_len, matype, devtype)?;
-    crate::write_wasm_f64_output("rvi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rvi_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = rvi_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("rvi_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_rvi_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = RviParams {
             period: Some(10),
             ma_len: None,
@@ -2690,8 +2644,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = RviInput::with_default_candles(&candles);
         let output = rvi_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -2788,8 +2742,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = RviParams {
             period: Some(10),
             ma_len: Some(14),
@@ -2834,8 +2788,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             RviParams::default(),
@@ -3159,8 +3113,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = RviBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -3174,8 +3128,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 2, 10, 2),
@@ -3211,26 +3165,26 @@ mod tests {
 
                         if bits == 0x11111111_11111111 {
                             panic!(
-								"[{}] Config {} (matype={}, devtype={}): Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                                "[{}] Config {} (matype={}, devtype={}): Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 								 at row {} col {} (flat index {}) with params: {:?}",
-								test, cfg_idx, matype, devtype, val, bits, row, col, idx, combo
-							);
+                                test, cfg_idx, matype, devtype, val, bits, row, col, idx, combo
+                            );
                         }
 
                         if bits == 0x22222222_22222222 {
                             panic!(
-								"[{}] Config {} (matype={}, devtype={}): Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                                "[{}] Config {} (matype={}, devtype={}): Found init_matrix_prefixes poison value {} (0x{:016X}) \
 								 at row {} col {} (flat index {}) with params: {:?}",
-								test, cfg_idx, matype, devtype, val, bits, row, col, idx, combo
-							);
+                                test, cfg_idx, matype, devtype, val, bits, row, col, idx, combo
+                            );
                         }
 
                         if bits == 0x33333333_33333333 {
                             panic!(
-								"[{}] Config {} (matype={}, devtype={}): Found make_uninit_matrix poison value {} (0x{:016X}) \
+                                "[{}] Config {} (matype={}, devtype={}): Found make_uninit_matrix poison value {} (0x{:016X}) \
 								 at row {} col {} (flat index {}) with params: {:?}",
-								test, cfg_idx, matype, devtype, val, bits, row, col, idx, combo
-							);
+                                test, cfg_idx, matype, devtype, val, bits, row, col, idx, combo
+                            );
                         }
                     }
                 }
@@ -3273,20 +3227,15 @@ mod tests {
 
     #[test]
     fn test_rvi_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let input = RviInput::with_default_candles(&candles);
 
         let baseline = rvi(&input)?.values;
 
         let mut out = vec![0.0f64; candles.close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             rvi_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            rvi_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -3308,467 +3257,4 @@ mod tests {
 
         Ok(())
     }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rvi_js(
-    data: &[f64],
-    period: usize,
-    ma_len: usize,
-    matype: usize,
-    devtype: usize,
-) -> Result<Vec<f64>, JsValue> {
-    if data.is_empty() {
-        return Err(JsValue::from_str("rvi: Empty data provided."));
-    }
-
-    if data.iter().all(|&x| x.is_nan()) {
-        return Err(JsValue::from_str("rvi: All values are NaN."));
-    }
-
-    if period == 0 || ma_len == 0 {
-        return Err(JsValue::from_str("rvi: Invalid period"));
-    }
-
-    let first = data.iter().position(|&x| !x.is_nan()).unwrap_or(0);
-    let needed = period.saturating_sub(1) + ma_len.saturating_sub(1) + 1;
-    let valid_len = data.len() - first;
-
-    if period > data.len() || ma_len > data.len() {
-        return Err(JsValue::from_str("rvi: Invalid period"));
-    } else if valid_len < needed {
-        return Err(JsValue::from_str("rvi: Not enough valid data"));
-    }
-
-    let params = RviParams {
-        period: Some(period),
-        ma_len: Some(ma_len),
-        matype: Some(matype),
-        devtype: Some(devtype),
-    };
-    let input = RviInput::from_slice(data, params);
-    let mut out = vec![f64::NAN; data.len()];
-    rvi_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rvi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rvi_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rvi_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    ma_len: usize,
-    matype: usize,
-    devtype: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("rvi_into: null pointer provided"));
-    }
-    if len == 0 {
-        return Err(JsValue::from_str("rvi_into: len cannot be 0"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        let params = RviParams {
-            period: Some(period),
-            ma_len: Some(ma_len),
-            matype: Some(matype),
-            devtype: Some(devtype),
-        };
-        let input = RviInput::from_slice(data, params);
-
-        if std::ptr::eq(in_ptr, out_ptr) {
-            let mut tmp = vec![f64::NAN; len];
-            rvi_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            out.copy_from_slice(&tmp);
-        } else {
-            rvi_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RviBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub ma_len_range: (usize, usize, usize),
-    pub matype_range: (usize, usize, usize),
-    pub devtype_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RviBatchJsOutput {
-    pub values: Vec<f64>,
-    pub periods: Vec<usize>,
-    pub ma_lens: Vec<usize>,
-    pub matypes: Vec<usize>,
-    pub devtypes: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = rvi_batch)]
-pub fn rvi_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: RviBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = RviBatchRange {
-        period: cfg.period_range,
-        ma_len: cfg.ma_len_range,
-        matype: cfg.matype_range,
-        devtype: cfg.devtype_range,
-    };
-
-    let output = rvi_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_out = RviBatchJsOutput {
-        values: output.values,
-        periods: output.combos.iter().map(|c| c.period.unwrap()).collect(),
-        ma_lens: output.combos.iter().map(|c| c.ma_len.unwrap()).collect(),
-        matypes: output.combos.iter().map(|c| c.matype.unwrap()).collect(),
-        devtypes: output.combos.iter().map(|c| c.devtype.unwrap()).collect(),
-        rows: output.rows,
-        cols: output.cols,
-    };
-    serde_wasm_bindgen::to_value(&js_out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rvi_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    p_start: usize,
-    p_end: usize,
-    p_step: usize,
-    m_start: usize,
-    m_end: usize,
-    m_step: usize,
-    t_start: usize,
-    t_end: usize,
-    t_step: usize,
-    d_start: usize,
-    d_end: usize,
-    d_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer to rvi_batch_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = RviBatchRange {
-            period: (p_start, p_end, p_step),
-            ma_len: (m_start, m_end, m_step),
-            matype: (t_start, t_end, t_step),
-            devtype: (d_start, d_end, d_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rvi_batch_into: rows * cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let simd = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-        rvi_batch_inner_into(data, &sweep, simd, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "rvi")]
-#[pyo3(signature = (data, period, ma_len, matype, devtype, kernel=None))]
-pub fn rvi_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    ma_len: usize,
-    matype: usize,
-    devtype: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [slice_in.len()], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let params = RviParams {
-        period: Some(period),
-        ma_len: Some(ma_len),
-        matype: Some(matype),
-        devtype: Some(devtype),
-    };
-    let input = RviInput::from_slice(slice_in, params);
-
-    py.allow_threads(|| rvi_into_slice(out_slice, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(out_arr)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "rvi_batch")]
-#[pyo3(signature = (data, period_range, ma_len_range, matype_range, devtype_range, kernel=None))]
-pub fn rvi_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    ma_len_range: (usize, usize, usize),
-    matype_range: (usize, usize, usize),
-    devtype_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-
-    let sweep = RviBatchRange {
-        period: period_range,
-        ma_len: ma_len_range,
-        matype: matype_range,
-        devtype: devtype_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rvi_batch: rows * cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    let simd = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        k => k,
-    };
-    let simd = match simd {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => Kernel::Scalar,
-    };
-
-    let combos_back = py
-        .allow_threads(|| rvi_batch_inner_into(slice_in, &sweep, simd, true, out_slice))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("values", out_arr.reshape((rows, cols))?)?;
-    d.set_item(
-        "periods",
-        combos_back
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "ma_lens",
-        combos_back
-            .iter()
-            .map(|p| p.ma_len.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "matypes",
-        combos_back
-            .iter()
-            .map(|p| p.matype.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "devtypes",
-        combos_back
-            .iter()
-            .map(|p| p.devtype.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RviStream")]
-pub struct RviStreamPy {
-    stream: RviStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RviStreamPy {
-    #[new]
-    fn new(period: usize, ma_len: usize, matype: usize, devtype: usize) -> PyResult<Self> {
-        let params = RviParams {
-            period: Some(period),
-            ma_len: Some(ma_len),
-            matype: Some(matype),
-            devtype: Some(devtype),
-        };
-        let stream =
-            RviStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(RviStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_rvi_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(rvi_py, m)?)?;
-    m.add_function(wrap_pyfunction!(rvi_batch_py, m)?)?;
-    m.add_class::<RviStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaRvi;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "rvi_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, ma_len_range, matype_range, devtype_range, device_id=0))]
-pub fn rvi_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    ma_len_range: (usize, usize, usize),
-    matype_range: (usize, usize, usize),
-    devtype_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    use numpy::{IntoPyArray, PyArrayMethods};
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let d = data_f32.as_slice()?;
-    let sweep = RviBatchRange {
-        period: period_range,
-        ma_len: ma_len_range,
-        matype: matype_range,
-        devtype: devtype_range,
-    };
-    let (inner, combos) = py.allow_threads(|| {
-        let cuda = CudaRvi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.rvi_batch_dev(d, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_lens",
-        combos
-            .iter()
-            .map(|p| p.ma_len.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "matypes",
-        combos
-            .iter()
-            .map(|p| p.matype.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "devtypes",
-        combos
-            .iter()
-            .map(|p| p.devtype.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok((handle, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "rvi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, period, ma_len, matype, devtype, device_id=0))]
-pub fn rvi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    ma_len: usize,
-    matype: usize,
-    devtype: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let tm = data_tm_f32.as_slice()?;
-    let params = RviParams {
-        period: Some(period),
-        ma_len: Some(ma_len),
-        matype: Some(matype),
-        devtype: Some(devtype),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaRvi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.rvi_many_series_one_param_time_major_dev(tm, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(make_device_array_py(device_id, inner)?)
 }

@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{alloc_with_nan_prefix, init_matrix_prefixes, make_uninit_matrix};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -42,10 +42,6 @@ pub struct MediumAdOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MediumAdParams {
     pub period: Option<usize>,
 }
@@ -236,7 +232,6 @@ pub fn medium_ad_with_kernel(
     Ok(MediumAdOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn medium_ad_into(input: &MediumAdInput, out: &mut [f64]) -> Result<(), MediumAdError> {
     let data: &[f64] = match &input.data {
@@ -994,7 +989,7 @@ fn medium_ad_batch_inner_into(
                     start: sweep.period.0.to_string(),
                     end: sweep.period.1.to_string(),
                     step: sweep.period.2.to_string(),
-                })
+                });
             }
         };
         for i in 0..warmup.min(cols) {
@@ -1533,37 +1528,11 @@ fn treap_priority(e: Entry) -> u64 {
     z ^ (z >> 31)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medium_ad_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = medium_ad_js(data, period)?;
-    crate::write_wasm_f64_output("medium_ad_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medium_ad_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = medium_ad_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "medium_ad_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
@@ -1572,8 +1541,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = MediumAdParams { period: None };
         let input = MediumAdInput::from_candles(&candles, "close", default_params);
@@ -1587,8 +1556,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = MediumAdParams { period: Some(5) };
         let input = MediumAdInput::from_candles(&candles, "hl2", params);
@@ -1615,8 +1584,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MediumAdInput::with_default_candles(&candles);
         match input.data {
             MediumAdData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1683,8 +1652,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = MediumAdParams { period: Some(5) };
         let first_input = MediumAdInput::from_candles(&candles, "close", first_params);
@@ -1703,8 +1672,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input =
             MediumAdInput::from_candles(&candles, "close", MediumAdParams { period: Some(5) });
         let res = medium_ad_with_kernel(&input, kernel)?;
@@ -1728,8 +1697,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 5;
         let input = MediumAdInput::from_candles(
@@ -2104,8 +2073,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = MediumAdBatchBuilder::new()
             .kernel(kernel)
@@ -2140,489 +2109,6 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
 }
-
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::{PyBufferError, PyValueError};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "medium_ad")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn medium_ad_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = MediumAdParams {
-        period: Some(period),
-    };
-    let input = MediumAdInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| medium_ad_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MediumAdStream")]
-pub struct MediumAdStreamPy {
-    stream: MediumAdStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MediumAdStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = MediumAdParams {
-            period: Some(period),
-        };
-        let stream =
-            MediumAdStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(MediumAdStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "medium_ad_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn medium_ad_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = MediumAdBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("medium_ad: batch output size overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => Kernel::ScalarBatch,
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            medium_ad_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::medium_ad_wrapper::{CudaMediumAd, CudaMediumAdBatchPlan};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::{CopyDestination, DeviceBuffer};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct MediumAdDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    ctx: Arc<Context>,
-    device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl MediumAdDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner;
-        let d = PyDict::new(py);
-
-        d.set_item("shape", (inner.rows, inner.cols))?;
-
-        d.set_item("typestr", "<f4")?;
-
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr_val = if inner.rows == 0 || inner.cols == 0 {
-            0usize
-        } else {
-            inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        let mut device_ordinal: i32 = 0;
-        unsafe {
-            let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-            let mut value = std::mem::MaybeUninit::<i32>::uninit();
-            let err = cust::sys::cuPointerGetAttribute(
-                value.as_mut_ptr() as *mut std::ffi::c_void,
-                attr,
-                self.inner.buf.as_device_ptr().as_raw(),
-            );
-            if err == cust::sys::CUresult::CUDA_SUCCESS {
-                device_ordinal = value.assume_init();
-            } else {
-                let _ = cust::sys::cuCtxGetDevice(&mut device_ordinal);
-            }
-        }
-        Ok((2, device_ordinal))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        if let Some(obj) = &stream {
-            if let Ok(i) = obj.extract::<i64>(py) {
-                if i == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__: stream 0 is disallowed for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_type, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_type != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyBufferError::new_err(
-                            "__dlpack__: copy semantics are not supported for medium_ad",
-                        ));
-                    } else {
-                        return Err(PyBufferError::new_err(
-                            "__dlpack__: requested device does not match allocation device",
-                        ));
-                    }
-                }
-            }
-        }
-
-        if copy
-            .as_ref()
-            .and_then(|c| c.extract::<bool>(py).ok())
-            .unwrap_or(false)
-        {
-            return Err(PyBufferError::new_err(
-                "__dlpack__: copy semantics are not supported for medium_ad",
-            ));
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "MediumAdCudaBatchPlan", unsendable)]
-pub struct MediumAdCudaBatchPlanPy {
-    cuda: CudaMediumAd,
-    plan: CudaMediumAdBatchPlan,
-    device_id: u32,
-    periods: Vec<usize>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-fn medium_ad_periods_from_range(period_range: (usize, usize, usize)) -> Vec<usize> {
-    let (start, end, step) = period_range;
-    if step == 0 || start == end {
-        return vec![start];
-    }
-    let mut out = Vec::new();
-    if start < end {
-        let mut v = start;
-        loop {
-            out.push(v);
-            match v.checked_add(step.max(1)) {
-                Some(next) if next <= end => v = next,
-                _ => break,
-            }
-        }
-    } else {
-        let mut v = start;
-        loop {
-            out.push(v);
-            if v == end {
-                break;
-            }
-            match v.checked_sub(step.max(1)) {
-                Some(next) if next >= end => v = next,
-                _ => break,
-            }
-        }
-    }
-    out
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl MediumAdCudaBatchPlanPy {
-    #[getter]
-    fn rows(&self) -> usize {
-        self.plan.rows()
-    }
-
-    #[getter]
-    fn cols(&self) -> usize {
-        self.plan.cols()
-    }
-
-    #[getter]
-    fn device_id(&self) -> u32 {
-        self.device_id
-    }
-
-    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        dict.set_item(
-            "periods",
-            self.periods
-                .iter()
-                .map(|&p| p as u64)
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        dict.set_item("rows", self.plan.rows())?;
-        dict.set_item("cols", self.plan.cols())?;
-        Ok(dict)
-    }
-
-    fn execute<'py>(
-        &mut self,
-        py: Python<'py>,
-        data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let slice = data_f32.as_slice()?;
-        let rows = self.plan.rows();
-        let cols = self.plan.cols();
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("medium_ad CUDA plan rows*cols overflow"))?;
-        let values = py.allow_threads(|| -> PyResult<Vec<f32>> {
-            let d_prices = DeviceBuffer::from_slice(slice)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            self.cuda
-                .launch_medium_ad_batch_plan(&d_prices, &mut self.plan)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            self.cuda
-                .synchronize()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let mut values = vec![0f32; total];
-            self.plan
-                .output()
-                .copy_to(&mut values)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok(values)
-        })?;
-        let dict = PyDict::new(py);
-        let arr = values.into_pyarray(py);
-        dict.set_item("values", arr.reshape((rows, cols))?)?;
-        dict.set_item(
-            "periods",
-            self.periods
-                .iter()
-                .map(|&p| p as u64)
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        dict.set_item("rows", rows)?;
-        dict.set_item("cols", cols)?;
-        Ok(dict)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "medium_ad_cuda_batch_plan_create")]
-#[pyo3(signature = (series_len, first_valid, period_range, device_id=0))]
-pub fn medium_ad_cuda_batch_plan_create_py(
-    py: Python<'_>,
-    series_len: usize,
-    first_valid: usize,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<MediumAdCudaBatchPlanPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sweep = MediumAdBatchRange {
-        period: period_range,
-    };
-    let periods = medium_ad_periods_from_range(period_range);
-    let (cuda, plan, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaMediumAd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let plan = cuda
-            .prepare_medium_ad_batch_plan(series_len, first_valid, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((cuda, plan, dev_id))
-    })?;
-    Ok(MediumAdCudaBatchPlanPy {
-        cuda,
-        plan,
-        device_id: dev_id,
-        periods,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "medium_ad_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn medium_ad_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<MediumAdDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_f32.as_slice()?;
-    let sweep = MediumAdBatchRange {
-        period: period_range,
-    };
-    let (inner, ctx, dev_id) =
-        py.allow_threads(|| -> PyResult<(DeviceArrayF32, Arc<Context>, u32)> {
-            let cuda =
-                CudaMediumAd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let ctx = cuda.context_arc();
-            let dev_id = cuda.device_id();
-            let arr = cuda
-                .medium_ad_batch_dev(slice, &sweep)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok((arr, ctx, dev_id))
-        })?;
-    Ok(MediumAdDeviceArrayF32Py {
-        inner,
-        ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "medium_ad_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, period, device_id=0))]
-pub fn medium_ad_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<MediumAdDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_tm_f32.as_slice()?;
-    let (inner, ctx, dev_id) =
-        py.allow_threads(|| -> PyResult<(DeviceArrayF32, Arc<Context>, u32)> {
-            let cuda =
-                CudaMediumAd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let ctx = cuda.context_arc();
-            let dev_id = cuda.device_id();
-            let arr = cuda
-                .medium_ad_many_series_one_param_time_major_dev(slice, cols, rows, period)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok((arr, ctx, dev_id))
-        })?;
-    Ok(MediumAdDeviceArrayF32Py {
-        inner,
-        ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 pub fn medium_ad_into_slice(
     dst: &mut [f64],
@@ -2674,166 +2160,7 @@ pub fn medium_ad_into_slice(
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medium_ad_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = MediumAdParams {
-        period: Some(period),
-    };
-    let input = MediumAdInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    medium_ad_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medium_ad_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medium_ad_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medium_ad_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = MediumAdParams {
-            period: Some(period),
-        };
-        let input = MediumAdInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            medium_ad_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            medium_ad_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MediumAdBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MediumAdBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<MediumAdParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = medium_ad_batch)]
-pub fn medium_ad_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: MediumAdBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = MediumAdBatchRange {
-        period: config.period_range,
-    };
-
-    let output = medium_ad_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = MediumAdBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn medium_ad_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to medium_ad_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = MediumAdBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let total = match rows.checked_mul(cols) {
-            Some(v) => v,
-            None => {
-                return Err(JsValue::from_str(
-                    "medium_ad_batch_into: rows*cols overflow in output size",
-                ))
-            }
-        };
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        medium_ad_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(test, not(all(target_arch = "wasm32", feature = "wasm"))))]
+#[cfg(test)]
 mod tests_into_parity {
     use super::*;
 

@@ -147,11 +147,9 @@ impl VocabularyBudget {
 
     /// Size ONE budget for a whole multi-timeframe run from its WIDEST frame.
     ///
-    /// `widest_rows` is the base timeframe's bar count: every other timeframe
-    /// is a resampling of it and therefore shorter, so a budget that fits the
-    /// base fits all of them, and the admitted id set is identical across the
-    /// run. Conservative by construction — the short frames are charged the
-    /// base frame's per-column price.
+    /// `widest_rows` is the largest independently downloaded timeframe row
+    /// count. A budget that fits that direct frame fits every smaller direct
+    /// frame, and the admitted id set is identical across the run.
     pub fn for_run(widest_rows: usize) -> Self {
         Self::for_frame(widest_rows)
     }

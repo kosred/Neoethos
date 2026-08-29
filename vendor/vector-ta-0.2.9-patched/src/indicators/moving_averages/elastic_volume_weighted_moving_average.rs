@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -30,6 +14,11 @@ const DEFAULT_LENGTH: usize = 30;
 const DEFAULT_ABSOLUTE_VOLUME_MILLIONS: f64 = 134.0;
 const DEFAULT_USE_VOLUME_SUM: bool = false;
 const MAX_LENGTH: usize = 4096;
+
+pub const EVWMA_ROLLING_VOLUME_F64_AUTHORITY_V1: &str =
+    "evwma_rolling_volume_close_length_key_default30_chronological_rn_f64_v1";
+pub const EVWMA_FIXED_GAMMA_N_F64_AUTHORITY_V1: &str =
+    "evwma_fixed_gamma_n_close_stable_delta_rn_f64_v1";
 
 impl<'a> AsRef<[f64]> for ElasticVolumeWeightedMovingAverageInput<'a> {
     #[inline(always)]
@@ -61,10 +50,6 @@ pub struct ElasticVolumeWeightedMovingAverageOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct ElasticVolumeWeightedMovingAverageParams {
     pub length: Option<usize>,
     pub absolute_volume_millions: Option<f64>,
@@ -116,7 +101,7 @@ impl<'a> ElasticVolumeWeightedMovingAverageInput<'a> {
     pub fn with_default_candles(candles: &'a Candles) -> Self {
         Self::from_candles(
             candles,
-            "hlcc4",
+            "close",
             ElasticVolumeWeightedMovingAverageParams::default(),
         )
     }
@@ -204,7 +189,7 @@ impl ElasticVolumeWeightedMovingAverageBuilder {
     {
         let input = ElasticVolumeWeightedMovingAverageInput::from_candles(
             candles,
-            "hlcc4",
+            "close",
             ElasticVolumeWeightedMovingAverageParams {
                 length: self.length,
                 absolute_volume_millions: self.absolute_volume_millions,
@@ -254,15 +239,25 @@ pub enum ElasticVolumeWeightedMovingAverageError {
     EmptyInputData,
     #[error("elastic_volume_weighted_moving_average: all values are NaN.")]
     AllValuesNaN,
-    #[error("elastic_volume_weighted_moving_average: price and volume length mismatch: price = {price_len}, volume = {volume_len}")]
+    #[error(
+        "elastic_volume_weighted_moving_average: price and volume length mismatch: price = {price_len}, volume = {volume_len}"
+    )]
     DataLengthMismatch { price_len: usize, volume_len: usize },
-    #[error("elastic_volume_weighted_moving_average: invalid length: {length}. Expected 1..={MAX_LENGTH}.")]
+    #[error(
+        "elastic_volume_weighted_moving_average: invalid length: {length}. Expected 1..={MAX_LENGTH}."
+    )]
     InvalidLength { length: usize },
-    #[error("elastic_volume_weighted_moving_average: invalid absolute_volume_millions: {absolute_volume_millions}")]
+    #[error(
+        "elastic_volume_weighted_moving_average: invalid absolute_volume_millions: {absolute_volume_millions}"
+    )]
     InvalidAbsoluteVolumeMillions { absolute_volume_millions: f64 },
-    #[error("elastic_volume_weighted_moving_average: output length mismatch: expected = {expected}, got = {got}")]
+    #[error(
+        "elastic_volume_weighted_moving_average: output length mismatch: expected = {expected}, got = {got}"
+    )]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error("elastic_volume_weighted_moving_average: invalid length range: start={start}, end={end}, step={step}")]
+    #[error(
+        "elastic_volume_weighted_moving_average: invalid length range: start={start}, end={end}, step={step}"
+    )]
     InvalidLengthRange {
         start: usize,
         end: usize,
@@ -354,6 +349,27 @@ fn prepare<'a>(
 }
 
 #[inline(always)]
+fn evwma_fixed_gamma_n_update_f64_v1(
+    base: f64,
+    price: f64,
+    volume: f64,
+    inv_absolute_volume: f64,
+) -> f64 {
+    let weight = volume * inv_absolute_volume;
+    base + weight * (price - base)
+}
+
+#[inline(always)]
+fn evwma_rolling_volume_update_f64_v1(
+    base: f64,
+    price: f64,
+    volume: f64,
+    rolling_sum: f64,
+) -> f64 {
+    ((rolling_sum - volume) * base + volume * price) / rolling_sum
+}
+
+#[inline(always)]
 fn compute_absolute_into(
     prices: &[f64],
     volumes: &[f64],
@@ -372,7 +388,8 @@ fn compute_absolute_into(
             continue;
         }
         let base = if prev.is_finite() { prev } else { price };
-        let value = base + volume * inv_absolute_volume * (price - base);
+        let value =
+            evwma_fixed_gamma_n_update_f64_v1(base, price, volume, inv_absolute_volume);
         out[index] = value;
         prev = value;
     }
@@ -421,7 +438,7 @@ fn compute_volume_sum_into(
         }
 
         let base = if prev.is_finite() { prev } else { price };
-        let value = ((rolling_sum - volume) * base + volume * price) / rolling_sum;
+        let value = evwma_rolling_volume_update_f64_v1(base, price, volume, rolling_sum);
         out[index] = value;
         prev = value;
     }
@@ -486,7 +503,6 @@ pub fn elastic_volume_weighted_moving_average_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn elastic_volume_weighted_moving_average_into(
     input: &ElasticVolumeWeightedMovingAverageInput,
@@ -498,7 +514,7 @@ pub fn elastic_volume_weighted_moving_average_into(
 #[derive(Clone, Debug)]
 pub struct ElasticVolumeWeightedMovingAverageStream {
     length: usize,
-    absolute_volume: f64,
+    inv_absolute_volume: f64,
     use_volume_sum: bool,
     volume_ring: Vec<f64>,
     rolling_sum: f64,
@@ -522,7 +538,7 @@ impl ElasticVolumeWeightedMovingAverageStream {
         }
         Ok(Self {
             length,
-            absolute_volume: absolute_volume_millions * 1_000_000.0,
+            inv_absolute_volume: 1.0 / (absolute_volume_millions * 1_000_000.0),
             use_volume_sum,
             volume_ring: vec![0.0; length],
             rolling_sum: 0.0,
@@ -543,7 +559,7 @@ impl ElasticVolumeWeightedMovingAverageStream {
 
     #[inline]
     pub fn update(&mut self, price: f64, volume: f64) -> Option<f64> {
-        let volume_period = if self.use_volume_sum {
+        if self.use_volume_sum {
             let volume_value = if volume.is_finite() { volume } else { 0.0 };
             if self.count < self.length {
                 self.volume_ring[self.count] = volume_value;
@@ -557,15 +573,12 @@ impl ElasticVolumeWeightedMovingAverageStream {
                     self.head = 0;
                 }
             }
-            self.rolling_sum
-        } else {
-            self.absolute_volume
-        };
+        }
 
         if !price.is_finite()
             || !volume.is_finite()
-            || !volume_period.is_finite()
-            || volume_period == 0.0
+            || (self.use_volume_sum
+                && (!self.rolling_sum.is_finite() || self.rolling_sum == 0.0))
         {
             self.prev = f64::NAN;
             return None;
@@ -576,7 +589,11 @@ impl ElasticVolumeWeightedMovingAverageStream {
         } else {
             price
         };
-        let value = ((volume_period - volume) * base + volume * price) / volume_period;
+        let value = if self.use_volume_sum {
+            evwma_rolling_volume_update_f64_v1(base, price, volume, self.rolling_sum)
+        } else {
+            evwma_fixed_gamma_n_update_f64_v1(base, price, volume, self.inv_absolute_volume)
+        };
         self.prev = value;
         value.is_finite().then_some(value)
     }
@@ -981,410 +998,12 @@ impl ElasticVolumeWeightedMovingAverageBatchBuilder {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "elastic_volume_weighted_moving_average")]
-#[pyo3(signature = (prices, volumes, length=None, absolute_volume_millions=None, use_volume_sum=None, kernel=None))]
-pub fn elastic_volume_weighted_moving_average_py<'py>(
-    py: Python<'py>,
-    prices: PyReadonlyArray1<'py, f64>,
-    volumes: PyReadonlyArray1<'py, f64>,
-    length: Option<usize>,
-    absolute_volume_millions: Option<f64>,
-    use_volume_sum: Option<bool>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let prices = prices.as_slice()?;
-    let volumes = volumes.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = ElasticVolumeWeightedMovingAverageInput::from_slice(
-        prices,
-        volumes,
-        ElasticVolumeWeightedMovingAverageParams {
-            length,
-            absolute_volume_millions,
-            use_volume_sum,
-        },
-    );
-    let out = py
-        .allow_threads(|| elastic_volume_weighted_moving_average_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ElasticVolumeWeightedMovingAverageStream")]
-pub struct ElasticVolumeWeightedMovingAverageStreamPy {
-    stream: ElasticVolumeWeightedMovingAverageStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ElasticVolumeWeightedMovingAverageStreamPy {
-    #[new]
-    #[pyo3(signature = (length=None, absolute_volume_millions=None, use_volume_sum=None))]
-    fn new(
-        length: Option<usize>,
-        absolute_volume_millions: Option<f64>,
-        use_volume_sum: Option<bool>,
-    ) -> PyResult<Self> {
-        let stream = ElasticVolumeWeightedMovingAverageStream::try_new(
-            ElasticVolumeWeightedMovingAverageParams {
-                length,
-                absolute_volume_millions,
-                use_volume_sum,
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, price: f64, volume: f64) -> Option<f64> {
-        self.stream.update(price, volume)
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "elastic_volume_weighted_moving_average_batch")]
-#[pyo3(signature = (prices, volumes, length_range=(DEFAULT_LENGTH, DEFAULT_LENGTH, 0), absolute_volume_millions=None, use_volume_sum=None, kernel=None))]
-pub fn elastic_volume_weighted_moving_average_batch_py<'py>(
-    py: Python<'py>,
-    prices: PyReadonlyArray1<'py, f64>,
-    volumes: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    absolute_volume_millions: Option<f64>,
-    use_volume_sum: Option<bool>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let prices = prices.as_slice()?;
-    let volumes = volumes.as_slice()?;
-    let range = ElasticVolumeWeightedMovingAverageBatchRange {
-        length: length_range,
-        absolute_volume_millions,
-        use_volume_sum,
-    };
-    let combos = expand_grid_elastic_volume_weighted_moving_average(&range)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = prices.len();
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-    let batch_kernel = match kernel {
-        Kernel::Auto => detect_best_batch_kernel(),
-        other => other,
-    };
-    let combos = py
-        .allow_threads(|| {
-            elastic_volume_weighted_moving_average_batch_inner_into(
-                prices,
-                volumes,
-                &range,
-                batch_simd_kernel(batch_kernel),
-                true,
-                out_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "absolute_volume_millions",
-        combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .absolute_volume_millions
-                    .unwrap_or(DEFAULT_ABSOLUTE_VOLUME_MILLIONS)
-            })
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "use_volume_sum",
-        combos
-            .iter()
-            .map(|combo| combo.use_volume_sum.unwrap_or(DEFAULT_USE_VOLUME_SUM))
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(dict.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ElasticVolumeWeightedMovingAverageBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub absolute_volume_millions: Option<f64>,
-    pub use_volume_sum: Option<bool>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ElasticVolumeWeightedMovingAverageBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<ElasticVolumeWeightedMovingAverageParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = elastic_volume_weighted_moving_average)]
-pub fn elastic_volume_weighted_moving_average_js(
-    prices: &[f64],
-    volumes: &[f64],
-    length: Option<usize>,
-    absolute_volume_millions: Option<f64>,
-    use_volume_sum: Option<bool>,
-) -> Result<Vec<f64>, JsValue> {
-    let input = ElasticVolumeWeightedMovingAverageInput::from_slice(
-        prices,
-        volumes,
-        ElasticVolumeWeightedMovingAverageParams {
-            length,
-            absolute_volume_millions,
-            use_volume_sum,
-        },
-    );
-    let mut out = vec![0.0; prices.len()];
-    elastic_volume_weighted_moving_average_into_slice(&mut out, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = elastic_volume_weighted_moving_average_batch)]
-pub fn elastic_volume_weighted_moving_average_batch_js(
-    prices: &[f64],
-    volumes: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: ElasticVolumeWeightedMovingAverageBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let range = ElasticVolumeWeightedMovingAverageBatchRange {
-        length: config.length_range,
-        absolute_volume_millions: config.absolute_volume_millions,
-        use_volume_sum: config.use_volume_sum,
-    };
-    let out = elastic_volume_weighted_moving_average_batch_with_kernel(
-        prices,
-        volumes,
-        &range,
-        detect_best_batch_kernel(),
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&ElasticVolumeWeightedMovingAverageBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn elastic_volume_weighted_moving_average_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn elastic_volume_weighted_moving_average_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = elastic_volume_weighted_moving_average_into)]
-pub fn elastic_volume_weighted_moving_average_into_js(
-    price_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: Option<usize>,
-    absolute_volume_millions: Option<f64>,
-    use_volume_sum: Option<bool>,
-) -> Result<(), JsValue> {
-    if price_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to elastic_volume_weighted_moving_average_into",
-        ));
-    }
-    unsafe {
-        let prices = std::slice::from_raw_parts(price_ptr, len);
-        let volumes = std::slice::from_raw_parts(volume_ptr, len);
-        let input = ElasticVolumeWeightedMovingAverageInput::from_slice(
-            prices,
-            volumes,
-            ElasticVolumeWeightedMovingAverageParams {
-                length,
-                absolute_volume_millions,
-                use_volume_sum,
-            },
-        );
-        if out_ptr == price_ptr as *mut f64 || out_ptr == volume_ptr as *mut f64 {
-            let mut temp = vec![0.0; len];
-            elastic_volume_weighted_moving_average_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            elastic_volume_weighted_moving_average_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = elastic_volume_weighted_moving_average_batch_into)]
-pub fn elastic_volume_weighted_moving_average_batch_into_js(
-    price_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    config: JsValue,
-) -> Result<usize, JsValue> {
-    if price_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to elastic_volume_weighted_moving_average_batch_into",
-        ));
-    }
-    let config: ElasticVolumeWeightedMovingAverageBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let range = ElasticVolumeWeightedMovingAverageBatchRange {
-        length: config.length_range,
-        absolute_volume_millions: config.absolute_volume_millions,
-        use_volume_sum: config.use_volume_sum,
-    };
-    let combos = expand_grid_elastic_volume_weighted_moving_average(&range)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    unsafe {
-        let prices = std::slice::from_raw_parts(price_ptr, len);
-        let volumes = std::slice::from_raw_parts(volume_ptr, len);
-        let simd = batch_simd_kernel(detect_best_batch_kernel());
-        if out_ptr == price_ptr as *mut f64 || out_ptr == volume_ptr as *mut f64 {
-            let mut temp = vec![0.0; rows * len];
-            elastic_volume_weighted_moving_average_batch_inner_into(
-                prices, volumes, &range, simd, false, &mut temp,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, rows * len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, rows * len);
-            elastic_volume_weighted_moving_average_batch_inner_into(
-                prices, volumes, &range, simd, false, out,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct ElasticVolumeWeightedMovingAverageStreamWasm {
-    inner: ElasticVolumeWeightedMovingAverageStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl ElasticVolumeWeightedMovingAverageStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        length: Option<usize>,
-        absolute_volume_millions: Option<f64>,
-        use_volume_sum: Option<bool>,
-    ) -> Result<ElasticVolumeWeightedMovingAverageStreamWasm, JsValue> {
-        let inner = ElasticVolumeWeightedMovingAverageStream::try_new(
-            ElasticVolumeWeightedMovingAverageParams {
-                length,
-                absolute_volume_millions,
-                use_volume_sum,
-            },
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, price: f64, volume: f64) -> Option<f64> {
-        self.inner.update(price, volume)
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn elastic_volume_weighted_moving_average_output_into_js(
-    prices: &[f64],
-    volumes: &[f64],
-    length: Option<usize>,
-    absolute_volume_millions: Option<f64>,
-    use_volume_sum: Option<bool>,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = elastic_volume_weighted_moving_average_js(
-        prices,
-        volumes,
-        length,
-        absolute_volume_millions,
-        use_volume_sum,
-    )?;
-    crate::write_wasm_f64_output(
-        "elastic_volume_weighted_moving_average_output_into_js",
-        &values,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn elastic_volume_weighted_moving_average_batch_output_into_js(
-    prices: &[f64],
-    volumes: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = elastic_volume_weighted_moving_average_batch_js(prices, volumes, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "elastic_volume_weighted_moving_average_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::moving_averages::ma::MaData;
     use crate::indicators::moving_averages::ma_batch::{
-        ma_batch_with_kernel_and_typed_params, MaBatchParamKV, MaBatchParamValue,
+        MaBatchParamKV, MaBatchParamValue, ma_batch_with_kernel_and_typed_params,
     };
 
     fn sample_prices(len: usize) -> Vec<f64> {
@@ -1397,6 +1016,20 @@ mod tests {
         (0..len)
             .map(|i| 1_000.0 + ((i % 9) as f64) * 57.0 + (i as f64) * 2.0)
             .collect()
+    }
+
+    fn reviewed_close_volume_fixture(len: usize) -> (Vec<f64>, Vec<f64>) {
+        const WAVE: [f64; 11] = [
+            0.000041, -0.000027, 0.000013, -0.000036, 0.000022, -0.000009, 0.000033,
+            -0.000019, 0.000006, -0.000031, 0.000017,
+        ];
+        let close = (0..len)
+            .map(|row| 1.075 + row as f64 * 0.0000007 + WAVE[row % WAVE.len()])
+            .collect();
+        let volume = (0..len)
+            .map(|row| 900.0 + (row % 97) as f64 * 3.25 + row as f64 * 0.001)
+            .collect();
+        (close, volume)
     }
 
     fn sample_candles(len: usize) -> Candles {
@@ -1643,5 +1276,125 @@ mod tests {
             let end = start + batch.cols;
             assert_series_close(&batch.values[start..end], &single.values);
         }
+    }
+
+    #[test]
+    fn evwma_rolling_f64_v1_authority_is_explicit() {
+        assert_eq!(
+            EVWMA_ROLLING_VOLUME_F64_AUTHORITY_V1,
+            "evwma_rolling_volume_close_length_key_default30_chronological_rn_f64_v1"
+        );
+    }
+
+    #[test]
+    fn evwma_default_candles_and_builder_use_close_for_fixed_gamma_n() {
+        let candles = sample_candles(32);
+        let default = elastic_volume_weighted_moving_average(
+            &ElasticVolumeWeightedMovingAverageInput::with_default_candles(&candles),
+        )
+        .unwrap();
+        let explicit_close = elastic_volume_weighted_moving_average(
+            &ElasticVolumeWeightedMovingAverageInput::from_candles(
+                &candles,
+                "close",
+                ElasticVolumeWeightedMovingAverageParams::default(),
+            ),
+        )
+        .unwrap();
+        let explicit_hlcc4 = elastic_volume_weighted_moving_average(
+            &ElasticVolumeWeightedMovingAverageInput::from_candles(
+                &candles,
+                "hlcc4",
+                ElasticVolumeWeightedMovingAverageParams::default(),
+            ),
+        )
+        .unwrap();
+        let built = ElasticVolumeWeightedMovingAverageBuilder::new()
+            .apply(&candles)
+            .unwrap();
+
+        for index in 0..candles.close.len() {
+            assert_eq!(default.values[index].to_bits(), explicit_close.values[index].to_bits());
+            assert_eq!(built.values[index].to_bits(), explicit_close.values[index].to_bits());
+        }
+        assert_ne!(
+            default.values[0].to_bits(),
+            explicit_hlcc4.values[0].to_bits(),
+            "the official close default must not silently select HLCC4"
+        );
+    }
+
+    #[test]
+    fn evwma_fixed_gamma_n_stream_uses_the_direct_stable_delta_schedule() {
+        let (prices, volumes) = reviewed_close_volume_fixture(64);
+        let params = ElasticVolumeWeightedMovingAverageParams::default();
+        let direct = elastic_volume_weighted_moving_average(
+            &ElasticVolumeWeightedMovingAverageInput::from_slice(
+                &prices,
+                &volumes,
+                params.clone(),
+            ),
+        )
+        .unwrap();
+        let mut stream = ElasticVolumeWeightedMovingAverageStream::try_new(params).unwrap();
+
+        for (index, (&price, &volume)) in prices.iter().zip(&volumes).enumerate() {
+            let streamed = stream.update(price, volume).unwrap();
+            assert_eq!(
+                streamed.to_bits(),
+                direct.values[index].to_bits(),
+                "fixed-gamma-N route drifted at row {index}"
+            );
+        }
+        assert_eq!(direct.values[10].to_bits(), 0x3ff1_335e_3050_90c8);
+    }
+
+    #[test]
+    fn evwma_rolling_f64_v1_is_exact_on_all_cpu_routes() {
+        let (prices, volumes) = reviewed_close_volume_fixture(64);
+        let params = ElasticVolumeWeightedMovingAverageParams {
+            length: Some(30),
+            absolute_volume_millions: None,
+            use_volume_sum: Some(true),
+        };
+        let input = ElasticVolumeWeightedMovingAverageInput::from_slice(
+            &prices,
+            &volumes,
+            params.clone(),
+        );
+        let scalar = elastic_volume_weighted_moving_average_with_kernel(&input, Kernel::Scalar)
+            .unwrap();
+        let mut into = vec![f64::NAN; prices.len()];
+        elastic_volume_weighted_moving_average_into_slice(&mut into, &input, Kernel::Auto)
+            .unwrap();
+        let batch = elastic_volume_weighted_moving_average_batch_with_kernel(
+            &prices,
+            &volumes,
+            &ElasticVolumeWeightedMovingAverageBatchRange {
+                length: (30, 30, 0),
+                absolute_volume_millions: None,
+                use_volume_sum: Some(true),
+            },
+            Kernel::ScalarBatch,
+        )
+        .unwrap();
+        let mut stream = ElasticVolumeWeightedMovingAverageStream::try_new(params).unwrap();
+
+        for kernel in [Kernel::Auto, Kernel::Avx2, Kernel::Avx512] {
+            let route = elastic_volume_weighted_moving_average_with_kernel(&input, kernel).unwrap();
+            assert_eq!(
+                route.values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                scalar.values.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        for index in 0..prices.len() {
+            let streamed = stream.update(prices[index], volumes[index]).unwrap();
+            let expected = scalar.values[index].to_bits();
+            assert_eq!(into[index].to_bits(), expected);
+            assert_eq!(batch.values[index].to_bits(), expected);
+            assert_eq!(streamed.to_bits(), expected);
+        }
+        assert_eq!(scalar.values[0].to_bits(), 0x3ff1_335e_310d_bf05);
+        assert_eq!(scalar.values[14].to_bits(), 0x3ff1_3338_6352_8cde);
     }
 }

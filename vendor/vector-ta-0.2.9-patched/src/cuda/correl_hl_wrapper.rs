@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::correl_hl::{CorrelHlBatchRange, CorrelHlParams};
@@ -6,8 +6,8 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -114,7 +114,6 @@ impl CudaCorrelHl {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/correl_hl_kernel.ptx"));
         let module = crate::load_cuda_embedded_module!("correl_hl_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
@@ -1228,14 +1227,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "correl_hl",
-            "one_series_many_params",
-            "correl_hl_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "correl_hl",
+                "one_series_many_params",
+                "correl_hl_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }

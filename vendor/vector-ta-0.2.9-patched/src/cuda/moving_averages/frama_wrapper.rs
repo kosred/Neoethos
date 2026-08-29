@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::frama::{FramaBatchRange, FramaParams};
@@ -7,15 +7,15 @@ use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
 use cust::memory::{
-    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info,
 };
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 const FRAMA_MAX_WINDOW: usize = 1024;
@@ -64,7 +64,9 @@ pub enum ManySeriesKernelSelected {
 pub enum CudaFramaError {
     #[error("CUDA error: {0}")]
     Cuda(#[from] CudaError),
-    #[error("Out of memory on device: required={required} bytes, free={free} bytes, headroom={headroom} bytes")]
+    #[error(
+        "Out of memory on device: required={required} bytes, free={free} bytes, headroom={headroom} bytes"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -118,11 +120,7 @@ fn axis_usize((start, end, step): (usize, usize, usize)) -> Vec<usize> {
 }
 
 fn evenize(window: usize) -> usize {
-    if window & 1 == 1 {
-        window + 1
-    } else {
-        window
-    }
+    if window & 1 == 1 { window + 1 } else { window }
 }
 
 fn expand_grid(range: &FramaBatchRange) -> Vec<FramaParams> {
@@ -213,8 +211,6 @@ impl CudaFrama {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let context = Context::new(device)?;
-
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/frama_kernel.ptx"));
 
         let module = crate::load_cuda_embedded_module!("frama_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;

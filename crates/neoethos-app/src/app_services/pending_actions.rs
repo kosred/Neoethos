@@ -374,9 +374,7 @@ fn sweep_expired(q: &mut VecDeque<PendingAction>) {
 /// **F-CORE3 closure (2026-05-25)**: routed through the canonical
 /// `env_overrides::pending_actions_path_override` typed getter.
 pub fn default_journal_path() -> PathBuf {
-    if let Some(custom) =
-        crate::app_services::env_overrides::pending_actions_path_override()
-    {
+    if let Some(custom) = crate::app_services::env_overrides::pending_actions_path_override() {
         return PathBuf::from(custom);
     }
     let base = dirs::data_dir().unwrap_or_else(|| {

@@ -137,7 +137,7 @@ models:
   use_sac_agent: true
   use_rllib_agent: false
   rllib_num_workers: 0
-  auto_enable_rllib: true
+  auto_enable_rllib: false
   use_neuroevolution: true
   rl_population_size: 5
   rl_timesteps: 10000000
@@ -186,8 +186,6 @@ models:
   prop_search_max_indicators: 12
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: auto
-  prop_search_train_years: 0
-  prop_search_val_years: 0
   prop_search_val_candidates: 0
   prop_search_val_min_positive_months: 0
   prop_search_val_min_trades_per_month: 0
@@ -355,7 +353,6 @@ models:
       window_days: 60
       n_windows: 0
       pass_rate: 0.0
-    genetic_expert_holdout: false
   eval_runtime:
     symbol: null
     account_currency: null
@@ -433,7 +430,6 @@ models:
     p_displacement: 0.5
   data_runtime:
     normalize_features: true
-    rebuild_stale_higher_tfs: false
     feature_cube_mode: auto
   tree_runtime:
     device: auto

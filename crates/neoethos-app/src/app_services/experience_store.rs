@@ -43,7 +43,7 @@ pub struct LiveExperience {
     pub entry_ts_ms: i64,
     pub entry_price: Option<f64>,
     /// The EXACT projected feature row the signal was computed from.
-    pub features: Vec<f32>,
+    pub features: Vec<f64>,
     // ── Filled at close ────────────────────────────────────────────────────
     pub close_ts_ms: Option<i64>,
     pub net_profit: Option<f64>,
@@ -52,7 +52,12 @@ pub struct LiveExperience {
 fn store_path() -> Option<PathBuf> {
     neoethos_core::Settings::from_yaml(&crate::server::state::current_config_path())
         .ok()
-        .map(|s| s.system.data_dir.join("experience").join("live_experience.jsonl"))
+        .map(|s| {
+            s.system
+                .data_dir
+                .join("experience")
+                .join("live_experience.jsonl")
+        })
 }
 
 /// Append one COMPLETED experience (entry snapshot + realized outcome).
@@ -65,7 +70,11 @@ pub fn record(exp: &LiveExperience) {
     match serde_json::to_string(exp) {
         Ok(line) => {
             use std::io::Write;
-            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 Ok(mut f) => {
                     if let Err(e) = writeln!(f, "{line}") {
                         tracing::warn!(

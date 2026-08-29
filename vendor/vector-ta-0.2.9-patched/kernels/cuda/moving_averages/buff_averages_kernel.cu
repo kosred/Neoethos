@@ -582,8 +582,8 @@ extern "C" __global__ void buff_averages_many_series_one_param_exp2_f32(
 // (src/indicators/moving_averages/buff_averages.rs:599-691), reached through
 // `buff_averages_with_kernel` (:342) -> `buff_averages_compute_into` (:524).
 //
-// OUTPUT: the FAST buff. `ma_batch.rs:627-637` defaults `output` to "fast",
-// so that is the column a caller asking for `value` gets.
+// PRIMARY OUTPUT: the FAST buff. The production entry below emits both
+// canonical registry outputs from this same row authority.
 //
 // PERIOD-SWEPT, and the swept int is the SLOW period: `ma_batch.rs:593`
 // assigns `sweep.slow_period = period_range` while `fast_period` stays at its
@@ -607,24 +607,15 @@ static __forceinline__ __device__ double buff_averages_neo_qnan() {
     return __longlong_as_double(0x7ff8000000000000ULL);
 }
 
-extern "C" __global__
-void buff_averages_neo_batch_f64(const double* __restrict__ price,
-                                 const double* __restrict__ volume,
-                                 int n,
-                                 const int* __restrict__ periods,
-                                 int n_combos,
-                                 int first_valid,
-                                 double* __restrict__ out) {
-    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
-    if (combo >= n_combos) return;
-    if (n <= 0) return;
-    (void)first_valid;  // derived below -- see the header.
-
-    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+static __forceinline__ __device__
+void buff_averages_neo_row_f64(const double* __restrict__ price,
+                               const double* __restrict__ volume,
+                               int n,
+                               int fast_period,
+                               int slow_period,
+                               double* __restrict__ fast_row,
+                               double* __restrict__ slow_row) {
     const double nn = buff_averages_neo_qnan();
-
-    const int slow_period = periods[combo];
-    const int fast_period = 5;  // buff_averages.rs:1429 / :220
 
     // buff_averages_prepare, :470-473 -- price alone, `!is_nan`.
     int first = -1;
@@ -651,46 +642,130 @@ void buff_averages_neo_batch_f64(const double* __restrict__ price,
     }
 
     if (refused) {
-        for (int i = 0; i < n; ++i) row[i] = nn;
+        for (int i = 0; i < n; ++i) {
+            if (fast_row != nullptr) fast_row[i] = nn;
+            if (slow_row != nullptr) slow_row[i] = nn;
+        }
         return;
     }
 
     const int warm = (int)warm_ll;
-    for (int i = 0; i < warm; ++i) row[i] = nn;
+    for (int i = 0; i < warm; ++i) {
+        if (fast_row != nullptr) fast_row[i] = nn;
+        if (slow_row != nullptr) slow_row[i] = nn;
+    }
 
-    // :633-640 -- the fast seed window, ascending, skipping any bar whose
+    // buff_averages_scalar :615-625 -- slow seed first, ascending.
+    double slow_num = 0.0;
+    double slow_den = 0.0;
+    const int slow_start = warm + 1 - slow_period;
+    for (int i = slow_start; i <= warm; ++i) {
+        const double p = price[i];
+        const double v = volume[i];
+        if (!isnan(p) && !isnan(v)) {
+            slow_num += p * v;
+            slow_den += v;
+        }
+    }
+
+    // :627-637 -- the fast seed window, ascending, skipping any bar whose
     // price OR volume is NaN.
-    double num = 0.0;
-    double den = 0.0;
+    double fast_num = 0.0;
+    double fast_den = 0.0;
     const int fast_start = warm + 1 - fast_period;
     for (int i = fast_start; i <= warm; ++i) {
         const double p = price[i];
         const double v = volume[i];
         if (!isnan(p) && !isnan(v)) {
-            num += p * v;
-            den += v;
+            fast_num += p * v;
+            fast_den += v;
         }
     }
-    row[warm] = (den != 0.0) ? (num / den) : 0.0;
+    if (slow_row != nullptr) {
+        slow_row[warm] = (slow_den != 0.0) ? (slow_num / slow_den) : 0.0;
+    }
+    if (fast_row != nullptr) {
+        fast_row[warm] = (fast_den != 0.0) ? (fast_num / fast_den) : 0.0;
+    }
 
-    // :615-651 -- subtract the leaving bar, then add the arriving one, in
-    // that order. Reversing them changes the rounding of `num`.
+    // :647-681 -- update/write the slow state first, then update/write fast.
+    // Each state subtracts the leaving bar before adding the arriving bar.
     for (int i = warm + 1; i < n; ++i) {
         const double new_p = price[i];
         const double new_v = volume[i];
-        const int old_i = i - fast_period;
-        const double old_p = price[old_i];
-        const double old_v = volume[old_i];
 
-        if (!isnan(old_p) && !isnan(old_v)) {
-            num -= old_p * old_v;
-            den -= old_v;
+        const int old_slow_i = i - slow_period;
+        const double old_slow_p = price[old_slow_i];
+        const double old_slow_v = volume[old_slow_i];
+        if (!isnan(old_slow_p) && !isnan(old_slow_v)) {
+            slow_num -= old_slow_p * old_slow_v;
+            slow_den -= old_slow_v;
         }
         if (!isnan(new_p) && !isnan(new_v)) {
-            num += new_p * new_v;
-            den += new_v;
+            slow_num += new_p * new_v;
+            slow_den += new_v;
+        }
+        if (slow_row != nullptr) {
+            slow_row[i] = (slow_den != 0.0) ? (slow_num / slow_den) : 0.0;
         }
 
-        row[i] = (den != 0.0) ? (num / den) : 0.0;
+        const int old_fast_i = i - fast_period;
+        const double old_fast_p = price[old_fast_i];
+        const double old_fast_v = volume[old_fast_i];
+        if (!isnan(old_fast_p) && !isnan(old_fast_v)) {
+            fast_num -= old_fast_p * old_fast_v;
+            fast_den -= old_fast_v;
+        }
+        if (!isnan(new_p) && !isnan(new_v)) {
+            fast_num += new_p * new_v;
+            fast_den += new_v;
+        }
+        if (fast_row != nullptr) {
+            fast_row[i] = (fast_den != 0.0) ? (fast_num / fast_den) : 0.0;
+        }
     }
+}
+
+extern "C" __global__
+void buff_averages_neo_batch_f64(const double* __restrict__ price,
+                                 const double* __restrict__ volume,
+                                 int n,
+                                 const int* __restrict__ periods,
+                                 int n_combos,
+                                 int first_valid,
+                                 double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    (void)first_valid;  // row authority derives the exact price-only start.
+
+    const int fast_period = 5;  // preserved primary ABI/default.
+    const int slow_period = periods[combo];
+    double* __restrict__ fast_row = out + (size_t)combo * (size_t)n;
+    buff_averages_neo_row_f64(
+        price, volume, n, fast_period, slow_period, fast_row, nullptr);
+}
+
+extern "C" __global__
+void buff_averages_production_f64(const double* __restrict__ price,
+                                  const double* __restrict__ volume,
+                                  int n,
+                                  const int* __restrict__ fast_periods,
+                                  const int* __restrict__ slow_periods,
+                                  int n_combos,
+                                  int first_valid,
+                                  double* __restrict__ out_fast,
+                                  double* __restrict__ out_slow) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    (void)first_valid;  // row authority derives the exact price-only start.
+
+    double* __restrict__ fast_row = out_fast + (size_t)combo * (size_t)n;
+    double* __restrict__ slow_row = out_slow + (size_t)combo * (size_t)n;
+    buff_averages_neo_row_f64(price,
+                              volume,
+                              n,
+                              fast_periods[combo],
+                              slow_periods[combo],
+                              fast_row,
+                              slow_row);
 }

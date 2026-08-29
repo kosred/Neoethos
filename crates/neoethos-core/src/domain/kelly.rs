@@ -103,11 +103,7 @@ pub fn risk_constrained_kelly(
 ///
 /// Fail-safe zeros: fewer than 30 finite samples, non-positive mean edge, or
 /// NO observed loss (a tail we have never seen cannot be sized against).
-pub fn risk_constrained_kelly_empirical(
-    r_sample: &[f64],
-    dd_level: f64,
-    dd_prob: f64,
-) -> f64 {
+pub fn risk_constrained_kelly_empirical(r_sample: &[f64], dd_level: f64, dd_prob: f64) -> f64 {
     if !(dd_level > 0.0 && dd_level < 1.0) || !(dd_prob > 0.0 && dd_prob < 1.0) {
         return 0.0;
     }
@@ -177,7 +173,10 @@ mod tests {
         // Accepting a 90% chance of dipping to 5% of start is looser than
         // anything full Kelly does — the growth optimum must come back.
         let f = risk_constrained_kelly(P, RR, 0.05, 0.90);
-        assert!((f - 0.325).abs() < 1e-9, "expected full Kelly 0.325, got {f}");
+        assert!(
+            (f - 0.325).abs() < 1e-9,
+            "expected full Kelly 0.325, got {f}"
+        );
     }
 
     #[test]
@@ -196,10 +195,12 @@ mod tests {
         );
         // Verify the returned size actually satisfies the bound equation.
         let lambda = (0.05f64).ln() / (0.5f64).ln();
-        let g = P * (1.0 + RR * strict).powf(-lambda)
-            + (1.0 - P) * (1.0 - strict).powf(-lambda)
-            - 1.0;
-        assert!(g <= 1e-9, "returned f must satisfy E[(1+f·r)^-λ] ≤ 1, g={g}");
+        let g =
+            P * (1.0 + RR * strict).powf(-lambda) + (1.0 - P) * (1.0 - strict).powf(-lambda) - 1.0;
+        assert!(
+            g <= 1e-9,
+            "returned f must satisfy E[(1+f·r)^-λ] ≤ 1, g={g}"
+        );
     }
 
     #[test]

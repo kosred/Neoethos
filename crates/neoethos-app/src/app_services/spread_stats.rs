@@ -110,13 +110,19 @@ pub fn spawn() {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let hour = chrono::Utc::now().format("%H").to_string().parse::<usize>().unwrap_or(0);
+            let hour = chrono::Utc::now()
+                .format("%H")
+                .to_string()
+                .parse::<usize>()
+                .unwrap_or(0);
             for t in crate::app_services::live_spots::snapshot_all() {
                 // Only FRESH ticks — a stale cache entry's spread is history.
                 if now_ms - t.received_at_unix_ms > 90_000 {
                     continue;
                 }
-                let (Some(bid), Some(ask)) = (t.bid, t.ask) else { continue };
+                let (Some(bid), Some(ask)) = (t.bid, t.ask) else {
+                    continue;
+                };
                 if ask <= bid {
                     continue; // crossed/invalid quote — skip, never record garbage
                 }

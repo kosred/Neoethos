@@ -1,0 +1,114 @@
+diff --git a/crates/neoethos-gpu-cuda/build.rs b/crates/neoethos-gpu-cuda/build.rs
+--- a/crates/neoethos-gpu-cuda/build.rs
++++ b/crates/neoethos-gpu-cuda/build.rs
+@@ -8,17 +8,18 @@ use std::process::Command;
+ 
+ use sha2::{Digest, Sha256};
+ 
+-const DEVICE_SOURCES: [&str; 12] = [
++const DEVICE_SOURCES: [&str; 13] = [
+     "native/smoke.cu",
+     "native/prototype_b.cu",
+     "native/prototype_b_population.cu",
+     "native/resident_feature_store_v3.cu",
++    "native/resident_higher_timeframe_alignment_v3.cu",
+     "native/resident_footprint_v2.cu",
+     "native/resident_quant_v3.cu",
+     "native/resident_regime_v3.cu",
+     "native/resident_session_v2.cu",
+     "native/resident_robust_normalization_v2.cu",
+     "native/resident_smc_v3.cu",
+     "native/resident_classic_ta_v3.cu",
+     "native/resident_trim_prefilter_v1.cu",
+ ];
+@@ -651,7 +652,8 @@ fn main() {
+ 
+ fn emit_rerun_contract(cuda_feature: bool) {
+     println!("cargo:rerun-if-changed=native/neoethos_gpu_cuda.h");
++    println!("cargo:rerun-if-changed=native/resident_higher_timeframe_alignment_v3_abi.cuh");
+     println!("cargo:rerun-if-changed=native/resident_quant_v3_abi.cuh");
+     println!("cargo:rerun-if-changed=native/resident_trim_prefilter_v1_abi.cuh");
+     println!("cargo:rerun-if-changed=native/resident_session_v2_abi.cuh");
+     println!("cargo:rerun-if-changed=native/layout_asserts.cpp");
+diff --git a/crates/neoethos-gpu-cuda/src/lib.rs b/crates/neoethos-gpu-cuda/src/lib.rs
+--- a/crates/neoethos-gpu-cuda/src/lib.rs
++++ b/crates/neoethos-gpu-cuda/src/lib.rs
+@@ -10,9 +10,13 @@ use thiserror::Error;
+ #[cfg(feature = "cuda")]
+ pub mod resident_classic_ta_v3;
+ #[cfg(feature = "cuda")]
+ pub mod resident_feature_store_v3;
++#[cfg(feature = "cuda")]
++pub mod resident_higher_timeframe_alignment_v3;
++#[cfg(feature = "cuda-device-fixtures")]
++pub mod resident_higher_timeframe_alignment_v3_device_fixture;
+ #[cfg(feature = "cuda")]
+ pub mod resident_footprint_v2;
+ #[cfg(feature = "cuda")]
+ pub mod resident_quant_v3;
+ #[cfg(feature = "cuda")]
+diff --git a/crates/neoethos-gpu-cuda/src/resident_feature_store_v3.rs b/crates/neoethos-gpu-cuda/src/resident_feature_store_v3.rs
+--- a/crates/neoethos-gpu-cuda/src/resident_feature_store_v3.rs
++++ b/crates/neoethos-gpu-cuda/src/resident_feature_store_v3.rs
+@@ -14,11 +14,15 @@ use crate::population::{
+ use crate::resident_classic_ta_v3::{
+     ResidentClassicTaExecutorErrorV3, ResidentClassicTaExecutorV3,
+     ResidentClassicTaPreDeviceMemoryReceiptV4, ResidentClassicTaRecipeV3,
+ };
+ use crate::resident_footprint_v2::{
+     ResidentFootprintRuntimeReceiptV2, launch_resident_footprint_v2,
+ };
++use crate::resident_higher_timeframe_alignment_v3::{
++    ResidentHigherTimeframeDirectParentV3, ResidentHigherTimeframeExecutorV3,
++    ResidentHigherTimeframeLaunchAuthorityV3, ResidentHigherTimeframeRuntimeReceiptV3,
++};
+ use crate::resident_quant_v3::{
+     ResidentQuantLaunchAuthorityV3, ResidentQuantRuntimeReceiptV3, launch_resident_quant_v3,
+ };
+ use crate::resident_regime_v3::{ResidentRegimeRuntimeReceiptV3, launch_resident_regime_v3};
+@@ -1695,8 +1699,45 @@ impl ResidentFeatureStoreAssemblerV3 {
+         self.append_batch(Box::new(batch))?;
+         Ok(receipt)
+     }
+ 
++    /// Append the complete variable-width, direct-parent HTF span in exact
++    /// resolved recipe-v4 order. Each emitted batch is retired before the
++    /// executor may release its moved parent carriers.
++    pub fn append_resident_higher_timeframe_alignment_v3(
++        &mut self,
++        parents: Vec<ResidentHigherTimeframeDirectParentV3>,
++        admitted_global_bindings: Vec<ResidentFeatureColumnBindingV3>,
++        launch_authority: ResidentHigherTimeframeLaunchAuthorityV3,
++    ) -> Result<ResidentHigherTimeframeRuntimeReceiptV3, ResidentFeatureStoreCudaErrorV3> {
++        let mut executor = {
++            let run_device = self.run_device.as_ref().ok_or_else(|| {
++                ResidentFeatureStoreCudaErrorV3::InvalidInput(
++                    "run-device admission was moved before HTF-v3 execution".into(),
++                )
++            })?;
++            let base_parent = self.parent_source.as_deref().ok_or_else(|| {
++                ResidentFeatureStoreCudaErrorV3::InvalidInput(
++                    "resident base parent was moved before HTF-v3 execution".into(),
++                )
++            })?;
++            ResidentHigherTimeframeExecutorV3::new(
++                run_device,
++                base_parent,
++                parents,
++                admitted_global_bindings,
++                launch_authority,
++            )?
++        };
++        while let Some(batch) = executor.next_pending_batch_v3()? {
++            self.append_batch(Box::new(batch))?;
++            while !self.try_retire_completed_batch()? {
++                std::thread::yield_now();
++            }
++        }
++        executor.finish_v3()
++    }
++
+     /// Launch and append the atomic twenty-three-column Session-v2 state
+     /// machine from the retained parent. Data's move-only launch authority
+     /// binds these outputs to one exact canonical millisecond input.
+     pub fn append_resident_session_v2(

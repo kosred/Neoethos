@@ -144,12 +144,13 @@ struct SuperTrendState {
     double factor;
     double prev_lower_band;
     double prev_upper_band;
+    double prev_supertrend;
     double prev_k;
     bool has_prev_lower_band;
     bool has_prev_upper_band;
+    bool has_prev_supertrend;
     bool has_prev_k;
     bool prev_atr_ready;
-    int prev_direction;
 
     __device__ void init(double factor_value) {
         factor = factor_value;
@@ -159,12 +160,13 @@ struct SuperTrendState {
     __device__ void reset() {
         prev_lower_band = NAN;
         prev_upper_band = NAN;
+        prev_supertrend = NAN;
         prev_k = NAN;
         has_prev_lower_band = false;
         has_prev_upper_band = false;
+        has_prev_supertrend = false;
         has_prev_k = false;
         prev_atr_ready = false;
-        prev_direction = 1;
     }
 
     __device__ void update(double k, double atr, double* supertrend, int* direction) {
@@ -183,7 +185,7 @@ struct SuperTrendState {
 
         if (!prev_atr_ready) {
             *direction = 1;
-        } else if (prev_direction == 1) {
+        } else if (has_prev_supertrend && prev_supertrend == prev_upper) {
             *direction = k > upper_band ? -1 : 1;
         } else if (k < lower_band) {
             *direction = 1;
@@ -194,12 +196,13 @@ struct SuperTrendState {
         *supertrend = *direction == -1 ? lower_band : upper_band;
         prev_lower_band = lower_band;
         prev_upper_band = upper_band;
+        prev_supertrend = *supertrend;
         prev_k = k;
         has_prev_lower_band = true;
         has_prev_upper_band = true;
+        has_prev_supertrend = true;
         has_prev_k = true;
         prev_atr_ready = true;
-        prev_direction = *direction;
     }
 };
 
@@ -448,10 +451,9 @@ extern "C" __global__ void range_filtered_trend_signals_batch_f64(
 // early return at :610-613 is the only thing it gates. Its VALUE feeds the
 // supertrend, trend, state and signal columns, none of which is this one. So
 // readiness is reproduced exactly and the band ratchet is not carried -- which
-// also side-steps a divergence in the 25-parameter kernel above, where
-// `prev_direction == 1` stands in for the CPU's `prev_supertrend ==
-// Some(prev_upper_band)` (:394); those disagree whenever a zero ATR makes the
-// two bands equal.
+// The full-output kernel above preserves the scalar recurrence's previous
+// Supertrend value explicitly. A previous direction is not an equivalent
+// proxy when zero ATR or a zero factor makes the two bands coincide.
 //
 // ARITHMETIC ORDER:
 //   * KalmanState: `gain = covariance / (covariance + alpha*period)` is formed

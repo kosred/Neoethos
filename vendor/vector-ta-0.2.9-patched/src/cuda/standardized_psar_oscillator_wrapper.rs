@@ -1,14 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::standardized_psar_oscillator::{
-    expand_grid_standardized_psar_oscillator, StandardizedPsarOscillatorBatchRange,
-    StandardizedPsarOscillatorParams,
+    StandardizedPsarOscillatorBatchRange, StandardizedPsarOscillatorParams,
+    expand_grid_standardized_psar_oscillator,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};

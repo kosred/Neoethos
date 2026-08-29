@@ -1,29 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaWclprice};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::DeviceArrayF32Py;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use std::error::Error;
 use thiserror::Error;
 
@@ -45,10 +25,6 @@ pub struct WclpriceOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct WclpriceParams;
 
 impl Default for WclpriceParams {
@@ -214,7 +190,6 @@ pub fn wclprice_with_kernel(
     Ok(WclpriceOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 
 pub fn wclprice_into(input: &WclpriceInput, out: &mut [f64]) -> Result<(), WclpriceError> {
@@ -764,381 +739,18 @@ impl WclpriceStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "wclprice")]
-#[pyo3(signature = (high, low, close, kernel=None))]
-pub fn wclprice_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{PyArray1, PyArrayMethods};
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-    let cs = close.as_slice()?;
-    let len = hs.len().min(ls.len()).min(cs.len());
-    let out = unsafe { PyArray1::<f64>::new(py, [len], false) };
-    let out_slice = unsafe { out.as_slice_mut()? };
-    let input = WclpriceInput::from_slices(hs, ls, cs);
-    let kern = validate_kernel(kernel, false)?;
-    py.allow_threads(|| wclprice_into_slice(out_slice, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "WclpriceStream")]
-pub struct WclpriceStreamPy {
-    stream: WclpriceStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl WclpriceStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        Ok(WclpriceStreamPy {
-            stream: WclpriceStream::default(),
-        })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "wclprice_batch")]
-#[pyo3(signature = (high, low, close, kernel=None))]
-pub fn wclprice_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-    let cs = close.as_slice()?;
-
-    let rows = 1usize;
-    let cols = hs.len().min(ls.len()).min(cs.len());
-
-    let size = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [size], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let batch_kernel = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        let simd = match batch_kernel {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            other => other,
-        };
-        wclprice_batch_inner_into(hs, ls, cs, simd, true, out_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    dict.set_item("periods", vec![0u64].into_pyarray(py))?;
-    dict.set_item("offsets", vec![0.0f64].into_pyarray(py))?;
-    dict.set_item("sigmas", vec![0.0f64].into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wclprice_cuda_dev")]
-#[pyo3(signature = (high, low, close, device_id=0))]
-pub fn wclprice_cuda_dev_py(
-    py: Python<'_>,
-    high: numpy::PyReadonlyArray1<'_, f32>,
-    low: numpy::PyReadonlyArray1<'_, f32>,
-    close: numpy::PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-    let cs = close.as_slice()?;
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaWclprice::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.wclprice_batch_dev(hs, ls, cs, &WclpriceBatchRange)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wclprice_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, device_id=0))]
-pub fn wclprice_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_f32: numpy::PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let hs = high_f32.as_slice()?;
-    let ls = low_f32.as_slice()?;
-    let cs = close_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaWclprice::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.wclprice_batch_dev(hs, ls, cs, &WclpriceBatchRange)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wclprice_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, device_id=0))]
-pub fn wclprice_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h_shape = high_tm_f32.shape();
-    if h_shape != low_tm_f32.shape() || h_shape != close_tm_f32.shape() {
-        return Err(PyValueError::new_err(
-            "high/low/close matrices must share shape",
-        ));
-    }
-    let rows = h_shape[0];
-    let cols = h_shape[1];
-    let hs = high_tm_f32.as_slice()?;
-    let ls = low_tm_f32.as_slice()?;
-    let cs = close_tm_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaWclprice::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.wclprice_many_series_one_param_time_major_dev(hs, ls, cs, cols, rows)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wclprice_js(high: &[f64], low: &[f64], close: &[f64]) -> Result<Vec<f64>, JsValue> {
-    if high.is_empty() || low.is_empty() || close.is_empty() {
-        return Err(JsValue::from_str("wclprice: Empty data provided"));
-    }
-
-    let input = WclpriceInput::from_slices(high, low, close);
-    let mut output = vec![0.0; high.len().min(low.len()).min(close.len())];
-
-    wclprice_into_slice(&mut output, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wclprice_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wclprice_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wclprice_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let input = WclpriceInput::from_slices(high, low, close);
-
-        if high_ptr == out_ptr || low_ptr == out_ptr || close_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            wclprice_into_slice(&mut temp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            wclprice_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WclpriceBatchConfig {}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WclpriceBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<WclpriceParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = wclprice_batch)]
-pub fn wclprice_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    cfg: JsValue,
-) -> Result<JsValue, JsValue> {
-    let _cfg: WclpriceBatchConfig =
-        serde_wasm_bindgen::from_value(cfg).unwrap_or(WclpriceBatchConfig {});
-    let out = wclprice_batch_inner(high, low, close, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = WclpriceBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wclprice_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let rows = 1;
-
-        if high_ptr == out_ptr || low_ptr == out_ptr || close_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            wclprice_batch_inner_into(high, low, close, detect_best_kernel(), false, &mut temp)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            wclprice_batch_inner_into(high, low, close, detect_best_kernel(), false, out)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wclprice_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = wclprice_js(high, low, close)?;
-    crate::write_wasm_f64_output("wclprice_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wclprice_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    cfg: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = wclprice_batch_unified_js(high, low, close, cfg)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "wclprice_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     #[test]
     fn test_wclprice_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let input = WclpriceInput::from_candles(&candles);
 
@@ -1175,8 +787,8 @@ mod tests {
     }
     fn check_wclprice_candles(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let input = WclpriceInput::from_candles(&candles);
         let output = wclprice_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -1216,8 +828,8 @@ mod tests {
 
     fn check_wclprice_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = WclpriceInput::from_candles(&candles);
         let result = wclprice_with_kernel(&input, kernel)?;
@@ -1244,8 +856,8 @@ mod tests {
     fn check_wclprice_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = WclpriceInput::from_candles(&candles);
         let output = wclprice_with_kernel(&input, kernel)?;
@@ -1544,8 +1156,8 @@ mod tests {
     generate_all_wclprice_tests!(check_wclprice_property);
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = WclpriceBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c)?;
@@ -1560,8 +1172,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = WclpriceBatchBuilder::new()
             .kernel(kernel)
@@ -1704,26 +1316,26 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {} ({}): Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                        "[{}] Config {} ({}): Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 						 in WCLPRICE batch at index {}",
-						test, cfg_idx, desc, val, bits, idx
-					);
+                        test, cfg_idx, desc, val, bits, idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {} ({}): Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                        "[{}] Config {} ({}): Found init_matrix_prefixes poison value {} (0x{:016X}) \
 						 in WCLPRICE batch at index {}",
-						test, cfg_idx, desc, val, bits, idx
-					);
+                        test, cfg_idx, desc, val, bits, idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {} ({}): Found make_uninit_matrix poison value {} (0x{:016X}) \
+                        "[{}] Config {} ({}): Found make_uninit_matrix poison value {} (0x{:016X}) \
 						 in WCLPRICE batch at index {}",
-						test, cfg_idx, desc, val, bits, idx
-					);
+                        test, cfg_idx, desc, val, bits, idx
+                    );
                 }
             }
         }

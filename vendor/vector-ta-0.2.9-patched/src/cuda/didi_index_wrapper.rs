@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::didi_index::{DidiIndexBatchRange, DidiIndexParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
@@ -250,6 +250,9 @@ impl CudaDidiIndex {
         let mut short_lengths = Vec::with_capacity(rows);
         let mut medium_lengths = Vec::with_capacity(rows);
         let mut long_lengths = Vec::with_capacity(rows);
+        let mut short_stride = 0usize;
+        let mut medium_stride = 0usize;
+        let mut long_stride = 0usize;
         for combo in &combos {
             let short_length = combo.short_length.unwrap_or(3);
             let medium_length = combo.medium_length.unwrap_or(8);
@@ -275,9 +278,24 @@ impl CudaDidiIndex {
                     "not enough valid data: needed={needed}, valid={valid}"
                 )));
             }
-            short_lengths.push(short_length as i32);
-            medium_lengths.push(medium_length as i32);
-            long_lengths.push(long_length as i32);
+            short_lengths.push(i32::try_from(short_length).map_err(|_| {
+                CudaDidiIndexError::InvalidInput(format!(
+                    "short_length exceeds CUDA i32 ABI: {short_length}"
+                ))
+            })?);
+            medium_lengths.push(i32::try_from(medium_length).map_err(|_| {
+                CudaDidiIndexError::InvalidInput(format!(
+                    "medium_length exceeds CUDA i32 ABI: {medium_length}"
+                ))
+            })?);
+            long_lengths.push(i32::try_from(long_length).map_err(|_| {
+                CudaDidiIndexError::InvalidInput(format!(
+                    "long_length exceeds CUDA i32 ABI: {long_length}"
+                ))
+            })?);
+            short_stride = short_stride.max(short_length);
+            medium_stride = medium_stride.max(medium_length);
+            long_stride = long_stride.max(long_length);
         }
 
         let input_bytes = cols
@@ -306,9 +324,24 @@ impl CudaDidiIndex {
             .checked_mul(std::mem::size_of::<f64>())
             .and_then(|value| value.checked_mul(4))
             .ok_or_else(|| CudaDidiIndexError::InvalidInput("output bytes overflow".into()))?;
+        let short_ring_elems = rows
+            .checked_mul(short_stride)
+            .ok_or_else(|| CudaDidiIndexError::InvalidInput("short ring overflow".into()))?;
+        let medium_ring_elems = rows
+            .checked_mul(medium_stride)
+            .ok_or_else(|| CudaDidiIndexError::InvalidInput("medium ring overflow".into()))?;
+        let long_ring_elems = rows
+            .checked_mul(long_stride)
+            .ok_or_else(|| CudaDidiIndexError::InvalidInput("long ring overflow".into()))?;
+        let scratch_bytes = short_ring_elems
+            .checked_add(medium_ring_elems)
+            .and_then(|value| value.checked_add(long_ring_elems))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f64>()))
+            .ok_or_else(|| CudaDidiIndexError::InvalidInput("ring bytes overflow".into()))?;
         let required = input_bytes
             .checked_add(params_bytes)
             .and_then(|value| value.checked_add(output_bytes))
+            .and_then(|value| value.checked_add(scratch_bytes))
             .ok_or_else(|| CudaDidiIndexError::InvalidInput("required bytes overflow".into()))?;
         Self::will_fit(required, DEFAULT_HEADROOM)?;
 
@@ -320,6 +353,31 @@ impl CudaDidiIndex {
         let d_out_long = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
         let d_out_crossover = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
         let d_out_crossunder = unsafe { DeviceBuffer::<f64>::uninitialized(output_elems)? };
+        let d_short_rings = unsafe { DeviceBuffer::<f64>::uninitialized(short_ring_elems)? };
+        let d_medium_rings = unsafe { DeviceBuffer::<f64>::uninitialized(medium_ring_elems)? };
+        let d_long_rings = unsafe { DeviceBuffer::<f64>::uninitialized(long_ring_elems)? };
+
+        let cols_i32 = i32::try_from(cols).map_err(|_| {
+            CudaDidiIndexError::InvalidInput(format!("bar count exceeds CUDA i32 ABI: {cols}"))
+        })?;
+        let rows_i32 = i32::try_from(rows).map_err(|_| {
+            CudaDidiIndexError::InvalidInput(format!("row count exceeds CUDA i32 ABI: {rows}"))
+        })?;
+        let short_stride_i32 = i32::try_from(short_stride).map_err(|_| {
+            CudaDidiIndexError::InvalidInput(format!(
+                "short ring stride exceeds CUDA i32 ABI: {short_stride}"
+            ))
+        })?;
+        let medium_stride_i32 = i32::try_from(medium_stride).map_err(|_| {
+            CudaDidiIndexError::InvalidInput(format!(
+                "medium ring stride exceeds CUDA i32 ABI: {medium_stride}"
+            ))
+        })?;
+        let long_stride_i32 = i32::try_from(long_stride).map_err(|_| {
+            CudaDidiIndexError::InvalidInput(format!(
+                "long ring stride exceeds CUDA i32 ABI: {long_stride}"
+            ))
+        })?;
 
         let func = self
             .module
@@ -336,11 +394,17 @@ impl CudaDidiIndex {
         unsafe {
             launch!(func<<<grid, block, 0, stream>>>(
                 d_data.as_device_ptr(),
-                cols as i32,
+                cols_i32,
                 d_short_lengths.as_device_ptr(),
                 d_medium_lengths.as_device_ptr(),
                 d_long_lengths.as_device_ptr(),
-                rows as i32,
+                rows_i32,
+                d_short_rings.as_device_ptr(),
+                short_stride_i32,
+                d_medium_rings.as_device_ptr(),
+                medium_stride_i32,
+                d_long_rings.as_device_ptr(),
+                long_stride_i32,
                 d_out_short.as_device_ptr(),
                 d_out_long.as_device_ptr(),
                 d_out_crossover.as_device_ptr(),

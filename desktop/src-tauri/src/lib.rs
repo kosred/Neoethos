@@ -13,7 +13,8 @@ use neoethos_core::execution_budget::{
     InstalledExecutionBudget, StartupEvent, StartupRuntimeKind, StartupTrace,
     format_startup_diagnostics, parse_parent_cpu_assignment,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tauri::Manager;
 
 const EMBEDDED_CONFIG_YAML: &[u8] = include_bytes!("../resources/config.yaml");
 const EMBEDDED_SYMBOL_METADATA_JSON: &[u8] = include_bytes!("../resources/symbol_metadata.json");
@@ -217,16 +218,16 @@ mod mcp_sidecar {
     /// Locate + spawn the sidecar. Called AFTER `prepare_data_root` so the
     /// CWD is the per-user data root — `mcp_servers.json` lives there and
     /// the sidecar's relative default resolves to it.
-    pub fn start() {
+    pub fn start(resource_dir: Option<&std::path::Path>) {
         let bin_name = if cfg!(windows) {
             "neoethos-mcp.exe"
         } else {
             "neoethos-mcp"
         };
-        // Search every place the bundler might have put the sidecar, in
-        // priority order, so it is found regardless of how the installer laid
-        // it out (audit follow-up: a locally-built 0.5.3 packaged before the
-        // sidecar finished building shipped without it beside the exe).
+        // Search the path reported by Tauri first, then the two development /
+        // portable layouts. Linux deb/rpm resources live under
+        // `/usr/lib/NeoEthos`, not beside the `/usr/bin` executable, so current
+        // executable discovery alone is not a packaged-runtime contract.
         //
         // `NEOETHOS_MCP_PATH` used to be consulted first. It is DELETED: an
         // environment variable that redirects which BINARY this shell launches
@@ -238,6 +239,9 @@ mod mcp_sidecar {
         // is still set.
         let mut checked: Vec<std::path::PathBuf> = Vec::new();
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(resource_dir) = resource_dir {
+            candidates.push(resource_dir.join(bin_name));
+        }
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(dir) = exe_path.parent() {
                 candidates.push(dir.join(bin_name)); // beside the exe
@@ -254,8 +258,9 @@ mod mcp_sidecar {
         let Some(exe) = exe else {
             eprintln!(
                 "MCP sidecar binary '{bin_name}' not found — MCP tools unavailable this session. \
-                 Put it beside the app executable (or in its resources/ dir), or reinstall from \
-                 a build that bundles it. Checked: {}",
+                 Reinstall from a build that bundles it in Tauri's resource directory. \
+                 Portable/development builds may put it beside the app executable. \
+                 Checked: {}",
                 checked
                     .iter()
                     .map(|p| p.display().to_string())
@@ -280,7 +285,11 @@ mod mcp_sidecar {
         }
         match cmd.spawn() {
             Ok(child) => {
-                eprintln!("MCP sidecar started: {} (pid {})", exe.display(), child.id());
+                eprintln!(
+                    "MCP sidecar started: {} (pid {})",
+                    exe.display(),
+                    child.id()
+                );
                 if let Ok(mut slot) = CHILD.lock() {
                     *slot = Some(child);
                 }
@@ -333,7 +342,7 @@ mod mesh_sidecar {
         };
         match slot.as_mut() {
             Some(child) => match child.try_wait() {
-                Ok(None) => true,             // still running
+                Ok(None) => true, // still running
                 _ => {
                     *slot = None; // exited or errored → clear the dead handle
                     false
@@ -343,20 +352,23 @@ mod mesh_sidecar {
         }
     }
 
-    /// Locate the sidecar binary — the SAME search order as `mcp_sidecar` so it
-    /// is found however the installer laid it out (beside the exe, or a
-    /// `resources/` subdir).
+    /// Locate the sidecar binary — the SAME search order as `mcp_sidecar`:
+    /// Tauri's authoritative resource directory first, followed by portable
+    /// layouts beside the executable or in its `resources/` child.
     ///
     /// `NEOETHOS_MESH_PATH` is DELETED, for the same reason as
     /// `NEOETHOS_MCP_PATH`: redirecting which binary joins a P2P swarm is not
     /// something an environment variable should be able to do silently.
-    fn locate() -> Option<std::path::PathBuf> {
+    fn locate(resource_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
         let bin_name = if cfg!(windows) {
             "neoethos-mesh.exe"
         } else {
             "neoethos-mesh"
         };
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(resource_dir) = resource_dir {
+            candidates.push(resource_dir.join(bin_name));
+        }
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(dir) = exe_path.parent() {
                 candidates.push(dir.join(bin_name));
@@ -370,15 +382,15 @@ mod mesh_sidecar {
     /// Called at startup (a no-op when disabled) and by the UI toggle. MUST run
     /// after `backend::start` so the ephemeral API-port file the mesh reads to
     /// find our `/federation` bridge already exists.
-    pub fn start() {
+    pub fn start(resource_dir: Option<&std::path::Path>) {
         if !is_enabled() || is_running() {
             return;
         }
-        let Some(exe) = locate() else {
+        let Some(exe) = locate(resource_dir) else {
             eprintln!(
                 "mesh sidecar 'neoethos-mesh' not found — mesh unavailable this session. \
-                 Put it beside the app executable (or in its resources/ dir), or reinstall \
-                 from a build that bundles it."
+                 Reinstall from a build that bundles it in Tauri's resource directory. \
+                 Portable/development builds may put it beside the executable."
             );
             return;
         };
@@ -397,7 +409,11 @@ mod mesh_sidecar {
         }
         match cmd.spawn() {
             Ok(child) => {
-                eprintln!("mesh sidecar started: {} (pid {})", exe.display(), child.id());
+                eprintln!(
+                    "mesh sidecar started: {} (pid {})",
+                    exe.display(),
+                    child.id()
+                );
                 if let Ok(mut slot) = CHILD.lock() {
                     *slot = Some(child);
                 }
@@ -417,10 +433,10 @@ mod mesh_sidecar {
     }
 
     /// Persist the operator's opt-in choice and start/stop the sidecar to match.
-    pub fn set_enabled(enabled: bool) {
+    pub fn set_enabled(enabled: bool, resource_dir: Option<&std::path::Path>) {
         if enabled {
             let _ = std::fs::write(enabled_marker(), "1");
-            start();
+            start(resource_dir);
         } else {
             let _ = std::fs::remove_file(enabled_marker());
             stop();
@@ -450,8 +466,9 @@ fn mesh_status() -> MeshStatus {
 /// Flip the mesh on/off from the UI: persists the opt-in and starts/stops the
 /// sidecar immediately (no app restart needed).
 #[tauri::command]
-fn mesh_set_enabled(enabled: bool) -> MeshStatus {
-    mesh_sidecar::set_enabled(enabled);
+fn mesh_set_enabled(app: tauri::AppHandle, enabled: bool) -> MeshStatus {
+    let resource_dir = app.path().resource_dir().ok();
+    mesh_sidecar::set_enabled(enabled, resource_dir.as_deref());
     MeshStatus {
         enabled: mesh_sidecar::is_enabled(),
         running: mesh_sidecar::is_running(),
@@ -553,7 +570,10 @@ fn prepare_data_root() -> Result<PathBuf, String> {
     {
         match std::env::set_current_dir(dir) {
             Ok(()) => {
-                eprintln!("data root → exe dir (config.yaml present): {}", dir.display());
+                eprintln!(
+                    "data root → exe dir (config.yaml present): {}",
+                    dir.display()
+                );
                 record_config_path(dir.join("config.yaml"));
                 return RESOLVED_CONFIG_PATH.get().cloned().ok_or_else(|| {
                     "failed to record executable-directory config path".to_string()
@@ -643,23 +663,64 @@ fn app_info() -> AppInfo {
     }
 }
 
-/// Symbols present on disk (e.g. EURUSD, GBPUSD, XAUUSD …).
-#[tauri::command]
-async fn list_symbols() -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let root = resolve_data_root();
-        neoethos_data::discover_symbols(&root).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExactDatasetGenerationReceipt {
+    #[serde(deserialize_with = "deserialize_canonical_dataset_identity")]
+    dataset_identity: neoethos_data::CanonicalDatasetIdentity,
+    generation: String,
 }
 
-/// Timeframes available for a symbol (M1, M5, H1, …), ordered.
+fn deserialize_canonical_dataset_identity<'de, D>(
+    deserializer: D,
+) -> Result<neoethos_data::CanonicalDatasetIdentity, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    neoethos_data::CanonicalDatasetIdentity::from_path_component(&encoded).map_err(|error| {
+        serde::de::Error::custom(format!(
+            "invalid canonical dataset identity {encoded:?}: {error}"
+        ))
+    })
+}
+
+fn verify_selected_generation_receipt(
+    selection: &ExactDatasetGenerationReceipt,
+    actual_generation: &str,
+) -> Result<(), String> {
+    if selection.generation != actual_generation {
+        return Err(format!(
+            "selected generation receipt for {} is stale or invalid: selected {:?}, current {:?}; refresh the Data inventory and select the exact current generation",
+            selection.dataset_identity.to_path_component(),
+            selection.generation,
+            actual_generation,
+        ));
+    }
+    Ok(())
+}
+
+fn load_exact_dataset_generation(
+    root: &std::path::Path,
+    selection: &ExactDatasetGenerationReceipt,
+) -> Result<neoethos_data::CanonicalOhlcvFrame, String> {
+    let loaded = neoethos_data::load_canonical_timeframe(root, &selection.dataset_identity)
+        .map_err(|error| format!("{error:#}"))?;
+    verify_selected_generation_receipt(selection, loaded.artifact().generation_id())?;
+    Ok(loaded)
+}
+
+/// Return the timeframe bound into one exact, fully verified generation.
+/// Dataset inventory is the only multi-identity listing API; this command
+/// never expands an identity from symbol text.
 #[tauri::command]
-async fn list_timeframes(symbol: String) -> Result<Vec<String>, String> {
+async fn list_timeframes(selection: ExactDatasetGenerationReceipt) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = resolve_data_root();
-        neoethos_data::discover_timeframes(&root, &symbol).map_err(|e| e.to_string())
+        let loaded = load_exact_dataset_generation(&root, &selection)?;
+        Ok(vec![
+            loaded.artifact().frame_timeframe().as_str().to_owned(),
+        ])
     })
     .await
     .map_err(|e| e.to_string())?
@@ -676,18 +737,17 @@ struct Candle {
     close: f64,
 }
 
-/// Trailing `limit` candles for (symbol, timeframe), read straight from the
-/// Vortex file. Returned ascending by time (the loader normalises order).
+/// Trailing `limit` candles from one exact, fully verified canonical Vortex
+/// generation. Returned ascending by time (the loader normalises order).
 #[tauri::command]
 async fn chart(
-    symbol: String,
-    timeframe: String,
+    selection: ExactDatasetGenerationReceipt,
     limit: Option<usize>,
 ) -> Result<Vec<Candle>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = resolve_data_root();
-        let ohlcv = neoethos_data::load_symbol_timeframe(&root, &symbol, &timeframe)
-            .map_err(|e| e.to_string())?;
+        let loaded = load_exact_dataset_generation(&root, &selection)?;
+        let ohlcv = loaded.ohlcv();
         let n = ohlcv.close.len();
         if n == 0 {
             return Ok::<Vec<Candle>, String>(Vec::new());
@@ -718,18 +778,57 @@ async fn chart(
     .map_err(|e| e.to_string())?
 }
 
-/// Open a native OS file picker for a data file to import (CSV/Parquet/TSV).
+struct ImportPickerFilter {
+    name: &'static str,
+    extensions: &'static [&'static str],
+}
+
+const IMPORT_PICKER_FILTERS: &[ImportPickerFilter] = &[
+    ImportPickerFilter {
+        name: "CSV",
+        extensions: &["csv"],
+    },
+    ImportPickerFilter {
+        name: "TSV",
+        extensions: &["tsv"],
+    },
+    ImportPickerFilter {
+        name: "JSON array",
+        extensions: &["json"],
+    },
+    ImportPickerFilter {
+        name: "JSON Lines",
+        extensions: &["jsonl", "ndjson"],
+    },
+    ImportPickerFilter {
+        name: "Parquet",
+        extensions: &["parquet"],
+    },
+    ImportPickerFilter {
+        name: "Arrow IPC file",
+        extensions: &["arrow", "feather", "ipc"],
+    },
+    ImportPickerFilter {
+        name: "Arrow IPC stream",
+        extensions: &["arrows", "ipcstream"],
+    },
+    ImportPickerFilter {
+        name: "Vortex",
+        extensions: &["vortex", "vtx"],
+    },
+];
+
+/// Open a native OS file picker for one of the eight explicit import formats.
 /// Returns the chosen absolute path, or `None` if the user cancelled — the
 /// webview's `<input type=file>` can't expose a real path, so the import needs
 /// this native dialog.
 #[tauri::command]
 async fn pick_data_file() -> Result<Option<String>, String> {
-    let file = rfd::AsyncFileDialog::new()
-        .set_title("Choose a data file to import")
-        .add_filter("Data files", &["csv", "tsv", "parquet", "txt"])
-        .add_filter("All files", &["*"])
-        .pick_file()
-        .await;
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose a data file to import");
+    for filter in IMPORT_PICKER_FILTERS {
+        dialog = dialog.add_filter(filter.name, filter.extensions);
+    }
+    let file = dialog.pick_file().await;
     Ok(file.map(|f| f.path().to_string_lossy().to_string()))
 }
 
@@ -737,44 +836,203 @@ async fn pick_data_file() -> Result<Option<String>, String> {
 /// Discovery pre-flight can show the operator EXACTLY what's about to be
 /// searched (years of data + bar count per pair) before they start.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SymbolCoverage {
-    symbol: String,
-    bars: usize,
-    first_ms: i64,
-    last_ms: i64,
-    years: f64,
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SymbolCoverage {
+    Verified {
+        #[serde(rename = "datasetIdentity")]
+        dataset_identity: String,
+        generation: String,
+        symbol: String,
+        bars: usize,
+        #[serde(rename = "firstMs")]
+        first_ms: i64,
+        #[serde(rename = "lastMs")]
+        last_ms: i64,
+        years: f64,
+    },
+    Failed {
+        #[serde(rename = "datasetIdentity")]
+        dataset_identity: String,
+        generation: String,
+        symbol: String,
+        error: SymbolCoverageError,
+    },
+}
+
+#[derive(Serialize)]
+struct SymbolCoverageError {
+    kind: &'static str,
+    detail: String,
+}
+
+fn summarize_exact_dataset_coverage<E>(
+    selection: &ExactDatasetGenerationReceipt,
+    result: Result<neoethos_data::CanonicalOhlcvFrame, E>,
+) -> SymbolCoverage
+where
+    E: std::fmt::Display,
+{
+    let dataset_identity = selection.dataset_identity.to_path_component();
+    let generation = selection.generation.clone();
+    let symbol = selection.dataset_identity.symbol_name().to_owned();
+    match result {
+        Ok(loaded) => {
+            let ohlcv = loaded.ohlcv();
+            let bars = ohlcv.close.len();
+            let timestamps = ohlcv.timestamp.as_deref().unwrap_or_default();
+            let first_ms = timestamps.first().copied().unwrap_or(0);
+            let last_ms = timestamps.last().copied().unwrap_or(0);
+            // 365.25 d/yr in ms.
+            let years = if last_ms > first_ms {
+                (last_ms - first_ms) as f64 / 31_557_600_000.0
+            } else {
+                0.0
+            };
+            SymbolCoverage::Verified {
+                dataset_identity,
+                generation,
+                symbol,
+                bars,
+                first_ms,
+                last_ms,
+                years,
+            }
+        }
+        Err(error) => SymbolCoverage::Failed {
+            dataset_identity,
+            generation,
+            symbol,
+            error: SymbolCoverageError {
+                kind: "load_failed",
+                detail: format!("{error:#}"),
+            },
+        },
+    }
 }
 
 #[tauri::command]
 async fn data_coverage(
-    symbols: Vec<String>,
-    timeframe: String,
+    selections: Vec<ExactDatasetGenerationReceipt>,
 ) -> Result<Vec<SymbolCoverage>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = resolve_data_root();
-        let out = symbols
+        let out = selections
             .iter()
-            .map(|sym| match neoethos_data::load_symbol_timeframe(&root, sym, &timeframe) {
-                Ok(o) => {
-                    let ts = o.timestamp.unwrap_or_default();
-                    let first = ts.first().copied().unwrap_or(0);
-                    let last = ts.last().copied().unwrap_or(0);
-                    // 365.25 d/yr in ms.
-                    let years = if last > first {
-                        (last - first) as f64 / 31_557_600_000.0
-                    } else {
-                        0.0
-                    };
-                    SymbolCoverage { symbol: sym.clone(), bars: o.close.len(), first_ms: first, last_ms: last, years }
-                }
-                Err(_) => SymbolCoverage { symbol: sym.clone(), bars: 0, first_ms: 0, last_ms: 0, years: 0.0 },
+            .map(|selection| {
+                let result = load_exact_dataset_generation(&root, selection);
+                summarize_exact_dataset_coverage(selection, result)
             })
             .collect::<Vec<_>>();
         Ok(out)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod gate1_desktop_contract_tests {
+    use super::*;
+    use std::fmt;
+
+    fn exact_receipt(generation: &str) -> ExactDatasetGenerationReceipt {
+        ExactDatasetGenerationReceipt {
+            dataset_identity: neoethos_data::CanonicalDatasetIdentity::external(
+                "desktop-contract-test",
+                "EURUSD",
+                neoethos_data::CanonicalTimeframe::M5,
+                neoethos_data::BarTimestampConvention::BarOpen,
+            )
+            .expect("the fixture identity must satisfy the canonical contract"),
+            generation: generation.to_owned(),
+        }
+    }
+
+    #[test]
+    fn native_picker_advertises_exactly_the_eight_explicit_import_formats() {
+        let advertised = IMPORT_PICKER_FILTERS
+            .iter()
+            .map(|filter| (filter.name, filter.extensions))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            advertised,
+            vec![
+                ("CSV", &["csv"][..]),
+                ("TSV", &["tsv"][..]),
+                ("JSON array", &["json"][..]),
+                ("JSON Lines", &["jsonl", "ndjson"][..]),
+                ("Parquet", &["parquet"][..]),
+                ("Arrow IPC file", &["arrow", "feather", "ipc"][..]),
+                ("Arrow IPC stream", &["arrows", "ipcstream"][..]),
+                ("Vortex", &["vortex", "vtx"][..]),
+            ]
+        );
+        assert!(
+            advertised.iter().all(|(_, extensions)| {
+                !extensions.contains(&"txt") && !extensions.contains(&"*")
+            })
+        );
+    }
+
+    struct AlternateDiagnostic;
+
+    impl fmt::Display for AlternateDiagnostic {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if formatter.alternate() {
+                formatter.write_str(
+                    "canonical dataset rejected: ambiguous identity: found 2 verified sources",
+                )
+            } else {
+                formatter.write_str("canonical dataset rejected")
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_loader_failure_is_typed_and_keeps_the_full_diagnostic() {
+        let selection = exact_receipt("g1-selected-generation");
+        let expected_identity = selection.dataset_identity.to_path_component();
+        let coverage = summarize_exact_dataset_coverage(
+            &selection,
+            Err::<neoethos_data::CanonicalOhlcvFrame, _>(AlternateDiagnostic),
+        );
+
+        match coverage {
+            SymbolCoverage::Failed {
+                dataset_identity,
+                generation,
+                symbol,
+                error,
+            } => {
+                assert_eq!(dataset_identity, expected_identity);
+                assert_eq!(generation, "g1-selected-generation");
+                assert_eq!(symbol, "EURUSD");
+                assert_eq!(error.kind, "load_failed");
+                assert_eq!(
+                    error.detail,
+                    "canonical dataset rejected: ambiguous identity: found 2 verified sources"
+                );
+            }
+            SymbolCoverage::Verified { .. } => {
+                panic!("a loader error must never be represented as verified empty coverage")
+            }
+        }
+    }
+
+    #[test]
+    fn generation_receipt_requires_an_exact_case_sensitive_match() {
+        let selection = exact_receipt("g1-AbCd");
+
+        verify_selected_generation_receipt(&selection, "g1-AbCd")
+            .expect("the selected and current generation are identical");
+
+        let error = verify_selected_generation_receipt(&selection, "g1-abcd")
+            .expect_err("even a case-only change must reject the stale receipt");
+        assert!(error.contains(&selection.dataset_identity.to_path_component()));
+        assert!(error.contains("g1-AbCd"));
+        assert!(error.contains("g1-abcd"));
+        assert!(error.contains("refresh the Data inventory"));
+    }
 }
 
 /// Environment variables this shell used to obey and no longer does, paired
@@ -844,6 +1102,12 @@ struct PreparedDesktopStartup {
 
 fn prepare_desktop_startup(raw_args: &[String]) -> Result<PreparedDesktopStartup, String> {
     let mut trace = StartupTrace::default();
+    // Tauri and Tokio both create threads. Linux SourceSeal signal ownership
+    // must be installed on the initial thread before either runtime exists.
+    neoethos_data::initialize_source_seal_before_runtime().map_err(|error| error.to_string())?;
+    trace
+        .record(StartupEvent::ImportSignalPreflightCompleted)
+        .map_err(|error| error.to_string())?;
     warn_retired_env_vars();
     let config_path = prepare_data_root()?;
     trace
@@ -976,11 +1240,12 @@ pub fn run() {
             broker::start_spot_streamer();
             // MCP sidecar (best-effort): exposes configured MCP servers' tools
             // to the Supervisor's approval-gated actions on 127.0.0.1:7431.
-            mcp_sidecar::start();
+            let resource_dir = app.path().resource_dir().ok();
+            mcp_sidecar::start(resource_dir.as_deref());
             // P2P mesh sidecar (best-effort, OPT-IN): auto-starts only if the
             // operator enabled the mesh in the Federation panel. Runs AFTER
             // backend::start so the API-port file it reads already exists.
-            mesh_sidecar::start();
+            mesh_sidecar::start(resource_dir.as_deref());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -992,7 +1257,6 @@ pub fn run() {
             mesh_set_enabled,
             // local vortex data
             app_info,
-            list_symbols,
             list_timeframes,
             chart,
             pick_data_file,

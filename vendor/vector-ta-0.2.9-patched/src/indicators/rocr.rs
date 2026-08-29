@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -15,32 +15,6 @@ use std::mem::ManuallyDrop;
 use thiserror::Error;
 
 const DEFAULT_PERIOD: usize = 10;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for RocrInput<'a> {
     #[inline(always)]
@@ -67,10 +41,6 @@ pub struct RocrOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RocrParams {
     pub period: Option<usize>,
 }
@@ -271,7 +241,6 @@ pub fn rocr_with_kernel(input: &RocrInput, kernel: Kernel) -> Result<RocrOutput,
     Ok(RocrOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn rocr_into(input: &RocrInput, out: &mut [f64]) -> Result<(), RocrError> {
     rocr_into_slice(out, input, Kernel::Auto)
 }
@@ -1069,525 +1038,16 @@ unsafe fn rocr_row_scalar_mul(
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "rocr")]
-#[pyo3(signature = (data, period=DEFAULT_PERIOD, kernel=None))]
-pub fn rocr_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = RocrParams {
-        period: Some(period),
-    };
-    let input = RocrInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| rocr_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RocrStream")]
-pub struct RocrStreamPy {
-    stream: RocrStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RocrStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = RocrParams {
-            period: Some(period),
-        };
-        let stream =
-            RocrStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(RocrStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "RocrDeviceArrayF32", unsendable)]
-pub struct RocrDeviceArrayF32Py {
-    pub inner: DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    device_id: i32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl RocrDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let inner = &self.inner;
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (inner.cols * itemsize, itemsize))?;
-        let ptr_val = inner.buf.as_device_ptr().as_raw() as usize;
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, _copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        _copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        if let Some(dev) = dl_device {
-            if let Ok((dtype, did)) = dev.extract::<(i32, i32)>(py) {
-                if dtype != 2 || did != self.device_id {
-                    return Err(PyValueError::new_err("dl_device mismatch for ROCR buffer"));
-                }
-            }
-        }
-
-        if let Some(s) = stream {
-            if let Ok(v) = s.extract::<i64>(py) {
-                if v == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__(stream=0) is invalid for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, self.device_id, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl RocrDeviceArrayF32Py {
-    fn new_from_cuda(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            device_id: device_id as i32,
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "rocr_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn rocr_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-    use std::mem::MaybeUninit;
-
-    let slice_in = data.as_slice()?;
-    let sweep = RocrBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let (first, _max_p) =
-        rocr_batch_prepare(slice_in, &combos).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let kern = validate_kernel(kernel, true)?;
-    let simd = match match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        k => k,
-    } {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => unreachable!(),
-    };
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rocr_batch_py: rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-    let warms: Vec<usize> = combos
-        .iter()
-        .map(|c| {
-            let p = c.period.unwrap();
-            first
-                .checked_add(p)
-                .ok_or_else(|| PyValueError::new_err("rocr_batch_py: warmup overflow"))
-        })
-        .collect::<Result<_, _>>()?;
-
-    unsafe {
-        let mu: &mut [MaybeUninit<f64>] = std::slice::from_raw_parts_mut(
-            slice_out.as_mut_ptr() as *mut MaybeUninit<f64>,
-            slice_out.len(),
-        );
-        init_matrix_prefixes(mu, cols, &warms);
-    }
-
-    py.allow_threads(|| rocr_batch_inner_into(slice_in, &combos, first, simd, true, slice_out))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "rocr_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn rocr_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<RocrDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaRocr;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice = data_f32.as_slice()?;
-    let sweep = RocrBatchRange {
-        period: period_range,
-    };
-    let result: PyResult<(DeviceArrayF32, Arc<Context>, u32)> = py.allow_threads(|| {
-        let cuda = CudaRocr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let buf = cuda
-            .rocr_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((buf, ctx, dev_id))
-    });
-    let (inner, ctx, dev_id) = result?;
-
-    Ok(RocrDeviceArrayF32Py::new_from_cuda(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "rocr_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, period, device_id=0))]
-pub fn rocr_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<RocrDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaRocr;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_tm_f32.as_slice()?;
-    let result: PyResult<(DeviceArrayF32, Arc<Context>, u32)> = py.allow_threads(|| {
-        let cuda = CudaRocr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let buf = cuda
-            .rocr_many_series_one_param_time_major_dev(slice, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((buf, ctx, dev_id))
-    });
-    let (inner, ctx, dev_id) = result?;
-    Ok(RocrDeviceArrayF32Py::new_from_cuda(inner, ctx, dev_id))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rocr_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = RocrParams {
-        period: Some(period),
-    };
-    let input = RocrInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    rocr_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rocr_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rocr_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rocr_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = RocrParams {
-            period: Some(period),
-        };
-        let input = RocrInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            rocr_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            rocr_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RocrBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RocrBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<RocrParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = rocr_batch)]
-pub fn rocr_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: RocrBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = RocrBatchRange {
-        period: config.period_range,
-    };
-
-    let output = rocr_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = RocrBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rocr_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to rocr_batch_into"));
-    }
-
-    unsafe {
-        let sweep = RocrBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let period_count = combos.len();
-
-        if in_ptr == out_ptr {
-            let total_elements = period_count
-                .checked_mul(len)
-                .ok_or_else(|| JsValue::from_str("rocr_batch_into: rows*cols overflow"))?;
-            let mut temp = vec![0.0; total_elements];
-            let (first, _max_p) = {
-                let data = std::slice::from_raw_parts(in_ptr, len);
-                rocr_batch_prepare(data, &combos).map_err(|e| JsValue::from_str(&e.to_string()))?
-            };
-
-            use std::mem::MaybeUninit;
-            let warms: Vec<usize> = combos
-                .iter()
-                .map(|c| {
-                    let p = c.period.unwrap();
-                    first
-                        .checked_add(p)
-                        .ok_or_else(|| JsValue::from_str("rocr_batch_into: warmup overflow"))
-                })
-                .collect::<Result<_, _>>()?;
-
-            {
-                let mu: &mut [MaybeUninit<f64>] = std::slice::from_raw_parts_mut(
-                    temp.as_mut_ptr() as *mut MaybeUninit<f64>,
-                    total_elements,
-                );
-                init_matrix_prefixes(mu, len, &warms);
-            }
-
-            let simd = match detect_best_batch_kernel() {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                _ => Kernel::Scalar,
-            };
-            {
-                let data = std::slice::from_raw_parts(in_ptr, len);
-                rocr_batch_inner_into(data, &combos, first, simd, false, &mut temp)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, total_elements);
-            out.copy_from_slice(&temp);
-            return Ok(period_count);
-        }
-
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let (first, _max_p) =
-            rocr_batch_prepare(data, &combos).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let total_elements = period_count
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rocr_batch_into: rows*cols overflow"))?;
-
-        use std::mem::MaybeUninit;
-        let warms: Vec<usize> = combos
-            .iter()
-            .map(|c| {
-                let p = c.period.unwrap();
-                first
-                    .checked_add(p)
-                    .ok_or_else(|| JsValue::from_str("rocr_batch_into: warmup overflow"))
-            })
-            .collect::<Result<_, _>>()?;
-        let mu: &mut [MaybeUninit<f64>] =
-            std::slice::from_raw_parts_mut(out_ptr as *mut MaybeUninit<f64>, total_elements);
-        init_matrix_prefixes(mu, len, &warms);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total_elements);
-
-        let simd = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-        rocr_batch_inner_into(data, &combos, first, simd, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(period_count)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rocr_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = rocr_js(data, period)?;
-    crate::write_wasm_f64_output("rocr_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rocr_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = rocr_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("rocr_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_rocr_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = RocrInput::from_candles(&candles, "close", RocrParams::default());
         let baseline = rocr(&input)?.values;
@@ -1613,8 +1073,8 @@ mod tests {
 
     fn check_rocr_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = RocrParams { period: None };
         let input = RocrInput::from_candles(&candles, "close", default_params);
@@ -1626,8 +1086,8 @@ mod tests {
 
     fn check_rocr_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = RocrInput::from_candles(&candles, "close", RocrParams { period: Some(10) });
         let result = rocr_with_kernel(&input, kernel)?;
@@ -1656,8 +1116,8 @@ mod tests {
 
     fn check_rocr_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = RocrInput::with_default_candles(&candles);
         match input.data {
@@ -1720,8 +1180,8 @@ mod tests {
 
     fn check_rocr_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = RocrParams { period: Some(14) };
         let first_input = RocrInput::from_candles(&candles, "close", first_params);
@@ -1746,8 +1206,8 @@ mod tests {
 
     fn check_rocr_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = RocrInput::from_candles(&candles, "close", RocrParams { period: Some(9) });
         let res = rocr_with_kernel(&input, kernel)?;
@@ -1768,8 +1228,8 @@ mod tests {
     fn check_rocr_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 9;
 
@@ -1817,8 +1277,8 @@ mod tests {
     fn check_rocr_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             RocrParams::default(),
@@ -2114,8 +1574,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = RocrBatchBuilder::new()
             .period_static(10)
@@ -2148,8 +1608,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),

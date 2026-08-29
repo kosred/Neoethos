@@ -1,13 +1,13 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::l2_ehlers_signal_to_noise::{
-    expand_grid, L2EhlersSignalToNoiseBatchRange, L2EhlersSignalToNoiseParams,
+    L2EhlersSignalToNoiseBatchRange, L2EhlersSignalToNoiseParams, expand_grid,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};

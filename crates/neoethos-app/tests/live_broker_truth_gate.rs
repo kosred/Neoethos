@@ -212,8 +212,8 @@ fn live_eligibility_gate_is_refused_before_loading_quality_metrics() {
 #[test]
 fn obsolete_local_pnl_fallback_implementation_is_not_shipped() {
     let bridge_source = include_str!("../src/server/bridge.rs");
-    let obsolete_module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/app_services/pnl.rs");
+    let obsolete_module =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app_services/pnl.rs");
     assert!(
         !obsolete_module.exists(),
         "superseded duplicate PnL request module is still shipped"
@@ -389,11 +389,7 @@ fn account_identity_and_margin_views_do_not_use_local_financial_fallbacks() {
             include_str!("../../../desktop/src-tauri/src/broker.rs"),
         ),
     ] {
-        for forbidden in [
-            "asset_id_to_currency",
-            "fn asset_currency(",
-            "_ => \"EUR\"",
-        ] {
+        for forbidden in ["asset_id_to_currency", "fn asset_currency(", "_ => \"EUR\""] {
             assert!(
                 !source.contains(forbidden),
                 "{name} still maps broker money identity locally via {forbidden:?}"
@@ -440,7 +436,9 @@ fn live_journal_requires_complete_broker_deal_financials_and_broker_equity() {
     let gate = scoped
         .find("current_broker_financial_truth_capability_v1")
         .expect("journal entry point has a broker-truth gate");
-    let first_local_read = scoped.find("data_dir()").expect("journal resolves its data dir");
+    let first_local_read = scoped
+        .find("data_dir()")
+        .expect("journal resolves its data dir");
     assert!(
         gate < first_local_read,
         "journal touches local state before the broker-truth capability gate"

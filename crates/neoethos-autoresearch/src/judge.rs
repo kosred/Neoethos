@@ -50,9 +50,9 @@ use neoethos_search::deflated::{
 use neoethos_search::goal_report::{DEFAULT_RISK_LEVELS, build_report};
 use serde::{Deserialize, Serialize};
 
+use crate::QuoteValidatedOosTouchEvidenceV1;
 use crate::goals::{GoalSet, Scenario};
 use crate::journal::{CostBandCounts, OosWindow, RiskOutcomeRecord};
-use crate::runner::OosEvidence;
 use crate::session::{ChampionRow, Session, SweepEvidence, SweepId};
 use crate::shuffle::ShuffleNull;
 use crate::verdict::PromotionCandidate;
@@ -191,7 +191,10 @@ impl JudgeThresholds {
             ("p_reach_min".into(), format!("{:?}", self.p_reach_min)),
             ("p_ruin_max".into(), format!("{:?}", self.p_ruin_max)),
             ("oos_fraction".into(), format!("{:?}", self.oos_fraction)),
-            ("oos_t_stat_min".into(), format!("{:?}", self.oos_t_stat_min)),
+            (
+                "oos_t_stat_min".into(),
+                format!("{:?}", self.oos_t_stat_min),
+            ),
             (
                 "oos_touches_total".into(),
                 self.oos_touches_total.to_string(),
@@ -1234,7 +1237,7 @@ pub fn path_stats(monthly_returns: &[f64]) -> MonthlyPathStats {
 /// re-checked here.
 pub fn promote(
     candidate: &PromotionCandidate,
-    oos: &OosEvidence,
+    oos: &QuoteValidatedOosTouchEvidenceV1,
     th: &JudgeThresholds,
     _goals: &GoalSet,
     scenario: &Scenario,
@@ -1242,7 +1245,7 @@ pub fn promote(
 ) -> Result<PromotionOutcome> {
     let mut notes: Vec<String> = Vec::new();
 
-    let stats = mean_and_se(&oos.per_trade_net_pips);
+    let stats = mean_and_se(oos.per_trade_net_pips());
     let e_oos = stats.map(|(m, _)| m);
     let se_oos = stats.map(|(_, s)| s);
     let t_stat = stats.and_then(|(m, s)| (s > 0.0).then_some(m / s));
@@ -1260,7 +1263,7 @@ pub fn promote(
 
     let goal_bar = match scenario {
         Scenario::Risky(r) => {
-            if oos.r_multiples.is_empty() || oos.trades_per_day <= 0.0 {
+            if oos.r_multiples().is_empty() || oos.trades_per_day() <= 0.0 {
                 notes.push(
                     "no out-of-sample R-multiples, so no goal projection was possible. That is a \
                      refusal, not a P(reach) of zero."
@@ -1268,11 +1271,11 @@ pub fn promote(
                 );
             } else {
                 let report = build_report(
-                    &oos.r_multiples,
+                    oos.r_multiples(),
                     r.start_balance_usd,
                     r.target_balance_usd,
                     f64::from(r.horizon_days),
-                    oos.trades_per_day,
+                    oos.trades_per_day(),
                     DEFAULT_RISK_LEVELS,
                     session.opened.as_ref().map(|h| h.session_seed).unwrap_or(0),
                 );
@@ -1305,9 +1308,9 @@ pub fn promote(
             th.p_reach_min
         }
         Scenario::PropFirm(p) => {
-            months_total = oos.monthly_returns.len();
+            months_total = oos.monthly_returns().len();
             months_clearing = oos
-                .monthly_returns
+                .monthly_returns()
                 .iter()
                 .filter(|r| **r >= p.monthly_profit_target_pct)
                 .count();
@@ -1321,7 +1324,7 @@ pub fn promote(
                         .to_string(),
                 );
             }
-            let path = path_stats(&oos.monthly_returns);
+            let path = path_stats(oos.monthly_returns());
             if path.worst_month_loss > p.max_overall_drawdown_pct
                 && path_constraint_failure.is_none()
             {
@@ -1357,16 +1360,16 @@ pub fn promote(
     let build = |failing: Option<PromotionConjunct>, detail: String| PromotionOutcome {
         sweep: candidate.sweep,
         slot: candidate.slot,
-        window: oos.window,
+        window: oos.window(),
         promoted: failing.is_none(),
         failing_conjunct: failing.map(|c| c.label().to_string()),
         detail,
-        n_trades: oos.per_trade_net_pips.len(),
+        n_trades: oos.per_trade_net_pips().len(),
         n_min_oos: th.n_min_oos,
         e_oos_pess_pips: e_oos,
         se_oos_pips: se_oos,
         t_stat,
-        band_survives: oos.band_survives,
+        band_survives: oos.band_survives(),
         pbo_session,
         goal_metric,
         goal_bar,
@@ -1452,7 +1455,7 @@ pub fn promote(
             format!(
                 "the out-of-sample expectancy has no standard error: {} trade(s) were recorded \
                  and at least 2 are needed. No number is never good news.",
-                oos.per_trade_net_pips.len()
+                oos.per_trade_net_pips().len()
             ),
         ));
     };
@@ -1475,12 +1478,12 @@ pub fn promote(
                  applied OUT of sample.",
                 th.oos_t_stat_min,
                 e - th.oos_t_stat_min * se,
-                oos.per_trade_net_pips.len()
+                oos.per_trade_net_pips().len()
             ),
         ));
     }
 
-    if !oos.band_survives {
+    if !oos.band_survives() {
         return Ok(build(
             Some(PromotionConjunct::OosCostBand),
             "band_verdict_oos is not SurvivesBand. A result that survives only at the optimistic \
@@ -1489,12 +1492,12 @@ pub fn promote(
         ));
     }
 
-    if oos.per_trade_net_pips.len() < th.n_min_oos {
+    if oos.per_trade_net_pips().len() < th.n_min_oos {
         return Ok(build(
             Some(PromotionConjunct::OosTradeCount),
             format!(
                 "{} out-of-sample trade(s) < the derived floor of {}",
-                oos.per_trade_net_pips.len(),
+                oos.per_trade_net_pips().len(),
                 th.n_min_oos
             ),
         ));
@@ -1719,7 +1722,10 @@ mod tests {
 
         // 3. And the fix deflates rather than flatters: the bar the champion had
         //    to clear by luck alone is HIGHER at the session-wide N.
-        let before = as_the_executor_produced_it.deflated_sharpe.as_ref().unwrap();
+        let before = as_the_executor_produced_it
+            .deflated_sharpe
+            .as_ref()
+            .unwrap();
         let after = installed.deflated_sharpe.as_ref().unwrap();
         assert!(
             after.expected_max_sharpe_per_period > before.expected_max_sharpe_per_period,
@@ -1842,8 +1848,16 @@ mod tests {
             ],
             statistics: vec![passing, rejected],
             champion_rows: vec![
-                Some(champion_row("fnv64:passed", "honest", vec![0.01, 0.02, 0.03])),
-                Some(champion_row("fnv64:rejected", "outlier", vec![9.0, 9.0, 9.0])),
+                Some(champion_row(
+                    "fnv64:passed",
+                    "honest",
+                    vec![0.01, 0.02, 0.03],
+                )),
+                Some(champion_row(
+                    "fnv64:rejected",
+                    "outlier",
+                    vec![9.0, 9.0, 9.0],
+                )),
             ],
             trials_offered: N,
             wall_ms: 1,
@@ -1881,14 +1895,21 @@ mod tests {
             statistics: vec![passing, rejected],
             champion_rows: vec![
                 None,
-                Some(champion_row("fnv64:rejected", "outlier", vec![9.0, 9.0, 9.0])),
+                Some(champion_row(
+                    "fnv64:rejected",
+                    "outlier",
+                    vec![9.0, 9.0, 9.0],
+                )),
             ],
             trials_offered: N,
             wall_ms: 1,
         };
 
         let screen = screen_sweep(&evidence, &JudgeThresholds::frozen(), N, &ready_null());
-        assert!(screen.champion.is_none(), "the reject's series must not stand in");
+        assert!(
+            screen.champion.is_none(),
+            "the reject's series must not stand in"
+        );
         let why = screen.champion_refusal.expect("the drop must be NAMED");
         assert!(why.contains("no per-period champion series"), "{why}");
         // best-ever is NOT gated on the row: R2's U2 still gets its number.

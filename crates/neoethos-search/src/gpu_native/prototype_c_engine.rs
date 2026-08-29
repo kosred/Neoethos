@@ -7,16 +7,16 @@
 //! without reading anything back. `readback_compact` is the only metrics D2H
 //! boundary.
 //!
-//! Device storage is shader-portable SoA `i32`/`f32`; the C-ABI structs used by
+//! Device storage is shader-portable SoA `i32`/`f64`; the C-ABI structs used by
 //! the native-CUDA Prototype B never enter this runtime, and no native pointer
 //! ever crosses into CubeCL. Canonical `u64` candidate/scenario identity is held
 //! in resident host tables and re-attached at the single compact readback, after
 //! the device-emitted table indices have been range-validated.
 //!
 //! Prices are carried in pip units. That is the same conditioning the fused
-//! Prototype A path uses and it keeps an `f32` device path meaningful for FX
-//! prices; all comparisons and P&L terms are algebraically identical to the
-//! canonical price-space form.
+//! Prototype A path uses while preserving the canonical `f64` precision; all
+//! comparisons and P&L terms are algebraically identical to the canonical
+//! price-space form.
 
 use crate::gpu_native::engine::{EngineError, HostSurvivorSummary};
 use crate::gpu_native::prototype_a::{
@@ -36,15 +36,15 @@ pub(crate) const SMC_WIDTH: usize = 11;
 /// CPU-only build.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CPopulationHostBuffers {
-    pub close_pips: Vec<f32>,
-    pub high_pips: Vec<f32>,
-    pub low_pips: Vec<f32>,
+    pub close_pips: Vec<f64>,
+    pub high_pips: Vec<f64>,
+    pub low_pips: Vec<f64>,
     pub gap_flags: Vec<i32>,
     pub timestamp_pair: Vec<i32>,
     pub months: Vec<i32>,
     pub days: Vec<i32>,
     pub smc_rows: Vec<i32>,
-    pub adaptive_base_pips: Vec<f32>,
+    pub adaptive_base_pips: Vec<f64>,
     pub has_adaptive_base: bool,
     pub bars: usize,
     pub feature_count: usize,
@@ -64,12 +64,7 @@ impl CPopulationHostBuffers {
         } else {
             settings.pip_value
         };
-        let to_pips = |values: &[f64]| {
-            values
-                .iter()
-                .map(|value| (value / pip) as f32)
-                .collect::<Vec<f32>>()
-        };
+        let to_pips = |values: &[f64]| values.iter().map(|value| value / pip).collect::<Vec<f64>>();
 
         // Gap detection is dataset-only preprocessing in exact f64: it depends on
         // no candidate and is computed once per logical upload.
@@ -96,7 +91,7 @@ impl CPopulationHostBuffers {
             .adaptive_base_pips
             .as_ref()
             .filter(|values| values.len() == bars)
-            .map(|values| values.iter().map(|value| *value as f32).collect::<Vec<_>>());
+            .cloned();
         let has_adaptive_base = adaptive_base_pips.is_some();
 
         Ok(Self {
@@ -117,7 +112,9 @@ impl CPopulationHostBuffers {
                 debug_assert_eq!(rows.len(), bars * SMC_WIDTH);
                 rows
             },
-            adaptive_base_pips: adaptive_base_pips.unwrap_or_else(|| vec![0.0]),
+            adaptive_base_pips: adaptive_base_pips
+                .map(|values| values.to_vec())
+                .unwrap_or_else(|| vec![0.0]),
             has_adaptive_base,
             bars,
             feature_count: dataset.feature_count,
@@ -129,12 +126,12 @@ fn saturating_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
-/// Widen validated device metrics into the canonical compact summary.
+/// Validate canonical device metrics and build the compact summary.
 ///
 /// Table indices are range-checked and non-finite values are rejected: a device
 /// result never becomes a survivor row on trust alone.
 pub fn survivor_summary_from_device_metrics(
-    metrics: &[f32],
+    metrics: &[f64],
     genes: &PrototypeAGeneUpload,
     scenarios: &PrototypeAScenarioUpload,
 ) -> Result<HostSurvivorSummary, EngineError> {
@@ -158,7 +155,7 @@ pub fn survivor_summary_from_device_metrics(
                     "Prototype C metric [{candidate}][{slot}] is non-finite"
                 )));
             }
-            row[slot] = f64::from(value);
+            row[slot] = value;
         }
         candidate_ids.push(genes.candidate_ids[candidate]);
         scenario_ids.push(scenarios.scenarios[candidate].scenario_id);
@@ -209,28 +206,28 @@ mod tests {
     }
 
     #[test]
-    fn pip_space_conversion_is_reversible_within_f32_resolution() {
+    fn pip_space_conversion_preserves_f64_values() {
         let (dataset, _, _) = TinyPopulationFixture::new(1, 96, 2).prototype_a_uploads();
         let pip = dataset.settings.pip_value;
         let buffers = CPopulationHostBuffers::from_dataset(&dataset).unwrap();
         for (bar, close) in dataset.close.iter().enumerate() {
-            let restored = f64::from(buffers.close_pips[bar]) * pip;
+            let restored = buffers.close_pips[bar] * pip;
             assert!(
-                (restored - close).abs() < pip * 1.0e-2,
+                (restored - close).abs() <= f64::EPSILON * close.abs().max(1.0) * 2.0,
                 "bar {bar}: {restored} vs {close}"
             );
         }
     }
 
     #[test]
-    fn device_metric_widening_rejects_wrong_shape_and_non_finite_values() {
+    fn device_metric_validation_rejects_wrong_shape_and_non_finite_values() {
         let (_, genes, scenarios) = TinyPopulationFixture::new(3, 96, 4).prototype_a_uploads();
-        let mut metrics = vec![0.0_f32; genes.population() * C_METRIC_WIDTH];
+        let mut metrics = vec![0.0_f64; genes.population() * C_METRIC_WIDTH];
         let summary = survivor_summary_from_device_metrics(&metrics, &genes, &scenarios).unwrap();
         assert_eq!(summary.candidate_ids, genes.candidate_ids);
         assert_eq!(summary.metrics.len(), genes.population());
 
-        metrics[5] = f32::NAN;
+        metrics[5] = f64::NAN;
         assert!(survivor_summary_from_device_metrics(&metrics, &genes, &scenarios).is_err());
 
         assert!(survivor_summary_from_device_metrics(&metrics[..3], &genes, &scenarios).is_err());

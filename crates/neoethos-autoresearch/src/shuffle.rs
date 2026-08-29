@@ -777,8 +777,7 @@ mod tests {
             assert!(tau > 0, "rows={rows}: a rotation of zero is not a control");
             assert!(tau < rows, "rows={rows}: tau={tau} would wrap to a no-op");
             assert!(
-                tau as f64 >= TAU_LO_FRAC * rows as f64
-                    && tau as f64 <= TAU_HI_FRAC * rows as f64,
+                tau as f64 >= TAU_LO_FRAC * rows as f64 && tau as f64 <= TAU_HI_FRAC * rows as f64,
                 "rows={rows}: tau={tau} left the band"
             );
         }

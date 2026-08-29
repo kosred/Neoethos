@@ -5,6 +5,9 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+// Official latest-tie/lookback/output authority:
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_AROON.c
+
 static __forceinline__ __device__ bool both_finite(float h, float l) {
     return isfinite(h) && isfinite(l);
 }
@@ -87,7 +90,7 @@ void aroon_batch_f32(const float* __restrict__ high,
 
             while (h_tail > h_head) {
                 const int last_slot = (h_tail_idx == 0) ? (W - 1) : (h_tail_idx - 1);
-                if (dq_max_val[last_slot] < h) {
+                if (dq_max_val[last_slot] <= h) {
                     --h_tail;
                     h_tail_idx = last_slot;
                 } else {
@@ -101,7 +104,7 @@ void aroon_batch_f32(const float* __restrict__ high,
 
             while (l_tail > l_head) {
                 const int last_slot = (l_tail_idx == 0) ? (W - 1) : (l_tail_idx - 1);
-                if (dq_min_val[last_slot] > l) {
+                if (dq_min_val[last_slot] >= l) {
                     --l_tail;
                     l_tail_idx = last_slot;
                 } else {
@@ -128,12 +131,8 @@ void aroon_batch_f32(const float* __restrict__ high,
                     const int dist_hi = t - idx_hi;
                     const int dist_lo = t - idx_lo;
 
-                    const float up = (dist_hi == 0) ? 100.0f
-                                     : (dist_hi >= length ? 0.0f
-                                     : fmaf(-(float)dist_hi, scale, 100.0f));
-                    const float dn = (dist_lo == 0) ? 100.0f
-                                     : (dist_lo >= length ? 0.0f
-                                     : fmaf(-(float)dist_lo, scale, 100.0f));
+                    const float up = scale * (float)(length - dist_hi);
+                    const float dn = scale * (float)(length - dist_lo);
                     out_up  [base + t] = up;
                     out_down[base + t] = dn;
                 }
@@ -210,7 +209,7 @@ void aroon_many_series_one_param_f32(const float* __restrict__ high_tm,
 
             while (h_tail > h_head) {
                 const int last_slot = (h_tail_idx == 0) ? (W - 1) : (h_tail_idx - 1);
-                if (dq_max_val[last_slot] < h) {
+                if (dq_max_val[last_slot] <= h) {
                     --h_tail;
                     h_tail_idx = last_slot;
                 } else {
@@ -224,7 +223,7 @@ void aroon_many_series_one_param_f32(const float* __restrict__ high_tm,
 
             while (l_tail > l_head) {
                 const int last_slot = (l_tail_idx == 0) ? (W - 1) : (l_tail_idx - 1);
-                if (dq_min_val[last_slot] > l) {
+                if (dq_min_val[last_slot] >= l) {
                     --l_tail;
                     l_tail_idx = last_slot;
                 } else {
@@ -250,12 +249,8 @@ void aroon_many_series_one_param_f32(const float* __restrict__ high_tm,
                 } else {
                     const int dist_hi = t - idx_hi;
                     const int dist_lo = t - idx_lo;
-                    const float up = (dist_hi == 0) ? 100.0f
-                                     : (dist_hi >= length ? 0.0f
-                                     : fmaf(-(float)dist_hi, scale, 100.0f));
-                    const float dn = (dist_lo == 0) ? 100.0f
-                                     : (dist_lo >= length ? 0.0f
-                                     : fmaf(-(float)dist_lo, scale, 100.0f));
+                    const float up = scale * (float)(length - dist_hi);
+                    const float dn = scale * (float)(length - dist_lo);
                     out_up_tm  [t * stride + s] = up;
                     out_down_tm[t * stride + s] = dn;
                 }
@@ -266,8 +261,8 @@ void aroon_many_series_one_param_f32(const float* __restrict__ high_tm,
 
 
 /* ===========================================================================
- * NEOETHOS f64 LANE — aroon (output "first" = aroon UP, index 0 of
- * fallback_outputs &["first","second"], cuda_non_ma_generated.rs)
+ * NEOETHOS f64 LANE — aroon (primary output "up", followed by canonical
+ * registry sibling "down")
  * ---------------------------------------------------------------------------
  * CPU oracle: src/indicators/aroon.rs:523 `aroon_scalar`.
  *
@@ -294,24 +289,18 @@ void aroon_many_series_one_param_f32(const float* __restrict__ high_tm,
 #define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
 #endif
 
-extern "C" __global__
-void aroon_neo_batch_f64(const double* __restrict__ high,
-                         const double* __restrict__ low,
-                         int series_len,
-                         const int* __restrict__ periods,
-                         int n_combos,
-                         int first_valid,
-                         double* __restrict__ out)
+static __device__ __forceinline__
+void aroon_row_f64(const double* __restrict__ high,
+                   const double* __restrict__ low,
+                   int len,
+                   int length,
+                   double* __restrict__ out_up,
+                   double* __restrict__ out_down)
 {
-    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (combo >= n_combos) return;
-    (void)first_valid;
-
-    const int len = series_len;
-    double* __restrict__ o = out + (size_t)combo * (size_t)len;
-    const int length = periods[combo];
-
-    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    for (int i = 0; i < len; ++i) {
+        out_up[i] = NEO_F64_NAN;
+        if (out_down != nullptr) out_down[i] = NEO_F64_NAN;
+    }
     if (length < 1 || length > len) return;      // aroon_scalar asserts this range
 
     const double scale_100 = 100.0 / (double)length;
@@ -334,7 +323,8 @@ void aroon_neo_batch_f64(const double* __restrict__ high,
         if (i < length) continue;
 
         if (invalid_count != 0) {
-            o[i] = NEO_F64_NAN;
+            out_up[i] = NEO_F64_NAN;
+            if (out_down != nullptr) out_down[i] = NEO_F64_NAN;
             have_extremes = false;
             continue;
         }
@@ -346,9 +336,9 @@ void aroon_neo_batch_f64(const double* __restrict__ high,
             mx = high[start]; mn = low[start];
             for (int j = start + 1; j <= i; ++j) {
                 const double hv = high[j];
-                if (hv > mx) { mx = hv; maxi = j; }
+                if (hv >= mx) { mx = hv; maxi = j; }
                 const double lv = low[j];
-                if (lv < mn) { mn = lv; mini = j; }
+                if (lv <= mn) { mn = lv; mini = j; }
             }
             have_extremes = true;
         } else {
@@ -356,20 +346,68 @@ void aroon_neo_batch_f64(const double* __restrict__ high,
                 maxi = start; mx = high[maxi];
                 for (int j = start + 1; j <= i; ++j) {
                     const double hv = high[j];
-                    if (hv > mx) { mx = hv; maxi = j; }
+                    if (hv >= mx) { mx = hv; maxi = j; }
                 }
-            } else if (h > mx) { maxi = i; mx = h; }
+            } else if (h >= mx) { maxi = i; mx = h; }
 
             if (mini < start) {
                 mini = start; mn = low[mini];
                 for (int j = start + 1; j <= i; ++j) {
                     const double lv = low[j];
-                    if (lv < mn) { mn = lv; mini = j; }
+                    if (lv <= mn) { mn = lv; mini = j; }
                 }
-            } else if (l < mn) { mini = i; mn = l; }
+            } else if (l <= mn) { mini = i; mn = l; }
         }
 
-        const double dist_hi = (double)(i - maxi);
-        o[i] = fmax(100.0 - dist_hi * scale_100, 0.0);     // aroon UP
+        const int dist_hi = i - maxi;
+        out_up[i] = scale_100 * (double)(length - dist_hi);
+        if (out_down != nullptr) {
+            const int dist_lo = i - mini;
+            out_down[i] = scale_100 * (double)(length - dist_lo);
+        }
     }
+}
+
+extern "C" __global__
+void aroon_neo_batch_f64(const double* __restrict__ high,
+                         const double* __restrict__ low,
+                         int series_len,
+                         const int* __restrict__ periods,
+                         int n_combos,
+                         int first_valid,
+                         double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)first_valid;
+
+    const int len = series_len;
+    double* __restrict__ out_up = out + (size_t)combo * (size_t)len;
+    aroon_row_f64(high, low, len, periods[combo], out_up, nullptr);
+}
+
+extern "C" __global__
+void aroon_outputs_f64(const double* __restrict__ high,
+                       const double* __restrict__ low,
+                       int series_len,
+                       const int* __restrict__ periods,
+                       int n_combos,
+                       int first_valid,
+                       double* __restrict__ out_up,
+                       double* __restrict__ out_down)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)first_valid;
+
+    const int len = series_len;
+    const size_t offset = (size_t)combo * (size_t)len;
+    aroon_row_f64(
+        high,
+        low,
+        len,
+        periods[combo],
+        out_up + offset,
+        out_down + offset
+    );
 }

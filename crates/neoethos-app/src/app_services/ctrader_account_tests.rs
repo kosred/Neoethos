@@ -200,6 +200,10 @@ fn deal_list_response_parses_recent_deals() {
     assert_eq!(deals[0].execution_price, Some(1.0990));
     assert_eq!(deals[0].gross_profit, Some(12.5));
     assert_eq!(deals[0].fee, Some(-0.4));
+    assert_eq!(
+        deals[0].pnl_conversion_fee_state,
+        Some(crate::app_services::broker_deal_economics::BrokerPnlConversionFeeV1::NotApplied)
+    );
 }
 
 #[test]
@@ -241,7 +245,21 @@ fn deal_list_response_scales_close_detail_money_digits_four_fields() {
     assert_eq!(deals[0].fee, Some(-0.004));
     assert_eq!(deals[0].swap, Some(-0.0015));
     assert_eq!(deals[0].pnl_conversion_fee, Some(-0.001));
-    assert_eq!(deals[0].net_profit, Some(0.1185));
+    assert_eq!(deals[0].account_id, 712345);
+    assert_eq!(deals[0].filled_volume_raw_centi_units, 1500);
+    assert_eq!(deals[0].money_digits, Some(4));
+    assert_eq!(deals[0].gross_profit_raw_scaled, Some(1250));
+    assert_eq!(deals[0].commission_raw_scaled_signed, Some(-40));
+    assert_eq!(deals[0].swap_raw_scaled_signed, Some(-15));
+    assert_eq!(
+        deals[0].pnl_conversion_fee_state,
+        Some(
+            crate::app_services::broker_deal_economics::BrokerPnlConversionFeeV1::Charged {
+                raw_scaled_signed: -10,
+            }
+        )
+    );
+    assert_eq!(deals[0].component_sum_account_currency, Some(0.1185));
 }
 
 #[test]
@@ -394,8 +412,13 @@ fn deal_list_close_detail_money_digits_two_fields() {
     assert_eq!(d.fee, Some(-0.40));
     assert_eq!(d.pnl_conversion_fee, Some(-0.10));
     // net = gross + swap + fee + pnl_conversion_fee = 12.50 - 0.15 - 0.40 - 0.10 = 11.85
-    let net = d.net_profit.expect("net profit computed");
-    assert!((net - 11.85).abs() < 1e-9, "net_profit broken: {net}");
+    let component_sum = d
+        .component_sum_account_currency
+        .expect("signed broker components summed");
+    assert!(
+        (component_sum - 11.85).abs() < 1e-9,
+        "component sum broken: {component_sum}"
+    );
 }
 
 /// §5.1.3 catch-all — the remaining cTrader monetary entities listed in
@@ -462,6 +485,7 @@ fn account_runtime_loader_authenticates_then_loads_trader_reconcile_and_deals() 
     assert_eq!(runtime.trader.account_id, 712345);
     assert_eq!(runtime.reconcile.positions.len(), 1);
     assert_eq!(runtime.recent_deals.len(), 1);
+    assert_eq!(runtime.environment, CTraderEnvironment::Demo);
     assert_eq!(runtime.unrealized_pnl, 11.34);
     assert_eq!(runtime.deposit_asset_name, "USD");
     assert_eq!(

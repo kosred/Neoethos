@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -75,10 +59,6 @@ pub struct QqeWeightedOscillatorOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct QqeWeightedOscillatorParams {
     pub length: Option<usize>,
     pub factor: Option<f64>,
@@ -259,13 +239,9 @@ pub enum QqeWeightedOscillatorError {
     EmptyInputData,
     #[error("qqe_weighted_oscillator: all values are NaN")]
     AllValuesNaN,
-    #[error(
-        "qqe_weighted_oscillator: invalid length: length = {length}, data length = {data_len}"
-    )]
+    #[error("qqe_weighted_oscillator: invalid length: length = {length}, data length = {data_len}")]
     InvalidLength { length: usize, data_len: usize },
-    #[error(
-        "qqe_weighted_oscillator: invalid smooth: smooth = {smooth}, data length = {data_len}"
-    )]
+    #[error("qqe_weighted_oscillator: invalid smooth: smooth = {smooth}, data length = {data_len}")]
     InvalidSmooth { smooth: usize, data_len: usize },
     #[error("qqe_weighted_oscillator: invalid factor: {factor}")]
     InvalidFactor { factor: f64 },
@@ -992,282 +968,6 @@ unsafe fn mu_slice_as_f64_slice_mut(buf: &mut ManuallyDrop<Vec<MaybeUninit<f64>>
 unsafe fn vec_f64_from_mu_guard(buf: ManuallyDrop<Vec<MaybeUninit<f64>>>) -> Vec<f64> {
     let mut buf = buf;
     Vec::from_raw_parts(buf.as_mut_ptr() as *mut f64, buf.len(), buf.capacity())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "qqe_weighted_oscillator")]
-#[pyo3(signature = (data, length=DEFAULT_LENGTH, factor=DEFAULT_FACTOR, smooth=DEFAULT_SMOOTH, weight=DEFAULT_WEIGHT, kernel=None))]
-pub fn qqe_weighted_oscillator_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    factor: f64,
-    smooth: usize,
-    weight: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = QqeWeightedOscillatorInput::from_slice(
-        data,
-        QqeWeightedOscillatorParams {
-            length: Some(length),
-            factor: Some(factor),
-            smooth: Some(smooth),
-            weight: Some(weight),
-        },
-    );
-    let output = py
-        .allow_threads(|| qqe_weighted_oscillator_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("rsi", output.rsi.into_pyarray(py))?;
-    dict.set_item("trailing_stop", output.trailing_stop.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "qqe_weighted_oscillator_batch")]
-#[pyo3(signature = (data, length_range, factor_range, smooth_range, weight_range, kernel=None))]
-pub fn qqe_weighted_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    factor_range: (f64, f64, f64),
-    smooth_range: (usize, usize, usize),
-    weight_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            qqe_weighted_oscillator_batch_with_kernel(
-                data,
-                &QqeWeightedOscillatorBatchRange {
-                    length: length_range,
-                    factor: factor_range,
-                    smooth: smooth_range,
-                    weight: weight_range,
-                },
-                kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let total = output.rows * output.cols;
-    let arrays = [
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-    ];
-    unsafe { arrays[0].as_slice_mut()? }.copy_from_slice(&output.rsi);
-    unsafe { arrays[1].as_slice_mut()? }.copy_from_slice(&output.trailing_stop);
-
-    let dict = PyDict::new(py);
-    dict.set_item("rsi", arrays[0].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "trailing_stop",
-        arrays[1].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "factors",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.factor.unwrap_or(DEFAULT_FACTOR))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.smooth.unwrap_or(DEFAULT_SMOOTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "weights",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.weight.unwrap_or(DEFAULT_WEIGHT))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "QqeWeightedOscillatorStream")]
-pub struct QqeWeightedOscillatorStreamPy {
-    stream: QqeWeightedOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl QqeWeightedOscillatorStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, factor=DEFAULT_FACTOR, smooth=DEFAULT_SMOOTH, weight=DEFAULT_WEIGHT))]
-    fn new(length: usize, factor: f64, smooth: usize, weight: f64) -> PyResult<Self> {
-        let stream = QqeWeightedOscillatorStream::try_new(QqeWeightedOscillatorParams {
-            length: Some(length),
-            factor: Some(factor),
-            smooth: Some(smooth),
-            weight: Some(weight),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream
-            .update(value)
-            .map(|output| (output.rsi, output.trailing_stop))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct QqeWeightedOscillatorJsOutput {
-    pub rsi: Vec<f64>,
-    pub trailing_stop: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = qqe_weighted_oscillator_js)]
-pub fn qqe_weighted_oscillator_js(
-    data: &[f64],
-    length: usize,
-    factor: f64,
-    smooth: usize,
-    weight: f64,
-) -> Result<JsValue, JsValue> {
-    let input = QqeWeightedOscillatorInput::from_slice(
-        data,
-        QqeWeightedOscillatorParams {
-            length: Some(length),
-            factor: Some(factor),
-            smooth: Some(smooth),
-            weight: Some(weight),
-        },
-    );
-    let output = qqe_weighted_oscillator_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&QqeWeightedOscillatorJsOutput {
-        rsi: output.rsi,
-        trailing_stop: output.trailing_stop,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct QqeWeightedOscillatorBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub factor_range: (f64, f64, f64),
-    pub smooth_range: (usize, usize, usize),
-    pub weight_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct QqeWeightedOscillatorBatchJsOutput {
-    pub rsi: Vec<f64>,
-    pub trailing_stop: Vec<f64>,
-    pub lengths: Vec<usize>,
-    pub factors: Vec<f64>,
-    pub smooths: Vec<usize>,
-    pub weights: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = qqe_weighted_oscillator_batch)]
-pub fn qqe_weighted_oscillator_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: QqeWeightedOscillatorBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let output = qqe_weighted_oscillator_batch_with_kernel(
-        data,
-        &QqeWeightedOscillatorBatchRange {
-            length: cfg.length_range,
-            factor: cfg.factor_range,
-            smooth: cfg.smooth_range,
-            weight: cfg.weight_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&QqeWeightedOscillatorBatchJsOutput {
-        rsi: output.rsi,
-        trailing_stop: output.trailing_stop,
-        lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH))
-            .collect(),
-        factors: output
-            .combos
-            .iter()
-            .map(|combo| combo.factor.unwrap_or(DEFAULT_FACTOR))
-            .collect(),
-        smooths: output
-            .combos
-            .iter()
-            .map(|combo| combo.smooth.unwrap_or(DEFAULT_SMOOTH))
-            .collect(),
-        weights: output
-            .combos
-            .iter()
-            .map(|combo| combo.weight.unwrap_or(DEFAULT_WEIGHT))
-            .collect(),
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_weighted_oscillator_output_into_js(
-    data: &[f64],
-    length: usize,
-    factor: f64,
-    smooth: usize,
-    weight: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = qqe_weighted_oscillator_js(data, length, factor, smooth, weight)?;
-    crate::write_wasm_object_f64_outputs("qqe_weighted_oscillator_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_weighted_oscillator_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = qqe_weighted_oscillator_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "qqe_weighted_oscillator_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

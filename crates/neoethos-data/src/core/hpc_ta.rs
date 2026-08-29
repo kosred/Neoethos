@@ -1,10 +1,12 @@
 use super::super::Ohlcv;
 use crate::core::all_indicators::ALL_INDICATORS;
 use crate::core::feature_budget::{VocabularyBudget, admit_indicators};
+use crate::core::features::{FeatureCellValidity, FeatureColumnF64};
 use crate::core::indicator_ledger::{
     DropReason, IndicatorLedger, expected_non_producing, has_finite_variation, output_ids_for,
     planned_output_count, series_fingerprint,
 };
+use crate::core::timestamps::validate_canonical_millisecond_timestamps;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -12,8 +14,14 @@ use vector_ta::indicators::dispatch::{
     IndicatorComputeOutput, IndicatorComputeRequest, IndicatorDataRef, IndicatorSeries, ParamKV,
     ParamValue, compute_cpu,
 };
+use vector_ta::indicators::registry::indicator_data_requirements;
 use vector_ta::utilities::data_loader::Candles;
 use vector_ta::utilities::enums::Kernel;
+use vector_ta::utilities::helpers::detect_best_kernel;
+
+#[cfg(all(test, feature = "gpu-cuda-device-fixtures"))]
+#[path = "gpu_resident_classic_ta_v3_device_tests.rs"]
+mod gpu_resident_classic_ta_v3_device_tests;
 
 /// Fewest distinct indicator ids the base pass must produce a column for
 /// before the feature build is considered sane, on a frame long enough to warm
@@ -80,7 +88,8 @@ pub fn compute_classic_ta_columns(ohlcv: &Ohlcv) -> anyhow::Result<Vec<(String, 
 }
 
 /// Process-wide policy set once by the binary that owns the operator's
-/// Settings. `None` until something sets it.
+/// Settings. The first read freezes the default `Auto` policy so a later
+/// settings install cannot relabel feature bits that were already computed.
 static POLICY_OVERRIDE: std::sync::OnceLock<IndicatorComputePolicy> = std::sync::OnceLock::new();
 
 /// Bind the indicator lane policy for this process. Idempotent-or-refuse: the
@@ -101,65 +110,164 @@ pub fn set_indicator_compute_policy(
     }
 }
 
-/// The policy a caller that does not name one gets.
+/// The exclusive policy a caller that does not name one gets.
 ///
-/// # Why this is not just `Auto`
-///
-/// It was, and that made the whole GPU-or-fail apparatus unreachable.
-/// [`IndicatorComputePolicy::RequireGpu`] existed, was correct, and had ZERO
-/// production call sites — `compute_classic_ta_columns` hardcoded `Auto`, and
-/// `Auto` turns a lane failure into a `tracing::warn!` plus CPU numbers. So on
-/// a card where the arch story is wrong, the run FINISHES, with a log line as
-/// the only symptom. That is this project's signature defect shape: the gate
-/// exists and the caller never passes through it.
-///
-/// Precedence, deliberately identical to `neoethos-search`'s backend
-/// resolution so the two cannot disagree about the same run:
-///
-/// 1. [`set_indicator_compute_policy`] — the operator's Settings.
-/// 2. `Auto`.
-///
-/// 2026-08-10 — THE SEAM IS FINALLY PLUGGED IN, and the env lever is gone.
-/// `set_indicator_compute_policy` had ZERO callers, so step 1 never fired and
-/// `NEOETHOS_REQUIRE_GPU` was the only way to reach `RequireGpu` at all: the
-/// module documented Settings as the source and read the environment instead.
-/// The installer is now called from
-/// `neoethos_search::backend::install_evaluation_backend_from_settings`, which
-/// already holds the resolved backend — so the escalation comes from the same
-/// config value (`system.enable_gpu_preference` / `models.prop_search_device`
-/// naming a `*_required` variant) that decides the search lane, and the two
-/// crates cannot disagree about one run.
-///
-/// ⚠ BEHAVIOUR CHANGE: exporting `NEOETHOS_REQUIRE_GPU=1` no longer forces
-/// `RequireGpu` here. That is a LOOSENING, so it is reported at ERROR by
-/// `neoethos_data::report_retired_env_vars()` whenever the variable is still
-/// set.
+/// The operator's resolved Settings are installed once through
+/// [`set_indicator_compute_policy`]. Without an explicit selection, the first
+/// read installs `Auto` as the immutable process policy. That ordering is part
+/// of receipt identity: a later `GpuOnly` install must fail instead of labeling
+/// already-computed CPU bits as CUDA output. `Auto` chooses one complete
+/// supported lane; it never authorizes a partial CPU/CUDA plan. The retired
+/// `NEOETHOS_REQUIRE_GPU` environment variable is still reported as an error by
+/// [`crate::report_retired_env_vars`].
 pub fn resolved_indicator_compute_policy() -> IndicatorComputePolicy {
     crate::report_retired_env_vars();
-    POLICY_OVERRIDE
-        .get()
-        .copied()
-        .unwrap_or(IndicatorComputePolicy::Auto)
+    *POLICY_OVERRIDE.get_or_init(|| IndicatorComputePolicy::Auto)
 }
 
-/// Which lane may compute the multi-period indicator sweep.
+/// Which exclusive device may compute the complete production feature plan.
 ///
-/// The base 340-indicator pass is CPU in every policy — vector-ta has no
-/// device dispatch for most of those ids, and inventing one per indicator is
-/// not something a policy flag can do. The multi-period sweep is the part that
-/// is sweep-shaped and therefore the part a card wins.
+/// A value never authorizes splitting one plan between host and device. Until
+/// the full resident CUDA graph is connected, [`Self::GpuOnly`] fails before
+/// any feature computation and [`Self::Auto`] resolves to [`Self::CpuOnly`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndicatorComputePolicy {
-    /// Use the card when this binary has the CUDA indicator lane compiled in
-    /// AND a usable device is present AND its arch matches the compiled PTX.
-    /// Otherwise use the CPU and RECORD THE REASON BY NAME in
-    /// `indicator_telemetry` (a declared fallback, not a silent one).
+    /// Select one complete supported lane. There is currently no complete GPU
+    /// plan, so this selects CPU-only; it never creates a mixed run.
     Auto,
     /// CPU only. This is the parity reference — f64 end to end.
-    Cpu,
-    /// The card or nothing. Panics rather than returning CPU numbers that
-    /// would be mistaken for device numbers. For the GPU-or-fail invariant.
-    RequireGpu,
+    CpuOnly,
+    /// GPU only. The entire requested graph must be resident and supported,
+    /// otherwise the request is rejected before CPU or CUDA work begins.
+    GpuOnly,
+}
+
+/// Exact vector-ta arithmetic lane selected for the canonical feature build.
+///
+/// This is an identity authority, not a performance hint. SIMD implementations
+/// are permitted to have different f64 bit patterns, so persisted search
+/// receipts must distinguish every lane that `Kernel::Auto` can actually
+/// select. The AVX-512 name pins the complete target-feature union required by
+/// vector-ta's current implementation rather than the misleading shorthand
+/// `avx512f` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedCanonicalFeatureMathLaneV1 {
+    CpuScalar,
+    CpuAvx2Fma,
+    CpuAvx512F64Avx2FmaDqVlBw,
+    GpuCudaF64Strict,
+}
+
+/// Runtime authority captured alongside a canonical search feature frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCanonicalFeatureExecutionAuthorityV1 {
+    pub policy: IndicatorComputePolicy,
+    pub selected_lane: ResolvedCanonicalFeatureMathLaneV1,
+    pub vector_ta_math_authority: &'static str,
+}
+
+pub const VECTOR_TA_CPU_F64_MATH_AUTHORITY_V1: &str = "neoethos.vector-ta.cpu-f64-exact-bits.v1";
+pub const VECTOR_TA_CUDA_F64_MATH_AUTHORITY_V1: &str = "neoethos.vector-ta.cuda-f64-exact-bits.v1";
+
+/// Families proven non-bit-exact by the required-card integrated M15/M30
+/// census. Standard/HPC/Adaptive remain usable only by excluding each family
+/// atomically until its CPU/CUDA value and validity authority is repaired.
+/// Full keeps the complete graph and therefore continues to fail closed.
+#[cfg(feature = "gpu-cuda")]
+const GPU_ONLY_PARITY_DEFERRED_INDICATORS_V3: &[&str] = &[
+    "geometric_bias_oscillator",
+    "gopalakrishnan_range_index",
+    "historical_volatility",
+    "ift_rsi",
+    "l1_ehlers_phasor",
+    "maaq",
+    "natr",
+    "nma",
+    "pfe",
+    "premier_rsi_oscillator",
+    "pwma",
+    "sgf",
+    "sinwma",
+    "squeeze_index",
+    "sqwma",
+    "supersmoother_3_pole",
+    "trendflex",
+    "ttm_trend",
+    "ultosc",
+    "uma",
+    "vidya",
+    "volatility_adjusted_ma",
+    "vpwma",
+    "wave_smoother",
+    "wma",
+];
+
+/// Resolve the same process policy and CPU dispatcher used by production.
+///
+/// `GpuOnly` records the strict CUDA authority. That policy still has to pass
+/// the complete pre-launch CUDA graph check before any feature computation;
+/// this function never turns an unavailable GPU request into a CPU receipt.
+pub fn resolved_canonical_feature_execution_authority_v1()
+-> ResolvedCanonicalFeatureExecutionAuthorityV1 {
+    let policy = resolved_indicator_compute_policy();
+    let (selected_lane, vector_ta_math_authority) = match policy {
+        IndicatorComputePolicy::Auto | IndicatorComputePolicy::CpuOnly => {
+            let selected_lane = match detect_best_kernel() {
+                Kernel::Scalar => ResolvedCanonicalFeatureMathLaneV1::CpuScalar,
+                Kernel::Avx2 => ResolvedCanonicalFeatureMathLaneV1::CpuAvx2Fma,
+                Kernel::Avx512 => ResolvedCanonicalFeatureMathLaneV1::CpuAvx512F64Avx2FmaDqVlBw,
+                unexpected => panic!(
+                    "vector-ta single-series Auto resolved unsupported canonical lane {unexpected:?}"
+                ),
+            };
+            (selected_lane, VECTOR_TA_CPU_F64_MATH_AUTHORITY_V1)
+        }
+        IndicatorComputePolicy::GpuOnly => (
+            ResolvedCanonicalFeatureMathLaneV1::GpuCudaF64Strict,
+            VECTOR_TA_CUDA_F64_MATH_AUTHORITY_V1,
+        ),
+    };
+    ResolvedCanonicalFeatureExecutionAuthorityV1 {
+        policy,
+        selected_lane,
+        vector_ta_math_authority,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClassicInputAvailability {
+    timestamps: bool,
+    volume: bool,
+}
+
+impl ClassicInputAvailability {
+    fn from_ohlcv(ohlcv: &Ohlcv) -> Self {
+        Self {
+            timestamps: ohlcv.timestamp.is_some(),
+            volume: ohlcv.volume.is_some(),
+        }
+    }
+
+    #[cfg(all(feature = "gpu-cuda", test))]
+    fn all_present() -> Self {
+        Self {
+            timestamps: true,
+            volume: true,
+        }
+    }
+
+    fn missing_for(self, indicator_id: &str) -> Option<&'static str> {
+        let requirements = indicator_data_requirements(indicator_id);
+        match (
+            requirements.requires_timestamps && !self.timestamps,
+            requirements.requires_volume && !self.volume,
+        ) {
+            (true, true) => Some("timestamps and volume are absent"),
+            (true, false) => Some("timestamps are absent"),
+            (false, true) => Some("volume is absent"),
+            (false, false) => None,
+        }
+    }
 }
 
 /// The exact vocabulary admission decision used by one classic-TA execution.
@@ -175,6 +283,12 @@ pub struct ClassicTaExecutionReport {
     pub max_columns: usize,
     pub admitted_indicator_ids: Vec<&'static str>,
     pub budget_deferred_indicator_ids: Vec<&'static str>,
+    /// Exact canonical-order families excluded from an explicitly versioned
+    /// GPU-only routeable subset because at least one requested output lacks a
+    /// complete resident f64 contract. Full-profile admission never uses this
+    /// escape hatch and remains atomic/fail-closed.
+    pub capability_deferred_indicator_ids: Vec<&'static str>,
+    pub capability_deferred_output_count: usize,
     /// Columns requested by the complete base vocabulary, before admission.
     pub planned_base_columns: usize,
     /// Columns represented by the admitted base IDs.
@@ -201,6 +315,184 @@ pub struct ClassicTaComputation {
     pub ledger: IndicatorLedger,
 }
 
+/// One allocation-free Classic/vector-ta admission decision, shared by the
+/// CPU reference and the strict CUDA planner.
+///
+/// The budget probe happens exactly once.  In particular, `GpuOnly` must not
+/// rebuild this object after opening a CUDA context: available RAM can change
+/// between probes, which would let the receipt describe a different admitted
+/// vocabulary from the one that actually ran.
+#[derive(Clone, Debug)]
+pub(crate) struct ClassicTaAdmissionPlan {
+    pub(crate) budget_rows: usize,
+    pub(crate) budget: VocabularyBudget,
+    pub(crate) base_budget: VocabularyBudget,
+    pub(crate) sweep_reserved: usize,
+    pub(crate) admitted_indicator_ids: Vec<&'static str>,
+    pub(crate) budget_deferred_indicator_ids: Vec<&'static str>,
+    pub(crate) capability_deferred_indicator_ids: Vec<&'static str>,
+    pub(crate) capability_deferred_output_count: usize,
+    pub(crate) gpu_route_mode: &'static str,
+    pub(crate) historical_indicator_ids: Vec<&'static str>,
+    pub(crate) planned_base_columns: usize,
+    pub(crate) admitted_base_columns: usize,
+    pub(crate) working_set: Option<std::sync::Arc<SweepBatch>>,
+    pub(crate) extended_groups: Vec<(&'static str, Vec<usize>)>,
+    pub(crate) extended_budget_deferred_indicator_ids: Vec<&'static str>,
+    pub(crate) extended_mode: &'static str,
+    pub(crate) extended_budget_columns: usize,
+    pub(crate) extended_planned_columns: usize,
+}
+
+/// One run-wide Classic/vector-ta admission decision.
+///
+/// Construction probes available RAM exactly once and, for `GpuOnly`, resolves
+/// the complete admitted CUDA graph before any feature producer or CUDA
+/// context exists.  Every direct timeframe in a multi-timeframe cube borrows
+/// this same value, so later allocations cannot silently narrow the admitted
+/// vocabulary.
+#[derive(Clone, Debug)]
+pub struct ClassicTaRunPlan {
+    policy: IndicatorComputePolicy,
+    admission: ClassicTaAdmissionPlan,
+    #[cfg(feature = "gpu-cuda")]
+    resident_cuda_launches: Option<Vec<crate::core::classic_cuda_plan::ResolvedClassicCudaLaunch>>,
+}
+
+/// Immutable projection of the one already-probed and already-resolved
+/// Classic TA run plan for the strict resident producer. This is deliberately
+/// crate-private: it carries no device authority and cannot be rebuilt by
+/// App/Search from an ordinal, a free-memory number or a caller recipe.
+#[cfg(feature = "gpu-cuda")]
+#[derive(Clone, Debug)]
+pub(crate) struct ClassicTaResidentPlanProjectionV3 {
+    pub(crate) budget_rows: usize,
+    pub(crate) available_bytes_at_admission: u64,
+    pub(crate) admitted_indicator_ids: Vec<&'static str>,
+    pub(crate) capability_deferred_indicator_ids: Vec<&'static str>,
+    pub(crate) capability_deferred_output_count: usize,
+    pub(crate) gpu_route_mode: &'static str,
+    pub(crate) extended_groups: Vec<(&'static str, Vec<usize>)>,
+    pub(crate) working_set: Option<std::sync::Arc<SweepBatch>>,
+    pub(crate) launches: Vec<crate::core::classic_cuda_plan::ResolvedClassicCudaLaunch>,
+}
+
+impl ClassicTaRunPlan {
+    pub const fn policy(&self) -> IndicatorComputePolicy {
+        self.policy
+    }
+
+    pub fn admission_report(&self) -> ClassicTaExecutionReport {
+        self.admission.execution_report(0, 0)
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    pub(crate) fn resident_admission_projection_v3(
+        &self,
+    ) -> anyhow::Result<ClassicTaResidentPlanProjectionV3> {
+        if self.policy != IndicatorComputePolicy::GpuOnly {
+            anyhow::bail!("resident Classic TA projection requires the frozen GpuOnly run plan")
+        }
+        let launches = self.resident_cuda_launches.clone().ok_or_else(|| {
+            anyhow::anyhow!("GpuOnly run plan omitted its pre-context resolved Classic CUDA graph")
+        })?;
+        Ok(ClassicTaResidentPlanProjectionV3 {
+            budget_rows: self.admission.budget_rows,
+            available_bytes_at_admission: self.admission.budget.available_bytes,
+            admitted_indicator_ids: self.admission.admitted_indicator_ids.clone(),
+            capability_deferred_indicator_ids: self
+                .admission
+                .capability_deferred_indicator_ids
+                .clone(),
+            capability_deferred_output_count: self.admission.capability_deferred_output_count,
+            gpu_route_mode: self.admission.gpu_route_mode,
+            extended_groups: self.admission.extended_groups.clone(),
+            working_set: self.admission.working_set.clone(),
+            launches,
+        })
+    }
+}
+
+impl ClassicTaAdmissionPlan {
+    pub(crate) fn execution_report(
+        &self,
+        historical_sweep_produced_columns: usize,
+        produced_columns: usize,
+    ) -> ClassicTaExecutionReport {
+        ClassicTaExecutionReport {
+            budget_rows: self.budget_rows,
+            available_bytes_at_admission: self.budget.available_bytes,
+            max_columns: self.budget.max_columns,
+            admitted_indicator_ids: self.admitted_indicator_ids.clone(),
+            budget_deferred_indicator_ids: self.budget_deferred_indicator_ids.clone(),
+            capability_deferred_indicator_ids: self.capability_deferred_indicator_ids.clone(),
+            capability_deferred_output_count: self.capability_deferred_output_count,
+            planned_base_columns: self.planned_base_columns,
+            admitted_base_columns: self.admitted_base_columns,
+            historical_sweep_reserved_columns: self.sweep_reserved,
+            historical_sweep_produced_columns,
+            extended_mode: self.extended_mode,
+            extended_admitted_indicator_ids: self
+                .extended_groups
+                .iter()
+                .map(|(id, _)| *id)
+                .collect(),
+            extended_budget_deferred_indicator_ids: self
+                .extended_budget_deferred_indicator_ids
+                .clone(),
+            extended_budget_columns: self.extended_budget_columns,
+            extended_planned_columns: self.extended_planned_columns,
+            produced_columns,
+        }
+    }
+
+    /// Start the exact ledger with the two admission-only drop classes.  Both
+    /// execution lanes add compute outcomes to this same shape.
+    pub(crate) fn admission_ledger(&self) -> IndicatorLedger {
+        let mut ledger = IndicatorLedger::new();
+        for id in &self.budget_deferred_indicator_ids {
+            ledger.dropped(
+                id,
+                id,
+                DropReason::OverBudget,
+                format!(
+                    "base-vocabulary budget full at {} columns ({} of {} total reserved for the \
+                     period sweep; sized at {} bars, {:.2} GB free)",
+                    self.base_budget.max_columns,
+                    self.sweep_reserved,
+                    self.budget.max_columns,
+                    self.budget_rows,
+                    self.budget.available_bytes as f64 / 1e9
+                ),
+            );
+        }
+        for id in &self.extended_budget_deferred_indicator_ids {
+            ledger.dropped(
+                id,
+                id,
+                DropReason::OverBudget,
+                format!(
+                    "extended period sweep: only {} columns of the {} the machine affords were \
+                     still unspent after the base vocabulary and the historical sweep",
+                    self.extended_budget_columns, self.budget.max_columns
+                ),
+            );
+        }
+        for id in &self.capability_deferred_indicator_ids {
+            ledger.dropped(
+                id,
+                id,
+                DropReason::UnsupportedCapability,
+                format!(
+                    "{id} is excluded by {} because at least one canonical output lacks a complete resident f64 route; the Full profile remains fail-closed",
+                    self.gpu_route_mode
+                ),
+            );
+        }
+        ledger
+    }
+}
+
 /// The multi-period sweep, with an explicit lane policy.
 ///
 /// # The device lane is f64 end to end
@@ -222,17 +514,13 @@ pub struct ClassicTaComputation {
 ///
 /// The column SET, NAMES and ORDER are identical in every policy.
 ///
-/// # What `Auto` costs, and why it is not the honest default on a card
+/// # `Auto` is one complete CPU lane, never a failed-GPU fallback
 ///
-/// Under `Auto` a lane failure is a `tracing::warn!` and CPU numbers. That is a
-/// DECLARED fallback — the reason is recorded per indicator and printed by
-/// `indicator_telemetry::indicator_device_summary()` — but a run that finishes
-/// is still a run that finishes, and a log line is a weak symptom for "the card
-/// did not participate". Under the standing GPU-EXCLUSIVE directive the honest
-/// default when a card is PRESENT is [`IndicatorComputePolicy::RequireGpu`];
-/// `Auto` should mean "CPU when there is no card", not "CPU when the card
-/// refused". Callers that do not name a policy get
-/// [`resolved_indicator_compute_policy`], which is where that choice is made.
+/// `Auto` currently resolves directly to the complete CPU reference. A caller
+/// that requires the card must install [`IndicatorComputePolicy::GpuOnly`]; an
+/// incomplete route or failed launch is then an error for the whole Classic
+/// plan, never a per-indicator warning followed by CPU numbers. Callers that do
+/// not name a policy get [`resolved_indicator_compute_policy`].
 pub fn compute_classic_ta_columns_with_policy(
     ohlcv: &Ohlcv,
     policy: IndicatorComputePolicy,
@@ -248,6 +536,168 @@ pub fn compute_classic_ta_columns_with_policy_report(
 ) -> anyhow::Result<ClassicTaComputation> {
     let rows = ohlcv.len();
     compute_classic_ta_columns_sized_report(ohlcv, policy, rows)
+}
+
+/// Compute Classic/vector-ta columns with an explicit f64 value/validity
+/// contract.
+///
+/// The legacy tuple route temporarily remains as an in-worktree parity bridge
+/// while Tasks 5B-9 migrate every consumer atomically.  This boundary is the
+/// only route allowed to enter the shared f64 feature plan: missing optional
+/// series never become numeric zeroes, leading NaNs are warmup, post-warmup
+/// non-finite cells stay invalid, and a preflight placeholder retains the exact
+/// reason captured by the same execution's [`IndicatorLedger`].
+pub fn compute_classic_ta_feature_columns_f64(
+    ohlcv: &Ohlcv,
+    policy: IndicatorComputePolicy,
+    budget_rows: usize,
+) -> anyhow::Result<Vec<FeatureColumnF64>> {
+    let run_plan = prepare_classic_ta_run_plan(budget_rows.max(ohlcv.len()), policy)?;
+    compute_classic_ta_feature_columns_f64_with_run_plan(ohlcv, &run_plan)
+}
+
+/// Compute one frame through an already captured run-wide admission plan.
+pub fn compute_classic_ta_feature_columns_f64_with_run_plan(
+    ohlcv: &Ohlcv,
+    run_plan: &ClassicTaRunPlan,
+) -> anyhow::Result<Vec<FeatureColumnF64>> {
+    validate_classic_ta_input(ohlcv)?;
+    let ClassicTaComputation {
+        columns,
+        report: _,
+        ledger,
+    } = compute_classic_ta_columns_sized_report_with_run_plan(ohlcv, run_plan)?;
+
+    columns
+        .into_iter()
+        .map(|(name, values)| {
+            let indicator_id = classic_indicator_id_for_column(&name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "classic/vector-ta column `{name}` has no canonical indicator identity"
+                )
+            })?;
+            let requirements = indicator_data_requirements(indicator_id);
+            let missing_required_input = (requirements.requires_timestamps
+                && ohlcv.timestamp.is_none())
+                || (requirements.requires_volume && ohlcv.volume.is_none());
+
+            let validity = if missing_required_input {
+                vec![FeatureCellValidity::MissingInput; values.len()]
+            } else {
+                classify_classic_ta_validity(&name, &values, &ledger)
+            };
+            FeatureColumnF64::new(name, values, validity)
+        })
+        .collect()
+}
+
+fn validate_classic_ta_input(ohlcv: &Ohlcv) -> anyhow::Result<()> {
+    let n = ohlcv.close.len();
+    anyhow::ensure!(
+        ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
+        "classic/vector-ta OHLC length mismatch: open={} high={} low={} close={n}",
+        ohlcv.open.len(),
+        ohlcv.high.len(),
+        ohlcv.low.len()
+    );
+    if n == 0 {
+        return Ok(());
+    }
+
+    for row in 0..n {
+        let (open, high, low, close) = (
+            ohlcv.open[row],
+            ohlcv.high[row],
+            ohlcv.low[row],
+            ohlcv.close[row],
+        );
+        anyhow::ensure!(
+            open.is_finite() && high.is_finite() && low.is_finite() && close.is_finite(),
+            "classic/vector-ta OHLC row {row} contains a non-finite price"
+        );
+        anyhow::ensure!(
+            open > 0.0 && high > 0.0 && low > 0.0 && close > 0.0,
+            "classic/vector-ta OHLC row {row} contains a non-positive price"
+        );
+        anyhow::ensure!(
+            low <= open.min(close) && high >= open.max(close) && high >= low,
+            "classic/vector-ta OHLC row {row} violates low <= open/close <= high"
+        );
+    }
+
+    if let Some(timestamps) = &ohlcv.timestamp {
+        anyhow::ensure!(
+            timestamps.len() == n,
+            "classic/vector-ta timestamp length {} does not match {n} OHLC rows",
+            timestamps.len()
+        );
+        validate_canonical_millisecond_timestamps(timestamps)?;
+    }
+    if let Some(volume) = &ohlcv.volume {
+        anyhow::ensure!(
+            volume.len() == n,
+            "classic/vector-ta volume length {} does not match {n} OHLC rows",
+            volume.len()
+        );
+        for (row, value) in volume.iter().copied().enumerate() {
+            anyhow::ensure!(
+                value.is_finite() && value >= 0.0,
+                "classic/vector-ta volume row {row} must be finite and non-negative"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn classic_indicator_id_for_column(name: &str) -> Option<&'static str> {
+    ALL_INDICATORS
+        .iter()
+        .copied()
+        .filter(|id| {
+            name == *id
+                || name
+                    .strip_prefix(*id)
+                    .is_some_and(|suffix| suffix.starts_with('_'))
+        })
+        .max_by_key(|id| id.len())
+}
+
+fn classify_classic_ta_validity(
+    name: &str,
+    values: &[f64],
+    ledger: &IndicatorLedger,
+) -> Vec<FeatureCellValidity> {
+    if values.iter().all(|value| value.is_nan()) {
+        let reason = if ledger
+            .drop_reasons_for_column(name)
+            .contains(&DropReason::PreflightWarmup)
+        {
+            FeatureCellValidity::Warmup
+        } else if ledger
+            .drop_reasons_for_column(name)
+            .contains(&DropReason::MissingRequiredInput)
+        {
+            FeatureCellValidity::MissingInput
+        } else {
+            FeatureCellValidity::ComputeFailure
+        };
+        return vec![reason; values.len()];
+    }
+
+    let mut observed_finite = false;
+    values
+        .iter()
+        .map(|value| {
+            if value.is_finite() {
+                observed_finite = true;
+                FeatureCellValidity::Valid
+            } else if !observed_finite && value.is_nan() {
+                FeatureCellValidity::Warmup
+            } else {
+                FeatureCellValidity::NonFinite
+            }
+        })
+        .collect()
 }
 
 /// The real entry point: same as [`compute_classic_ta_columns_with_policy`] but
@@ -282,12 +732,354 @@ pub fn compute_classic_ta_columns_sized(
     Ok(compute_classic_ta_columns_sized_report(ohlcv, policy, budget_rows)?.columns)
 }
 
+/// Resolve the one budget/admission/working-set decision both execution lanes
+/// consume. Registry/table inspection only; no feature or device allocation.
+fn build_classic_ta_admission_plan(n: usize, budget_rows: usize) -> ClassicTaAdmissionPlan {
+    let budget_rows = budget_rows.max(n);
+    let budget = VocabularyBudget::for_run(budget_rows);
+    let sweep_reserved = planned_sweep_columns();
+    let base_budget = budget.reserve(sweep_reserved);
+    let all_ids: Vec<&'static str> = ALL_INDICATORS.to_vec();
+    let (admitted_indicator_ids, budget_deferred_indicator_ids, planned_base_columns) =
+        admit_indicators(&all_ids, &base_budget);
+    let admitted_base_columns = admitted_indicator_ids
+        .iter()
+        .map(|id| planned_output_count(id))
+        .sum::<usize>();
+
+    // The extension is a planning fact, not a consequence of how many columns
+    // one particular frame happened to produce.  Resolve it before either lane
+    // allocates Candles/device buffers so CPU and CUDA consume the same request.
+    let planned_so_far = admitted_base_columns + sweep_reserved;
+    let unspent = budget.max_columns.saturating_sub(planned_so_far);
+    let working_set = current_extended_sweep_working_set();
+    let (
+        extended_groups,
+        extended_budget_deferred_indicator_ids,
+        extended_mode,
+        extended_budget_columns,
+    ) = match working_set.as_deref() {
+        Some(batch) => {
+            if batch.planned_columns > unspent {
+                tracing::warn!(
+                    target: "neoethos_data::hpc_ta",
+                    cursor = batch.cursor,
+                    batch_columns = batch.planned_columns,
+                    unspent_columns = unspent,
+                    max_columns = budget.max_columns,
+                    "the installed streaming working set is WIDER than this machine still \
+                     affords after the base vocabulary and the historical sweep. Building it \
+                     anyway — the caller sized the batch and refusing here would silently \
+                     change which parameter region the run explored — but expect memory \
+                     pressure. Size the batch from VocabularyBudget minus the resident plan."
+                );
+            }
+            (
+                batch.grouped_by_id(),
+                Vec::new(),
+                "streaming_batch",
+                batch.planned_columns,
+            )
+        }
+        None => {
+            let extended_budget = unspent.min(planned_so_far);
+            let (plan, deferred) = extended_sweep_plan(extended_budget);
+            let groups = plan
+                .into_iter()
+                .map(|id| (id, extended_sweep_periods(id)))
+                .collect();
+            (groups, deferred, "budget_prefix", extended_budget)
+        }
+    };
+    let extended_planned_columns = extended_groups
+        .iter()
+        .map(|(id, periods)| planned_output_count(id) * periods.len())
+        .sum();
+
+    ClassicTaAdmissionPlan {
+        budget_rows,
+        budget,
+        base_budget,
+        sweep_reserved,
+        admitted_indicator_ids,
+        budget_deferred_indicator_ids,
+        capability_deferred_indicator_ids: Vec::new(),
+        capability_deferred_output_count: 0,
+        gpu_route_mode: "complete_graph_v1",
+        historical_indicator_ids: MULTI_PERIOD_IDS.to_vec(),
+        planned_base_columns,
+        admitted_base_columns,
+        working_set,
+        extended_groups,
+        extended_budget_deferred_indicator_ids,
+        extended_mode,
+        extended_budget_columns,
+        extended_planned_columns,
+    }
+}
+
+/// Capture the exact allocation-free Classic/vector-ta graph for a run.
+///
+/// `budget_rows` is the widest independently downloaded direct timeframe.
+/// `GpuOnly` resolves every admitted output here, before feature computation;
+/// an unsupported output therefore returns the complete ordered manifest
+/// without creating a CUDA context or silently substituting CPU/f32 work.
+pub fn prepare_classic_ta_run_plan(
+    budget_rows: usize,
+    policy: IndicatorComputePolicy,
+) -> anyhow::Result<ClassicTaRunPlan> {
+    let admission = build_classic_ta_admission_plan(budget_rows, budget_rows);
+    #[cfg(feature = "gpu-cuda")]
+    let mut resident_cuda_launches = None;
+    if policy == IndicatorComputePolicy::GpuOnly && budget_rows > 0 {
+        #[cfg(not(feature = "gpu-cuda"))]
+        anyhow::bail!(
+            "GpuOnly is unavailable: neoethos-data was built without the gpu-cuda feature. \
+             Strict GPU execution never substitutes CpuOnly."
+        );
+
+        #[cfg(feature = "gpu-cuda")]
+        {
+            let plan = crate::core::classic_cuda_plan::build_exact_classic_cuda_plan(
+                budget_rows,
+                &admission.admitted_indicator_ids,
+                &MULTI_PERIOD_IDS,
+                &admission.extended_groups,
+            )?;
+            let resolved = crate::core::classic_cuda_plan::resolve_gpu_only_classic_plan(&plan)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "GpuOnly run admission rows={} available_bytes={} max_columns={} \
+                         admitted_base_ids={:?} extended_ids={:?}: {error:#}",
+                        admission.budget_rows,
+                        admission.budget.available_bytes,
+                        admission.budget.max_columns,
+                        admission.admitted_indicator_ids,
+                        admission
+                            .extended_groups
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .collect::<Vec<_>>(),
+                    )
+                })?;
+            resident_cuda_launches = Some(resolved);
+        }
+    }
+    Ok(ClassicTaRunPlan {
+        policy,
+        admission,
+        #[cfg(feature = "gpu-cuda")]
+        resident_cuda_launches,
+    })
+}
+
+/// Seal the explicitly versioned exact-routeable Classic subset used by
+/// non-Full GPU-only milestone/search profiles. Every family with any missing
+/// output contract or missing exact pre-device allocation authority is removed
+/// atomically, recorded by canonical id and exact deferred output count, and
+/// bound into the resident recipe identity. The Full profile keeps using
+/// [`prepare_classic_ta_run_plan`] and therefore still refuses the same complete
+/// gap manifest without excluding anything.
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn prepare_classic_ta_gpu_exact_parity_run_plan_v3(
+    budget_rows: usize,
+) -> anyhow::Result<ClassicTaRunPlan> {
+    let mut admission = build_classic_ta_admission_plan(budget_rows, budget_rows);
+    anyhow::ensure!(
+        admission.working_set.is_none(),
+        "gpu_only_exact_parity_subset_v3 refuses an installed extended sweep working set"
+    );
+    let full_plan = crate::core::classic_cuda_plan::build_exact_classic_cuda_plan(
+        budget_rows,
+        &admission.admitted_indicator_ids,
+        &admission.historical_indicator_ids,
+        &admission.extended_groups,
+    )?;
+    let gaps = crate::core::classic_cuda_plan::preflight_exact_classic_cuda_plan(&full_plan)
+        .err()
+        .unwrap_or_default();
+    let mut deferred = gaps
+        .iter()
+        .map(|gap| gap.indicator_id)
+        .collect::<HashSet<_>>();
+    deferred.extend(GPU_ONLY_PARITY_DEFERRED_INDICATORS_V3.iter().copied());
+
+    // Routeability alone is insufficient: the run-device carrier may only be
+    // consumed after every launch has an exact allocation receipt. Today that
+    // authority is complete for primary single-output f64 sweeps; named owners
+    // stay fail-closed until their retained parameter/scratch sizing is sealed.
+    let candidate_admitted_indicator_ids = admission
+        .admitted_indicator_ids
+        .iter()
+        .copied()
+        .filter(|indicator_id| !deferred.contains(indicator_id))
+        .collect::<Vec<_>>();
+    let candidate_historical_indicator_ids = admission
+        .historical_indicator_ids
+        .iter()
+        .copied()
+        .filter(|indicator_id| !deferred.contains(indicator_id))
+        .collect::<Vec<_>>();
+    let candidate_extended_groups = admission
+        .extended_groups
+        .iter()
+        .filter(|(indicator_id, _)| !deferred.contains(indicator_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let candidate_plan = crate::core::classic_cuda_plan::build_exact_classic_cuda_plan(
+        budget_rows,
+        &candidate_admitted_indicator_ids,
+        &candidate_historical_indicator_ids,
+        &candidate_extended_groups,
+    )?;
+    let candidate_launches =
+        crate::core::classic_cuda_plan::resolve_gpu_only_classic_plan(&candidate_plan)?;
+    let mut allocation_deferred = HashSet::new();
+    let mut node_cursor = 0usize;
+    for launch in &candidate_launches {
+        let output_count = launch.output_count();
+        let node_end = node_cursor.checked_add(output_count).ok_or_else(|| {
+            anyhow::anyhow!("Classic exact-routeable allocation census output cursor overflowed")
+        })?;
+        let launch_nodes = candidate_plan
+            .nodes
+            .get(node_cursor..node_end)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Classic exact-routeable allocation census exceeded the candidate graph"
+                )
+            })?;
+        let indicator_id = launch_nodes
+            .first()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Classic exact-routeable allocation census found an empty launch")
+            })?
+            .indicator_id;
+        anyhow::ensure!(
+            launch_nodes
+                .iter()
+                .all(|node| node.indicator_id == indicator_id),
+            "Classic exact-routeable launch crossed indicator-family ownership"
+        );
+        if !matches!(
+            launch,
+            crate::core::classic_cuda_plan::ResolvedClassicCudaLaunch::Primary(_)
+        ) {
+            allocation_deferred.insert(indicator_id);
+        }
+        node_cursor = node_end;
+    }
+    anyhow::ensure!(
+        node_cursor == candidate_plan.nodes.len(),
+        "Classic exact-routeable allocation census did not consume the candidate graph"
+    );
+    deferred.extend(allocation_deferred);
+
+    admission.capability_deferred_indicator_ids = ALL_INDICATORS
+        .iter()
+        .copied()
+        .filter(|indicator_id| deferred.contains(indicator_id))
+        .collect();
+    admission.capability_deferred_output_count = full_plan
+        .nodes
+        .iter()
+        .filter(|node| deferred.contains(node.indicator_id))
+        .count();
+    admission.gpu_route_mode = "gpu_only_exact_parity_subset_v3";
+    admission
+        .admitted_indicator_ids
+        .retain(|indicator_id| !deferred.contains(indicator_id));
+    admission.admitted_base_columns = admission
+        .admitted_indicator_ids
+        .iter()
+        .map(|indicator_id| planned_output_count(indicator_id))
+        .sum();
+    admission.historical_indicator_ids = MULTI_PERIOD_IDS
+        .iter()
+        .copied()
+        .filter(|indicator_id| !deferred.contains(indicator_id))
+        .collect();
+    admission.sweep_reserved = admission
+        .historical_indicator_ids
+        .iter()
+        .map(|indicator_id| planned_output_count(indicator_id) * ALT_PERIODS.len())
+        .sum();
+    admission
+        .extended_groups
+        .retain(|(indicator_id, _)| !deferred.contains(indicator_id));
+    admission.extended_budget_columns = admission
+        .extended_groups
+        .iter()
+        .map(|(indicator_id, periods)| planned_output_count(indicator_id) * periods.len())
+        .sum();
+    admission.extended_planned_columns = admission.extended_budget_columns;
+    admission.extended_mode = "gpu_only_exact_parity_subset_v3";
+
+    let routeable_plan = crate::core::classic_cuda_plan::build_exact_classic_cuda_plan(
+        budget_rows,
+        &admission.admitted_indicator_ids,
+        &admission.historical_indicator_ids,
+        &admission.extended_groups,
+    )?;
+    let resident_cuda_launches =
+        crate::core::classic_cuda_plan::resolve_gpu_only_classic_plan(&routeable_plan)?;
+    anyhow::ensure!(
+        !resident_cuda_launches.is_empty()
+            && !admission.capability_deferred_indicator_ids.is_empty()
+            && admission.capability_deferred_output_count
+                == full_plan
+                    .nodes
+                    .iter()
+                    .filter(|node| deferred.contains(node.indicator_id))
+                    .count(),
+        "gpu_only_exact_parity_subset_v3 produced an invalid debt receipt"
+    );
+    Ok(ClassicTaRunPlan {
+        policy: IndicatorComputePolicy::GpuOnly,
+        admission,
+        resident_cuda_launches: Some(resident_cuda_launches),
+    })
+}
+
+/// Required-card fixture oracle for the exact versioned Classic subset.
+/// Admission is resolved through the same GpuOnly plan as production, then
+/// only the execution policy is switched to CPU so the fixture compares the
+/// identical ordered route graph without launching a second GPU authority.
+#[cfg(feature = "gpu-cuda-device-fixtures")]
+pub fn compute_classic_ta_gpu_exact_parity_feature_columns_for_device_fixture_v3(
+    ohlcv: &Ohlcv,
+    budget_rows: usize,
+) -> anyhow::Result<Vec<FeatureColumnF64>> {
+    let mut run_plan =
+        prepare_classic_ta_gpu_exact_parity_run_plan_v3(budget_rows.max(ohlcv.len()))?;
+    run_plan.policy = IndicatorComputePolicy::CpuOnly;
+    run_plan.resident_cuda_launches = None;
+    compute_classic_ta_feature_columns_f64_with_run_plan(ohlcv, &run_plan)
+}
+
 /// Sized form of [`compute_classic_ta_columns_with_policy_report`].
 pub fn compute_classic_ta_columns_sized_report(
     ohlcv: &Ohlcv,
     policy: IndicatorComputePolicy,
     budget_rows: usize,
 ) -> anyhow::Result<ClassicTaComputation> {
+    let run_plan = prepare_classic_ta_run_plan(budget_rows.max(ohlcv.len()), policy)?;
+    compute_classic_ta_columns_sized_report_with_run_plan(ohlcv, &run_plan)
+}
+
+/// Sized execution through one previously captured run-wide admission plan.
+pub fn compute_classic_ta_columns_sized_report_with_run_plan(
+    ohlcv: &Ohlcv,
+    run_plan: &ClassicTaRunPlan,
+) -> anyhow::Result<ClassicTaComputation> {
+    let policy = run_plan.policy;
+    if policy == IndicatorComputePolicy::GpuOnly {
+        #[cfg(not(feature = "gpu-cuda"))]
+        anyhow::bail!(
+            "GpuOnly is unavailable: neoethos-data was built without the gpu-cuda feature. \
+             Strict GPU execution never substitutes CpuOnly."
+        );
+    }
     let n = ohlcv.len();
     if n == 0 {
         return Ok(ClassicTaComputation {
@@ -298,6 +1090,8 @@ pub fn compute_classic_ta_columns_sized_report(
                 max_columns: 0,
                 admitted_indicator_ids: Vec::new(),
                 budget_deferred_indicator_ids: Vec::new(),
+                capability_deferred_indicator_ids: Vec::new(),
+                capability_deferred_output_count: 0,
                 planned_base_columns: 0,
                 admitted_base_columns: 0,
                 historical_sweep_reserved_columns: 0,
@@ -312,7 +1106,28 @@ pub fn compute_classic_ta_columns_sized_report(
             ledger: IndicatorLedger::new(),
         });
     }
-    let budget_rows = budget_rows.max(n);
+    anyhow::ensure!(
+        n <= run_plan.admission.budget_rows,
+        "classic/vector-ta frame has {n} rows but the frozen run plan was sized for only {}",
+        run_plan.admission.budget_rows
+    );
+    let admission = run_plan.admission.clone();
+
+    #[cfg(feature = "gpu-cuda")]
+    if policy == IndicatorComputePolicy::GpuOnly {
+        let plan = crate::core::classic_cuda_plan::build_exact_classic_cuda_plan(
+            n,
+            &admission.admitted_indicator_ids,
+            &admission.historical_indicator_ids,
+            &admission.extended_groups,
+        )?;
+        return crate::core::classic_cuda_plan::execute_gpu_only_classic_plan(
+            ohlcv, plan, admission,
+        );
+    }
+
+    let budget_rows = admission.budget_rows;
+    let input_availability = ClassicInputAvailability::from_ohlcv(ohlcv);
 
     // 1. Pack data into VectorTA Candles struct (once; shared read-only
     //    across the rayon workers below — `Candles` holds plain Vecs so it
@@ -341,18 +1156,15 @@ pub fn compute_classic_ta_columns_sized_report(
     //
     //    THE SWEEP IS RESERVED FIRST. The period sweep used to be staged
     //    entirely OUTSIDE this budget, so `max_columns` was never the peak: at
-    //    the M5 store's 1,054,320 bars its 130 columns are another 1.10 GB of
+    //    the M5 store's 1,054,320 bars its 120 columns are another 1.01 GB of
     //    f64 staging that nothing accounted for, and it mattered most exactly
-    //    where the budget binds. The sweep is also the HISTORICAL vocabulary,
-    //    so it has first claim — a machine that can afford only 66 columns gets
-    //    precisely what it got before this change, and the base pass takes what
-    //    is left.
-    let budget = VocabularyBudget::for_run(budget_rows);
-    let sweep_reserved = planned_sweep_columns();
-    let base_budget = budget.reserve(sweep_reserved);
-    let all_ids: Vec<&'static str> = ALL_INDICATORS.to_vec();
-    let (admitted, deferred, planned_columns) = admit_indicators(&all_ids, &base_budget);
-    let base_admitted_plan: usize = admitted.iter().map(|id| planned_output_count(id)).sum();
+    //    where the budget binds. The statically valid critical sweep has first
+    //    claim, and the base pass takes what is left.
+    let budget = &admission.budget;
+    let base_budget = &admission.base_budget;
+    let admitted = &admission.admitted_indicator_ids;
+    let planned_columns = admission.planned_base_columns;
+    let base_admitted_plan = admission.admitted_base_columns;
 
     // 3. Dispatch to every admitted indicator — PARALLEL across indicators.
     //    Each indicator is an independent pure function of the shared
@@ -399,6 +1211,7 @@ pub fn compute_classic_ta_columns_sized_report(
                 &[],
                 n,
                 Kernel::Auto,
+                input_availability,
                 &mut out,
                 &mut ledger,
             );
@@ -406,23 +1219,7 @@ pub fn compute_classic_ta_columns_sized_report(
         })
         .collect();
 
-    let mut ledger = IndicatorLedger::new();
-    for id in &deferred {
-        ledger.dropped(
-            id,
-            id,
-            DropReason::OverBudget,
-            format!(
-                "base-vocabulary budget full at {} columns ({} of {} total reserved for the \
-                 period sweep; sized at {} bars, {:.2} GB free)",
-                base_budget.max_columns,
-                sweep_reserved,
-                budget.max_columns,
-                budget_rows,
-                budget.available_bytes as f64 / 1e9
-            ),
-        );
-    }
+    let mut ledger = admission.admission_ledger();
     let mut cols: Vec<(String, Vec<f64>)> = Vec::new();
     for (mut produced, led) in per_id {
         cols.append(&mut produced);
@@ -439,28 +1236,28 @@ pub fn compute_classic_ta_columns_sized_report(
     // 3. Multi-period variants for the most critical indicators. Appended
     //    after the base columns to preserve the original ordering exactly.
     //
-    //    ROUTING (task #22): this is the sweep-shaped part of the feature
-    //    build — 18 indicators × 5 periods = 90 independent full-series scans
-    //    over the same OHLCV — and therefore the part a card wins. When the
-    //    CUDA lane is compiled in, present and arch-compatible, every id in
-    //    `gpu_indicators::GPU_SWEEP_SPECS` is swept on the device against ONE
-    //    resident upload; the rest stay on the CPU and are reported by name as
-    //    `CpuIndicatorNotPortable`. That remainder is now exactly the five
-    //    MULTI-OUTPUT ids (stoch, macd, bollinger_bands, keltner, supertrend),
-    //    which emit ZERO columns on EITHER lane because `compute_cpu` with
-    //    `output_id: None` returns `Err(InvalidParam)` and line 291 below
-    //    swallows it. No count is written here on purpose: the membership rule
-    //    is asserted by
-    //    `gpu_indicators::tests::every_reachable_multi_period_id_with_an_f64_kernel_is_claimed`.
+    //    ROUTING: this body is the CPU reference only. `GpuOnly` returned above
+    //    through the exact typed plan before Candles existed, so no individual
+    //    id may switch lane here. Multi-output ids are dispatched by their
+    //    canonical `output_ids_for` identities on CPU; their strict CUDA
+    //    counterparts must all preflight and launch inside one resident engine
+    //    or the whole GPU request fails before work.
     //
     //    ORDER IS LOAD-BEARING: column order feeds `effective_feature_names`
     //    and every discovery artifact. The per-indicator results are collected
     //    into a slot indexed by position in `MULTI_PERIOD_IDS` and then
     //    concatenated in that order, so the emitted order is byte-identical to
     //    the pure-CPU path regardless of which lane produced which column.
-    let multi_cols = compute_multi_period_columns(ohlcv, &candles, n, policy);
+    let (multi_cols, multi_ledger) = compute_multi_period_columns(
+        ohlcv,
+        &candles,
+        n,
+        policy,
+        &admission.historical_indicator_ids,
+    );
     let sweep_actual = multi_cols.len();
     cols.extend(multi_cols);
+    ledger.merge(multi_ledger);
 
     // 4b. THE EXTENDED SWEEP — the answer to "a period is not a detail".
     //
@@ -470,7 +1267,7 @@ pub fn compute_classic_ta_columns_sized_report(
     //     vocabulary that can only reach one of them is 300 arbitrary points in
     //     a space nobody chose. `period_plan` already knows how to drive each
     //     indicator's real window parameters — it was simply unreachable for
-    //     anything outside the hardcoded eighteen.
+    //     anything outside the hardcoded sixteen.
     //
     //     So every id whose window is drivable (`Key` or `Ratio`) and that is
     //     NOT already in `MULTI_PERIOD_IDS` is swept too, in `ALL_INDICATORS`
@@ -513,7 +1310,8 @@ pub fn compute_classic_ta_columns_sized_report(
     //     batch's (indicator, period) pairs and the budget-capped prefix is not
     //     consulted. With no working set installed — the default, and every
     //     existing caller — this block is byte-identical to what it was: same
-    //     plan function, same `ALT_PERIODS` slice per id, same emission order,
+    //     plan function, same statically valid/distinct period points per id,
+    //     same emission order,
     //     same deferral ledger. That identity is the parity property, and it is
     //     structural rather than tested-by-luck: both lanes run through the SAME
     //     `sweep_one_id_ledgered`.
@@ -536,68 +1334,20 @@ pub fn compute_classic_ta_columns_sized_report(
     //     `smooth_theil_sen` 1.12 s, `volume_adjusted_ma` 0.79 s, each for five
     //     periods).
     let spent = cols.len();
-    let planned_so_far = base_admitted_plan + sweep_reserved;
-    let unspent = budget.max_columns.saturating_sub(planned_so_far);
-    let working_set = current_extended_sweep_working_set();
-    let (ext_groups, ext_deferred, ext_mode, extended_budget) = match working_set.as_deref() {
-        Some(batch) => {
-            if batch.planned_columns > unspent {
-                tracing::warn!(
-                    target: "neoethos_data::hpc_ta",
-                    cursor = batch.cursor,
-                    batch_columns = batch.planned_columns,
-                    unspent_columns = unspent,
-                    max_columns = budget.max_columns,
-                    "the installed streaming working set is WIDER than this machine still \
-                     affords after the base vocabulary and the historical sweep. Building it \
-                     anyway — the caller sized the batch and refusing here would silently \
-                     change which parameter region the run explored — but expect memory \
-                     pressure. Size the batch from VocabularyBudget minus the resident plan."
-                );
-            }
-            (
-                batch.grouped_by_id(),
-                Vec::new(),
-                "streaming_batch",
-                batch.planned_columns,
-            )
-        }
-        None => {
-            let extended_budget = unspent.min(planned_so_far);
-            let (plan, deferred) = extended_sweep_plan(extended_budget);
-            let groups: Vec<(&'static str, Vec<usize>)> = plan
-                .into_iter()
-                .map(|id| (id, ALT_PERIODS.to_vec()))
-                .collect();
-            (groups, deferred, "budget_prefix", extended_budget)
-        }
-    };
-    let extended_admitted_indicator_ids = ext_groups.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-    let extended_planned_columns = ext_groups
-        .iter()
-        .map(|(id, periods)| planned_output_count(id) * periods.len())
-        .sum();
+    let working_set = &admission.working_set;
+    let ext_groups = &admission.extended_groups;
+    let ext_mode = admission.extended_mode;
     if !ext_groups.is_empty() {
         let ext: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = ext_groups
             .par_iter()
-            .map(|(id, periods)| sweep_one_id_ledgered(&candles, *id, periods, n, Kernel::Auto))
+            .map(|(id, periods)| {
+                sweep_one_id_ledgered(&candles, *id, periods, n, Kernel::Auto, input_availability)
+            })
             .collect();
         for (mut c, l) in ext {
             cols.append(&mut c);
             ledger.merge(l);
         }
-    }
-    for id in &ext_deferred {
-        ledger.dropped(
-            id,
-            id,
-            DropReason::OverBudget,
-            format!(
-                "extended period sweep: only {extended_budget} columns of the {} the machine \
-                 affords were still unspent after the base vocabulary and the historical sweep",
-                budget.max_columns
-            ),
-        );
     }
     tracing::info!(
         target: "neoethos_data::hpc_ta",
@@ -611,7 +1361,7 @@ pub fn compute_classic_ta_columns_sized_report(
         extended_space_len = working_set.as_deref().map(|b| b.space_len).unwrap_or(0),
         extended_ids = ext_groups.len(),
         extended_pairs = ext_groups.iter().map(|(_, p)| p.len()).sum::<usize>(),
-        extended_deferred = ext_deferred.len(),
+        extended_deferred = admission.extended_budget_deferred_indicator_ids.len(),
         extended_columns = cols.len() - spent,
         total_columns = cols.len(),
         "indicator vocabulary composition (base pass at library defaults + period sweeps)"
@@ -620,13 +1370,12 @@ pub fn compute_classic_ta_columns_sized_report(
     // 5. CENSUS. Fingerprint every column exactly once and report the two
     //    quality facts the old code could not have known:
     //
-    //      * DUPLICATES — a column bit-identical to an earlier one. This is
-    //        what a period sweep looks like when the indicator ignores the
-    //        swept key (obv and vwap declare no window parameter, so their
-    //        five "periods" are five copies). Reported, NOT removed: the
-    //        column SET must be a function of the id list and the registry and
-    //        never of the frame, or the per-timeframe cube width would vary
-    //        and `lib.rs`'s width invariant would break.
+    //      * DUPLICATES — a column bit-identical to an earlier one on this
+    //        frame. Formula-proven aliases and ignored/saturated sweep points
+    //        are removed statically before dispatch; remaining matches are
+    //        reported as possible corpus coincidences, never dropped from one
+    //        frame. The schema therefore depends on the production contract,
+    //        not on market values.
     //      * DEGENERATE — no finite variation on this frame. Ballast for any
     //        correlation-ranked prefilter. Also kept, for the same reason.
     //
@@ -725,23 +1474,7 @@ pub fn compute_classic_ta_columns_sized_report(
         );
     }
 
-    let report = ClassicTaExecutionReport {
-        budget_rows,
-        available_bytes_at_admission: budget.available_bytes,
-        max_columns: budget.max_columns,
-        admitted_indicator_ids: admitted,
-        budget_deferred_indicator_ids: deferred,
-        planned_base_columns: planned_columns,
-        admitted_base_columns: base_admitted_plan,
-        historical_sweep_reserved_columns: sweep_reserved,
-        historical_sweep_produced_columns: sweep_actual,
-        extended_mode: ext_mode,
-        extended_admitted_indicator_ids,
-        extended_budget_deferred_indicator_ids: ext_deferred,
-        extended_budget_columns: extended_budget,
-        extended_planned_columns,
-        produced_columns: cols.len(),
-    };
+    let report = admission.execution_report(sweep_actual, cols.len());
 
     Ok(ClassicTaComputation {
         columns: cols,
@@ -750,8 +1483,8 @@ pub fn compute_classic_ta_columns_sized_report(
     })
 }
 
-/// Dispatch ONE indicator across all of its declared outputs, appending each
-/// produced column and recording every discard with a reason.
+/// Dispatch ONE indicator across its statically admitted production outputs,
+/// appending each produced column and recording every discard with a reason.
 ///
 /// This is the single place the two dispatch mistakes are fixed, shared by the
 /// base pass and the multi-period sweep so they cannot drift apart again:
@@ -764,9 +1497,9 @@ pub fn compute_classic_ta_columns_sized_report(
 ///     vector-ta reports a 1-D series as `rows=1 x cols=n`.
 ///
 /// `column_prefix` is the base column name — `"rsi"` for the base pass,
-/// `"rsi_21"` for the sweep. A multi-output indicator suffixes the output id
-/// (`"macd_21_signal"`), matching `compute_single_indicator`'s convention, so
-/// the name says which series it is rather than a positional `_line2`.
+/// `"rsi_21"` for the sweep. Every `Some(output_id)` suffixes that semantic id
+/// (`"macd_21_signal"`), even when static filtering leaves only one named
+/// output, so the name never changes when a redundant sibling is removed.
 fn dispatch_indicator_outputs(
     candles: &Candles,
     id: &'static str,
@@ -774,17 +1507,31 @@ fn dispatch_indicator_outputs(
     params: &[ParamKV],
     n: usize,
     kernel: Kernel,
+    input_availability: ClassicInputAvailability,
     out: &mut Vec<(String, Vec<f64>)>,
     ledger: &mut IndicatorLedger,
 ) {
+    if let Some(detail) = input_availability.missing_for(id) {
+        let first = out.len();
+        push_absent_columns(id, column_prefix, n, out);
+        for (name, _) in &out[first..] {
+            ledger.dropped(
+                id,
+                name,
+                DropReason::MissingRequiredInput,
+                format!("{detail}; no scalar kernel was launched"),
+            );
+        }
+        return;
+    }
+
     let outputs = output_ids_for(id);
-    let multi = outputs.len() > 1;
     let excluded = expected_non_producing(id);
 
     for out_id in outputs {
         let name = match out_id {
-            Some(o) if multi => format!("{column_prefix}_{o}"),
-            _ => column_prefix.to_string(),
+            Some(o) => format!("{column_prefix}_{o}"),
+            None => column_prefix.to_string(),
         };
         let data_ref = IndicatorDataRef::Candles {
             candles,
@@ -898,34 +1645,30 @@ fn push_absent_columns(
     out: &mut Vec<(String, Vec<f64>)>,
 ) {
     let outputs = output_ids_for(id);
-    let multi = outputs.len() > 1;
     for out_id in outputs {
         let name = match out_id {
-            Some(o) if multi => format!("{column_prefix}_{o}"),
-            _ => column_prefix.to_string(),
+            Some(o) => format!("{column_prefix}_{o}"),
+            None => column_prefix.to_string(),
         };
         out.push((name, vec![f64::NAN; n]));
     }
 }
 
-/// Decompose a pattern MATRIX output into one named boolean column per pattern,
+/// Decompose a pattern MATRIX output into one named signed column per pattern,
 /// or `None` when this output is not a matrix.
 ///
 /// `pattern_recognition` is the only id in vector-ta 0.2.9 that returns one:
-/// `rows = PATTERN_RUNNERS.len()` — 62 candlestick patterns, set at
-/// `pattern_recognition.rs:1146` — and `cols = bars`, laid out PATTERN-MAJOR.
-/// The orientation is not assumed: it is read off the crate's own
-/// `PatternRecognitionOutput::to_bitmask_u64`, which indexes
-/// `values_u8[row * cols .. row * cols + cols]` (pattern_recognition.rs:344-346)
-/// with `words_per_row = cols.div_ceil(64)`, i.e. one row IS one pattern's
-/// series across all bars.
+/// `rows = PATTERN_RUNNERS.len()` and `cols = bars`, laid out PATTERN-MAJOR as
+/// `values_i8[row * cols .. row * cols + cols]`. One row is one pattern's
+/// series across all bars. The signed `-100/-80/0/80/100` values preserve both
+/// direction and pattern strength through the production feature boundary.
 ///
 /// Every one of the three shape facts is CHECKED rather than trusted — the row
 /// count against the id list, the column count against the frame, and the value
 /// count against their product. A mismatch returns `None`, and the caller then
 /// takes the normal path, where `normalize_indicator_len` refuses the flattened
 /// multi-series with a named hard error. Guessing an orientation here would
-/// produce 62 columns of silent mis-attribution, which is strictly worse than
+/// produce one column per pattern with silent mis-attribution, which is strictly worse than
 /// the drop it replaces.
 fn pattern_matrix_columns(
     output: &IndicatorComputeOutput,
@@ -936,10 +1679,16 @@ fn pattern_matrix_columns(
     if ids.is_empty() || output.rows != ids.len() || output.cols != n {
         return None;
     }
-    let IndicatorSeries::Bool(values) = &output.series else {
+    let IndicatorSeries::I32(values) = &output.series else {
         return None;
     };
     if values.len() != output.rows.checked_mul(output.cols)? {
+        return None;
+    }
+    if !values
+        .iter()
+        .all(|value| matches!(*value, -100 | -80 | 0 | 80 | 100))
+    {
         return None;
     }
     Some(
@@ -949,7 +1698,7 @@ fn pattern_matrix_columns(
                 let start = row * n;
                 let series = values[start..start + n]
                     .iter()
-                    .map(|&b| if b { 1.0 } else { 0.0 })
+                    .map(|&value| value as f64)
                     .collect();
                 (format!("{column_prefix}_{pattern}"), series)
             })
@@ -957,8 +1706,10 @@ fn pattern_matrix_columns(
     )
 }
 
-/// The 18 indicators that get a period sweep, in emission order.
-pub const MULTI_PERIOD_IDS: [&str; 18] = [
+/// The 16 indicators that declare a real, production-relevant period sweep, in
+/// emission order. No-window indicators are deliberately absent: inventing a
+/// `period` for OBV or VWAP only creates five aliases of their base feature.
+pub const MULTI_PERIOD_IDS: [&str; 16] = [
     "rsi",
     "ema",
     "sma",
@@ -975,8 +1726,6 @@ pub const MULTI_PERIOD_IDS: [&str; 18] = [
     "mom",
     "tsi",
     "mfi",
-    "obv",
-    "vwap",
 ];
 
 /// The periods swept for each of [`MULTI_PERIOD_IDS`].
@@ -987,9 +1736,8 @@ pub const ALT_PERIODS: [usize; 5] = [7, 21, 50, 100, 200];
 ///
 /// Registry lookups only — no compute — so this can be subtracted from the
 /// machine's budget BEFORE the base pass is admitted. That ordering is the
-/// point: the sweep IS the 66-column vocabulary every historical result was
-/// produced on, so it has first claim on the memory, and a machine that can
-/// afford nothing else still gets exactly what it had before.
+/// point: the statically valid critical sweep has first claim on memory, so a
+/// constrained machine does not silently lose the parameterised vocabulary.
 ///
 /// It over-counts on short frames — the `#212` pre-flight guard skips periods
 /// whose warmup exceeds the frame — and that is the correct direction for a
@@ -1041,9 +1789,9 @@ pub fn streaming_batch_columns(budget_rows: usize) -> usize {
 ///     the `"period"` naming convention, which the by-name dispatch arms may or
 ///     may not read. Sweeping on a guess is how a vocabulary fills with
 ///     duplicates wearing distinct names;
-///   * its plan must be [`PeriodPlan::Key`] or [`PeriodPlan::Ratio`], never
-///     `NoWindow` — `NoWindow` means the swept key is ignored by construction
-///     (obv, vwap);
+///   * its plan must be [`PeriodPlan::Key`], [`PeriodPlan::Ratio`], or
+///     [`PeriodPlan::RegistryRatio`], never `NoWindow` — no-window indicators
+///     such as OBV and VWAP are not sweepable by construction;
 ///   * it must not be on `EXPECTED_NON_PRODUCING`. Those ids cannot produce even
 ///     once; sweeping them would multiply a known, named failure by five. They
 ///     are still ATTEMPTED once per frame by the base pass, so the exclusion
@@ -1052,14 +1800,17 @@ pub fn streaming_batch_columns(budget_rows: usize) -> usize {
 /// [`MULTI_PERIOD_IDS`] is excluded by the caller, not here, because those ids
 /// are swept already and re-sweeping them would emit duplicate column NAMES —
 /// a hard error in `compute_classic_ta_columns_sized`.
-fn is_extended_sweepable(id: &str) -> bool {
+fn is_extended_sweepable(id: &'static str) -> bool {
     if expected_non_producing(id).is_some() {
         return false;
     }
     if vector_ta::indicators::registry::get_indicator(id).is_none() {
         return false;
     }
-    matches!(period_plan(id), PeriodPlan::Key(_) | PeriodPlan::Ratio(_))
+    matches!(
+        period_plan(id),
+        PeriodPlan::Key(_) | PeriodPlan::Ratio(_) | PeriodPlan::RegistryRatio(_)
+    ) && !extended_sweep_periods(id).is_empty()
 }
 
 /// Which ids the EXTENDED period sweep can afford, in `ALL_INDICATORS` order.
@@ -1089,7 +1840,7 @@ pub fn extended_sweep_plan(budget_columns: usize) -> (Vec<&'static str>, Vec<&'s
         if MULTI_PERIOD_IDS.contains(&id) || !is_extended_sweepable(id) {
             continue;
         }
-        let want = planned_output_count(id) * ALT_PERIODS.len();
+        let want = planned_output_count(id) * extended_sweep_periods(id).len();
         if used + want <= budget_columns {
             used += want;
             admitted.push(id);
@@ -1131,7 +1882,8 @@ pub fn extended_sweep_plan(budget_columns: usize) -> (Vec<&'static str>, Vec<&'s
 // WHY `extended_sweep_plan` COULD NOT BE THE ADVANCE, despite its own doc
 // comment claiming it was the prototype of one: it is a PREFIX selector that
 // always restarts at index 0, it takes no offset, and it enumerates IDS (all
-// five `ALT_PERIODS` atomically) rather than (indicator, period) pairs, so a
+// every statically valid/distinct `ALT_PERIODS` point atomically) rather than
+// (indicator, period) pairs, so a
 // batch boundary could only ever fall between ids. The three functions below
 // are the advance it described but was not.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1240,7 +1992,9 @@ pub fn extended_sweep_space() -> Vec<SweepPair> {
             if MULTI_PERIOD_IDS.contains(&id) || !is_extended_sweepable(id) {
                 continue;
             }
-            space.push(SweepPair { id, period });
+            if sweep_point_is_distinct_and_valid(id, period) {
+                space.push(SweepPair { id, period });
+            }
         }
     }
     space
@@ -1349,11 +2103,11 @@ pub fn current_extended_sweep_working_set() -> Option<std::sync::Arc<SweepBatch>
 /// — f64 end to end — and is the only implementation of the column naming and
 /// the #212 pre-flight guard, so the GPU lane cannot drift from it by
 /// accident.
-// Only the CUDA lane still calls the un-ledgered shape: its per-indicator CPU
-// fallback and the parity test. The pure-CPU path aggregates one census for the
-// whole sweep via `cpu_multi_period_all`, so in a card-less build this wrapper
-// has no callers.
-#[cfg(feature = "gpu-cuda")]
+// Only the real-card parity test calls the un-ledgered shape. Production has
+// no per-indicator CPU fallback: `GpuOnly` is rejected before work until its
+// complete resident graph is available, while `CpuOnly` aggregates one census
+// for the whole sweep via `cpu_multi_period_all`.
+#[cfg(all(feature = "gpu-cuda", test))]
 fn cpu_multi_period_columns(
     candles: &Candles,
     ind_id: &str,
@@ -1361,7 +2115,14 @@ fn cpu_multi_period_columns(
     n: usize,
     kernel: Kernel,
 ) -> Vec<(String, Vec<f64>)> {
-    let (cols, ledger) = cpu_multi_period_columns_ledgered(candles, ind_id, periods, n, kernel);
+    let (cols, ledger) = cpu_multi_period_columns_ledgered(
+        candles,
+        ind_id,
+        periods,
+        n,
+        kernel,
+        ClassicInputAvailability::all_present(),
+    );
     // This wrapper exists so the GPU lane's per-indicator CPU fallback and the
     // parity test keep their original signature. It must still be incapable of
     // dropping silently, so anything the sweep discarded is reported here.
@@ -1378,9 +2139,8 @@ fn cpu_multi_period_columns(
 /// But "sweep everything at `period = P`" is wrong in a specific, measurable
 /// way — vector-ta reads parameters BY KEY, and an indicator that does not
 /// declare `period` simply ignores the key and returns its default series. Five
-/// swept "periods" then produce five identical columns: 342 pieces of noise
-/// wearing legitimate names, which is worse than the 66-column status quo
-/// because the GA would happily fit them.
+/// swept "periods" then produce five identical columns wearing legitimate
+/// names, which the GA would happily fit as if they were distinct evidence.
 ///
 /// So the sweep asks the registry what the indicator's window parameters
 /// actually are:
@@ -1398,15 +2158,17 @@ fn cpu_multi_period_columns(
 ///     `P / anchor`, preserving the shape, so macd at 7 vs at 200 really are
 ///     the fast and slow versions of the same phenomenon.
 ///   * [`PeriodPlan::NoWindow`] — the indicator declares no window at all
-///     (obv, vwap). The `period` key is still passed, UNCHANGED from the
-///     historical behaviour, because dropping the `obv_7 … obv_200` names
-///     would break projection-by-name against every stored portfolio. The
-///     duplication is instead surfaced by the duplicate census in
-///     `compute_classic_ta_columns_with_policy`, which names them.
+///     (OBV, VWAP). It is not sweepable: no synthetic compatibility parameter
+///     is dispatched and no alias columns are added to the production schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PeriodPlan {
     Key(&'static str),
     Ratio(&'static [(&'static str, i64)]),
+    /// A coupled window tuple read directly from vector-ta's registry. The
+    /// largest declared default is the anchor and every member is scaled by
+    /// the same rational factor, so adding a new registered indicator cannot
+    /// silently fall back to an ignored synthetic `period` key.
+    RegistryRatio(&'static str),
     NoWindow,
 }
 
@@ -1454,7 +2216,7 @@ const RECOGNISED_WINDOW_KEYS: [&str; 4] = ["period", "length", "lookback_period"
 /// is simply ignored by the kernel and five identical columns come back wearing
 /// five different names. So an unmatched window-shaped key is a WARN naming the
 /// id and the key, not a shrug.
-fn period_plan(ind_id: &str) -> PeriodPlan {
+fn period_plan(ind_id: &'static str) -> PeriodPlan {
     if let Some((_, keys)) = COUPLED_WINDOWS.iter().find(|(k, _)| *k == ind_id) {
         return PeriodPlan::Ratio(keys);
     }
@@ -1466,15 +2228,22 @@ fn period_plan(ind_id: &str) -> PeriodPlan {
         }
         let unmatched = unmatched_window_keys(ind_id);
         if !unmatched.is_empty() {
-            tracing::warn!(
-                target: "neoethos_data::hpc_ta",
-                indicator = ind_id,
-                keys = %unmatched.join(","),
-                "indicator declares window-shaped parameters the period sweep does not \
-                 recognise, so sweeping it produces IDENTICAL columns under different names. \
-                 Add it to hpc_ta::COUPLED_WINDOWS (anchored on its longest window) or extend \
-                 RECOGNISED_WINDOW_KEYS."
-            );
+            match registry_window_defaults(ind_id) {
+                Ok(defaults) if !defaults.is_empty() => {
+                    return PeriodPlan::RegistryRatio(ind_id);
+                }
+                Ok(_) => unreachable!("unmatched keys were non-empty"),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "neoethos_data::hpc_ta",
+                        indicator = ind_id,
+                        keys = %unmatched.join(","),
+                        error,
+                        "indicator has a window tuple that cannot be scaled from the vector-ta \
+                         registry; refusing to invent defaults"
+                    );
+                }
+            }
         }
         return PeriodPlan::NoWindow;
     }
@@ -1513,6 +2282,61 @@ fn unmatched_window_keys(ind_id: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Registry window keys paired with their authoritative positive integer
+/// defaults. An incomplete tuple is an error: scaling only the members whose
+/// defaults happened to be readable changes the indicator's identity.
+fn registry_window_defaults(ind_id: &str) -> std::result::Result<Vec<(&'static str, i64)>, String> {
+    use vector_ta::indicators::registry::ParamValueStatic;
+
+    let info = vector_ta::indicators::registry::get_indicator(ind_id)
+        .ok_or_else(|| format!("{ind_id} is absent from the vector-ta registry"))?;
+    let keys = unmatched_window_keys(ind_id);
+    let mut defaults = Vec::with_capacity(keys.len());
+    for key in keys {
+        let param = info
+            .params
+            .iter()
+            .find(|param| param.key == key)
+            .ok_or_else(|| format!("registry key {key} disappeared while resolving {ind_id}"))?;
+        let default = match param.default {
+            Some(ParamValueStatic::Int(value)) if value > 0 => value,
+            Some(other) => {
+                return Err(format!(
+                    "{ind_id}.{key} needs a positive Int default, found {other:?}"
+                ));
+            }
+            None => return Err(format!("{ind_id}.{key} has no registry default")),
+        };
+        defaults.push((key, default));
+    }
+    Ok(defaults)
+}
+
+fn scale_window_tuple(
+    keys: &[(&'static str, i64)],
+    anchor_default: i64,
+    period: usize,
+) -> Vec<ParamKV<'static>> {
+    assert!(anchor_default > 0, "window anchor must be positive");
+    let target = i128::try_from(period).expect("swept period exceeds i128");
+    let anchor = i128::from(anchor_default);
+    keys.iter()
+        .map(|&(key, default)| {
+            assert!(default > 0, "{key} default must be positive");
+            // All operands are positive. Adding anchor/2 implements the same
+            // half-up rounding as the previous f64 `.round()` expression,
+            // without architecture-dependent floating conversion.
+            let scaled = ((i128::from(default) * target + anchor / 2) / anchor).max(1);
+            ParamKV {
+                key,
+                value: ParamValue::Int(
+                    i64::try_from(scaled).expect("scaled window exceeds the dispatch i64 ABI"),
+                ),
+            }
+        })
+        .collect()
+}
+
 /// Build the parameter list for one indicator at one swept period.
 fn sweep_params(plan: PeriodPlan, period: usize) -> Vec<ParamKV<'static>> {
     match plan {
@@ -1520,28 +2344,225 @@ fn sweep_params(plan: PeriodPlan, period: usize) -> Vec<ParamKV<'static>> {
             key,
             value: ParamValue::Int(period as i64),
         }],
-        PeriodPlan::Ratio(keys) => {
-            let (_, anchor_default) = keys[0];
-            keys.iter()
-                .map(|&(key, default)| {
-                    // Preserve the tuple's shape: scale each declared default
-                    // by the same factor, never below 1.
-                    let scaled = ((default as f64) * (period as f64) / (anchor_default as f64))
-                        .round()
-                        .max(1.0) as i64;
-                    ParamKV {
-                        key,
-                        value: ParamValue::Int(scaled),
-                    }
-                })
-                .collect()
+        PeriodPlan::Ratio(keys) => scale_window_tuple(keys, keys[0].1, period),
+        PeriodPlan::RegistryRatio(ind_id) => {
+            let keys = registry_window_defaults(ind_id).unwrap_or_else(|error| {
+                panic!("period_plan admitted an invalid registry tuple for {ind_id}: {error}")
+            });
+            let anchor_default = keys
+                .iter()
+                .map(|(_, default)| *default)
+                .max()
+                .expect("RegistryRatio cannot contain an empty tuple");
+            scale_window_tuple(&keys, anchor_default, period)
         }
-        // Historical behaviour preserved deliberately — see PeriodPlan docs.
-        PeriodPlan::NoWindow => vec![ParamKV {
-            key: "period",
-            value: ParamValue::Int(period as i64),
-        }],
+        PeriodPlan::NoWindow => Vec::new(),
     }
+}
+
+/// CUDA's generic f64 ABI accepts one integer timescale.  Resolve the exact
+/// anchor represented by the CPU request without inventing a default.
+///
+/// `None` is the base pass (`params: &[]`), so its anchor is read from the same
+/// registry/default tuple [`period_plan`] uses.  A no-window formula receives
+/// the inert value `1`; preflight separately proves that its registered kernel
+/// is period-invariant before that value is allowed to launch.
+#[cfg(feature = "gpu-cuda")]
+pub(super) fn classic_cuda_period_anchor(
+    indicator_id: &'static str,
+    swept_period: Option<usize>,
+) -> std::result::Result<usize, String> {
+    if let Some(period) = swept_period {
+        return (period > 0)
+            .then_some(period)
+            .ok_or_else(|| format!("{indicator_id}: swept period must be positive"));
+    }
+
+    use vector_ta::indicators::registry::ParamValueStatic;
+    match period_plan(indicator_id) {
+        PeriodPlan::Key(key) => {
+            let info =
+                vector_ta::indicators::registry::get_indicator(indicator_id).ok_or_else(|| {
+                    format!(
+                        "{indicator_id}: base CPU dispatch is unregistered, so its `{key}` default \
+                         cannot be proven from the canonical registry"
+                    )
+                })?;
+            let param = info
+                .params
+                .iter()
+                .find(|param| param.key == key)
+                .ok_or_else(|| format!("{indicator_id}: registry no longer declares `{key}`"))?;
+            match param.default {
+                Some(ParamValueStatic::Int(value)) if value > 0 => usize::try_from(value)
+                    .map_err(|_| format!("{indicator_id}.{key}: default {value} exceeds usize")),
+                other => Err(format!(
+                    "{indicator_id}.{key}: expected a positive integer default, found {other:?}"
+                )),
+            }
+        }
+        PeriodPlan::Ratio(keys) => usize::try_from(keys[0].1).map_err(|_| {
+            format!(
+                "{indicator_id}.{}: default {} exceeds usize",
+                keys[0].0, keys[0].1
+            )
+        }),
+        PeriodPlan::RegistryRatio(id) => registry_window_defaults(id)?
+            .into_iter()
+            .map(|(_, default)| default)
+            .max()
+            .ok_or_else(|| format!("{indicator_id}: registry window tuple is empty"))
+            .and_then(|default| {
+                usize::try_from(default)
+                    .map_err(|_| format!("{indicator_id}: default {default} exceeds usize"))
+            }),
+        PeriodPlan::NoWindow => Ok(1),
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+pub(super) fn classic_cuda_base_has_no_window(indicator_id: &'static str) -> bool {
+    matches!(period_plan(indicator_id), PeriodPlan::NoWindow)
+}
+
+/// Exact integer overrides the CPU sweep sends for an admitted point.  The
+/// planner records them in its gap manifest so a CUDA route cannot claim only
+/// the column name while silently interpreting a different coupled tuple.
+#[cfg(feature = "gpu-cuda")]
+pub(super) fn classic_cuda_sweep_params(
+    indicator_id: &'static str,
+    period: usize,
+) -> std::result::Result<Vec<(&'static str, i64)>, String> {
+    sweep_params(period_plan(indicator_id), period)
+        .into_iter()
+        .map(|param| match param.value {
+            ParamValue::Int(value) => Ok((param.key, value)),
+            other => Err(format!(
+                "{indicator_id}.{}: CUDA sweep needs an integer override, found {other:?}",
+                param.key
+            )),
+        })
+        .collect()
+}
+
+/// Formula-proven parameter points that must not enter the production sweep.
+///
+/// These are static properties of the implementation, never conclusions drawn
+/// from one market frame. Keeping the reason beside the point makes saturation
+/// and integer-scaling collisions reviewable instead of silently shaving the
+/// schema at runtime.
+pub const SWEEP_POINT_EXCLUSIONS: &[(&str, usize, &str)] = &[
+    (
+        "cycle_channel_oscillator",
+        7,
+        "ratio scaling makes the internal short delay zero, so fast and slow both read the undelayed source",
+    ),
+    (
+        "ehlers_itrend",
+        100,
+        "the implementation clamps its adaptive MESA period to 50, making period 100 identical to period 50",
+    ),
+    (
+        "ehlers_itrend",
+        200,
+        "the implementation clamps its adaptive MESA period to 50, making period 200 identical to period 50",
+    ),
+];
+
+/// Formula-level reason why an extended sweep point is deliberately absent.
+pub fn sweep_point_exclusion(indicator_id: &str, period: usize) -> Option<&'static str> {
+    SWEEP_POINT_EXCLUSIONS
+        .iter()
+        .find(|(candidate_id, candidate_period, _)| {
+            *candidate_id == indicator_id && *candidate_period == period
+        })
+        .map(|(_, _, reason)| *reason)
+}
+
+/// Whether one extended-sweep point is both accepted by the registry contract
+/// and semantically different from the base vocabulary's default call.
+///
+/// This is deliberately static: the emitted feature schema may depend on the
+/// indicator registry and requested parameter point, never on the values in a
+/// particular market frame. It prevents three expensive false features:
+///
+/// * a point equal to every overridden registry default (the base pass already
+///   computed it);
+/// * an integer outside its declared min/max bounds;
+/// * a coupled tuple whose rounding reverses or collapses a strict ordering
+///   present in the authoritative defaults (for example short < long);
+/// * a formula-proven saturation or integer-scaling collision named in
+///   [`SWEEP_POINT_EXCLUSIONS`].
+fn sweep_point_is_distinct_and_valid(ind_id: &'static str, period: usize) -> bool {
+    use std::cmp::Ordering;
+    use vector_ta::indicators::registry::{IndicatorParamKind, ParamValueStatic};
+
+    if sweep_point_exclusion(ind_id, period).is_some() {
+        return false;
+    }
+
+    let Some(info) = vector_ta::indicators::registry::get_indicator(ind_id) else {
+        return false;
+    };
+    let params = sweep_params(period_plan(ind_id), period);
+    if params.is_empty() {
+        return false;
+    }
+
+    let mut generated_with_defaults = Vec::with_capacity(params.len());
+    let mut all_at_default = true;
+    for param in &params {
+        let ParamValue::Int(value) = param.value else {
+            return false;
+        };
+        let Some(declared) = info
+            .params
+            .iter()
+            .find(|candidate| candidate.key == param.key)
+        else {
+            return false;
+        };
+        if !matches!(declared.kind, IndicatorParamKind::Int) {
+            return false;
+        }
+        if declared.min.is_some_and(|minimum| (value as f64) < minimum)
+            || declared.max.is_some_and(|maximum| (value as f64) > maximum)
+        {
+            return false;
+        }
+        let Some(ParamValueStatic::Int(default)) = declared.default else {
+            return false;
+        };
+        all_at_default &= value == default;
+        generated_with_defaults.push((default, value));
+    }
+    if all_at_default {
+        return false;
+    }
+
+    for left in 0..generated_with_defaults.len() {
+        for right in (left + 1)..generated_with_defaults.len() {
+            let (left_default, left_value) = generated_with_defaults[left];
+            let (right_default, right_value) = generated_with_defaults[right];
+            match left_default.cmp(&right_default) {
+                Ordering::Less if left_value >= right_value => return false,
+                Ordering::Greater if left_value <= right_value => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// Extended points for one id after static contract validation and removal of
+/// the base-default duplicate. Every caller uses this exact list, so memory
+/// planning, streaming selection, and actual dispatch cannot disagree.
+fn extended_sweep_periods(ind_id: &'static str) -> Vec<usize> {
+    ALT_PERIODS
+        .iter()
+        .copied()
+        .filter(|period| sweep_point_is_distinct_and_valid(ind_id, *period))
+        .collect()
 }
 
 /// The sweep, with its outcomes counted.
@@ -1558,6 +2579,7 @@ fn cpu_multi_period_columns_ledgered(
     periods: &[usize],
     n: usize,
     kernel: Kernel,
+    input_availability: ClassicInputAvailability,
 ) -> (Vec<(String, Vec<f64>)>, IndicatorLedger) {
     let mut out: Vec<(String, Vec<f64>)> = Vec::new();
     let mut ledger = IndicatorLedger::new();
@@ -1577,12 +2599,12 @@ fn cpu_multi_period_columns_ledgered(
     };
     let _ = &mut out;
     let _ = &mut ledger;
-    sweep_one_id_ledgered(candles, static_id, periods, n, kernel)
+    sweep_one_id_ledgered(candles, static_id, periods, n, kernel, input_availability)
 }
 
 /// Sweep ONE `'static` indicator id across `periods`.
 ///
-/// Shared by the historical eighteen (through
+/// Shared by the historical sixteen (through
 /// [`cpu_multi_period_columns_ledgered`], which keeps the id-table guard the
 /// GPU lane relies on) and by the extended sweep, so the two cannot drift on
 /// naming, on the `#212` pre-flight guard, or on what they record.
@@ -1592,6 +2614,7 @@ fn sweep_one_id_ledgered(
     periods: &[usize],
     n: usize,
     kernel: Kernel,
+    input_availability: ClassicInputAvailability,
 ) -> (Vec<(String, Vec<f64>)>, IndicatorLedger) {
     let mut out: Vec<(String, Vec<f64>)> = Vec::new();
     let mut ledger = IndicatorLedger::new();
@@ -1612,8 +2635,9 @@ fn sweep_one_id_ledgered(
             // frame, which is precisely what `lib.rs::try_assemble_cube_in_ram`
             // refuses to assemble, so a run would fall through to the slower
             // streaming disk path with nothing but a debug line to say why.
-            // Harmless while the sweep was 18 ids; not harmless now that it is
-            // hundreds. Caught by `cube_assembly_tests::ram_and_disk_cubes_are_identical`.
+            // This becomes especially damaging once the extended sweep reaches
+            // hundreds of points. Caught by
+            // `cube_assembly_tests::ram_and_disk_cubes_are_identical`.
             //
             // So the columns are still EMITTED, at full frame length, filled
             // with NaN — the same value the warmup prefix of every windowed
@@ -1644,6 +2668,7 @@ fn sweep_one_id_ledgered(
             &params,
             n,
             kernel,
+            input_availability,
             &mut out,
             &mut ledger,
         );
@@ -1654,11 +2679,23 @@ fn sweep_one_id_ledgered(
 /// Pure-CPU multi-period sweep across all of [`MULTI_PERIOD_IDS`], parallel
 /// across indicators. Column order is by position in `MULTI_PERIOD_IDS` —
 /// `flat_map_iter` + `collect` on an indexed `par_iter` preserves it.
-fn cpu_multi_period_all(candles: &Candles, n: usize) -> Vec<(String, Vec<f64>)> {
-    let per_id: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = MULTI_PERIOD_IDS
+fn cpu_multi_period_all(
+    candles: &Candles,
+    n: usize,
+    input_availability: ClassicInputAvailability,
+    indicator_ids: &[&'static str],
+) -> (Vec<(String, Vec<f64>)>, IndicatorLedger) {
+    let per_id: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = indicator_ids
         .par_iter()
         .map(|&ind_id| {
-            cpu_multi_period_columns_ledgered(candles, ind_id, &ALT_PERIODS, n, Kernel::Auto)
+            cpu_multi_period_columns_ledgered(
+                candles,
+                ind_id,
+                &ALT_PERIODS,
+                n,
+                Kernel::Auto,
+                input_availability,
+            )
         })
         .collect();
     let mut cols = Vec::new();
@@ -1667,260 +2704,47 @@ fn cpu_multi_period_all(candles: &Candles, n: usize) -> Vec<(String, Vec<f64>)> 
         cols.append(&mut c);
         ledger.merge(l);
     }
-    // ONE summary for the whole sweep rather than eighteen — but never zero.
+    // ONE summary for the whole sweep rather than sixteen — but never zero.
     ledger.log_summary("multi-period-sweep", n);
-    cols
+    (cols, ledger)
 }
 
-// --- lane selection -------------------------------------------------------
+// --- exclusive lane selection ---------------------------------------------
 //
-// Two implementations of `compute_multi_period_columns`, chosen at COMPILE
-// time. In a card-less build the CUDA one does not exist, so nothing about the
-// default build changes — not the code, not the dependency graph, not the
-// object output.
-
-#[cfg(not(feature = "gpu-cuda"))]
-fn compute_multi_period_columns(
-    _ohlcv: &Ohlcv,
-    candles: &Candles,
-    n: usize,
-    policy: IndicatorComputePolicy,
-) -> Vec<(String, Vec<f64>)> {
-    use crate::core::indicator_telemetry::{IndicatorLane, IndicatorRunSummary, record};
-    use std::time::Instant;
-
-    // `RequireGpu` on a binary with no CUDA lane compiled in is an operator
-    // error that MUST be loud. Returning CPU numbers here is exactly the
-    // silent degradation the GPU-or-fail invariant exists to prevent.
-    assert!(
-        policy != IndicatorComputePolicy::RequireGpu,
-        "IndicatorComputePolicy::RequireGpu was requested but this binary has no CUDA indicator \
-         lane compiled in. Rebuild with `--features gpu-cuda` (and CUDA_ARCH set to the card's \
-         compute capability), or use IndicatorComputePolicy::Auto/Cpu."
-    );
-
-    let t0 = Instant::now();
-    let cols = cpu_multi_period_all(candles, n);
-    let lane = match policy {
-        IndicatorComputePolicy::Cpu => IndicatorLane::CpuByPolicy,
-        _ => IndicatorLane::CpuNoFeature,
-    };
-    record(IndicatorRunSummary {
-        gpu_indicators: Vec::new(),
-        cpu_indicators: MULTI_PERIOD_IDS
-            .iter()
-            .map(|id| (*id, lane.clone()))
-            .collect(),
-        cpu_time: t0.elapsed(),
-        ..Default::default()
-    });
-    cols
-}
-
-#[cfg(feature = "gpu-cuda")]
+// This helper is CPU-only. `GpuOnly` returns through `classic_cuda_plan` before
+// Candles are allocated and materializes f64 only after every admitted output
+// has passed the exact CUDA preflight. It may never enter this helper.
 fn compute_multi_period_columns(
     ohlcv: &Ohlcv,
     candles: &Candles,
     n: usize,
     policy: IndicatorComputePolicy,
-) -> Vec<(String, Vec<f64>)> {
-    use crate::core::gpu_indicators::{GpuIndicatorEngine, spec_for};
+    indicator_ids: &[&'static str],
+) -> (Vec<(String, Vec<f64>)>, IndicatorLedger) {
     use crate::core::indicator_telemetry::{IndicatorLane, IndicatorRunSummary, record};
     use std::time::Instant;
 
-    if policy == IndicatorComputePolicy::Cpu {
-        let t0 = Instant::now();
-        let cols = cpu_multi_period_all(candles, n);
-        record(IndicatorRunSummary {
-            cpu_indicators: MULTI_PERIOD_IDS
-                .iter()
-                .map(|id| (*id, IndicatorLane::CpuByPolicy))
-                .collect(),
-            cpu_time: t0.elapsed(),
-            ..Default::default()
-        });
-        return cols;
-    }
-
-    // Device ordinal 0. Multi-card indicator fan-out is a separate change; a
-    // single card already serves the whole frame from one upload.
-    let engine = match GpuIndicatorEngine::new(ohlcv, 0) {
-        Ok(e) => e,
-        Err(e) => {
-            // `RequireGpu`: no fallback exists. Panic with the device error
-            // still attached — this is the GPU-or-fail invariant, and it is
-            // worth more than a completed run with CPU numbers in it.
-            if policy == IndicatorComputePolicy::RequireGpu {
-                panic!(
-                    "IndicatorComputePolicy::RequireGpu: the CUDA indicator lane could not be \
-                     opened and there is no fallback: {e:?}"
-                );
-            }
-            // `Auto`: fall back, but the fallback is DECLARED — logged at WARN
-            // with the device error, and recorded per indicator in the run
-            // summary so `indicator_device_summary()` prints the reason.
-            tracing::warn!(
-                target: "neoethos_data::hpc_ta",
-                error = %format!("{e:#}"),
-                "CUDA indicator lane unavailable — the multi-period sweep runs on the CPU for \
-                 this frame. This is a DECLARED fallback: the reason is recorded in the \
-                 indicator-lane device summary. Use IndicatorComputePolicy::RequireGpu to make \
-                 it fatal."
-            );
-            let t0 = Instant::now();
-            let cols = cpu_multi_period_all(candles, n);
-            let lane = IndicatorLane::CpuDeviceUnavailable {
-                why: format!("{e:#}"),
-            };
-            record(IndicatorRunSummary {
-                cpu_indicators: MULTI_PERIOD_IDS
-                    .iter()
-                    .map(|id| (*id, lane.clone()))
-                    .collect(),
-                cpu_time: t0.elapsed(),
-                ..Default::default()
-            });
-            return cols;
+    let lane = match policy {
+        IndicatorComputePolicy::CpuOnly => IndicatorLane::CpuByPolicy,
+        IndicatorComputePolicy::Auto => IndicatorLane::CpuNoFeature,
+        IndicatorComputePolicy::GpuOnly => {
+            unreachable!("GpuOnly must return through the exact CUDA executor before this helper")
         }
     };
-
-    // The lane is proven. Announce WHICH lane and at WHAT precision, once per
-    // frame, the same way the population lane's `device_summary` does — a
-    // reader must never have to infer either.
-    //
-    // This used to be a WARN announcing a divergence, because the device layer
-    // was f32 while every other column in the frame was f64. It is now INFO
-    // announcing parity, because the lane is f64 end to end (no narrowing on
-    // upload, f64 kernels, no fast math). The claim is checked by
-    // `gpu_cpu_indicator_sweep_parity` on real bars; the log line states the
-    // precision, it does not prove it.
-    tracing::info!(
-        target: "neoethos_data::hpc_ta",
-        device = engine.device_name(),
-        arch = engine.device_arch(),
-        compiled_archs = vector_ta::cuda::module_loader::COMPILED_ARCHS,
-        ptx_arch = crate::core::indicator_telemetry::VECTOR_TA_PTX_ARCH,
-        precision = engine.precision(),
-        gpu_indicators = crate::core::gpu_indicators::GPU_SWEEP_SPECS.len(),
-        cpu_indicators = MULTI_PERIOD_IDS.len() - crate::core::gpu_indicators::GPU_SWEEP_SPECS.len(),
-        "multi-period indicator sweep is running on the CUDA f64 lane — f64 upload, f64 kernels, \
-         no fast math. See hpc_ta::gpu_cpu_indicator_sweep_parity for the measured agreement \
-         against the f64 CPU reference."
+    let started = Instant::now();
+    let (columns, ledger) = cpu_multi_period_all(
+        candles,
+        n,
+        ClassicInputAvailability::from_ohlcv(ohlcv),
+        indicator_ids,
     );
-
-    // Per-indicator slots, filled in `MULTI_PERIOD_IDS` order so the emitted
-    // column order matches the pure-CPU path exactly.
-    let mut slots: Vec<Vec<(String, Vec<f64>)>> = vec![Vec::new(); MULTI_PERIOD_IDS.len()];
-    // Tracked explicitly rather than inferred from `slots[i].is_empty()` so a
-    // successful device request that emits only schema-preserving all-NaN
-    // placeholders is still recorded as handled, without a CPU re-run.
-    let mut device_handled = vec![false; MULTI_PERIOD_IDS.len()];
-    let mut gpu_ids: Vec<&'static str> = Vec::new();
-    let mut cpu_ids: Vec<(&'static str, IndicatorLane)> = Vec::new();
-    let mut device_calls: u64 = 0;
-    let mut gpu_time = std::time::Duration::ZERO;
-    let mut cpu_time = std::time::Duration::ZERO;
-
-    // Device pass first: serial across indicators by design. They all read the
-    // same resident buffers on one stream, so interleaving them from rayon
-    // workers would only contend for the same stream.
-    for (idx, &ind_id) in MULTI_PERIOD_IDS.iter().enumerate() {
-        let Some(spec) = spec_for(ind_id) else {
-            continue;
-        };
-        let t0 = Instant::now();
-        match engine.sweep_columns(spec, &ALT_PERIODS) {
-            Ok(cols) => {
-                // ONE launch per indicator now, for the whole period list —
-                // the f64 lane takes an explicit period array instead of an
-                // arithmetic (start, end, step) range, so the five periods no
-                // longer cost five launches. Counting columns here would
-                // silently re-inflate this back to the old number and hide the
-                // improvement.
-                if engine.has_launchable_period(&ALT_PERIODS) {
-                    device_calls += 1;
-                }
-                gpu_time += t0.elapsed();
-                slots[idx] = cols;
-                device_handled[idx] = true;
-                gpu_ids.push(ind_id);
-            }
-            Err(e) => {
-                // A launch that fails AFTER the lane was proven is a real
-                // fault, not a capability gap. Under RequireGpu it is fatal;
-                // under Auto it is a declared per-indicator fallback.
-                if policy == IndicatorComputePolicy::RequireGpu {
-                    panic!(
-                        "IndicatorComputePolicy::RequireGpu: device sweep for `{ind_id}` failed \
-                         after the lane was proven: {e:?}"
-                    );
-                }
-                tracing::warn!(
-                    target: "neoethos_data::hpc_ta",
-                    indicator = %ind_id,
-                    error = %format!("{e:#}"),
-                    "device sweep failed for this indicator; falling back to the CPU for it \
-                     (declared, recorded in the indicator-lane summary)"
-                );
-                cpu_ids.push((
-                    ind_id,
-                    IndicatorLane::CpuDeviceUnavailable {
-                        why: format!("{e:#}"),
-                    },
-                ));
-            }
-        }
-    }
-    if let Err(e) = engine.synchronize() {
-        tracing::warn!(
-            target: "neoethos_data::hpc_ta",
-            error = %format!("{e:#}"),
-            "CudaRuntime::synchronize failed after the indicator sweep; recorded device time is \
-             a lower bound"
-        );
-    }
-
-    // Anything the device did not fill is a CPU indicator: either not in the
-    // device table (enumerated up front) or a failed launch recorded above.
-    let cpu_pending: Vec<(usize, &'static str)> = device_handled
-        .iter()
-        .enumerate()
-        .filter(|(_, handled)| !**handled)
-        .map(|(i, _)| (i, MULTI_PERIOD_IDS[i]))
-        .collect();
-    for &(_, id) in &cpu_pending {
-        if !cpu_ids.iter().any(|(cid, _)| *cid == id) {
-            cpu_ids.push((id, IndicatorLane::CpuIndicatorNotPortable));
-        }
-    }
-    let t0 = Instant::now();
-    let cpu_filled: Vec<(usize, Vec<(String, Vec<f64>)>)> = cpu_pending
-        .par_iter()
-        .map(|&(i, id)| {
-            (
-                i,
-                cpu_multi_period_columns(candles, id, &ALT_PERIODS, n, Kernel::Auto),
-            )
-        })
-        .collect();
-    cpu_time += t0.elapsed();
-    for (i, cols) in cpu_filled {
-        slots[i] = cols;
-    }
-
     record(IndicatorRunSummary {
-        gpu_indicators: gpu_ids,
-        cpu_indicators: cpu_ids,
-        gpu_time,
-        cpu_time,
-        device_calls,
-        uploads: engine.uploads(),
-        // Reported by the engine rather than restated here, so the telemetry
-        // string and the lane cannot drift apart.
-        precision: Some(engine.precision()),
+        gpu_indicators: Vec::new(),
+        cpu_indicators: indicator_ids.iter().map(|id| (*id, lane.clone())).collect(),
+        cpu_time: started.elapsed(),
+        ..Default::default()
     });
-
-    slots.into_iter().flatten().collect()
+    (columns, ledger)
 }
 
 /// One series returned by `compute_single_indicator` — multi-output
@@ -2126,7 +2950,8 @@ mod streaming_advance_tests {
     /// The degenerate case: one batch whose working set is the WHOLE space,
     /// starting at cursor 0. Its emitted `(id, periods)` grouping must be
     /// exactly what the non-streaming pass builds — the budget-prefix plan with
-    /// every id at all five `ALT_PERIODS`, in `ALL_INDICATORS` order.
+    /// every id at every statically valid, non-default `ALT_PERIODS` point, in
+    /// `ALL_INDICATORS` order.
     ///
     /// Asserted on the (id, period) LIST, not on a count: the extension emits
     /// `<id>_<period>` names into the same namespace as the base pass and a
@@ -2146,7 +2971,7 @@ mod streaming_advance_tests {
         assert!(deferred.is_empty(), "an unbounded budget defers nothing");
         let expected: Vec<(&'static str, Vec<usize>)> = plan
             .into_iter()
-            .map(|id| (id, ALT_PERIODS.to_vec()))
+            .map(|id| (id, extended_sweep_periods(id)))
             .collect();
 
         assert_eq!(
@@ -2286,6 +3111,88 @@ mod streaming_advance_tests {
 mod tests {
     use super::*;
 
+    fn semantic_pattern_columns(
+        open: &[f64],
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+    ) -> std::collections::BTreeMap<String, Vec<f64>> {
+        let output = compute_cpu(IndicatorComputeRequest {
+            indicator_id: "pattern_recognition",
+            output_id: Some("matrix"),
+            data: IndicatorDataRef::Ohlc {
+                open,
+                high,
+                low,
+                close,
+            },
+            params: &[],
+            kernel: Kernel::Scalar,
+        })
+        .expect("native vector-ta CPU pattern dispatch must succeed");
+        assert!(
+            matches!(&output.series, IndicatorSeries::I32(_)),
+            "production pattern dispatch must preserve signed magnitude"
+        );
+        pattern_matrix_columns(&output, "pattern_recognition", close.len())
+            .expect("hpc decomposition must accept the signed pattern matrix")
+            .into_iter()
+            .collect()
+    }
+
+    fn baseline_pattern_ohlc() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        (
+            vec![100.0; 192],
+            vec![102.0; 192],
+            vec![99.0; 192],
+            vec![101.0; 192],
+        )
+    }
+
+    #[test]
+    fn semantic_uniqueness_cpu_dispatch_to_hpc_preserves_pattern_magnitude_and_sign() {
+        let (mut open, mut high, mut low, mut close) = baseline_pattern_ohlc();
+        open[190] = 105.0;
+        high[190] = 105.05;
+        low[190] = 100.95;
+        close[190] = 101.0;
+        open[191] = 106.0;
+        high[191] = 109.05;
+        low[191] = 105.95;
+        close[191] = 109.0;
+        let kicking = semantic_pattern_columns(&open, &high, &low, &close);
+        assert_eq!(kicking["pattern_recognition_cdlkicking"][191], 100.0);
+        assert_eq!(
+            kicking["pattern_recognition_cdlkickingbylength"][191],
+            -100.0
+        );
+
+        // A shared endpoint is strength 80. Run both first-candle directions
+        // so the complete native {-100,-80,0,80,100} magnitude contract is
+        // exercised through dispatch and hpc decomposition, not just directly.
+        let (mut open, mut high, mut low, mut close) = baseline_pattern_ohlc();
+        open[190] = 100.0;
+        high[190] = 104.5;
+        low[190] = 99.5;
+        close[190] = 104.0;
+        open[191] = 104.0;
+        high[191] = 104.2;
+        low[191] = 103.3;
+        close[191] = 103.5;
+        let bearish = semantic_pattern_columns(&open, &high, &low, &close);
+        assert_eq!(bearish["pattern_recognition_cdlharami"][191], -80.0);
+        assert_eq!(bearish["pattern_recognition_cdlharami"][0], 0.0);
+
+        open[190] = 104.0;
+        close[190] = 100.0;
+        open[191] = 100.0;
+        high[191] = 100.7;
+        low[191] = 99.8;
+        close[191] = 100.5;
+        let bullish = semantic_pattern_columns(&open, &high, &low, &close);
+        assert_eq!(bullish["pattern_recognition_cdlharami"][191], 80.0);
+    }
+
     // #212: pre-flight check helper used by the validation harness and
     // gene admission gate to refuse computation on slices smaller than
     // the indicator's warmup. These assertions document the contract
@@ -2342,19 +3249,20 @@ mod tests {
             MAX_MULTI_PERIOD_LOOKBACK,
             "MAX_MULTI_PERIOD_LOOKBACK must be the largest swept period"
         );
-        assert_eq!(MULTI_PERIOD_IDS.len(), 18);
+        assert_eq!(MULTI_PERIOD_IDS.len(), 16);
+        assert!(!MULTI_PERIOD_IDS.contains(&"obv"));
+        assert!(!MULTI_PERIOD_IDS.contains(&"vwap"));
     }
 
-    /// Column SET, NAMES and ORDER must not depend on which lane computed the
-    /// values. On a card-less build both policies run the same code and this
-    /// only pins the contract; on a box with a card it is a real cross-lane
-    /// test, because `Auto` routes ten of the eighteen indicators through
-    /// CUDA and the columns are re-assembled by slot afterwards.
+    /// Automatic selection currently resolves the whole request to CpuOnly
+    /// because the complete GPU graph is not promoted. It must therefore
+    /// preserve the exact CpuOnly schema rather than running a partial CUDA
+    /// sweep and reassembling host columns.
     #[test]
     fn lane_policy_does_not_change_column_names_or_order() {
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
-        let cpu =
-            compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Cpu).unwrap();
+        let cpu = compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::CpuOnly)
+            .unwrap();
         let auto =
             compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Auto).unwrap();
         let cpu_names: Vec<&str> = cpu.iter().map(|(n, _)| n.as_str()).collect();
@@ -2362,7 +3270,37 @@ mod tests {
         assert_eq!(
             cpu_names, auto_names,
             "the lane policy changed the feature-frame column layout — every stored artifact \
-             would be invalidated"
+            would be invalidated"
+        );
+    }
+
+    /// Strict GPU selection is a whole-graph execution boundary. It must
+    /// reject the still-incomplete resident feature plan before the CPU base
+    /// pass starts, never execute the old CPU -> partial CUDA -> CPU route.
+    #[test]
+    fn strict_gpu_policy_rejects_the_incomplete_graph_before_work() {
+        let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
+        let result =
+            compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::GpuOnly);
+        let error = result.expect_err("strict GPU mode must reject an incomplete resident graph");
+        let message = format!("{error:#}");
+        eprintln!("NEOETHOS_GPU_ONLY_REJECTION={message}");
+        assert!(
+            message.contains("GpuOnly preflight rejected before any CPU or CUDA work"),
+            "unexpected strict-GPU rejection: {message}"
+        );
+        #[cfg(feature = "gpu-cuda")]
+        assert!(
+            message.contains("classic-TA output route(s) are incomplete")
+                && message.contains("No CPU segment")
+                && message.contains("missing_"),
+            "unexpected strict-GPU rejection: {message}"
+        );
+        #[cfg(not(feature = "gpu-cuda"))]
+        assert!(
+            message.contains("built without the gpu-cuda feature")
+                && message.contains("never substitutes CpuOnly"),
+            "unexpected strict-GPU rejection: {message}"
         );
     }
 
@@ -2370,7 +3308,7 @@ mod tests {
     fn execution_report_accounts_for_the_exact_production_admission() {
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
         let run =
-            compute_classic_ta_columns_with_policy_report(&ohlcv, IndicatorComputePolicy::Cpu)
+            compute_classic_ta_columns_with_policy_report(&ohlcv, IndicatorComputePolicy::CpuOnly)
                 .unwrap();
         let report = &run.report;
 
@@ -2401,7 +3339,7 @@ mod tests {
             report
                 .extended_admitted_indicator_ids
                 .iter()
-                .map(|id| planned_output_count(id) * ALT_PERIODS.len())
+                .map(|id| planned_output_count(id) * extended_sweep_periods(id).len())
                 .sum::<usize>()
         );
         assert!(
@@ -2441,8 +3379,8 @@ mod tests {
     #[test]
     fn the_base_vocabulary_is_no_longer_a_single_column() {
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
-        let cols =
-            compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Cpu).unwrap();
+        let cols = compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::CpuOnly)
+            .unwrap();
         let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
         // The sweep alone contributes 65 on a long frame, but at ~100 bars only
         // the 7/21/50 periods clear the #212 pre-flight guard. The base pass is
@@ -2468,8 +3406,8 @@ mod tests {
     #[test]
     fn multi_output_indicators_now_emit_one_named_column_per_output() {
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
-        let cols =
-            compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Cpu).unwrap();
+        let cols = compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::CpuOnly)
+            .unwrap();
         let bb: Vec<&String> = cols
             .iter()
             .map(|(n, _)| n)
@@ -2493,8 +3431,8 @@ mod tests {
     fn every_emitted_column_is_exactly_frame_length() {
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
         let n = ohlcv.len();
-        let cols =
-            compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Cpu).unwrap();
+        let cols = compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::CpuOnly)
+            .unwrap();
         assert!(!cols.is_empty());
         for (name, v) in &cols {
             assert_eq!(
@@ -2534,18 +3472,27 @@ mod tests {
             close: full.close[..60].to_vec(),
             volume: full.volume.as_ref().map(|v| v[..60].to_vec()),
         };
-        let a = compute_classic_ta_columns_with_policy(&full, IndicatorComputePolicy::Cpu).unwrap();
+        let a =
+            compute_classic_ta_columns_with_policy(&full, IndicatorComputePolicy::CpuOnly).unwrap();
         // Sized against the LONGER frame, exactly as a multi-timeframe build
         // does — the budget must not vary per timeframe either.
-        let b = compute_classic_ta_columns_sized(&short, IndicatorComputePolicy::Cpu, full.len())
-            .unwrap();
+        let b =
+            compute_classic_ta_columns_sized(&short, IndicatorComputePolicy::CpuOnly, full.len())
+                .unwrap();
         let names_a: Vec<&str> = a.iter().map(|(n, _)| n.as_str()).collect();
         let names_b: Vec<&str> = b.iter().map(|(n, _)| n.as_str()).collect();
+        let set_a: HashSet<&str> = names_a.iter().copied().collect();
+        let set_b: HashSet<&str> = names_b.iter().copied().collect();
+        let mut only_full: Vec<&str> = set_a.difference(&set_b).copied().collect();
+        let mut only_short: Vec<&str> = set_b.difference(&set_a).copied().collect();
+        only_full.sort_unstable();
+        only_short.sort_unstable();
         assert_eq!(
             names_a.len(),
             names_b.len(),
             "a {}-bar frame emitted {} columns and a 60-bar frame emitted {} — the cube's width \
-             invariant would refuse to assemble and the run would silently take the disk path",
+             invariant would refuse to assemble and the run would silently take the disk path; \
+             only_full={only_full:?}; only_short={only_short:?}",
             full.len(),
             names_a.len(),
             names_b.len()
@@ -2564,8 +3511,8 @@ mod tests {
     #[test]
     fn column_names_are_unique() {
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
-        let cols =
-            compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Cpu).unwrap();
+        let cols = compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::CpuOnly)
+            .unwrap();
         let mut seen = std::collections::HashSet::new();
         for (name, _) in &cols {
             assert!(seen.insert(name.clone()), "duplicate column name '{name}'");
@@ -2603,11 +3550,227 @@ mod tests {
         }
         // stoch is the other coupled one.
         assert!(matches!(period_plan("stoch"), PeriodPlan::Ratio(_)));
-        // obv declares no window — the historical `period` key is still sent so
-        // the obv_7..obv_200 names survive, and the duplication is reported by
-        // the census instead of being pretended away.
+        assert_eq!(
+            period_plan("alligator"),
+            PeriodPlan::RegistryRatio("alligator")
+        );
+        // OBV declares no window. It stays as one base feature and a sweep may
+        // not invent ignored parameters or compatibility aliases for it.
         assert_eq!(period_plan("obv"), PeriodPlan::NoWindow);
-        assert_eq!(sweep_params(PeriodPlan::NoWindow, 21)[0].key, "period");
+        assert!(sweep_params(PeriodPlan::NoWindow, 21).is_empty());
+    }
+
+    /// A registry-declared integer window must never fall through to
+    /// `NoWindow`: that makes vector-ta ignore the synthetic `period` key and
+    /// emits several bit-identical features under different names.
+    #[test]
+    fn every_windowed_extended_indicator_has_a_scalable_period_plan() {
+        let unresolved = ALL_INDICATORS
+            .iter()
+            .copied()
+            .filter(|id| !MULTI_PERIOD_IDS.contains(id))
+            .filter(|id| !unmatched_window_keys(id).is_empty())
+            .filter(|id| matches!(period_plan(id), PeriodPlan::NoWindow))
+            .map(|id| (id, unmatched_window_keys(id)))
+            .collect::<Vec<_>>();
+        assert!(
+            unresolved.is_empty(),
+            "windowed indicators still routed through NoWindow: {unresolved:#?}"
+        );
+    }
+
+    /// The vector-ta registry is the source of truth for automatically scaled
+    /// tuples. At the anchor default the generated params must reproduce every
+    /// registry default exactly; at every search period they remain positive
+    /// and complete.
+    #[test]
+    fn registry_window_tuple_scaling_preserves_authoritative_defaults() {
+        use vector_ta::indicators::registry::ParamValueStatic;
+
+        for &id in ALL_INDICATORS {
+            let keys = unmatched_window_keys(id);
+            if keys.is_empty() {
+                continue;
+            }
+            let defaults = registry_window_defaults(id)
+                .unwrap_or_else(|error| panic!("invalid registry tuple for {id}: {error}"));
+            assert_eq!(defaults.len(), keys.len(), "{id}: incomplete window tuple");
+            let anchor = defaults
+                .iter()
+                .map(|(_, default)| *default)
+                .max()
+                .expect("non-empty tuple has an anchor");
+            let at_default = sweep_params(
+                PeriodPlan::RegistryRatio(id),
+                usize::try_from(anchor).expect("positive default fits usize"),
+            );
+            assert_eq!(at_default.len(), defaults.len(), "{id}: param count drift");
+            for &(key, default) in &defaults {
+                let generated = at_default
+                    .iter()
+                    .find(|param| param.key == key)
+                    .unwrap_or_else(|| panic!("{id}: generated tuple omitted {key}"));
+                assert_eq!(
+                    generated.value,
+                    ParamValue::Int(default),
+                    "{id}.{key}: anchor scaling changed the registry default"
+                );
+
+                let info = vector_ta::indicators::registry::get_indicator(id)
+                    .expect("ALL_INDICATORS entry must be registered");
+                let declared = info
+                    .params
+                    .iter()
+                    .find(|param| param.key == key)
+                    .expect("key came from this registry entry");
+                assert_eq!(declared.default, Some(ParamValueStatic::Int(default)));
+                if let Some(minimum) = declared.min {
+                    assert!(
+                        (default as f64) >= minimum,
+                        "{id}.{key}: default {default} < registry min {minimum}"
+                    );
+                }
+                if let Some(maximum) = declared.max {
+                    assert!(
+                        (default as f64) <= maximum,
+                        "{id}.{key}: default {default} > registry max {maximum}"
+                    );
+                }
+            }
+            for &period in &ALT_PERIODS {
+                let generated = sweep_params(PeriodPlan::RegistryRatio(id), period);
+                assert_eq!(generated.len(), defaults.len(), "{id}@{period}");
+                for param in generated {
+                    match param.value {
+                        ParamValue::Int(value) => {
+                            assert!(value >= 1, "{id}.{} scaled to {value}", param.key)
+                        }
+                        _ => panic!("{id}.{} did not generate an Int", param.key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The base vocabulary already evaluates every indicator at its registry
+    /// defaults. Re-emitting that exact parameter tuple under a `_50`/`_100`
+    /// suffix is dead work and a false extra feature. Likewise, a point that
+    /// violates the registry's declared bounds must be rejected by the static
+    /// sweep plan, not attempted later and converted into an all-NaN column.
+    #[test]
+    fn extended_space_excludes_default_equivalent_and_invalid_parameter_points() {
+        let space = extended_sweep_space();
+
+        assert!(
+            !space.contains(&SweepPair {
+                id: "atr_percentile",
+                period: 50,
+            }),
+            "atr_percentile@50 reproduces its exact registry-default tuple"
+        );
+        assert!(
+            !space.contains(&SweepPair {
+                id: "halftrend",
+                period: 100,
+            }),
+            "halftrend@100 reproduces its exact registry-default tuple"
+        );
+        assert!(
+            !space.contains(&SweepPair {
+                id: "geometric_bias_oscillator",
+                period: 7,
+            }),
+            "geometric_bias_oscillator.length has registry minimum 10"
+        );
+        assert!(
+            !space.contains(&SweepPair {
+                id: "ehlers_autocorrelation_periodogram",
+                period: 7,
+            }),
+            "the scaled min_period at anchor 7 falls below its registry minimum"
+        );
+
+        for pair in [
+            SweepPair {
+                id: "atr_percentile",
+                period: 21,
+            },
+            SweepPair {
+                id: "halftrend",
+                period: 50,
+            },
+            SweepPair {
+                id: "geometric_bias_oscillator",
+                period: 21,
+            },
+            SweepPair {
+                id: "ehlers_autocorrelation_periodogram",
+                period: 21,
+            },
+        ] {
+            assert!(space.contains(&pair), "valid point was lost: {pair:?}");
+        }
+    }
+
+    #[test]
+    fn formula_proven_sweep_collisions_are_named_unique_and_absent() {
+        let mut keys = std::collections::BTreeSet::new();
+        for (id, period, reason) in SWEEP_POINT_EXCLUSIONS {
+            assert!(ALL_INDICATORS.contains(id), "unknown excluded id {id}");
+            assert!(ALT_PERIODS.contains(period), "{id}@{period} is not swept");
+            assert!(
+                keys.insert((*id, *period)),
+                "duplicate sweep exclusion for {id}@{period}"
+            );
+            assert!(
+                reason.len() > 20,
+                "{id}@{period} has no formula-level exclusion reason"
+            );
+            assert_eq!(
+                sweep_point_exclusion(id, *period),
+                Some(*reason),
+                "exclusion lookup drifted"
+            );
+            assert!(
+                !sweep_point_is_distinct_and_valid(id, *period),
+                "{id}@{period} remains dispatchable despite its formula collision"
+            );
+        }
+
+        for (id, period) in [
+            ("cycle_channel_oscillator", 21),
+            ("ehlers_itrend", 50),
+            ("half_causal_estimator", 21),
+            ("half_causal_estimator", 50),
+        ] {
+            assert!(
+                sweep_point_is_distinct_and_valid(id, period),
+                "neighbouring valid point was over-excluded: {id}@{period}"
+            );
+        }
+        let hce_21 = sweep_params(PeriodPlan::RegistryRatio("half_causal_estimator"), 21);
+        let hce_21_value = |key| {
+            hce_21
+                .iter()
+                .find(|param| param.key == key)
+                .map(|param| match param.value {
+                    ParamValue::Int(value) => value,
+                    _ => panic!("HCE RegistryRatio values must remain integers"),
+                })
+                .unwrap_or_else(|| panic!("HCE@21 omitted {key}"))
+        };
+        assert_eq!(hce_21_value("data_period"), 5);
+        assert_eq!(hce_21_value("filter_length"), 21);
+
+        assert_eq!(
+            period_plan("ehlers_pma"),
+            PeriodPlan::NoWindow,
+            "Ehlers PMA has no period parameter in its formula"
+        );
+        assert!(
+            !is_extended_sweepable("ehlers_pma"),
+            "a parameterless formula must not enter the extended period sweep"
+        );
     }
 
     /// The ratio scaling must never produce a zero or negative window.
@@ -2763,12 +3926,12 @@ mod tests {
         };
 
         eprintln!(
-            "parity vs {} ({}), fatbin archs {}, build.rs recorded {}, precision {}, \
+            "parity vs {} ({}), native cubin archs {:?}, source {}, precision {}, \
              {n} real EURUSD M1 bars",
             engine.device_name(),
             engine.device_arch(),
             vector_ta::cuda::module_loader::COMPILED_ARCHS,
-            crate::core::indicator_telemetry::VECTOR_TA_PTX_ARCH,
+            crate::core::indicator_telemetry::VECTOR_TA_ARCH_SOURCE,
             engine.precision(),
         );
 
@@ -2916,7 +4079,10 @@ mod tests {
                 // kernel launch, so the arches are compatible by construction.
                 // Assert the reported strings are populated, not placeholders.
                 assert!(engine.device_arch().starts_with("sm_"));
-                assert_ne!(crate::core::indicator_telemetry::VECTOR_TA_PTX_ARCH, "none");
+                assert!(
+                    !crate::core::indicator_telemetry::VECTOR_TA_NATIVE_ARCHS.is_empty(),
+                    "a live GPU lane must report at least one exact native cubin architecture"
+                );
             }
             Err(e) => {
                 let msg = format!("{e:#}");

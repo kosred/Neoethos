@@ -17,13 +17,13 @@ fn dead_backend() -> Backend {
 }
 
 const MALICIOUS: &[&str] = &[
-    "realId/confirm?x=",   // the exact reject→confirm path-injection payload
-    "realId/confirm",      // bare traversal onto the guarded route
-    "id with spaces",      // whitespace
-    "id%2Fconfirm",        // percent-encoded slash
-    "id#frag",             // fragment
-    "id?q=1",              // query
-    "../../confirm",       // dot-dot traversal
+    "realId/confirm?x=", // the exact reject→confirm path-injection payload
+    "realId/confirm",    // bare traversal onto the guarded route
+    "id with spaces",    // whitespace
+    "id%2Fconfirm",      // percent-encoded slash
+    "id#frag",           // fragment
+    "id?q=1",            // query
+    "../../confirm",     // dot-dot traversal
 ];
 
 #[tokio::test]

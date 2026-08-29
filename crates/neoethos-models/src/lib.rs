@@ -10,6 +10,12 @@
 // Base classes and utilities (derived from models/base.py)
 pub mod base;
 pub mod common;
+#[cfg(any(
+    feature = "neuro-evolution-gpu",
+    feature = "statistical-gpu",
+    feature = "burn-cuda-backend"
+))]
+mod cubecl_lifecycle;
 pub mod runtime;
 
 // Machine learning models

@@ -1,5 +1,6 @@
 use crate::utilities::enums::Kernel;
 use aligned_vec::AVec;
+#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use std::arch::is_x86_feature_detected;
 use std::sync::OnceLock;
 use std::{mem::MaybeUninit, ptr, slice};
@@ -7,32 +8,89 @@ use std::{mem::MaybeUninit, ptr, slice};
 static BEST_SINGLE: OnceLock<Kernel> = OnceLock::new();
 static BEST_BATCH: OnceLock<Kernel> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct X86FeatureSet {
+    avx2: bool,
+    fma: bool,
+    avx512f: bool,
+    avx512dq: bool,
+    avx512vl: bool,
+    avx512bw: bool,
+}
+
+#[inline(always)]
+fn runtime_x86_features() -> X86FeatureSet {
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    {
+        return X86FeatureSet {
+            avx2: is_x86_feature_detected!("avx2"),
+            fma: is_x86_feature_detected!("fma"),
+            avx512f: is_x86_feature_detected!("avx512f"),
+            avx512dq: is_x86_feature_detected!("avx512dq"),
+            avx512vl: is_x86_feature_detected!("avx512vl"),
+            avx512bw: is_x86_feature_detected!("avx512bw"),
+        };
+    }
+
+    #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+    {
+        X86FeatureSet::default()
+    }
+}
+
+#[inline(always)]
+const fn kernel_is_supported_by_features(kernel: Kernel, features: X86FeatureSet) -> bool {
+    match kernel {
+        Kernel::Auto | Kernel::Scalar | Kernel::ScalarBatch => true,
+        Kernel::Avx2 | Kernel::Avx2Batch => features.avx2 && features.fma,
+        Kernel::Avx512 | Kernel::Avx512Batch => {
+            features.avx2
+                && features.fma
+                && features.avx512f
+                && features.avx512dq
+                && features.avx512vl
+                && features.avx512bw
+        }
+    }
+}
+
+#[inline(always)]
+const fn best_kernel_for_x86_features(features: X86FeatureSet) -> Kernel {
+    if kernel_is_supported_by_features(Kernel::Avx512, features) {
+        Kernel::Avx512
+    } else if kernel_is_supported_by_features(Kernel::Avx2, features) {
+        Kernel::Avx2
+    } else {
+        Kernel::Scalar
+    }
+}
+
+#[inline(always)]
+const fn best_batch_kernel_for_x86_features(features: X86FeatureSet) -> Kernel {
+    match best_kernel_for_x86_features(features) {
+        Kernel::Avx512 => Kernel::Avx512Batch,
+        Kernel::Avx2 => Kernel::Avx2Batch,
+        _ => Kernel::ScalarBatch,
+    }
+}
+
+/// Runtime support decision shared by the production selector and the exported
+/// test-skip macro. Kept hidden from the public documentation because callers
+/// should request [`Kernel::Auto`] rather than reproduce dispatch policy.
+#[doc(hidden)]
+#[inline(always)]
+pub fn runtime_supports_kernel(kernel: Kernel) -> bool {
+    kernel_is_supported_by_features(kernel, runtime_x86_features())
+}
+
 #[inline(always)]
 pub fn detect_best_kernel() -> Kernel {
-    *BEST_SINGLE.get_or_init(|| {
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        {
-            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma") {
-                return Kernel::Avx512;
-            }
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                return Kernel::Avx2;
-            }
-        }
-
-        Kernel::Scalar
-    })
+    *BEST_SINGLE.get_or_init(|| best_kernel_for_x86_features(runtime_x86_features()))
 }
 
 #[inline(always)]
 pub fn detect_best_batch_kernel() -> Kernel {
-    *BEST_BATCH.get_or_init(|| match detect_best_kernel() {
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx512 => Kernel::Avx512Batch,
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx2 => Kernel::Avx2Batch,
-        _ => Kernel::ScalarBatch,
-    })
+    *BEST_BATCH.get_or_init(|| best_batch_kernel_for_x86_features(runtime_x86_features()))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -60,44 +118,147 @@ pub fn detect_wasm_kernel() -> Kernel {
 #[macro_export]
 macro_rules! skip_if_unsupported {
     ($kernel:expr, $test_name:expr) => {{
-        use std::arch::is_x86_feature_detected;
-        use $crate::utilities::enums::Kernel;
-
-        #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-        {
-            if matches!(
-                $kernel,
-                Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch
-            ) {
+        let kernel = $kernel;
+        if !$crate::utilities::helpers::runtime_supports_kernel(kernel) {
+            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
+            {
                 eprintln!(
                     "[{}] skipped {:?} – compiled without `nightly-avx`",
-                    $test_name, $kernel
+                    $test_name, kernel
                 );
                 return Ok(());
             }
-        }
 
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        {
-            let need: (&'static str, fn() -> bool) = match $kernel {
-                Kernel::Avx512 | Kernel::Avx512Batch => ("AVX-512F + FMA", || {
-                    is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma")
-                }),
-                Kernel::Avx2 | Kernel::Avx2Batch => ("AVX2 + FMA", || {
-                    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
-                }),
-                _ => ("", || true),
-            };
-
-            if !(need.1)() {
-                eprintln!(
-                    "[{}] skipped {:?} - CPU lacks {}",
-                    $test_name, $kernel, need.0
-                );
+            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+            {
+                let need = match kernel {
+                    $crate::utilities::enums::Kernel::Avx512
+                    | $crate::utilities::enums::Kernel::Avx512Batch => {
+                        "AVX2 + AVX-512F/DQ/VL/BW + FMA"
+                    }
+                    $crate::utilities::enums::Kernel::Avx2
+                    | $crate::utilities::enums::Kernel::Avx2Batch => "AVX2 + FMA",
+                    _ => "the requested kernel features",
+                };
+                eprintln!("[{}] skipped {:?} - CPU lacks {}", $test_name, kernel, need);
                 return Ok(());
             }
         }
     }};
+}
+
+#[cfg(test)]
+mod x86_kernel_selection_tests {
+    use super::{
+        X86FeatureSet, best_batch_kernel_for_x86_features, best_kernel_for_x86_features,
+        kernel_is_supported_by_features,
+    };
+    use crate::utilities::enums::Kernel;
+
+    const FULL: X86FeatureSet = X86FeatureSet {
+        avx2: true,
+        fma: true,
+        avx512f: true,
+        avx512dq: true,
+        avx512vl: true,
+        avx512bw: true,
+    };
+    const NONE: X86FeatureSet = X86FeatureSet {
+        avx2: false,
+        fma: false,
+        avx512f: false,
+        avx512dq: false,
+        avx512vl: false,
+        avx512bw: false,
+    };
+
+    #[test]
+    fn complete_avx512_target_feature_union_selects_avx512() {
+        assert!(kernel_is_supported_by_features(Kernel::Avx512, FULL));
+        assert!(kernel_is_supported_by_features(Kernel::Avx512Batch, FULL));
+        assert_eq!(best_kernel_for_x86_features(FULL), Kernel::Avx512);
+        assert_eq!(
+            best_batch_kernel_for_x86_features(FULL),
+            Kernel::Avx512Batch
+        );
+    }
+
+    #[test]
+    fn each_missing_avx512_subset_feature_falls_back_to_avx2() {
+        let missing_one = [
+            X86FeatureSet {
+                avx512f: false,
+                ..FULL
+            },
+            X86FeatureSet {
+                avx512dq: false,
+                ..FULL
+            },
+            X86FeatureSet {
+                avx512vl: false,
+                ..FULL
+            },
+            X86FeatureSet {
+                avx512bw: false,
+                ..FULL
+            },
+        ];
+
+        for features in missing_one {
+            assert!(!kernel_is_supported_by_features(Kernel::Avx512, features));
+            assert!(!kernel_is_supported_by_features(
+                Kernel::Avx512Batch,
+                features
+            ));
+            assert_eq!(best_kernel_for_x86_features(features), Kernel::Avx2);
+            assert_eq!(
+                best_batch_kernel_for_x86_features(features),
+                Kernel::Avx2Batch
+            );
+        }
+    }
+
+    #[test]
+    fn avx2_and_fma_are_required_by_every_vector_route() {
+        for features in [
+            X86FeatureSet {
+                avx2: false,
+                ..FULL
+            },
+            X86FeatureSet { fma: false, ..FULL },
+        ] {
+            assert!(!kernel_is_supported_by_features(Kernel::Avx2, features));
+            assert!(!kernel_is_supported_by_features(
+                Kernel::Avx2Batch,
+                features
+            ));
+            assert!(!kernel_is_supported_by_features(Kernel::Avx512, features));
+            assert_eq!(best_kernel_for_x86_features(features), Kernel::Scalar);
+            assert_eq!(
+                best_batch_kernel_for_x86_features(features),
+                Kernel::ScalarBatch
+            );
+        }
+    }
+
+    #[test]
+    fn avx2_only_and_scalar_masks_choose_the_safe_fallbacks() {
+        let avx2_only = X86FeatureSet {
+            avx2: true,
+            fma: true,
+            ..NONE
+        };
+        assert_eq!(best_kernel_for_x86_features(avx2_only), Kernel::Avx2);
+        assert_eq!(
+            best_batch_kernel_for_x86_features(avx2_only),
+            Kernel::Avx2Batch
+        );
+        assert_eq!(best_kernel_for_x86_features(NONE), Kernel::Scalar);
+        assert_eq!(
+            best_batch_kernel_for_x86_features(NONE),
+            Kernel::ScalarBatch
+        );
+    }
 }
 #[inline(always)]
 pub fn alloc_with_nan_prefix(len: usize, warm: usize) -> Vec<f64> {

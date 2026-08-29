@@ -89,7 +89,10 @@ pub const RETIRED_ENV_VARS: &[(&str, &str)] = &[
         "NEOETHOS_BOT_TRAIN_PRECISION",
         "system.hardware.training_precision",
     ),
-    ("FOREX_TRAIN_PRECISION", "system.hardware.training_precision"),
+    (
+        "FOREX_TRAIN_PRECISION",
+        "system.hardware.training_precision",
+    ),
     (
         "FOREX_BURN_MODEL_SUPPORTS_BF16",
         "the backend's own B::supports_dtype probe (a capability, not a knob)",

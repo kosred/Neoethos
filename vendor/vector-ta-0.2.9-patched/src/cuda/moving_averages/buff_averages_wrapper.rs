@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::buff_averages::BuffAveragesBatchRange;
@@ -7,17 +7,17 @@ use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
 use cust::memory::{
-    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info,
 };
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys as cu;
 use std::env;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -28,7 +28,9 @@ pub enum CudaBuffAveragesError {
     InvalidInput(String),
     #[error("invalid policy: {0}")]
     InvalidPolicy(&'static str),
-    #[error("out of memory on device: required ≈{required} bytes (incl headroom {headroom}), free={free}")]
+    #[error(
+        "out of memory on device: required ≈{required} bytes (incl headroom {headroom}), free={free}"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -303,28 +305,7 @@ impl CudaBuffAverages {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/buff_averages_kernel.ptx"));
-
-        let mut jit_vec: Vec<ModuleJitOption> = vec![
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
-        if let Ok(rs) = std::env::var("BUFF_MAXREG") {
-            if let Ok(v) = rs.parse::<u32>() {
-                jit_vec.push(ModuleJitOption::MaxRegisters(v));
-            }
-        }
-        let module = match Module::from_ptx(ptx, &jit_vec) {
-            Ok(m) => m,
-            Err(_) => {
-                if let Ok(m) = Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext])
-                {
-                    m
-                } else {
-                    Module::from_ptx(ptx, &[])?
-                }
-            }
-        };
+        let module = crate::load_cuda_embedded_module!("buff_averages_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
         Ok(Self {
@@ -602,11 +583,7 @@ impl CudaBuffAverages {
                 }
             }
         }
-        if series_len < 8192 {
-            128
-        } else {
-            256
-        }
+        if series_len < 8192 { 128 } else { 256 }
     }
 
     pub fn expand_grid(range: &BuffAveragesBatchRange) -> Vec<(usize, usize)> {

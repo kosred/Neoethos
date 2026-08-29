@@ -243,7 +243,7 @@ impl Error for PopulationOracleError {}
 #[derive(Debug, Clone)]
 struct CandidateSignals {
     values: Vec<i8>,
-    confidences: Vec<f32>,
+    confidences: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -325,6 +325,14 @@ pub(crate) fn population_settings_for_dataset(
     dataset: &crate::gpu_native::prototype_a::PrototypeADatasetUpload,
 ) -> Result<NeoPopulationSettings, PopulationOracleError> {
     let source = dataset.settings.to_settings();
+    population_settings_for_settings(&source)
+}
+
+/// Exact device projection when the immutable dataset and view live in the
+/// run-scoped native resident session rather than in a legacy upload carrier.
+pub(crate) fn population_settings_for_settings(
+    source: &crate::eval::BacktestSettings,
+) -> Result<NeoPopulationSettings, PopulationOracleError> {
     let runtime = current_backtest_runtime_overrides();
     Ok(NeoPopulationSettings {
         abi_version: ABI_VERSION,
@@ -418,11 +426,9 @@ pub(crate) fn validate_population_oracle_workload(
 pub fn evaluate_population_oracle(
     workload: &PrototypePopulationWorkload,
 ) -> Result<OraclePopulationEvaluation, PopulationOracleError> {
-    neoethos_core::current_broker_financial_truth_capability_v1()
-        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
-        .map_err(|error| {
-            PopulationOracleError::BrokerFinancialTruthUnavailable(error.to_string())
-        })?;
+    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1().map_err(
+        |error| PopulationOracleError::BrokerFinancialTruthUnavailable(error.to_string()),
+    )?;
     evaluate_population_oracle_unchecked_test_oracle(workload)
 }
 
@@ -1080,7 +1086,7 @@ fn synthesize_candidate_signals(
     gene_index: usize,
 ) -> CandidateSignals {
     let bars = workload.dataset.bars();
-    let mut combined = vec![0.0_f32; bars];
+    let mut combined = vec![0.0_f64; bars];
     let start = workload.genes.offsets[gene_index] as usize;
     let end = workload.genes.offsets[gene_index + 1] as usize;
     for term in start..end {
@@ -1093,7 +1099,7 @@ fn synthesize_candidate_signals(
     }
 
     let mut values = vec![0_i8; bars];
-    let mut confidences = vec![0.0_f32; bars];
+    let mut confidences = vec![0.0_f64; bars];
     let long_threshold = workload.genes.long_thresholds[gene_index];
     let short_threshold = workload.genes.short_thresholds[gene_index];
     let gap = (long_threshold - short_threshold).abs().max(1.0e-6);
@@ -1108,7 +1114,7 @@ fn synthesize_candidate_signals(
                 0.0
             }
         })
-        .sum::<f32>();
+        .sum::<f64>();
     let active_sum = if crate::genetic::smc_gate_disabled() {
         0.0
     } else {
@@ -1153,7 +1159,7 @@ fn synthesize_candidate_signals(
                         0.0
                     }
                 })
-                .sum::<f32>();
+                .sum::<f64>();
             score >= gate
         } else {
             true
@@ -1771,11 +1777,7 @@ mod tests {
             .iter()
             .copied()
             .map(|candidate_id| {
-                crate::gpu_native::scenario::base_scenario(
-                    candidate_id,
-                    candidate_id + 900,
-                    BARS,
-                )
+                crate::gpu_native::scenario::base_scenario(candidate_id, candidate_id + 900, BARS)
             })
             .collect();
 
@@ -2026,7 +2028,7 @@ mod tests {
         assert_eq!(row.values[7], 1.0);
         assert_eq!(
             BacktestMetrics::from_metric_array(row.values).to_metric_array()[7],
-            0.0
+            1.0
         );
     }
 

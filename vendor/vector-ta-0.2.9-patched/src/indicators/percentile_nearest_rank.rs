@@ -1,23 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, CandleFieldFlags, Candles};
+use crate::utilities::data_loader::{CandleFieldFlags, Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 use std::convert::AsRef;
 use std::error::Error;
@@ -54,10 +40,6 @@ pub struct PercentileNearestRankOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct PercentileNearestRankParams {
     pub length: Option<usize>,
     pub percentage: Option<f64>,
@@ -122,9 +104,7 @@ pub enum PercentileNearestRankError {
     #[error("percentile_nearest_rank: All values are NaN")]
     AllValuesNaN,
 
-    #[error(
-        "percentile_nearest_rank: Invalid period: period = {period}, data length = {data_len}"
-    )]
+    #[error("percentile_nearest_rank: Invalid period: period = {period}, data length = {data_len}")]
     InvalidPeriod { period: usize, data_len: usize },
 
     #[error("percentile_nearest_rank: Percentage must be between 0 and 100, got {percentage}")]
@@ -350,7 +330,6 @@ pub fn percentile_nearest_rank_with_kernel(
     Ok(PercentileNearestRankOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn percentile_nearest_rank_into(
     input: &PercentileNearestRankInput,
@@ -558,11 +537,7 @@ fn nearest_rank_index_fast(pf: f64, wl: usize) -> usize {
         0
     } else {
         k -= 1;
-        if k >= wl {
-            wl - 1
-        } else {
-            k
-        }
+        if k >= wl { wl - 1 } else { k }
     }
 }
 
@@ -756,127 +731,6 @@ impl PercentileNearestRankStream {
 
         self.current_left_top().or(Some(f64::NAN))
     }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "percentile_nearest_rank")]
-#[pyo3(signature = (data, length=15, percentage=50.0, kernel=None))]
-pub fn percentile_nearest_rank_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    percentage: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let kern = validate_kernel(kernel, false)?;
-    let data_slice = data.as_slice()?;
-
-    let params = PercentileNearestRankParams {
-        length: Some(length),
-        percentage: Some(percentage),
-    };
-    let input = PercentileNearestRankInput::from_slice(data_slice, params);
-
-    let result = py
-        .allow_threads(|| percentile_nearest_rank_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "PercentileNearestRankStream")]
-pub struct PercentileNearestRankStreamPy {
-    stream: PercentileNearestRankStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PercentileNearestRankStreamPy {
-    #[new]
-    fn new(length: usize, percentage: f64) -> PyResult<Self> {
-        let params = PercentileNearestRankParams {
-            length: Some(length),
-            percentage: Some(percentage),
-        };
-        let stream = PercentileNearestRankStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PercentileNearestRankStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "percentile_nearest_rank_batch")]
-#[pyo3(signature = (data, length_range, percentage_range, kernel=None))]
-pub fn percentile_nearest_rank_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    percentage_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let sweep = PercentileNearestRankBatchRange {
-        length: length_range,
-        percentage: percentage_range,
-    };
-
-    let combos = expand_grid_pnr(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    for (row_idx, combo) in combos.iter().enumerate() {
-        let length = combo.length.unwrap_or(15);
-        let warmup = length - 1;
-        let row_start = row_idx * cols;
-        for i in 0..warmup.min(cols) {
-            slice_out[row_start + i] = f64::NAN;
-        }
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let k = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-
-        pnr_batch_inner_into(slice_in, &combos, k, true, slice_out)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap_or(15) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "percentages",
-        combos
-            .iter()
-            .map(|p| p.percentage.unwrap_or(50.0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict.into())
 }
 
 #[derive(Clone, Debug)]
@@ -1318,146 +1172,10 @@ fn pnr_batch_inner_into(
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn percentile_nearest_rank_js(
-    data: &[f64],
-    length: usize,
-    percentage: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let params = PercentileNearestRankParams {
-        length: Some(length),
-        percentage: Some(percentage),
-    };
-    let input = PercentileNearestRankInput::from_slice(data, params);
-    percentile_nearest_rank(&input)
-        .map(|o| o.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn percentile_nearest_rank_alloc(n: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(n);
-    let p = v.as_mut_ptr();
-    core::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn percentile_nearest_rank_free(ptr: *mut f64, n: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, n);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn percentile_nearest_rank_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    percentage: f64,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let params = PercentileNearestRankParams {
-            length: Some(length),
-            percentage: Some(percentage),
-        };
-        let input = PercentileNearestRankInput::from_slice(data, params);
-
-        if data_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            percentile_nearest_rank_into_slice(&mut temp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            percentile_nearest_rank_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PercentileNearestRankBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub percentage_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PercentileNearestRankBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<PercentileNearestRankParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = percentile_nearest_rank_batch)]
-pub fn percentile_nearest_rank_batch_unified_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: PercentileNearestRankBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = PercentileNearestRankBatchRange {
-        length: cfg.length_range,
-        percentage: cfg.percentage_range,
-    };
-    let out = pnr_batch_inner(data, &sweep, detect_best_batch_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = PercentileNearestRankBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn percentile_nearest_rank_output_into_js(
-    data: &[f64],
-    length: usize,
-    percentage: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = percentile_nearest_rank_js(data, length, percentage)?;
-    crate::write_wasm_f64_output("percentile_nearest_rank_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn percentile_nearest_rank_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = percentile_nearest_rank_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "percentile_nearest_rank_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     macro_rules! skip_if_unsupported {
@@ -1476,8 +1194,8 @@ mod tests {
     fn check_pnr_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = PercentileNearestRankParams {
             length: Some(15),
@@ -1546,8 +1264,8 @@ mod tests {
     fn check_pnr_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = PercentileNearestRankInput::with_default_candles(&candles);
         let result = percentile_nearest_rank_with_kernel(&input, kernel)?;
@@ -1659,8 +1377,8 @@ mod tests {
     fn check_pnr_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = PercentileNearestRankParams {
             length: Some(15),
@@ -1718,8 +1436,8 @@ mod tests {
     fn check_pnr_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = PercentileNearestRankParams {
             length: Some(15),
@@ -1762,8 +1480,8 @@ mod tests {
     fn check_pnr_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             PercentileNearestRankParams::default(),
@@ -1894,8 +1612,8 @@ mod tests {
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = PercentileNearestRankBatchBuilder::new()
             .kernel(kernel)
@@ -1917,8 +1635,8 @@ mod tests {
     fn check_batch_sweep(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = PercentileNearestRankBatchBuilder::new()
             .kernel(kernel)
@@ -1937,8 +1655,8 @@ mod tests {
     fn check_batch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = PercentileNearestRankBatchBuilder::new()
             .kernel(kernel)
@@ -2130,113 +1848,4 @@ mod tests {
 
         assert_eq!(result.values[4], 3.5);
     }
-}
-
-#[cfg(feature = "python")]
-pub fn register_percentile_nearest_rank_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(percentile_nearest_rank_py, m)?)?;
-    m.add_function(wrap_pyfunction!(percentile_nearest_rank_batch_py, m)?)?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(
-            percentile_nearest_rank_cuda_batch_dev_py,
-            m
-        )?)?;
-        m.add_function(wrap_pyfunction!(
-            percentile_nearest_rank_cuda_many_series_one_param_dev_py,
-            m
-        )?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::percentile_nearest_rank_wrapper::CudaPercentileNearestRank;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "percentile_nearest_rank_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, length_range, percentage_range, device_id=0))]
-pub fn percentile_nearest_rank_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    length_range: (usize, usize, usize),
-    percentage_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, pyo3::types::PyDict>)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-    let slice_in = data_f32.as_slice()?;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sweep = PercentileNearestRankBatchRange {
-        length: length_range,
-        percentage: percentage_range,
-    };
-    let (inner, ctx, dev_id, combos) = py.allow_threads(|| {
-        let cuda = CudaPercentileNearestRank::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.pnr_batch_dev(slice_in, &sweep)
-            .map(|(inner, combos)| (inner, ctx, dev_id, combos))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = pyo3::types::PyDict::new(py);
-    let lengths: Vec<u64> = combos
-        .iter()
-        .map(|c| c.length.unwrap_or(15) as u64)
-        .collect();
-    let percentages: Vec<f64> = combos
-        .iter()
-        .map(|c| c.percentage.unwrap_or(50.0))
-        .collect();
-    dict.set_item("lengths", lengths.into_pyarray(py))?;
-    dict.set_item("percentages", percentages.into_pyarray(py))?;
-    Ok((
-        DeviceArrayF32Py {
-            inner,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-        dict,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "percentile_nearest_rank_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, length, percentage, device_id=0))]
-pub fn percentile_nearest_rank_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    length: usize,
-    percentage: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_tm_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaPercentileNearestRank::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.pnr_many_series_one_param_time_major_dev(slice_in, cols, rows, length, percentage)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
 }

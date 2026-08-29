@@ -80,11 +80,7 @@ impl AccountDailyEntryCap {
     /// IMMEDIATELY — before the order is submitted — so two engines racing at
     /// `count = cap − 1` cannot both pass. If the order then fails to become
     /// an entry, give the slot back with [`release`](Self::release).
-    pub fn try_reserve(
-        &self,
-        utc_day: u32,
-        cap: Option<u32>,
-    ) -> Result<u32, DailyEntryCapRefusal> {
+    pub fn try_reserve(&self, utc_day: u32, cap: Option<u32>) -> Result<u32, DailyEntryCapRefusal> {
         // A poisoned lock must not kill the trading loop (a panic while
         // holding it cannot leave the two u32s half-written): take the data.
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());

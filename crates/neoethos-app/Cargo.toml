@@ -18,6 +18,11 @@ readme = "../../README.md"
 # so there is no native LLM dependency to feature-gate.
 default = []
 
+# Transitional ownership flag for source files that are still path-included by
+# `neoethos-broker-history`. The app itself leaves this disabled; the history
+# crate enables it while the shared transport is moved out of the app tree.
+broker-history-service = []
+
 # #205 GPU backends — pick ONE per build.
 #
 # Pulls cubecl/burn/lightgbm/candle/ort into the appropriate GPU
@@ -30,11 +35,18 @@ gpu-nvidia = [
     # by NOTHING — `grep -rn "neoethos-data/gpu-cuda"` over the repo returned
     # zero matches, so vector-ta's 329 CUDA indicator kernels have never been in
     # a shipped binary. Adding it here is what actually puts the indicator lane
-    # in the build. Requires nvcc AND `CUDA_ARCH` set to the card's compute
-    # capability (see crates/neoethos-data/Cargo.toml for the arch trap).
+    # in the build. Requires nvcc and cuobjdump; the build detects every visible
+    # card, while cross-builds name exact targets through `CUDA_ARCHS`.
     "neoethos-data/gpu-cuda",
     "neoethos-models/gpu-cuda",
     "neoethos-search/gpu-cuda",
+]
+# Full NVIDIA release surface. The base feature owns the native CUDA search,
+# model and indicator lanes; Burn's CUDA backend is named explicitly so the
+# shipped deep/Exit/SAC models cannot silently remain on their CPU backend.
+gpu-nvidia-full = [
+    "gpu-nvidia",
+    "neoethos-models/burn-cuda-backend",
 ]
 gpu-vulkan = [
     "neoethos-models/gpu-vulkan",
@@ -102,6 +114,10 @@ serde_yaml_ng = "0.10.0"
 serde_repr = "0.1"
 dirs = "5.0.1"
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+# In-process, cancellation-aware DNS for the persistent cTrader socket. This
+# avoids std::net::ToSocketAddrs/getaddrinfo, whose blocking call cannot observe
+# an exact-run stop token or the cumulative connect deadline.
+hickory-resolver = "0.26.1"
 futures = "0.3.31"
 # **2026-05-25 — SSE push channel**: `BroadcastStream` adapter so
 # the `/live/spots/stream` SSE endpoint can wrap a
@@ -147,6 +163,8 @@ sysinfo = "0.39.6"
 # Our internal core engines
 neoethos-core = { path = "../neoethos-core" }
 neoethos-data = { path = "../neoethos-data" }
+neoethos-broker-truth = { path = "../neoethos-broker-truth" }
+neoethos-broker-history = { path = "../neoethos-broker-history" }
 neoethos-search = { path = "../neoethos-search" }
 # The autonomous-trader engine. The `/autonomous/replay` endpoint drives the SAME
 # engine the CLI `trader-replay` command does (parity) over real on-disk history.
@@ -179,6 +197,7 @@ neoethos-models = { path = "../neoethos-models", default-features = true, featur
 # HTTP + crypto); the AI Helper proxies chat requests through the
 # operator's ChatGPT Plus/Pro subscription.
 neoethos-codex = { path = "../neoethos-codex" }
+sha2.workspace = true
 clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"
 # Native folder-picker for the "Browse..." button on the data-bootstrap
@@ -289,6 +308,8 @@ section = "finance"
 priority = "optional"
 assets = [
     ["target/release/neoethos-app", "usr/bin/", "755"],
+    ["target/release/libxgboost.so", "usr/lib/neoethos-app/", "644"],
+    ["target/release/libcatboostmodel.so", "usr/lib/neoethos-app/", "644"],
     ["../../assets/symbol_metadata/defaults.json", "usr/share/neoethos/symbol_metadata/", "644"],
     ["../../LICENSE", "usr/share/doc/neoethos/", "644"],
     ["../../README.md", "usr/share/doc/neoethos/", "644"],
@@ -306,6 +327,8 @@ name = "neoethos"
 license = "AGPL-3.0-or-later"
 assets = [
     { source = "target/release/neoethos-app", dest = "/usr/bin/neoethos-app", mode = "0755" },
+    { source = "target/release/libxgboost.so", dest = "/usr/lib/neoethos-app/libxgboost.so", mode = "0644" },
+    { source = "target/release/libcatboostmodel.so", dest = "/usr/lib/neoethos-app/libcatboostmodel.so", mode = "0644" },
     { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/neoethos/symbol_metadata/defaults.json", mode = "0644" },
     { source = "LICENSE", dest = "/usr/share/doc/neoethos/LICENSE", mode = "0644" },
     { source = "README.md", dest = "/usr/share/doc/neoethos/README.md", mode = "0644" },

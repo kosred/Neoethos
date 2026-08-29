@@ -1,29 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaMsw};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -57,20 +37,12 @@ pub enum MswData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MswOutput {
     pub sine: Vec<f64>,
     pub lead: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MswParams {
     pub period: Option<usize>,
 }
@@ -1554,117 +1526,6 @@ unsafe fn msw_row_avx512_long(
     msw_row_avx512_short(data, first, period, sine, lead)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "msw")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn msw_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    use numpy::PyArrayMethods;
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = MswParams {
-        period: Some(period),
-    };
-    let msw_in = MswInput::from_slice(slice_in, params);
-
-    let out = py
-        .allow_threads(|| msw_with_kernel(&msw_in, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((out.sine.into_pyarray(py), out.lead.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MswStream")]
-pub struct MswStreamPy {
-    stream: MswStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MswStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = MswParams {
-            period: Some(period),
-        };
-        let stream =
-            MswStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(MswStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "msw_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn msw_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = MswBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("msw_batch_py: rows*cols overflow"))?;
-    let out_sine = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_lead = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out_sine = unsafe { out_sine.as_slice_mut()? };
-    let slice_out_lead = unsafe { out_lead.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-
-            msw_batch_inner_into(slice_in, &sweep, simd, true, slice_out_sine, slice_out_lead)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("sine", out_sine.reshape((rows, cols))?)?;
-    dict.set_item("lead", out_lead.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
 #[inline]
 pub fn msw_into_slice(
     sine_dst: &mut [f64],
@@ -1804,385 +1665,16 @@ unsafe fn msw_scalar_into(
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MswJsOutput {
-    pub sine: Vec<f64>,
-    pub lead: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MswResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_js(data: &[f64], period: usize) -> Result<JsValue, JsValue> {
-    let params = MswParams {
-        period: Some(period),
-    };
-    let input = MswInput::from_slice(data, params);
-
-    let len = data.len();
-    let mut values = vec![f64::NAN; 2 * len];
-    let (sine, lead) = values.split_at_mut(len);
-
-    msw_into_slice(sine, lead, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let res = MswResult {
-        values,
-        rows: 2,
-        cols: len,
-    };
-    serde_wasm_bindgen::to_value(&res)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(since = "1.0.0", note = "Use msw_js instead")]
-pub fn msw_wasm(data: &[f64], period: usize) -> Result<JsValue, JsValue> {
-    msw_js(data, period)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_into_flat(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let (sine, lead) = (
-            std::slice::from_raw_parts_mut(out_ptr, len),
-            std::slice::from_raw_parts_mut(out_ptr.add(len), len),
-        );
-        let input = MswInput::from_slice(
-            data,
-            MswParams {
-                period: Some(period),
-            },
-        );
-        msw_into_slice(sine, lead, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_into(
-    in_ptr: *const f64,
-    sine_ptr: *mut f64,
-    lead_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || sine_ptr.is_null() || lead_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = MswParams {
-            period: Some(period),
-        };
-        let input = MswInput::from_slice(data, params);
-
-        let aliasing = in_ptr as *const _ == sine_ptr as *const _
-            || in_ptr as *const _ == lead_ptr as *const _
-            || sine_ptr == lead_ptr;
-
-        if aliasing {
-            let mut temp_sine = vec![0.0; len];
-            let mut temp_lead = vec![0.0; len];
-            msw_into_slice(&mut temp_sine, &mut temp_lead, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let sine_out = std::slice::from_raw_parts_mut(sine_ptr, len);
-            let lead_out = std::slice::from_raw_parts_mut(lead_ptr, len);
-            sine_out.copy_from_slice(&temp_sine);
-            lead_out.copy_from_slice(&temp_lead);
-        } else {
-            let sine_out = std::slice::from_raw_parts_mut(sine_ptr, len);
-            let lead_out = std::slice::from_raw_parts_mut(lead_ptr, len);
-            msw_into_slice(sine_out, lead_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MswBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MswBatchJsOutput {
-    pub sine: Vec<f64>,
-    pub lead: Vec<f64>,
-    pub combos: Vec<MswParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MswBatchFlatJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<MswParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = msw_batch)]
-pub fn msw_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: MswBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = MswBatchRange {
-        period: config.period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|_| JsValue::from_str("No parameter combinations"))?;
-    let rows = combos.len();
-    let cols = data.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .and_then(|n| n.checked_mul(2))
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let mut values = vec![f64::NAN; total];
-    let (sine_out, lead_out) = values.split_at_mut(rows * cols);
-
-    msw_batch_inner_into(data, &sweep, Kernel::Auto, false, sine_out, lead_out)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let out = MswBatchFlatJsOutput {
-        values,
-        combos,
-        rows: 2 * rows,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<JsValue, JsValue> {
-    let sweep = MswBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let output = msw_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = MswBatchJsOutput {
-        sine: output.sine,
-        lead: output.lead,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = MswBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|_| JsValue::from_str("No parameter combinations"))?;
-    let metadata = combos
-        .iter()
-        .map(|combo| combo.period.unwrap() as f64)
-        .collect();
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_batch_into_flat(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = MswBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos =
-            expand_grid(&sweep).map_err(|_| JsValue::from_str("No parameter combinations"))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let sine_out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-        let lead_out = std::slice::from_raw_parts_mut(out_ptr.add(rows * cols), rows * cols);
-
-        msw_batch_inner_into(data, &sweep, Kernel::Auto, false, sine_out, lead_out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(2 * rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_batch_into(
-    in_ptr: *const f64,
-    sine_ptr: *mut f64,
-    lead_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || sine_ptr.is_null() || lead_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = MswBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep)
-            .map_err(|_| JsValue::from_str("No valid parameter combinations"))?;
-
-        let rows = combos.len();
-        let cols = len;
-        let total_len = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-        let sine_out = std::slice::from_raw_parts_mut(sine_ptr, total_len);
-        let lead_out = std::slice::from_raw_parts_mut(lead_ptr, total_len);
-
-        for (idx, params) in combos.iter().enumerate() {
-            let row_start = idx * cols;
-            let row_end = row_start + cols;
-
-            let input = MswInput::from_slice(data, params.clone());
-
-            msw_into_slice(
-                &mut sine_out[row_start..row_end],
-                &mut lead_out[row_start..row_end],
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = msw_js(data, period)?;
-    crate::write_wasm_object_f64_outputs("msw_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = msw_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("msw_batch_unified_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn msw_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = msw_batch_js(data, period_start, period_end, period_step)?;
-    crate::write_wasm_selected_object_f64_outputs("msw_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_msw_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = MswParams { period: None };
         let input_default = MswInput::from_candles(&candles, "close", default_params);
         let output_default = msw_with_kernel(&input_default, kernel)?;
@@ -2193,8 +1685,8 @@ mod tests {
 
     fn check_msw_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MswParams { period: Some(5) };
         let input = MswInput::from_candles(&candles, "close", params);
         let msw_result = msw_with_kernel(&input, kernel)?;
@@ -2240,8 +1732,8 @@ mod tests {
 
     fn check_msw_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MswInput::with_default_candles(&candles);
         let output = msw_with_kernel(&input, kernel)?;
         assert_eq!(output.sine.len(), candles.close.len());
@@ -2296,8 +1788,8 @@ mod tests {
 
     fn check_msw_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MswParams { period: Some(5) };
         let input = MswInput::from_candles(&candles, "close", params);
         let res = msw_with_kernel(&input, kernel)?;
@@ -2308,8 +1800,8 @@ mod tests {
 
     fn check_msw_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 5;
         let input = MswInput::from_candles(
             &candles,
@@ -2375,8 +1867,8 @@ mod tests {
     fn check_msw_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             MswParams::default(),
@@ -2833,8 +2325,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = MswBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2848,8 +2340,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -3010,72 +2502,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "msw_cuda_batch_dev")]
-#[pyo3(signature = (close_f32, period_range, device_id=0))]
-pub fn msw_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, pyo3::types::PyDict>)> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = close_f32.as_slice()?;
-    let sweep = MswBatchRange {
-        period: period_range,
-    };
-    let (inner, combos) = py.allow_threads(|| {
-        let cuda = CudaMsw::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.msw_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", 2 * combos.len())?;
-    dict.set_item("cols", slice.len())?;
-    Ok((handle, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "msw_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn msw_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array (rows x cols)"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = MswParams {
-        period: Some(period),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaMsw::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.msw_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(make_device_array_py(device_id, inner)?)
 }

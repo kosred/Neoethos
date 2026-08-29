@@ -1,54 +1,11 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_adaptive_cg_output_into_js(
-    data: &[f64],
-    alpha: Option<f64>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_adaptive_cg_js(data, alpha)?;
-    crate::write_wasm_object_f64_outputs("ehlers_adaptive_cg_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_adaptive_cg_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_adaptive_cg_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_adaptive_cg_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
 
 #[cfg(test)]
 use std::error::Error as StdError;
@@ -85,10 +42,6 @@ pub struct EhlersAdaptiveCgOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersAdaptiveCgParams {
     pub alpha: Option<f64>,
 }
@@ -516,7 +469,6 @@ pub fn ehlers_adaptive_cg_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn ehlers_adaptive_cg_into(
     input: &EhlersAdaptiveCgInput,
     cg_out: &mut [f64],
@@ -877,262 +829,10 @@ fn ehlers_adaptive_cg_batch_inner(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_adaptive_cg")]
-#[pyo3(signature = (data, alpha=None, *, kernel=None))]
-pub fn ehlers_adaptive_cg_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    alpha: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = EhlersAdaptiveCgInput::from_slice(slice, EhlersAdaptiveCgParams { alpha });
-    let out = py
-        .allow_threads(|| ehlers_adaptive_cg_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((out.cg.into_pyarray(py), out.trigger.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersAdaptiveCgStream")]
-pub struct EhlersAdaptiveCgStreamPy {
-    inner: EhlersAdaptiveCgStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersAdaptiveCgStreamPy {
-    #[new]
-    pub fn new(alpha: Option<f64>) -> PyResult<Self> {
-        let inner = EhlersAdaptiveCgStream::try_new(EhlersAdaptiveCgParams { alpha })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.inner.update(value)
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_adaptive_cg_batch")]
-#[pyo3(signature = (data, alpha_range, kernel=None))]
-pub fn ehlers_adaptive_cg_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    alpha_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let out = py
-        .allow_threads(|| {
-            ehlers_adaptive_cg_batch_with_kernel(
-                slice,
-                &EhlersAdaptiveCgBatchRange { alpha: alpha_range },
-                kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("cg", out.cg.into_pyarray(py).reshape((out.rows, out.cols))?)?;
-    dict.set_item(
-        "trigger",
-        out.trigger.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "alphas",
-        out.combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", out.rows)?;
-    dict.set_item("cols", out.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_ehlers_adaptive_cg_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(ehlers_adaptive_cg_py, m)?)?;
-    m.add_function(wrap_pyfunction!(ehlers_adaptive_cg_batch_py, m)?)?;
-    m.add_class::<EhlersAdaptiveCgStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct EhlersAdaptiveCgJsOutput {
-    cg: Vec<f64>,
-    trigger: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct EhlersAdaptiveCgStreamJsOutput {
-    cg: f64,
-    trigger: f64,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersAdaptiveCgBatchConfig {
-    pub alpha_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersAdaptiveCgBatchJsOutput {
-    pub cg: Vec<f64>,
-    pub trigger: Vec<f64>,
-    pub combos: Vec<EhlersAdaptiveCgParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_adaptive_cg_js)]
-pub fn ehlers_adaptive_cg_js(data: &[f64], alpha: Option<f64>) -> Result<JsValue, JsValue> {
-    let out = ehlers_adaptive_cg(&EhlersAdaptiveCgInput::from_slice(
-        data,
-        EhlersAdaptiveCgParams { alpha },
-    ))
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersAdaptiveCgJsOutput {
-        cg: out.cg,
-        trigger: out.trigger,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_adaptive_cg_batch)]
-pub fn ehlers_adaptive_cg_batch_unified_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: EhlersAdaptiveCgBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let out = ehlers_adaptive_cg_batch_with_kernel(
-        data,
-        &EhlersAdaptiveCgBatchRange {
-            alpha: config.alpha_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersAdaptiveCgBatchJsOutput {
-        cg: out.cg,
-        trigger: out.trigger,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_adaptive_cg_alloc)]
-pub fn ehlers_adaptive_cg_alloc(len: usize) -> *mut f64 {
-    let mut values = vec![0.0; len];
-    let ptr = values.as_mut_ptr();
-    std::mem::forget(values);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_adaptive_cg_free)]
-pub fn ehlers_adaptive_cg_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Vec::from_raw_parts(ptr, 0, len));
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_adaptive_cg_into)]
-pub fn ehlers_adaptive_cg_into(
-    data_ptr: *const f64,
-    cg_ptr: *mut f64,
-    trigger_ptr: *mut f64,
-    len: usize,
-    alpha: Option<f64>,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || cg_ptr.is_null() || trigger_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_adaptive_cg_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let input = EhlersAdaptiveCgInput::from_slice(data, EhlersAdaptiveCgParams { alpha });
-
-        let alias_input = data_ptr == cg_ptr as *const f64 || data_ptr == trigger_ptr as *const f64;
-        let alias_outputs = cg_ptr == trigger_ptr;
-        if alias_input || alias_outputs {
-            let mut cg = vec![0.0; len];
-            let mut trigger = vec![0.0; len];
-            ehlers_adaptive_cg_into_slice(&mut cg, &mut trigger, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(cg_ptr, len).copy_from_slice(&cg);
-            std::slice::from_raw_parts_mut(trigger_ptr, len).copy_from_slice(&trigger);
-            return Ok(());
-        }
-
-        let cg = std::slice::from_raw_parts_mut(cg_ptr, len);
-        let trigger = std::slice::from_raw_parts_mut(trigger_ptr, len);
-        ehlers_adaptive_cg_into_slice(cg, trigger, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct EhlersAdaptiveCgStreamWasm {
-    inner: EhlersAdaptiveCgStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl EhlersAdaptiveCgStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(alpha: Option<f64>) -> Result<EhlersAdaptiveCgStreamWasm, JsValue> {
-        Ok(Self {
-            inner: EhlersAdaptiveCgStream::try_new(EhlersAdaptiveCgParams { alpha })
-                .map_err(|e| JsValue::from_str(&e.to_string()))?,
-        })
-    }
-
-    pub fn update(&mut self, value: f64) -> Result<JsValue, JsValue> {
-        match self.inner.update(value) {
-            Some((cg, trigger)) => {
-                serde_wasm_bindgen::to_value(&EhlersAdaptiveCgStreamJsOutput { cg, trigger })
-                    .map_err(|e| JsValue::from_str(&e.to_string()))
-            }
-            None => Ok(JsValue::NULL),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn sample_data() -> Vec<f64> {
         (0..256)
@@ -1228,7 +928,7 @@ mod tests {
 
     #[test]
     fn ehlers_adaptive_cg_fixture_has_values() -> Result<(), Box<dyn StdError>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let out = ehlers_adaptive_cg(&EhlersAdaptiveCgInput::with_default_candles(&candles))?;
         assert_eq!(out.cg.len(), candles.close.len());
         assert_eq!(out.trigger.len(), candles.close.len());

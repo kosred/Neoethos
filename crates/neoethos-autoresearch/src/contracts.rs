@@ -70,8 +70,10 @@ mod required_symbols {
         period_returns,
     };
     // The goal functional (axis-B variant B5 and the promotion inequality).
-    use neoethos_search::goal_report::{DEFAULT_RISK_LEVELS, GoalReport, RiskOutcome, build_report};
     use neoethos_search::genetic::Gene;
+    use neoethos_search::goal_report::{
+        DEFAULT_RISK_LEVELS, GoalReport, RiskOutcome, build_report,
+    };
     // The operator's config and the prop-firm baselines.
     use neoethos_core::config::{PropFirmGateConfig, Settings};
     use neoethos_core::domain::prop_firm::{PropFirmConstraints, PropFirmPreset};
@@ -168,7 +170,8 @@ mod required_symbols {
 //          session still writes verdict.json in the same shape as a success. An
 //          abort that produces no artifact is the multi-hour run that ended with
 //          nothing, which this repository has actually lived through.
-//   verdict::VerdictContext { session_id: String, symbol: String, cost_hash: String,
+//   verdict::VerdictContext { session_id: String, symbol: String,
+//     dataset_receipt: DatasetReceiptV1, cost_hash: String,
 //                             judge_hash: String, oos_window: journal::OosWindow }
 //   verdict::build(&Session, &GoalSet, &goals::Scenario, &JudgeThresholds, StopReason,
 //                  VerdictContext) -> SessionVerdict

@@ -1,0 +1,157 @@
+HTF-v3 Data materializer handoff (capability remains fail-closed)
+
+Guarded current preimages
+-------------------------
+pinned_canonical_series_v1.rs = 56400EDBE983B8C8A3A8777F7DF2D8150562B21D7E648F281D206A3D7C1F064E
+gpu_resident_feature_store_v3.rs = B5492918E95E2F45B475E973804D00840B73907A227C4996C20BB01C13BF2AE6
+gpu_resident_feature_recipe_v4.rs = 8C364BA6B3A7F7CD2130227688A16C74ED16FD8EC5C0C8404E894623FD5F46C0
+resident_smc_v3.rs = E372AB98573993E47E7D50712AA2E6E82B2ACC8E1E8FAA2739DC80E4AEEB13F2
+
+Pinned source descriptor API
+----------------------------
+
+#[must_use]
+pub(crate) struct MaterializedPinnedResidentCanonicalSourceV1 {
+    timeframe: CanonicalTimeframe,
+    frame: CanonicalOhlcvFrame,
+    binding: SourceArtifactBindingV1,
+    source_binding_sha256: [u8; 32],
+}
+
+#[must_use]
+pub(crate) struct MaterializedPinnedResidentCanonicalSourcesV1 {
+    base: MaterializedPinnedResidentCanonicalSourceV1,
+    direct_parents: Vec<MaterializedPinnedResidentCanonicalSourceV1>,
+}
+
+impl PinnedResidentCanonicalSourceDescriptorV1 {
+    pub(crate) fn into_materialized_resident_sources_v1(
+        self,
+        base_timeframe: CanonicalTimeframe,
+    ) -> Result<MaterializedPinnedResidentCanonicalSourcesV1>;
+}
+
+The implementation consumes `sources` in sealed
+`receipt.direct_timeframes()` order. For every source it reopens the retained
+lease with `artifact.lease().reopen_verified()`, decodes that exact Vortex
+generation once, and calls `CanonicalOhlcvFrame::from_parts(ohlcv, artifact)`.
+It requires exactly one base and every other selected direct timeframe to be
+strictly above the base. The full SourceArtifactBindingV1 is domain-separated
+and length-framed before SHA-256; using only manifest_hash or vortex_hash is
+not an acceptable source-binding identity.
+
+Opaque resident parent capture API
+----------------------------------
+
+The only required shared gpu-cuda exposure is crate-private and stays inside
+the CUDA crate:
+
+impl ResidentSmcMaterializationV3 {
+    pub(crate) fn into_higher_timeframe_parent_parts_v3(
+        mut self,
+    ) -> Result<
+        (
+            Box<dyn ResidentParentDatasetSourceV3>,
+            Box<dyn ResidentF64FeatureBatchV3>,
+        ),
+        ResidentFeatureStoreCudaErrorV3,
+    >;
+}
+
+The owned HTF module should expose one opaque capture, not the concrete SMC,
+Classic, Quant, Session, Regime or Footprint batch types:
+
+pub struct ResidentHigherTimeframeDirectParentLaunchPlanV3 {
+    // Classic recipe + exact global bindings + pre-device memory receipt;
+    // Quant bindings + launch authority;
+    // Session bindings + launch authority;
+    // Regime bindings + exact scale anchor;
+    // Footprint bindings.
+}
+
+pub struct PendingResidentHigherTimeframeDirectParentCaptureV3 {
+    // Move-owned parent source, canonically tagged feature-major batches, and
+    // immutable binding descriptors. No host feature/validity arrays.
+}
+
+pub fn capture_resident_higher_timeframe_direct_parent_v3(
+    run_device: &GpuOnlyRunDeviceAdmissionV3,
+    smc: ResidentSmcMaterializationV3,
+    plan: ResidentHigherTimeframeDirectParentLaunchPlanV3,
+) -> Result<
+    PendingResidentHigherTimeframeDirectParentCaptureV3,
+    ResidentFeatureStoreCudaErrorV3,
+>;
+
+impl PendingResidentHigherTimeframeDirectParentCaptureV3 {
+    pub fn route_descriptors(&self) -> &[ResidentHigherTimeframeCapturedRouteV3];
+    pub fn rows(&self) -> usize;
+    pub fn retained_device_bytes(&self) -> usize;
+    pub fn context_process_token(&self) -> [u8; 32];
+    pub fn stream_process_token(&self) -> [u8; 32];
+    pub fn into_direct_parent(
+        self,
+        authority: ResidentHigherTimeframeParentAuthorityV3,
+    ) -> Result<ResidentHigherTimeframeDirectParentV3, ResidentFeatureStoreCudaErrorV3>;
+}
+
+Capture launches in exact CPU producer order:
+SMC -> every Classic recipe batch -> Quant -> Session -> Regime -> Footprint.
+It moves each feature-major batch into the capture. It must never call
+append_batch, pack feature-major to bar-major, copy_to, or synchronize.
+
+Required Data factory seam
+--------------------------
+
+fn prepare_direct_parent_htf_v3(
+    &mut self,
+    run_device: &GpuOnlyRunDeviceAdmissionV3,
+) -> Result<
+    PendingResidentHigherTimeframeRuntimeV3<
+        PendingResidentHigherTimeframeDirectParentCaptureV3,
+    >,
+    GpuOnlyFeatureMaterializationErrorV3,
+>;
+
+For each direct parent, this method moves the canonical timestamp Vec used at
+that same SMC upload call, the source-binding digest, and the opaque capture
+into `retain_live_resident_higher_timeframe_parent_v3`. It then calls
+`preflight_resident_higher_timeframe_alignment_v3` once over all selected
+parents. No fixed route census is supplied.
+
+Minimal guarded materializer hunk against B5492918...F2AE6
+---------------------------------------------------------
+
+@@ materialize_gpu_only_feature_store_v3
+     let admitted_global_bindings =
+         preflight.exact_bindings_for(ResidentFeatureProducerV3::ClassicTa)?;
++    let admitted_htf_bindings = preflight
++        .exact_bindings_for(ResidentFeatureProducerV3::HigherTimeframeAlignment)?;
+@@ before bind_gpu_only_run_device_v3 moves run_device
+     producers.prepare_smc(&run_device, smc_bindings)?;
++    let prepared_htf_append = producers
++        .prepare_direct_parent_htf_v3(&run_device)?
++        .bind_current_native_v3(&run_device, admitted_htf_bindings)?;
+     let admission = bind_gpu_only_run_device_v3(preflight, run_device)?;
+@@ after all base column producers append, before normalization/store seal
++    let (htf_runtime_admission, htf_runtime_receipt) =
++        prepared_htf_append.append_to(&mut assembler)?;
++    seal_token.attach_higher_timeframe_runtime_v3(
++        htf_runtime_admission,
++        htf_runtime_receipt,
++    )?;
+     seal_token.apply_resident_robust_normalization_v2(&mut assembler)?;
+
+Hard architecture blocker
+-------------------------
+
+On the guarded preimages, ResidentSmcMaterializationV3 keeps `parent` and
+`batch` private, while every normal assembler append immediately packs and
+event-retires the feature-major batch. The sealed bar-major store is not a
+valid substitute for the HTF feature-major pointer/offset ABI. Therefore no
+legal current call path can retain direct-parent features without either the
+opaque capture above or a forbidden device-to-host/device round trip.
+
+Do not register resident_higher_timeframe_capability_v3 until this capture,
+Data runtime evidence attachment, strict build, route/value/validity parity,
+and release census all close.

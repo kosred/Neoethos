@@ -477,64 +477,127 @@ extern "C" __global__ void gatorosc_many_series_one_param_f32(
 
 
 // ===========================================================================
-// S1 f64 LANE  --  gatorosc
+// Exact f64 production lane -- Gator Oscillator
 // ===========================================================================
-// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
-// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
-// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
-// the WHOLE translation unit out of `--use_fast_math`, which is the only way
-// the opt-out can be correct: the f32 and f64 entry points share one
-// translation unit and nvcc has no per-entry flag.
-//
-// CPU reference: src/indicators/gatorosc.rs -- `gatorosc_scalar` (:361), `gator_warmups` (:262), `gatorosc_with_kernel` (:292)
-//
-// PERIOD-INVARIANT. `compute_gatorosc_batch` (cpu_batch.rs:14904) reads
-// jaws/teeth/lips length and shift (13/8, 8/5, 5/3); no `period` parameter.
-// Source is CLOSE here -- note this differs from `alligator`, whose batch arm
-// asks for hl2. The two indicators share a shape and not a source, and taking
-// the source from the shape would compute the wrong series for one of them.
-//
-// PRIMARY OUTPUT: `upper`. cpu_batch.rs:14934 maps "value" to `out.upper`.
-// `lower`, `upper_change` and `lower_change` are separate series; this lane
-// carries one matrix. `upper` never reads them, so dropping them is lossless
-// for the emitted series.
-//
-// ARITHMETIC ORDER -- three `mul_add`s, ONE rounding each:
-//   `jema = jma.mul_add(jema, ja * x)` -- the multiplier is the DECAY
-//   `(1 - alpha)` and the addend is `alpha * x`, so the fused operand order is
-//   (decay, prev, alpha*x). Reproduced as `fma(jma, jema, ja * x)`.
-// Note this is a DIFFERENT rounding structure from `apo`'s
-// `alpha*p + oma*se` (three roundings) even though both are EMAs -- which is
-// exactly why the count is taken from the CPU line and not from the concept.
-//
-// NaN HANDLING IS A SUBSTITUTION, NOT A SKIP: a NaN bar feeds `jema` (the JAW
-// ema) back in as the input to ALL THREE emas, so the recursion continues with
-// the jaw's last value rather than poisoning. Reproduced literally -- an
-// `fmax`-style rewrite would be wrong here, and simply propagating the NaN
-// would diverge from the CPU at the first gap.
-//
-// THE SHIFT RING is `max(shifts) + 1` long and is PRE-FILLED with the seed
-// value `data[first_valid]`, not with zero -- so a bar whose shifted read
-// predates the series start sees the seed, and the first emitted `upper` is
-// not a difference against zero. Reproduced.
-//
-// WARMUP (`gator_warmups`): `upper_warmup = first + (max(jl,tl) + max(js,ts))
-// - 1`, saturating. That is NOT `first + period - 1`, and the change series
-// warm one bar later still.
-// ===========================================================================
+// `gatorosc_row_f64` is the sole f64 arithmetic authority for both the
+// preserved primary ABI and the canonical four-output resident ABI. The CPU
+// authority is `gatorosc_scalar`: three fused EMA recurrences, NaN substitution
+// with the previous jaw EMA, seed-filled shifted rings, and independent upper,
+// lower and change warmups. Each CUDA thread owns one complete parameter row.
 
 #ifndef NEO_S1_QNAN_DEFINED
 #define NEO_S1_QNAN_DEFINED
-// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
-// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
-// quiet-NaN pattern, stated once per translation unit.
 __device__ __forceinline__ double neo_s1_qnan() {
     return __longlong_as_double(0x7ff8000000000000LL);
 }
 __device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
 #endif
 
-#define NEO_S1_GATOR_MAX_SHIFT 64
+__device__ __forceinline__ void gatorosc_row_f64(
+    const double* __restrict__ prices,
+    int n,
+    int first_valid,
+    int jaws_length,
+    int jaws_shift,
+    int teeth_length,
+    int teeth_shift,
+    int lips_length,
+    int lips_shift,
+    int ring_capacity,
+    double* __restrict__ ring_scratch,
+    double* __restrict__ upper,
+    double* __restrict__ lower,
+    double* __restrict__ upper_change,
+    double* __restrict__ lower_change)
+{
+    for (int i = 0; i < n; ++i) {
+        if (upper != nullptr) upper[i] = neo_s1_qnan();
+        if (lower != nullptr) lower[i] = neo_s1_qnan();
+        if (upper_change != nullptr) upper_change[i] = neo_s1_qnan();
+        if (lower_change != nullptr) lower_change[i] = neo_s1_qnan();
+    }
+
+    int max_shift = jaws_shift;
+    if (teeth_shift > max_shift) max_shift = teeth_shift;
+    if (lips_shift > max_shift) max_shift = lips_shift;
+    const int buf_len = max_shift + 1;
+    int max_length = jaws_length;
+    if (teeth_length > max_length) max_length = teeth_length;
+    if (lips_length > max_length) max_length = lips_length;
+    const bool declined =
+        (n <= 0) || (first_valid < 0) || (first_valid >= n) ||
+        (jaws_length <= 0) || (teeth_length <= 0) || (lips_length <= 0) ||
+        (jaws_shift < 0) || (teeth_shift < 0) || (lips_shift < 0) ||
+        (buf_len <= 0) || (buf_len > ring_capacity) ||
+        ((n - first_valid) < (max_length + max_shift));
+    if (declined) return;
+
+    double* __restrict__ jring = ring_scratch;
+    double* __restrict__ tring = ring_scratch + ring_capacity;
+    double* __restrict__ lring = ring_scratch + 2 * ring_capacity;
+    const double ja = 2.0 / ((double)jaws_length + 1.0);
+    const double ta = 2.0 / ((double)teeth_length + 1.0);
+    const double la = 2.0 / ((double)lips_length + 1.0);
+    const double jma = 1.0 - ja;
+    const double tma = 1.0 - ta;
+    const double lma = 1.0 - la;
+    double jema = prices[first_valid];
+    double tema = jema;
+    double lema = jema;
+    for (int k = 0; k < buf_len; ++k) {
+        jring[k] = jema;
+        tring[k] = tema;
+        lring[k] = lema;
+    }
+
+    const int upper_needed = max(jaws_length, teeth_length) + max(jaws_shift, teeth_shift);
+    const int lower_needed = max(teeth_length, lips_length) + max(teeth_shift, lips_shift);
+    const int upper_warmup = first_valid + max(upper_needed - 1, 0);
+    const int lower_warmup = first_valid + max(lower_needed - 1, 0);
+    double u_prev = 0.0;
+    double l_prev = 0.0;
+    int rpos = 0;
+
+    for (int i = first_valid; i < n; ++i) {
+        const double xi = prices[i];
+        const double x = neo_s1_isnan(xi) ? jema : xi;
+        jema = fma(jma, jema, ja * x);
+        tema = fma(tma, tema, ta * x);
+        lema = fma(lma, lema, la * x);
+        jring[rpos] = jema;
+        tring[rpos] = tema;
+        lring[rpos] = lema;
+
+        int jj = rpos + buf_len - jaws_shift;
+        if (jj >= buf_len) jj -= buf_len;
+        int tt = rpos + buf_len - teeth_shift;
+        if (tt >= buf_len) tt -= buf_len;
+        int ll = rpos + buf_len - lips_shift;
+        if (ll >= buf_len) ll -= buf_len;
+
+        if (i >= upper_warmup) {
+            const double u = fabs(jring[jj] - tring[tt]);
+            if (upper != nullptr) upper[i] = u;
+            if (i == upper_warmup) {
+                u_prev = u;
+            } else {
+                if (upper_change != nullptr) upper_change[i] = u - u_prev;
+                u_prev = u;
+            }
+        }
+        if (i >= lower_warmup) {
+            const double l = -fabs(tring[tt] - lring[ll]);
+            if (lower != nullptr) lower[i] = l;
+            if (i == lower_warmup) {
+                l_prev = l;
+            } else {
+                if (lower_change != nullptr) lower_change[i] = -(l - l_prev);
+                l_prev = l;
+            }
+        }
+        if (++rpos == buf_len) rpos = 0;
+    }
+}
 
 extern "C" __global__ void neoethos_gatorosc_batch_f64(
     const double* __restrict__ prices,
@@ -546,73 +609,50 @@ extern "C" __global__ void neoethos_gatorosc_batch_f64(
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= n_combos) return;
-    double* __restrict__ row = out + (size_t)r * (size_t)n;
-    (void)periods;
+    const int jaws_length = periods[r];
+    int teeth_length = (int)(((int64_t)8 * jaws_length + 6) / 13);
+    int lips_length = (int)(((int64_t)5 * jaws_length + 6) / 13);
+    if (teeth_length < 1) teeth_length = 1;
+    if (lips_length < 1) lips_length = 1;
+    double ring_scratch[27];
+    gatorosc_row_f64(
+        prices, n, first_valid,
+        jaws_length, 8, teeth_length, 5, lips_length, 3,
+        9, ring_scratch,
+        out + (size_t)r * (size_t)n, nullptr, nullptr, nullptr);
+}
 
-    // `GatorOscParams` defaults as read by cpu_batch.rs:14911-14916.
-    const int jaws_length = 13, jaws_shift = 8;
-    const int teeth_length = 8, teeth_shift = 5;
-    const int lips_length = 5, lips_shift = 3;
-
-    int max_shift = jaws_shift;
-    if (teeth_shift > max_shift) max_shift = teeth_shift;
-    if (lips_shift > max_shift) max_shift = lips_shift;
-    const int buf_len = max_shift + 1;
-
-    const bool declined =
-        (n <= 0) ||
-        (first_valid < 0) || (first_valid >= n) ||
-        (buf_len > NEO_S1_GATOR_MAX_SHIFT);
-    if (declined) {
-        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
-        return;
-    }
-
-    // `gator_warmups`: upper_needed = max(jl,tl) + max(js,ts).
-    int a = (jaws_length > teeth_length) ? jaws_length : teeth_length;
-    int b = (jaws_shift > teeth_shift) ? jaws_shift : teeth_shift;
-    const int upper_needed = a + b;
-    const int uw = first_valid + ((upper_needed >= 1) ? (upper_needed - 1) : 0);
-
-    for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
-
-    const double ja = 2.0 / ((double)jaws_length + 1.0);
-    const double ta = 2.0 / ((double)teeth_length + 1.0);
-    const double la = 2.0 / ((double)lips_length + 1.0);
-    const double jma = 1.0 - ja;
-    const double tma = 1.0 - ta;
-    const double lma = 1.0 - la;
-
-    double jema = prices[first_valid];
-    double tema = jema;
-    double lema = jema;
-
-    double jring[NEO_S1_GATOR_MAX_SHIFT];
-    double tring[NEO_S1_GATOR_MAX_SHIFT];
-    for (int k = 0; k < buf_len; ++k) { jring[k] = jema; tring[k] = tema; }
-
-    int rpos = 0;
-
-    for (int i = first_valid; i < n; ++i) {
-        const double xi = prices[i];
-        const double x = neo_s1_isnan(xi) ? jema : xi;
-
-        jema = fma(jma, jema, ja * x);
-        tema = fma(tma, tema, ta * x);
-        lema = fma(lma, lema, la * x);
-
-        jring[rpos] = jema;
-        tring[rpos] = tema;
-
-        int jj = rpos + buf_len - jaws_shift;
-        if (jj >= buf_len) jj -= buf_len;
-        int tt = rpos + buf_len - teeth_shift;
-        if (tt >= buf_len) tt -= buf_len;
-
-        if (i >= uw) {
-            row[i] = fabs(jring[jj] - tring[tt]);
-        }
-
-        if (++rpos == buf_len) rpos = 0;
-    }
+extern "C" __global__ void gatorosc_outputs_f64(
+    const double* __restrict__ prices,
+    int n,
+    int first_valid,
+    const int* __restrict__ jaws_lengths,
+    const int* __restrict__ jaws_shifts,
+    const int* __restrict__ teeth_lengths,
+    const int* __restrict__ teeth_shifts,
+    const int* __restrict__ lips_lengths,
+    const int* __restrict__ lips_shifts,
+    int n_combos,
+    int ring_stride,
+    double* __restrict__ ring_scratch,
+    double* __restrict__ upper,
+    double* __restrict__ lower,
+    double* __restrict__ upper_change,
+    double* __restrict__ lower_change)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
+    const size_t row_offset = (size_t)r * (size_t)n;
+    double* __restrict__ row_scratch =
+        ring_scratch + (size_t)r * (size_t)(3 * ring_stride);
+    gatorosc_row_f64(
+        prices, n, first_valid,
+        jaws_lengths[r], jaws_shifts[r],
+        teeth_lengths[r], teeth_shifts[r],
+        lips_lengths[r], lips_shifts[r],
+        ring_stride, row_scratch,
+        upper + row_offset,
+        lower + row_offset,
+        upper_change + row_offset,
+        lower_change + row_offset);
 }

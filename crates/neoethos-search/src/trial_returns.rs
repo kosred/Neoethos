@@ -97,10 +97,15 @@ use chrono::{Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::artifact_io::{fnv1a64, write_json_atomic};
+use crate::data_selection::CanonicalSearchInputReceiptV2;
 use crate::quality::Trade;
 
 /// Schema tag written into the manifest and checked by any reader.
-pub const TRIAL_RETURNS_SCHEMA: &str = "neoethos.trial_returns.v1";
+pub const TRIAL_RETURNS_SCHEMA: &str = "neoethos.trial_returns.v3";
+
+const SEARCH_STATE_DIRECTORY: &str = "canonical-search-state";
+const TRIAL_RETURNS_MANIFEST_FILE: &str = "trial_returns.v3.json";
+const TRIAL_RETURNS_BINARY_FILE: &str = "trial_returns.v1.bin";
 
 /// Magic bytes at the head of the binary payload.
 pub const TRIAL_RETURNS_MAGIC: &[u8; 8] = b"NEOTRIAL";
@@ -148,6 +153,7 @@ pub struct TrialReturnMatrix {
 
 /// What was actually written, in numbers a reader can verify.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrialReturnsManifest {
     pub schema: String,
     /// File name (not a path) of the binary payload, next to this manifest.
@@ -155,17 +161,12 @@ pub struct TrialReturnsManifest {
     /// `fnv64:…` over the exact bytes written.
     pub binary_hash: String,
     pub timestamp_ms: i64,
-    /// `ResolvedConfigStamp::config_hash` of the run that wrote this matrix.
-    ///
-    /// IDENTITY, not decoration. The manifest is keyed only on
-    /// `{SYMBOL}_{TF}.trial_returns.json`, so without this a ledger written by a
-    /// run that skipped the quality screen — or ran under a different config, or
-    /// whose matrix write failed (non-fatal by design) — would silently attach
-    /// the PREVIOUS run's matrix to itself and then assert on that basis that
-    /// DSR and PBO are computable. `None` means the writer had no stamp; a
-    /// consumer must treat that as "cannot be attributed", not as "matches".
-    #[serde(default)]
-    pub config_hash: Option<String>,
+    /// Full canonical input proof and its recomputed content identity.
+    pub search_input_receipt: CanonicalSearchInputReceiptV2,
+    pub search_input_receipt_sha256: String,
+    /// `ResolvedConfigStamp::config_hash` of the exact run. Required: a matrix
+    /// with no configuration identity is not a valid research artifact.
+    pub config_hash: String,
     pub symbol: String,
     pub timeframe: String,
 
@@ -214,26 +215,90 @@ pub struct TrialReturnsManifest {
     pub statistics: Option<crate::deflated::TrialStatisticsReport>,
 }
 
-/// `<cache_dir>/{SYMBOL}_{TF}.trial_returns.json` — the manifest.
-pub fn manifest_path(cache_dir: &str, symbol: &str, tf: &str) -> PathBuf {
-    let mut p = PathBuf::from(cache_dir);
-    p.push(trial_returns_stem(symbol, tf, "json"));
-    p
+fn validate_config_hash(config_hash: &str) -> Result<&str> {
+    let hex = config_hash.strip_prefix("fnv64:").ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid trial-returns config hash `{config_hash}`: expected fnv64:<16 hex>"
+        )
+    })?;
+    anyhow::ensure!(
+        hex.len() == 16
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid trial-returns config hash `{config_hash}`: expected fnv64:<16 lowercase hex>"
+    );
+    Ok(hex)
 }
 
-/// `<cache_dir>/{SYMBOL}_{TF}.trial_returns.bin` — the payload.
-pub fn binary_path(cache_dir: &str, symbol: &str, tf: &str) -> PathBuf {
-    let mut p = PathBuf::from(cache_dir);
-    p.push(trial_returns_stem(symbol, tf, "bin"));
-    p
+fn receipt_identity(receipt: &CanonicalSearchInputReceiptV2) -> Result<String> {
+    receipt
+        .identity_sha256()
+        .map_err(anyhow::Error::new)
+        .context("validate canonical search input receipt for trial returns")
 }
 
-fn trial_returns_stem(symbol: &str, tf: &str, ext: &str) -> String {
-    format!(
-        "{}_{}.trial_returns.{ext}",
+fn validate_receipt_display_identity(
+    receipt: &CanonicalSearchInputReceiptV2,
+    symbol: &str,
+    tf: &str,
+) -> Result<()> {
+    let anchor = receipt.validate().map_err(anyhow::Error::new)?;
+    anyhow::ensure!(
+        anchor.symbol_name().eq_ignore_ascii_case(symbol.trim())
+            && anchor.timeframe().as_str().eq_ignore_ascii_case(tf.trim()),
+        "trial-returns display identity {}/{} does not match receipt anchor {}/{}",
+        symbol,
+        tf,
+        anchor.symbol_name(),
+        anchor.timeframe().as_str()
+    );
+    Ok(())
+}
+
+fn state_directory(
+    cache_dir: &str,
+    receipt: &CanonicalSearchInputReceiptV2,
+    config_hash: &str,
+) -> Result<PathBuf> {
+    let receipt_sha256 = receipt_identity(receipt)?;
+    let config_hex = validate_config_hash(config_hash)?;
+    Ok(PathBuf::from(cache_dir)
+        .join(SEARCH_STATE_DIRECTORY)
+        .join(receipt_sha256)
+        .join(format!("fnv64-{config_hex}")))
+}
+
+/// Receipt/config-addressed manifest path.
+pub fn manifest_path(
+    cache_dir: &str,
+    expected_receipt: &CanonicalSearchInputReceiptV2,
+    expected_config_hash: &str,
+) -> Result<PathBuf> {
+    Ok(
+        state_directory(cache_dir, expected_receipt, expected_config_hash)?
+            .join(TRIAL_RETURNS_MANIFEST_FILE),
+    )
+}
+
+/// Receipt/config-addressed binary payload path.
+pub fn binary_path(
+    cache_dir: &str,
+    expected_receipt: &CanonicalSearchInputReceiptV2,
+    expected_config_hash: &str,
+) -> Result<PathBuf> {
+    Ok(
+        state_directory(cache_dir, expected_receipt, expected_config_hash)?
+            .join(TRIAL_RETURNS_BINARY_FILE),
+    )
+}
+
+fn legacy_manifest_path(cache_dir: &str, symbol: &str, tf: &str) -> PathBuf {
+    PathBuf::from(cache_dir).join(format!(
+        "{}_{}.trial_returns.json",
         symbol.trim().to_ascii_uppercase(),
         tf.trim().to_ascii_uppercase()
-    )
+    ))
 }
 
 /// Ascending calendar-month keys covering `[first_ms, last_ms]` inclusive.
@@ -456,7 +521,9 @@ pub struct TrialReturnsWriter {
     outside_offered: usize,
     /// Identity of the run that produced these rows. Written into the manifest
     /// so a ledger cannot silently attach a PREVIOUS run's matrix to itself.
-    config_hash: Option<String>,
+    search_input_receipt: CanonicalSearchInputReceiptV2,
+    search_input_receipt_sha256: String,
+    config_hash: String,
 }
 
 impl TrialReturnsWriter {
@@ -467,15 +534,23 @@ impl TrialReturnsWriter {
         period_keys: Vec<i64>,
         initial_balance: f64,
         expected_trials: usize,
-        config_hash: Option<String>,
+        expected_receipt: &CanonicalSearchInputReceiptV2,
+        expected_config_hash: &str,
     ) -> Result<Self> {
-        let dir = PathBuf::from(cache_dir);
+        let search_input_receipt_sha256 = receipt_identity(expected_receipt)?;
+        validate_receipt_display_identity(expected_receipt, symbol, tf)?;
+        validate_config_hash(expected_config_hash)?;
+        let dir = state_directory(cache_dir, expected_receipt, expected_config_hash)?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create trial-returns directory {}", dir.display()))?;
 
         let periods = period_keys.len();
         let (disk_available, budget, budget_source) = match available_bytes_for(&dir) {
-            Some(available) => (available, available / DISK_SHARE_DIVISOR, "filesystem_probe"),
+            Some(available) => (
+                available,
+                available / DISK_SHARE_DIVISOR,
+                "filesystem_probe",
+            ),
             None => (
                 0,
                 PROBE_FAILED_BUDGET_BYTES,
@@ -486,7 +561,7 @@ impl TrialReturnsWriter {
         let capacity = rows_within_budget(budget, periods, mean_row_bytes);
         let stride = retention_stride(expected_trials, capacity);
 
-        let path = binary_path(cache_dir, symbol, tf);
+        let path = binary_path(cache_dir, expected_receipt, expected_config_hash)?;
         let mut file = std::fs::File::create(&path)
             .with_context(|| format!("create trial-returns payload {}", path.display()))?;
         let header = encode_header(&period_keys, initial_balance, 0);
@@ -514,7 +589,9 @@ impl TrialReturnsWriter {
             bytes_written,
             outside_written: 0,
             outside_offered: 0,
-            config_hash,
+            search_input_receipt: expected_receipt.clone(),
+            search_input_receipt_sha256,
+            config_hash: expected_config_hash.to_string(),
         })
     }
 
@@ -613,7 +690,9 @@ impl TrialReturnsWriter {
                 .unwrap_or_default(),
             binary_hash: format!("fnv64:{:016x}", fnv1a64(&bytes)),
             timestamp_ms,
-            config_hash: self.config_hash.take(),
+            search_input_receipt: self.search_input_receipt.clone(),
+            search_input_receipt_sha256: self.search_input_receipt_sha256.clone(),
+            config_hash: self.config_hash.clone(),
             symbol: self.symbol.clone(),
             timeframe: self.timeframe.clone(),
             period_count: self.period_keys.len(),
@@ -636,7 +715,11 @@ impl TrialReturnsWriter {
             initial_balance: self.initial_balance,
             statistics: Some(statistics.clone()),
         };
-        let man = manifest_path(&self.cache_dir, &self.symbol, &self.timeframe);
+        let man = manifest_path(
+            &self.cache_dir,
+            &self.search_input_receipt,
+            &self.config_hash,
+        )?;
         write_json_atomic(&man, &manifest)
             .with_context(|| format!("write trial-returns manifest {}", man.display()))?;
 
@@ -651,7 +734,8 @@ impl TrialReturnsWriter {
             target: "neoethos_search::trial_returns",
             symbol = %manifest.symbol,
             timeframe = %manifest.timeframe,
-            config_hash = ?manifest.config_hash,
+            config_hash = %manifest.config_hash,
+            receipt_sha256 = %manifest.search_input_receipt_sha256,
             trials_offered = manifest.trials_offered,
             trials_written = manifest.trials_written,
             deflated_sharpe = ?statistics.dsr_value(),
@@ -673,6 +757,8 @@ pub fn write_trial_returns(
     cache_dir: &str,
     symbol: &str,
     tf: &str,
+    expected_receipt: &CanonicalSearchInputReceiptV2,
+    expected_config_hash: &str,
     matrix: &TrialReturnMatrix,
     timestamp_ms: i64,
 ) -> Result<TrialReturnsManifest> {
@@ -686,38 +772,191 @@ pub fn write_trial_returns(
         matrix.period_keys.clone(),
         matrix.initial_balance,
         matrix.rows.len(),
-        None,
+        expected_receipt,
+        expected_config_hash,
     )?;
     writer.append(&matrix.rows)?;
     writer.finish(timestamp_ms)
 }
 
-/// Load a previously written manifest, or `None` when absent/unreadable.
-/// Fail-soft by design: the ledger embeds this and a missing sidecar must not
-/// fail a ledger write.
-pub fn load_manifest(cache_dir: &str, symbol: &str, tf: &str) -> Option<TrialReturnsManifest> {
-    let path = manifest_path(cache_dir, symbol, tf);
+/// Validate an already-parsed manifest against the exact expected run and its
+/// binary payload. Public within the crate so the discovery-ledger loader can
+/// revalidate an embedded copy rather than trusting it as nested decoration.
+pub(crate) fn validate_manifest_for_receipt(
+    cache_dir: &str,
+    symbol: &str,
+    tf: &str,
+    expected_receipt: &CanonicalSearchInputReceiptV2,
+    expected_config_hash: &str,
+    manifest: &TrialReturnsManifest,
+) -> Result<()> {
+    let expected_receipt_sha256 = receipt_identity(expected_receipt)?;
+    validate_receipt_display_identity(expected_receipt, symbol, tf)?;
+    validate_config_hash(expected_config_hash)?;
+    anyhow::ensure!(
+        manifest.schema == TRIAL_RETURNS_SCHEMA,
+        "unsupported trial-returns schema `{}`; expected `{TRIAL_RETURNS_SCHEMA}`",
+        manifest.schema
+    );
+    let embedded_receipt_sha256 = receipt_identity(&manifest.search_input_receipt)?;
+    anyhow::ensure!(
+        manifest.search_input_receipt_sha256 == embedded_receipt_sha256,
+        "trial-returns receipt id does not match its embedded receipt"
+    );
+    anyhow::ensure!(
+        embedded_receipt_sha256 == expected_receipt_sha256
+            && manifest.search_input_receipt == *expected_receipt,
+        "trial-returns receipt mismatch: stored {}, expected {}",
+        embedded_receipt_sha256,
+        expected_receipt_sha256
+    );
+    anyhow::ensure!(
+        manifest.config_hash == expected_config_hash,
+        "trial-returns config mismatch: stored `{}`, expected `{}`",
+        manifest.config_hash,
+        expected_config_hash
+    );
+    anyhow::ensure!(
+        manifest.symbol == symbol.trim().to_ascii_uppercase()
+            && manifest.timeframe == tf.trim().to_ascii_uppercase(),
+        "trial-returns display identity mismatch: stored {}/{}, expected {}/{}",
+        manifest.symbol,
+        manifest.timeframe,
+        symbol.trim().to_ascii_uppercase(),
+        tf.trim().to_ascii_uppercase()
+    );
+
+    let expected_binary = binary_path(cache_dir, expected_receipt, expected_config_hash)?;
+    let expected_binary_file = expected_binary
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        manifest.binary_file == expected_binary_file,
+        "trial-returns binary file mismatch: stored `{}`, expected `{}`",
+        manifest.binary_file,
+        expected_binary_file
+    );
+    let bytes = std::fs::read(&expected_binary).with_context(|| {
+        format!(
+            "read receipt-bound trial-returns binary {}",
+            expected_binary.display()
+        )
+    })?;
+    let binary_hash = format!("fnv64:{:016x}", fnv1a64(&bytes));
+    anyhow::ensure!(
+        manifest.binary_hash == binary_hash,
+        "trial-returns binary hash mismatch for {}: stored `{}`, recomputed `{}`",
+        expected_binary.display(),
+        manifest.binary_hash,
+        binary_hash
+    );
+    anyhow::ensure!(
+        manifest.bytes_written == bytes.len() as u64,
+        "trial-returns binary length mismatch for {}: manifest {}, actual {}",
+        expected_binary.display(),
+        manifest.bytes_written,
+        bytes.len()
+    );
+    anyhow::ensure!(
+        bytes.len() >= HEADER_BYTES as usize && &bytes[..8] == TRIAL_RETURNS_MAGIC,
+        "trial-returns binary header mismatch for {}",
+        expected_binary.display()
+    );
+    let binary_version = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed header slice"));
+    let binary_trials = u32::from_le_bytes(bytes[12..16].try_into().expect("fixed header slice"));
+    let binary_periods = u32::from_le_bytes(bytes[16..20].try_into().expect("fixed header slice"));
+    anyhow::ensure!(
+        binary_version == 1,
+        "unsupported trial-returns binary version {binary_version} in {}",
+        expected_binary.display()
+    );
+    anyhow::ensure!(
+        binary_trials as usize == manifest.trials_written
+            && binary_periods as usize == manifest.period_count,
+        "trial-returns binary header counts disagree with its manifest in {}",
+        expected_binary.display()
+    );
+    Ok(())
+}
+
+/// Load a previously written manifest at the exact receipt/config address.
+/// Genuine absence is `Ok(None)`; corruption, mismatch, swaps, and legacy
+/// symbol/TF-only state are errors and never masquerade as absence.
+pub fn load_manifest(
+    cache_dir: &str,
+    symbol: &str,
+    tf: &str,
+    expected_receipt: &CanonicalSearchInputReceiptV2,
+    expected_config_hash: &str,
+) -> Result<Option<TrialReturnsManifest>> {
+    let path = manifest_path(cache_dir, expected_receipt, expected_config_hash)?;
     if !path.exists() {
-        return None;
+        let binary = binary_path(cache_dir, expected_receipt, expected_config_hash)?;
+        anyhow::ensure!(
+            !binary.exists(),
+            "orphaned receipt-bound trial-returns binary {} exists without manifest {}",
+            binary.display(),
+            path.display()
+        );
+        let legacy = legacy_manifest_path(cache_dir, symbol, tf);
+        anyhow::ensure!(
+            !legacy.exists(),
+            "legacy unbound trial-returns manifest {} exists for {}/{}; refusing symbol/TF-only state",
+            legacy.display(),
+            symbol,
+            tf
+        );
+        return Ok(None);
     }
-    match crate::artifact_io::read_json::<TrialReturnsManifest>(&path, "trial-returns manifest") {
-        Ok(m) => Some(m),
-        Err(err) => {
-            tracing::warn!(
-                target: "neoethos_search::trial_returns",
-                path = %path.display(),
-                error = %err,
-                "trial-returns manifest present but unreadable — the ledger will record its \
-                 absence rather than pretend the series were never produced"
-            );
-            None
-        }
-    }
+    let manifest = crate::artifact_io::read_json::<TrialReturnsManifest>(
+        &path,
+        "receipt-bound trial-returns manifest",
+    )?;
+    validate_manifest_for_receipt(
+        cache_dir,
+        symbol,
+        tf,
+        expected_receipt,
+        expected_config_hash,
+        &manifest,
+    )?;
+    Ok(Some(manifest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_CONFIG_HASH: &str = "fnv64:0123456789abcdef";
+
+    fn sample_receipt() -> CanonicalSearchInputReceiptV2 {
+        let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let anchor = features.provenance().bindings()[0]
+            .dataset_identity()
+            .clone();
+        CanonicalSearchInputReceiptV2::from_feature_frame(&anchor, &features)
+            .expect("canonical receipt fixture")
+    }
+
+    fn other_valid_receipt(
+        receipt: &CanonicalSearchInputReceiptV2,
+    ) -> CanonicalSearchInputReceiptV2 {
+        let mut value = serde_json::to_value(receipt).expect("receipt JSON");
+        let current = value["feature_plan_identity"]
+            .as_str()
+            .expect("feature plan identity");
+        let replacement = if current == "0".repeat(64) {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        };
+        value["feature_plan_identity"] = serde_json::Value::String(replacement);
+        CanonicalSearchInputReceiptV2::from_json_bytes(
+            &serde_json::to_vec(&value).expect("receipt bytes"),
+        )
+        .expect("structurally valid alternate receipt")
+    }
 
     fn trade(entry_ms: i64, pnl: f64) -> Trade {
         Trade {
@@ -729,6 +968,19 @@ mod tests {
             mfe: 0.0,
             mae: 0.0,
             r_multiple: 0.0,
+        }
+    }
+
+    fn one_row_matrix(return_value: f64) -> TrialReturnMatrix {
+        TrialReturnMatrix {
+            period_keys: month_keys_spanning(JAN_2024, MAR_2024),
+            rows: vec![TrialReturnRow {
+                candidate_index: 0,
+                strategy_id: format!("gene_{return_value}"),
+                returns: vec![return_value, 0.0, -return_value],
+                trades_outside_grid: 0,
+            }],
+            initial_balance: 10_000.0,
         }
     }
 
@@ -750,7 +1002,11 @@ mod tests {
     #[test]
     fn returns_bucket_by_entry_month_as_fractions_of_balance() {
         let keys = month_keys_spanning(JAN_2024, MAR_2024);
-        let trades = vec![trade(JAN_2024, 100.0), trade(JAN_2024, -40.0), trade(MAR_2024, 20.0)];
+        let trades = vec![
+            trade(JAN_2024, 100.0),
+            trade(JAN_2024, -40.0),
+            trade(MAR_2024, 20.0),
+        ];
         let (r, outside) = period_returns(&trades, &keys, 1000.0);
         assert_eq!(outside, 0);
         assert!((r[0] - 0.06).abs() < 1e-12, "Jan = (100 - 40)/1000");
@@ -851,6 +1107,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.to_string_lossy().to_string();
+        let receipt = sample_receipt();
 
         let matrix = TrialReturnMatrix {
             period_keys: month_keys_spanning(JAN_2024, MAR_2024),
@@ -864,7 +1121,16 @@ mod tests {
                 })
                 .collect(),
         };
-        let m = write_trial_returns(&cache, "eurusd", "m5", &matrix, 1_717_000_000_000).unwrap();
+        let m = write_trial_returns(
+            &cache,
+            "eurusd",
+            "m1",
+            &receipt,
+            TEST_CONFIG_HASH,
+            &matrix,
+            1_717_000_000_000,
+        )
+        .unwrap();
         assert_eq!(m.schema, TRIAL_RETURNS_SCHEMA);
         assert_eq!(m.trials_offered, 5);
         assert_eq!(
@@ -874,14 +1140,229 @@ mod tests {
         );
         assert_eq!(m.period_count, 3);
         assert_eq!(m.dtype, "f64_le");
-        assert!(binary_path(&cache, "EURUSD", "M5").exists());
-        assert_eq!(m.binary_file, "EURUSD_M5.trial_returns.bin");
+        assert!(
+            binary_path(&cache, &receipt, TEST_CONFIG_HASH)
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(m.binary_file, TRIAL_RETURNS_BINARY_FILE);
+        assert_eq!(m.search_input_receipt, receipt);
+        assert_eq!(m.config_hash, TEST_CONFIG_HASH);
 
-        let reloaded = load_manifest(&cache, "EURUSD", "M5").expect("manifest");
+        let reloaded = load_manifest(
+            &cache,
+            "EURUSD",
+            "M1",
+            &m.search_input_receipt,
+            TEST_CONFIG_HASH,
+        )
+        .expect("valid manifest")
+        .expect("manifest present");
         assert_eq!(reloaded, m);
-        assert!(load_manifest(&cache, "NOPE", "M1").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_symbol_timeframe_but_different_receipt_or_config_has_a_different_address() {
+        let receipt_a = sample_receipt();
+        let receipt_b = other_valid_receipt(&receipt_a);
+        let config_b = "fnv64:fedcba9876543210";
+
+        let path_a = manifest_path("cache", &receipt_a, TEST_CONFIG_HASH).unwrap();
+        let receipt_path_b = manifest_path("cache", &receipt_b, TEST_CONFIG_HASH).unwrap();
+        let config_path_b = manifest_path("cache", &receipt_a, config_b).unwrap();
+        assert_ne!(path_a, receipt_path_b);
+        assert_ne!(path_a, config_path_b);
+        assert!(
+            path_a
+                .to_string_lossy()
+                .contains(&receipt_a.identity_sha256().unwrap())
+        );
+        assert!(path_a.to_string_lossy().contains("fnv64-0123456789abcdef"));
+    }
+
+    #[test]
+    fn a_binary_swapped_between_receipts_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos_trial_binary_swap_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.to_string_lossy().to_string();
+        let receipt_a = sample_receipt();
+        let receipt_b = other_valid_receipt(&receipt_a);
+        write_trial_returns(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt_a,
+            TEST_CONFIG_HASH,
+            &one_row_matrix(0.01),
+            1,
+        )
+        .unwrap();
+        write_trial_returns(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt_b,
+            TEST_CONFIG_HASH,
+            &one_row_matrix(0.02),
+            2,
+        )
+        .unwrap();
+        std::fs::copy(
+            binary_path(&cache, &receipt_b, TEST_CONFIG_HASH).unwrap(),
+            binary_path(&cache, &receipt_a, TEST_CONFIG_HASH).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_manifest(&cache, "EURUSD", "M1", &receipt_a, TEST_CONFIG_HASH)
+            .expect_err("a foreign binary must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("trial-returns binary hash mismatch")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_manifest_copied_to_another_receipt_address_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos_trial_manifest_swap_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.to_string_lossy().to_string();
+        let receipt_a = sample_receipt();
+        let receipt_b = other_valid_receipt(&receipt_a);
+        write_trial_returns(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt_a,
+            TEST_CONFIG_HASH,
+            &one_row_matrix(0.01),
+            1,
+        )
+        .unwrap();
+        let path_b = manifest_path(&cache, &receipt_b, TEST_CONFIG_HASH).unwrap();
+        std::fs::create_dir_all(path_b.parent().unwrap()).unwrap();
+        std::fs::copy(
+            manifest_path(&cache, &receipt_a, TEST_CONFIG_HASH).unwrap(),
+            &path_b,
+        )
+        .unwrap();
+
+        let error = load_manifest(&cache, "EURUSD", "M1", &receipt_b, TEST_CONFIG_HASH)
+            .expect_err("a foreign manifest must fail closed");
+        assert!(error.to_string().contains("trial-returns receipt mismatch"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_manifest_copied_to_another_config_address_is_rejected() {
+        const OTHER_CONFIG_HASH: &str = "fnv64:fedcba9876543210";
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos_trial_config_swap_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.to_string_lossy().to_string();
+        let receipt = sample_receipt();
+        write_trial_returns(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt,
+            TEST_CONFIG_HASH,
+            &one_row_matrix(0.01),
+            1,
+        )
+        .unwrap();
+        let foreign_manifest = manifest_path(&cache, &receipt, OTHER_CONFIG_HASH).unwrap();
+        let foreign_binary = binary_path(&cache, &receipt, OTHER_CONFIG_HASH).unwrap();
+        std::fs::create_dir_all(foreign_manifest.parent().unwrap()).unwrap();
+        std::fs::copy(
+            manifest_path(&cache, &receipt, TEST_CONFIG_HASH).unwrap(),
+            &foreign_manifest,
+        )
+        .unwrap();
+        std::fs::copy(
+            binary_path(&cache, &receipt, TEST_CONFIG_HASH).unwrap(),
+            &foreign_binary,
+        )
+        .unwrap();
+
+        let error = load_manifest(&cache, "EURUSD", "M1", &receipt, OTHER_CONFIG_HASH)
+            .expect_err("a foreign config manifest must fail closed");
+        assert!(error.to_string().contains("trial-returns config mismatch"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_unbound_manifest_is_an_error_but_true_absence_is_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos_trial_legacy_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.to_string_lossy().to_string();
+        let receipt = sample_receipt();
+        assert!(
+            load_manifest(&cache, "EURUSD", "M1", &receipt, TEST_CONFIG_HASH)
+                .expect("true absence")
+                .is_none()
+        );
+        std::fs::write(legacy_manifest_path(&cache, "EURUSD", "M1"), b"{}").unwrap();
+        let error = load_manifest(&cache, "EURUSD", "M1", &receipt, TEST_CONFIG_HASH)
+            .expect_err("legacy unbound state must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy unbound trial-returns manifest")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn corrupt_receipt_bound_manifest_is_an_error_not_absence() {
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos_trial_corrupt_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.to_string_lossy().to_string();
+        let receipt = sample_receipt();
+        let path = manifest_path(&cache, &receipt, TEST_CONFIG_HASH).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"{not-json").unwrap();
+
+        let error = load_manifest(&cache, "EURUSD", "M1", &receipt, TEST_CONFIG_HASH)
+            .expect_err("corruption must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("receipt-bound trial-returns manifest")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The probe must work on the HOST, not only in the arithmetic.
@@ -934,15 +1415,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.to_string_lossy().to_string();
         let keys = month_keys_spanning(JAN_2024, MAR_2024);
+        let receipt = sample_receipt();
 
         let mut w = TrialReturnsWriter::open(
             &cache,
             "eurusd",
-            "m5",
+            "m1",
             keys.clone(),
             10_000.0,
             10,
-            Some("fnv64:deadbeef".to_string()),
+            &receipt,
+            TEST_CONFIG_HASH,
         )
         .unwrap();
         let chunk: Vec<TrialReturnRow> = (0..4)
@@ -957,7 +1440,8 @@ mod tests {
         // Simulate the kill: drop the writer without calling `finish`.
         drop(w);
 
-        let bytes = std::fs::read(binary_path(&cache, "EURUSD", "M5")).unwrap();
+        let bytes =
+            std::fs::read(binary_path(&cache, &receipt, TEST_CONFIG_HASH).unwrap()).unwrap();
         assert_eq!(&bytes[..8], TRIAL_RETURNS_MAGIC);
         assert_eq!(
             u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
@@ -968,6 +1452,13 @@ mod tests {
             bytes.len() as u64,
             HEADER_BYTES + 8 * 3 + 4 * row_bytes(6, 3),
             "exactly the flushed rows, no truncated tail"
+        );
+        let error = load_manifest(&cache, "EURUSD", "M1", &receipt, TEST_CONFIG_HASH)
+            .expect_err("a partial binary without a manifest is incomplete state");
+        assert!(
+            error
+                .to_string()
+                .contains("orphaned receipt-bound trial-returns binary")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -984,6 +1475,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.to_string_lossy().to_string();
         let keys = month_keys_spanning(JAN_2024, MAR_2024);
+        let receipt = sample_receipt();
         let rows: Vec<TrialReturnRow> = (0..7)
             .map(|i| TrialReturnRow {
                 candidate_index: i,
@@ -996,11 +1488,12 @@ mod tests {
         let mut w = TrialReturnsWriter::open(
             &cache,
             "eurusd",
-            "m5",
+            "m1",
             keys.clone(),
             10_000.0,
             rows.len(),
-            Some("fnv64:0123456789abcdef".to_string()),
+            &receipt,
+            TEST_CONFIG_HASH,
         )
         .unwrap();
         for chunk in rows.chunks(3) {
@@ -1010,7 +1503,7 @@ mod tests {
 
         assert_eq!(m.trials_offered, 7);
         assert_eq!(m.trials_written + m.trials_dropped, m.trials_offered);
-        assert_eq!(m.config_hash.as_deref(), Some("fnv64:0123456789abcdef"));
+        assert_eq!(m.config_hash, TEST_CONFIG_HASH);
         // Nothing was dropped here, so the two outside-grid counts agree.
         assert_eq!(m.trades_outside_grid, m.trades_outside_grid_offered);
         assert_eq!(m.trades_outside_grid, 3, "rows 1, 3, 5");
@@ -1023,7 +1516,8 @@ mod tests {
         };
         let refs: Vec<&TrialReturnRow> = matrix.rows.iter().collect();
         let expected = encode(&matrix, &refs);
-        let actual = std::fs::read(binary_path(&cache, "EURUSD", "M5")).unwrap();
+        let actual =
+            std::fs::read(binary_path(&cache, &receipt, TEST_CONFIG_HASH).unwrap()).unwrap();
         assert_eq!(actual, expected);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1047,6 +1541,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.to_string_lossy().to_string();
         let keys = month_keys_spanning(JAN_2024, MAR_2024);
+        let receipt = sample_receipt();
         let rows: Vec<TrialReturnRow> = (0..7)
             .map(|i| TrialReturnRow {
                 candidate_index: i,
@@ -1059,17 +1554,21 @@ mod tests {
         let mut w = TrialReturnsWriter::open(
             &cache,
             "eurusd",
-            "m5",
+            "m1",
             keys,
             10_000.0,
             rows.len(),
-            Some("fnv64:cafebabe".to_string()),
+            &receipt,
+            TEST_CONFIG_HASH,
         )
         .unwrap();
         w.append(&rows).unwrap();
         let m = w.finish(1_717_000_000_000).unwrap();
 
-        let stats = m.statistics.as_ref().expect("finish must attach statistics");
+        let stats = m
+            .statistics
+            .as_ref()
+            .expect("finish must attach statistics");
         assert_eq!(stats.matrix_rows, 7);
         assert_eq!(stats.matrix_periods, 3);
         assert_eq!(stats.trials_offered, 7);
@@ -1085,7 +1584,9 @@ mod tests {
 
         // And it survives the manifest's own JSON round trip, which is how it
         // reaches the discovery ledger.
-        let reloaded = load_manifest(&cache, "EURUSD", "M5").expect("manifest");
+        let reloaded = load_manifest(&cache, "EURUSD", "M1", &receipt, TEST_CONFIG_HASH)
+            .expect("valid manifest")
+            .expect("manifest present");
         assert_eq!(reloaded.statistics, m.statistics);
         assert_eq!(reloaded, m);
 
@@ -1106,6 +1607,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let cache = dir.to_string_lossy().to_string();
+        let receipt = sample_receipt();
         // 48 months × 40 trials.
         let keys: Vec<i64> = (0..48).map(|i| 24_000 + i).collect();
         let rows: Vec<TrialReturnRow> = (0..40)
@@ -1122,16 +1624,30 @@ mod tests {
             })
             .collect();
 
-        let mut w =
-            TrialReturnsWriter::open(&cache, "eurusd", "m5", keys, 10_000.0, rows.len(), None)
-                .unwrap();
+        let mut w = TrialReturnsWriter::open(
+            &cache,
+            "eurusd",
+            "m1",
+            keys,
+            10_000.0,
+            rows.len(),
+            &receipt,
+            TEST_CONFIG_HASH,
+        )
+        .unwrap();
         w.append(&rows).unwrap();
         let m = w.finish(1_717_000_000_000).unwrap();
 
         let stats = m.statistics.as_ref().unwrap();
-        let dsr = stats.deflated_sharpe.as_ref().expect("DSR computable at 48×40");
+        let dsr = stats
+            .deflated_sharpe
+            .as_ref()
+            .expect("DSR computable at 48×40");
         assert!((0.0..=1.0).contains(&dsr.deflated_sharpe_ratio));
-        assert_eq!(dsr.trials_n, 40, "the honest N is the row count, not the winners");
+        assert_eq!(
+            dsr.trials_n, 40,
+            "the honest N is the row count, not the winners"
+        );
         let pbo = stats.pbo.as_ref().expect("PBO computable at 48×40");
         assert!((0.0..=1.0).contains(&pbo.pbo));
         assert!(stats.dsr_value().is_some() && stats.pbo_value().is_some());

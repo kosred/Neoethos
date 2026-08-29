@@ -23,6 +23,10 @@ pub mod symbol_metadata;
 pub mod system;
 pub mod utils;
 
+/// Immutable broker-financial evidence contracts and the fail-closed release
+/// gate. This is a dependency-leaf re-export; core does not own or install a
+/// mutable process-global authority.
+pub use neoethos_broker_truth as broker_financial_truth;
 /// The single process-capacity and CPU-permit authority. Re-exporting the
 /// zero-dependency leaf keeps root-engine consumers on the exact same types as
 /// the isolated MCP and mesh workspaces without moving runtime policy into
@@ -45,11 +49,11 @@ pub use broker_truth::{
 pub use config::{NewsTradingMode, Settings, default_news_rss_feeds};
 pub use contracts::{
     ARTIFACT_SCHEMA_VERSION, ArtifactContractError, ArtifactContractKind, ArtifactEnvelope,
-    ArtifactKind, ArtifactProvenance, BackendKind, CANONICAL_TIMEFRAMES, CandleTimestampPolicy,
-    DeterminismPolicy, DeviceAssignment, FeatureAvailabilityPolicy, LiveExecutionContract,
-    LivePromotionGate, LiveReadyStrategyArtifact, LiveReadyStrategyArtifactContract,
-    LiveValidationEvidence, ModelRuntimeArtifact, ModelRuntimeArtifactContract,
-    MultiTimeframeAvailabilityPolicy, PortfolioSelectionArtifact,
+    ArtifactKind, ArtifactProvenance, BackendKind, BarTimestampConvention, CANONICAL_TIMEFRAMES,
+    CandleTimestampPolicy, CanonicalTimeframe, DeterminismPolicy, DeviceAssignment,
+    FeatureAvailabilityPolicy, LiveExecutionContract, LivePromotionGate, LiveReadyStrategyArtifact,
+    LiveReadyStrategyArtifactContract, LiveValidationEvidence, ModelRuntimeArtifact,
+    ModelRuntimeArtifactContract, MultiTimeframeAvailabilityPolicy, PortfolioSelectionArtifact,
     PortfolioSelectionArtifactContract, PromotionReadinessCheck, PromotionReadinessCheckKind,
     PromotionReadinessReport, PromotionReadinessStatus, RuntimeDegradedReason, RuntimeMode,
     RuntimeSafetyIssue, RuntimeSafetyReport, SearchCheckpointArtifact,

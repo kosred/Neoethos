@@ -1,68 +1,10 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_breakout_signals_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    range_length: usize,
-    confirmation_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_breakout_signals_js(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        range_length,
-        confirmation_length,
-    )?;
-    crate::write_wasm_object_f64_outputs("range_breakout_signals_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_breakout_signals_batch_unified_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_breakout_signals_batch_unified_js(open, high, low, close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "range_breakout_signals_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
 
 #[cfg(test)]
 use std::error::Error as StdError;
@@ -117,10 +59,6 @@ pub enum RangeBreakoutSignalsData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RangeBreakoutSignalsOutput {
     pub range_top: Vec<f64>,
     pub range_bottom: Vec<f64>,
@@ -131,10 +69,6 @@ pub struct RangeBreakoutSignalsOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RangeBreakoutSignalsParams {
     pub range_length: Option<usize>,
     pub confirmation_length: Option<usize>,
@@ -341,7 +275,9 @@ pub enum RangeBreakoutSignalsError {
     NotEnoughValidData { needed: usize, valid: usize },
     #[error("range_breakout_signals: output length mismatch: expected = {expected}, got = {got}")]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error("range_breakout_signals: invalid range for {axis}: start = {start}, end = {end}, step = {step}")]
+    #[error(
+        "range_breakout_signals: invalid range for {axis}: start = {start}, end = {end}, step = {step}"
+    )]
     InvalidRange {
         axis: &'static str,
         start: String,
@@ -1424,7 +1360,6 @@ pub fn range_breakout_signals_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn range_breakout_signals_into(
     range_top_out: &mut [f64],
     range_bottom_out: &mut [f64],
@@ -1521,10 +1456,6 @@ impl RangeBreakoutSignalsBatchBuilder {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RangeBreakoutSignalsBatchOutput {
     pub range_top: Vec<f64>,
     pub range_bottom: Vec<f64>,
@@ -1892,397 +1823,6 @@ pub fn range_breakout_signals_batch_par_slice(
     kernel: Kernel,
 ) -> Result<RangeBreakoutSignalsBatchOutput, RangeBreakoutSignalsError> {
     range_breakout_signals_batch_with_kernel(open, high, low, close, volume, sweep, kernel)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "range_breakout_signals")]
-#[pyo3(signature = (open, high, low, close, volume, range_length=DEFAULT_RANGE_LENGTH, confirmation_length=DEFAULT_CONFIRMATION_LENGTH, kernel=None))]
-pub fn range_breakout_signals_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    range_length: usize,
-    confirmation_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let kernel = validate_kernel(kernel, false)?;
-    let input = RangeBreakoutSignalsInput::from_slices(
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        volume.as_slice()?,
-        RangeBreakoutSignalsParams {
-            range_length: Some(range_length),
-            confirmation_length: Some(confirmation_length),
-        },
-    );
-    let out = py
-        .allow_threads(|| range_breakout_signals_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("range_top", out.range_top.into_pyarray(py))?;
-    dict.set_item("range_bottom", out.range_bottom.into_pyarray(py))?;
-    dict.set_item("bullish", out.bullish.into_pyarray(py))?;
-    dict.set_item("extra_bullish", out.extra_bullish.into_pyarray(py))?;
-    dict.set_item("bearish", out.bearish.into_pyarray(py))?;
-    dict.set_item("extra_bearish", out.extra_bearish.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "range_breakout_signals_batch")]
-#[pyo3(signature = (open, high, low, close, volume, range_length_range=(DEFAULT_RANGE_LENGTH, DEFAULT_RANGE_LENGTH, 0), confirmation_length_range=(DEFAULT_CONFIRMATION_LENGTH, DEFAULT_CONFIRMATION_LENGTH, 0), kernel=None))]
-pub fn range_breakout_signals_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    range_length_range: (usize, usize, usize),
-    confirmation_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let kernel = validate_kernel(kernel, true)?;
-    let out = range_breakout_signals_batch_with_kernel(
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        volume.as_slice()?,
-        &RangeBreakoutSignalsBatchRange {
-            range_length: range_length_range,
-            confirmation_length: confirmation_length_range,
-        },
-        kernel,
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "range_top",
-        out.range_top
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "range_bottom",
-        out.range_bottom
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "bullish",
-        out.bullish.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "extra_bullish",
-        out.extra_bullish
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "bearish",
-        out.bearish.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "extra_bearish",
-        out.extra_bearish
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "range_lengths",
-        out.combos
-            .iter()
-            .map(|combo| combo.range_length.unwrap_or(DEFAULT_RANGE_LENGTH))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "confirmation_lengths",
-        out.combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .confirmation_length
-                    .unwrap_or(DEFAULT_CONFIRMATION_LENGTH)
-            })
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", out.rows)?;
-    dict.set_item("cols", out.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RangeBreakoutSignalsStream")]
-pub struct RangeBreakoutSignalsStreamPy {
-    inner: RangeBreakoutSignalsStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RangeBreakoutSignalsStreamPy {
-    #[new]
-    #[pyo3(signature = (range_length=None, confirmation_length=None))]
-    pub fn new(range_length: Option<usize>, confirmation_length: Option<usize>) -> PyResult<Self> {
-        let inner = RangeBreakoutSignalsStream::try_new(RangeBreakoutSignalsParams {
-            range_length,
-            confirmation_length,
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(
-        &mut self,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: f64,
-    ) -> Option<(f64, f64, f64, f64, f64, f64)> {
-        self.inner.update(open, high, low, close, volume)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeBreakoutSignalsBatchConfig {
-    pub range_length_range: (usize, usize, usize),
-    pub confirmation_length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_breakout_signals_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    range_length: usize,
-    confirmation_length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = RangeBreakoutSignalsInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        RangeBreakoutSignalsParams {
-            range_length: Some(range_length),
-            confirmation_length: Some(confirmation_length),
-        },
-    );
-    let out = range_breakout_signals_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_breakout_signals_alloc(len: usize) -> *mut f64 {
-    let mut values = Vec::<f64>::with_capacity(len);
-    let ptr = values.as_mut_ptr();
-    std::mem::forget(values);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_breakout_signals_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_breakout_signals_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    range_top_ptr: *mut f64,
-    range_bottom_ptr: *mut f64,
-    bullish_ptr: *mut f64,
-    extra_bullish_ptr: *mut f64,
-    bearish_ptr: *mut f64,
-    extra_bearish_ptr: *mut f64,
-    len: usize,
-    range_length: usize,
-    confirmation_length: usize,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || range_top_ptr.is_null()
-        || range_bottom_ptr.is_null()
-        || bullish_ptr.is_null()
-        || extra_bullish_ptr.is_null()
-        || bearish_ptr.is_null()
-        || extra_bearish_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let input = RangeBreakoutSignalsInput::from_slices(
-            std::slice::from_raw_parts(open_ptr, len),
-            std::slice::from_raw_parts(high_ptr, len),
-            std::slice::from_raw_parts(low_ptr, len),
-            std::slice::from_raw_parts(close_ptr, len),
-            std::slice::from_raw_parts(volume_ptr, len),
-            RangeBreakoutSignalsParams {
-                range_length: Some(range_length),
-                confirmation_length: Some(confirmation_length),
-            },
-        );
-        let out = range_breakout_signals_with_kernel(&input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        std::slice::from_raw_parts_mut(range_top_ptr, len).copy_from_slice(&out.range_top);
-        std::slice::from_raw_parts_mut(range_bottom_ptr, len).copy_from_slice(&out.range_bottom);
-        std::slice::from_raw_parts_mut(bullish_ptr, len).copy_from_slice(&out.bullish);
-        std::slice::from_raw_parts_mut(extra_bullish_ptr, len).copy_from_slice(&out.extra_bullish);
-        std::slice::from_raw_parts_mut(bearish_ptr, len).copy_from_slice(&out.bearish);
-        std::slice::from_raw_parts_mut(extra_bearish_ptr, len).copy_from_slice(&out.extra_bearish);
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_breakout_signals_batch)]
-pub fn range_breakout_signals_batch_unified_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: RangeBreakoutSignalsBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let out = range_breakout_signals_batch_with_kernel(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        &RangeBreakoutSignalsBatchRange {
-            range_length: config.range_length_range,
-            confirmation_length: config.confirmation_length_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_breakout_signals_batch_into)]
-pub fn range_breakout_signals_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    range_top_ptr: *mut f64,
-    range_bottom_ptr: *mut f64,
-    bullish_ptr: *mut f64,
-    extra_bullish_ptr: *mut f64,
-    bearish_ptr: *mut f64,
-    extra_bearish_ptr: *mut f64,
-    len: usize,
-    range_length_start: usize,
-    range_length_end: usize,
-    range_length_step: usize,
-    confirmation_length_start: usize,
-    confirmation_length_end: usize,
-    confirmation_length_step: usize,
-) -> Result<usize, JsValue> {
-    let sweep = RangeBreakoutSignalsBatchRange {
-        range_length: (range_length_start, range_length_end, range_length_step),
-        confirmation_length: (
-            confirmation_length_start,
-            confirmation_length_end,
-            confirmation_length_step,
-        ),
-    };
-    let rows = expand_grid_range_breakout_signals(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows * cols overflow"))?;
-
-    unsafe {
-        let out = range_breakout_signals_batch_with_kernel(
-            std::slice::from_raw_parts(open_ptr, len),
-            std::slice::from_raw_parts(high_ptr, len),
-            std::slice::from_raw_parts(low_ptr, len),
-            std::slice::from_raw_parts(close_ptr, len),
-            std::slice::from_raw_parts(volume_ptr, len),
-            &sweep,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        std::slice::from_raw_parts_mut(range_top_ptr, total).copy_from_slice(&out.range_top);
-        std::slice::from_raw_parts_mut(range_bottom_ptr, total).copy_from_slice(&out.range_bottom);
-        std::slice::from_raw_parts_mut(bullish_ptr, total).copy_from_slice(&out.bullish);
-        std::slice::from_raw_parts_mut(extra_bullish_ptr, total)
-            .copy_from_slice(&out.extra_bullish);
-        std::slice::from_raw_parts_mut(bearish_ptr, total).copy_from_slice(&out.bearish);
-        std::slice::from_raw_parts_mut(extra_bearish_ptr, total)
-            .copy_from_slice(&out.extra_bearish);
-    }
-
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct RangeBreakoutSignalsStreamWasm {
-    inner: RangeBreakoutSignalsStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl RangeBreakoutSignalsStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        range_length: Option<usize>,
-        confirmation_length: Option<usize>,
-    ) -> Result<RangeBreakoutSignalsStreamWasm, JsValue> {
-        let inner = RangeBreakoutSignalsStream::try_new(RangeBreakoutSignalsParams {
-            range_length,
-            confirmation_length,
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(
-        &mut self,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: f64,
-    ) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.inner.update(open, high, low, close, volume))
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
 }
 
 #[cfg(test)]

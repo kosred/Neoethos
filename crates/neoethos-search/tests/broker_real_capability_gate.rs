@@ -2,19 +2,19 @@ use ndarray::Array2;
 use neoethos_search::eval::{
     PopulationEvalInputs, SessionSpreadProfile, validation_backtest_scenarios_cpu,
 };
-use neoethos_search::{BacktestSettings, evaluate_population_core};
 use neoethos_search::gpu_native::population_fixture::TinyPopulationFixture;
 use neoethos_search::gpu_native::prototype_population::{
     PropFirmRequirement, PrototypeBcRequirements,
 };
 use neoethos_search::gpu_native::prototype_population_oracle::evaluate_population_oracle;
+use neoethos_search::{BacktestSettings, evaluate_population_core};
 
 const BROKER_TRUTH_UNAVAILABLE: &str = "BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1";
 
 #[test]
 fn historical_financial_evaluation_fails_before_an_empty_population_can_short_circuit() {
-    let indicators = Array2::<f32>::zeros((0, 0));
-    let weights = [0.0_f32; 11];
+    let indicators = Array2::<f64>::zeros((0, 0));
+    let weights = [0.0_f64; 11];
     let mut settings = BacktestSettings::default();
     settings.spread_pips = 1.5;
     settings.commission_per_trade = 14.0;
@@ -61,8 +61,8 @@ fn historical_financial_evaluation_fails_before_an_empty_population_can_short_ci
 
 #[test]
 fn scenario_lane_fails_before_an_empty_work_list_can_bypass_the_gate() {
-    let indicators = Array2::<f32>::zeros((0, 0));
-    let weights = [0.0_f32; 11];
+    let indicators = Array2::<f64>::zeros((0, 0));
+    let weights = [0.0_f64; 11];
     let settings = BacktestSettings::default();
 
     let result = validation_backtest_scenarios_cpu(
@@ -228,8 +228,7 @@ fn every_externally_reachable_search_finance_path_is_checked() {
     let validation = include_str!("../src/validation.rs");
     let models = include_str!("../../neoethos-models/src/training_orchestrator.rs");
     let benchmark = include_str!("../src/gpu_native/benchmark.rs");
-    let population_oracle =
-        include_str!("../src/gpu_native/prototype_population_oracle.rs");
+    let population_oracle = include_str!("../src/gpu_native/prototype_population_oracle.rs");
     let autoresearch_runner = include_str!("../../neoethos-autoresearch/src/runner.rs");
 
     for raw_api in [

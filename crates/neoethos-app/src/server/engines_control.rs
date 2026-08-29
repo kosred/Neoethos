@@ -21,21 +21,25 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
+use neoethos_data::{ExactDatasetGenerationConflict, SelectedDatasetGenerationV1};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::app_services::ServiceEvent;
-use crate::app_services::discovery::{DiscoveryRequest, start_discovery_job};
+use crate::app_services::discovery::{
+    DirectTimeframeAcquisitionRequired, DiscoveryRequest, pin_discovery_input, start_discovery_job,
+};
 use crate::app_services::jobs::{JobKind, JobState};
 use crate::app_services::training::{TrainingRequest, start_training_job};
 
 use super::errors::actionable_error;
 use super::state::AppApiState;
 
-/// Shared request body for `start` endpoints — picks the symbol +
-/// timeframe to operate on. Empty fields are resolved from `config.yaml`
-/// via the shared `SystemConfig` resolvers (the SAME ones the CLI uses);
-/// a missing symbol/base fails loud rather than silently defaulting.
+/// Shared request body for `start` endpoints. Discovery requires an exact
+/// canonical `dataset_selection`; the legacy symbol/base fields may only
+/// assert consistency with it. Training still resolves symbol/base through
+/// its existing configuration path because it shares this wire type.
 ///
 /// `higher_tfs` is the MTF context discovery considers alongside
 /// `base_tf`. When omitted, the server resolves the operator's configured
@@ -46,6 +50,10 @@ use super::state::AppApiState;
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct StartJobBody {
+    /// Exact identity + immutable generation + manifest binding selected from
+    /// the data inventory. Optional here only because Training shares this
+    /// request body; Discovery rejects `None` before any data lookup.
+    pub dataset_selection: Option<SelectedDatasetGenerationV1>,
     pub symbol: Option<String>,
     pub base_tf: Option<String>,
     pub higher_tfs: Option<Vec<String>>,
@@ -61,12 +69,49 @@ pub struct StartJobBody {
     pub portfolio_size: Option<usize>,
 }
 
+fn resolve_discovery_selection(body: &StartJobBody) -> Result<SelectedDatasetGenerationV1> {
+    let selected = body
+        .dataset_selection
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("dataset_selection is required for Discovery"))?;
+    selected.validate()?;
+    let identity = selected.identity();
+    if let Some(asserted) = body
+        .symbol
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        anyhow::ensure!(
+            asserted.eq_ignore_ascii_case(identity.symbol_name()),
+            "legacy symbol assertion {asserted:?} disagrees with exact dataset identity symbol {:?}",
+            identity.symbol_name()
+        );
+    }
+    if let Some(asserted) = body
+        .base_tf
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        anyhow::ensure!(
+            asserted.eq_ignore_ascii_case(identity.timeframe().as_str()),
+            "legacy base timeframe assertion {asserted:?} disagrees with exact dataset identity timeframe {:?}",
+            identity.timeframe().as_str()
+        );
+    }
+    Ok(selected)
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct StartResponse {
     pub started: bool,
     pub kind: &'static str,
     pub symbol: String,
     pub base_tf: String,
+    pub dataset_identity: Option<String>,
+    pub dataset_generation: Option<String>,
+    pub manifest_binding_sha256: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -82,6 +127,17 @@ pub async fn discovery_start(
     body: Option<Json<StartJobBody>>,
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    let dataset_selection = match resolve_discovery_selection(&body) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Discovery requires the exact canonical dataset generation selected from Data. Symbol/timeframe alone are not a safe selector.",
+                &error,
+            );
+        }
+    };
 
     // 2026-06-04 PARITY: resolve symbol / base / higher-TFs through the SAME
     // shared `SystemConfig` resolvers the CLI uses, seeded from config.yaml,
@@ -99,31 +155,18 @@ pub async fn discovery_start(
                 target: "neoethos_app::engines_control",
                 error = %err,
                 config_path = %state.config_path().display(),
-                "failed to load Settings; symbol/base/higher-TF defaults and \
-                 DiscoveryConfig will fall back and the run will fail loud at the \
-                 symbol/cost-model guards until config.yaml is fixed"
+                "failed to load Settings; exact dataset identity remains selected, \
+                 but DiscoveryConfig and configured higher timeframes are unavailable; \
+                 the request will fail closed until config.yaml is fixed"
             );
             None
         }
     };
-    let symbol = body
-        .symbol
-        .map(|s| s.trim().to_uppercase())
-        .filter(|s| !s.is_empty())
-        .or_else(|| settings.as_ref().map(|s| s.system.resolve_symbol()))
-        .unwrap_or_default();
-    let base_tf = body
-        .base_tf
-        .map(|s| s.trim().to_uppercase())
-        .filter(|s| !s.is_empty())
-        .or_else(|| settings.as_ref().map(|s| s.system.resolve_base_timeframe()))
-        .unwrap_or_default();
-    let higher_tfs: Vec<String> = match body.higher_tfs.filter(|v| !v.is_empty()) {
-        Some(v) => v
-            .into_iter()
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect(),
+    let dataset_identity = dataset_selection.identity().clone();
+    let symbol = dataset_identity.symbol_name().to_owned();
+    let base_tf = dataset_identity.timeframe().as_str().to_owned();
+    let higher_tfs: Vec<String> = match body.higher_tfs {
+        Some(v) => v.into_iter().map(|s| s.trim().to_uppercase()).collect(),
         // Default = the operator-configured ladder above THIS base (the shared
         // resolver honours multi_resolution_* / higher_timeframes), NOT a raw
         // canonical sweep — identical to a CLI `discover` with no `--higher`.
@@ -132,19 +175,6 @@ pub async fn discovery_start(
             .map(|s| s.system.resolve_higher_timeframes(&base_tf))
             .unwrap_or_default(),
     };
-
-    // Fail loud (parity with the CLI's F-CORE2 doctrine): no synthetic
-    // symbol/base fallback. Empty here means neither the request nor a
-    // readable config.yaml supplied one.
-    if symbol.is_empty() || base_tf.is_empty() {
-        return actionable_error(
-            StatusCode::BAD_REQUEST,
-            "Discovery can't start — no symbol / base timeframe was supplied and \
-             config.yaml couldn't be read to provide a default. Set them in \
-             Settings (or include them in the request) and try again.",
-            &anyhow::anyhow!("symbol='{symbol}' base_tf='{base_tf}'"),
-        );
-    }
 
     if state.engine_state(JobKind::Discovery).await == EngineRunState::Running {
         return (
@@ -168,24 +198,56 @@ pub async fn discovery_start(
         }
     };
 
-    // #153: pre-flight gate. A bare-install user clicks "Start Discovery"
-    // before running Data Bootstrap; discovery then runs for ~2 seconds
-    // before bailing with a deep "no matching files" panic that the
-    // dashboard surfaces as a useless "crash". Catch the empty / missing
-    // data root here and explain what to do instead.
-    if let Err(err) = preflight_discovery_data_root(&data_root, &symbol, &base_tf).await {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": err.to_string(),
-                "code": "discovery_no_data",
-                "data_root": data_root.display().to_string(),
-                "hint": "Run Data Bootstrap or import a CSV/Parquet \
-                         file for this symbol + base timeframe first.",
-            })),
-        )
-            .into_response();
-    }
+    // Linearize the run against the exact selected generation and pin every
+    // direct higher timeframe before the background job exists. A stale
+    // anchor is a typed 409; missing higher frames are a separate explicit
+    // acquisition step. Discovery itself never downloads or rebinds data.
+    let pin_root = data_root.clone();
+    let pin_selection = dataset_selection.clone();
+    let pin_higher = higher_tfs.clone();
+    let pinned_input = match tokio::task::spawn_blocking(move || {
+        pin_discovery_input(&pin_root, pin_selection, &pin_higher)
+    })
+    .await
+    {
+        Ok(Ok(pinned)) => Arc::new(pinned),
+        Ok(Err(error))
+            if error
+                .downcast_ref::<ExactDatasetGenerationConflict>()
+                .is_some() =>
+        {
+            return actionable_error(
+                StatusCode::CONFLICT,
+                "The selected dataset generation is no longer current. Refresh Data and explicitly select the new generation.",
+                &error,
+            );
+        }
+        Ok(Err(error))
+            if error
+                .downcast_ref::<DirectTimeframeAcquisitionRequired>()
+                .is_some() =>
+        {
+            return actionable_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Discovery requires each requested timeframe as its own direct broker/import generation. Acquire the missing timeframe(s), refresh Data, and start again.",
+                &error,
+            );
+        }
+        Ok(Err(error)) => {
+            return actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Discovery could not verify and pin the selected dataset generations.",
+                &error,
+            );
+        }
+        Err(error) => {
+            return actionable_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The exact dataset pinning task failed before Discovery started.",
+                &anyhow::anyhow!("exact dataset pinning task panicked: {error}"),
+            );
+        }
+    };
 
     // #194: stitch operator overrides into the default DiscoveryConfig.
     // Anything the body omits stays at the engine default (which itself
@@ -220,7 +282,8 @@ pub async fn discovery_start(
             );
         }
     };
-    // Body-supplied symbol always wins (operator picked it on the UI).
+    // The exact identity is the selector; the legacy body symbol was checked
+    // only as a consistency assertion above.
     config.evaluation_symbol = symbol.clone();
     // Account currency comes from Settings (loaded into config by
     // from_settings). An empty value propagates to the guard, which bails with
@@ -262,8 +325,7 @@ pub async fn discovery_start(
 
     let request = DiscoveryRequest {
         data_root,
-        symbol: symbol.clone(),
-        base_tf: base_tf.clone(),
+        pinned_input,
         higher_tfs: higher_tfs.clone(),
         config,
         prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
@@ -275,8 +337,8 @@ pub async fn discovery_start(
         Err(err) => {
             return actionable_error(
                 StatusCode::BAD_REQUEST,
-                "Discovery failed to start. Make sure a symbol and timeframe are selected, \
-                 then try again.",
+                "Discovery failed to start. Verify the selected canonical dataset identity \
+                 and its direct timeframe artifacts, then try again.",
                 &err,
             );
         }
@@ -303,6 +365,9 @@ pub async fn discovery_start(
         kind: "discovery",
         symbol,
         base_tf,
+        dataset_identity: Some(dataset_identity.to_path_component()),
+        dataset_generation: Some(dataset_selection.generation_id().to_owned()),
+        manifest_binding_sha256: Some(dataset_selection.manifest_binding_sha256().to_owned()),
     })
     .into_response()
 }
@@ -401,6 +466,9 @@ pub async fn training_start(
         kind: "training",
         symbol,
         base_tf,
+        dataset_identity: None,
+        dataset_generation: None,
+        manifest_binding_sha256: None,
     })
     .into_response()
 }
@@ -430,95 +498,6 @@ async fn resolve_data_root() -> Result<PathBuf> {
     })
     .await
     .map_err(|e| anyhow::anyhow!("blocking task panicked: {e}"))?
-}
-
-/// #153 pre-flight: refuse to start discovery if the data root is
-/// missing, unreadable, or contains zero files for the requested
-/// `symbol`+`base_tf`. The deep-stack failure that motivated this
-/// gate was a `panic!("no matching files")` two layers below
-/// `start_discovery_job` after ~2s — fast enough to look like a
-/// crash, slow enough that the user thought the engine "broke".
-///
-/// #203 refactor: the original v1 only scanned the TOP LEVEL of the
-/// data directory for filenames containing both the symbol and the
-/// timeframe strings. That gave a false negative for the actual
-/// hive-style layout the rest of the codebase uses
-/// (`data/symbol=EURUSD/timeframe=H1/data.vortex`) — the only
-/// top-level entry is `symbol=EURUSD` which doesn't contain "H1".
-/// Now we delegate to the data layer's `discover_timeframes` which
-/// already understands the hive layout and is cached per #79.
-async fn preflight_discovery_data_root(
-    data_root: &std::path::Path,
-    symbol: &str,
-    base_tf: &str,
-) -> Result<()> {
-    if !data_root.exists() {
-        anyhow::bail!(
-            "data directory does not exist: {} (configured via \
-             config.yaml `system.data_dir`)",
-            data_root.display()
-        );
-    }
-    if !data_root.is_dir() {
-        anyhow::bail!("data directory is not a directory: {}", data_root.display());
-    }
-
-    // Empty-directory branch: distinguish "user hasn't run Data
-    // Bootstrap at all" from "user ran it for a different symbol".
-    let mut entries = tokio::fs::read_dir(data_root)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot read data directory {}: {e}", data_root.display()))?;
-    let mut total = 0usize;
-    while let Some(_entry) = entries.next_entry().await? {
-        total += 1;
-    }
-    if total == 0 {
-        anyhow::bail!(
-            "data directory is empty: {} — run Data Bootstrap or import \
-             a CSV/Parquet file first",
-            data_root.display()
-        );
-    }
-
-    let symbol_up = symbol.to_uppercase();
-    let base_tf_up = base_tf.to_uppercase();
-    let data_root_owned = data_root.to_path_buf();
-    let symbol_for_blocking = symbol_up.clone();
-    // `discover_timeframes` walks `symbol=*/timeframe=*/` and does
-    // some std::fs work; run it on the blocking pool so the async
-    // runtime stays responsive even when the data dir is on a slow
-    // network drive.
-    let discovered: Vec<String> = tokio::task::spawn_blocking(move || {
-        neoethos_data::discover_timeframes(&data_root_owned, &symbol_for_blocking)
-            .unwrap_or_default()
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("timeframe-discovery task panicked: {e}"))?;
-
-    if discovered.is_empty() {
-        anyhow::bail!(
-            "no data on disk for {} in {} — import OHLCV for this \
-             symbol first (data dir has {} top-level entries but \
-             none under symbol={})",
-            symbol_up,
-            data_root.display(),
-            total,
-            symbol_up,
-        );
-    }
-    if !discovered
-        .iter()
-        .any(|tf| tf.eq_ignore_ascii_case(&base_tf_up))
-    {
-        anyhow::bail!(
-            "{} is on disk but timeframe {} is missing — available: {} ({})",
-            symbol_up,
-            base_tf_up,
-            discovered.join(", "),
-            data_root.display(),
-        );
-    }
-    Ok(())
 }
 
 /// Spawn a background task that drains the ServiceEvent rx channel
@@ -674,6 +653,82 @@ fn spawn_auto_chained_training(state: AppApiState, symbol: String, base_tf: Stri
                  must launch it manually from the Training screen"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod exact_dataset_selection_tests {
+    use super::*;
+    use neoethos_data::{BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe};
+
+    fn selected_identity() -> CanonicalDatasetIdentity {
+        CanonicalDatasetIdentity::external(
+            "operator-upload",
+            "EURUSD",
+            CanonicalTimeframe::M5,
+            BarTimestampConvention::BarOpen,
+        )
+        .expect("valid exact dataset identity")
+    }
+
+    fn selected_generation() -> SelectedDatasetGenerationV1 {
+        SelectedDatasetGenerationV1::new(
+            selected_identity(),
+            format!("g1-{}.vortex", "1".repeat(64)),
+            "2".repeat(64),
+        )
+        .expect("valid selected generation")
+    }
+
+    fn body(selection: Option<SelectedDatasetGenerationV1>) -> StartJobBody {
+        StartJobBody {
+            dataset_selection: selection,
+            symbol: Some("EURUSD".to_owned()),
+            base_tf: Some("M5".to_owned()),
+            ..StartJobBody::default()
+        }
+    }
+
+    #[test]
+    fn discovery_requires_an_exact_dataset_generation() {
+        let error = resolve_discovery_selection(&body(None))
+            .expect_err("symbol and timeframe alone must never select discovery data");
+
+        assert!(error.to_string().contains("dataset_selection"));
+    }
+
+    #[test]
+    fn discovery_derives_symbol_and_timeframe_from_the_exact_identity() {
+        let selection = selected_generation();
+        let resolved = resolve_discovery_selection(&body(Some(selection.clone())))
+            .expect("consistent legacy assertions must be accepted");
+
+        assert_eq!(resolved, selection);
+        assert_eq!(resolved.identity().symbol_name(), "EURUSD");
+        assert_eq!(resolved.identity().timeframe().as_str(), "M5");
+    }
+
+    #[test]
+    fn discovery_rejects_a_legacy_symbol_that_disagrees_with_the_identity() {
+        let mut request = body(Some(selected_generation()));
+        request.symbol = Some("GBPUSD".to_owned());
+
+        let error = resolve_discovery_selection(&request)
+            .expect_err("legacy symbol may assert consistency but cannot select another series");
+        assert!(error.to_string().contains("GBPUSD"));
+        assert!(error.to_string().contains("EURUSD"));
+    }
+
+    #[test]
+    fn discovery_rejects_a_legacy_timeframe_that_disagrees_with_the_identity() {
+        let mut request = body(Some(selected_generation()));
+        request.base_tf = Some("H1".to_owned());
+
+        let error = resolve_discovery_selection(&request).expect_err(
+            "legacy timeframe may assert consistency but cannot select another timeframe",
+        );
+        assert!(error.to_string().contains("H1"));
+        assert!(error.to_string().contains("M5"));
     }
 }
 

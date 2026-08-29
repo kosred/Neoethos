@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-pub const SNAPSHOT_FIXTURE_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_FIXTURE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotSettingsDto {
@@ -123,13 +123,13 @@ pub struct SnapshotFixtureDto {
     pub high: Vec<f64>,
     pub low: Vec<f64>,
     /// Feature-major contiguous `[feature][bar]` values.
-    pub indicators: Vec<f32>,
+    pub indicators: Vec<f64>,
     pub feature_count: usize,
     pub gene_offsets: Vec<i32>,
     pub gene_indices: Vec<i32>,
-    pub gene_weights: Vec<f32>,
-    pub long_thresholds: Vec<f32>,
-    pub short_thresholds: Vec<f32>,
+    pub gene_weights: Vec<f64>,
+    pub long_thresholds: Vec<f64>,
+    pub short_thresholds: Vec<f64>,
     pub months: Vec<i64>,
     pub days: Vec<i64>,
     pub timestamps: Vec<i64>,
@@ -138,7 +138,7 @@ pub struct SnapshotFixtureDto {
     pub stop_vol_multipliers: Vec<f64>,
     pub smc_data: Vec<SmcRow>,
     pub gene_smc_flags: Vec<SmcRow>,
-    pub smc_weights: [f32; 11],
+    pub smc_weights: [f64; 11],
     pub settings: SnapshotSettingsDto,
 }
 
@@ -149,12 +149,12 @@ pub struct SnapshotPopulationFixture {
     close: Vec<f64>,
     high: Vec<f64>,
     low: Vec<f64>,
-    indicators: Array2<f32>,
+    indicators: Array2<f64>,
     gene_offsets: Vec<i32>,
     gene_indices: Vec<i32>,
-    gene_weights: Vec<f32>,
-    long_thresholds: Vec<f32>,
-    short_thresholds: Vec<f32>,
+    gene_weights: Vec<f64>,
+    long_thresholds: Vec<f64>,
+    short_thresholds: Vec<f64>,
     months: Vec<i64>,
     days: Vec<i64>,
     timestamps: Vec<i64>,
@@ -163,7 +163,7 @@ pub struct SnapshotPopulationFixture {
     stop_vol_multipliers: Vec<f64>,
     smc_data: Vec<SmcRow>,
     gene_smc_flags: Vec<SmcRow>,
-    smc_weights: [f32; 11],
+    smc_weights: [f64; 11],
     settings: BacktestSettings,
 }
 

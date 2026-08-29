@@ -1,11 +1,26 @@
 use serde::de::DeserializeOwned;
 
 use neoethos_app::server::data_control::{FetchBody, ImportBody};
+use neoethos_app::server::engines_control::StartJobBody;
 use neoethos_app::server::orders::{
     AmendPositionProtectionBody, CancelOrderBody, ClosePositionBody, NewOrderBody,
     NewPendingOrderBody,
 };
 use neoethos_app::server::strategy_lab::PromoteBody;
+use neoethos_data::{
+    BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe,
+    SelectedDatasetGenerationV1,
+};
+
+fn exact_external_dataset_identity() -> CanonicalDatasetIdentity {
+    CanonicalDatasetIdentity::external(
+        "operator-upload",
+        "EURUSD",
+        CanonicalTimeframe::M5,
+        BarTimestampConvention::BarOpen,
+    )
+    .expect("valid exact external dataset identity")
+}
 
 fn assert_unknown_field<T: DeserializeOwned>(fixture: &str, field: &str) {
     let error = match serde_json::from_str::<T>(fixture) {
@@ -31,27 +46,76 @@ fn server_contract_tests_frontend_fixtures_use_camel_case() {
     assert_eq!(protection.trailing_stop_loss, Some(true));
 
     let import: ImportBody = serde_json::from_str(
-        r#"{"sourcePath":"C:/market-data/EURUSD.csv","symbol":"EURUSD","timeframe":"M5"}"#,
+        r#"{"sourcePath":"C:/market-data/EURUSD.csv","sourceFormat":"csv","sourceNamespace":"operator-upload","symbol":"EURUSD","timeframe":"M5","barTimestampConvention":"bar_open","expectedGeneration":null}"#,
     )
     .expect("deserialize dataImportBody fixture");
     assert_eq!(import.source_path, "C:/market-data/EURUSD.csv");
+    assert_eq!(import.source_format.as_str(), "csv");
+    assert_eq!(import.source_namespace, "operator-upload");
     assert_eq!(import.symbol, "EURUSD");
     assert_eq!(import.timeframe, "M5");
+    assert_eq!(import.bar_timestamp_convention, "bar_open");
+    assert_eq!(import.expected_generation, None);
 
     let fetch: FetchBody = serde_json::from_str(
-        r#"{"symbol":"EURUSD","timeframe":"M5","fromMs":1700000000000}"#,
+        r#"{"symbol":"EURUSD","timeframe":"M5","fromMs":1700000000000,"datasetSelection":null}"#,
     )
     .expect("deserialize dataFetchBody fixture");
     assert_eq!(fetch.symbol, "EURUSD");
     assert_eq!(fetch.timeframe, "M5");
     assert_eq!(fetch.from_ms, 1_700_000_000_000);
     assert_eq!(fetch.to_ms, None);
+    assert!(fetch.dataset_selection.is_none());
 
-    let promotion: PromoteBody =
-        serde_json::from_str(r#"{"symbol":"EURUSD","baseTf":"M5"}"#)
-            .expect("deserialize promoteStrategyBody fixture");
+    let promotion: PromoteBody = serde_json::from_str(r#"{"symbol":"EURUSD","baseTf":"M5"}"#)
+        .expect("deserialize promoteStrategyBody fixture");
     assert_eq!(promotion.symbol.as_deref(), Some("EURUSD"));
     assert_eq!(promotion.base_tf.as_deref(), Some("M5"));
+}
+
+#[test]
+fn discovery_start_contract_decodes_the_canonical_d1_identity_to_a_typed_value() {
+    let identity = exact_external_dataset_identity();
+    let selection = SelectedDatasetGenerationV1::new(
+        identity.clone(),
+        format!("g1-{}.vortex", "1".repeat(64)),
+        "2".repeat(64),
+    )
+    .expect("valid selected generation receipt");
+    let body: StartJobBody = serde_json::from_value(serde_json::json!({
+        "dataset_selection": selection,
+        "symbol": "EURUSD",
+        "base_tf": "M5",
+    }))
+    .expect("decode exact discovery selection");
+
+    assert_eq!(
+        body.dataset_selection
+            .as_ref()
+            .map(SelectedDatasetGenerationV1::identity),
+        Some(&identity)
+    );
+}
+
+#[test]
+fn discovery_start_contract_rejects_a_noncanonical_dataset_identity() {
+    let error = serde_json::from_value::<StartJobBody>(serde_json::json!({
+        "dataset_selection": {
+            "schema": "neoethos.selected-dataset-generation.v1",
+            "version": 1,
+            "dataset_identity": "d1-not-canonical",
+            "generation_id": format!("g1-{}.vortex", "1".repeat(64)),
+            "manifest_binding_sha256": "2".repeat(64),
+        },
+        "symbol": "EURUSD",
+        "base_tf": "M5",
+    }))
+    .expect_err("noncanonical discovery identity must fail during request decoding");
+
+    assert!(
+        error.to_string().contains("canonical dataset identity"),
+        "unexpected decode error: {error}"
+    );
 }
 
 #[test]
@@ -96,10 +160,7 @@ fn server_contract_tests_snake_case_aliases_are_rejected() {
         r#"{"positionId":42,"position_id":43,"volume":1000}"#,
         "position_id",
     );
-    assert_unknown_field::<CancelOrderBody>(
-        r#"{"orderId":84,"order_id":85}"#,
-        "order_id",
-    );
+    assert_unknown_field::<CancelOrderBody>(r#"{"orderId":84,"order_id":85}"#, "order_id");
     assert_unknown_field::<AmendPositionProtectionBody>(
         r#"{"positionId":42,"position_id":43,"stopLossPrice":1.07125,"takeProfitPrice":1.0845,"trailingStopLoss":true}"#,
         "position_id",
@@ -124,8 +185,12 @@ fn server_contract_tests_snake_case_aliases_are_rejected() {
         r#"{"symbol":"EURUSD","timeframe":"M5","fromMs":1700000000000,"toMs":1700003600000,"to_ms":1700007200000}"#,
         "to_ms",
     );
+    assert_unknown_field::<FetchBody>(
+        r#"{"symbol":"EURUSD","timeframe":"M5","fromMs":1700000000000,"datasetSelection":null,"expectedGeneration":"g1-retired.vortex"}"#,
+        "expectedGeneration",
+    );
     assert_unknown_field::<ImportBody>(
-        r#"{"sourcePath":"C:/market-data/EURUSD.csv","source_path":"C:/other.csv","symbol":"EURUSD","timeframe":"M5"}"#,
+        r#"{"sourcePath":"C:/market-data/EURUSD.csv","source_path":"C:/other.csv","sourceFormat":"csv","sourceNamespace":"operator-upload","symbol":"EURUSD","timeframe":"M5","barTimestampConvention":"bar_open","expectedGeneration":null}"#,
         "source_path",
     );
     assert_unknown_field::<PromoteBody>(
@@ -148,10 +213,7 @@ fn server_contract_tests_unknown_fields_are_rejected_by_every_body() {
         r#"{"positionId":42,"volume":1000,"closePrice":1.07125}"#,
         "closePrice",
     );
-    assert_unknown_field::<CancelOrderBody>(
-        r#"{"orderId":84,"refundUsd":100.0}"#,
-        "refundUsd",
-    );
+    assert_unknown_field::<CancelOrderBody>(r#"{"orderId":84,"refundUsd":100.0}"#, "refundUsd");
     assert_unknown_field::<AmendPositionProtectionBody>(
         r#"{"positionId":42,"stopLossPrice":1.07125,"takeProfitPrice":1.0845,"trailingStopLoss":true,"moneyAtRisk":100.0}"#,
         "moneyAtRisk",
@@ -161,7 +223,7 @@ fn server_contract_tests_unknown_fields_are_rejected_by_every_body() {
         "budgetUsd",
     );
     assert_unknown_field::<ImportBody>(
-        r#"{"sourcePath":"C:/market-data/EURUSD.csv","symbol":"EURUSD","timeframe":"M5","priceScale":100000}"#,
+        r#"{"sourcePath":"C:/market-data/EURUSD.csv","sourceFormat":"csv","sourceNamespace":"operator-upload","symbol":"EURUSD","timeframe":"M5","barTimestampConvention":"bar_open","expectedGeneration":null,"priceScale":100000}"#,
         "priceScale",
     );
     assert_unknown_field::<PromoteBody>(

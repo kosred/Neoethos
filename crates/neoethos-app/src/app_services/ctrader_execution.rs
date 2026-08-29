@@ -1,3 +1,4 @@
+use crate::app_services::broker_deal_economics::BrokerSymbolVolumeScaleEvidenceV1;
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
@@ -90,6 +91,12 @@ pub struct CTraderExecutionOutcome {
     /// is `None` or 0.0. Lets the trading loop decide whether to
     /// scale-in the residual or cancel-and-log.
     pub filled_lot_size: Option<f64>,
+    /// Exact `ProtoOADeal.filledVolume` wire integer (centi-units).
+    pub filled_volume_raw_centi_units: Option<i64>,
+    /// Exact broker symbol/account/environment lot-size identity used by the
+    /// order-preparation path. Raw event parsers leave it absent; the submitting
+    /// broker API binds it before returning the outcome to its caller.
+    pub volume_scale_evidence: Option<BrokerSymbolVolumeScaleEvidenceV1>,
     pub execution_price: Option<f64>,
     pub gross_profit: Option<f64>,
     pub fee: Option<f64>,
@@ -975,6 +982,8 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
         filled_lot_size: deal
             .as_ref()
             .map(|item| volume_to_units(item.filled_volume)),
+        filled_volume_raw_centi_units: deal.as_ref().map(|item| item.filled_volume),
+        volume_scale_evidence: None,
         execution_price: deal
             .as_ref()
             .and_then(|item| item.execution_price)
@@ -1024,6 +1033,8 @@ fn parse_order_error_event(response_json: &str) -> Result<CTraderExecutionOutcom
         lot_size: None,
         requested_lot_size: None,
         filled_lot_size: None,
+        filled_volume_raw_centi_units: None,
+        volume_scale_evidence: None,
         execution_price: None,
         gross_profit: None,
         fee: None,

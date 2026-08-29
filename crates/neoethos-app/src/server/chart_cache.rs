@@ -134,7 +134,9 @@ fn cache() -> &'static Mutex<Cache> {
 /// leaves no invariant a fresh reader can't tolerate, so recovering the guard
 /// via `into_inner()` is safe and keeps the cache alive across a stray panic.
 fn lock_cache() -> MutexGuard<'static, Cache> {
-    cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Cache-key lookup. `None` = miss; caller loads from disk + calls `put`.

@@ -1,31 +1,11 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaQqe};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-use crate::indicators::moving_averages::ema::{ema, EmaInput, EmaParams};
-use crate::indicators::rsi::{rsi, RsiInput, RsiParams};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::moving_averages::ema::{EmaInput, EmaParams, ema};
+use crate::indicators::rsi::{RsiInput, RsiParams, rsi};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -81,10 +61,6 @@ pub struct QqeOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct QqeParams {
     pub rsi_period: Option<usize>,
     pub smoothing_factor: Option<usize>,
@@ -1369,585 +1345,11 @@ pub fn qqe_batch_par_slice(
     qqe_batch_inner(data, sweep, kern, true)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "qqe")]
-#[pyo3(signature = (data, rsi_period=14, smoothing_factor=5, fast_factor=4.236, kernel=None))]
-pub fn qqe_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    rsi_period: usize,
-    smoothing_factor: usize,
-    fast_factor: f64,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = QqeParams {
-        rsi_period: Some(rsi_period),
-        smoothing_factor: Some(smoothing_factor),
-        fast_factor: Some(fast_factor),
-    };
-    let input = QqeInput::from_slice(slice_in, params);
-
-    let result = py
-        .allow_threads(|| qqe_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((result.fast.into_pyarray(py), result.slow.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "QqeStream")]
-pub struct QqeStreamPy {
-    stream: QqeStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl QqeStreamPy {
-    #[new]
-    fn new(rsi_period: usize, smoothing_factor: usize, fast_factor: f64) -> PyResult<Self> {
-        let params = QqeParams {
-            rsi_period: Some(rsi_period),
-            smoothing_factor: Some(smoothing_factor),
-            fast_factor: Some(fast_factor),
-        };
-        let stream =
-            QqeStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(QqeStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "qqe_batch")]
-#[pyo3(signature = (data, rsi_period_range, smoothing_factor_range, fast_factor_range, kernel=None))]
-pub fn qqe_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    rsi_period_range: (usize, usize, usize),
-    smoothing_factor_range: (usize, usize, usize),
-    fast_factor_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray2, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let sweep = QqeBatchRange {
-        rsi_period: rsi_period_range,
-        smoothing_factor: smoothing_factor_range,
-        fast_factor: fast_factor_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid(&sweep);
-    if combos.is_empty() {
-        return Err(PyValueError::new_err("Empty parameter combination"));
-    }
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let fast_arr = unsafe { PyArray2::<f64>::new(py, [rows, cols], false) };
-    let slow_arr = unsafe { PyArray2::<f64>::new(py, [rows, cols], false) };
-    let fast_slice = unsafe { fast_arr.as_slice_mut()? };
-    let slow_slice = unsafe { slow_arr.as_slice_mut()? };
-
-    let first = slice_in.iter().position(|x| !x.is_nan()).unwrap_or(0);
-    let warm: Vec<usize> = combos
-        .iter()
-        .map(|c| first + c.rsi_period.unwrap() + c.smoothing_factor.unwrap() - 2)
-        .collect();
-
-    let mut tmp_mu = make_uninit_matrix(1, cols);
-    let tmp: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(tmp_mu.as_mut_ptr() as *mut f64, cols) };
-
-    use crate::indicators::moving_averages::ema::ema_into_slice;
-    use crate::indicators::rsi::rsi_into_slice;
-
-    let simd = match kern {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => Kernel::Scalar,
-    };
-
-    py.allow_threads(|| -> PyResult<()> {
-        for (row, combo) in combos.iter().enumerate() {
-            let rsi_p = combo.rsi_period.unwrap();
-            let ema_p = combo.smoothing_factor.unwrap();
-            let fast_k = combo.fast_factor.unwrap();
-            let start = warm[row];
-
-            let dst_fast = &mut fast_slice[row * cols..(row + 1) * cols];
-            let dst_slow = &mut slow_slice[row * cols..(row + 1) * cols];
-
-            rsi_into_slice(
-                tmp,
-                &RsiInput::from_slice(
-                    slice_in,
-                    RsiParams {
-                        period: Some(rsi_p),
-                    },
-                ),
-                simd,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-            ema_into_slice(
-                dst_fast,
-                &EmaInput::from_slice(
-                    tmp,
-                    EmaParams {
-                        period: Some(ema_p),
-                    },
-                ),
-                simd,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-            for v in &mut dst_fast[..start] {
-                *v = f64::NAN;
-            }
-            for v in &mut dst_slow[..start] {
-                *v = f64::NAN;
-            }
-
-            qqe_compute_slow_from(dst_fast, fast_k, start, dst_slow);
-        }
-        Ok(())
-    })?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("fast", fast_arr)?;
-    dict.set_item("slow", slow_arr)?;
-    dict.set_item(
-        "rsi_periods",
-        combos
-            .iter()
-            .map(|c| c.rsi_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smoothing_factors",
-        combos
-            .iter()
-            .map(|c| c.smoothing_factor.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "fast_factors",
-        combos
-            .iter()
-            .map(|c| c.fast_factor.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "qqe_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, rsi_period_range, smoothing_factor_range, fast_factor_range, device_id=0))]
-pub fn qqe_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    rsi_period_range: (usize, usize, usize),
-    smoothing_factor_range: (usize, usize, usize),
-    fast_factor_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, pyo3::types::PyDict>)> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_f32.as_slice()?;
-    let sweep = QqeBatchRange {
-        rsi_period: rsi_period_range,
-        smoothing_factor: smoothing_factor_range,
-        fast_factor: fast_factor_range,
-    };
-    let (inner, combos) = py.allow_threads(|| {
-        let cuda = CudaQqe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.qqe_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "rsi_periods",
-        combos
-            .iter()
-            .map(|c| c.rsi_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smoothing_factors",
-        combos
-            .iter()
-            .map(|c| c.smoothing_factor.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "fast_factors",
-        combos
-            .iter()
-            .map(|c| c.fast_factor.unwrap() as f64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", 2 * combos.len())?;
-    dict.set_item("cols", slice.len())?;
-    Ok((handle, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "qqe_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, rsi_period, smoothing_factor, fast_factor, device_id=0))]
-pub fn qqe_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    rsi_period: usize,
-    smoothing_factor: usize,
-    fast_factor: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array (rows x cols)"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = QqeParams {
-        rsi_period: Some(rsi_period),
-        smoothing_factor: Some(smoothing_factor),
-        fast_factor: Some(fast_factor),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaQqe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.qqe_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct QqeJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_js(
-    data: &[f64],
-    rsi_period: usize,
-    smoothing_factor: usize,
-    fast_factor: f64,
-) -> Result<JsValue, JsValue> {
-    let params = QqeParams {
-        rsi_period: Some(rsi_period),
-        smoothing_factor: Some(smoothing_factor),
-        fast_factor: Some(fast_factor),
-    };
-    let input = QqeInput::from_slice(data, params);
-
-    let mut values = vec![f64::NAN; data.len() * 2];
-
-    let (fast_slice, slow_slice) = values.split_at_mut(data.len());
-
-    qqe_into_slices(fast_slice, slow_slice, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let result = QqeJsResult {
-        values,
-        rows: 2,
-        cols: data.len(),
-    };
-
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_unified_js(
-    data: &[f64],
-    rsi_period: usize,
-    smoothing_factor: usize,
-    fast_factor: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let params = QqeParams {
-        rsi_period: Some(rsi_period),
-        smoothing_factor: Some(smoothing_factor),
-        fast_factor: Some(fast_factor),
-    };
-    let input = QqeInput::from_slice(data, params);
-
-    let mut result = vec![f64::NAN; data.len() * 2];
-
-    let (fast_slice, slow_slice) = result.split_at_mut(data.len());
-
-    qqe_into_slices(fast_slice, slow_slice, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(result)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len * 2);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len * 2);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    rsi_period: usize,
-    smoothing_factor: usize,
-    fast_factor: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to qqe_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = QqeParams {
-            rsi_period: Some(rsi_period),
-            smoothing_factor: Some(smoothing_factor),
-            fast_factor: Some(fast_factor),
-        };
-        let input = QqeInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut tmp = vec![f64::NAN; len * 2];
-            let (tmp_fast, tmp_slow) = tmp.split_at_mut(len);
-            qqe_into_slices(tmp_fast, tmp_slow, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let dst = std::slice::from_raw_parts_mut(out_ptr, len * 2);
-            dst.copy_from_slice(&tmp);
-        } else {
-            let dst = std::slice::from_raw_parts_mut(out_ptr, len * 2);
-            let (dst_fast, dst_slow) = dst.split_at_mut(len);
-            qqe_into_slices(dst_fast, dst_slow, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct QqeBatchConfig {
-    pub rsi_period_range: (usize, usize, usize),
-    pub smoothing_factor_range: (usize, usize, usize),
-    pub fast_factor_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize)]
-pub struct QqeBatchJsOutput {
-    pub fast_values: Vec<f64>,
-    pub slow_values: Vec<f64>,
-    pub combos: Vec<QqeParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = qqe_batch)]
-pub fn qqe_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: QqeBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = QqeBatchRange {
-        rsi_period: config.rsi_period_range,
-        smoothing_factor: config.smoothing_factor_range,
-        fast_factor: config.fast_factor_range,
-    };
-
-    let kernel = detect_best_batch_kernel();
-    let result = qqe_batch_with_kernel(data, &sweep, kernel)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let output = QqeBatchJsOutput {
-        fast_values: result.fast_values,
-        slow_values: result.slow_values,
-        combos: result.combos,
-        rows: result.rows,
-        cols: result.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    rsi_period_start: usize,
-    rsi_period_end: usize,
-    rsi_period_step: usize,
-    smoothing_start: usize,
-    smoothing_end: usize,
-    smoothing_step: usize,
-    fast_factor_start: f64,
-    fast_factor_end: f64,
-    fast_factor_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to qqe_batch_into"));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(in_ptr, len);
-        let sweep = QqeBatchRange {
-            rsi_period: (rsi_period_start, rsi_period_end, rsi_period_step),
-            smoothing_factor: (smoothing_start, smoothing_end, smoothing_step),
-            fast_factor: (fast_factor_start, fast_factor_end, fast_factor_step),
-        };
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        if rows == 0 {
-            return Err(JsValue::from_str("Empty parameter combination"));
-        }
-
-        let total = rows * len * 2;
-        let dst = core::slice::from_raw_parts_mut(out_ptr, total);
-        let (dst_fast_all, dst_slow_all) = dst.split_at_mut(rows * len);
-
-        let mut tmp_mu = make_uninit_matrix(1, len);
-        let tmp: &mut [f64] = core::slice::from_raw_parts_mut(tmp_mu.as_mut_ptr() as *mut f64, len);
-
-        let simd = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => Kernel::Scalar,
-        };
-
-        use crate::indicators::moving_averages::ema::ema_into_slice;
-        use crate::indicators::rsi::rsi_into_slice;
-
-        let first = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
-
-        for (row, combo) in combos.iter().enumerate() {
-            let rsi_p = combo.rsi_period.unwrap();
-            let ema_p = combo.smoothing_factor.unwrap();
-            let fast_k = combo.fast_factor.unwrap();
-
-            let start = first + rsi_p + ema_p - 2;
-
-            let dst_fast = &mut dst_fast_all[row * len..(row + 1) * len];
-            let dst_slow = &mut dst_slow_all[row * len..(row + 1) * len];
-
-            rsi_into_slice(
-                tmp,
-                &RsiInput::from_slice(
-                    data,
-                    RsiParams {
-                        period: Some(rsi_p),
-                    },
-                ),
-                simd,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            ema_into_slice(
-                dst_fast,
-                &EmaInput::from_slice(
-                    tmp,
-                    EmaParams {
-                        period: Some(ema_p),
-                    },
-                ),
-                simd,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            for v in &mut dst_fast[..start] {
-                *v = f64::NAN;
-            }
-            for v in &mut dst_slow[..start] {
-                *v = f64::NAN;
-            }
-
-            qqe_compute_slow_from(dst_fast, fast_k, start, dst_slow);
-        }
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_unified_output_into_js(
-    data: &[f64],
-    rsi_period: usize,
-    smoothing_factor: usize,
-    fast_factor: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = qqe_unified_js(data, rsi_period, smoothing_factor, fast_factor)?;
-    crate::write_wasm_f64_output("qqe_unified_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_output_into_js(
-    data: &[f64],
-    rsi_period: usize,
-    smoothing_factor: usize,
-    fast_factor: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = qqe_js(data, rsi_period, smoothing_factor, fast_factor)?;
-    crate::write_wasm_object_f64_outputs("qqe_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qqe_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = qqe_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("qqe_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
@@ -1955,8 +1357,8 @@ mod tests {
 
     fn check_qqe_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = QqeInput::from_candles(&candles, "close", QqeParams::default());
         let result = qqe_with_kernel(&input, kernel)?;
@@ -2012,8 +1414,8 @@ mod tests {
 
     fn check_qqe_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = QqeParams {
             rsi_period: None,
@@ -2030,8 +1432,8 @@ mod tests {
 
     fn check_qqe_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = QqeInput::with_default_candles(&candles);
         match input.data {
@@ -2293,8 +1695,8 @@ mod tests {
 
     fn check_qqe_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let p = QqeParams::default();
 
         let out1 = qqe_with_kernel(&QqeInput::from_candles(&c, "close", p.clone()), kernel)?;
@@ -2308,8 +1710,8 @@ mod tests {
 
     fn check_qqe_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let p = QqeParams::default();
         let res = qqe_with_kernel(&QqeInput::from_candles(&c, "close", p.clone()), kernel)?;
@@ -2327,8 +1729,8 @@ mod tests {
 
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let out = QqeBatchBuilder::new()
             .kernel(kernel)
@@ -2351,8 +1753,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = QqeBatchBuilder::new()
             .kernel(kernel)
             .rsi_period_range(10, 14, 2)

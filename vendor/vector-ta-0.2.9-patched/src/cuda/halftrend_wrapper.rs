@@ -1,14 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
-use crate::indicators::atr::{atr, AtrInput, AtrParams};
+use crate::indicators::atr::{AtrInput, AtrParams, atr};
 use crate::indicators::halftrend::{HalfTrendBatchRange, HalfTrendParams};
-use crate::indicators::moving_averages::sma::{sma, SmaInput, SmaParams};
+use crate::indicators::moving_averages::sma::{SmaInput, SmaParams, sma};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -112,11 +112,6 @@ impl CudaHalftrend {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/halftrend_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("halftrend_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -802,8 +797,10 @@ impl CudaHalftrend {
             };
             if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") && !self.debug_batch_logged
             {
-                eprintln!("[halftrend] batch kernel (row-major): block_x={} rows={} len={} first_valid={}",
-                    block_x, rows, n, first);
+                eprintln!(
+                    "[halftrend] batch kernel (row-major): block_x={} rows={} len={} first_valid={}",
+                    block_x, rows, n, first
+                );
                 unsafe {
                     (*(self as *const _ as *mut CudaHalftrend)).debug_batch_logged = true;
                 }
@@ -940,8 +937,10 @@ impl CudaHalftrend {
             let block_x = 256u32;
             if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") && !self.debug_batch_logged
             {
-                eprintln!("[halftrend] batch kernel (time-major): block_x={} rows={} len={} first_valid={}",
-                    block_x, rows, n, first);
+                eprintln!(
+                    "[halftrend] batch kernel (time-major): block_x={} rows={} len={} first_valid={}",
+                    block_x, rows, n, first
+                );
                 unsafe {
                     (*(self as *const _ as *mut CudaHalftrend)).debug_batch_logged = true;
                 }

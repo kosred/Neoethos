@@ -13,11 +13,18 @@
 //! library that is not on the link line is LNK2001 followed by LNK1120: the
 //! next Windows GPU release build would have failed at the link step.
 //!
-//! The build script is kept (rather than deleted) so `cargo` does not have to
-//! re-resolve the package layout, and so this note survives where the next
-//! person will look for it.
+//! Linux tree-model runtimes are staged beside the final executable by their
+//! owning sys crates. The final binary therefore carries a single `$ORIGIN`
+//! RUNPATH. Windows already searches the executable directory for DLLs; adding
+//! a linker search path there would weaken that portable, adjacent-file rule.
 
 fn main() {
-    // Nothing to do. Kept deliberately empty — see the module comment.
     println!("cargo:rerun-if-changed=build.rs");
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS")
+        .expect("Cargo must provide CARGO_CFG_TARGET_OS to neoethos-cli/build.rs");
+    if target_os == "linux" {
+        println!("cargo:rustc-link-arg-bin=neoethos-cli=-Wl,-rpath,$ORIGIN");
+        println!("cargo:rustc-link-arg-bin=neoethos-cli=-Wl,-rpath,$ORIGIN/../lib/neoethos-cli");
+    }
 }

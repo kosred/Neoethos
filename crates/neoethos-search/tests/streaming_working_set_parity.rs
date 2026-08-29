@@ -60,11 +60,12 @@ fn gene(id: &str, indices: Vec<usize>) -> Gene {
 }
 
 fn frame(names: &[String]) -> FeatureFrame {
-    FeatureFrame::from_array(
-        vec![0i64, 1],
+    neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+        neoethos_data::test_fixtures::canonical_test_timestamps(2),
         names.to_vec(),
-        ndarray::Array2::<f32>::zeros((2, names.len())),
+        ndarray::Array2::<f64>::zeros((2, names.len())),
     )
+    .expect("valid f64 test frame")
 }
 
 /// Rows the batch width is sized against. Only used to ask the hardware what it

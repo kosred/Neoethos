@@ -1,15 +1,15 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 extern crate vector_ta;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use cust::context::CurrentContext;
 use std::time::Duration;
 use vector_ta::cuda::{CudaDeviceSliceF32Ref, CudaRuntime};
 use vector_ta::indicators::dispatch::{
-    compute_cuda, compute_cuda_device, CudaOutputTarget, IndicatorCudaDataRef,
-    IndicatorCudaDeviceDataRef, IndicatorCudaDeviceRequest, IndicatorCudaRequest,
-    IndicatorCudaSeries, ParamKV, ParamValue,
+    CudaOutputTarget, IndicatorCudaDataRef, IndicatorCudaDeviceDataRef, IndicatorCudaDeviceRequest,
+    IndicatorCudaRequest, IndicatorCudaSeries, ParamKV, ParamValue, compute_cuda,
+    compute_cuda_device,
 };
 use vector_ta::utilities::enums::Kernel;
 

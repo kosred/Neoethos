@@ -3,9 +3,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use ndarray::Array2;
+use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame};
+use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
 use neoethos_models::LogisticExpert;
 use neoethos_models::base::ExpertModel;
-use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -71,22 +72,47 @@ impl Drop for TempArtifactRoot {
 }
 
 fn load_contract() -> Result<ModelFrameContract> {
-    serde_json::from_str(include_str!("fixtures/model_frame_contract_v1.json"))
+    serde_json::from_str(include_str!("fixtures/model_frame_contract_v2.json"))
         .context("parse model-frame contract fixture")
 }
 
-fn build_frame(features: &[FeatureColumnContract]) -> Result<DataFrame> {
-    let columns: Vec<Column> = features
+fn build_frame(features: &[FeatureColumnContract]) -> Result<FeatureFrame> {
+    let rows = features
+        .first()
+        .map(|feature| feature.values.len())
+        .unwrap_or_default();
+    let columns = features
         .iter()
-        .map(|feature| Series::new(feature.name.clone().into(), feature.values.clone()).into())
-        .collect();
-    DataFrame::new(columns).context("build deterministic model frame")
+        .map(|feature| {
+            FeatureColumnF64::new(
+                feature.name.clone(),
+                feature.values.clone(),
+                vec![FeatureCellValidity::Valid; rows],
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+        neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+        columns,
+    )
 }
 
-fn probability_bits(probabilities: &Array2<f32>) -> Vec<Vec<u32>> {
+fn single_worker_lease() -> CpuLease {
+    let width = WorkerLimit::new(1).expect("one worker is a valid lease width");
+    CpuPermitBroker::new(width)
+        .acquire(CpuPermitRequest::local(width))
+        .expect("the isolated model-contract broker has one available permit")
+}
+
+fn backend_f32_probability_bits(probabilities: &Array2<f64>) -> Vec<Vec<u32>> {
     probabilities
         .outer_iter()
-        .map(|row| row.iter().copied().map(f32::to_bits).collect())
+        .map(|row| {
+            row.iter()
+                .copied()
+                .map(|value| (value as f32).to_bits())
+                .collect()
+        })
         .collect()
 }
 
@@ -116,10 +142,28 @@ fn peak_rss_kib() -> Option<u64> {
 }
 
 #[test]
-fn current_polars_model_frame_contract_is_deterministic_and_strict() -> Result<()> {
+fn shared_model_base_has_no_polars_compatibility_surface() {
+    let source = include_str!("../src/base.rs");
+    for forbidden in [
+        "polars::",
+        "DataFrame",
+        "Series",
+        "dataframe_to_float32_array",
+        "feature_columns_from_dataframe",
+        "strict_numeric_column_values",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "shared model base still exposes retired Polars compatibility symbol `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn f64_feature_frame_contract_is_deterministic_and_strict() -> Result<()> {
     let fixture = load_contract()?;
     ensure!(
-        fixture.schema == "neoethos.model_frame_contract.v1",
+        fixture.schema == "neoethos.model_frame_contract.v2",
         "unexpected fixture schema {}",
         fixture.schema
     );
@@ -147,23 +191,24 @@ fn current_polars_model_frame_contract_is_deterministic_and_strict() -> Result<(
     }
 
     let frame = build_frame(&fixture.features)?;
-    let labels = Series::new("label".into(), fixture.labels.clone());
+    let labels = fixture.labels.clone();
+    let lease = single_worker_lease();
     let mut first = LogisticExpert::new();
-    first.fit(&frame, &labels)?;
-    let first_probabilities = first.predict_proba(&frame)?;
+    first.fit(&frame, &labels, &lease)?;
+    let first_probabilities = first.predict_proba(&frame, &lease)?;
     assert_eq!(first_probabilities.dim(), (rows, 3));
     for (row_idx, row) in first_probabilities.outer_iter().enumerate() {
         assert!(
             row.iter().all(|value| value.is_finite()),
             "row {row_idx} contains a non-finite probability"
         );
-        let sum: f32 = row.iter().sum();
+        let sum: f64 = row.iter().sum();
         assert!(
             (sum - 1.0).abs() <= 1e-6,
             "row {row_idx} probability sum is {sum}"
         );
     }
-    let first_bits = probability_bits(&first_probabilities);
+    let first_bits = backend_f32_probability_bits(&first_probabilities);
     assert!(
         !fixture.expected_probability_f32_bits.is_empty(),
         "capture deterministic baseline probability bits: {first_bits:?}"
@@ -174,9 +219,9 @@ fn current_polars_model_frame_contract_is_deterministic_and_strict() -> Result<(
     );
 
     let mut second = LogisticExpert::new();
-    second.fit(&frame, &labels)?;
+    second.fit(&frame, &labels, &lease)?;
     assert_eq!(
-        probability_bits(&second.predict_proba(&frame)?),
+        backend_f32_probability_bits(&second.predict_proba(&frame, &lease)?),
         first_bits,
         "same input/config produced different predictions in one process"
     );
@@ -222,7 +267,7 @@ fn current_polars_model_frame_contract_is_deterministic_and_strict() -> Result<(
     let mut loaded = LogisticExpert::new();
     loaded.load(&artifact_path)?;
     assert_eq!(
-        probability_bits(&loaded.predict_proba(&frame)?),
+        backend_f32_probability_bits(&loaded.predict_proba(&frame, &lease)?),
         first_bits,
         "save/load changed deterministic probabilities"
     );
@@ -239,7 +284,7 @@ fn current_polars_model_frame_contract_is_deterministic_and_strict() -> Result<(
         .collect();
     let reordered = build_frame(&reversed_features)?;
     let reorder_error = loaded
-        .predict_proba(&reordered)
+        .predict_proba(&reordered, &lease)
         .expect_err("reordered feature columns must fail closed");
     assert!(
         reorder_error
@@ -248,48 +293,41 @@ fn current_polars_model_frame_contract_is_deterministic_and_strict() -> Result<(
         "unexpected reordered-column error: {reorder_error:#}"
     );
 
-    let mut null_values: Vec<Option<f64>> = fixture.features[0]
-        .values
-        .iter()
-        .copied()
-        .map(Some)
-        .collect();
-    null_values[3] = None;
-    let mut null_columns = Vec::with_capacity(fixture.features.len());
-    null_columns.push(Series::new(fixture.features[0].name.clone().into(), null_values).into());
-    null_columns.extend(
-        fixture.features[1..]
-            .iter()
-            .map(|feature| Series::new(feature.name.clone().into(), feature.values.clone()).into()),
-    );
-    let null_frame = DataFrame::new(null_columns)?;
-    let null_error = LogisticExpert::new()
-        .fit(&null_frame, &labels)
-        .expect_err("null model input must fail closed");
-    assert!(
-        null_error.to_string().contains("contains null at row 3"),
-        "unexpected null error: {null_error:#}"
-    );
-
-    let mut non_finite_features: Vec<FeatureColumnContract> = fixture
+    let mut invalid_columns = fixture
         .features
         .iter()
-        .map(|feature| FeatureColumnContract {
-            name: feature.name.clone(),
-            values: feature.values.clone(),
-            current_f32_bits: feature.current_f32_bits.clone(),
+        .map(|feature| {
+            FeatureColumnF64::new(
+                feature.name.clone(),
+                feature.values.clone(),
+                vec![FeatureCellValidity::Valid; rows],
+            )
         })
-        .collect();
-    non_finite_features[1].values[4] = f64::NAN;
-    let non_finite_frame = build_frame(&non_finite_features)?;
-    let non_finite_error = LogisticExpert::new()
-        .fit(&non_finite_frame, &labels)
-        .expect_err("non-finite model input must fail closed");
+        .collect::<Result<Vec<_>>>()?;
+    invalid_columns[0].invalidate(3, FeatureCellValidity::MissingInput)?;
+    let invalid_frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+        neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+        invalid_columns,
+    )?;
+    let invalid_error = LogisticExpert::new()
+        .fit(&invalid_frame, &labels, &lease)
+        .expect_err("invalid model input must fail closed");
     assert!(
-        non_finite_error
+        invalid_error.to_string().contains("row 3")
+            && invalid_error.to_string().contains("missing_input"),
+        "unexpected invalid-cell error: {invalid_error:#}"
+    );
+
+    let malformed = FeatureColumnF64::new(
+        "bad",
+        vec![0.0, f64::NAN],
+        vec![FeatureCellValidity::Valid; 2],
+    )
+    .expect_err("valid-marked NaN must fail at the shared feature boundary");
+    assert!(
+        malformed
             .to_string()
-            .contains("contains non-finite value NaN at row 4"),
-        "unexpected non-finite error: {non_finite_error:#}"
+            .contains("marked valid with non-finite")
     );
 
     Ok(())
@@ -302,16 +340,17 @@ fn baseline_fixed_logistic_training_metrics() -> Result<()> {
 
     let fixture = load_contract()?;
     let frame = build_frame(&fixture.features)?;
-    let labels = Series::new("label".into(), fixture.labels.clone());
+    let labels = fixture.labels.clone();
     let expected = fixture.expected_probability_f32_bits;
+    let lease = single_worker_lease();
 
     let run_sample = || -> Result<u64> {
         let mut checksum = 0_u64;
         for _ in 0..TRAININGS_PER_SAMPLE {
             let mut model = LogisticExpert::new();
-            model.fit(&frame, &labels)?;
-            let probabilities = model.predict_proba(&frame)?;
-            let bits = probability_bits(&probabilities);
+            model.fit(&frame, &labels, &lease)?;
+            let probabilities = model.predict_proba(&frame, &lease)?;
+            let bits = backend_f32_probability_bits(&probabilities);
             ensure!(bits == expected, "training benchmark changed contract bits");
             checksum = checksum.wrapping_add(
                 bits.iter()
@@ -335,8 +374,8 @@ fn baseline_fixed_logistic_training_metrics() -> Result<()> {
 
     let report = serde_json::json!({
         "schema": "neoethos.task1_model_baseline.v1",
-        "rows": frame.height(),
-        "features": frame.width(),
+        "rows": frame.n_samples(),
+        "features": frame.n_features(),
         "trainings_per_sample": TRAININGS_PER_SAMPLE,
         "warmups": 3,
         "measured_runs": 10,

@@ -1,27 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -59,10 +41,6 @@ pub struct NetMyrsiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct NetMyrsiParams {
     pub period: Option<usize>,
 }
@@ -887,7 +865,6 @@ pub fn net_myrsi_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn net_myrsi_into(input: &NetMyrsiInput, out: &mut [f64]) -> Result<(), NetMyrsiError> {
     let (data, period, first, chosen) = net_myrsi_prepare(input, Kernel::Auto)?;
@@ -1298,338 +1275,11 @@ pub fn net_myrsi_batch(
     results
 }
 
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(name = "net_myrsi")]
-pub fn net_myrsi_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = NetMyrsiParams {
-        period: Some(period),
-    };
-    let input = NetMyrsiInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| net_myrsi_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "net_myrsi_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn net_myrsi_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-
-    let periods =
-        expand_grid_period(period_range).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let combos: Vec<NetMyrsiParams> = periods
-        .into_iter()
-        .map(|p| NetMyrsiParams { period: Some(p) })
-        .collect();
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let len = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [len], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let actual = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-
-        net_myrsi_batch_inner_into(slice_in, &combos, actual, out_slice)
-    })
-    .map_err(|e: NetMyrsiError| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "net_myrsi_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn net_myrsi_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let prices = data_f32.as_slice()?;
-    let sweep = NetMyrsiBatchRange {
-        period: period_range,
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = crate::cuda::CudaNetMyrsi::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.net_myrsi_batch_dev(prices, &sweep)
-            .map(|(inner, _)| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "net_myrsi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn net_myrsi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let flat = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = NetMyrsiParams {
-        period: Some(period),
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = crate::cuda::CudaNetMyrsi::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.net_myrsi_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "NetMyrsiStream")]
-pub struct NetMyrsiStreamPy {
-    stream: NetMyrsiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl NetMyrsiStreamPy {
-    #[new]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let params = NetMyrsiParams {
-            period: Some(period),
-        };
-        let stream =
-            NetMyrsiStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn net_myrsi_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let input = NetMyrsiInput::from_slice(
-        data,
-        NetMyrsiParams {
-            period: Some(period),
-        },
-    );
-    let mut out = vec![f64::NAN; data.len()];
-    net_myrsi_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn net_myrsi_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn net_myrsi_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn net_myrsi_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = NetMyrsiInput::from_slice(
-            data,
-            NetMyrsiParams {
-                period: Some(period),
-            },
-        );
-
-        if in_ptr == out_ptr {
-            let mut tmp = vec![0.0; len];
-            net_myrsi_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            net_myrsi_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NetMyrsiBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NetMyrsiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<NetMyrsiParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = net_myrsi_batch)]
-pub fn net_myrsi_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: NetMyrsiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = NetMyrsiBatchRange {
-        period: cfg.period_range,
-    };
-    let out = net_myrsi_batch_with_kernel(data, &sweep, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&NetMyrsiBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn net_myrsi_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to net_myrsi_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let periods = expand_grid_period((period_start, period_end, period_step))
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let combos: Vec<NetMyrsiParams> = periods
-            .into_iter()
-            .map(|p| NetMyrsiParams { period: Some(p) })
-            .collect();
-        let rows = combos.len();
-        let cols = len;
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        net_myrsi_batch_inner_into(data, &combos, detect_best_kernel(), out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn net_myrsi_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = net_myrsi_js(data, period)?;
-    crate::write_wasm_f64_output("net_myrsi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn net_myrsi_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = net_myrsi_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "net_myrsi_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
@@ -1639,8 +1289,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = NetMyrsiParams { period: None };
         let input = NetMyrsiInput::from_candles(&candles, "close", default_params);
@@ -1652,8 +1302,8 @@ mod tests {
 
     fn check_net_myrsi_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = NetMyrsiInput::from_candles(&candles, "close", NetMyrsiParams::default());
         let result = net_myrsi_with_kernel(&input, kernel)?;
@@ -1681,8 +1331,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = NetMyrsiInput::with_default_candles(&candles);
         match input.data {
@@ -1769,8 +1419,8 @@ mod tests {
 
     fn check_net_myrsi_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = NetMyrsiParams { period: Some(14) };
         let first_input = NetMyrsiInput::from_candles(&candles, "close", first_params);
@@ -1794,8 +1444,8 @@ mod tests {
 
     fn check_net_myrsi_warmup_nans(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first = candles.close.iter().position(|x| !x.is_nan()).unwrap_or(0);
         let p = 14;
         let out = net_myrsi_with_kernel(
@@ -1840,8 +1490,8 @@ mod tests {
     fn check_net_myrsi_streaming(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let period = 14;
 
         let batch = NetMyrsiInput::from_candles(
@@ -1880,8 +1530,8 @@ mod tests {
     fn check_net_myrsi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             NetMyrsiParams::default(),
@@ -2032,8 +1682,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = NetMyrsiBatchBuilder::new()
             .kernel(kernel)
             .period_range(10, 20, 1)
@@ -2047,8 +1697,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = NetMyrsiBatchBuilder::new()
             .kernel(kernel)
             .period_range(10, 20, 5)
@@ -2081,8 +1731,8 @@ mod tests {
 
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = NetMyrsiBatchBuilder::new()
             .kernel(kernel)
             .period_range(10, 20, 5)
@@ -2139,13 +1789,8 @@ mod tests {
 
         let mut out = vec![0.0; data.len()];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             net_myrsi_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            net_myrsi_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());

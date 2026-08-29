@@ -5,7 +5,8 @@ use neoethos_core::storage::json::{
     write_json_with_backup as write_json_artifact_with_backup,
 };
 use neoethos_core::{BackendKind, RuntimeDegradedReason, RuntimeMode};
-use polars::prelude::{DataFrame, DataType, Series};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1035,22 +1036,6 @@ fn swarm_high_volatility(snapshot: &SwarmForecastSnapshot) -> bool {
     snapshot.volatility_ratio >= 1.35
 }
 
-fn is_numeric_dtype(dtype: &DataType) -> bool {
-    matches!(
-        dtype,
-        DataType::Float32
-            | DataType::Float64
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-    )
-}
-
 fn signed_direction(value: f32) -> f32 {
     if value > 1e-6 {
         1.0
@@ -1115,6 +1100,7 @@ fn blend_forecasts(primary: &[f32], secondary: &[f32], primary_weight: f32) -> V
         .collect()
 }
 
+#[cfg(feature = "swarm-forecasting")]
 fn interval_coverage(prediction: &[f32], reference: &[f32], band: f32) -> f32 {
     if prediction.is_empty() || reference.is_empty() {
         return 0.0;
@@ -2958,184 +2944,57 @@ fn build_validation_windows(
     windows
 }
 
-fn is_price_like_column_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    [
-        "close", "open", "high", "low", "price", "mid", "bid", "ask", "last", "hl2", "hlc3",
-        "ohlc4", "typical", "weighted", "wap", "vwap",
-    ]
-    .iter()
-    .any(|needle| name.contains(needle))
-}
+const SWARM_PRICE_COLUMN: &str = "quant_close";
 
-fn label_series_is_class_like(values: &[f32]) -> bool {
-    if values.is_empty() {
-        return true;
-    }
-    let mut unique = values.to_vec();
-    unique.sort_by(|left, right| left.total_cmp(right));
-    unique.dedup_by(|left, right| (*left - *right).abs() < 1e-6);
-    unique.len() <= 4
-        || values.iter().all(|value| {
-            [-1.0_f32, 0.0, 1.0, 2.0]
-                .iter()
-                .any(|class| (*value - *class).abs() < 1e-6)
-        })
-}
+fn exact_training_series_from_frame(frame: &FeatureFrame) -> Result<(Vec<f32>, Vec<f64>)> {
+    anyhow::ensure!(
+        frame.n_samples() >= 32,
+        "swarm forecaster requires at least 32 exact quant_close rows; got {}",
+        frame.n_samples()
+    );
+    let column_index = frame
+        .names
+        .iter()
+        .position(|name| name == SWARM_PRICE_COLUMN)
+        .context("swarm forecaster training requires exact `quant_close`")?;
+    let column = frame.feature_column(column_index)?;
+    anyhow::ensure!(
+        column.len() == frame.timestamps.len(),
+        "swarm quant_close/timestamp mismatch: {} values vs {} timestamps",
+        column.len(),
+        frame.timestamps.len()
+    );
 
-fn extract_continuous_label_series(labels: &Series) -> Result<Option<Vec<f32>>> {
-    let Ok(series) = labels.cast(&DataType::Float64) else {
-        return Ok(None);
-    };
-    let values = series
-        .f64()
-        .context("access swarm label series as Float64")?
-        .into_iter()
+    let values = column
+        .values
+        .iter()
+        .copied()
+        .zip(column.validity.iter().copied())
         .enumerate()
-        .map(|(idx, value)| {
-            let value = value.with_context(|| {
-                format!(
-                    "swarm label series contains null at row {idx}; continuous forecasting labels must be fully materialized"
-                )
-            })?;
-            if !value.is_finite() {
-                bail!(
-                    "swarm label series contains non-finite value {} at row {}",
-                    value,
-                    idx
-                );
-            }
-            Ok(value as f32)
+        .map(|(row, (value, validity))| {
+            anyhow::ensure!(
+                validity.is_valid(),
+                "swarm quant_close row {row} is invalid: {validity:?}"
+            );
+            anyhow::ensure!(
+                value.is_finite() && value > 0.0 && value <= f32::MAX as f64,
+                "swarm f64-to-f32 adapter rejected quant_close row {row}: {value}"
+            );
+            let narrowed = value as f32;
+            anyhow::ensure!(
+                narrowed.is_finite() && narrowed > 0.0,
+                "swarm f64-to-f32 adapter underflowed quant_close row {row}: {value}"
+            );
+            Ok(narrowed)
         })
         .collect::<Result<Vec<_>>>()?;
-    if values.len() < 32 || label_series_is_class_like(&values) || volatility(&values) <= 1e-8 {
-        return Ok(None);
-    }
-    Ok(Some(values))
-}
-
-fn extract_series_from_frame(frame: &DataFrame, labels: &Series) -> Result<Vec<f32>> {
-    let preferred_columns = [
-        "close",
-        "base_close",
-        "mid",
-        "price",
-        "bid",
-        "ask",
-        "last",
-        "target_price",
-        "future_close",
-        "next_close",
-        "close_M1",
-        "close_m1",
-    ];
-
-    for column_name in preferred_columns {
-        if let Ok(column) = frame.column(column_name) {
-            let series = column
-                .cast(&DataType::Float64)
-                .with_context(|| format!("cast swarm source column {column_name} to Float64"))?;
-            let values = series
-                .f64()
-                .context("access swarm source column as Float64")?
-                .into_iter()
-                .enumerate()
-                .map(|(idx, value)| {
-                    let value = value.with_context(|| {
-                        format!(
-                            "swarm source column {column_name} contains null at row {idx}; forecasting requires fully materialized series"
-                        )
-                    })?;
-                    if !value.is_finite() {
-                        bail!(
-                            "swarm source column {column_name} contains non-finite value {} at row {}",
-                            value,
-                            idx
-                        );
-                    }
-                    Ok(value as f32)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if values.len() >= 32 {
-                return Ok(values);
-            }
-        }
-    }
-
-    for column in frame.get_columns() {
-        if preferred_columns.contains(&column.name().as_str()) {
-            continue;
-        }
-        let name = column.name().as_str().to_ascii_lowercase();
-        if name.contains("label") || name.contains("target") || name.contains("signal") {
-            continue;
-        }
-        if !is_price_like_column_name(&name) {
-            continue;
-        }
-        if !is_numeric_dtype(column.dtype()) {
-            continue;
-        }
-        let series = column.cast(&DataType::Float64).with_context(|| {
-            format!(
-                "cast fallback swarm source column {} to Float64",
-                column.name().as_str()
-            )
-        })?;
-        let values = series
-            .f64()
-            .context("access fallback swarm source column as Float64")?
-            .into_iter()
-            .enumerate()
-            .map(|(idx, value)| {
-                let value = value.with_context(|| {
-                    format!(
-                        "fallback swarm source column {} contains null at row {}; forecasting requires fully materialized series",
-                        column.name().as_str(),
-                        idx
-                    )
-                })?;
-                if !value.is_finite() {
-                    bail!(
-                        "fallback swarm source column {} contains non-finite value {} at row {}",
-                        column.name().as_str(),
-                        value,
-                        idx
-                    );
-                }
-                Ok(value as f32)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if values.len() >= 32 {
-            return Ok(values);
-        }
-    }
-
-    if let Some(values) = extract_continuous_label_series(labels)? {
-        return Ok(values);
-    }
-
-    let candidate_numeric_columns = frame
-        .get_columns()
+    let timestamps = frame
+        .timestamps
         .iter()
-        .filter(|column| {
-            let name = column.name().as_str().to_ascii_lowercase();
-            !name.contains("label")
-                && !name.contains("target")
-                && !name.contains("signal")
-                && is_numeric_dtype(column.dtype())
-        })
-        .map(|column| column.name().as_str().to_string())
+        .copied()
+        .map(|timestamp| timestamp as f64)
         .collect::<Vec<_>>();
-
-    bail!(
-        "swarm forecaster could not derive a price-like series from the training frame; price-like columns are required and synthetic row-mean reconstruction is disabled. numeric columns seen: {}",
-        if candidate_numeric_columns.is_empty() {
-            "<none>".to_string()
-        } else {
-            candidate_numeric_columns.join(", ")
-        }
-    )
+    Ok((values, timestamps))
 }
 
 pub struct SwarmForecaster {
@@ -3227,13 +3086,14 @@ impl SwarmForecaster {
 
     pub fn fit_from_frame(
         &mut self,
-        frame: &DataFrame,
-        labels: &Series,
+        frame: &FeatureFrame,
         unique_id: impl Into<String>,
+        lease: &CpuLease,
     ) -> Result<()> {
-        let values = extract_series_from_frame(frame, labels)?;
-        let timestamps = (0..values.len()).map(|idx| idx as f64).collect::<Vec<_>>();
-        self.fit_series(&values, &timestamps, unique_id)
+        lease.scope(|| {
+            let (values, timestamps) = exact_training_series_from_frame(frame)?;
+            self.fit_series(&values, &timestamps, unique_id)
+        })
     }
 
     #[cfg(feature = "swarm-forecasting")]
@@ -3550,6 +3410,8 @@ impl SwarmForecaster {
     pub fn load(&mut self, path: &Path) -> Result<()> {
         let artifact: SwarmForecasterArtifact =
             read_json_artifact(path.join(SWARM_ARTIFACT_FILE_NAME), "swarm forecaster")?;
+        #[cfg(not(feature = "swarm-forecasting"))]
+        let loaded_external_runtime = artifact.runtime_mode == SwarmRuntimeMode::ExternalSwarm;
         let artifact = sanitize_forecaster_artifact(artifact)?;
 
         let SwarmForecasterArtifact {
@@ -3627,7 +3489,7 @@ impl SwarmForecaster {
                     snapshot_rebuild_min_observations(next_state.values.len()),
                 )?);
             }
-            if next_state.fitted && next_state.runtime_mode == SwarmRuntimeMode::ExternalSwarm {
+            if next_state.fitted && loaded_external_runtime {
                 next_state.runtime_mode = SwarmRuntimeMode::LocalFallback;
                 next_state.runtime_degraded_reason =
                     Some("swarm_forecasting_feature_disabled".to_string());

@@ -1,13 +1,13 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::kairi_relative_index::{
-    expand_grid_kairi_relative_index, KairiRelativeIndexBatchRange, KairiRelativeIndexParams,
+    KairiRelativeIndexBatchRange, KairiRelativeIndexParams, expand_grid_kairi_relative_index,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};

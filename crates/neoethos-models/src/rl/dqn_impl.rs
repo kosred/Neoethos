@@ -2,7 +2,8 @@ use anyhow::{Context, Result, bail};
 #[cfg(feature = "reinforcement-learning")]
 use candle_core::{DType, Device, Module};
 use ndarray::Array2;
-use polars::prelude::{DataFrame, Series};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 #[cfg(feature = "reinforcement-learning")]
 use rlkit::network::NeuralNetwork;
 #[cfg(feature = "reinforcement-learning")]
@@ -18,6 +19,10 @@ use crate::base::{
     build_runtime_prediction_with_details, canonical_three_class_label_mapping,
     three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
+use crate::common::{
+    CudaDevicePolicy, ResolvedCudaDevicePolicy, parse_cuda_device_policy,
+    resolve_cuda_device_policy,
+};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{
     CapabilityState, ModelFamily, normalize_training_precision_policy,
@@ -25,9 +30,32 @@ use crate::runtime::capabilities::{
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    FeatureScaler, METADATA_FILE_NAME, feature_matrix_from_dataframe, read_json,
+    FeatureScaler, METADATA_FILE_NAME, feature_matrix_from_frame, read_json,
     remap_three_class_labels, write_json,
 };
+
+fn dqn_backend_f32_matrix(values: &Array2<f64>, context: &str) -> Result<Array2<f32>> {
+    let mut narrowed = Vec::with_capacity(values.len());
+    for ((row, column), value) in values.indexed_iter() {
+        if !value.is_finite() {
+            bail!("{context} contains non-finite value {value} at row {row}, column {column}");
+        }
+        let narrowed_value = *value as f32;
+        if !narrowed_value.is_finite() {
+            bail!(
+                "{context} value {value} at row {row}, column {column} overflows the DQN f32 backend"
+            );
+        }
+        if *value != 0.0 && narrowed_value == 0.0 {
+            bail!(
+                "{context} value {value} at row {row}, column {column} underflows the DQN f32 backend"
+            );
+        }
+        narrowed.push(narrowed_value);
+    }
+    Array2::from_shape_vec(values.raw_dim(), narrowed)
+        .context("shape checked DQN f32 backend matrix")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TradingAction {
@@ -388,6 +416,7 @@ fn is_known_rl_effective_device_policy(value: &str) -> bool {
     normalized == "cpu" || normalized.starts_with("cuda:") || normalized.starts_with("gpu:")
 }
 
+#[cfg(feature = "reinforcement-learning")]
 fn artifact_requested_device_policy(artifact: &TradingRlArtifact) -> String {
     artifact
         .requested_device_policy
@@ -407,6 +436,98 @@ fn artifact_effective_device_policy(artifact: &TradingRlArtifact) -> String {
         .effective_device_policy
         .clone()
         .unwrap_or_else(|| artifact.device_policy.clone())
+}
+
+fn validate_rl_artifact_device_identity(
+    artifact: &TradingRlArtifact,
+) -> Result<(CudaDevicePolicy, ResolvedCudaDevicePolicy)> {
+    let requested_label = artifact
+        .requested_device_policy
+        .as_deref()
+        .context("RL artifact is missing requested_device_policy")?;
+    let requested = parse_cuda_device_policy(requested_label)
+        .with_context(|| format!("validate RL requested CUDA policy `{requested_label}`"))?;
+    let effective_label = artifact
+        .effective_device_policy
+        .as_deref()
+        .context("RL artifact is missing effective_device_policy")?
+        .trim()
+        .to_ascii_lowercase();
+    let recorded = if effective_label == "cpu" {
+        ResolvedCudaDevicePolicy::Cpu
+    } else if let Some(raw_ordinal) = effective_label.strip_prefix("cuda:") {
+        let ordinal = raw_ordinal.parse::<usize>().with_context(|| {
+            format!("RL artifact has invalid effective CUDA device `{effective_label}`")
+        })?;
+        if effective_label != format!("cuda:{ordinal}") {
+            bail!(
+                "RL artifact effective device must be canonical `cuda:<ordinal>`, got `{effective_label}`"
+            );
+        }
+        ResolvedCudaDevicePolicy::Cuda { ordinal }
+    } else {
+        bail!(
+            "RL artifact effective device must be `cpu` or exact `cuda:<ordinal>`, got `{effective_label}`"
+        );
+    };
+    match (requested, recorded) {
+        (CudaDevicePolicy::Cpu, ResolvedCudaDevicePolicy::Cuda { .. }) => {
+            bail!("RL artifact requested CPU but recorded CUDA execution")
+        }
+        (CudaDevicePolicy::Gpu { .. }, ResolvedCudaDevicePolicy::Cpu) => {
+            bail!("RL artifact requested explicit CUDA but recorded CPU execution")
+        }
+        (
+            CudaDevicePolicy::Gpu { ordinal: requested },
+            ResolvedCudaDevicePolicy::Cuda { ordinal: recorded },
+        ) if requested != recorded => {
+            bail!("RL artifact CUDA ordinal mismatch: requested {requested}, recorded {recorded}")
+        }
+        (CudaDevicePolicy::Auto, ResolvedCudaDevicePolicy::Cuda { ordinal: recorded })
+            if recorded != 0 =>
+        {
+            bail!("RL Auto artifact must record CUDA ordinal 0, got {recorded}")
+        }
+        _ => {}
+    }
+    let effective_backend = artifact_effective_backend(artifact);
+    if (effective_backend == "rlkit_cuda")
+        != matches!(recorded, ResolvedCudaDevicePolicy::Cuda { .. })
+    {
+        bail!(
+            "RL artifact effective backend `{effective_backend}` is inconsistent with device `{effective_label}`"
+        );
+    }
+    Ok((requested, recorded))
+}
+
+fn validate_rl_artifact_device_for_load(artifact: &TradingRlArtifact) -> Result<()> {
+    let (requested, recorded) = validate_rl_artifact_device_identity(artifact)?;
+    let requested_label = artifact
+        .requested_device_policy
+        .as_deref()
+        .context("RL artifact is missing requested_device_policy")?;
+    let visible_nvidia_devices = crate::tree_models::config::nvidia_gpu_count();
+    let resolved = resolve_cuda_device_policy(requested_label, visible_nvidia_devices)?;
+    if matches!(resolved, ResolvedCudaDevicePolicy::Cuda { .. })
+        && !cfg!(feature = "reinforcement-learning-cuda")
+    {
+        bail!(
+            "RL artifact resolves CUDA from policy `{requested_label}`, but this build lacks `reinforcement-learning-cuda`"
+        );
+    }
+    let auto_cpu_relocation = matches!(requested, CudaDevicePolicy::Auto)
+        && matches!(recorded, ResolvedCudaDevicePolicy::Cuda { .. })
+        && matches!(resolved, ResolvedCudaDevicePolicy::Cpu)
+        && visible_nvidia_devices == 0;
+    if !auto_cpu_relocation && recorded != resolved {
+        bail!(
+            "RL runtime device drift on load: recorded {:?}, resolved {:?} from policy `{requested_label}`",
+            recorded,
+            resolved
+        );
+    }
+    Ok(())
 }
 
 fn staged_rl_file(path: &Path, file_name: &str) -> PathBuf {
@@ -483,7 +604,7 @@ fn probe_runtime_rl_bf16_support(backend: &str, device_policy: &str) -> Option<b
     }
 
     let ordinal = normalize_rl_device_policy(device_policy)
-        .strip_prefix("cuda:")
+        .strip_prefix("gpu:")
         .and_then(|value| value.parse::<usize>().ok())?;
     Device::new_cuda(ordinal)
         .ok()
@@ -821,6 +942,7 @@ impl FeatureBounds {
         Ok(Self { mins, maxs })
     }
 
+    #[cfg(feature = "reinforcement-learning")]
     fn discretize(&self, values: &[f32], bins: u16) -> Result<Vec<u16>> {
         if values.len() != self.mins.len() {
             bail!(
@@ -882,79 +1004,80 @@ impl FeatureBounds {
 // unconditional artifact-validation helpers; must be available under all
 // feature combinations (no rlkit/candle dependency).
 fn normalize_rl_device_policy(policy: &str) -> String {
-    // RL adds `wgpu:` to the vendor prefix set; unrecognised tokens are
-    // forced to `auto` (strict whitelist semantics specific to RL).
-    let collapsed = crate::common::normalize_vendor_device_policy(policy, &["wgpu"]);
-    if matches!(collapsed.as_str(), "cpu" | "auto" | "gpu") || collapsed.starts_with("gpu:") {
-        collapsed
-    } else {
-        "auto".to_string()
+    match parse_cuda_device_policy(policy) {
+        Ok(CudaDevicePolicy::Auto) => "auto".to_string(),
+        Ok(CudaDevicePolicy::Cpu) => "cpu".to_string(),
+        Ok(CudaDevicePolicy::Gpu { ordinal: 0 }) if !policy.trim().contains(':') => {
+            "gpu".to_string()
+        }
+        Ok(CudaDevicePolicy::Gpu { ordinal }) => format!("gpu:{ordinal}"),
+        Err(_) => policy.trim().to_ascii_lowercase(),
     }
-}
-
-#[cfg(all(
-    feature = "reinforcement-learning",
-    feature = "reinforcement-learning-cuda"
-))]
-fn requested_cuda_ordinal(policy: &str) -> Option<usize> {
-    normalize_rl_device_policy(policy)
-        .strip_prefix("gpu:")
-        .and_then(|value| value.parse::<usize>().ok())
 }
 
 #[cfg(feature = "reinforcement-learning")]
 fn resolve_rl_training_device(policy: &str) -> Result<(Device, String, String)> {
     let normalized = normalize_rl_device_policy(policy);
-    let explicit_gpu = requested_gpu_device_policy(&normalized);
+    let resolved =
+        resolve_cuda_device_policy(&normalized, crate::tree_models::config::nvidia_gpu_count())?;
 
     #[cfg(feature = "reinforcement-learning-cuda")]
     {
-        let ordinal = requested_cuda_ordinal(&normalized).unwrap_or(0);
-        match normalized.as_str() {
-            "cpu" => return Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string())),
-            "auto" => match Device::new_cuda(ordinal) {
-                Ok(device) => {
-                    return Ok((device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string()));
-                }
-                Err(_) => return Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string())),
-            },
-            "gpu" => {
+        match resolved {
+            ResolvedCudaDevicePolicy::Cpu => {
+                Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string()))
+            }
+            ResolvedCudaDevicePolicy::Cuda { ordinal } => {
                 let device = Device::new_cuda(ordinal)
                     .map_err(|err| anyhow::anyhow!("initialize RL CUDA device {ordinal}: {err}"))?;
-                return Ok((device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string()));
+                Ok((device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string()))
             }
-            value if value.starts_with("gpu:") => {
-                let device = Device::new_cuda(ordinal)
-                    .map_err(|err| anyhow::anyhow!("initialize RL CUDA device {ordinal}: {err}"))?;
-                return Ok((device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string()));
-            }
-            _ => {}
         }
     }
 
-    if explicit_gpu {
-        return Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string()));
+    #[cfg(not(feature = "reinforcement-learning-cuda"))]
+    {
+        match resolved {
+            ResolvedCudaDevicePolicy::Cpu => {
+                Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string()))
+            }
+            ResolvedCudaDevicePolicy::Cuda { ordinal } => bail!(
+                "RL CUDA device policy `{policy}` resolved ordinal {ordinal}, but this build has no usable CUDA backend"
+            ),
+        }
     }
-
-    Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string()))
 }
 
 #[cfg(feature = "reinforcement-learning")]
-fn resolve_rl_inference_device(policy: &str) -> (Device, String, String) {
+fn resolve_rl_inference_device(policy: &str) -> Result<(Device, String, String)> {
+    let normalized = normalize_rl_device_policy(policy);
+    let resolved =
+        resolve_cuda_device_policy(&normalized, crate::tree_models::config::nvidia_gpu_count())?;
     #[cfg(feature = "reinforcement-learning-cuda")]
     {
-        let normalized = normalize_rl_device_policy(policy);
-        let ordinal = requested_cuda_ordinal(&normalized).unwrap_or(0);
-        if matches!(normalized.as_str(), "auto" | "gpu") || normalized.starts_with("gpu:") {
-            if let Ok(device) = Device::new_cuda(ordinal) {
-                return (device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string());
+        match resolved {
+            ResolvedCudaDevicePolicy::Cpu => {
+                Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string()))
+            }
+            ResolvedCudaDevicePolicy::Cuda { ordinal } => {
+                let device = Device::new_cuda(ordinal)
+                    .map_err(|err| anyhow::anyhow!("initialize RL CUDA device {ordinal}: {err}"))?;
+                Ok((device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string()))
             }
         }
     }
-    #[cfg(not(feature = "reinforcement-learning-cuda"))]
-    let _ = policy;
 
-    (Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string())
+    #[cfg(not(feature = "reinforcement-learning-cuda"))]
+    {
+        match resolved {
+            ResolvedCudaDevicePolicy::Cpu => {
+                Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string()))
+            }
+            ResolvedCudaDevicePolicy::Cuda { ordinal } => bail!(
+                "RL CUDA device policy `{policy}` resolved ordinal {ordinal}, but this build has no usable CUDA backend"
+            ),
+        }
+    }
 }
 
 fn q_value_for_action(
@@ -1435,6 +1558,9 @@ impl TradingReinforcementLearner {
             bail!("RL training requires at least one transition");
         }
         self.train_args.train_rows = total_transitions;
+        let requested_device_policy = artifact_requested_device_policy(&self.train_args);
+        let (device, effective_policy, effective_backend) =
+            resolve_rl_training_device(&requested_device_policy)?;
         self.train_linear_q_fallback(episodes)?;
         let first_state = self.train_args.state_dim;
         let bounds = self.bounds.as_ref().context("RL feature bounds missing")?;
@@ -1458,8 +1584,6 @@ impl TradingReinforcementLearner {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (device, effective_policy, effective_backend) =
-            resolve_rl_training_device(&self.train_args.device_policy)?;
         let requested_precision = requested_training_precision_policy();
         let (effective_precision, _precision_degraded_reason) =
             resolve_rl_training_precision_with_capability(
@@ -1479,13 +1603,11 @@ impl TradingReinforcementLearner {
             .requested_device_policy
             .get_or_insert_with(|| self.train_args.device_policy.clone());
 
-        // Build → train → snapshot for a given (device, dtype). We attempt the
-        // resolved accelerator first; if rlkit's CUDA backend rejects the run
-        // (e.g. candle's CUDA matmul has no BF16 kernel — the A6000 supports
-        // BF16 in hardware, the *kernel* doesn't), fall back to CPU fp32 so the
-        // DQN still trains. Fail-loud WARN, never a silently-skipped model. The
-        // `self` borrow is confined to this block so the runtime fields below
-        // stay mutable.
+        // Build → train → snapshot on the one resolved device. Once auto or an
+        // explicit policy resolves to CUDA, every accelerator error is
+        // terminal; retrying the same request on CPU would falsify the
+        // persisted execution backend. The `self` borrow is confined to this
+        // block so the runtime fields below stay mutable.
         let (network, effective_backend, effective_policy, effective_precision) = {
             let build_and_train = |device: &Device, dtype: DType| -> Result<NeuralNetwork> {
                 let mut env =
@@ -1525,29 +1647,17 @@ impl TradingReinforcementLearner {
                 Ok(*network)
             };
 
-            match build_and_train(&device, model_dtype) {
-                Ok(network) => (
-                    network,
-                    effective_backend,
-                    effective_policy,
-                    effective_precision,
-                ),
-                Err(gpu_err) if effective_backend != "rlkit_cpu" => {
-                    tracing::warn!(
-                        target: "neoethos_models::rl::dqn",
-                        error = %gpu_err,
-                        "DQN accelerator training failed; retrying on CPU (fp32)"
-                    );
-                    let network = build_and_train(&Device::Cpu, DType::F32)?;
-                    (
-                        network,
-                        "rlkit_cpu".to_string(),
-                        "cpu".to_string(),
-                        "fp32".to_string(),
-                    )
-                }
-                Err(err) => return Err(err),
-            }
+            let network = build_and_train(&device, model_dtype).with_context(|| {
+                format!(
+                    "execute DQN training on {effective_backend} ({effective_policy}, {effective_precision})"
+                )
+            })?;
+            (
+                network,
+                effective_backend,
+                effective_policy,
+                effective_precision,
+            )
         };
 
         self.inference_network = Some(network);
@@ -1582,15 +1692,15 @@ impl TradingReinforcementLearner {
         Ok(())
     }
 
-    pub fn train_on_frame(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        let (features, _) = feature_matrix_from_dataframe(x)?;
-        let feature_columns = x
-            .get_column_names()
-            .iter()
-            .map(|name| name.to_string())
-            .collect::<Vec<_>>();
+    pub fn train_on_frame(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| self.train_on_frame_scoped(x, y))
+    }
+
+    fn train_on_frame_scoped(&mut self, x: &FeatureFrame, y: &[i32]) -> Result<()> {
+        let (features, feature_columns) = feature_matrix_from_frame(x)?;
         let scaler = FeatureScaler::fit(&features)?;
-        let scaled = scaler.transform(&features)?;
+        let scaled_f64 = scaler.transform(&features)?;
+        let scaled = dqn_backend_f32_matrix(&scaled_f64, "scaled DQN training features")?;
         let labels = remap_three_class_labels(y)?;
         let horizon = if self.train_args.reward_horizon > 0 {
             self.train_args.reward_horizon.clamp(2, 128)
@@ -1722,7 +1832,7 @@ impl TradingReinforcementLearner {
             {
                 bail!("RL artifact feature_scaler contains non-finite values");
             }
-            if scaler.stds.iter().any(|value| *value <= f32::EPSILON) {
+            if scaler.stds.iter().any(|value| *value <= f64::EPSILON) {
                 bail!("RL artifact feature_scaler contains non-positive standard deviations");
             }
         }
@@ -1881,7 +1991,7 @@ impl TradingReinforcementLearner {
             );
         }
         if effective_backend == "rlkit_cuda"
-            && !normalize_rl_device_policy(&effective_device_policy).starts_with("cuda:")
+            && !normalize_rl_device_policy(&effective_device_policy).starts_with("gpu:")
         {
             bail!(
                 "RL effective backend {} requires cuda:<ordinal> device policy, got {}",
@@ -2037,6 +2147,7 @@ impl TradingReinforcementLearner {
         if !report.used_network_snapshot && artifact.network_precision.is_some() {
             bail!("RL artifact persists network_precision without a persisted network snapshot");
         }
+        let _ = validate_rl_artifact_device_identity(artifact)?;
         Ok(())
     }
 
@@ -2118,7 +2229,16 @@ impl TradingReinforcementLearner {
         Ok(bounds)
     }
 
-    fn preprocess_runtime_state(&self, state: &[f32]) -> Result<Vec<f32>> {
+    fn preprocess_runtime_state_f64(&self, state: &[f64]) -> Result<Vec<f32>> {
+        if state.len() != self.train_args.state_dim {
+            bail!(
+                "RL runtime state dimension mismatch: expected {}, got {}",
+                self.train_args.state_dim,
+                state.len()
+            );
+        }
+        let features = Array2::from_shape_vec((1, state.len()), state.to_vec())
+            .context("shape typed RL runtime state")?;
         if let Some(scaler) = self.feature_scaler.as_ref() {
             if state.len() != scaler.means.len() || state.len() != scaler.stds.len() {
                 bail!(
@@ -2127,13 +2247,24 @@ impl TradingReinforcementLearner {
                     state.len()
                 );
             }
-            let features = Array2::from_shape_vec((1, state.len()), state.to_vec())
-                .context("shape RL runtime state for scaling")?;
             let scaled = scaler.transform(&features)?;
-            Ok(scaled.row(0).iter().copied().collect())
+            Ok(dqn_backend_f32_matrix(&scaled, "scaled DQN runtime state")?
+                .row(0)
+                .iter()
+                .copied()
+                .collect())
         } else {
-            Ok(state.to_vec())
+            Ok(dqn_backend_f32_matrix(&features, "DQN runtime state")?
+                .row(0)
+                .iter()
+                .copied()
+                .collect())
         }
+    }
+
+    fn preprocess_runtime_state(&self, state: &[f32]) -> Result<Vec<f32>> {
+        let typed_state = state.iter().copied().map(f64::from).collect::<Vec<_>>();
+        self.preprocess_runtime_state_f64(&typed_state)
     }
 
     #[cfg(feature = "reinforcement-learning")]
@@ -2149,9 +2280,14 @@ impl TradingReinforcementLearner {
     #[cfg(feature = "reinforcement-learning")]
     pub fn predict_q_values(&self, state: &[f32]) -> Result<Vec<f32>> {
         self.ensure_runtime_state_ready()?;
+        let scaled = self.preprocess_runtime_state(state)?;
+        self.predict_q_values_preprocessed(&scaled)
+    }
+
+    #[cfg(feature = "reinforcement-learning")]
+    fn predict_q_values_preprocessed(&self, scaled: &[f32]) -> Result<Vec<f32>> {
         if let Some(network) = self.inference_network.as_ref() {
-            let scaled = self.preprocess_runtime_state(state)?;
-            let status = self.discretize_state(&scaled)?;
+            let status = self.discretize_state(scaled)?;
             let tensor = match self.state_encoding {
                 TradingStateEncoding::OneHot => status
                     .to_one_hot_flat(
@@ -2197,8 +2333,7 @@ impl TradingReinforcementLearner {
                 .as_ref()
                 .context("RL fallback bias missing")?;
             let bounds = self.bounds.as_ref().context("RL feature bounds missing")?;
-            let scaled = self.preprocess_runtime_state(state)?;
-            let normalized = bounds.normalize(&scaled)?;
+            let normalized = bounds.normalize(scaled)?;
             let fallback_state = expand_fallback_basis(&normalized, self.train_args.fallback_basis);
             validate_q_values(
                 (0..3)
@@ -2219,6 +2354,12 @@ impl TradingReinforcementLearner {
     #[cfg(not(feature = "reinforcement-learning"))]
     pub fn predict_q_values(&self, state: &[f32]) -> Result<Vec<f32>> {
         self.ensure_runtime_state_ready()?;
+        let scaled = self.preprocess_runtime_state(state)?;
+        self.predict_q_values_preprocessed(&scaled)
+    }
+
+    #[cfg(not(feature = "reinforcement-learning"))]
+    fn predict_q_values_preprocessed(&self, scaled: &[f32]) -> Result<Vec<f32>> {
         let weights = self
             .fallback_weights
             .as_ref()
@@ -2228,8 +2369,7 @@ impl TradingReinforcementLearner {
             .as_ref()
             .context("RL fallback bias missing")?;
         let bounds = self.bounds.as_ref().context("RL feature bounds missing")?;
-        let scaled = self.preprocess_runtime_state(state)?;
-        let normalized = bounds.normalize(&scaled)?;
+        let normalized = bounds.normalize(scaled)?;
         let fallback_state = expand_fallback_basis(&normalized, self.train_args.fallback_basis);
         validate_q_values(
             (0..3)
@@ -2244,6 +2384,12 @@ impl TradingReinforcementLearner {
                 })
                 .collect(),
         )
+    }
+
+    fn predict_q_values_f64(&self, state: &[f64]) -> Result<Vec<f32>> {
+        self.ensure_runtime_state_ready()?;
+        let scaled = self.preprocess_runtime_state_f64(state)?;
+        self.predict_q_values_preprocessed(&scaled)
     }
 
     pub fn select_action(&self, state: &[f32]) -> Result<TradingAction> {
@@ -2262,7 +2408,7 @@ impl TradingReinforcementLearner {
             self.live_runtime_identity();
         let mut reasons = Vec::new();
         let requested_precision = requested_training_precision_policy();
-        let (effective_precision, precision_degraded_reason) =
+        let (_effective_precision, precision_degraded_reason) =
             resolve_rl_training_precision_with_capability(
                 Some(&requested_precision),
                 &effective_backend,
@@ -2282,9 +2428,9 @@ impl TradingReinforcementLearner {
                 .ok()
                 .flatten();
             if let Some(runtime_network_precision) = runtime_network_precision {
-                if runtime_network_precision != effective_precision {
+                if runtime_network_precision != _effective_precision {
                     reasons.push(format!(
-                        "rl_runtime_network_precision_drift({runtime_network_precision}!={effective_precision})"
+                        "rl_runtime_network_precision_drift({runtime_network_precision}!={_effective_precision})"
                     ));
                 }
                 if let Some(persisted_network_precision) = self
@@ -2411,9 +2557,17 @@ impl TradingReinforcementLearner {
         }
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        lease.scope(|| self.predict_runtime_scoped(x))
+    }
+
+    fn predict_runtime_scoped(&self, x: &FeatureFrame) -> Result<Vec<RuntimePrediction>> {
         self.ensure_runtime_state_ready()?;
-        let (features, columns) = feature_matrix_from_dataframe(x)?;
+        let (features, columns) = feature_matrix_from_frame(x)?;
         if !self.feature_columns.is_empty() && self.feature_columns != columns {
             bail!(
                 "RL runtime feature-column mismatch: expected {:?}, got {:?}",
@@ -2426,14 +2580,15 @@ impl TradingReinforcementLearner {
         let mut predictions = Vec::with_capacity(features.nrows());
         for row in features.outer_iter() {
             let state = row.iter().copied().collect::<Vec<_>>();
-            let q_values = self.predict_q_values(&state)?;
+            let q_values = self.predict_q_values_f64(&state)?;
             let probabilities = softmax_q_values(&q_values)?;
-            let (confidence, abstain) = three_class_runtime_confidence(probabilities)?;
+            let probabilities_f64 = probabilities.map(f64::from);
+            let (confidence, abstain) = three_class_runtime_confidence(probabilities_f64)?;
             predictions.push(build_runtime_prediction_with_details(
                 "dqn",
                 ModelFamily::Rl,
                 CapabilityState::Implemented,
-                probabilities,
+                probabilities_f64,
                 Some(confidence),
                 Some(abstain),
                 execution_backend.clone(),
@@ -2570,6 +2725,7 @@ impl TradingReinforcementLearner {
         {
             let mut artifact: TradingRlArtifact = read_json(&path.join("rl_config.json"))?;
             Self::validate_artifact(&artifact)?;
+            validate_rl_artifact_device_for_load(&artifact)?;
             if artifact.feature_columns.is_empty() {
                 artifact.feature_columns = default_rl_feature_columns(artifact.state_dim);
             }
@@ -2587,6 +2743,11 @@ impl TradingReinforcementLearner {
                 .training_report
                 .clone()
                 .context("RL artifact is missing training_report")?;
+            if training_report.used_network_snapshot && !persisted_network_snapshot_present {
+                bail!(
+                    "RL artifact training_report claims a network snapshot but q_network.safetensors is missing"
+                );
+            }
             Ok(Self {
                 inference_network: None,
                 hidden_dims: artifact.hidden_dims.clone(),
@@ -2610,6 +2771,7 @@ impl TradingReinforcementLearner {
         {
             let mut artifact: TradingRlArtifact = read_json(&path.join("rl_config.json"))?;
             Self::validate_artifact(&artifact)?;
+            validate_rl_artifact_device_for_load(&artifact)?;
             if artifact.feature_columns.is_empty() {
                 artifact.feature_columns = default_rl_feature_columns(artifact.state_dim);
             }
@@ -2618,7 +2780,7 @@ impl TradingReinforcementLearner {
             let bounds = Self::bounds_from_artifact(&artifact)?;
             let requested_device_policy = artifact_requested_device_policy(&artifact);
             let (device, effective_policy, effective_backend) =
-                resolve_rl_inference_device(&requested_device_policy);
+                resolve_rl_inference_device(&requested_device_policy)?;
             let network_path = path.join("q_network.safetensors");
             let persisted_network_snapshot_present = network_path.exists();
             let network_precision = if persisted_network_snapshot_present {

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::cwma::{CwmaBatchRange, CwmaParams};
@@ -7,15 +7,15 @@ use cust::context::{CacheConfig, SharedMemoryConfig};
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, Function, GridSize};
 use cust::memory::{
-    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info,
 };
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,7 +26,9 @@ pub enum CudaCwmaError {
     InvalidInput(String),
     #[error("invalid policy: {0}")]
     InvalidPolicy(&'static str),
-    #[error("device out of memory: required={required} bytes, free={free} bytes, headroom={headroom} bytes")]
+    #[error(
+        "device out of memory: required={required} bytes, free={free} bytes, headroom={headroom} bytes"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -120,17 +122,6 @@ impl CudaCwma {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/cwma_kernel.ptx"));
-
-        let mut jit_vec: Vec<ModuleJitOption> = vec![
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
-        if let Ok(v) = std::env::var("CWMA_JIT_MAXREGS") {
-            if let Ok(cap) = v.parse::<u32>() {
-                jit_vec.push(ModuleJitOption::MaxRegisters(cap));
-            }
-        }
         let module = crate::load_cuda_embedded_module!("cwma_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -219,7 +210,7 @@ impl CudaCwma {
         let _ = func.set_shared_memory_config(SharedMemoryConfig::FourByteBankSize);
 
         unsafe {
-            use cust::sys::{cuFuncSetAttribute, CUfunction_attribute_enum as Attr};
+            use cust::sys::{CUfunction_attribute_enum as Attr, cuFuncSetAttribute};
             let raw = func.to_raw();
 
             let _ = cuFuncSetAttribute(

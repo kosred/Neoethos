@@ -1,19 +1,19 @@
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "cuda-build-native"))]
 fn main() {
     eprintln!("profile_yang_zhang_cuda requires --features cuda");
     std::process::exit(1);
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 use std::error::Error;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 use std::time::Instant;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 use vector_ta::cuda::CudaYangZhangVolatility;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 use vector_ta::indicators::yang_zhang_volatility::YangZhangVolatilityBatchRange;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -21,12 +21,12 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 fn env_string(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 fn gen_ohlc(len: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut open = vec![0.0f32; len];
     let mut high = vec![0.0f32; len];
@@ -50,7 +50,7 @@ fn gen_ohlc(len: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     (open, high, low, close)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 fn main() -> Result<(), Box<dyn Error>> {
     let len = env_usize("YZ_LEN", 1_000_000);
     let params = env_usize("YZ_PARAMS", 250);

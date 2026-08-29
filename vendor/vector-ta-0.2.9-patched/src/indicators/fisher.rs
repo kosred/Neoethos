@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -30,18 +14,399 @@ use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaFisher;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
+const FISHER_QNAN_BITS_F64_V2: u64 = 0x7ff8_0000_0000_0000;
+const FISHER_RANGE_FLOOR_F64_V2: f64 = 0.001;
+pub const FISHER_CUDA_F64_MAX_PERIOD_V2: usize = 1024;
+
+// Bounded-faithful audit receipts, not a universal RN or ULP guarantee:
+// FISHER_F64_V2_FIXTURE_MAX_ULP=2
+// FISHER_F64_V2_FIXTURE_MAX_ABS=8.881784197001252e-16
+// FISHER_F64_V2_ADVERSARIAL_MAX_ABS=1.7763568394002505e-15
+// The fixture bound is against a correctly-rounded transform while retaining
+// the established binary64 coefficient/floor schedule: 24,195 primary cells,
+// 1,327 nonzero differences, 28 above one ULP. Exact-real normalization is a
+// separate authority question and is deliberately not claimed by this v2.
+// The frozen 1M-row, six-period host microbenchmark requires the O(N) deque
+// route to beat the former native-log direct scan in aggregate; the design
+// receipt measured 2.32x.
+#[cfg(test)]
+const FISHER_F64_V2_ADVERSARIAL_MAX_ABS: f64 = 1.776_356_839_400_250_5e-15;
+
+// Sun fdlibm/OpenLibm e_log binary64 constants. The operation order below is
+// deliberately literal: it is mirrored with explicit RN intrinsics in CUDA.
+// Immutable authority receipt:
+// commit=82e90aef0657289192efe77be89791c07dea0775
+// source=https://raw.githubusercontent.com/JuliaMath/openlibm/82e90aef0657289192efe77be89791c07dea0775/src/e_log.c
+// license=https://raw.githubusercontent.com/JuliaMath/openlibm/82e90aef0657289192efe77be89791c07dea0775/LICENSE.md
+// sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD
+const FISHER_LOG_TWO54_F64_V2: f64 = 1.801_439_850_948_198_400_00e16;
+const FISHER_LOG_LN2_HI_F64_V2: f64 = 6.931_471_803_691_238_164_90e-1;
+const FISHER_LOG_LN2_LO_F64_V2: f64 = 1.908_214_929_270_587_700_02e-10;
+const FISHER_LOG_LG1_F64_V2: f64 = 6.666_666_666_666_735_130e-1;
+const FISHER_LOG_LG2_F64_V2: f64 = 3.999_999_999_940_941_908e-1;
+const FISHER_LOG_LG3_F64_V2: f64 = 2.857_142_874_366_239_149e-1;
+const FISHER_LOG_LG4_F64_V2: f64 = 2.222_219_843_214_978_396e-1;
+const FISHER_LOG_LG5_F64_V2: f64 = 1.818_357_216_161_805_012e-1;
+const FISHER_LOG_LG6_F64_V2: f64 = 1.531_383_769_920_937_332e-1;
+const FISHER_LOG_LG7_F64_V2: f64 = 1.479_819_860_511_658_591e-1;
+
+#[inline(always)]
+fn fisher_qnan_f64_v2() -> f64 {
+    f64::from_bits(FISHER_QNAN_BITS_F64_V2)
+}
+
+#[inline(always)]
+fn fisher_with_high_word_f64_v2(value: f64, high: u32) -> f64 {
+    f64::from_bits((value.to_bits() & 0x0000_0000_ffff_ffff) | (u64::from(high) << 32))
+}
+
+#[inline(always)]
+fn fisher_log_f64_v2(mut value: f64) -> Option<f64> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+
+    let mut high = (value.to_bits() >> 32) as i32;
+    let low = value.to_bits() as u32;
+    let mut exponent = 0i32;
+    if high < 0x0010_0000 {
+        if (((high as u32) & 0x7fff_ffff) | low) == 0 {
+            return None;
+        }
+        exponent -= 54;
+        value *= FISHER_LOG_TWO54_F64_V2;
+        high = (value.to_bits() >> 32) as i32;
+    }
+    if high >= 0x7ff0_0000 {
+        return None;
+    }
+
+    exponent += (high >> 20) - 1023;
+    high &= 0x000f_ffff;
+    let normalize = (high + 0x0009_5f64) & 0x0010_0000;
+    value = fisher_with_high_word_f64_v2(value, (high | (normalize ^ 0x3ff0_0000)) as u32);
+    exponent += normalize >> 20;
+
+    let fraction = value - 1.0;
+    if (0x000f_ffff & (2 + high)) < 3 {
+        if fraction == 0.0 {
+            if exponent == 0 {
+                return Some(0.0);
+            }
+            let exponent_f64 = f64::from(exponent);
+            return Some(
+                exponent_f64 * FISHER_LOG_LN2_HI_F64_V2 + exponent_f64 * FISHER_LOG_LN2_LO_F64_V2,
+            );
+        }
+        let remainder = fraction * fraction * (0.5 - 0.333_333_333_333_333_33 * fraction);
+        if exponent == 0 {
+            return Some(fraction - remainder);
+        }
+        let exponent_f64 = f64::from(exponent);
+        return Some(
+            exponent_f64 * FISHER_LOG_LN2_HI_F64_V2
+                - ((remainder - exponent_f64 * FISHER_LOG_LN2_LO_F64_V2) - fraction),
+        );
+    }
+
+    let scaled = fraction / (2.0 + fraction);
+    let exponent_f64 = f64::from(exponent);
+    let square = scaled * scaled;
+    let selector = (high - 0x0006_147a) | (0x0006_b851 - high);
+    let fourth = square * square;
+    let even = fourth
+        * (FISHER_LOG_LG2_F64_V2
+            + fourth * (FISHER_LOG_LG4_F64_V2 + fourth * FISHER_LOG_LG6_F64_V2));
+    let odd = square
+        * (FISHER_LOG_LG1_F64_V2
+            + fourth
+                * (FISHER_LOG_LG3_F64_V2
+                    + fourth * (FISHER_LOG_LG5_F64_V2 + fourth * FISHER_LOG_LG7_F64_V2)));
+    let remainder = odd + even;
+    let result = if selector > 0 {
+        let half_square = 0.5 * fraction * fraction;
+        if exponent == 0 {
+            fraction - (half_square - scaled * (half_square + remainder))
+        } else {
+            exponent_f64 * FISHER_LOG_LN2_HI_F64_V2
+                - ((half_square
+                    - (scaled * (half_square + remainder)
+                        + exponent_f64 * FISHER_LOG_LN2_LO_F64_V2))
+                    - fraction)
+        }
+    } else if exponent == 0 {
+        fraction - scaled * (fraction - remainder)
+    } else {
+        exponent_f64 * FISHER_LOG_LN2_HI_F64_V2
+            - ((scaled * (fraction - remainder) - exponent_f64 * FISHER_LOG_LN2_LO_F64_V2)
+                - fraction)
+    };
+    result.is_finite().then_some(result)
+}
+
+#[inline(always)]
+fn fisher_midpoint_f64_v2(high: f64, low: f64) -> Option<f64> {
+    if !high.is_finite() || !low.is_finite() {
+        return None;
+    }
+    let midpoint = 0.5 * (high + low);
+    midpoint.is_finite().then_some(midpoint)
+}
+
+#[inline(always)]
+fn fisher_first_finite_midpoint_v2(high: &[f64], low: &[f64]) -> Option<usize> {
+    high.iter().zip(low).position(|(&high_value, &low_value)| {
+        fisher_midpoint_f64_v2(high_value, low_value).is_some()
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FisherHostAdmissionV2 {
+    data_len: usize,
+    first: usize,
+}
+
+#[inline(always)]
+fn fisher_admit_shape_v2(high: &[f64], low: &[f64]) -> Result<usize, FisherError> {
+    if high.is_empty() || low.is_empty() {
+        return Err(FisherError::EmptyInputData);
+    }
+    if high.len() != low.len() {
+        return Err(FisherError::MismatchedDataLength {
+            high: high.len(),
+            low: low.len(),
+        });
+    }
+    Ok(high.len())
+}
+
+#[inline(always)]
+fn fisher_admit_period_v2(period: usize, data_len: usize) -> Result<(), FisherError> {
+    if period == 0 || period > data_len {
+        return Err(FisherError::InvalidPeriod { period, data_len });
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn fisher_admit_finite_tail_v2(
+    data_len: usize,
+    first: usize,
+    period: usize,
+) -> Result<(), FisherError> {
+    let valid = data_len.saturating_sub(first);
+    if valid < period {
+        return Err(FisherError::NotEnoughValidData {
+            needed: period,
+            valid,
+        });
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn fisher_admit_host_v2(
+    high: &[f64],
+    low: &[f64],
+    period: usize,
+) -> Result<FisherHostAdmissionV2, FisherError> {
+    let data_len = fisher_admit_shape_v2(high, low)?;
+    fisher_admit_period_v2(period, data_len)?;
+    let first = fisher_first_finite_midpoint_v2(high, low).ok_or(FisherError::AllValuesNaN)?;
+    fisher_admit_finite_tail_v2(data_len, first, period)?;
+    Ok(FisherHostAdmissionV2 { data_len, first })
+}
+
+#[inline(always)]
+fn fisher_raw_into_is_admitted_v2(
+    high: &[f64],
+    low: &[f64],
+    period: usize,
+    first: usize,
+    fisher_out: &[f64],
+    signal_out: &[f64],
+) -> bool {
+    let data_len = high.len();
+    !high.is_empty()
+        && low.len() == data_len
+        && fisher_out.len() == data_len
+        && signal_out.len() == data_len
+        && period != 0
+        && first < data_len
+        && period <= data_len - first
+        && period.checked_add(1).is_some()
+}
+
+#[inline(always)]
+fn fisher_stream_period_is_admitted_v2(period: usize) -> bool {
+    period != 0
+        && period
+            .checked_add(1)
+            .and_then(|capacity| capacity.checked_mul(core::mem::size_of::<(f64, usize)>()))
+            .is_some_and(|bytes| bytes <= isize::MAX as usize)
+}
+
+#[inline(always)]
+fn reset_finite_segment_v2(
+    min_queue: &mut VecDeque<(f64, usize)>,
+    max_queue: &mut VecDeque<(f64, usize)>,
+    finite_bars: &mut usize,
+    value1: &mut f64,
+    previous_fisher: &mut f64,
+) {
+    min_queue.clear();
+    max_queue.clear();
+    *finite_bars = 0;
+    *value1 = 0.0;
+    *previous_fisher = 0.0;
+}
+
+#[inline(always)]
+fn fisher_admit_midpoint_v2(
+    min_queue: &mut VecDeque<(f64, usize)>,
+    max_queue: &mut VecDeque<(f64, usize)>,
+    index: usize,
+    midpoint: f64,
+    period: usize,
+) {
+    while let Some(&(last, _)) = min_queue.back() {
+        if last >= midpoint {
+            min_queue.pop_back();
+        } else {
+            break;
+        }
+    }
+    min_queue.push_back((midpoint, index));
+
+    while let Some(&(last, _)) = max_queue.back() {
+        if last <= midpoint {
+            max_queue.pop_back();
+        } else {
+            break;
+        }
+    }
+    max_queue.push_back((midpoint, index));
+
+    let start = index.saturating_add(1).saturating_sub(period);
+    while min_queue.front().is_some_and(|&(_, queued)| queued < start) {
+        min_queue.pop_front();
+    }
+    while max_queue.front().is_some_and(|&(_, queued)| queued < start) {
+        max_queue.pop_front();
+    }
+}
+
+#[inline(always)]
+fn fisher_transition_f64_v2(
+    midpoint: f64,
+    minimum: f64,
+    maximum: f64,
+    value1: &mut f64,
+    previous_fisher: &mut f64,
+) -> Option<(f64, f64)> {
+    let range_delta = maximum - minimum;
+    if !range_delta.is_finite() {
+        return None;
+    }
+    let range = range_delta.max(FISHER_RANGE_FLOOR_F64_V2);
+    let normalized = (midpoint - minimum) / range - 0.5;
+    let weighted = 0.66 * normalized;
+    if !normalized.is_finite() || !weighted.is_finite() {
+        return None;
+    }
+
+    let mut next_value1 = 0.67f64.mul_add(*value1, weighted);
+    if !next_value1.is_finite() {
+        return None;
+    }
+    if next_value1 > 0.99 {
+        next_value1 = 0.999;
+    } else if next_value1 < -0.99 {
+        next_value1 = -0.999;
+    }
+
+    let numerator = 1.0 + next_value1;
+    let denominator = 1.0 - next_value1;
+    let ratio = numerator / denominator;
+    let logarithm = fisher_log_f64_v2(ratio)?;
+    let signal = *previous_fisher;
+    let next_fisher = 0.5f64.mul_add(logarithm, 0.5 * signal);
+    if !next_fisher.is_finite() {
+        return None;
+    }
+
+    *value1 = next_value1;
+    *previous_fisher = next_fisher;
+    Some((next_fisher, signal))
+}
+
+#[inline]
+fn fisher_f64_into_v2(
+    high: &[f64],
+    low: &[f64],
+    period: usize,
+    first: usize,
+    fisher_out: &mut [f64],
+    signal_out: &mut [f64],
+) {
+    if !fisher_raw_into_is_admitted_v2(high, low, period, first, fisher_out, signal_out) {
+        return;
+    }
+    let len = high.len();
+    fisher_out.fill(fisher_qnan_f64_v2());
+    signal_out.fill(fisher_qnan_f64_v2());
+
+    let mut min_queue = VecDeque::with_capacity(period + 1);
+    let mut max_queue = VecDeque::with_capacity(period + 1);
+    let mut finite_bars = 0usize;
+    let mut previous_fisher = 0.0f64;
+    let mut value1 = 0.0f64;
+
+    for index in first..len {
+        let Some(midpoint) = fisher_midpoint_f64_v2(high[index], low[index]) else {
+            reset_finite_segment_v2(
+                &mut min_queue,
+                &mut max_queue,
+                &mut finite_bars,
+                &mut value1,
+                &mut previous_fisher,
+            );
+            continue;
+        };
+        fisher_admit_midpoint_v2(&mut min_queue, &mut max_queue, index, midpoint, period);
+        finite_bars = finite_bars.saturating_add(1).min(period);
+        if finite_bars < period {
+            continue;
+        }
+
+        let minimum = min_queue
+            .front()
+            .map(|&(value, _)| value)
+            .unwrap_or(midpoint);
+        let maximum = max_queue
+            .front()
+            .map(|&(value, _)| value)
+            .unwrap_or(midpoint);
+        if let Some((fisher, signal)) = fisher_transition_f64_v2(
+            midpoint,
+            minimum,
+            maximum,
+            &mut value1,
+            &mut previous_fisher,
+        ) {
+            fisher_out[index] = fisher;
+            signal_out[index] = signal;
+        } else {
+            reset_finite_segment_v2(
+                &mut min_queue,
+                &mut max_queue,
+                &mut finite_bars,
+                &mut value1,
+                &mut previous_fisher,
+            );
+        }
+    }
+}
 
 impl<'a> FisherInput<'a> {
     #[inline(always)]
@@ -66,10 +431,6 @@ pub struct FisherOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct FisherParams {
     pub period: Option<usize>,
 }
@@ -217,38 +578,8 @@ pub fn fisher_with_kernel(
     kernel: Kernel,
 ) -> Result<FisherOutput, FisherError> {
     let (high, low) = input.get_high_low();
-
-    if high.is_empty() || low.is_empty() {
-        return Err(FisherError::EmptyInputData);
-    }
-    if high.len() != low.len() {
-        return Err(FisherError::MismatchedDataLength {
-            high: high.len(),
-            low: low.len(),
-        });
-    }
-
     let period = input.get_period();
-    let data_len = high.len();
-    if period == 0 || period > data_len {
-        return Err(FisherError::InvalidPeriod { period, data_len });
-    }
-
-    let mut first = None;
-    for i in 0..data_len {
-        if !high[i].is_nan() && !low[i].is_nan() {
-            first = Some(i);
-            break;
-        }
-    }
-    let first = first.ok_or(FisherError::AllValuesNaN)?;
-
-    if (data_len - first) < period {
-        return Err(FisherError::NotEnoughValidData {
-            needed: period,
-            valid: data_len - first,
-        });
-    }
+    let FisherHostAdmissionV2 { data_len, first } = fisher_admit_host_v2(high, low, period)?;
 
     let chosen = match kernel {
         Kernel::Auto => Kernel::Scalar,
@@ -286,7 +617,6 @@ pub fn fisher_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn fisher_into(
     input: &FisherInput,
@@ -305,112 +635,7 @@ pub fn fisher_scalar_into(
     fisher_out: &mut [f64],
     signal_out: &mut [f64],
 ) {
-    let len = high.len().min(low.len());
-    if period == 0 || first >= len {
-        return;
-    }
-    if period == 9 {
-        fisher_scalar_period9_into(high, low, first, fisher_out, signal_out);
-        return;
-    }
-
-    let mut prev_fish = 0.0f64;
-    let mut val1 = 0.0f64;
-    let warm = first + period - 1;
-
-    for i in warm..len {
-        let start = i + 1 - period;
-
-        let (mut min_val, mut max_val) = (f64::MAX, f64::MIN);
-        for j in start..=i {
-            let midpoint = 0.5 * (high[j] + low[j]);
-            if midpoint > max_val {
-                max_val = midpoint;
-            }
-            if midpoint < min_val {
-                min_val = midpoint;
-            }
-        }
-
-        let range = (max_val - min_val).max(0.001);
-        let hl = 0.5 * (high[i] + low[i]);
-        val1 = 0.67f64.mul_add(val1, 0.66 * ((hl - min_val) / range - 0.5));
-        if val1 > 0.99 {
-            val1 = 0.999;
-        } else if val1 < -0.99 {
-            val1 = -0.999;
-        }
-        signal_out[i] = prev_fish;
-        let new_fish = 0.5f64.mul_add(((1.0 + val1) / (1.0 - val1)).ln(), 0.5 * prev_fish);
-        fisher_out[i] = new_fish;
-        prev_fish = new_fish;
-    }
-}
-
-#[inline(always)]
-fn fisher_update_min_max(midpoint: f64, min_val: &mut f64, max_val: &mut f64) {
-    if midpoint > *max_val {
-        *max_val = midpoint;
-    }
-    if midpoint < *min_val {
-        *min_val = midpoint;
-    }
-}
-
-#[inline(always)]
-fn fisher_scalar_period9_into(
-    high: &[f64],
-    low: &[f64],
-    first: usize,
-    fisher_out: &mut [f64],
-    signal_out: &mut [f64],
-) {
-    let len = high.len().min(low.len());
-    if first >= len {
-        return;
-    }
-
-    let mut prev_fish = 0.0f64;
-    let mut val1 = 0.0f64;
-    let warm = first + 8;
-
-    for i in warm..len {
-        let start = i - 8;
-        let mut min_val = f64::MAX;
-        let mut max_val = f64::MIN;
-
-        let midpoint = 0.5 * (high[start] + low[start]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-        let midpoint = 0.5 * (high[start + 1] + low[start + 1]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-        let midpoint = 0.5 * (high[start + 2] + low[start + 2]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-        let midpoint = 0.5 * (high[start + 3] + low[start + 3]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-        let midpoint = 0.5 * (high[start + 4] + low[start + 4]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-        let midpoint = 0.5 * (high[start + 5] + low[start + 5]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-        let midpoint = 0.5 * (high[start + 6] + low[start + 6]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-        let midpoint = 0.5 * (high[start + 7] + low[start + 7]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-        let midpoint = 0.5 * (high[start + 8] + low[start + 8]);
-        fisher_update_min_max(midpoint, &mut min_val, &mut max_val);
-
-        let range = (max_val - min_val).max(0.001);
-        let hl = 0.5 * (high[i] + low[i]);
-        val1 = 0.67f64.mul_add(val1, 0.66 * ((hl - min_val) / range - 0.5));
-        if val1 > 0.99 {
-            val1 = 0.999;
-        } else if val1 < -0.99 {
-            val1 = -0.999;
-        }
-        signal_out[i] = prev_fish;
-        let new_fish = 0.5f64.mul_add(((1.0 + val1) / (1.0 - val1)).ln(), 0.5 * prev_fish);
-        fisher_out[i] = new_fish;
-        prev_fish = new_fish;
-    }
+    fisher_f64_into_v2(high, low, period, first, fisher_out, signal_out);
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -447,31 +672,8 @@ pub fn fisher_into_slice(
     kern: Kernel,
 ) -> Result<(), FisherError> {
     let (high, low) = input.as_ref();
-    if high.is_empty() || low.is_empty() {
-        return Err(FisherError::EmptyData);
-    }
-    if high.len() != low.len() {
-        return Err(FisherError::MismatchedDataLength {
-            high: high.len(),
-            low: low.len(),
-        });
-    }
-
-    let data_len = high.len();
     let period = input.params.period.unwrap_or(9);
-
-    let mut first = None;
-    for i in 0..data_len {
-        if !high[i].is_nan() && !low[i].is_nan() {
-            first = Some(i);
-            break;
-        }
-    }
-    let first = first.ok_or(FisherError::AllValuesNaN)?;
-
-    if period == 0 || period > data_len {
-        return Err(FisherError::InvalidPeriod { period, data_len });
-    }
+    let FisherHostAdmissionV2 { data_len, first } = fisher_admit_host_v2(high, low, period)?;
     if fisher_dst.len() != data_len || signal_dst.len() != data_len {
         return Err(FisherError::OutputLengthMismatch {
             expected: data_len,
@@ -502,12 +704,6 @@ pub fn fisher_into_slice(
             fisher_avx512_into(high, low, period, first, fisher_dst, signal_dst)
         }
         _ => unreachable!(),
-    }
-
-    let warmup_end = first + period - 1;
-    for i in 0..warmup_end {
-        fisher_dst[i] = f64::NAN;
-        signal_dst[i] = f64::NAN;
     }
 
     Ok(())
@@ -619,51 +815,90 @@ impl FisherBatchOutput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FisherGridShapeV2 {
+    count: usize,
+    max_period: usize,
+}
+
 #[inline(always)]
-fn expand_grid(r: &FisherBatchRange) -> Vec<FisherParams> {
-    fn axis_usize((start, end, step): (usize, usize, usize)) -> Vec<usize> {
-        if step == 0 || start == end {
-            return vec![start];
+fn fisher_grid_shape_v2(
+    r: &FisherBatchRange,
+    max_count: usize,
+) -> Result<FisherGridShapeV2, FisherError> {
+    let (start, end, step) = r.period;
+    let invalid_range = || FisherError::InvalidRange { start, end, step };
+
+    if step == 0 || start == end {
+        if start == 0 {
+            return Err(FisherError::InvalidPeriod {
+                period: 0,
+                data_len: max_count,
+            });
         }
-        let mut out = Vec::new();
-        if start < end {
-            if step == 0 {
-                return vec![start];
-            }
-            let mut v = start;
-            while v <= end {
-                out.push(v);
-                match v.checked_add(step) {
-                    Some(n) => v = n,
-                    None => break,
-                }
-            }
+        if max_count == 0 {
+            return Err(invalid_range());
+        }
+        return Ok(FisherGridShapeV2 {
+            count: 1,
+            max_period: start,
+        });
+    }
+
+    let distance = if start < end {
+        end - start
+    } else {
+        start - end
+    };
+    let count = (distance / step).checked_add(1).ok_or_else(invalid_range)?;
+    if count == 0 || count > max_count {
+        return Err(invalid_range());
+    }
+    let steps = count - 1;
+    let traversed = steps.checked_mul(step).ok_or_else(invalid_range)?;
+    let last = if start < end {
+        start.checked_add(traversed).ok_or_else(invalid_range)?
+    } else {
+        start.checked_sub(traversed).ok_or_else(invalid_range)?
+    };
+    if start == 0 || last == 0 {
+        return Err(FisherError::InvalidPeriod {
+            period: 0,
+            data_len: max_count,
+        });
+    }
+
+    Ok(FisherGridShapeV2 {
+        count,
+        max_period: start.max(last),
+    })
+}
+
+#[inline(always)]
+fn expand_grid_checked_v2(
+    r: &FisherBatchRange,
+    shape: FisherGridShapeV2,
+) -> Result<Vec<FisherParams>, FisherError> {
+    let (start, end, step) = r.period;
+    let invalid_range = || FisherError::InvalidRange { start, end, step };
+    let mut out = Vec::new();
+    out.try_reserve_exact(shape.count)
+        .map_err(|_| invalid_range())?;
+    let mut period = start;
+    for index in 0..shape.count {
+        out.push(FisherParams {
+            period: Some(period),
+        });
+        if index + 1 == shape.count {
+            break;
+        }
+        period = if start < end {
+            period.checked_add(step).ok_or_else(invalid_range)?
         } else {
-            if step == 0 {
-                return vec![start];
-            }
-            let mut v = start;
-            while v >= end {
-                out.push(v);
-                if v < end + step {
-                    break;
-                }
-                v -= step;
-                if v == 0 && end > 0 && step > 0 {
-                    if v < end {
-                        break;
-                    }
-                }
-            }
-        }
-        out
+            period.checked_sub(step).ok_or_else(invalid_range)?
+        };
     }
-    let periods = axis_usize(r.period);
-    let mut out = Vec::with_capacity(periods.len());
-    for &p in &periods {
-        out.push(FisherParams { period: Some(p) });
-    }
-    out
+    Ok(out)
 }
 
 #[inline(always)]
@@ -693,38 +928,16 @@ fn fisher_batch_inner(
     kern: Kernel,
     parallel: bool,
 ) -> Result<FisherBatchOutput, FisherError> {
-    let combos = expand_grid(sweep);
-    if combos.is_empty() {
-        let (s, e, st) = sweep.period;
-        return Err(FisherError::InvalidRange {
-            start: s,
-            end: e,
-            step: st,
-        });
-    }
-
-    let data_len = high.len().min(low.len());
-
-    let mut first = None;
-    for i in 0..data_len {
-        if !high[i].is_nan() && !low[i].is_nan() {
-            first = Some(i);
-            break;
-        }
-    }
-    let first = first.ok_or(FisherError::AllValuesNaN)?;
-
-    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
-    if data_len - first < max_p {
-        return Err(FisherError::NotEnoughValidData {
-            needed: max_p,
-            valid: data_len - first,
-        });
-    }
+    let data_len = fisher_admit_shape_v2(high, low)?;
+    let grid = fisher_grid_shape_v2(sweep, data_len)?;
+    fisher_admit_period_v2(grid.max_period, data_len)?;
+    let first = fisher_first_finite_midpoint_v2(high, low).ok_or(FisherError::AllValuesNaN)?;
+    fisher_admit_finite_tail_v2(data_len, first, grid.max_period)?;
+    let combos = expand_grid_checked_v2(sweep, grid)?;
     let rows = combos.len();
     let cols = data_len;
 
-    let _ = rows.checked_mul(cols).ok_or(FisherError::InvalidRange {
+    let _cell_count = rows.checked_mul(cols).ok_or(FisherError::InvalidRange {
         start: sweep.period.0,
         end: sweep.period.1,
         step: sweep.period.2,
@@ -759,28 +972,10 @@ fn fisher_batch_inner(
         core::slice::from_raw_parts_mut(signal_guard.as_mut_ptr() as *mut f64, signal_guard.len())
     };
 
-    let hl: Vec<f64> = (0..data_len).map(|i| 0.5 * (high[i] + low[i])).collect();
-
     let do_row = |row: usize, out_fish: &mut [f64], out_signal: &mut [f64]| {
         let period = combos[row].period.unwrap();
-        match kern {
-            Kernel::Scalar | Kernel::ScalarBatch => {
-                fisher_row_scalar_from_hl(&hl, first, period, out_fish, out_signal)
-            }
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2 | Kernel::Avx2Batch => {
-                fisher_row_avx2_direct(high, low, first, period, out_fish, out_signal)
-            }
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512 | Kernel::Avx512Batch => {
-                fisher_row_avx512_direct(high, low, first, period, out_fish, out_signal)
-            }
-            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
-                fisher_row_scalar_direct(high, low, first, period, out_fish, out_signal)
-            }
-            Kernel::Auto => fisher_row_scalar_from_hl(&hl, first, period, out_fish, out_signal),
-        }
+        let _route_label = kern;
+        fisher_f64_into_v2(high, low, period, first, out_fish, out_signal);
     };
 
     if parallel {
@@ -850,50 +1045,25 @@ fn fisher_batch_inner_into(
     fisher_out: &mut [f64],
     signal_out: &mut [f64],
 ) -> Result<Vec<FisherParams>, FisherError> {
-    let combos = expand_grid(sweep);
-    if combos.is_empty() {
-        let (s, e, st) = sweep.period;
-        return Err(FisherError::InvalidRange {
-            start: s,
-            end: e,
-            step: st,
-        });
-    }
-
-    let data_len = high.len().min(low.len());
-
-    let mut first = None;
-    for i in 0..data_len {
-        if !high[i].is_nan() && !low[i].is_nan() {
-            first = Some(i);
-            break;
-        }
-    }
-    let first = first.ok_or(FisherError::AllValuesNaN)?;
-
-    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
-    let _ = combos
-        .len()
-        .checked_mul(max_p)
-        .ok_or(FisherError::InvalidRange {
-            start: sweep.period.0,
-            end: sweep.period.1,
-            step: sweep.period.2,
-        })?;
-    if data_len - first < max_p {
-        return Err(FisherError::NotEnoughValidData {
-            needed: max_p,
-            valid: data_len - first,
-        });
-    }
-
-    let rows = combos.len();
+    let data_len = fisher_admit_shape_v2(high, low)?;
+    let grid = fisher_grid_shape_v2(sweep, data_len)?;
+    fisher_admit_period_v2(grid.max_period, data_len)?;
+    let first = fisher_first_finite_midpoint_v2(high, low).ok_or(FisherError::AllValuesNaN)?;
+    fisher_admit_finite_tail_v2(data_len, first, grid.max_period)?;
+    let rows = grid.count;
     let cols = data_len;
-    let _ = rows.checked_mul(cols).ok_or(FisherError::InvalidRange {
+    let expected = rows.checked_mul(cols).ok_or(FisherError::InvalidRange {
         start: sweep.period.0,
         end: sweep.period.1,
         step: sweep.period.2,
     })?;
+    if fisher_out.len() != expected || signal_out.len() != expected {
+        return Err(FisherError::OutputLengthMismatch {
+            expected,
+            got: fisher_out.len().min(signal_out.len()),
+        });
+    }
+    let combos = expand_grid_checked_v2(sweep, grid)?;
 
     for (row, combo) in combos.iter().enumerate() {
         let p = combo.period.unwrap_or(0);
@@ -911,28 +1081,10 @@ fn fisher_batch_inner_into(
         }
     }
 
-    let hl: Vec<f64> = (0..data_len).map(|i| 0.5 * (high[i] + low[i])).collect();
-
     let do_row = |row: usize, out_fish: &mut [f64], out_signal: &mut [f64]| {
         let period = combos[row].period.unwrap();
-        match kern {
-            Kernel::Scalar | Kernel::ScalarBatch => {
-                fisher_row_scalar_from_hl(&hl, first, period, out_fish, out_signal)
-            }
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2 | Kernel::Avx2Batch => {
-                fisher_row_avx2_direct(high, low, first, period, out_fish, out_signal)
-            }
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512 | Kernel::Avx512Batch => {
-                fisher_row_avx512_direct(high, low, first, period, out_fish, out_signal)
-            }
-            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-            Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {
-                fisher_row_scalar_direct(high, low, first, period, out_fish, out_signal)
-            }
-            Kernel::Auto => fisher_row_scalar_from_hl(&hl, first, period, out_fish, out_signal),
-        }
+        let _route_label = kern;
+        fisher_f64_into_v2(high, low, period, first, out_fish, out_signal);
     };
 
     if parallel {
@@ -968,98 +1120,6 @@ fn fisher_batch_inner_into(
     Ok(combos)
 }
 
-#[inline(always)]
-fn fisher_row_scalar_direct(
-    high: &[f64],
-    low: &[f64],
-    first: usize,
-    period: usize,
-    out_fish: &mut [f64],
-    out_signal: &mut [f64],
-) {
-    let len = high.len().min(low.len());
-    if period == 0 || first >= len {
-        return;
-    }
-
-    let mut prev_fish = 0.0f64;
-    let mut val1 = 0.0f64;
-
-    let warm = first + period - 1;
-
-    for i in warm..len {
-        let start = i + 1 - period;
-
-        let (mut min_val, mut max_val) = (f64::MAX, f64::MIN);
-        for j in start..=i {
-            let midpoint = 0.5 * (high[j] + low[j]);
-            if midpoint > max_val {
-                max_val = midpoint;
-            }
-            if midpoint < min_val {
-                min_val = midpoint;
-            }
-        }
-
-        let range = (max_val - min_val).max(0.001);
-        let hl = 0.5 * (high[i] + low[i]);
-        val1 = 0.67 * val1 + 0.66 * ((hl - min_val) / range - 0.5);
-        if val1 > 0.99 {
-            val1 = 0.999;
-        } else if val1 < -0.99 {
-            val1 = -0.999;
-        }
-        out_signal[i] = prev_fish;
-        let new_fish = 0.5 * ((1.0 + val1) / (1.0 - val1)).ln() + 0.5 * prev_fish;
-        out_fish[i] = new_fish;
-        prev_fish = new_fish;
-    }
-}
-
-#[inline(always)]
-fn fisher_row_scalar_from_hl(
-    hl: &[f64],
-    first: usize,
-    period: usize,
-    out_fish: &mut [f64],
-    out_signal: &mut [f64],
-) {
-    let len = hl.len();
-    if period == 0 || first >= len {
-        return;
-    }
-
-    let mut prev_fish = 0.0f64;
-    let mut val1 = 0.0f64;
-    let warm = first + period - 1;
-
-    for i in warm..len {
-        let start = i + 1 - period;
-        let (mut min_val, mut max_val) = (f64::MAX, f64::MIN);
-        for &v in &hl[start..=i] {
-            if v > max_val {
-                max_val = v;
-            }
-            if v < min_val {
-                min_val = v;
-            }
-        }
-
-        let range = (max_val - min_val).max(0.001);
-        let v = hl[i];
-        val1 = 0.67f64.mul_add(val1, 0.66 * ((v - min_val) / range - 0.5));
-        if val1 > 0.99 {
-            val1 = 0.999;
-        } else if val1 < -0.99 {
-            val1 = -0.999;
-        }
-        out_signal[i] = prev_fish;
-        let new_fish = 0.5f64.mul_add(((1.0 + val1) / (1.0 - val1)).ln(), 0.5 * prev_fish);
-        out_fish[i] = new_fish;
-        prev_fish = new_fish;
-    }
-}
-
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 #[inline]
 pub fn fisher_row_avx2_direct(
@@ -1070,7 +1130,7 @@ pub fn fisher_row_avx2_direct(
     out_fish: &mut [f64],
     out_signal: &mut [f64],
 ) {
-    fisher_row_scalar_direct(high, low, first, period, out_fish, out_signal)
+    fisher_f64_into_v2(high, low, period, first, out_fish, out_signal)
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -1083,7 +1143,7 @@ pub fn fisher_row_avx512_direct(
     out_fish: &mut [f64],
     out_signal: &mut [f64],
 ) {
-    fisher_row_scalar_direct(high, low, first, period, out_fish, out_signal)
+    fisher_f64_into_v2(high, low, period, first, out_fish, out_signal)
 }
 
 #[derive(Debug, Clone)]
@@ -1091,7 +1151,7 @@ pub struct FisherStream {
     period: usize,
 
     idx: usize,
-    filled: bool,
+    finite_bars: usize,
 
     minq: VecDeque<(f64, usize)>,
     maxq: VecDeque<(f64, usize)>,
@@ -1102,7 +1162,7 @@ pub struct FisherStream {
 impl FisherStream {
     pub fn try_new(params: FisherParams) -> Result<Self, FisherError> {
         let period = params.period.unwrap_or(9);
-        if period == 0 {
+        if !fisher_stream_period_is_admitted_v2(period) {
             return Err(FisherError::InvalidPeriod {
                 period,
                 data_len: 0,
@@ -1111,9 +1171,9 @@ impl FisherStream {
         Ok(Self {
             period,
             idx: 0,
-            filled: false,
-            minq: VecDeque::with_capacity(period + 1),
-            maxq: VecDeque::with_capacity(period + 1),
+            finite_bars: 0,
+            minq: VecDeque::new(),
+            maxq: VecDeque::new(),
             prev_fish: 0.0,
             val1: 0.0,
         })
@@ -1121,113 +1181,75 @@ impl FisherStream {
 
     #[inline(always)]
     pub fn update(&mut self, high: f64, low: f64) -> Option<(f64, f64)> {
-        let v = 0.5 * (high + low);
-        let k = self.idx;
-
-        while let Some(&(last_v, _)) = self.minq.back() {
-            if last_v >= v {
-                self.minq.pop_back();
-            } else {
-                break;
-            }
+        let index = self.idx;
+        self.idx = self.idx.saturating_add(1);
+        if !high.is_finite() || !low.is_finite() {
+            reset_finite_segment_v2(
+                &mut self.minq,
+                &mut self.maxq,
+                &mut self.finite_bars,
+                &mut self.val1,
+                &mut self.prev_fish,
+            );
+            return None;
         }
-        self.minq.push_back((v, k));
+        let Some(midpoint) = fisher_midpoint_f64_v2(high, low) else {
+            reset_finite_segment_v2(
+                &mut self.minq,
+                &mut self.maxq,
+                &mut self.finite_bars,
+                &mut self.val1,
+                &mut self.prev_fish,
+            );
+            return None;
+        };
 
-        while let Some(&(last_v, _)) = self.maxq.back() {
-            if last_v <= v {
-                self.maxq.pop_back();
-            } else {
-                break;
-            }
-        }
-        self.maxq.push_back((v, k));
-
-        let start = k.saturating_sub(self.period - 1);
-        while let Some(&(_, i)) = self.minq.front() {
-            if i < start {
-                self.minq.pop_front();
-            } else {
-                break;
-            }
-        }
-        while let Some(&(_, i)) = self.maxq.front() {
-            if i < start {
-                self.maxq.pop_front();
-            } else {
-                break;
-            }
+        fisher_admit_midpoint_v2(&mut self.minq, &mut self.maxq, index, midpoint, self.period);
+        self.finite_bars = self.finite_bars.saturating_add(1).min(self.period);
+        if self.finite_bars < self.period {
+            return None;
         }
 
-        self.idx = k + 1;
-
-        if !self.filled {
-            self.filled = self.idx >= self.period;
-            if !self.filled {
-                return None;
-            }
-        }
-
-        let min_val = self.minq.front().map(|&(x, _)| x).unwrap_or(v);
-        let max_val = self.maxq.front().map(|&(x, _)| x).unwrap_or(v);
-
-        let range = (max_val - min_val).max(0.001);
-
-        self.val1 = 0.67f64.mul_add(self.val1, 0.66 * ((v - min_val) / range - 0.5));
-        if self.val1 > 0.99 {
-            self.val1 = 0.999;
-        } else if self.val1 < -0.99 {
-            self.val1 = -0.999;
-        }
-
-        let signal = self.prev_fish;
-        let fisher = 0.5f64.mul_add(
-            ((1.0 + self.val1) / (1.0 - self.val1)).ln(),
-            0.5 * self.prev_fish,
+        let minimum = self
+            .minq
+            .front()
+            .map(|&(value, _)| value)
+            .unwrap_or(midpoint);
+        let maximum = self
+            .maxq
+            .front()
+            .map(|&(value, _)| value)
+            .unwrap_or(midpoint);
+        let output = fisher_transition_f64_v2(
+            midpoint,
+            minimum,
+            maximum,
+            &mut self.val1,
+            &mut self.prev_fish,
         );
-
-        self.prev_fish = fisher;
-        Some((fisher, signal))
+        if output.is_none() {
+            reset_finite_segment_v2(
+                &mut self.minq,
+                &mut self.maxq,
+                &mut self.finite_bars,
+                &mut self.val1,
+                &mut self.prev_fish,
+            );
+        }
+        output
     }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fisher_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let result = fisher_js(high, low, period)?;
-    crate::write_wasm_f64_output("fisher_output_into_js", &result.values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fisher_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = fisher_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "fisher_batch_unified_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_fisher_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = FisherParams { period: None };
         let input = FisherInput::from_candles(&candles, default_params);
         let output = fisher_with_kernel(&input, kernel)?;
@@ -1237,8 +1259,8 @@ mod tests {
 
     fn check_fisher_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = FisherInput::from_candles(&candles, FisherParams::default());
         let result = fisher_with_kernel(&input, kernel)?;
         let expected_last_five_fisher = [
@@ -1333,8 +1355,8 @@ mod tests {
 
     fn check_fisher_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = FisherInput::from_candles(&candles, FisherParams::default());
         let res = fisher_with_kernel(&input, kernel)?;
         assert_eq!(res.fisher.len(), candles.close.len());
@@ -1353,8 +1375,8 @@ mod tests {
 
     fn check_fisher_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 9;
         let input = FisherInput::from_candles(
             &candles,
@@ -1401,8 +1423,8 @@ mod tests {
     fn check_fisher_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             FisherParams::default(),
@@ -1806,8 +1828,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = FisherBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
         let def = FisherParams::default();
@@ -1837,8 +1859,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (1, 10, 1),
@@ -2088,7 +2110,6 @@ mod tests {
         let mut out_fish = vec![0.0; n];
         let mut out_sig = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             fisher_into(&input, &mut out_fish, &mut out_sig)?;
         }
@@ -2118,629 +2139,286 @@ mod tests {
 
         Ok(())
     }
-}
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "fisher")]
-#[pyo3(signature = (high, low, period, kernel=None))]
-pub fn fisher_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let data_len = high_slice.len().min(low_slice.len());
-
-    let fisher_arr = unsafe { PyArray1::<f64>::new(py, [data_len], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [data_len], false) };
-    let fisher_slice = unsafe { fisher_arr.as_slice_mut()? };
-    let signal_slice = unsafe { signal_arr.as_slice_mut()? };
-
-    let params = FisherParams {
-        period: Some(period),
-    };
-    let input = FisherInput::from_slices(high_slice, low_slice, params);
-
-    py.allow_threads(|| fisher_into_slice(fisher_slice, signal_slice, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((fisher_arr, signal_arr))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "FisherStream")]
-pub struct FisherStreamPy {
-    stream: FisherStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl FisherStreamPy {
-    #[new]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let params = FisherParams {
-            period: Some(period),
-        };
-        let stream =
-            FisherStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(FisherStreamPy { stream })
-    }
-
-    pub fn update(&mut self, high: f64, low: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "fisher_batch")]
-#[pyo3(signature = (high, low, period_range, kernel=None))]
-pub fn fisher_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    if high_slice.len() != low_slice.len() {
-        return Err(PyValueError::new_err(format!(
-            "Mismatched data length: high={}, low={}",
-            high_slice.len(),
-            low_slice.len()
-        )));
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = FisherBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = high_slice.len();
-    let total_len = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("Fisher batch: rows*cols overflow"))?;
-
-    let fisher_arr = unsafe { PyArray1::<f64>::new(py, [total_len], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [total_len], false) };
-
-    let first = (0..cols)
-        .find(|&i| !high_slice[i].is_nan() && !low_slice[i].is_nan())
-        .ok_or_else(|| PyValueError::new_err("All values are NaN"))?;
-    let mut warmups: Vec<usize> = Vec::with_capacity(combos.len());
-    for c in &combos {
-        let p = c.period.unwrap_or(0);
-        let warm = first
-            .checked_add(p.saturating_sub(1))
-            .ok_or_else(|| PyValueError::new_err("Fisher batch: warmup overflow"))?;
-        warmups.push(warm);
-    }
-
-    unsafe {
-        let fisher_mu = std::slice::from_raw_parts_mut(
-            fisher_arr.as_slice_mut()?.as_mut_ptr() as *mut MaybeUninit<f64>,
-            total_len,
-        );
-        let signal_mu = std::slice::from_raw_parts_mut(
-            signal_arr.as_slice_mut()?.as_mut_ptr() as *mut MaybeUninit<f64>,
-            total_len,
-        );
-        init_matrix_prefixes(fisher_mu, cols, &warmups);
-        init_matrix_prefixes(signal_mu, cols, &warmups);
-    }
-
-    let fisher_ptr = unsafe { fisher_arr.as_slice_mut()?.as_mut_ptr() } as usize;
-    let signal_ptr = unsafe { signal_arr.as_slice_mut()?.as_mut_ptr() } as usize;
-
-    py.allow_threads(move || {
-        let kernel = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        let simd = match kernel {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => kernel,
-        };
-
-        unsafe {
-            let fisher_slice = std::slice::from_raw_parts_mut(fisher_ptr as *mut f64, total_len);
-            let signal_slice = std::slice::from_raw_parts_mut(signal_ptr as *mut f64, total_len);
-            fisher_batch_inner_into(
-                high_slice,
-                low_slice,
-                &sweep,
-                simd,
-                true,
-                fisher_slice,
-                signal_slice,
-            )
+    fn reviewed_fixture_v3_high_low() -> (Vec<f64>, Vec<f64>) {
+        const ROWS: usize = 4_096;
+        let mut high = Vec::with_capacity(ROWS);
+        let mut low = Vec::with_capacity(ROWS);
+        let mut close = Vec::with_capacity(ROWS);
+        for row in 0..ROWS {
+            let drift = row as f64 * 0.000_000_7;
+            let wave = match row % 11 {
+                0 => 0.000_041,
+                1 => -0.000_027,
+                2 => 0.000_013,
+                3 => -0.000_036,
+                4 => 0.000_022,
+                5 => -0.000_009,
+                6 => 0.000_033,
+                7 => -0.000_019,
+                8 => 0.000_006,
+                9 => -0.000_031,
+                _ => 0.000_017,
+            };
+            let row_open = 1.075 + drift;
+            let row_close = row_open + wave;
+            high.push(row_open.max(row_close) + 0.000_08 + (row % 7) as f64 * 0.000_001);
+            low.push(row_open.min(row_close) - 0.000_07 - (row % 5) as f64 * 0.000_001);
+            close.push(row_close);
         }
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("fisher", fisher_arr.reshape((rows, cols))?)?;
-    dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "FisherDeviceArrayF32", unsendable)]
-pub struct FisherDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32Py>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl FisherDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        inner.__cuda_array_interface__(py)
+        let final_row = ROWS - 1;
+        close[final_row] = f64::from_bits(close[final_row].to_bits() ^ 1);
+        high[final_row] = high[final_row].max(close[final_row] + 0.000_001);
+        low[final_row] = low[final_row].min(close[final_row] - 0.000_001);
+        (high, low)
     }
 
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        inner.__dlpack_device__()
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        if let Some(ref s_obj) = stream {
-            if let Ok(s) = s_obj.extract::<usize>(py) {
-                if s == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__ stream=0 is invalid for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let mut inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-        let capsule = inner.__dlpack__(py, stream, max_version, dl_device, copy)?;
-        Ok(capsule)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl FisherDeviceArrayF32Py {
-    pub fn new_from_rust(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner: Some(DeviceArrayF32Py {
-                inner,
-                _ctx: Some(ctx_guard),
-                device_id: Some(device_id),
-            }),
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "fisher_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, period_range, device_id=0))]
-pub fn fisher_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high = high_f32.as_slice()?;
-    let low = low_f32.as_slice()?;
-    let sweep = FisherBatchRange {
-        period: period_range,
-    };
-    let cuda = CudaFisher::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let ctx_guard = cuda.context_arc();
-    let dev_id = cuda.device_id();
-    let ((pair, combos)) = py.allow_threads(|| {
-        cuda.fisher_batch_dev(high, low, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "fisher",
-        Py::new(
-            py,
-            FisherDeviceArrayF32Py::new_from_rust(pair.fisher, ctx_guard.clone(), dev_id),
-        )?,
-    )?;
-    dict.set_item(
-        "signal",
-        Py::new(
-            py,
-            FisherDeviceArrayF32Py::new_from_rust(pair.signal, ctx_guard, dev_id),
-        )?,
-    )?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", high.len())?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "fisher_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, cols, rows, period, device_id=0))]
-pub fn fisher_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high_tm = high_tm_f32.as_slice()?;
-    let low_tm = low_tm_f32.as_slice()?;
-    let cuda = CudaFisher::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let ctx_guard = cuda.context_arc();
-    let dev_id = cuda.device_id();
-    let pair = py.allow_threads(|| {
-        cuda.fisher_many_series_one_param_time_major_dev(high_tm, low_tm, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "fisher",
-        Py::new(
-            py,
-            FisherDeviceArrayF32Py::new_from_rust(pair.fisher, ctx_guard.clone(), dev_id),
-        )?,
-    )?;
-    dict.set_item(
-        "signal",
-        Py::new(
-            py,
-            FisherDeviceArrayF32Py::new_from_rust(pair.signal, ctx_guard, dev_id),
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct FisherResult {
-    values: Vec<f64>,
-    rows: usize,
-    cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl FisherResult {
-    #[wasm_bindgen(getter)]
-    pub fn values(&self) -> Vec<f64> {
-        self.values.clone()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn cols(&self) -> usize {
-        self.cols
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fisher_js(high: &[f64], low: &[f64], period: usize) -> Result<FisherResult, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str("Mismatched data length"));
-    }
-    let len = high.len();
-    let params = FisherParams {
-        period: Some(period),
-    };
-    let input = FisherInput::from_slices(high, low, params);
-
-    let total = len
-        .checked_mul(2)
-        .ok_or_else(|| JsValue::from_str("fisher_js: len*2 overflow"))?;
-    let mut out = vec![0.0_f64; total];
-    let (fisher_out, signal_out) = out.split_at_mut(len);
-
-    fisher_into_slice(fisher_out, signal_out, &input, Kernel::Scalar)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(FisherResult {
-        values: out,
-        rows: 2,
-        cols: len,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fisher_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to fisher_into"));
-    }
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        if high.len() != low.len() {
-            return Err(JsValue::from_str("Mismatched data length"));
-        }
-        let total = len
-            .checked_mul(2)
-            .ok_or_else(|| JsValue::from_str("fisher_into: len*2 overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let (fisher_out, signal_out) = out.split_at_mut(len);
-
-        let params = FisherParams {
-            period: Some(period),
-        };
-        let input = FisherInput::from_slices(high, low, params);
-
-        fisher_into_slice(fisher_out, signal_out, &input, Kernel::Scalar)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fisher_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fisher_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FisherBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FisherBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub combos: Vec<FisherParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = fisher_batch)]
-pub fn fisher_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str("Mismatched data length"));
-    }
-    let config: FisherBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = FisherBatchRange {
-        period: config.period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let cols = high.len();
-    let rows = combos.len();
-    let total_elems = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("fisher_batch_unified_js: rows*cols overflow"))?;
-
-    let mut fisher = vec![0.0; total_elems];
-    let mut signal = vec![0.0; total_elems];
-
-    fisher_batch_inner_into(
-        high,
-        low,
-        &sweep,
-        Kernel::Scalar,
-        false,
-        &mut fisher,
-        &mut signal,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let values_capacity = total_elems
-        .checked_mul(2)
-        .ok_or_else(|| JsValue::from_str("fisher_batch_unified_js: values capacity overflow"))?;
-    let mut values = Vec::with_capacity(values_capacity);
-    for r in 0..rows {
-        values.extend_from_slice(&fisher[r * cols..(r + 1) * cols]);
-        values.extend_from_slice(&signal[r * cols..(r + 1) * cols]);
-    }
-
-    let js = FisherBatchJsOutput {
-        values,
-        rows: 2 * rows,
-        cols,
-        combos,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn fisher_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    fisher_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || fisher_ptr.is_null() || signal_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let sweep = FisherBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let total_size = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("fisher_batch_into: rows*len overflow"))?;
-
-        let fisher_out = std::slice::from_raw_parts_mut(fisher_ptr, total_size);
-        let signal_out = std::slice::from_raw_parts_mut(signal_ptr, total_size);
-
-        let output = fisher_batch_inner(high, low, &sweep, Kernel::Auto, false)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        fisher_out.copy_from_slice(&output.fisher);
-        signal_out.copy_from_slice(&output.signal);
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For streaming patterns, use the fast/unsafe API with persistent buffers"
-)]
-pub struct FisherContext {
-    period: usize,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(deprecated)]
-impl FisherContext {
-    #[wasm_bindgen(constructor)]
-    #[deprecated(
-        since = "1.0.0",
-        note = "For streaming patterns, use the fast/unsafe API with persistent buffers"
-    )]
-    pub fn new(period: usize) -> Result<FisherContext, JsValue> {
-        if period == 0 {
-            return Err(JsValue::from_str("Invalid period: 0"));
-        }
-
-        Ok(FisherContext {
-            period,
-            kernel: Kernel::Scalar,
+    fn fnv1a64_f64_bits(values: &[f64]) -> u64 {
+        values.iter().fold(0xcbf2_9ce4_8422_2325, |hash, value| {
+            (hash ^ value.to_bits()).wrapping_mul(0x0000_0100_0000_01b3)
         })
     }
 
-    pub fn update_into(
-        &self,
-        high_ptr: *const f64,
-        low_ptr: *const f64,
-        fisher_ptr: *mut f64,
-        signal_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if high_ptr.is_null() || low_ptr.is_null() || fisher_ptr.is_null() || signal_ptr.is_null() {
-            return Err(JsValue::from_str("Null pointer provided"));
+    #[test]
+    fn fisher_log_f64_v2_matches_frozen_sun_checkpoints() {
+        let cases = [
+            (0x3ff0_0000_0000_0000, 0x0000_0000_0000_0000),
+            (0x0000_0000_0000_0001, 0xc087_4385_446d_71c3),
+            (0x4000_0000_0000_0000, 0x3fe6_2e42_fefa_39ef),
+            (0x3fe0_0000_0000_0000, 0xbfe6_2e42_fefa_39ef),
+            (0x3f90_d8b0_1d6a_1591, 0xc010_6de8_9959_7cd8),
+            (0x3fa8_6023_0080_6d1d, 0xc008_5ba3_1b96_26ee),
+            (0x3fb8_4482_7417_a07c, 0xc002_d928_b548_dbe4),
+            (0x3fc7_6c46_f3ca_9d14, 0xbffb_2c4a_e8c3_fca8),
+        ];
+        for (input_bits, expected_bits) in cases {
+            let actual = fisher_log_f64_v2(f64::from_bits(input_bits))
+                .expect("positive finite checkpoint must be in-domain");
+            assert_eq!(actual.to_bits(), expected_bits, "input=0x{input_bits:016x}");
         }
+        for invalid in [0.0, -0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(fisher_log_f64_v2(invalid).is_none());
+        }
+    }
 
-        unsafe {
-            let high = std::slice::from_raw_parts(high_ptr, len);
-            let low = std::slice::from_raw_parts(low_ptr, len);
-            let fisher_out = std::slice::from_raw_parts_mut(fisher_ptr, len);
-            let signal_out = std::slice::from_raw_parts_mut(signal_ptr, len);
+    #[test]
+    fn fisher_f64_v2_full_fixture_hashes_close_all_host_routes() -> Result<(), Box<dyn Error>> {
+        let (high, low) = reviewed_fixture_v3_high_low();
+        let expected = [
+            (7, 0x9b5a_e551_a162_7b03, 0xc1c3_f13f_db8b_f8ed),
+            (9, 0xc84a_1bc5_292a_9042, 0xeb5c_0c24_ec94_1076),
+            (21, 0xebc3_f1d4_ef69_711b, 0xe661_29f8_343f_c31b),
+            (50, 0x6fc8_7727_2dbb_cbda, 0x6df4_ac1c_7959_fed4),
+            (100, 0x22b1_a232_c4ef_c58e, 0x77be_302a_66fe_8c89),
+            (200, 0xd1e2_51ae_216a_896e, 0x53bd_a56d_b471_2b73),
+        ];
 
+        for (period, expected_fisher, expected_signal) in expected {
             let params = FisherParams {
-                period: Some(self.period),
+                period: Some(period),
             };
-            let input = FisherInput::from_slices(high, low, params);
+            let input = FisherInput::from_slices(&high, &low, params.clone());
+            for kernel in [Kernel::Scalar, Kernel::Auto, Kernel::Avx2, Kernel::Avx512] {
+                let output = fisher_with_kernel(&input, kernel)?;
+                assert_eq!(fnv1a64_f64_bits(&output.fisher), expected_fisher);
+                assert_eq!(fnv1a64_f64_bits(&output.signal), expected_signal);
+            }
 
-            fisher_into_slice(fisher_out, signal_out, &input, self.kernel)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let sweep = FisherBatchRange {
+                period: (period, period, 0),
+            };
+            for kernel in [Kernel::Scalar, Kernel::Auto, Kernel::Avx2, Kernel::Avx512] {
+                let output = fisher_batch_slice(&high, &low, &sweep, kernel)?;
+                assert_eq!(fnv1a64_f64_bits(&output.fisher), expected_fisher);
+                assert_eq!(fnv1a64_f64_bits(&output.signal), expected_signal);
+            }
 
-            Ok(())
+            let mut stream = FisherStream::try_new(params)?;
+            let mut fisher_values = Vec::with_capacity(high.len());
+            let mut signal_values = Vec::with_capacity(high.len());
+            for (&high_value, &low_value) in high.iter().zip(&low) {
+                match stream.update(high_value, low_value) {
+                    Some((fisher, signal)) => {
+                        fisher_values.push(fisher);
+                        signal_values.push(signal);
+                    }
+                    None => {
+                        fisher_values.push(f64::from_bits(FISHER_QNAN_BITS_F64_V2));
+                        signal_values.push(f64::from_bits(FISHER_QNAN_BITS_F64_V2));
+                    }
+                }
+            }
+            assert_eq!(fnv1a64_f64_bits(&fisher_values), expected_fisher);
+            assert_eq!(fnv1a64_f64_bits(&signal_values), expected_signal);
         }
+        Ok(())
     }
 
-    pub fn get_period(&self) -> usize {
-        self.period
+    #[test]
+    fn fisher_f64_v2_resets_holes_warmup_and_first_signal_to_positive_zero()
+    -> Result<(), Box<dyn Error>> {
+        let mut high: Vec<f64> = (0..20).map(|row| 2.0 + row as f64 * 0.1).collect();
+        let mut low: Vec<f64> = (0..20).map(|row| 1.0 + row as f64 * 0.1).collect();
+        high[5] = f64::NAN;
+        low[10] = f64::INFINITY;
+        high[15] = f64::MAX;
+        low[15] = f64::MAX;
+
+        let input = FisherInput::from_slices(&high, &low, FisherParams { period: Some(3) });
+        let output = fisher_with_kernel(&input, Kernel::Scalar)?;
+        let emitted = [2usize, 3, 4, 8, 9, 13, 14, 18, 19];
+        for row in 0..high.len() {
+            if emitted.contains(&row) {
+                assert!(output.fisher[row].is_finite(), "row {row} must emit");
+                assert!(output.signal[row].is_finite(), "row {row} signal must emit");
+            } else {
+                assert_eq!(output.fisher[row].to_bits(), FISHER_QNAN_BITS_F64_V2);
+                assert_eq!(output.signal[row].to_bits(), FISHER_QNAN_BITS_F64_V2);
+            }
+        }
+        for first_emission in [2usize, 8, 13, 18] {
+            assert_eq!(output.signal[first_emission].to_bits(), 0);
+        }
+
+        let mut stream = FisherStream::try_new(FisherParams { period: Some(3) })?;
+        for (row, (&high_value, &low_value)) in high.iter().zip(&low).enumerate() {
+            let streamed = stream.update(high_value, low_value);
+            if emitted.contains(&row) {
+                let (fisher, signal) = streamed.expect("stream must emit on the same finite row");
+                assert_eq!(fisher.to_bits(), output.fisher[row].to_bits());
+                assert_eq!(signal.to_bits(), output.signal[row].to_bits());
+            } else {
+                assert!(streamed.is_none(), "stream row {row} must be a hole/warmup");
+            }
+        }
+        Ok(())
     }
 
-    pub fn get_warmup_period(&self) -> usize {
-        self.period - 1
+    #[test]
+    fn fisher_f64_v2_fails_closed_on_finite_range_overflow() -> Result<(), Box<dyn Error>> {
+        let half_max = f64::MAX * 0.5;
+        let high = [-half_max, half_max, 1.0, 1.1, 1.2];
+        let low = high;
+        let input = FisherInput::from_slices(&high, &low, FisherParams { period: Some(2) });
+        let output = fisher_with_kernel(&input, Kernel::Scalar)?;
+        assert_eq!(output.fisher[1].to_bits(), FISHER_QNAN_BITS_F64_V2);
+        assert_eq!(output.signal[1].to_bits(), FISHER_QNAN_BITS_F64_V2);
+        assert_eq!(output.fisher[2].to_bits(), FISHER_QNAN_BITS_F64_V2);
+        assert!(output.fisher[3].is_finite());
+        assert_eq!(output.signal[3].to_bits(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn fisher_f64_v2_leading_infinity_is_not_admitted_as_first_valid() {
+        let high = [f64::INFINITY, 2.0, 3.0, 4.0];
+        let low = [1.0, 1.0, 2.0, 3.0];
+        let input = FisherInput::from_slices(&high, &low, FisherParams { period: Some(4) });
+        assert!(matches!(
+            fisher_with_kernel(&input, Kernel::Scalar),
+            Err(FisherError::NotEnoughValidData {
+                needed: 4,
+                valid: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn fisher_f64_v2_cancellation_bound_is_absolute_not_universal_ulp() {
+        let got = f64::from_bits(0xc012_5d40_b4e7_c082);
+        let exact_fixed_schedule = f64::from_bits(0xc012_5d40_b4e7_c080);
+        assert_eq!(
+            (got - exact_fixed_schedule).abs(),
+            1.776_356_839_400_250_5e-15
+        );
+        assert!(
+            (got - exact_fixed_schedule).abs() <= FISHER_F64_V2_ADVERSARIAL_MAX_ABS,
+            "the frozen adversarial corpus is an absolute-error claim only"
+        );
+    }
+
+    #[test]
+    fn fisher_f64_v2_admission_precedes_scan_grid_allocation_and_writes() {
+        let high = [f64::NAN];
+        let low = [f64::NAN, 1.0];
+        let input = FisherInput::from_slices(&high, &low, FisherParams { period: Some(0) });
+        assert!(matches!(
+            fisher_with_kernel(&input, Kernel::Scalar),
+            Err(FisherError::MismatchedDataLength { high: 1, low: 2 })
+        ));
+
+        let all_nan = [f64::NAN; 2];
+        let zero = FisherInput::from_slices(&all_nan, &all_nan, FisherParams { period: Some(0) });
+        assert!(matches!(
+            fisher_with_kernel(&zero, Kernel::Scalar),
+            Err(FisherError::InvalidPeriod {
+                period: 0,
+                data_len: 2
+            })
+        ));
+
+        let sweep = FisherBatchRange { period: (0, 0, 0) };
+        assert!(matches!(
+            fisher_batch_slice(&high, &low, &sweep, Kernel::Scalar),
+            Err(FisherError::MismatchedDataLength { high: 1, low: 2 })
+        ));
+    }
+
+    #[test]
+    fn fisher_f64_v2_grid_is_checked_and_count_bounded_before_materialization() {
+        let descending = FisherBatchRange {
+            period: (usize::MAX, usize::MAX - 1, usize::MAX),
+        };
+        let shape = fisher_grid_shape_v2(&descending, usize::MAX)
+            .expect("descending endpoint arithmetic must not overflow");
+        let combos = expand_grid_checked_v2(&descending, shape)
+            .expect("the one-value descending grid is valid");
+        assert_eq!(combos.len(), 1);
+        assert_eq!(combos[0].period, Some(usize::MAX));
+
+        let enormous = FisherBatchRange {
+            period: (1, usize::MAX, 1),
+        };
+        assert!(matches!(
+            fisher_grid_shape_v2(&enormous, 4_096),
+            Err(FisherError::InvalidRange { .. })
+        ));
+        let bounded = FisherBatchRange {
+            period: (1, 1_000_000, 1),
+        };
+        assert!(matches!(
+            fisher_grid_shape_v2(&bounded, 4_096),
+            Err(FisherError::InvalidRange { .. })
+        ));
+    }
+
+    #[test]
+    fn fisher_f64_v2_extreme_raw_and_stream_periods_fail_without_capacity_panic_or_write() {
+        let stream = std::panic::catch_unwind(|| {
+            FisherStream::try_new(FisherParams {
+                period: Some(usize::MAX),
+            })
+        });
+        assert!(stream.is_ok(), "extreme stream admission must not panic");
+        assert!(matches!(
+            stream.unwrap(),
+            Err(FisherError::InvalidPeriod {
+                period: usize::MAX,
+                data_len: 0
+            })
+        ));
+
+        let mut fisher_out = [123.0];
+        let mut signal_out = [456.0];
+        fisher_scalar_into(
+            &[1.0],
+            &[1.0],
+            usize::MAX,
+            0,
+            &mut fisher_out,
+            &mut signal_out,
+        );
+        assert_eq!(fisher_out, [123.0]);
+        assert_eq!(signal_out, [456.0]);
     }
 }

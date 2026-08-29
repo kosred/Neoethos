@@ -210,7 +210,7 @@ pub struct SearchCheckpointArtifactFile {
     pub ledger: EvaluatedCandidateLedger,
     pub genes: Vec<Gene>,
     pub metrics: Vec<[f64; 11]>,
-    pub effective_smc_gate_threshold: f32,
+    pub effective_smc_gate_threshold: f64,
 }
 
 impl SearchCheckpointArtifactFile {
@@ -346,7 +346,7 @@ mod tests {
         .expect("strict temporal contract should be valid")
     }
 
-    fn sample_gene(weight: f32) -> Gene {
+    fn sample_gene(weight: f64) -> Gene {
         Gene {
             indices: vec![0, 2],
             weights: vec![weight, -0.25],

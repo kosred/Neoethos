@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 pub fn axis_usize(axis: (usize, usize, usize)) -> Vec<usize> {
     let (start, end, step) = axis;

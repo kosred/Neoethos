@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
@@ -69,10 +53,6 @@ pub struct VelocityAccelerationConvergenceDivergenceIndicatorOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VelocityAccelerationConvergenceDivergenceIndicatorParams {
     pub length: Option<usize>,
     pub smooth_length: Option<usize>,
@@ -373,17 +353,9 @@ fn warmup_prefix(smooth_length: usize) -> usize {
 #[inline(always)]
 fn classify_signal(vacd: f64, prev_vacd_nz: f64) -> f64 {
     if vacd > 0.0 {
-        if vacd > prev_vacd_nz {
-            2.0
-        } else {
-            1.0
-        }
+        if vacd > prev_vacd_nz { 2.0 } else { 1.0 }
     } else if vacd < 0.0 {
-        if vacd < prev_vacd_nz {
-            -2.0
-        } else {
-            -1.0
-        }
+        if vacd < prev_vacd_nz { -2.0 } else { -1.0 }
     } else {
         0.0
     }
@@ -757,7 +729,6 @@ pub fn velocity_acceleration_convergence_divergence_indicator_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn velocity_acceleration_convergence_divergence_indicator_into(
     input: &VelocityAccelerationConvergenceDivergenceIndicatorInput,
     out_vacd: &mut [f64],
@@ -1101,7 +1072,7 @@ fn velocity_acceleration_convergence_divergence_indicator_batch_inner_into(
                 VelocityAccelerationConvergenceDivergenceIndicatorError::InvalidKernelForBatch(
                     other,
                 ),
-            )
+            );
         }
     }
 
@@ -1199,389 +1170,11 @@ fn velocity_acceleration_convergence_divergence_indicator_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "velocity_acceleration_convergence_divergence_indicator")]
-#[pyo3(signature = (data, length=21, smooth_length=5, kernel=None))]
-pub fn velocity_acceleration_convergence_divergence_indicator_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    smooth_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let input = VelocityAccelerationConvergenceDivergenceIndicatorInput::from_slice(
-        data,
-        VelocityAccelerationConvergenceDivergenceIndicatorParams {
-            length: Some(length),
-            smooth_length: Some(smooth_length),
-        },
-    );
-    let out = py
-        .allow_threads(|| {
-            velocity_acceleration_convergence_divergence_indicator_with_kernel(&input, kern)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((out.vacd.into_pyarray(py), out.signal.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VelocityAccelerationConvergenceDivergenceIndicatorStream")]
-pub struct VelocityAccelerationConvergenceDivergenceIndicatorStreamPy {
-    stream: VelocityAccelerationConvergenceDivergenceIndicatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VelocityAccelerationConvergenceDivergenceIndicatorStreamPy {
-    #[new]
-    #[pyo3(signature = (length=21, smooth_length=5))]
-    fn new(length: usize, smooth_length: usize) -> PyResult<Self> {
-        let stream = VelocityAccelerationConvergenceDivergenceIndicatorStream::try_new(
-            VelocityAccelerationConvergenceDivergenceIndicatorParams {
-                length: Some(length),
-                smooth_length: Some(smooth_length),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.stream.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "velocity_acceleration_convergence_divergence_indicator_batch")]
-#[pyo3(signature = (data, length_range=(21, 21, 0), smooth_length_range=(5, 5, 0), kernel=None))]
-pub fn velocity_acceleration_convergence_divergence_indicator_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    smooth_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            velocity_acceleration_convergence_divergence_indicator_batch_with_kernel(
-                data,
-                &VelocityAccelerationConvergenceDivergenceIndicatorBatchRange {
-                    length: length_range,
-                    smooth_length: smooth_length_range,
-                },
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "vacd",
-        output
-            .vacd
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "signal",
-        output
-            .signal
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.length.unwrap_or(21) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.smooth_length.unwrap_or(5) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_velocity_acceleration_convergence_divergence_indicator_module(
-    m: &Bound<'_, PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(
-        velocity_acceleration_convergence_divergence_indicator_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        velocity_acceleration_convergence_divergence_indicator_batch_py,
-        m
-    )?)?;
-    m.add_class::<VelocityAccelerationConvergenceDivergenceIndicatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VelocityAccelerationConvergenceDivergenceIndicatorBatchConfig {
-    pub length_range: Vec<usize>,
-    pub smooth_length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = velocity_acceleration_convergence_divergence_indicator_js)]
-pub fn velocity_acceleration_convergence_divergence_indicator_js(
-    data: &[f64],
-    length: usize,
-    smooth_length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = VelocityAccelerationConvergenceDivergenceIndicatorInput::from_slice(
-        data,
-        VelocityAccelerationConvergenceDivergenceIndicatorParams {
-            length: Some(length),
-            smooth_length: Some(smooth_length),
-        },
-    );
-    let out =
-        velocity_acceleration_convergence_divergence_indicator_with_kernel(&input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("vacd"),
-        &serde_wasm_bindgen::to_value(&out.vacd).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("signal"),
-        &serde_wasm_bindgen::to_value(&out.signal).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = velocity_acceleration_convergence_divergence_indicator_batch_js)]
-pub fn velocity_acceleration_convergence_divergence_indicator_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: VelocityAccelerationConvergenceDivergenceIndicatorBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 || config.smooth_length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: every range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let out = velocity_acceleration_convergence_divergence_indicator_batch_with_kernel(
-        data,
-        &VelocityAccelerationConvergenceDivergenceIndicatorBatchRange {
-            length: (
-                config.length_range[0],
-                config.length_range[1],
-                config.length_range[2],
-            ),
-            smooth_length: (
-                config.smooth_length_range[0],
-                config.smooth_length_range[1],
-                config.smooth_length_range[2],
-            ),
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("vacd"),
-        &serde_wasm_bindgen::to_value(&out.vacd).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("signal"),
-        &serde_wasm_bindgen::to_value(&out.signal).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_acceleration_convergence_divergence_indicator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(2 * len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_acceleration_convergence_divergence_indicator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_acceleration_convergence_divergence_indicator_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    smooth_length: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to velocity_acceleration_convergence_divergence_indicator_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * len);
-        let (dst_vacd, dst_signal) = out.split_at_mut(len);
-        let input = VelocityAccelerationConvergenceDivergenceIndicatorInput::from_slice(
-            data,
-            VelocityAccelerationConvergenceDivergenceIndicatorParams {
-                length: Some(length),
-                smooth_length: Some(smooth_length),
-            },
-        );
-        velocity_acceleration_convergence_divergence_indicator_into_slice(
-            dst_vacd,
-            dst_signal,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_acceleration_convergence_divergence_indicator_batch_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    smooth_length_start: usize,
-    smooth_length_end: usize,
-    smooth_length_step: usize,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to velocity_acceleration_convergence_divergence_indicator_batch_into",
-        ));
-    }
-    let sweep = VelocityAccelerationConvergenceDivergenceIndicatorBatchRange {
-        length: (length_start, length_end, length_step),
-        smooth_length: (smooth_length_start, smooth_length_end, smooth_length_step),
-    };
-    let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .and_then(|value| value.checked_mul(2))
-        .ok_or_else(|| {
-            JsValue::from_str(
-                "rows*cols overflow in velocity_acceleration_convergence_divergence_indicator_batch_into",
-            )
-        })?;
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let split = rows * len;
-        let (dst_vacd, dst_signal) = out.split_at_mut(split);
-        velocity_acceleration_convergence_divergence_indicator_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Auto,
-            false,
-            dst_vacd,
-            dst_signal,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_acceleration_convergence_divergence_indicator_output_into_js(
-    data: &[f64],
-    length: usize,
-    smooth_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value =
-        velocity_acceleration_convergence_divergence_indicator_js(data, length, smooth_length)?;
-    crate::write_wasm_object_f64_outputs(
-        "velocity_acceleration_convergence_divergence_indicator_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn velocity_acceleration_convergence_divergence_indicator_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = velocity_acceleration_convergence_divergence_indicator_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "velocity_acceleration_convergence_divergence_indicator_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu, IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue,
+        IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue, compute_cpu,
     };
 
     fn sample_ohlc(len: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -1627,8 +1220,8 @@ mod tests {
     }
 
     #[test]
-    fn velocity_acceleration_convergence_divergence_indicator_output_contract(
-    ) -> Result<(), Box<dyn Error>> {
+    fn velocity_acceleration_convergence_divergence_indicator_output_contract()
+    -> Result<(), Box<dyn Error>> {
         let (_open, _high, _low, _close, hlcc4) = sample_ohlc(256);
         let input = VelocityAccelerationConvergenceDivergenceIndicatorInput::from_slice(
             &hlcc4,
@@ -1646,8 +1239,8 @@ mod tests {
     }
 
     #[test]
-    fn velocity_acceleration_convergence_divergence_indicator_into_matches_api(
-    ) -> Result<(), Box<dyn Error>> {
+    fn velocity_acceleration_convergence_divergence_indicator_into_matches_api()
+    -> Result<(), Box<dyn Error>> {
         let (_open, _high, _low, _close, hlcc4) = sample_ohlc(220);
         let input = VelocityAccelerationConvergenceDivergenceIndicatorInput::from_slice(
             &hlcc4,
@@ -1671,8 +1264,8 @@ mod tests {
     }
 
     #[test]
-    fn velocity_acceleration_convergence_divergence_indicator_stream_matches_batch(
-    ) -> Result<(), Box<dyn Error>> {
+    fn velocity_acceleration_convergence_divergence_indicator_stream_matches_batch()
+    -> Result<(), Box<dyn Error>> {
         let (_open, _high, _low, _close, hlcc4) = sample_ohlc(256);
         let batch = velocity_acceleration_convergence_divergence_indicator(
             &VelocityAccelerationConvergenceDivergenceIndicatorInput::from_slice(
@@ -1707,8 +1300,8 @@ mod tests {
     }
 
     #[test]
-    fn velocity_acceleration_convergence_divergence_indicator_batch_single_matches_single(
-    ) -> Result<(), Box<dyn Error>> {
+    fn velocity_acceleration_convergence_divergence_indicator_batch_single_matches_single()
+    -> Result<(), Box<dyn Error>> {
         let (_open, _high, _low, _close, hlcc4) = sample_ohlc(240);
         let single = velocity_acceleration_convergence_divergence_indicator(
             &VelocityAccelerationConvergenceDivergenceIndicatorInput::from_slice(
@@ -1754,8 +1347,8 @@ mod tests {
     }
 
     #[test]
-    fn velocity_acceleration_convergence_divergence_indicator_dispatch_compute_returns_outputs(
-    ) -> Result<(), Box<dyn Error>> {
+    fn velocity_acceleration_convergence_divergence_indicator_dispatch_compute_returns_outputs()
+    -> Result<(), Box<dyn Error>> {
         let (open, high, low, close, _hlcc4) = sample_ohlc(192);
         for output_id in ["vacd", "signal"] {
             let req = IndicatorComputeRequest {

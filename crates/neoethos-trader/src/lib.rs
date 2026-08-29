@@ -51,6 +51,7 @@ pub mod contracts;
 pub mod data_replay;
 pub mod decision;
 pub mod engine;
+pub mod engine_money_v2;
 mod execution;
 pub mod gene_signal;
 pub mod portfolio;
@@ -60,26 +61,33 @@ pub mod risk;
 pub mod signal;
 
 // Curated surface so front-ends can `use neoethos_trader::*` ergonomically.
+pub use blend_signal::{
+    BlendConfig, BlendMode, BlendedSignalEngine, DEFAULT_BLEND_GATE_FLOOR,
+    DEFAULT_BLEND_VETO_BELOW, MlDecision, blend_decision,
+};
 pub use contracts::{
     AccountSnapshot, CloseReason, Direction, ExecReport, ExecStatus, ExecutionAdapter,
     KillSwitchTier, LiveBar, PortfolioEntry, RiskGate, Signal, SignalEngine, SignalSource,
     StrategySource, TradeIntent, TradeMode,
 };
-pub use blend_signal::{
-    BlendConfig, BlendMode, BlendedSignalEngine, DEFAULT_BLEND_GATE_FLOOR,
-    DEFAULT_BLEND_VETO_BELOW, MlDecision, blend_decision,
-};
+#[cfg(feature = "ml-blend")]
+pub use data_replay::replay_blend_from_dir;
 pub use data_replay::{
     load_bars_from_dir, ohlcv_to_livebars, replay_portfolio_from_dir, replay_symbol_from_dir,
 };
-#[cfg(feature = "ml-blend")]
-pub use data_replay::replay_blend_from_dir;
+pub use decision::{DEFAULT_SYNTHETIC_STOP_FRAC, DecisionConfig, DecisionEngine};
+pub use engine::{EngineConfig, EngineStats};
+pub use engine_money_v2::{
+    ENGINE_MONEY_SCHEMA_VERSION_V2, EngineMoneyErrorCodeV2, EngineMoneyErrorV2, EngineMoneyStateV2,
+    EngineMoneyStatsV2, ExecutionPriceV1, FillSideV2, FilledExecutionReportV2,
+    LegacyMonetaryAuthorityV2, LegacyMoneyArtifactClassV2, MoneyAvailabilityV2,
+    MoneyUnavailableReasonV2, StandardLotsV1, apply_filled_execution_v2,
+    try_from_legacy_engine_stats, try_from_legacy_exec_report,
+};
 pub use gene_signal::{
     PrecomputedSignalEngine, combine_gene_signals, combine_gene_signals_with_brackets,
     combine_gene_signals_with_confidence,
 };
-pub use decision::{DEFAULT_SYNTHETIC_STOP_FRAC, DecisionConfig, DecisionEngine};
-pub use engine::{EngineConfig, EngineStats};
 pub use portfolio::PortfolioRegistry;
 pub use position::{Position, PositionManager, TrailingPolicy};
 pub use risk::{MaxOpenPositionsGate, PermissiveRiskGate};

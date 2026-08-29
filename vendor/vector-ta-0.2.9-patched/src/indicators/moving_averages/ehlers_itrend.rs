@@ -1,46 +1,16 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
-use std::f64::consts::PI;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(feature = "python")]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaEhlersITrend;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for EhlersITrendInput<'a> {
     fn as_ref(&self) -> &[f64] {
@@ -66,10 +36,6 @@ pub struct EhlersITrendOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersITrendParams {
     pub warmup_bars: Option<usize>,
     pub max_dc_period: Option<usize>,
@@ -126,7 +92,9 @@ pub enum EhlersITrendError {
     EmptyInputData,
     #[error("ehlers_itrend: All values are NaN.")]
     AllValuesNaN,
-    #[error("ehlers_itrend: Not enough data for warmup. warmup_bars={warmup_bars} but data length={length}")]
+    #[error(
+        "ehlers_itrend: Not enough data for warmup. warmup_bars={warmup_bars} but data length={length}"
+    )]
     NotEnoughDataForWarmup { warmup_bars: usize, length: usize },
 
     #[error("ehlers_itrend: Not enough valid data: needed={needed}, valid={valid}")]
@@ -212,12 +180,161 @@ fn warm_index(first: usize, warmup_bars: usize) -> usize {
     first + warmup_bars
 }
 
+/// NeoEthos f64 authority for the adaptive SMA inside Ehlers ITrend.
+///
+/// The creator's formula defines a simple mean over the rounded dominant-cycle
+/// period followed by a 4-3-2-1 WMA. It does not define a floating-point
+/// reduction tree. This version therefore fixes one accuracy-oriented tree for
+/// every CPU/GPU f64 route: chronological, power-of-two-normalized Neumaier
+/// summation for the adaptive window, and explicit 4-3-2-1 `/ 10` order.
+pub const EHLERS_ITREND_F64_AUTHORITY_V1: &str =
+    "ehlers_itrend_f64_pow2_scaled_chronological_neumaier_window_explicit_wma4_rn_v1";
+
+#[derive(Clone, Copy, Default)]
+struct ITrendNeumaierF64V1 {
+    sum: f64,
+    correction: f64,
+}
+
+impl ITrendNeumaierF64V1 {
+    #[inline(always)]
+    fn add(&mut self, value: f64) {
+        let next = self.sum + value;
+        if self.sum.abs() >= value.abs() {
+            self.correction += (self.sum - next) + value;
+        } else {
+            self.correction += (value - next) + self.sum;
+        }
+        self.sum = next;
+    }
+
+    #[inline(always)]
+    fn total(self) -> f64 {
+        self.sum + self.correction
+    }
+}
+
+#[inline(always)]
+fn itrend_qnan_v1() -> f64 {
+    f64::from_bits(0x7ff8_0000_0000_0000)
+}
+
+/// Exact power-of-two at or immediately below one finite positive binary64.
+#[inline(always)]
+fn itrend_floor_power_of_two_v1(max_abs: f64) -> f64 {
+    debug_assert!(max_abs.is_finite() && max_abs > 0.0);
+    let bits = max_abs.to_bits();
+    let exponent = bits & 0x7ff0_0000_0000_0000;
+    if exponent != 0 {
+        f64::from_bits(exponent)
+    } else {
+        let highest_mantissa_bit = 63 - bits.leading_zeros();
+        f64::from_bits(1_u64 << highest_mantissa_bit)
+    }
+}
+
+/// Stable mean of one logical window supplied oldest-to-newest by `value_at`.
+#[inline(always)]
+fn itrend_stable_window_mean_v1<F>(count: usize, mut value_at: F) -> f64
+where
+    F: FnMut(usize) -> f64,
+{
+    debug_assert!(count > 0);
+    let mut max_abs = 0.0_f64;
+    for index in 0..count {
+        let value = value_at(index);
+        if !value.is_finite() {
+            return itrend_qnan_v1();
+        }
+        max_abs = max_abs.max(value.abs());
+    }
+    if max_abs == 0.0 {
+        return 0.0;
+    }
+
+    let scale = itrend_floor_power_of_two_v1(max_abs);
+    let mut normalized = ITrendNeumaierF64V1::default();
+    for index in 0..count {
+        normalized.add(value_at(index) / scale);
+    }
+    let result = (normalized.total() / count as f64) * scale;
+    if !result.is_finite() {
+        itrend_qnan_v1()
+    } else if result == 0.0 {
+        0.0
+    } else {
+        result
+    }
+}
+
+/// Explicitly rounded schedule shared by the input smoother and final ITrend.
+#[inline(always)]
+fn itrend_wma4_v1(current: f64, lag1: f64, lag2: f64, lag3: f64) -> f64 {
+    let weighted_0 = 4.0 * current;
+    let weighted_1 = weighted_0 + 3.0 * lag1;
+    let weighted_2 = weighted_1 + 2.0 * lag2;
+    let weighted_3 = weighted_2 + lag3;
+    weighted_3 / 10.0
+}
+
+/// Explicit Hilbert-transform schedule shared by scalar, batch and stream.
+#[inline(always)]
+fn itrend_hilbert4_v1(current: f64, lag2: f64, lag4: f64, lag6: f64) -> f64 {
+    let term_0 = 0.0962 * current;
+    let term_1 = term_0 + 0.5769 * lag2;
+    let term_2 = term_1 - 0.5769 * lag4;
+    term_2 - 0.0962 * lag6
+}
+
+/// One explicit dominant-cycle update shared by every CPU f64 route.
+#[inline(always)]
+fn itrend_period_v1(
+    re_smooth: f64,
+    im_smooth: f64,
+    prev_mesa: f64,
+    prev_smooth: f64,
+    max_dc: usize,
+) -> (f64, f64, usize) {
+    let mut new_mesa = 0.0;
+    if re_smooth != 0.0 && im_smooth != 0.0 {
+        let angle = im_smooth.atan2(re_smooth);
+        if angle != 0.0 {
+            new_mesa = (2.0 * core::f64::consts::PI) / angle;
+        }
+    }
+    let up_lim = 1.5 * prev_mesa;
+    if new_mesa > up_lim {
+        new_mesa = up_lim;
+    }
+    let low_lim = 0.67 * prev_mesa;
+    if new_mesa < low_lim {
+        new_mesa = low_lim;
+    }
+    new_mesa = new_mesa.clamp(6.0, 50.0);
+
+    let final_mesa = 0.2 * new_mesa + 0.8 * prev_mesa;
+    let smooth_period = 0.33 * final_mesa + 0.67 * prev_smooth;
+    let mut dcp = (smooth_period + 0.5).floor() as usize;
+    dcp = dcp.clamp(1, max_dc);
+    (final_mesa, smooth_period, dcp)
+}
+
+#[inline(always)]
+fn itrend_ring_oldest_v1(next: usize, count: usize, capacity: usize) -> usize {
+    debug_assert!(next < capacity && count <= capacity);
+    if next >= count {
+        next - count
+    } else {
+        capacity - (count - next)
+    }
+}
+
 #[inline(always)]
 pub fn ehlers_itrend_scalar_tail(
     src: &[f64],
     warmup_bars: usize,
     max_dc: usize,
-    first_valid: usize,
+    _first_valid: usize,
     warm: usize,
     out: &mut [f64],
 ) {
@@ -231,32 +348,7 @@ pub fn ehlers_itrend_scalar_tail(
     let (mut prev_i2, mut prev_q2) = (0.0, 0.0);
     let (mut prev_re, mut prev_im) = (0.0, 0.0);
     let (mut prev_mesa, mut prev_smooth) = (0.0, 0.0);
-    let prefix_sum = if first_valid == 0 {
-        let mut values = Vec::with_capacity(length + 1);
-        values.push(0.0);
-        let mut acc = 0.0;
-        let mut finite = true;
-        for &x in src {
-            if !x.is_finite() {
-                finite = false;
-                break;
-            }
-            acc += x;
-            values.push(acc);
-        }
-        if finite {
-            Some(values)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let mut sum_ring = if prefix_sum.is_some() {
-        Vec::new()
-    } else {
-        vec![0.0; max_dc]
-    };
+    let mut sum_ring = vec![0.0; max_dc];
     let mut sum_idx = 0usize;
     let (mut prev_it1, mut prev_it2, mut prev_it3) = (0.0, 0.0, 0.0);
     let mut ring_ptr = 0usize;
@@ -274,7 +366,7 @@ pub fn ehlers_itrend_scalar_tail(
     for i in 0..length {
         let x0 = src[i];
 
-        let fir_val = (4.0 * x0 + 3.0 * src_l1 + 2.0 * src_l2 + src_l3) / 10.0;
+        let fir_val = itrend_wma4_v1(x0, src_l1, src_l2, src_l3);
         fir_buf[ring_ptr] = fir_val;
 
         let fir_0 = ring_get(&fir_buf, ring_ptr, 0);
@@ -282,7 +374,7 @@ pub fn ehlers_itrend_scalar_tail(
         let fir_4 = ring_get(&fir_buf, ring_ptr, 4);
         let fir_6 = ring_get(&fir_buf, ring_ptr, 6);
 
-        let h_in = 0.0962 * fir_0 + 0.5769 * fir_2 - 0.5769 * fir_4 - 0.0962 * fir_6;
+        let h_in = itrend_hilbert4_v1(fir_0, fir_2, fir_4, fir_6);
         let period_mult = 0.075 * prev_mesa + 0.54;
         let det_val = h_in * period_mult;
         det_buf[ring_ptr] = det_val;
@@ -294,7 +386,7 @@ pub fn ehlers_itrend_scalar_tail(
         let det_2 = ring_get(&det_buf, ring_ptr, 2);
         let det_4 = ring_get(&det_buf, ring_ptr, 4);
         let det_6 = ring_get(&det_buf, ring_ptr, 6);
-        let h_in_q1 = 0.0962 * det_0 + 0.5769 * det_2 - 0.5769 * det_4 - 0.0962 * det_6;
+        let h_in_q1 = itrend_hilbert4_v1(det_0, det_2, det_4, det_6);
         let q1_val = h_in_q1 * period_mult;
         q1_buf[ring_ptr] = q1_val;
 
@@ -302,13 +394,13 @@ pub fn ehlers_itrend_scalar_tail(
         let i1_2 = ring_get(&i1_buf, ring_ptr, 2);
         let i1_4 = ring_get(&i1_buf, ring_ptr, 4);
         let i1_6 = ring_get(&i1_buf, ring_ptr, 6);
-        let j_i_val = (0.0962 * i1_0 + 0.5769 * i1_2 - 0.5769 * i1_4 - 0.0962 * i1_6) * period_mult;
+        let j_i_val = itrend_hilbert4_v1(i1_0, i1_2, i1_4, i1_6) * period_mult;
 
         let q1_0 = ring_get(&q1_buf, ring_ptr, 0);
         let q1_2 = ring_get(&q1_buf, ring_ptr, 2);
         let q1_4 = ring_get(&q1_buf, ring_ptr, 4);
         let q1_6 = ring_get(&q1_buf, ring_ptr, 6);
-        let j_q_val = (0.0962 * q1_0 + 0.5769 * q1_2 - 0.5769 * q1_4 - 0.0962 * q1_6) * period_mult;
+        let j_q_val = itrend_hilbert4_v1(q1_0, q1_2, q1_4, q1_6) * period_mult;
 
         let mut i2_cur = 0.2 * (i1_val - j_q_val) + 0.8 * prev_i2;
         let mut q2_cur = 0.2 * (q1_val + j_i_val) + 0.8 * prev_q2;
@@ -323,54 +415,24 @@ pub fn ehlers_itrend_scalar_tail(
         prev_re = re_smooth;
         prev_im = im_smooth;
 
-        let mut new_mesa = 0.0;
-        if re_smooth != 0.0 && im_smooth != 0.0 {
-            let angle = im_smooth.atan2(re_smooth);
-            if angle != 0.0 {
-                new_mesa = (2.0 * core::f64::consts::PI) / angle;
-            }
-        }
-        let up_lim = 1.5 * prev_mesa;
-        if new_mesa > up_lim {
-            new_mesa = up_lim;
-        }
-        let low_lim = 0.67 * prev_mesa;
-        if new_mesa < low_lim {
-            new_mesa = low_lim;
-        }
-        new_mesa = new_mesa.clamp(6.0, 50.0);
-        let final_mesa = 0.2 * new_mesa + 0.8 * prev_mesa;
+        let (final_mesa, sp_val, dcp) =
+            itrend_period_v1(re_smooth, im_smooth, prev_mesa, prev_smooth, max_dc);
         prev_mesa = final_mesa;
-        let sp_val = 0.33 * final_mesa + 0.67 * prev_smooth;
         prev_smooth = sp_val;
 
-        let mut dcp = (sp_val + 0.5).floor() as usize;
-        dcp = dcp.clamp(1, max_dc);
-
-        let sum_src = if let Some(prefix) = prefix_sum.as_ref() {
-            let end = i + 1;
-            let start = end.saturating_sub(dcp);
-            prefix[end] - prefix[start]
-        } else {
-            sum_ring[sum_idx] = x0;
-            sum_idx += 1;
-            if sum_idx == max_dc {
-                sum_idx = 0;
-            }
-            let mut sum_src = 0.0;
-            let mut idx2 = sum_idx;
-            for _ in 0..dcp {
-                idx2 = if idx2 == 0 { max_dc - 1 } else { idx2 - 1 };
-                sum_src += sum_ring[idx2];
-            }
-            sum_src
-        };
-        let it_val = sum_src / dcp as f64;
+        sum_ring[sum_idx] = x0;
+        sum_idx += 1;
+        if sum_idx == max_dc {
+            sum_idx = 0;
+        }
+        let oldest = itrend_ring_oldest_v1(sum_idx, dcp, max_dc);
+        let it_val =
+            itrend_stable_window_mean_v1(dcp, |offset| sum_ring[(oldest + offset) % max_dc]);
 
         let eit_val = if i < warmup_bars {
             x0
         } else {
-            (4.0 * it_val + 3.0 * prev_it1 + 2.0 * prev_it2 + prev_it3) / 10.0
+            itrend_wma4_v1(it_val, prev_it1, prev_it2, prev_it3)
         };
 
         prev_it3 = prev_it2;
@@ -452,7 +514,6 @@ pub fn ehlers_itrend_with_kernel(
     Ok(EhlersITrendOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn ehlers_itrend_into(
     input: &EhlersITrendInput,
     out: &mut [f64],
@@ -485,7 +546,7 @@ pub fn ehlers_itrend_scalar(
     src: &[f64],
     warmup_bars: usize,
     max_dc: usize,
-    first_valid: usize,
+    _first_valid: usize,
     out: &mut [f64],
 ) {
     debug_assert_eq!(src.len(), out.len());
@@ -527,7 +588,7 @@ fn ehlers_itrend_safe_scalar(src: &[f64], warmup_bars: usize, max_dc: usize, out
         let x1 = if i >= 1 { src[i - 1] } else { 0.0 };
         let x2 = if i >= 2 { src[i - 2] } else { 0.0 };
         let x3 = if i >= 3 { src[i - 3] } else { 0.0 };
-        let fir_val = (4.0 * x0 + 3.0 * x1 + 2.0 * x2 + x3) / 10.0;
+        let fir_val = itrend_wma4_v1(x0, x1, x2, x3);
         fir_buf[ring_ptr] = fir_val;
 
         #[inline(always)]
@@ -539,7 +600,7 @@ fn ehlers_itrend_safe_scalar(src: &[f64], warmup_bars: usize, max_dc: usize, out
         let fir_4 = get_ring(&fir_buf, ring_ptr, 4);
         let fir_6 = get_ring(&fir_buf, ring_ptr, 6);
 
-        let h_in = 0.0962 * fir_0 + 0.5769 * fir_2 - 0.5769 * fir_4 - 0.0962 * fir_6;
+        let h_in = itrend_hilbert4_v1(fir_0, fir_2, fir_4, fir_6);
         let period_mult = 0.075 * prev_mesa + 0.54;
         let det_val = h_in * period_mult;
         det_buf[ring_ptr] = det_val;
@@ -551,7 +612,7 @@ fn ehlers_itrend_safe_scalar(src: &[f64], warmup_bars: usize, max_dc: usize, out
         let det_2 = get_ring(&det_buf, ring_ptr, 2);
         let det_4 = get_ring(&det_buf, ring_ptr, 4);
         let det_6 = get_ring(&det_buf, ring_ptr, 6);
-        let h_in_q1 = 0.0962 * det_0 + 0.5769 * det_2 - 0.5769 * det_4 - 0.0962 * det_6;
+        let h_in_q1 = itrend_hilbert4_v1(det_0, det_2, det_4, det_6);
         let q1_val = h_in_q1 * period_mult;
         q1_buf[ring_ptr] = q1_val;
 
@@ -559,13 +620,13 @@ fn ehlers_itrend_safe_scalar(src: &[f64], warmup_bars: usize, max_dc: usize, out
         let i1_2 = get_ring(&i1_buf, ring_ptr, 2);
         let i1_4 = get_ring(&i1_buf, ring_ptr, 4);
         let i1_6 = get_ring(&i1_buf, ring_ptr, 6);
-        let j_i_val = (0.0962 * i1_0 + 0.5769 * i1_2 - 0.5769 * i1_4 - 0.0962 * i1_6) * period_mult;
+        let j_i_val = itrend_hilbert4_v1(i1_0, i1_2, i1_4, i1_6) * period_mult;
 
         let q1_0 = get_ring(&q1_buf, ring_ptr, 0);
         let q1_2 = get_ring(&q1_buf, ring_ptr, 2);
         let q1_4 = get_ring(&q1_buf, ring_ptr, 4);
         let q1_6 = get_ring(&q1_buf, ring_ptr, 6);
-        let j_q_val = (0.0962 * q1_0 + 0.5769 * q1_2 - 0.5769 * q1_4 - 0.0962 * q1_6) * period_mult;
+        let j_q_val = itrend_hilbert4_v1(q1_0, q1_2, q1_4, q1_6) * period_mult;
 
         let mut i2_cur = i1_val - j_q_val;
         let mut q2_cur = q1_val + j_i_val;
@@ -582,48 +643,21 @@ fn ehlers_itrend_safe_scalar(src: &[f64], warmup_bars: usize, max_dc: usize, out
         prev_re = re_smooth;
         prev_im = im_smooth;
 
-        let mut new_mesa = 0.0;
-        if re_smooth != 0.0 && im_smooth != 0.0 {
-            let angle = im_smooth.atan2(re_smooth);
-            if angle != 0.0 {
-                new_mesa = (2.0 * PI) / angle;
-            }
-        }
-        let up_lim = 1.5 * prev_mesa;
-        if new_mesa > up_lim {
-            new_mesa = up_lim;
-        }
-        let low_lim = 0.67 * prev_mesa;
-        if new_mesa < low_lim {
-            new_mesa = low_lim;
-        }
-        new_mesa = new_mesa.clamp(6.0, 50.0);
-        let final_mesa = 0.2 * new_mesa + 0.8 * prev_mesa;
+        let (final_mesa, sp_val, dcp) =
+            itrend_period_v1(re_smooth, im_smooth, prev_mesa, prev_smooth, max_dc);
         prev_mesa = final_mesa;
-        let sp_val = 0.33 * final_mesa + 0.67 * prev_smooth;
         prev_smooth = sp_val;
-        let mut dcp = (sp_val + 0.5).floor() as i32;
-        if dcp < 1 {
-            dcp = 1;
-        }
-        if dcp as usize > max_dc {
-            dcp = max_dc as i32;
-        }
 
         sum_ring[sum_idx] = x0;
         sum_idx = (sum_idx + 1) % max_dc;
-        let mut sum_src = 0.0;
-        let mut idx2 = sum_idx;
-        for _ in 0..dcp {
-            idx2 = if idx2 == 0 { max_dc - 1 } else { idx2 - 1 };
-            sum_src += sum_ring[idx2];
-        }
-        let it_val = sum_src / dcp as f64;
+        let oldest = itrend_ring_oldest_v1(sum_idx, dcp, max_dc);
+        let it_val =
+            itrend_stable_window_mean_v1(dcp, |offset| sum_ring[(oldest + offset) % max_dc]);
 
         let eit_val = if i < warmup_bars {
             x0
         } else {
-            (4.0 * it_val + 3.0 * prev_it1 + 2.0 * prev_it2 + prev_it3) / 10.0
+            itrend_wma4_v1(it_val, prev_it1, prev_it2, prev_it3)
         };
         prev_it3 = prev_it2;
         prev_it2 = prev_it1;
@@ -662,11 +696,6 @@ pub unsafe fn ehlers_itrend_unsafe_scalar(
     let (mut mesa_p, mut sm_p) = (0.0, 0.0);
     let (mut it1p, mut it2p, mut it3p) = (0.0, 0.0, 0.0);
 
-    const C0: f64 = 0.0962;
-    const C1: f64 = 0.5769;
-    const DIV10: f64 = 0.1;
-    const TWO_PI: f64 = core::f64::consts::PI * 2.0;
-
     let mut rp = 0;
     let mut sp = 0;
 
@@ -686,26 +715,41 @@ pub unsafe fn ehlers_itrend_unsafe_scalar(
         } else {
             0.0
         };
-        let fir_val = (4.0 * x0 + 3.0 * x1 + 2.0 * x2 + x3) * DIV10;
+        let fir_val = itrend_wma4_v1(x0, x1, x2, x3);
         *fir.get_unchecked_mut(rp) = fir_val;
 
-        let hp =
-            C0 * (r7(&fir, rp, 0) - r7(&fir, rp, 6)) + C1 * (r7(&fir, rp, 2) - r7(&fir, rp, 4));
+        let hp = itrend_hilbert4_v1(
+            r7(&fir, rp, 0),
+            r7(&fir, rp, 2),
+            r7(&fir, rp, 4),
+            r7(&fir, rp, 6),
+        );
         let period_mult = 0.075 * mesa_p + 0.54;
         let det_val = hp * period_mult;
         *det.get_unchecked_mut(rp) = det_val;
 
         let i1v = r7(&det, rp, 3);
-        let q1v = (C0 * (r7(&det, rp, 0) - r7(&det, rp, 6))
-            + C1 * (r7(&det, rp, 2) - r7(&det, rp, 4)))
-            * period_mult;
+        let q1v = itrend_hilbert4_v1(
+            r7(&det, rp, 0),
+            r7(&det, rp, 2),
+            r7(&det, rp, 4),
+            r7(&det, rp, 6),
+        ) * period_mult;
         *i1.get_unchecked_mut(rp) = i1v;
         *q1.get_unchecked_mut(rp) = q1v;
 
-        let j_i = (C0 * (r7(&i1, rp, 0) - r7(&i1, rp, 6)) + C1 * (r7(&i1, rp, 2) - r7(&i1, rp, 4)))
-            * period_mult;
-        let j_q = (C0 * (r7(&q1, rp, 0) - r7(&q1, rp, 6)) + C1 * (r7(&q1, rp, 2) - r7(&q1, rp, 4)))
-            * period_mult;
+        let j_i = itrend_hilbert4_v1(
+            r7(&i1, rp, 0),
+            r7(&i1, rp, 2),
+            r7(&i1, rp, 4),
+            r7(&i1, rp, 6),
+        ) * period_mult;
+        let j_q = itrend_hilbert4_v1(
+            r7(&q1, rp, 0),
+            r7(&q1, rp, 2),
+            r7(&q1, rp, 4),
+            r7(&q1, rp, 6),
+        ) * period_mult;
 
         let mut i2 = 0.2 * (i1v - j_q) + 0.8 * i2p;
         let mut q2 = 0.2 * (q1v + j_i) + 0.8 * q2p;
@@ -717,19 +761,9 @@ pub unsafe fn ehlers_itrend_unsafe_scalar(
         rep = re;
         imp = im;
 
-        let mut mesa = if re != 0.0 && im != 0.0 {
-            TWO_PI / im.atan2(re)
-        } else {
-            0.0
-        };
-        mesa = mesa.clamp(0.67 * mesa_p, 1.5 * mesa_p).clamp(6.0, 50.0);
-        let mesa_f = 0.2 * mesa + 0.8 * mesa_p;
+        let (mesa_f, sp_v, dcp) = itrend_period_v1(re, im, mesa_p, sm_p, max_dc);
         mesa_p = mesa_f;
-
-        let sp_v = 0.33 * mesa_f + 0.67 * sm_p;
         sm_p = sp_v;
-
-        let dcp = sp_v.round().clamp(1.0, max_dc as f64) as usize;
 
         *sum.get_unchecked_mut(sp) = x0;
         sp += 1;
@@ -737,18 +771,15 @@ pub unsafe fn ehlers_itrend_unsafe_scalar(
             sp = 0;
         }
 
-        let mut acc = 0.0;
-        let mut j = sp;
-        for _ in 0..dcp {
-            j = if j == 0 { max_dc - 1 } else { j - 1 };
-            acc += *sum.get_unchecked(j);
-        }
-        let it = acc / dcp as f64;
+        let oldest = itrend_ring_oldest_v1(sp, dcp, max_dc);
+        let it = itrend_stable_window_mean_v1(dcp, |offset| unsafe {
+            *sum.get_unchecked((oldest + offset) % max_dc)
+        });
 
         out[idx] = if idx < warmup {
             x0
         } else {
-            (4.0 * it + 3.0 * it1p + 2.0 * it2p + it3p) * DIV10
+            itrend_wma4_v1(it, it1p, it2p, it3p)
         };
 
         it3p = it2p;
@@ -864,9 +895,6 @@ pub struct EhlersITrendStream {
     sum_ring: Vec<f64>,
     sum_idx: usize,
 
-    cum_ring: Vec<f64>,
-    cum_idx: usize,
-
     wma_hist: [f64; 3],
     prev_it1: f64,
     prev_it2: f64,
@@ -899,8 +927,6 @@ impl EhlersITrendStream {
             prev_smooth: 0.0,
             sum_ring: vec![0.0; max_dc],
             sum_idx: 0,
-            cum_ring: vec![0.0; max_dc + 1],
-            cum_idx: 0,
             wma_hist: [0.0; 3],
             prev_it1: 0.0,
             prev_it2: 0.0,
@@ -920,12 +946,7 @@ impl EhlersITrendStream {
             }
             buf[idx]
         }
-        const C0: f64 = 0.0962;
-        const C1: f64 = 0.5769;
-        const DIV10: f64 = 0.1;
-
-        let fir_val =
-            (4.0 * x0 + 3.0 * self.wma_hist[0] + 2.0 * self.wma_hist[1] + self.wma_hist[2]) * DIV10;
+        let fir_val = itrend_wma4_v1(x0, self.wma_hist[0], self.wma_hist[1], self.wma_hist[2]);
 
         self.wma_hist[2] = self.wma_hist[1];
         self.wma_hist[1] = self.wma_hist[0];
@@ -944,7 +965,7 @@ impl EhlersITrendStream {
         let fir_4 = r7(&self.fir_buf, self.ring_ptr, 4);
         let fir_6 = r7(&self.fir_buf, self.ring_ptr, 6);
 
-        let h_in = C0 * (fir_0 - fir_6) + C1 * (fir_2 - fir_4);
+        let h_in = itrend_hilbert4_v1(fir_0, fir_2, fir_4, fir_6);
         let period_mult = 0.075 * self.prev_mesa + 0.54;
 
         let det_val = h_in * period_mult;
@@ -957,7 +978,7 @@ impl EhlersITrendStream {
         let det_2 = r7(&self.det_buf, self.ring_ptr, 2);
         let det_4 = r7(&self.det_buf, self.ring_ptr, 4);
         let det_6 = r7(&self.det_buf, self.ring_ptr, 6);
-        let h_in_q1 = C0 * (det_0 - det_6) + C1 * (det_2 - det_4);
+        let h_in_q1 = itrend_hilbert4_v1(det_0, det_2, det_4, det_6);
         let q1_val = h_in_q1 * period_mult;
         self.q1_buf[self.ring_ptr] = q1_val;
 
@@ -965,13 +986,13 @@ impl EhlersITrendStream {
         let i1_2 = r7(&self.i1_buf, self.ring_ptr, 2);
         let i1_4 = r7(&self.i1_buf, self.ring_ptr, 4);
         let i1_6 = r7(&self.i1_buf, self.ring_ptr, 6);
-        let j_i_val = (C0 * (i1_0 - i1_6) + C1 * (i1_2 - i1_4)) * period_mult;
+        let j_i_val = itrend_hilbert4_v1(i1_0, i1_2, i1_4, i1_6) * period_mult;
 
         let q1_0 = r7(&self.q1_buf, self.ring_ptr, 0);
         let q1_2 = r7(&self.q1_buf, self.ring_ptr, 2);
         let q1_4 = r7(&self.q1_buf, self.ring_ptr, 4);
         let q1_6 = r7(&self.q1_buf, self.ring_ptr, 6);
-        let j_q_val = (C0 * (q1_0 - q1_6) + C1 * (q1_2 - q1_4)) * period_mult;
+        let j_q_val = itrend_hilbert4_v1(q1_0, q1_2, q1_4, q1_6) * period_mult;
 
         let mut i2_cur = 0.2 * (i1_val - j_q_val) + 0.8 * self.prev_i2;
         let mut q2_cur = 0.2 * (q1_val + j_i_val) + 0.8 * self.prev_q2;
@@ -986,53 +1007,25 @@ impl EhlersITrendStream {
         self.prev_re = re_smooth;
         self.prev_im = im_smooth;
 
-        let mut new_mesa = if re_smooth != 0.0 && im_smooth != 0.0 {
-            let angle = im_smooth.atan2(re_smooth);
-            if angle != 0.0 {
-                (2.0 * core::f64::consts::PI) / angle
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        let up_lim = 1.5 * self.prev_mesa;
-        if new_mesa > up_lim {
-            new_mesa = up_lim;
-        }
-        let low_lim = 0.67 * self.prev_mesa;
-        if new_mesa < low_lim {
-            new_mesa = low_lim;
-        }
-        new_mesa = new_mesa.clamp(6.0, 50.0);
-
-        let final_mesa = 0.2 * new_mesa + 0.8 * self.prev_mesa;
+        let (final_mesa, sp_val, dcp) = itrend_period_v1(
+            re_smooth,
+            im_smooth,
+            self.prev_mesa,
+            self.prev_smooth,
+            self.max_dc,
+        );
         self.prev_mesa = final_mesa;
-        let sp_val = 0.33 * final_mesa + 0.67 * self.prev_smooth;
         self.prev_smooth = sp_val;
 
-        let mut dcp_i = (sp_val + 0.5).floor() as i32;
-        if dcp_i < 1 {
-            dcp_i = 1;
-        }
-        if dcp_i as usize > self.max_dc {
-            dcp_i = self.max_dc as i32;
-        }
-        let dcp = dcp_i as usize;
-
-        let mut sum_src = 0.0;
-        let mut idx2 = self.sum_idx;
-        for _ in 0..dcp {
-            idx2 = if idx2 == 0 { self.max_dc - 1 } else { idx2 - 1 };
-            sum_src += self.sum_ring[idx2];
-        }
-        let it_val = sum_src / dcp as f64;
+        let oldest = itrend_ring_oldest_v1(self.sum_idx, dcp, self.max_dc);
+        let it_val = itrend_stable_window_mean_v1(dcp, |offset| {
+            self.sum_ring[(oldest + offset) % self.max_dc]
+        });
 
         let eit_val = if self.bar < self.warmup_bars {
             x0
         } else {
-            (4.0 * it_val + 3.0 * self.prev_it1 + 2.0 * self.prev_it2 + self.prev_it3) * DIV10
+            itrend_wma4_v1(it_val, self.prev_it1, self.prev_it2, self.prev_it3)
         };
 
         self.prev_it3 = self.prev_it2;
@@ -1236,7 +1229,7 @@ fn ehlers_itrend_batch_inner_into(
             let x1 = if i >= 1 { src[i - 1] } else { 0.0 };
             let x2 = if i >= 2 { src[i - 2] } else { 0.0 };
             let x3 = if i >= 3 { src[i - 3] } else { 0.0 };
-            fir.push((4.0 * x0 + 3.0 * x1 + 2.0 * x2 + x3) / 10.0);
+            fir.push(itrend_wma4_v1(x0, x1, x2, x3));
         }
         fir
     }
@@ -1427,7 +1420,7 @@ fn ehlers_itrend_row_scalar_tail_with_fir(
         let fir_4 = ring_get(&fir_buf, ring_ptr, 4);
         let fir_6 = ring_get(&fir_buf, ring_ptr, 6);
 
-        let h_in = 0.0962 * fir_0 + 0.5769 * fir_2 - 0.5769 * fir_4 - 0.0962 * fir_6;
+        let h_in = itrend_hilbert4_v1(fir_0, fir_2, fir_4, fir_6);
         let period_mult = 0.075 * prev_mesa + 0.54;
         let det_val = h_in * period_mult;
         det_buf[ring_ptr] = det_val;
@@ -1439,7 +1432,7 @@ fn ehlers_itrend_row_scalar_tail_with_fir(
         let det_2 = ring_get(&det_buf, ring_ptr, 2);
         let det_4 = ring_get(&det_buf, ring_ptr, 4);
         let det_6 = ring_get(&det_buf, ring_ptr, 6);
-        let h_in_q1 = 0.0962 * det_0 + 0.5769 * det_2 - 0.5769 * det_4 - 0.0962 * det_6;
+        let h_in_q1 = itrend_hilbert4_v1(det_0, det_2, det_4, det_6);
         let q1_val = h_in_q1 * period_mult;
         q1_buf[ring_ptr] = q1_val;
 
@@ -1447,13 +1440,13 @@ fn ehlers_itrend_row_scalar_tail_with_fir(
         let i1_2 = ring_get(&i1_buf, ring_ptr, 2);
         let i1_4 = ring_get(&i1_buf, ring_ptr, 4);
         let i1_6 = ring_get(&i1_buf, ring_ptr, 6);
-        let j_i_val = (0.0962 * i1_0 + 0.5769 * i1_2 - 0.5769 * i1_4 - 0.0962 * i1_6) * period_mult;
+        let j_i_val = itrend_hilbert4_v1(i1_0, i1_2, i1_4, i1_6) * period_mult;
 
         let q1_0 = ring_get(&q1_buf, ring_ptr, 0);
         let q1_2 = ring_get(&q1_buf, ring_ptr, 2);
         let q1_4 = ring_get(&q1_buf, ring_ptr, 4);
         let q1_6 = ring_get(&q1_buf, ring_ptr, 6);
-        let j_q_val = (0.0962 * q1_0 + 0.5769 * q1_2 - 0.5769 * q1_4 - 0.0962 * q1_6) * period_mult;
+        let j_q_val = itrend_hilbert4_v1(q1_0, q1_2, q1_4, q1_6) * period_mult;
 
         let mut i2_cur = i1_val - j_q_val;
         let mut q2_cur = q1_val + j_i_val;
@@ -1470,51 +1463,24 @@ fn ehlers_itrend_row_scalar_tail_with_fir(
         prev_re = re_smooth;
         prev_im = im_smooth;
 
-        let mut new_mesa = 0.0;
-        if re_smooth != 0.0 && im_smooth != 0.0 {
-            let angle = im_smooth.atan2(re_smooth);
-            if angle != 0.0 {
-                new_mesa = (2.0 * core::f64::consts::PI) / angle;
-            }
-        }
-        let up_lim = 1.5 * prev_mesa;
-        if new_mesa > up_lim {
-            new_mesa = up_lim;
-        }
-        let low_lim = 0.67 * prev_mesa;
-        if new_mesa < low_lim {
-            new_mesa = low_lim;
-        }
-        new_mesa = new_mesa.clamp(6.0, 50.0);
-        let final_mesa = 0.2 * new_mesa + 0.8 * prev_mesa;
+        let (final_mesa, sp_val, dcp) =
+            itrend_period_v1(re_smooth, im_smooth, prev_mesa, prev_smooth, max_dc);
         prev_mesa = final_mesa;
-        let sp_val = 0.33 * final_mesa + 0.67 * prev_smooth;
         prev_smooth = sp_val;
-
-        let mut dcp = (sp_val + 0.5).floor() as usize;
-        if dcp == 0 {
-            dcp = 1;
-        } else if dcp > max_dc {
-            dcp = max_dc;
-        }
 
         sum_ring[sum_idx] = x0;
         sum_idx += 1;
         if sum_idx == max_dc {
             sum_idx = 0;
         }
-        let mut sum_src = 0.0;
-        let mut idx2 = sum_idx;
-        for _ in 0..dcp {
-            idx2 = if idx2 == 0 { max_dc - 1 } else { idx2 - 1 };
-            sum_src += sum_ring[idx2];
-        }
-        let it_val = sum_src / dcp as f64;
+        let oldest = itrend_ring_oldest_v1(sum_idx, dcp, max_dc);
+        let it_val =
+            itrend_stable_window_mean_v1(dcp, |offset| sum_ring[(oldest + offset) % max_dc]);
 
         let eit_val = if i < warmup_bars {
             x0
         } else {
-            (4.0 * it_val + 3.0 * prev_it1 + 2.0 * prev_it2 + prev_it3) / 10.0
+            itrend_wma4_v1(it_val, prev_it1, prev_it2, prev_it3)
         };
 
         prev_it3 = prev_it2;
@@ -1532,429 +1498,158 @@ fn ehlers_itrend_row_scalar_tail_with_fir(
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_itrend")]
-#[pyo3(signature = (data, warmup_bars, max_dc_period, kernel=None))]
-pub fn ehlers_itrend_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    warmup_bars: usize,
-    max_dc_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let kern = validate_kernel(kernel, false)?;
-    let params = EhlersITrendParams {
-        warmup_bars: Some(warmup_bars),
-        max_dc_period: Some(max_dc_period),
-    };
-
-    let result_vec: Vec<f64> = if let Ok(slice_in) = data.as_slice() {
-        let input = EhlersITrendInput::from_slice(slice_in, params);
-        py.allow_threads(|| ehlers_itrend_with_kernel(&input, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    } else {
-        let owned = data.as_array().to_owned();
-        let slice_in = owned.as_slice().expect("owned array should be contiguous");
-        let input = EhlersITrendInput::from_slice(slice_in, params);
-        py.allow_threads(|| ehlers_itrend_with_kernel(&input, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    };
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_itrend_batch")]
-#[pyo3(signature = (data, warmup_range, max_dc_range, kernel=None))]
-pub fn ehlers_itrend_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    warmup_range: (usize, usize, usize),
-    max_dc_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let sweep = EhlersITrendBatchRange {
-        warmup_bars: warmup_range,
-        max_dc_period: max_dc_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let simd = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-
-        let simd = match simd {
-            Kernel::ScalarBatch => Kernel::Scalar,
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2Batch => Kernel::Avx2,
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512Batch => Kernel::Avx512,
-            _ => Kernel::Scalar,
-        };
-        ehlers_itrend_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "warmups",
-        combos
-            .iter()
-            .map(|p| p.warmup_bars.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "max_dcs",
-        combos
-            .iter()
-            .map(|p| p.max_dc_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ehlers_itrend_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, warmup_range=(12, 12, 0), max_dc_range=(50, 50, 0), device_id=0))]
-pub fn ehlers_itrend_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    warmup_range: (usize, usize, usize),
-    max_dc_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32ITrendPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = EhlersITrendBatchRange {
-        warmup_bars: warmup_range,
-        max_dc_period: max_dc_range,
-    };
-
-    let cuda = Arc::new(
-        CudaEhlersITrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?,
-    );
-    let inner = py.allow_threads(|| -> PyResult<_> {
-        cuda.ehlers_itrend_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32ITrendPy { inner, guard: cuda })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ehlers_itrend_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, warmup_bars=12, max_dc_period=50, device_id=0))]
-pub fn ehlers_itrend_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    warmup_bars: usize,
-    max_dc_period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32ITrendPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if warmup_bars == 0 {
-        return Err(PyValueError::new_err("warmup_bars must be positive"));
-    }
-    if max_dc_period == 0 {
-        return Err(PyValueError::new_err("max_dc_period must be positive"));
-    }
-
-    let flat = data_tm_f32.as_slice()?;
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("time-major matrix must be 2D"));
-    }
-    let series_len = shape[0];
-    let num_series = shape[1];
-    let params = EhlersITrendParams {
-        warmup_bars: Some(warmup_bars),
-        max_dc_period: Some(max_dc_period),
-    };
-
-    let cuda = Arc::new(
-        CudaEhlersITrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?,
-    );
-    let inner = py.allow_threads(|| -> PyResult<_> {
-        cuda.ehlers_itrend_many_series_one_param_time_major_dev(
-            flat, num_series, series_len, &params,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32ITrendPy { inner, guard: cuda })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32ITrendPy {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) guard: Arc<CudaEhlersITrend>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32ITrendPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-
-        d.set_item("typestr", "<f4")?;
-
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.guard.device_id() as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_itrend_js(
-    data: &[f64],
-    warmup_bars: usize,
-    max_dc_period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let input = EhlersITrendInput::from_slice(
-        data,
-        EhlersITrendParams {
-            warmup_bars: Some(warmup_bars),
-            max_dc_period: Some(max_dc_period),
-        },
-    );
-    let mut out = vec![0.0; data.len()];
-    ehlers_itrend_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_itrend_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    core::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_itrend_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_itrend_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    warmup_bars: usize,
-    max_dc_period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(in_ptr, len);
-        let params = EhlersITrendParams {
-            warmup_bars: Some(warmup_bars),
-            max_dc_period: Some(max_dc_period),
-        };
-        let input = EhlersITrendInput::from_slice(data, params);
-        if core::ptr::eq(in_ptr, out_ptr) {
-            let mut tmp = vec![0.0; len];
-            ehlers_itrend_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            core::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = core::slice::from_raw_parts_mut(out_ptr, len);
-            ehlers_itrend_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersBatchConfig {
-    pub warmup_range: (usize, usize, usize),
-    pub max_dc_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersITrendBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<EhlersITrendParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_itrend_batch)]
-pub fn ehlers_itrend_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: EhlersBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = EhlersITrendBatchRange {
-        warmup_bars: cfg.warmup_range,
-        max_dc_period: cfg.max_dc_range,
-    };
-    let out = ehlers_itrend_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = EhlersITrendBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersITrendStream")]
-pub struct EhlersITrendStreamPy {
-    stream: EhlersITrendStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersITrendStreamPy {
-    #[new]
-    fn new(warmup_bars: Option<usize>, max_dc_period: Option<usize>) -> PyResult<Self> {
-        let params = EhlersITrendParams {
-            warmup_bars,
-            max_dc_period,
-        };
-        let stream = EhlersITrendStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(EhlersITrendStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_itrend_output_into_js(
-    data: &[f64],
-    warmup_bars: usize,
-    max_dc_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ehlers_itrend_js(data, warmup_bars, max_dc_period)?;
-    crate::write_wasm_f64_output("ehlers_itrend_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_itrend_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_itrend_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_itrend_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
+
+    fn reviewed_routeable_subset_close_v3() -> Vec<f64> {
+        const WAVE: [f64; 11] = [
+            0.000_041, -0.000_027, 0.000_013, -0.000_036, 0.000_022, -0.000_009, 0.000_033,
+            -0.000_019, 0.000_006, -0.000_031, 0.000_017,
+        ];
+        (0..64)
+            .map(|row| 1.075 + row as f64 * 0.000_000_7 + WAVE[row % WAVE.len()])
+            .collect()
+    }
+
+    #[test]
+    fn stable_window_mean_f64_authority_covers_offsets_extremes_subnormals_and_gaps() {
+        fn assert_mean_bits(values: &[f64], expected_bits: u64) {
+            let actual = itrend_stable_window_mean_v1(values.len(), |index| values[index]);
+            assert_eq!(actual.to_bits(), expected_bits, "values={values:?}");
+        }
+
+        let fixture = reviewed_routeable_subset_close_v3();
+        assert_mean_bits(&fixture[11..25], 0x3ff1_3342_d0f8_8cca);
+
+        let offset = (0..37)
+            .map(|index| {
+                2.0_f64.powi(50)
+                    + ((index % 17) as f64 - 8.0) * 0.25
+                    + ((index * 7) % 5) as f64 * 0.125
+            })
+            .collect::<Vec<_>>();
+        assert_mean_bits(&offset, 0x4310_0000_0000_0000);
+
+        let huge = (0..43)
+            .map(|index| 1e300 * (1.0 + ((index % 19) as f64 - 9.0) * 2.0_f64.powi(-49)))
+            .collect::<Vec<_>>();
+        assert_mean_bits(&huge, 0x7e37_e43c_8800_7592);
+
+        let subnormal = (0..29)
+            .map(|index| ((index % 13) as f64 - 6.0) * f64::from_bits(1))
+            .collect::<Vec<_>>();
+        assert_mean_bits(&subnormal, 0x8000_0000_0000_0001);
+
+        let alternating = (0..31)
+            .map(|index| {
+                (if index % 2 == 0 { 1e250 } else { -1e250 }) + ((index % 7) as f64 - 3.0) * 1e235
+            })
+            .collect::<Vec<_>>();
+        assert_mean_bits(&alternating, 0x7387_116f_249e_43fe);
+
+        assert_mean_bits(&[0.0, -0.0, 0.0], 0);
+        assert_eq!(
+            itrend_stable_window_mean_v1(3, |index| [1.0, f64::NAN, 2.0][index]).to_bits(),
+            0x7ff8_0000_0000_0000
+        );
+    }
+
+    #[test]
+    fn stable_f64_authority_is_bit_exact_across_scalar_batch_legacy_and_stream_routes()
+    -> Result<(), Box<dyn Error>> {
+        const ROW: usize = 24;
+        const EXPECTED_BITS: u64 = 0x3ff1_3341_e8f7_49b5;
+        let data = reviewed_routeable_subset_close_v3();
+        let params = EhlersITrendParams {
+            warmup_bars: Some(20),
+            max_dc_period: Some(14),
+        };
+        let input = EhlersITrendInput::from_slice(&data, params.clone());
+
+        let scalar = ehlers_itrend_with_kernel(&input, Kernel::Scalar)?.values;
+        let auto = ehlers_itrend_with_kernel(&input, Kernel::Auto)?.values;
+        let mut into = vec![0.0; data.len()];
+        ehlers_itrend_into_slice(&mut into, &input, Kernel::Scalar)?;
+
+        let sweep = EhlersITrendBatchRange {
+            warmup_bars: (20, 20, 0),
+            max_dc_period: (14, 14, 0),
+        };
+        let batch = ehlers_itrend_batch_with_kernel(&data, &sweep, Kernel::ScalarBatch)?;
+
+        let mut legacy = vec![0.0; data.len()];
+        ehlers_itrend_scalar(&data, 20, 14, 0, &mut legacy);
+
+        let mut stream = EhlersITrendStream::try_new(params)?;
+        let streamed = data
+            .iter()
+            .map(|&value| stream.update(value).unwrap_or(f64::NAN))
+            .collect::<Vec<_>>();
+
+        for (route, value) in [
+            ("scalar", scalar[ROW]),
+            ("auto", auto[ROW]),
+            ("into", into[ROW]),
+            ("batch", batch.values[ROW]),
+            ("legacy", legacy[ROW]),
+            ("stream", streamed[ROW]),
+        ] {
+            assert_eq!(
+                value.to_bits(),
+                EXPECTED_BITS,
+                "{route} lost the stable f64 authority at reviewed fixture row {ROW}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nonfinite_gap_fails_closed_without_f64_route_drift() -> Result<(), Box<dyn Error>> {
+        let mut data = reviewed_routeable_subset_close_v3();
+        data[30] = f64::NAN;
+        let params = EhlersITrendParams {
+            warmup_bars: Some(20),
+            max_dc_period: Some(14),
+        };
+        let input = EhlersITrendInput::from_slice(&data, params.clone());
+
+        let authority = ehlers_itrend_with_kernel(&input, Kernel::Scalar)?.values;
+        let sweep = EhlersITrendBatchRange {
+            warmup_bars: (20, 20, 0),
+            max_dc_period: (14, 14, 0),
+        };
+        let batch = ehlers_itrend_batch_with_kernel(&data, &sweep, Kernel::ScalarBatch)?.values;
+
+        let mut safe = vec![0.0; data.len()];
+        ehlers_itrend_safe_scalar(&data, 20, 14, &mut safe);
+        let mut unchecked = vec![0.0; data.len()];
+        unsafe { ehlers_itrend_unsafe_scalar(&data, 20, 14, &mut unchecked) };
+
+        let mut stream = EhlersITrendStream::try_new(params)?;
+        let streamed = data
+            .iter()
+            .map(|&value| stream.update(value).unwrap_or_else(itrend_qnan_v1))
+            .collect::<Vec<_>>();
+
+        for row in 20..data.len() {
+            for (route, value) in [
+                ("batch", batch[row]),
+                ("safe", safe[row]),
+                ("unchecked", unchecked[row]),
+                ("stream", streamed[row]),
+            ] {
+                assert_eq!(
+                    value.to_bits(),
+                    authority[row].to_bits(),
+                    "{route} drifted from the f64 authority at gapped row {row}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_ehlers_itrend_into_matches_api() -> Result<(), Box<dyn Error>> {
@@ -1968,13 +1663,8 @@ mod tests {
         let baseline = ehlers_itrend(&input)?.values;
 
         let mut out = vec![0.0; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             ehlers_itrend_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            ehlers_itrend_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1998,8 +1688,8 @@ mod tests {
 
     fn check_itrend_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = EhlersITrendParams {
             warmup_bars: None,
             max_dc_period: None,
@@ -2012,8 +1702,8 @@ mod tests {
 
     fn check_itrend_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EhlersITrendInput::with_default_candles(&candles);
         let result = ehlers_itrend_with_kernel(&input, kernel)?;
 
@@ -2036,8 +1726,8 @@ mod tests {
 
     fn check_itrend_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EhlersITrendInput::with_default_candles(&candles);
         match input.data {
             EhlersITrendData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -2120,8 +1810,8 @@ mod tests {
 
     fn check_itrend_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = EhlersITrendParams {
             warmup_bars: Some(12),
             max_dc_period: Some(50),
@@ -2150,8 +1840,8 @@ mod tests {
 
     fn check_itrend_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EhlersITrendInput::from_candles(
             &candles,
             "close",
@@ -2177,8 +1867,8 @@ mod tests {
 
     fn check_itrend_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let warmup_bars = 12;
         let max_dc = 50;
         let input = EhlersITrendInput::from_candles(
@@ -2256,8 +1946,8 @@ mod tests {
     fn check_itrend_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_warmup_bars = vec![1, 5, 12, 20, 30];
         let test_max_dc_periods = vec![35, 40, 50, 60];
@@ -2358,7 +2048,7 @@ mod tests {
                     (Err(e1), Err(e2))
                         if std::mem::discriminant(&e1) == std::mem::discriminant(&e2) =>
                     {
-                        return Ok(())
+                        return Ok(());
                     }
                     (Err(e1), Err(e2)) => {
                         prop_assert!(false, "different errors: fast={:?} slow={:?}", e1, e2)
@@ -2449,32 +2139,40 @@ mod tests {
             })
             .unwrap();
 
-        assert!(ehlers_itrend(&EhlersITrendInput::from_slice(
-            &[],
-            EhlersITrendParams::default()
-        ))
-        .is_err());
-        assert!(ehlers_itrend(&EhlersITrendInput::from_slice(
-            &[f64::NAN; 12],
-            EhlersITrendParams::default()
-        ))
-        .is_err());
-        assert!(ehlers_itrend(&EhlersITrendInput::from_slice(
-            &[1.0; 5],
-            EhlersITrendParams {
-                warmup_bars: Some(8),
-                max_dc_period: Some(50)
-            }
-        ))
-        .is_err());
-        assert!(ehlers_itrend(&EhlersITrendInput::from_slice(
-            &[1.0; 5],
-            EhlersITrendParams {
-                warmup_bars: Some(0),
-                max_dc_period: Some(10)
-            }
-        ))
-        .is_err());
+        assert!(
+            ehlers_itrend(&EhlersITrendInput::from_slice(
+                &[],
+                EhlersITrendParams::default()
+            ))
+            .is_err()
+        );
+        assert!(
+            ehlers_itrend(&EhlersITrendInput::from_slice(
+                &[f64::NAN; 12],
+                EhlersITrendParams::default()
+            ))
+            .is_err()
+        );
+        assert!(
+            ehlers_itrend(&EhlersITrendInput::from_slice(
+                &[1.0; 5],
+                EhlersITrendParams {
+                    warmup_bars: Some(8),
+                    max_dc_period: Some(50)
+                }
+            ))
+            .is_err()
+        );
+        assert!(
+            ehlers_itrend(&EhlersITrendInput::from_slice(
+                &[1.0; 5],
+                EhlersITrendParams {
+                    warmup_bars: Some(0),
+                    max_dc_period: Some(10)
+                }
+            ))
+            .is_err()
+        );
 
         Ok(())
     }
@@ -2521,8 +2219,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = EhlersITrendBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2568,8 +2266,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_sources = vec!["open", "high", "low", "close", "hl2", "hlc3", "ohlc4"];
 
@@ -2642,7 +2340,17 @@ mod tests {
                 {
                     panic!(
                         "[{}] Found poison value {} (0x{:016X}) at row {} col {} with warmup_range({},{},{}) and max_dc_range({},{},{})",
-                        test, val, bits, row, col, warmup_start, warmup_end, warmup_step, max_dc_start, max_dc_end, max_dc_step
+                        test,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        warmup_start,
+                        warmup_end,
+                        warmup_step,
+                        max_dc_start,
+                        max_dc_end,
+                        max_dc_step
                     );
                 }
             }

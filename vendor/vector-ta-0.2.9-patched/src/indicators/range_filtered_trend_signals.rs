@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::mem::{ManuallyDrop, MaybeUninit};
@@ -65,10 +47,6 @@ pub struct RangeFilteredTrendSignalsOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RangeFilteredTrendSignalsParams {
     pub kalman_alpha: Option<f64>,
     pub kalman_beta: Option<f64>,
@@ -217,7 +195,9 @@ pub enum RangeFilteredTrendSignalsError {
     InvalidKalmanAlpha { kalman_alpha: f64 },
     #[error("range_filtered_trend_signals: invalid kalman_beta: {kalman_beta}")]
     InvalidKalmanBeta { kalman_beta: f64 },
-    #[error("range_filtered_trend_signals: invalid kalman_period: kalman_period = {kalman_period}, data length = {data_len}")]
+    #[error(
+        "range_filtered_trend_signals: invalid kalman_period: kalman_period = {kalman_period}, data length = {data_len}"
+    )]
     InvalidKalmanPeriod {
         kalman_period: usize,
         data_len: usize,
@@ -226,7 +206,9 @@ pub enum RangeFilteredTrendSignalsError {
     InvalidDev { dev: f64 },
     #[error("range_filtered_trend_signals: invalid supertrend_factor: {supertrend_factor}")]
     InvalidSupertrendFactor { supertrend_factor: f64 },
-    #[error("range_filtered_trend_signals: invalid supertrend_atr_period: supertrend_atr_period = {supertrend_atr_period}, data length = {data_len}")]
+    #[error(
+        "range_filtered_trend_signals: invalid supertrend_atr_period: supertrend_atr_period = {supertrend_atr_period}, data length = {data_len}"
+    )]
     InvalidSupertrendAtrPeriod {
         supertrend_atr_period: usize,
         data_len: usize,
@@ -235,9 +217,7 @@ pub enum RangeFilteredTrendSignalsError {
         "range_filtered_trend_signals: not enough valid data: needed = {needed}, valid = {valid}"
     )]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error(
-        "range_filtered_trend_signals: output length mismatch: expected {expected}, got {got}"
-    )]
+    #[error("range_filtered_trend_signals: output length mismatch: expected {expected}, got {got}")]
     OutputLengthMismatch { expected: usize, got: usize },
     #[error("range_filtered_trend_signals: invalid range: start={start}, end={end}, step={step}")]
     InvalidRange {
@@ -511,11 +491,7 @@ impl SuperTrendState {
         let direction = if !self.prev_atr_ready {
             1
         } else if self.prev_supertrend == Some(prev_upper_band) {
-            if k > upper_band {
-                -1
-            } else {
-                1
-            }
+            if k > upper_band { -1 } else { 1 }
         } else if k < lower_band {
             1
         } else {
@@ -1339,7 +1315,7 @@ pub fn range_filtered_trend_signals_batch_with_kernel(
         _ => {
             return Err(RangeFilteredTrendSignalsError::InvalidKernelForBatch(
                 kernel,
-            ))
+            ));
         }
     };
     let single_kernel = batch_kernel.to_non_batch();
@@ -1601,526 +1577,6 @@ unsafe fn assume_init_vec(buf: ManuallyDrop<Vec<MaybeUninit<f64>>>) -> Vec<f64> 
     Vec::from_raw_parts(buf.as_mut_ptr() as *mut f64, buf.len(), buf.capacity())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "range_filtered_trend_signals")]
-#[pyo3(signature = (high, low, close, kalman_alpha=DEFAULT_KALMAN_ALPHA, kalman_beta=DEFAULT_KALMAN_BETA, kalman_period=DEFAULT_KALMAN_PERIOD, dev=DEFAULT_DEV, supertrend_factor=DEFAULT_SUPERTREND_FACTOR, supertrend_atr_period=DEFAULT_SUPERTREND_ATR_PERIOD, kernel=None))]
-pub fn range_filtered_trend_signals_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    kalman_alpha: f64,
-    kalman_beta: f64,
-    kalman_period: usize,
-    dev: f64,
-    supertrend_factor: f64,
-    supertrend_atr_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = RangeFilteredTrendSignalsInput::from_slices(
-        high,
-        low,
-        close,
-        RangeFilteredTrendSignalsParams {
-            kalman_alpha: Some(kalman_alpha),
-            kalman_beta: Some(kalman_beta),
-            kalman_period: Some(kalman_period),
-            dev: Some(dev),
-            supertrend_factor: Some(supertrend_factor),
-            supertrend_atr_period: Some(supertrend_atr_period),
-        },
-    );
-    let output = py
-        .allow_threads(|| range_filtered_trend_signals_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("kalman", output.kalman.into_pyarray(py))?;
-    dict.set_item("supertrend", output.supertrend.into_pyarray(py))?;
-    dict.set_item("upper_band", output.upper_band.into_pyarray(py))?;
-    dict.set_item("lower_band", output.lower_band.into_pyarray(py))?;
-    dict.set_item("trend", output.trend.into_pyarray(py))?;
-    dict.set_item("kalman_trend", output.kalman_trend.into_pyarray(py))?;
-    dict.set_item("state", output.state.into_pyarray(py))?;
-    dict.set_item("market_trending", output.market_trending.into_pyarray(py))?;
-    dict.set_item("market_ranging", output.market_ranging.into_pyarray(py))?;
-    dict.set_item(
-        "short_term_bullish",
-        output.short_term_bullish.into_pyarray(py),
-    )?;
-    dict.set_item(
-        "short_term_bearish",
-        output.short_term_bearish.into_pyarray(py),
-    )?;
-    dict.set_item(
-        "long_term_bullish",
-        output.long_term_bullish.into_pyarray(py),
-    )?;
-    dict.set_item(
-        "long_term_bearish",
-        output.long_term_bearish.into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "range_filtered_trend_signals_batch")]
-#[pyo3(signature = (high, low, close, kalman_alpha_range, kalman_beta_range, kalman_period_range, dev_range, supertrend_factor_range, supertrend_atr_period_range, kernel=None))]
-pub fn range_filtered_trend_signals_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    kalman_alpha_range: (f64, f64, f64),
-    kalman_beta_range: (f64, f64, f64),
-    kalman_period_range: (usize, usize, usize),
-    dev_range: (f64, f64, f64),
-    supertrend_factor_range: (f64, f64, f64),
-    supertrend_atr_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            range_filtered_trend_signals_batch_with_kernel(
-                high,
-                low,
-                close,
-                &RangeFilteredTrendSignalsBatchRange {
-                    kalman_alpha: kalman_alpha_range,
-                    kalman_beta: kalman_beta_range,
-                    kalman_period: kalman_period_range,
-                    dev: dev_range,
-                    supertrend_factor: supertrend_factor_range,
-                    supertrend_atr_period: supertrend_atr_period_range,
-                },
-                kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let total = output.rows * output.cols;
-    let arrays = [
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-    ];
-    unsafe { arrays[0].as_slice_mut()? }.copy_from_slice(&output.kalman);
-    unsafe { arrays[1].as_slice_mut()? }.copy_from_slice(&output.supertrend);
-    unsafe { arrays[2].as_slice_mut()? }.copy_from_slice(&output.upper_band);
-    unsafe { arrays[3].as_slice_mut()? }.copy_from_slice(&output.lower_band);
-    unsafe { arrays[4].as_slice_mut()? }.copy_from_slice(&output.trend);
-    unsafe { arrays[5].as_slice_mut()? }.copy_from_slice(&output.kalman_trend);
-    unsafe { arrays[6].as_slice_mut()? }.copy_from_slice(&output.state);
-    unsafe { arrays[7].as_slice_mut()? }.copy_from_slice(&output.market_trending);
-    unsafe { arrays[8].as_slice_mut()? }.copy_from_slice(&output.market_ranging);
-    unsafe { arrays[9].as_slice_mut()? }.copy_from_slice(&output.short_term_bullish);
-    unsafe { arrays[10].as_slice_mut()? }.copy_from_slice(&output.short_term_bearish);
-    unsafe { arrays[11].as_slice_mut()? }.copy_from_slice(&output.long_term_bullish);
-    unsafe { arrays[12].as_slice_mut()? }.copy_from_slice(&output.long_term_bearish);
-
-    let dict = PyDict::new(py);
-    dict.set_item("kalman", arrays[0].reshape((output.rows, output.cols))?)?;
-    dict.set_item("supertrend", arrays[1].reshape((output.rows, output.cols))?)?;
-    dict.set_item("upper_band", arrays[2].reshape((output.rows, output.cols))?)?;
-    dict.set_item("lower_band", arrays[3].reshape((output.rows, output.cols))?)?;
-    dict.set_item("trend", arrays[4].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "kalman_trend",
-        arrays[5].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item("state", arrays[6].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "market_trending",
-        arrays[7].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "market_ranging",
-        arrays[8].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "short_term_bullish",
-        arrays[9].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "short_term_bearish",
-        arrays[10].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "long_term_bullish",
-        arrays[11].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "long_term_bearish",
-        arrays[12].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "kalman_alphas",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.kalman_alpha.unwrap_or(DEFAULT_KALMAN_ALPHA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "kalman_betas",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.kalman_beta.unwrap_or(DEFAULT_KALMAN_BETA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "kalman_periods",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.kalman_period.unwrap_or(DEFAULT_KALMAN_PERIOD) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "devs",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.dev.unwrap_or(DEFAULT_DEV))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "supertrend_factors",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.supertrend_factor.unwrap_or(DEFAULT_SUPERTREND_FACTOR))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "supertrend_atr_periods",
-        output
-            .combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .supertrend_atr_period
-                    .unwrap_or(DEFAULT_SUPERTREND_ATR_PERIOD) as u64
-            })
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RangeFilteredTrendSignalsStream")]
-pub struct RangeFilteredTrendSignalsStreamPy {
-    stream: RangeFilteredTrendSignalsStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RangeFilteredTrendSignalsStreamPy {
-    #[new]
-    #[pyo3(signature = (kalman_alpha=DEFAULT_KALMAN_ALPHA, kalman_beta=DEFAULT_KALMAN_BETA, kalman_period=DEFAULT_KALMAN_PERIOD, dev=DEFAULT_DEV, supertrend_factor=DEFAULT_SUPERTREND_FACTOR, supertrend_atr_period=DEFAULT_SUPERTREND_ATR_PERIOD))]
-    fn new(
-        kalman_alpha: f64,
-        kalman_beta: f64,
-        kalman_period: usize,
-        dev: f64,
-        supertrend_factor: f64,
-        supertrend_atr_period: usize,
-    ) -> PyResult<Self> {
-        let stream = RangeFilteredTrendSignalsStream::try_new(RangeFilteredTrendSignalsParams {
-            kalman_alpha: Some(kalman_alpha),
-            kalman_beta: Some(kalman_beta),
-            kalman_period: Some(kalman_period),
-            dev: Some(dev),
-            supertrend_factor: Some(supertrend_factor),
-            supertrend_atr_period: Some(supertrend_atr_period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<Vec<f64>> {
-        self.stream.update(high, low, close).map(|output| {
-            vec![
-                output.kalman,
-                output.supertrend,
-                output.upper_band,
-                output.lower_band,
-                output.trend,
-                output.kalman_trend,
-                output.state,
-                output.market_trending,
-                output.market_ranging,
-                output.short_term_bullish,
-                output.short_term_bearish,
-                output.long_term_bullish,
-                output.long_term_bearish,
-            ]
-        })
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_range_filtered_trend_signals_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(range_filtered_trend_signals_py, m)?)?;
-    m.add_function(wrap_pyfunction!(range_filtered_trend_signals_batch_py, m)?)?;
-    m.add_class::<RangeFilteredTrendSignalsStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeFilteredTrendSignalsJsOutput {
-    pub kalman: Vec<f64>,
-    pub supertrend: Vec<f64>,
-    pub upper_band: Vec<f64>,
-    pub lower_band: Vec<f64>,
-    pub trend: Vec<f64>,
-    pub kalman_trend: Vec<f64>,
-    pub state: Vec<f64>,
-    pub market_trending: Vec<f64>,
-    pub market_ranging: Vec<f64>,
-    pub short_term_bullish: Vec<f64>,
-    pub short_term_bearish: Vec<f64>,
-    pub long_term_bullish: Vec<f64>,
-    pub long_term_bearish: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_filtered_trend_signals_js)]
-pub fn range_filtered_trend_signals_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    kalman_alpha: f64,
-    kalman_beta: f64,
-    kalman_period: usize,
-    dev: f64,
-    supertrend_factor: f64,
-    supertrend_atr_period: usize,
-) -> Result<JsValue, JsValue> {
-    let input = RangeFilteredTrendSignalsInput::from_slices(
-        high,
-        low,
-        close,
-        RangeFilteredTrendSignalsParams {
-            kalman_alpha: Some(kalman_alpha),
-            kalman_beta: Some(kalman_beta),
-            kalman_period: Some(kalman_period),
-            dev: Some(dev),
-            supertrend_factor: Some(supertrend_factor),
-            supertrend_atr_period: Some(supertrend_atr_period),
-        },
-    );
-    let output = range_filtered_trend_signals_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&RangeFilteredTrendSignalsJsOutput {
-        kalman: output.kalman,
-        supertrend: output.supertrend,
-        upper_band: output.upper_band,
-        lower_band: output.lower_band,
-        trend: output.trend,
-        kalman_trend: output.kalman_trend,
-        state: output.state,
-        market_trending: output.market_trending,
-        market_ranging: output.market_ranging,
-        short_term_bullish: output.short_term_bullish,
-        short_term_bearish: output.short_term_bearish,
-        long_term_bullish: output.long_term_bullish,
-        long_term_bearish: output.long_term_bearish,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeFilteredTrendSignalsBatchConfig {
-    pub kalman_alpha_range: (f64, f64, f64),
-    pub kalman_beta_range: (f64, f64, f64),
-    pub kalman_period_range: (usize, usize, usize),
-    pub dev_range: (f64, f64, f64),
-    pub supertrend_factor_range: (f64, f64, f64),
-    pub supertrend_atr_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeFilteredTrendSignalsBatchJsOutput {
-    pub kalman: Vec<f64>,
-    pub supertrend: Vec<f64>,
-    pub upper_band: Vec<f64>,
-    pub lower_band: Vec<f64>,
-    pub trend: Vec<f64>,
-    pub kalman_trend: Vec<f64>,
-    pub state: Vec<f64>,
-    pub market_trending: Vec<f64>,
-    pub market_ranging: Vec<f64>,
-    pub short_term_bullish: Vec<f64>,
-    pub short_term_bearish: Vec<f64>,
-    pub long_term_bullish: Vec<f64>,
-    pub long_term_bearish: Vec<f64>,
-    pub kalman_alphas: Vec<f64>,
-    pub kalman_betas: Vec<f64>,
-    pub kalman_periods: Vec<usize>,
-    pub devs: Vec<f64>,
-    pub supertrend_factors: Vec<f64>,
-    pub supertrend_atr_periods: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_filtered_trend_signals_batch)]
-pub fn range_filtered_trend_signals_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: RangeFilteredTrendSignalsBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let output = range_filtered_trend_signals_batch_with_kernel(
-        high,
-        low,
-        close,
-        &RangeFilteredTrendSignalsBatchRange {
-            kalman_alpha: cfg.kalman_alpha_range,
-            kalman_beta: cfg.kalman_beta_range,
-            kalman_period: cfg.kalman_period_range,
-            dev: cfg.dev_range,
-            supertrend_factor: cfg.supertrend_factor_range,
-            supertrend_atr_period: cfg.supertrend_atr_period_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&RangeFilteredTrendSignalsBatchJsOutput {
-        kalman: output.kalman,
-        supertrend: output.supertrend,
-        upper_band: output.upper_band,
-        lower_band: output.lower_band,
-        trend: output.trend,
-        kalman_trend: output.kalman_trend,
-        state: output.state,
-        market_trending: output.market_trending,
-        market_ranging: output.market_ranging,
-        short_term_bullish: output.short_term_bullish,
-        short_term_bearish: output.short_term_bearish,
-        long_term_bullish: output.long_term_bullish,
-        long_term_bearish: output.long_term_bearish,
-        kalman_alphas: output
-            .combos
-            .iter()
-            .map(|combo| combo.kalman_alpha.unwrap_or(DEFAULT_KALMAN_ALPHA))
-            .collect(),
-        kalman_betas: output
-            .combos
-            .iter()
-            .map(|combo| combo.kalman_beta.unwrap_or(DEFAULT_KALMAN_BETA))
-            .collect(),
-        kalman_periods: output
-            .combos
-            .iter()
-            .map(|combo| combo.kalman_period.unwrap_or(DEFAULT_KALMAN_PERIOD))
-            .collect(),
-        devs: output
-            .combos
-            .iter()
-            .map(|combo| combo.dev.unwrap_or(DEFAULT_DEV))
-            .collect(),
-        supertrend_factors: output
-            .combos
-            .iter()
-            .map(|combo| combo.supertrend_factor.unwrap_or(DEFAULT_SUPERTREND_FACTOR))
-            .collect(),
-        supertrend_atr_periods: output
-            .combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .supertrend_atr_period
-                    .unwrap_or(DEFAULT_SUPERTREND_ATR_PERIOD)
-            })
-            .collect(),
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_filtered_trend_signals_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    kalman_alpha: f64,
-    kalman_beta: f64,
-    kalman_period: usize,
-    dev: f64,
-    supertrend_factor: f64,
-    supertrend_atr_period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_filtered_trend_signals_js(
-        high,
-        low,
-        close,
-        kalman_alpha,
-        kalman_beta,
-        kalman_period,
-        dev,
-        supertrend_factor,
-        supertrend_atr_period,
-    )?;
-    crate::write_wasm_object_f64_outputs("range_filtered_trend_signals_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_filtered_trend_signals_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_filtered_trend_signals_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "range_filtered_trend_signals_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2139,6 +1595,101 @@ mod tests {
             close.push(c);
         }
         (high, low, close)
+    }
+
+    /// Independent small-vector oracle for the published composition:
+    /// Kalman-smoothed close, Supertrend over Wilder ATR, and a 200-bar WMA
+    /// range envelope. This deliberately does not call any production helper
+    /// to calculate the expected values.
+    #[test]
+    fn range_filtered_trend_signals_constant_series_matches_hand_derived_values() {
+        const BARS: usize = 205;
+        const FIRST_VALID: usize = 199;
+        let high = vec![11.0; BARS];
+        let low = vec![9.0; BARS];
+        let close = vec![10.0; BARS];
+        let params = RangeFilteredTrendSignalsParams {
+            kalman_alpha: Some(1.0),
+            kalman_beta: Some(0.0),
+            kalman_period: Some(1),
+            dev: Some(1.5),
+            supertrend_factor: Some(2.0),
+            supertrend_atr_period: Some(1),
+        };
+        let output = range_filtered_trend_signals(&RangeFilteredTrendSignalsInput::from_slices(
+            &high, &low, &close, params,
+        ))
+        .expect("the hand-derived constant fixture is valid");
+
+        for index in 0..FIRST_VALID {
+            for value in [
+                output.kalman[index],
+                output.supertrend[index],
+                output.upper_band[index],
+                output.lower_band[index],
+                output.trend[index],
+                output.kalman_trend[index],
+                output.state[index],
+                output.market_trending[index],
+                output.market_ranging[index],
+                output.short_term_bullish[index],
+                output.short_term_bearish[index],
+                output.long_term_bullish[index],
+                output.long_term_bearish[index],
+            ] {
+                assert!(
+                    value.is_nan(),
+                    "bar {index} became valid before the 200-bar WMA"
+                );
+            }
+        }
+
+        for index in FIRST_VALID..BARS {
+            assert_eq!(output.kalman[index].to_bits(), 10.0f64.to_bits());
+            assert_eq!(output.supertrend[index].to_bits(), 14.0f64.to_bits());
+            assert_eq!(output.upper_band[index].to_bits(), 13.0f64.to_bits());
+            assert_eq!(output.lower_band[index].to_bits(), 7.0f64.to_bits());
+            assert_eq!(output.trend[index].to_bits(), 0.0f64.to_bits());
+            assert_eq!(output.kalman_trend[index].to_bits(), (-1.0f64).to_bits());
+            assert_eq!(output.state[index].to_bits(), (-0.0f64).to_bits());
+            for value in [
+                output.market_trending[index],
+                output.market_ranging[index],
+                output.short_term_bullish[index],
+                output.short_term_bearish[index],
+                output.long_term_bullish[index],
+                output.long_term_bearish[index],
+            ] {
+                assert_eq!(value.to_bits(), 0.0f64.to_bits());
+            }
+        }
+    }
+
+    /// With a zero Supertrend factor both bands coincide. The published
+    /// recurrence identifies the previous branch from the previous
+    /// Supertrend value, not from a cached direction flag. After an upward
+    /// step followed by two equal Kalman values the hand-derived directions
+    /// are therefore `1, -1, -1, 1`.
+    #[test]
+    fn supertrend_coincident_bands_use_previous_output_identity() {
+        let mut state = SuperTrendState::new(0.0);
+        let points = [10.0, 11.0, 11.0, 11.0];
+        let expected_directions = [1, -1, -1, 1];
+
+        for (index, (&point, &expected_direction)) in
+            points.iter().zip(expected_directions.iter()).enumerate()
+        {
+            let (supertrend, direction) = state.update(point, 2.0);
+            assert_eq!(
+                supertrend.to_bits(),
+                point.to_bits(),
+                "coincident-band Supertrend changed at step {index}"
+            );
+            assert_eq!(
+                direction, expected_direction,
+                "wrong coincident-band branch at step {index}"
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::cuda::device_types::CudaDeviceSliceF32Ref;
@@ -8,8 +8,8 @@ use crate::indicators::mab::{MabBatchRange, MabParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys as cu;
@@ -160,11 +160,6 @@ impl CudaMab {
         let device = Device::get_device(device_id as u32)?;
         let context = std::sync::Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/mab_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("mab_kernel")?;
         let stream = std::sync::Arc::new(Stream::new(StreamFlags::NON_BLOCKING, None)?);
         Ok(Self {
@@ -176,11 +171,6 @@ impl CudaMab {
     }
 
     pub fn from_session(session: std::sync::Arc<CudaSession>) -> Result<Self, CudaMabError> {
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/mab_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("mab_kernel")?;
         Ok(Self {
             module,
@@ -219,8 +209,8 @@ impl CudaMab {
         prices_f32: &[f32],
         period: usize,
     ) -> Result<Vec<f32>, CudaMabError> {
-        use crate::indicators::moving_averages::ema::{ema, EmaInput, EmaParams};
-        use crate::indicators::moving_averages::sma::{sma, SmaInput, SmaParams};
+        use crate::indicators::moving_averages::ema::{EmaInput, EmaParams, ema};
+        use crate::indicators::moving_averages::sma::{SmaInput, SmaParams, sma};
         let prices: Vec<f64> = prices_f32.iter().map(|&v| v as f64).collect();
         let n = prices.len();
         if period == 0 || period > n {
@@ -315,8 +305,8 @@ impl CudaMab {
         rows: usize,
         period: usize,
     ) -> Result<Vec<f32>, CudaMabError> {
-        use crate::indicators::moving_averages::ema::{ema, EmaInput, EmaParams};
-        use crate::indicators::moving_averages::sma::{sma, SmaInput, SmaParams};
+        use crate::indicators::moving_averages::ema::{EmaInput, EmaParams, ema};
+        use crate::indicators::moving_averages::sma::{SmaInput, SmaParams, sma};
         let expected = cols
             .checked_mul(rows)
             .ok_or_else(|| CudaMabError::InvalidInput("time-major dims overflow".into()))?;

@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -104,11 +104,6 @@ impl CudaWad {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/wad_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("wad_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -852,14 +847,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "wad",
-            "one_series",
-            "wad_cuda_series",
-            "1m",
-            prep_one_series,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series())]
+        vec![
+            CudaBenchScenario::new(
+                "wad",
+                "one_series",
+                "wad_cuda_series",
+                "1m",
+                prep_one_series,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series()),
+        ]
     }
 }

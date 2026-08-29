@@ -2,6 +2,12 @@
 resolver = "3"
 members = [
   "crates/neoethos-execution-budget",
+  "crates/neoethos-x86-64-v3-launcher",
+  "crates/neoethos-broker-truth",
+  "crates/neoethos-broker-history",
+  "crates/neoethos-broker-truth-acquire",
+  "crates/neoethos-dataset-contracts",
+  "crates/neoethos-feature-contracts",
   "crates/neoethos-search",
   "crates/neoethos-cli",
   "crates/neoethos-data",
@@ -33,6 +39,8 @@ members = [
 ]
 default-members = [
   "crates/neoethos-execution-budget",
+  "crates/neoethos-broker-truth",
+  "crates/neoethos-feature-contracts",
   "crates/neoethos-search",
   "crates/neoethos-cli",
   "crates/neoethos-data",
@@ -54,7 +62,12 @@ default-members = [
 # workspace + Cargo.lock under mesh/, so its bleeding-edge iroh/QUIC dependency
 # tree can never conflict with this workspace's pinned GPU/ML stack. Excluded
 # here so no root `cargo` command ever pulls it into the engine's build.
-exclude = ["mesh", "mcp"]
+exclude = [
+  "mesh",
+  "mcp",
+  "vendor/vector-ta-0.2.9-patched",
+  "vendor/catboost-rust-0.3.8-patched",
+]
 
 [workspace.package]
 edition = "2024"
@@ -63,10 +76,21 @@ license = "AGPL-3.0-or-later"
 # ── Shared dependency versions (pinned once for the whole workspace) ──────────
 [workspace.dependencies]
 neoethos-execution-budget = { path = "crates/neoethos-execution-budget" }
+neoethos-broker-truth = { path = "crates/neoethos-broker-truth" }
+neoethos-dataset-contracts = { path = "crates/neoethos-dataset-contracts" }
+neoethos-feature-contracts = { path = "crates/neoethos-feature-contracts" }
+arrow-array = "58.3.0"
+arrow-schema = "58.3.0"
+arrow-ipc = { version = "58.3.0", default-features = false, features = ["lz4", "zstd"] }
+parquet = { version = "58.3.0", default-features = false, features = ["arrow", "snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] }
+thrift = { version = "0.17.0", default-features = false }
+flatbuffers = "25.12.19"
+vortex-flatbuffers = { version = "0.67.0", default-features = false, features = ["file"] }
 anyhow      = "1.0.100"
 chrono      = { version = "0.4.44", features = ["serde"] }
 serde       = { version = "1.0.228", features = ["derive"] }
 serde_json  = "1.0.149"
+sha2        = "0.10.9"
 tokio       = { version = "1.49.0", features = ["full"] }
 tracing     = "0.1.42"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
@@ -77,7 +101,6 @@ rayon       = "1.11.0"
 reqwest     = { version = "0.13.3", default-features = true, features = ["rustls", "json", "query", "form", "cookies"] }
 rand        = "0.9.2"
 nalgebra    = "0.33.0"
-polars      = { version = "0.52.0", features = ["lazy", "dtype-datetime", "timezones"] }
 thiserror   = "2.0.16"
 
 # ── Release profile — public-testing distribution ────────────────────────────
@@ -142,6 +165,7 @@ opt-level = 0
 codegen-units = 16
 
 [patch.crates-io]
+lightgbm3 = { path = "vendor/lightgbm3" }
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
 # VENDORED 2026-08-04 for one line: upstream build.rs canonicalizes the CMake
 # source dir with std::fs::canonicalize, whose Windows `\\?\` prefix empties
@@ -153,14 +177,13 @@ lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
 # dunce; check LIVE at https://crates.io/api/v1/crates/xgboost_lib-sys — the
 # local index is stale and has misreported versions before.
 xgboost_lib-sys = { path = "vendor/xgboost_lib-sys" }
-# sklears-core RE-VENDORED 2026-07-12 at v0.1.1. Upstream 0.1.1 calls
-# the linux-only `read_perf_counters()` unconditionally on x86_64, so it
-# does not COMPILE on Windows/macOS (E0599 — caught by the first real CI
-# release run). The fix had previously been applied by editing the crate
-# IN THE LOCAL CARGO REGISTRY CACHE — invisible, lost on any cache clean,
-# and the reason local builds passed while CI failed. The vendored copy
-# carries that patch (zeroed CacheStats fallback on non-linux, marked
-# "Patched:" in src/benchmarking.rs) the honest, reproducible way.
+# sklears-core RE-VENDORED 2026-08-24 from the complete crates.io v0.1.2
+# package. Upstream's new Windows system_info API omits its direct winapi
+# feature closure, and its x86_64 cache path calls the Linux-only
+# `read_perf_counters()` on every OS. The vendored patch explicitly enables
+# every imported Windows module and keeps perf counters on Linux while using
+# an honest zero/unknown fallback on non-Linux x86_64. Re-check both defects
+# before unvendoring to any release newer than 0.1.2.
 sklears-core = { path = "vendor/sklears-core" }
 rlkit = { path = "vendor/rlkit" }
 # **vector-ta 2026-05-26**: patched local copy with a one-line fix to
@@ -173,3 +196,25 @@ rlkit = { path = "vendor/rlkit" }
 # style warm value. Reported upstream to VectorAlpha-dev/VectorTA;
 # remove this patch entry once the upstream crate ships a fix.
 vector-ta = { path = "vendor/vector-ta-0.2.9-patched" }
+# CubeCL 0.10.0 asks `memory_cleanup()` to release only the calling thread's
+# stream, while CUDA owns separate allocator pools for every initialized stream.
+# These coordinated upstream 0.11 backports enumerate all initialized streams,
+# aggregate their memory reports, and drain both GPU and pinned-host pools.
+cubecl-runtime = { path = "vendor/cubecl-runtime-0.10.0-patched" }
+cubecl-cuda = { path = "vendor/cubecl-cuda-0.10.0-patched" }
+# CubeK 0.2 validates TMA only after it has already built tensor-map bindings.
+# On pre-Hopper NVIDIA cards that reaches cuTensorMapEncodeTiled and returns
+# CUDA_ERROR_NOT_SUPPORTED before the autotuner can reject the candidate. This
+# local backport is CubeK 0.3's pre-launch Tma::Base capability guard.
+cubek-matmul = { path = "vendor/cubek-matmul-0.2.0-patched" }
+# CubeK convolution creates its Im2col and tiled tensor-map descriptors before
+# control reaches the matmul launcher. On pre-Hopper cards those CUDA APIs fail
+# before the matmul guard above can reject the autotune candidate. Apply the
+# same Tma::Base preflight at convolution's top-level launch boundary.
+cubek-convolution = { path = "vendor/cubek-convolution-0.2.0-patched" }
+# catboost-rust 0.3.8 assumes that every Cargo target directory has the
+# literal basename `target`; its build script panics before compiling our
+# models when CARGO_TARGET_DIR is any valid custom path. The vendored patch
+# resolves the profile directory from Cargo's OUT_DIR layout and keeps routine
+# asset download progress out of Cargo's warning channel.
+catboost-rust = { path = "vendor/catboost-rust-0.3.8-patched" }

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 //! `goertzel_cycle_composite_wave` on the card.
 //!
@@ -19,11 +19,11 @@
 //! has been created. A launch failure is an `Err` naming the indicator.
 
 use crate::cuda::f64_launch::{
-    checked_mul, plan_slots, scratch_elems, validate_launch, LaunchPlanError, DEFAULT_HEADROOM,
+    DEFAULT_HEADROOM, LaunchPlanError, checked_mul, plan_slots, scratch_elems, validate_launch,
 };
 use crate::indicators::goertzel_cycle_composite_wave::{
-    expand_grid_goertzel_cycle_composite_wave, GoertzelCycleCompositeWaveBatchRange,
-    GoertzelCycleCompositeWaveParams, GoertzelDetrendMode,
+    GoertzelCycleCompositeWaveBatchRange, GoertzelCycleCompositeWaveParams, GoertzelDetrendMode,
+    expand_grid_goertzel_cycle_composite_wave,
 };
 use cust::context::Context;
 use cust::device::Device;
@@ -292,29 +292,43 @@ impl CudaGoertzelCycleCompositeWave {
 
         let doubles_per_slot = 6 * sample_cap + 4 * work_cap + 3 * cycle_cap;
         let ints_per_slot = cycle_cap;
-        let bytes_per_slot = checked_mul(INDICATOR, "double scratch/slot", doubles_per_slot, f64_size)?
-            .checked_add(checked_mul(INDICATOR, "int scratch/slot", ints_per_slot, i32_size)?)
-            .ok_or(LaunchPlanError::SizeOverflow {
-                indicator: INDICATOR,
-                what: "bytes/slot",
-            })?;
+        let bytes_per_slot =
+            checked_mul(INDICATOR, "double scratch/slot", doubles_per_slot, f64_size)?
+                .checked_add(checked_mul(
+                    INDICATOR,
+                    "int scratch/slot",
+                    ints_per_slot,
+                    i32_size,
+                )?)
+                .ok_or(LaunchPlanError::SizeOverflow {
+                    indicator: INDICATOR,
+                    what: "bytes/slot",
+                })?;
         let fixed_bytes = checked_mul(INDICATOR, "output bytes", output_elems, f64_size)?
             .checked_add(cols * f64_size)
-            .and_then(|b| rows.checked_mul(3 * i32_size).and_then(|c| b.checked_add(c)))
+            .and_then(|b| {
+                rows.checked_mul(3 * i32_size)
+                    .and_then(|c| b.checked_add(c))
+            })
             .ok_or(LaunchPlanError::SizeOverflow {
                 indicator: INDICATOR,
                 what: "fixed bytes",
             })?;
 
-        let plan = plan_slots(INDICATOR, rows, fixed_bytes, bytes_per_slot, DEFAULT_HEADROOM)?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )?;
         let scratch_doubles =
             scratch_elems(INDICATOR, "double scratch", plan.slots, doubles_per_slot)?;
         let scratch_ints = scratch_elems(INDICATOR, "int scratch", plan.slots, ints_per_slot)?;
 
-        let func = self
-            .module
-            .get_function(KERNEL)
-            .map_err(|_| CudaGoertzelCycleCompositeWaveError::MissingKernelSymbol { name: KERNEL })?;
+        let func = self.module.get_function(KERNEL).map_err(|_| {
+            CudaGoertzelCycleCompositeWaveError::MissingKernelSymbol { name: KERNEL }
+        })?;
 
         let d_data = DeviceBuffer::from_slice(data)?;
         let d_max_periods = DeviceBuffer::from_slice(&max_periods)?;

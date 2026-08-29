@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::nama::{NamaBatchRange, NamaParams};
@@ -6,12 +6,12 @@ use cust::context::{CacheConfig, Context, SharedMemoryConfig};
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, Function, GridSize};
 use cust::memory::AsyncCopyDestination;
-use cust::memory::{mem_get_info, CopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys::{
-    cuDeviceGetAttribute, cuFuncSetAttribute, CUdevice_attribute, CUfunction_attribute,
+    CUdevice_attribute, CUfunction_attribute, cuDeviceGetAttribute, cuFuncSetAttribute,
 };
 use std::env;
 use std::ffi::c_void;
@@ -182,7 +182,6 @@ impl CudaNama {
         let device = Device::get_device(device_id as u32)?;
         let context = Context::new(device)?;
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/nama_kernel.ptx"));
         let module = crate::load_cuda_embedded_module!("nama_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
@@ -472,11 +471,7 @@ impl CudaNama {
             let (_, suggested) = func
                 .suggested_launch_configuration(shared_bytes as usize, BlockSize::xyz(0, 0, 0))
                 .unwrap_or((0, 128));
-            if suggested > 0 {
-                suggested
-            } else {
-                128
-            }
+            if suggested > 0 { suggested } else { 128 }
         };
         block_x = block_x.clamp(32, 1024);
         let grid: GridSize = (n_chunk as u32, 1, 1).into();
@@ -1119,11 +1114,7 @@ impl CudaNama {
             let (_, suggested) = func
                 .suggested_launch_configuration(shared_bytes as usize, BlockSize::xyz(0, 0, 0))
                 .unwrap_or((0, 128));
-            if suggested > 0 {
-                suggested
-            } else {
-                128
-            }
+            if suggested > 0 { suggested } else { 128 }
         };
         block_x = block_x.clamp(32, 1024);
         let grid: GridSize = (num_series as u32, 1, 1).into();

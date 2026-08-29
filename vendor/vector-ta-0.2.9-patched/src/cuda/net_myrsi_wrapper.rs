@@ -1,19 +1,19 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
 use crate::indicators::net_myrsi::{NetMyrsiBatchRange, NetMyrsiParams};
 use cust::context::{CacheConfig, Context, SharedMemoryConfig};
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(thiserror::Error, Debug)]
 pub enum CudaNetMyrsiError {
@@ -117,12 +117,6 @@ impl CudaNetMyrsi {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/net_myrsi_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("net_myrsi_kernel")?;
 
         let _ = cust::context::CurrentContext::set_cache_config(CacheConfig::PreferL1);
@@ -528,112 +522,9 @@ impl CudaNetMyrsi {
             combos,
         ))
     }
-
-    fn prepare_many_series_inputs(
-        data_tm_f32: &[f32],
-        cols: usize,
-        rows: usize,
-        params: &NetMyrsiParams,
-    ) -> Result<(Vec<i32>, usize), CudaNetMyrsiError> {
-        if cols == 0 || rows == 0 {
-            return Err(CudaNetMyrsiError::InvalidInput(
-                "invalid matrix shape".into(),
-            ));
-        }
-        let expected = cols
-            .checked_mul(rows)
-            .ok_or_else(|| CudaNetMyrsiError::InvalidInput("cols*rows overflow".into()))?;
-        if data_tm_f32.len() != expected {
-            return Err(CudaNetMyrsiError::InvalidInput(
-                "invalid matrix shape".into(),
-            ));
-        }
-        let period = params.period.unwrap_or(14);
-        if period == 0 || period > rows {
-            return Err(CudaNetMyrsiError::InvalidInput("invalid period".into()));
-        }
-        let mut first_valids = vec![0i32; cols];
-        for s in 0..cols {
-            let mut fv = None;
-            for t in 0..rows {
-                let v = data_tm_f32[t * cols + s];
-                if !v.is_nan() {
-                    fv = Some(t);
-                    break;
-                }
-            }
-            let fv =
-                fv.ok_or_else(|| CudaNetMyrsiError::InvalidInput(format!("series {} all NaN", s)))?;
-            if rows - fv < period + 1 {
-                return Err(CudaNetMyrsiError::InvalidInput(format!(
-                    "series {} not enough valid data (need >= {}, valid = {})",
-                    s,
-                    period + 1,
-                    rows - fv
-                )));
-            }
-            first_valids[s] = fv as i32;
-        }
-        Ok((first_valids, period))
-    }
-
-    pub fn net_myrsi_many_series_one_param_time_major_dev(
-        &self,
-        data_tm_f32: &[f32],
-        cols: usize,
-        rows: usize,
-        params: &NetMyrsiParams,
-    ) -> Result<DeviceArrayF32, CudaNetMyrsiError> {
-        // COUNTED, not disguised. See rvi_wrapper.rs for the full reasoning:
-        // this function name ends in `_dev` and returns a DeviceArray, but the
-        // arithmetic below runs on the HOST and is then uploaded. A caller
-        // holding that pointer cannot tell the device never ran.
-        //
-        // The rule is not "never compute on the host". It is: card present and a
-        // kernel exists -> the card runs it; card present and no kernel -> the
-        // host may compute it, but the call is RECORDED by indicator id so it
-        // shows up as work still owed. host_fallback::total() is meant to reach
-        // zero by achievement; it was returning zero by construction because
-        // record() had no call sites anywhere in the crate.
-        crate::cuda::host_fallback::record("net_myrsi");
-
-        let (_first_valids, _period) =
-            Self::prepare_many_series_inputs(data_tm_f32, cols, rows, params)?;
-
-        let elems = cols
-            .checked_mul(rows)
-            .ok_or_else(|| CudaNetMyrsiError::InvalidInput("cols*rows overflow".into()))?;
-        let mut out_tm_host = vec![f32::NAN; elems];
-
-        for s in 0..cols {
-            let mut series64 = vec![f64::NAN; rows];
-            for r in 0..rows {
-                series64[r] = data_tm_f32[r * cols + s] as f64;
-            }
-            let out = crate::indicators::net_myrsi::net_myrsi_with_kernel(
-                &crate::indicators::net_myrsi::NetMyrsiInput::from_slice(&series64, params.clone()),
-                crate::utilities::enums::Kernel::Scalar,
-            )
-            .map_err(|e| CudaNetMyrsiError::InvalidInput(e.to_string()))?;
-            for r in 0..rows {
-                out_tm_host[r * cols + s] = out.values[r] as f32;
-            }
-        }
-
-        let mut d_out = unsafe { DeviceBuffer::uninitialized_async(elems, &self.stream)? };
-        unsafe {
-            d_out.async_copy_from(out_tm_host.as_slice(), &self.stream)?;
-        }
-        self.synchronize()?;
-        Ok(DeviceArrayF32 {
-            buf: d_out,
-            rows,
-            cols,
-        })
-    }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 pub mod benches {
     use super::*;
     use crate::cuda::{CudaBenchScenario, CudaBenchState};

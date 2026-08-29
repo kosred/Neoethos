@@ -4,8 +4,8 @@
 
 namespace {
 
-__device__ std::int32_t first_hit_reason(float high,
-                                         float low,
+__device__ std::int32_t first_hit_reason(double high,
+                                         double low,
                                          const NeoFirstHitEvent& event) {
   bool stop_hit = false;
   bool target_hit = false;
@@ -24,8 +24,8 @@ __device__ std::int32_t first_hit_reason(float high,
   return 0;
 }
 
-__global__ void warp_first_hit_kernel(const float* highs,
-                                      const float* lows,
+__global__ void warp_first_hit_kernel(const double* highs,
+                                      const double* lows,
                                       std::size_t rows,
                                       const NeoFirstHitEvent* events,
                                       NeoFirstHitResult* results,
@@ -71,8 +71,8 @@ __global__ void warp_first_hit_kernel(const float* highs,
 }  // namespace
 
 extern "C" std::int32_t neoethos_gpu_cuda_warp_first_hit(
-    const float* highs,
-    const float* lows,
+    const double* highs,
+    const double* lows,
     std::size_t rows,
     const NeoFirstHitEvent* events,
     NeoFirstHitResult* results,
@@ -82,11 +82,11 @@ extern "C" std::int32_t neoethos_gpu_cuda_warp_first_hit(
     return -20;
   }
 
-  float* device_highs = nullptr;
-  float* device_lows = nullptr;
+  double* device_highs = nullptr;
+  double* device_lows = nullptr;
   NeoFirstHitEvent* device_events = nullptr;
   NeoFirstHitResult* device_results = nullptr;
-  const std::size_t price_bytes = rows * sizeof(float);
+  const std::size_t price_bytes = rows * sizeof(double);
   const std::size_t event_bytes = event_count * sizeof(NeoFirstHitEvent);
   const std::size_t result_bytes = event_count * sizeof(NeoFirstHitResult);
 

@@ -68,8 +68,12 @@ pub fn train_from_experience() -> Result<ExperienceTrainReport> {
     let mut total = 0usize;
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         total += 1;
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let Some(net) = v.get("netProfit").and_then(|x| x.as_f64()) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(net) = v.get("netProfit").and_then(|x| x.as_f64()) else {
+            continue;
+        };
         let feats: Vec<f64> = v
             .get("features")
             .and_then(|x| x.as_array())

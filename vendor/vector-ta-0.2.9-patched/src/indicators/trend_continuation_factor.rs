@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -63,10 +47,6 @@ pub struct TrendContinuationFactorOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TrendContinuationFactorParams {
     pub length: Option<usize>,
 }
@@ -197,9 +177,7 @@ pub enum TrendContinuationFactorError {
         "trend_continuation_factor: Invalid length: length = {length}, data length = {data_len}"
     )]
     InvalidLength { length: usize, data_len: usize },
-    #[error(
-        "trend_continuation_factor: Not enough valid data: needed = {needed}, valid = {valid}"
-    )]
+    #[error("trend_continuation_factor: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
     #[error(
         "trend_continuation_factor: Output length mismatch: expected = {expected}, got = {got}"
@@ -560,7 +538,6 @@ pub fn trend_continuation_factor_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn trend_continuation_factor_into(
     input: &TrendContinuationFactorInput,
@@ -909,336 +886,12 @@ fn trend_continuation_factor_batch_inner_into(
     Ok(())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "trend_continuation_factor")]
-#[pyo3(signature = (data, length=35, kernel=None))]
-pub fn trend_continuation_factor_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = TrendContinuationFactorInput::from_slice(
-        data,
-        TrendContinuationFactorParams {
-            length: Some(length),
-        },
-    );
-    let output = py
-        .allow_threads(|| trend_continuation_factor_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        output.plus_tcf.into_pyarray(py),
-        output.minus_tcf.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "TrendContinuationFactorStream")]
-pub struct TrendContinuationFactorStreamPy {
-    stream: TrendContinuationFactorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl TrendContinuationFactorStreamPy {
-    #[new]
-    #[pyo3(signature = (length=35))]
-    fn new(length: usize) -> PyResult<Self> {
-        let stream = TrendContinuationFactorStream::try_new(TrendContinuationFactorParams {
-            length: Some(length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update_reset_on_nan(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "trend_continuation_factor_batch")]
-#[pyo3(signature = (data, length_range, kernel=None))]
-pub fn trend_continuation_factor_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let sweep = TrendContinuationFactorBatchRange {
-        length: length_range,
-    };
-    let combos = expand_grid_trend_continuation_factor(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let plus_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let minus_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_plus = unsafe { plus_arr.as_slice_mut()? };
-    let out_minus = unsafe { minus_arr.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        trend_continuation_factor_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            out_plus,
-            out_minus,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("plus_tcf", plus_arr.reshape((rows, cols))?)?;
-    dict.set_item("minus_tcf", minus_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|params| params.length.unwrap_or(35) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_trend_continuation_factor_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(trend_continuation_factor_py, m)?)?;
-    m.add_function(wrap_pyfunction!(trend_continuation_factor_batch_py, m)?)?;
-    m.add_class::<TrendContinuationFactorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TrendContinuationFactorBatchConfig {
-    length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TrendContinuationFactorBatchJsOutput {
-    plus_tcf: Vec<f64>,
-    minus_tcf: Vec<f64>,
-    rows: usize,
-    cols: usize,
-    combos: Vec<TrendContinuationFactorParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TrendContinuationFactorJsOutput {
-    plus_tcf: Vec<f64>,
-    minus_tcf: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "trend_continuation_factor_js")]
-pub fn trend_continuation_factor_js(data: &[f64], length: usize) -> Result<JsValue, JsValue> {
-    let input = TrendContinuationFactorInput::from_slice(
-        data,
-        TrendContinuationFactorParams {
-            length: Some(length),
-        },
-    );
-    let output =
-        trend_continuation_factor(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&TrendContinuationFactorJsOutput {
-        plus_tcf: output.plus_tcf,
-        minus_tcf: output.minus_tcf,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "trend_continuation_factor_batch_js")]
-pub fn trend_continuation_factor_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: TrendContinuationFactorBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: length_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let sweep = TrendContinuationFactorBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-    };
-    let batch = trend_continuation_factor_batch_slice(data, &sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&TrendContinuationFactorBatchJsOutput {
-        plus_tcf: batch.plus_tcf,
-        minus_tcf: batch.minus_tcf,
-        rows: batch.rows,
-        cols: batch.cols,
-        combos: batch.combos,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_continuation_factor_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len * 2);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_continuation_factor_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len * 2);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_continuation_factor_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to trend_continuation_factor_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len * 2);
-        let (out_plus, out_minus) = out.split_at_mut(len);
-        let input = TrendContinuationFactorInput::from_slice(
-            data,
-            TrendContinuationFactorParams {
-                length: Some(length),
-            },
-        );
-        trend_continuation_factor_into_slice(out_plus, out_minus, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "trend_continuation_factor_into_host")]
-pub fn trend_continuation_factor_into_host(
-    data: &[f64],
-    out_ptr: *mut f64,
-    length: usize,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to trend_continuation_factor_into_host",
-        ));
-    }
-    unsafe {
-        let out = std::slice::from_raw_parts_mut(out_ptr, data.len() * 2);
-        let (out_plus, out_minus) = out.split_at_mut(data.len());
-        let input = TrendContinuationFactorInput::from_slice(
-            data,
-            TrendContinuationFactorParams {
-                length: Some(length),
-            },
-        );
-        trend_continuation_factor_into_slice(out_plus, out_minus, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_continuation_factor_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to trend_continuation_factor_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = TrendContinuationFactorBatchRange {
-            length: (length_start, length_end, length_step),
-        };
-        let combos = expand_grid_trend_continuation_factor(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * len * 2);
-        let (out_plus, out_minus) = out.split_at_mut(rows * len);
-        trend_continuation_factor_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Scalar,
-            false,
-            out_plus,
-            out_minus,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_continuation_factor_output_into_js(
-    data: &[f64],
-    length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = trend_continuation_factor_js(data, length)?;
-    crate::write_wasm_object_f64_outputs("trend_continuation_factor_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn trend_continuation_factor_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = trend_continuation_factor_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "trend_continuation_factor_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-        ParamValue,
+        IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+        compute_cpu_batch,
     };
 
     fn sample_data(len: usize) -> Vec<f64> {

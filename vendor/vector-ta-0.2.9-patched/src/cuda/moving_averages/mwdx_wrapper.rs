@@ -1,20 +1,20 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::cwma_wrapper::{BatchKernelPolicy, ManySeriesKernelPolicy};
-use crate::indicators::moving_averages::mwdx::{expand_grid_mwdx, MwdxBatchRange, MwdxParams};
+use crate::indicators::moving_averages::mwdx::{MwdxBatchRange, MwdxParams, expand_grid_mwdx};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
 use cust::memory::AsyncCopyDestination;
-use cust::memory::{mem_get_info, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys as cu;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -97,10 +97,10 @@ impl CudaMwdx {
         series_len: usize,
     ) {
         use cu::{
-            cuCtxSetLimit, cuDeviceGetAttribute, cuStreamSetAttribute,
             CUaccessPolicyWindow_v1 as CUaccessPolicyWindow, CUaccessProperty_enum as AccessProp,
             CUdevice_attribute_enum as DevAttr, CUlimit_enum as CULimit,
             CUstreamAttrID_enum as StreamAttrId, CUstreamAttrValue_v1 as CUstreamAttrValue,
+            cuCtxSetLimit, cuDeviceGetAttribute, cuStreamSetAttribute,
         };
         use cust::device::Device as CuDevice;
 
@@ -137,23 +137,7 @@ impl CudaMwdx {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/mwdx_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-            ModuleJitOption::MaxRegisters(64),
-        ];
-        let module = match Module::from_ptx(ptx, jit_opts) {
-            Ok(m) => m,
-            Err(_) => {
-                if let Ok(m) = Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext])
-                {
-                    m
-                } else {
-                    Module::from_ptx(ptx, &[])?
-                }
-            }
-        };
+        let module = crate::load_cuda_embedded_module!("mwdx_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
         Ok(Self {

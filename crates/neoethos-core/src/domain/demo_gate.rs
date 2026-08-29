@@ -206,7 +206,8 @@ mod tests {
             max_drawdown_pct: 11.5,
             trades: 140,
         };
-        let d = evaluate_demo_forward_gate(140, &live, &backtest(), &DemoForwardGateConfig::default());
+        let d =
+            evaluate_demo_forward_gate(140, &live, &backtest(), &DemoForwardGateConfig::default());
         assert!(d.eligible, "should be eligible: {}", d.summary);
         assert!(d.criteria.iter().all(|c| c.passed));
     }
@@ -214,7 +215,8 @@ mod tests {
     #[test]
     fn too_few_demo_trades_is_not_yet() {
         let live = backtest(); // metrics fine, but only 40 trades
-        let d = evaluate_demo_forward_gate(40, &live, &backtest(), &DemoForwardGateConfig::default());
+        let d =
+            evaluate_demo_forward_gate(40, &live, &backtest(), &DemoForwardGateConfig::default());
         assert!(!d.eligible);
         assert!(d.summary.starts_with("Not yet"), "summary: {}", d.summary);
         // The trade-count criterion is the one that failed.
@@ -228,7 +230,8 @@ mod tests {
             profit_factor: 1.10,
             ..backtest()
         };
-        let d = evaluate_demo_forward_gate(200, &live, &backtest(), &DemoForwardGateConfig::default());
+        let d =
+            evaluate_demo_forward_gate(200, &live, &backtest(), &DemoForwardGateConfig::default());
         assert!(!d.eligible);
         assert!(d.summary.starts_with("Blocked"), "summary: {}", d.summary);
     }
@@ -240,7 +243,8 @@ mod tests {
             max_drawdown_pct: 13.0,
             ..backtest()
         };
-        let d = evaluate_demo_forward_gate(200, &live, &backtest(), &DemoForwardGateConfig::default());
+        let d =
+            evaluate_demo_forward_gate(200, &live, &backtest(), &DemoForwardGateConfig::default());
         assert!(!d.eligible);
     }
 

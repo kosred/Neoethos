@@ -1,35 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::sama_wrapper::DeviceArrayF32Sama;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, moving_averages::CudaSama};
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -67,10 +41,6 @@ pub struct SamaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct SamaParams {
     pub length: Option<usize>,
     pub maj_length: Option<usize>,
@@ -260,7 +230,6 @@ pub fn sama_with_kernel(input: &SamaInput, kernel: Kernel) -> Result<SamaOutput,
     Ok(SamaOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn sama_into(input: &SamaInput, out: &mut [f64]) -> Result<(), SamaError> {
     let (data, length, maj_length, min_length, first, chosen) = sama_prepare(input, Kernel::Auto)?;
 
@@ -1321,396 +1290,17 @@ impl SamaStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "sama")]
-#[pyo3(signature = (data, length, maj_length, min_length, kernel=None))]
-pub fn sama_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    maj_length: usize,
-    min_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = SamaParams {
-        length: Some(length),
-        maj_length: Some(maj_length),
-        min_length: Some(min_length),
-    };
-    let input = SamaInput::from_slice(slice_in, params);
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| sama_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "sama_batch")]
-#[pyo3(signature = (data, length_range, maj_length_range, min_length_range, kernel=None))]
-pub fn sama_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    maj_length_range: (usize, usize, usize),
-    min_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let sweep = SamaBatchRange {
-        length: length_range,
-        maj_length: maj_length_range,
-        min_length: min_length_range,
-    };
-
-    let combos = expand_grid_sama(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let mapped = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match mapped {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => Kernel::Scalar,
-            };
-
-            let first = slice_in
-                .iter()
-                .position(|x| !x.is_nan())
-                .ok_or(SamaError::AllValuesNaN)?;
-            sama_batch_inner_into(slice_in, &combos, first, simd, true, slice_out).map(|_| combos)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap_or(200) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "maj_lengths",
-        combos
-            .iter()
-            .map(|p| p.maj_length.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "min_lengths",
-        combos
-            .iter()
-            .map(|p| p.min_length.unwrap_or(6) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "sama_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, length_range=(200, 200, 0), maj_length_range=(14, 14, 0), min_length_range=(6, 6, 0), device_id=0))]
-pub fn sama_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    length_range: (usize, usize, usize),
-    maj_length_range: (usize, usize, usize),
-    min_length_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32SamaPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = SamaBatchRange {
-        length: length_range,
-        maj_length: maj_length_range,
-        min_length: min_length_range,
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaSama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.sama_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32SamaPy { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "sama_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, length, maj_length, min_length, device_id=0))]
-pub fn sama_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    length: usize,
-    maj_length: usize,
-    min_length: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32SamaPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if length == 0 || maj_length == 0 || min_length == 0 {
-        return Err(PyValueError::new_err(
-            "length, maj_length, and min_length must be positive",
-        ));
-    }
-
-    let flat = data_tm_f32.as_slice()?;
-    let shape = data_tm_f32.shape();
-    let series_len = shape[0];
-    let num_series = shape[1];
-    let params = SamaParams {
-        length: Some(length),
-        maj_length: Some(maj_length),
-        min_length: Some(min_length),
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaSama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.sama_many_series_one_param_time_major_dev(flat, num_series, series_len, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32SamaPy { inner })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "SamaStream")]
-pub struct SamaStreamPy {
-    stream: SamaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl SamaStreamPy {
-    #[new]
-    fn new(length: usize, maj_length: usize, min_length: usize) -> PyResult<Self> {
-        let params = SamaParams {
-            length: Some(length),
-            maj_length: Some(maj_length),
-            min_length: Some(min_length),
-        };
-        let stream =
-            SamaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(SamaStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sama_js(
-    data: &[f64],
-    length: usize,
-    maj_length: usize,
-    min_length: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = SamaParams {
-        length: Some(length),
-        maj_length: Some(maj_length),
-        min_length: Some(min_length),
-    };
-    let input = SamaInput::from_slice(data, params);
-    let mut out = vec![0.0; data.len()];
-    sama_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SamaBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub maj_length_range: (usize, usize, usize),
-    pub min_length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SamaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<SamaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = sama_batch)]
-pub fn sama_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: SamaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = SamaBatchRange {
-        length: cfg.length_range,
-        maj_length: cfg.maj_length_range,
-        min_length: cfg.min_length_range,
-    };
-    let out = sama_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&SamaBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sama_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sama_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sama_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    maj_length: usize,
-    min_length: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = SamaParams {
-            length: Some(length),
-            maj_length: Some(maj_length),
-            min_length: Some(min_length),
-        };
-        let input = SamaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut tmp = vec![0.0; len];
-            sama_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-            sama_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sama_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    maj_start: usize,
-    maj_end: usize,
-    maj_step: usize,
-    min_start: usize,
-    min_end: usize,
-    min_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = SamaBatchRange {
-            length: (length_start, length_end, length_step),
-            maj_length: (maj_start, maj_end, maj_step),
-            min_length: (min_start, min_end, min_step),
-        };
-        let combos = expand_grid_sama(&sweep).map_err(|_| JsValue::from_str("Invalid range"))?;
-        let rows = combos.len();
-        let cols = len;
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-        let first = data
-            .iter()
-            .position(|x| !x.is_nan())
-            .ok_or_else(|| JsValue::from_str("All NaN"))?;
-        sama_batch_inner_into(data, &combos, first, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sama_output_into_js(
-    data: &[f64],
-    length: usize,
-    maj_length: usize,
-    min_length: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = sama_js(data, length, maj_length, min_length)?;
-    crate::write_wasm_f64_output("sama_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn sama_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = sama_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("sama_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     fn check_sama_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = SamaInput::from_candles(&candles, "close", SamaParams::default());
         let result = sama_with_kernel(&input, kernel)?;
@@ -1727,7 +1317,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_sama_into_matches_api() -> Result<(), Box<dyn Error>> {
         let mut data = Vec::with_capacity(256);
@@ -1764,8 +1353,8 @@ mod tests {
 
     fn check_sama_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = SamaParams {
             length: None,
@@ -1781,8 +1370,8 @@ mod tests {
 
     fn check_sama_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = SamaInput::with_default_candles(&candles);
         match input.data {
@@ -1881,8 +1470,8 @@ mod tests {
 
     fn check_sama_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = SamaParams {
             length: Some(50),
@@ -1906,8 +1495,8 @@ mod tests {
 
     fn check_sama_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = SamaParams::default();
         let input = SamaInput::from_candles(&candles, "close", params);
@@ -1934,8 +1523,8 @@ mod tests {
 
     fn check_sama_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = SamaParams::default();
 
@@ -1977,8 +1566,8 @@ mod tests {
 
     fn check_batch_sweep(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let range = SamaBatchRange {
             length: (190, 210, 1),
@@ -2006,8 +1595,8 @@ mod tests {
 
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let range = SamaBatchRange {
             length: (200, 200, 0),
@@ -2110,8 +1699,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let cfgs = vec![
             (190, 200, 1, 12, 14, 1, 4, 8, 1),
@@ -2164,8 +1753,8 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn test_sama_no_poison_values() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = SamaInput::from_candles(&candles, "close", SamaParams::default());
         let output = sama(&input)?;
@@ -2298,99 +1887,5 @@ mod prop_tests {
                 }
             }
         }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32SamaPy {
-    pub(crate) inner: DeviceArrayF32Sama,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32SamaPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-
-        let len = self.inner.rows.checked_mul(self.inner.cols).unwrap_or(0);
-        let ptr_usize = if len == 0 {
-            0usize
-        } else {
-            self.inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr_usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let device_id = self.inner.device_id;
-        let ctx = self.inner.ctx.clone();
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Sama {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx,
-                device_id,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
     }
 }

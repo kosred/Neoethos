@@ -14,8 +14,30 @@ use crate::statistical::common::{METADATA_FILE_NAME, write_json};
 use anyhow::Result;
 use burn::module::Param;
 use burn::tensor::Tensor;
-use polars::prelude::{DataFrame, NamedFrom, Series};
+use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame};
+use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
 use std::path::PathBuf;
+
+fn typed_frame(columns: Vec<(&str, Vec<f64>)>) -> Result<FeatureFrame> {
+    let rows = columns.first().map_or(0, |(_, values)| values.len());
+    let columns = columns
+        .into_iter()
+        .map(|(name, values)| {
+            FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+        neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+        columns,
+    )
+}
+
+fn one_worker_lease() -> CpuLease {
+    let width = WorkerLimit::new(1).expect("one worker");
+    CpuPermitBroker::new(width)
+        .acquire(CpuPermitRequest::local(width))
+        .expect("isolated exit-agent test lease")
+}
 
 #[test]
 fn observe_exit_uses_explicit_direction() {
@@ -429,20 +451,20 @@ fn predict_runtime_uses_shared_three_class_confidence_gate() -> Result<()> {
         execution_backend: agent.execution_backend.clone(),
     });
 
-    let df = DataFrame::new(vec![
-        Series::new("f1".into(), vec![0.0_f64]).into(),
-        Series::new("f2".into(), vec![0.0_f64]).into(),
-        Series::new("f3".into(), vec![0.0_f64]).into(),
-        Series::new("f4".into(), vec![0.0_f64]).into(),
-        Series::new("f5".into(), vec![0.0_f64]).into(),
-        Series::new("f6".into(), vec![0.0_f64]).into(),
+    let frame = typed_frame(vec![
+        ("f1", vec![0.0]),
+        ("f2", vec![0.0]),
+        ("f3", vec![0.0]),
+        ("f4", vec![0.0]),
+        ("f5", vec![0.0]),
+        ("f6", vec![0.0]),
     ])?;
 
-    let predictions = agent.predict_runtime(&df)?;
+    let predictions = agent.predict_runtime(&frame, &one_worker_lease())?;
     let prediction = predictions
         .first()
         .expect("one runtime prediction should be produced");
-    let expected_row = ExitAgent::runtime_probabilities(0.7, 0.3);
+    let expected_row = ExitAgent::runtime_probabilities(0.7, 0.3).map(f64::from);
     let (expected_confidence, expected_abstain) = three_class_runtime_confidence(expected_row)?;
 
     assert!((prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6);
@@ -453,7 +475,9 @@ fn predict_runtime_uses_shared_three_class_confidence_gate() -> Result<()> {
 
 #[test]
 fn artifact_carries_device_policy_fields() {
-    let agent = ExitAgent::with_hidden_dim(6, 16).with_device_policy("cpu");
+    let agent = ExitAgent::with_hidden_dim(6, 16)
+        .with_device_policy("cpu")
+        .expect("CPU Burn policy must resolve in the default test build");
     let artifact = agent.artifact();
     assert_eq!(artifact.requested_device_policy.as_deref(), Some("cpu"));
     assert_eq!(artifact.effective_device_policy.as_deref(), Some("cpu"));
@@ -507,7 +531,9 @@ fn with_device_policy_invalidates_trained_runtime_state() {
     agent.persisted_effective_device_policy = Some("cpu".to_string());
     agent.persisted_execution_backend = Some(agent.execution_backend.clone());
 
-    let agent = agent.with_device_policy("cpu");
+    let agent = agent
+        .with_device_policy("cpu")
+        .expect("CPU Burn policy must resolve in the default test build");
 
     assert_eq!(agent.train_rows, 0);
     assert_eq!(agent.trained_memory_size, 0);
@@ -843,18 +869,18 @@ fn runtime_degraded_reason_marks_untrained_runtime_state() {
 #[test]
 fn predict_runtime_rejects_untrained_runtime_state() {
     let agent = ExitAgent::with_hidden_dim(6, 16);
-    let df = DataFrame::new(vec![
-        Series::new("f1".into(), vec![0.0_f64]).into(),
-        Series::new("f2".into(), vec![0.1_f64]).into(),
-        Series::new("f3".into(), vec![0.2_f64]).into(),
-        Series::new("f4".into(), vec![0.3_f64]).into(),
-        Series::new("f5".into(), vec![0.4_f64]).into(),
-        Series::new("f6".into(), vec![0.5_f64]).into(),
+    let frame = typed_frame(vec![
+        ("f1", vec![0.0]),
+        ("f2", vec![0.1]),
+        ("f3", vec![0.2]),
+        ("f4", vec![0.3]),
+        ("f5", vec![0.4]),
+        ("f6", vec![0.5]),
     ])
     .expect("single-row frame");
 
     let err = agent
-        .predict_runtime(&df)
+        .predict_runtime(&frame, &one_worker_lease())
         .expect_err("cold exit agent should not run inference");
     assert!(err.to_string().contains("untrained runtime state"));
 }
@@ -882,18 +908,18 @@ fn predict_runtime_rejects_missing_training_report_in_trained_state() {
     agent.trained_checkpoint_ready = true;
     agent.training_report = None;
 
-    let df = DataFrame::new(vec![
-        Series::new("f1".into(), vec![0.0_f64]).into(),
-        Series::new("f2".into(), vec![0.1_f64]).into(),
-        Series::new("f3".into(), vec![0.2_f64]).into(),
-        Series::new("f4".into(), vec![0.3_f64]).into(),
-        Series::new("f5".into(), vec![0.4_f64]).into(),
-        Series::new("f6".into(), vec![0.5_f64]).into(),
+    let frame = typed_frame(vec![
+        ("f1", vec![0.0]),
+        ("f2", vec![0.1]),
+        ("f3", vec![0.2]),
+        ("f4", vec![0.3]),
+        ("f5", vec![0.4]),
+        ("f6", vec![0.5]),
     ])
     .expect("single-row frame");
 
     let err = agent
-        .predict_runtime(&df)
+        .predict_runtime(&frame, &one_worker_lease())
         .expect_err("trained state without training report must fail");
     assert!(err.to_string().contains("persisted training report"));
 }

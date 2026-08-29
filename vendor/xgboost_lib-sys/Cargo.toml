@@ -32,7 +32,10 @@ repository = "https://github.com/marcomq/rust-xgboost"
 
 [features]
 cuda = []
-default = ["use_prebuilt_xgb"]
+# `xgb` forwards its own selected runtime feature explicitly. Keeping a sys
+# default here re-enabled the CPU prebuilt runtime even when NeoEthos selected
+# `xgb/local_build`, leaving both libraries on the link/runtime search path.
+default = []
 local_build = ["cmake"]
 use_prebuilt_xgb = ["reqwest"]
 

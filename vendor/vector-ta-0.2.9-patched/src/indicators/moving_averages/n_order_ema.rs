@@ -1,35 +1,22 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
-use crate::utilities::helpers::{
-    alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
-};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
+use crate::utilities::helpers::detect_best_batch_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
 use std::error::Error;
 use thiserror::Error;
 
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 const DEFAULT_PERIOD: f64 = 9.0;
 const DEFAULT_ORDER: usize = 1;
 const DEFAULT_EMA_STYLE: &str = "ema";
 const DEFAULT_IIR_STYLE: &str = "impulse_matched";
 const MAX_ORDER: usize = 64;
+
+// Creator authority: https://www.tradingview.com/script/Hgvs8kZi-N-Order-EMA/
+// Facade identity: PUB;0d0d8869215f4446b4c17e62c6080830
+// Exact Pine source SHA-256:
+// 539EEC25A8422DDE96705873212CD55302301BD6CE3284A411C2010536B843D3
 
 impl<'a> AsRef<[f64]> for NOrderEmaInput<'a> {
     #[inline(always)]
@@ -67,14 +54,6 @@ pub struct NOrderEmaOutput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    serde(rename_all = "snake_case")
-)]
 pub enum NOrderEmaStyle {
     Ema,
     Dema,
@@ -106,14 +85,6 @@ impl NOrderEmaStyle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    serde(rename_all = "snake_case")
-)]
 pub enum NOrderEmaIirStyle {
     AllPole,
     ImpulseMatched,
@@ -147,10 +118,6 @@ impl NOrderEmaIirStyle {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct NOrderEmaParams {
     pub period: Option<f64>,
     pub order: Option<usize>,
@@ -312,8 +279,6 @@ pub enum NOrderEmaError {
     InvalidEmaStyle { value: String },
     #[error("n_order_ema: Invalid iir_style: {value}")]
     InvalidIirStyle { value: String },
-    #[error("n_order_ema: Not enough valid data: needed = {needed}, valid = {valid}")]
-    NotEnoughValidData { needed: usize, valid: usize },
     #[error("n_order_ema: Output length mismatch: expected = {expected}, got = {got}")]
     OutputLengthMismatch { expected: usize, got: usize },
     #[error("n_order_ema: Invalid float range: start = {start}, end = {end}, step = {step}")]
@@ -431,8 +396,7 @@ enum NOrderEmaState {
 #[derive(Clone, Debug)]
 pub struct NOrderEmaStream {
     state: NOrderEmaState,
-    warmup: usize,
-    count: usize,
+    started: bool,
 }
 
 impl NOrderEmaStream {
@@ -468,14 +432,13 @@ impl NOrderEmaStream {
 
         Self {
             state,
-            warmup: warmup_len(resolved),
-            count: 0,
+            started: false,
         }
     }
 
     #[inline(always)]
     pub fn reset(&mut self) {
-        self.count = 0;
+        self.started = false;
         match &mut self.state {
             NOrderEmaState::Ema { f1 } => f1.reset(),
             NOrderEmaState::Dema { f1, f2 } => {
@@ -501,20 +464,30 @@ impl NOrderEmaStream {
 
     #[inline(always)]
     pub fn update(&mut self, value: f64) -> Option<f64> {
-        if !value.is_finite() {
+        if value.is_infinite() {
             self.reset();
             return None;
         }
 
+        let safe_value = if value.is_nan() {
+            if !self.started {
+                return None;
+            }
+            0.0
+        } else {
+            self.started = true;
+            value
+        };
+
         let out = match &mut self.state {
-            NOrderEmaState::Ema { f1 } => f1.update(value).unwrap(),
+            NOrderEmaState::Ema { f1 } => f1.update(safe_value).unwrap(),
             NOrderEmaState::Dema { f1, f2 } => {
-                let e1 = f1.update(value).unwrap();
+                let e1 = f1.update(safe_value).unwrap();
                 let e2 = f2.update(e1).unwrap();
                 2.0 * e1 - e2
             }
             NOrderEmaState::Tema { f1, f2, f3 } => {
-                let e1 = f1.update(value).unwrap();
+                let e1 = f1.update(safe_value).unwrap();
                 let e2 = f2.update(e1).unwrap();
                 let e3 = f3.update(e2).unwrap();
                 3.0 * (e1 - e2) + e3
@@ -524,56 +497,13 @@ impl NOrderEmaStream {
                 base,
                 final_filter,
             } => {
-                let e1 = short.update(value).unwrap();
-                let e2 = base.update(value).unwrap();
+                let e1 = short.update(safe_value).unwrap();
+                let e2 = base.update(safe_value).unwrap();
                 final_filter.update(2.0 * e1 - e2).unwrap()
             }
         };
 
-        self.count += 1;
-        if self.count > self.warmup {
-            Some(out)
-        } else {
-            None
-        }
-    }
-}
-
-#[inline(always)]
-fn ceil_period(period: f64) -> usize {
-    period.ceil().max(1.0) as usize
-}
-
-#[inline(always)]
-fn base_lookback(period: f64, order: usize) -> usize {
-    order.saturating_mul(ceil_period(period).saturating_sub(1))
-}
-
-#[inline(always)]
-fn warmup_len(params: ResolvedParams) -> usize {
-    match params.ema_style {
-        NOrderEmaStyle::Ema => base_lookback(params.period, params.order),
-        NOrderEmaStyle::Dema => base_lookback(params.period, params.order),
-        NOrderEmaStyle::Tema => base_lookback(params.period, params.order).saturating_mul(3),
-        NOrderEmaStyle::Hema => {
-            let short = base_lookback((params.period * 0.5).max(1.0), params.order);
-            let base = base_lookback(params.period, params.order);
-            let final_lb = base_lookback(params.period.sqrt().max(1.0), params.order);
-            short.max(base).saturating_add(final_lb)
-        }
-    }
-}
-
-#[inline(always)]
-fn required_valid_len(params: ResolvedParams) -> usize {
-    let base = base_lookback(params.period, params.order);
-    match params.ema_style {
-        NOrderEmaStyle::Ema => warmup_len(params).saturating_add(1),
-        NOrderEmaStyle::Dema => base
-            .saturating_mul(2)
-            .max(warmup_len(params).saturating_add(1)),
-        NOrderEmaStyle::Tema => warmup_len(params).saturating_add(1),
-        NOrderEmaStyle::Hema => warmup_len(params).saturating_add(1),
+        Some(out)
     }
 }
 
@@ -665,7 +595,7 @@ fn build_coefficients(period: f64, order: usize, style: NOrderEmaIirStyle) -> Ii
 #[inline(always)]
 fn resolve_params(params: &NOrderEmaParams, len: usize) -> Result<ResolvedParams, NOrderEmaError> {
     let period = params.period.unwrap_or(DEFAULT_PERIOD);
-    if !period.is_finite() || period < 1.0 || (len > 0 && period.ceil() as usize > len) {
+    if !period.is_finite() || period < 1.0 {
         return Err(NOrderEmaError::InvalidPeriod {
             period,
             data_len: len,
@@ -701,36 +631,12 @@ fn resolve_params(params: &NOrderEmaParams, len: usize) -> Result<ResolvedParams
 }
 
 #[inline(always)]
-fn validate_input(data: &[f64], resolved: ResolvedParams) -> Result<(), NOrderEmaError> {
+fn validate_input(data: &[f64]) -> Result<(), NOrderEmaError> {
     if data.is_empty() {
         return Err(NOrderEmaError::EmptyInputData);
     }
-    let needed = required_valid_len(resolved);
-    let mut best = 0usize;
-    let mut cur = 0usize;
-    let mut any = false;
-    for &value in data {
-        if value.is_finite() {
-            any = true;
-            cur += 1;
-            if cur >= needed {
-                return Ok(());
-            }
-            if cur > best {
-                best = cur;
-            }
-        } else {
-            cur = 0;
-        }
-    }
-    if !any {
+    if !data.iter().any(|value| value.is_finite()) {
         return Err(NOrderEmaError::AllValuesNaN);
-    }
-    if best < needed {
-        return Err(NOrderEmaError::NotEnoughValidData {
-            needed,
-            valid: best,
-        });
     }
     Ok(())
 }
@@ -746,14 +652,12 @@ pub fn n_order_ema_with_kernel(
 ) -> Result<NOrderEmaOutput, NOrderEmaError> {
     let data = input.as_ref();
     let resolved = resolve_params(&input.params, data.len())?;
-    validate_input(data, resolved)?;
-    let warmup = warmup_len(resolved);
-    let mut output = alloc_with_nan_prefix(data.len(), warmup.min(data.len()));
+    validate_input(data)?;
+    let mut output = vec![f64::NAN; data.len()];
     n_order_ema_compute_into(data, resolved, &mut output);
     Ok(NOrderEmaOutput { values: output })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn n_order_ema_into(input: &NOrderEmaInput, out: &mut [f64]) -> Result<(), NOrderEmaError> {
     n_order_ema_into_slice(out, input, Kernel::Auto)
@@ -772,7 +676,7 @@ pub fn n_order_ema_into_slice(
         });
     }
     let resolved = resolve_params(&input.params, data.len())?;
-    validate_input(data, resolved)?;
+    validate_input(data)?;
     n_order_ema_compute_into(data, resolved, out);
     Ok(())
 }
@@ -802,31 +706,33 @@ fn is_default_ema(resolved: ResolvedParams) -> bool {
 fn n_order_ema_default_ema_into(data: &[f64], out: &mut [f64]) {
     let mut prev = 0.0;
     let mut initialized = false;
-    let mut count = 0usize;
 
     for (dst, &value) in out.iter_mut().zip(data.iter()) {
-        if !value.is_finite() {
+        if value.is_infinite() {
             initialized = false;
-            count = 0;
             *dst = f64::NAN;
             continue;
         }
 
+        if value.is_nan() && !initialized {
+            *dst = f64::NAN;
+            continue;
+        }
+        let safe_value = if value.is_nan() { 0.0 } else { value };
+
         if initialized {
             let old = prev;
-            let mut acc = 0.2 * value;
+            let mut acc = 0.2 * safe_value;
             acc -= -0.8 * old;
             prev = acc;
-            count += 1;
         } else {
-            let mut acc = 0.2 * value;
-            acc -= -0.8 * value;
+            let mut acc = 0.2 * safe_value;
+            acc -= -0.8 * safe_value;
             prev = acc;
             initialized = true;
-            count = 1;
         }
 
-        *dst = if count > 8 { prev } else { f64::NAN };
+        *dst = prev;
     }
 }
 
@@ -936,17 +842,11 @@ pub fn n_order_ema_batch_from_input_with_kernel(
     let combos = expand_grid_n_order_ema(sweep, &input.params)?;
     let rows = combos.len();
     let cols = data.len();
-    let mut warmups = Vec::with_capacity(rows);
     for combo in &combos {
         let resolved = resolve_params(combo, cols)?;
-        validate_input(data, resolved)?;
-        warmups.push(warmup_len(resolved));
+        validate_input(data)?;
     }
-    let mut raw = make_uninit_matrix(rows, cols);
-    init_matrix_prefixes(&mut raw, cols, &warmups);
-    let mut values =
-        unsafe { Vec::from_raw_parts(raw.as_mut_ptr() as *mut f64, raw.len(), raw.capacity()) };
-    std::mem::forget(raw);
+    let mut values = vec![f64::NAN; rows.saturating_mul(cols)];
     n_order_ema_batch_inner_into(data, &combos, kernel, true, &mut values)?;
     Ok(NOrderEmaBatchOutput {
         values,
@@ -1104,359 +1004,12 @@ impl NOrderEmaBatchBuilder {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "n_order_ema")]
-#[pyo3(signature = (data, period=DEFAULT_PERIOD, order=DEFAULT_ORDER, ema_style=DEFAULT_EMA_STYLE, iir_style=DEFAULT_IIR_STYLE, kernel=None))]
-pub fn n_order_ema_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: f64,
-    order: usize,
-    ema_style: &str,
-    iir_style: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = NOrderEmaInput::from_slice(
-        slice,
-        NOrderEmaParams {
-            period: Some(period),
-            order: Some(order),
-            ema_style: Some(ema_style.to_string()),
-            iir_style: Some(iir_style.to_string()),
-        },
-    );
-    let values = py
-        .allow_threads(|| n_order_ema_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "n_order_ema_batch")]
-#[pyo3(signature = (data, period_range, order_range=(DEFAULT_ORDER, DEFAULT_ORDER, 0), ema_style=DEFAULT_EMA_STYLE, iir_style=DEFAULT_IIR_STYLE, kernel=None))]
-pub fn n_order_ema_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (f64, f64, f64),
-    order_range: (usize, usize, usize),
-    ema_style: &str,
-    iir_style: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let batch_kernel = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        other => other,
-    };
-    let output = py
-        .allow_threads(|| {
-            n_order_ema_batch_with_kernel(
-                slice,
-                &NOrderEmaBatchRange {
-                    period: period_range,
-                    order: order_range,
-                },
-                &NOrderEmaParams {
-                    period: None,
-                    order: None,
-                    ema_style: Some(ema_style.to_string()),
-                    iir_style: Some(iir_style.to_string()),
-                },
-                batch_kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "values",
-        output
-            .values
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "periods",
-        output
-            .combos
-            .iter()
-            .map(|p| p.period.unwrap_or(DEFAULT_PERIOD))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "orders",
-        output
-            .combos
-            .iter()
-            .map(|p| p.order.unwrap_or(DEFAULT_ORDER) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict.into())
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "NOrderEmaStream")]
-pub struct NOrderEmaStreamPy {
-    stream: NOrderEmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl NOrderEmaStreamPy {
-    #[new]
-    #[pyo3(signature = (period=DEFAULT_PERIOD, order=DEFAULT_ORDER, ema_style=DEFAULT_EMA_STYLE, iir_style=DEFAULT_IIR_STYLE))]
-    pub fn new(period: f64, order: usize, ema_style: &str, iir_style: &str) -> PyResult<Self> {
-        let stream = NOrderEmaStream::try_new(NOrderEmaParams {
-            period: Some(period),
-            order: Some(order),
-            ema_style: Some(ema_style.to_string()),
-            iir_style: Some(iir_style.to_string()),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> f64 {
-        self.stream.update(value).unwrap_or(f64::NAN)
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_n_order_ema_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(n_order_ema_py, m)?)?;
-    m.add_function(wrap_pyfunction!(n_order_ema_batch_py, m)?)?;
-    m.add_class::<NOrderEmaStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn n_order_ema_js(
-    data: &[f64],
-    period: f64,
-    order: usize,
-    ema_style: &str,
-    iir_style: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let input = NOrderEmaInput::from_slice(
-        data,
-        NOrderEmaParams {
-            period: Some(period),
-            order: Some(order),
-            ema_style: Some(ema_style.to_string()),
-            iir_style: Some(iir_style.to_string()),
-        },
-    );
-    let mut output = alloc_with_nan_prefix(data.len(), 0);
-    n_order_ema_into_slice(&mut output, &input, Kernel::Scalar)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NOrderEmaBatchConfig {
-    pub period_range: (f64, f64, f64),
-    pub order_range: (usize, usize, usize),
-    pub ema_style: Option<String>,
-    pub iir_style: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NOrderEmaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<NOrderEmaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn n_order_ema_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: NOrderEmaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let output = n_order_ema_batch_with_kernel(
-        data,
-        &NOrderEmaBatchRange {
-            period: config.period_range,
-            order: config.order_range,
-        },
-        &NOrderEmaParams {
-            period: None,
-            order: None,
-            ema_style: Some(
-                config
-                    .ema_style
-                    .unwrap_or_else(|| DEFAULT_EMA_STYLE.to_string()),
-            ),
-            iir_style: Some(
-                config
-                    .iir_style
-                    .unwrap_or_else(|| DEFAULT_IIR_STYLE.to_string()),
-            ),
-        },
-        Kernel::ScalarBatch,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&NOrderEmaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn n_order_ema_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn n_order_ema_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn n_order_ema_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: f64,
-    order: usize,
-    ema_style: &str,
-    iir_style: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to n_order_ema_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = NOrderEmaInput::from_slice(
-            data,
-            NOrderEmaParams {
-                period: Some(period),
-                order: Some(order),
-                ema_style: Some(ema_style.to_string()),
-                iir_style: Some(iir_style.to_string()),
-            },
-        );
-        if in_ptr == out_ptr {
-            let mut tmp = alloc_with_nan_prefix(len, 0);
-            n_order_ema_into_slice(&mut tmp, &input, Kernel::Scalar)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            n_order_ema_into_slice(
-                std::slice::from_raw_parts_mut(out_ptr, len),
-                &input,
-                Kernel::Scalar,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn n_order_ema_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: f64,
-    period_end: f64,
-    period_step: f64,
-    order_start: usize,
-    order_end: usize,
-    order_step: usize,
-    ema_style: &str,
-    iir_style: &str,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to n_order_ema_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = NOrderEmaBatchRange {
-            period: (period_start, period_end, period_step),
-            order: (order_start, order_end, order_step),
-        };
-        let combos = expand_grid_n_order_ema(
-            &sweep,
-            &NOrderEmaParams {
-                period: None,
-                order: None,
-                ema_style: Some(ema_style.to_string()),
-                iir_style: Some(iir_style.to_string()),
-            },
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        n_order_ema_batch_inner_into(
-            data,
-            &combos,
-            Kernel::ScalarBatch,
-            false,
-            std::slice::from_raw_parts_mut(out_ptr, rows * len),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn n_order_ema_output_into_js(
-    data: &[f64],
-    period: f64,
-    order: usize,
-    ema_style: &str,
-    iir_style: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = n_order_ema_js(data, period, order, ema_style, iir_style)?;
-    crate::write_wasm_f64_output("n_order_ema_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn n_order_ema_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = n_order_ema_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("n_order_ema_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indicators::moving_averages::ma::{ma, ma_with_kernel, MaData};
+    use crate::indicators::moving_averages::ma::{MaData, ma, ma_with_kernel};
     use crate::indicators::moving_averages::ma_batch::{
-        ma_batch_with_kernel_and_typed_params, MaBatchParamKV, MaBatchParamValue,
+        MaBatchParamKV, MaBatchParamValue, ma_batch_with_kernel_and_typed_params,
     };
 
     fn sample_data(len: usize) -> Vec<f64> {
@@ -1475,6 +1028,39 @@ mod tests {
         .values;
         for value in out.into_iter().skip(32) {
             assert!((value - 42.0).abs() <= 1e-12);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn n_order_ema_creator_emits_on_first_finite_bar_without_period_warmup()
+    -> Result<(), Box<dyn Error>> {
+        let data = [f64::NAN, 10.0, 20.0];
+        let out = n_order_ema(&NOrderEmaInput::from_slice(
+            &data,
+            NOrderEmaParams::default(),
+        ))?
+        .values;
+
+        assert!(out[0].is_nan());
+        assert_eq!(out[1].to_bits(), 10.0f64.to_bits());
+        assert_eq!(out[2].to_bits(), 12.0f64.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn n_order_ema_creator_nz_gap_is_zero_input_without_filter_reset() -> Result<(), Box<dyn Error>>
+    {
+        let data = [10.0, 20.0, f64::NAN, 30.0];
+        let out = n_order_ema(&NOrderEmaInput::from_slice(
+            &data,
+            NOrderEmaParams::default(),
+        ))?
+        .values;
+
+        let expected: [f64; 4] = [10.0, 12.0, 9.600000000000001, 13.680000000000001];
+        for (actual, expected) in out.iter().zip(expected) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
         }
         Ok(())
     }

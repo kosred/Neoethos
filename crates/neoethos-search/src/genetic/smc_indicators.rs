@@ -71,19 +71,8 @@ static SMC_SEARCH_CONFIG_CACHE: OnceLock<SmcSearchConfig> = OnceLock::new();
 impl SmcSearchConfig {
     /// The installed SMC search config, or the typed defaults when nothing was
     /// installed (the `neoethos-models` GA and test fixtures land here).
-    ///
-    /// This is the honest name. `from_env` below is the old one, kept because
-    /// call sites outside this change still use it.
     pub fn current() -> Self {
         *SMC_SEARCH_CONFIG_CACHE.get_or_init(SmcSearchConfig::default)
-    }
-
-    /// Deprecated spelling of [`Self::current`] — it has read no environment
-    /// since 2026-08-10. Retained because `genetic/search_engine.rs` and
-    /// `execution_profile.rs` call it; renaming those is a mechanical follow-up
-    /// recorded in the handoff.
-    pub fn from_env() -> Self {
-        Self::current()
     }
 
     /// Config-driven constructor (was the `NEOETHOS_BOT_PROP_SMC_*` env
@@ -114,18 +103,6 @@ impl SmcSearchConfig {
         }
         cfg
     }
-}
-
-/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
-/// Kept only because `genetic/mod.rs` and `lib.rs` re-export it.
-pub fn install_smc_search_config_from_env() {
-    tracing::error!(
-        target: "neoethos_search::retired_env",
-        "install_smc_search_config_from_env() is RETIRED and installs typed DEFAULTS — \
-         the NEOETHOS_BOT_PROP_SMC_* layer no longer exists. Call \
-         install_smc_search_config_from_settings(&settings)."
-    );
-    let _ = SMC_SEARCH_CONFIG_CACHE.set(SmcSearchConfig::default());
 }
 
 /// Config-driven install — reads the SMC search knobs from the single
@@ -161,27 +138,6 @@ mod overrides_tests {
         assert_eq!(defaults.min_flags, 1);
         assert!((defaults.p_mtf - 0.85).abs() < 1e-9);
         assert!((defaults.p_ob - 0.50).abs() < 1e-9);
-    }
-
-    #[test]
-    fn smc_search_config_from_env_returns_legal_values() {
-        let cfg = SmcSearchConfig::from_env();
-        assert!((0.0..=1.0).contains(&cfg.force_ratio));
-        for p in [
-            cfg.p_ob,
-            cfg.p_fvg,
-            cfg.p_liq,
-            cfg.p_premium,
-            cfg.p_inducement,
-            cfg.p_mtf,
-            cfg.p_bos,
-            cfg.p_choch,
-            cfg.p_eqh,
-            cfg.p_eql,
-            cfg.p_displacement,
-        ] {
-            assert!((0.0..=1.0).contains(&p), "probability out of range: {p}");
-        }
     }
 }
 
@@ -336,11 +292,11 @@ fn normalize_feature_name(name: &str) -> String {
 ///    vocabulary at 217 columns the collision surface was already populated —
 ///    `ob` matches `obv` and `moving_average_cross_probability`, `fvg` matches
 ///    `fvg_positioning_average` and `fvg_trailing_stop`, `liq` matches
-///    `quant_amihud_illiquidity`, `trend` matches 25 classic ids plus
-///    `regime_trend_strength`. The correct binding held only because the SMC
-///    family is emitted FIRST in the frame and its own column therefore came
-///    first in column order. That is positional luck, not a binding rule, and
-///    the vocabulary just grew 27x.
+///    `quant_amihud_illiquidity`, and `trend` matched 25 classic ids plus the
+///    retired v2 Regime trend-strength label. The correct binding held only
+///    because the SMC family is emitted FIRST in the frame and its own column
+///    therefore came first in column order. That is positional luck, not a
+///    binding rule, and the vocabulary just grew 27x.
 /// 2. The alias PRIORITY ORDER was inert. `["smc_ob", "order_block", "ob"]`
 ///    did not prefer `smc_ob`: the first matching COLUMN won, whichever alias
 ///    it happened to match. Here the candidate list is the outer loop, so the
@@ -611,7 +567,7 @@ fn record_binding(names: &[String], bound: &[Option<usize>; SMC_FLAG_COUNT]) {
     }
 }
 
-fn quantize_dir(value: f32) -> i8 {
+fn quantize_dir(value: f64) -> i8 {
     if value > 1e-9 {
         1
     } else if value < -1e-9 {
@@ -621,7 +577,7 @@ fn quantize_dir(value: f32) -> i8 {
     }
 }
 
-fn quantize_binary(value: f32) -> i8 {
+fn quantize_binary(value: f64) -> i8 {
     if value > 1e-9 { 1 } else { 0 }
 }
 
@@ -853,7 +809,7 @@ mod column_binding_tests {
         "fvg_trailing_stop",
         "quant_amihud_illiquidity",
         "adaptive_schaff_trend_cycle",
-        "regime_trend_strength",
+        "regime_wilder_adx_14_v3",
         "supertrend",
         "choch_reversal_probability",
         "premium_zone_index",
@@ -1025,7 +981,10 @@ mod column_binding_tests {
         let sig_a = SMC_LAST_LOGGED_BINDING.load(Ordering::Relaxed);
         record_binding(&without_ob, &b);
         let sig_b = SMC_LAST_LOGGED_BINDING.load(Ordering::Relaxed);
-        assert_ne!(sig_a, sig_b, "a dropped SMC column must change the signature");
+        assert_ne!(
+            sig_a, sig_b,
+            "a dropped SMC column must change the signature"
+        );
         assert_ne!(sig_a, 0);
     }
 
@@ -1048,7 +1007,7 @@ mod column_binding_tests {
         let ohlcv = ctrader_sample_ohlcv();
         let n = ohlcv.close.len();
         let cols = names(&DECOYS);
-        let mut data = Array2::<f32>::zeros((n, cols.len()));
+        let mut data = Array2::<f64>::zeros((n, cols.len()));
         // Fill with a signal that would be loudly visible if it leaked into a
         // gate array: alternating +1 / -1.
         for i in 0..n {
@@ -1059,10 +1018,12 @@ mod column_binding_tests {
         let ts = ohlcv
             .timestamp
             .clone()
-            .unwrap_or_else(|| (0..n as i64).collect());
-        let frame = FeatureFrame::from_array(ts, cols, data);
+            .expect("cTrader fixture has canonical timestamps");
+        let frame =
+            neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(ts, cols, data)
+                .expect("valid f64 decoy frame");
 
-        let built = build_smc_arrays(&frame, &ohlcv);
+        let built = build_smc_arrays(&frame, &ohlcv).expect("SMC arrays build");
         let mut derived = derive_smc_arrays(&ohlcv);
         // The frame-independent tail step of `build_smc_arrays`, restated.
         let disp_baseline = derived.10.clone();
@@ -1132,7 +1093,7 @@ mod column_binding_tests {
     }
 }
 
-pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
+pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<SmcSignalTuple> {
     let n = frame.n_samples();
     let cols = detect_smc_columns(&frame.names);
     let (
@@ -1149,30 +1110,43 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
         mut displacement,
     ) = derive_smc_arrays(ohlcv);
 
-    let apply_dir_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+    let valid_value = |column: &neoethos_data::FeatureColumnF64, row: usize| {
+        column.validity[row]
+            .is_valid()
+            .then_some(column.values[row])
+    };
+    let apply_dir_col = |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
         if let Some(col) = col_opt
             && col < frame.n_features()
         {
+            let column = frame.feature_column(col)?;
             for (i, slot) in target.iter_mut().enumerate().take(n) {
-                *slot = quantize_dir(frame.feature_at(i, col));
+                *slot = valid_value(&column, i).map_or(0, quantize_dir);
             }
         }
+        Ok(())
     };
-    let apply_binary_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+    let apply_binary_col = |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
         if let Some(col) = col_opt
             && col < frame.n_features()
         {
+            let column = frame.feature_column(col)?;
             for (i, slot) in target.iter_mut().enumerate().take(n) {
-                *slot = quantize_binary(frame.feature_at(i, col));
+                *slot = valid_value(&column, i).map_or(0, quantize_binary);
             }
         }
+        Ok(())
     };
-    let apply_eqh_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+    let apply_eqh_col = |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
         if let Some(col) = col_opt
             && col < frame.n_features()
         {
+            let column = frame.feature_column(col)?;
             for (i, slot) in target.iter_mut().enumerate().take(n) {
-                let v = frame.feature_at(i, col);
+                let Some(v) = valid_value(&column, i) else {
+                    *slot = 0;
+                    continue;
+                };
                 let q = quantize_dir(v);
                 *slot = if q != 0 {
                     q
@@ -1183,13 +1157,18 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
                 };
             }
         }
+        Ok(())
     };
-    let apply_eql_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+    let apply_eql_col = |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
         if let Some(col) = col_opt
             && col < frame.n_features()
         {
+            let column = frame.feature_column(col)?;
             for (i, slot) in target.iter_mut().enumerate().take(n) {
-                let v = frame.feature_at(i, col);
+                let Some(v) = valid_value(&column, i) else {
+                    *slot = 0;
+                    continue;
+                };
                 let q = quantize_dir(v);
                 *slot = if q != 0 {
                     q
@@ -1200,6 +1179,7 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
                 };
             }
         }
+        Ok(())
     };
     // **F-040 documentation (2026-05-25)** — this closure fills zero
     // slots in `target` with the direction signal from a SECONDARY
@@ -1217,23 +1197,30 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
     // καλό" — uniformity of SMC voting rules across the indicators).
     // A future research-driven sweep may split these into separate
     // gate-votes; that's a Phase-C scope decision, not a bug.
-    let apply_dir_fill_zeros = |target: &mut Vec<i8>, col_opt: Option<usize>| {
-        if let Some(col) = col_opt
-            && col < frame.n_features()
-        {
-            for (i, slot) in target.iter_mut().enumerate().take(n) {
-                if *slot == 0 {
-                    *slot = quantize_dir(frame.feature_at(i, col));
+    let apply_dir_fill_zeros =
+        |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
+            if let Some(col) = col_opt
+                && col < frame.n_features()
+            {
+                let column = frame.feature_column(col)?;
+                for (i, slot) in target.iter_mut().enumerate().take(n) {
+                    if *slot == 0 {
+                        *slot = valid_value(&column, i).map_or(0, quantize_dir);
+                    }
                 }
             }
-        }
-    };
-    let apply_eq_levels = |target: &mut Vec<i8>, eqh_col: Option<usize>, eql_col: Option<usize>| {
+            Ok(())
+        };
+    let apply_eq_levels = |target: &mut Vec<i8>,
+                           eqh_col: Option<usize>,
+                           eql_col: Option<usize>|
+     -> anyhow::Result<()> {
         if let Some(col) = eqh_col
             && col < frame.n_features()
         {
+            let column = frame.feature_column(col)?;
             for (i, slot) in target.iter_mut().enumerate().take(n) {
-                if quantize_binary(frame.feature_at(i, col)) != 0 {
+                if valid_value(&column, i).is_some_and(|value| quantize_binary(value) != 0) {
                     *slot = -1;
                 }
             }
@@ -1241,37 +1228,40 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
         if let Some(col) = eql_col
             && col < frame.n_features()
         {
+            let column = frame.feature_column(col)?;
             for (i, slot) in target.iter_mut().enumerate().take(n) {
-                if quantize_binary(frame.feature_at(i, col)) != 0 {
+                if valid_value(&column, i).is_some_and(|value| quantize_binary(value) != 0) {
                     *slot = 1;
                 }
             }
         }
+        Ok(())
     };
 
-    apply_dir_col(&mut ob, cols.ob);
-    apply_dir_col(&mut fvg, cols.fvg);
-    apply_dir_col(&mut liq, cols.liq);
-    apply_dir_col(&mut trend, cols.trend);
-    apply_dir_col(&mut premium, cols.premium);
-    apply_binary_col(&mut inducement, cols.inducement);
-    apply_dir_col(&mut bos, cols.bos);
-    apply_dir_col(&mut choch, cols.choch);
-    apply_eqh_col(&mut eqh, cols.eqh);
-    apply_eql_col(&mut eql, cols.eql);
-    apply_dir_col(&mut displacement, cols.displacement);
-    apply_dir_fill_zeros(&mut ob, cols.bos);
-    apply_dir_fill_zeros(&mut ob, cols.choch);
-    apply_eq_levels(&mut liq, cols.eqh, cols.eql);
-    apply_dir_fill_zeros(&mut trend, cols.bos);
-    apply_dir_fill_zeros(&mut trend, cols.choch);
-    apply_dir_fill_zeros(&mut trend, cols.displacement);
+    apply_dir_col(&mut ob, cols.ob)?;
+    apply_dir_col(&mut fvg, cols.fvg)?;
+    apply_dir_col(&mut liq, cols.liq)?;
+    apply_dir_col(&mut trend, cols.trend)?;
+    apply_dir_col(&mut premium, cols.premium)?;
+    apply_binary_col(&mut inducement, cols.inducement)?;
+    apply_dir_col(&mut bos, cols.bos)?;
+    apply_dir_col(&mut choch, cols.choch)?;
+    apply_eqh_col(&mut eqh, cols.eqh)?;
+    apply_eql_col(&mut eql, cols.eql)?;
+    apply_dir_col(&mut displacement, cols.displacement)?;
+    apply_dir_fill_zeros(&mut ob, cols.bos)?;
+    apply_dir_fill_zeros(&mut ob, cols.choch)?;
+    apply_eq_levels(&mut liq, cols.eqh, cols.eql)?;
+    apply_dir_fill_zeros(&mut trend, cols.bos)?;
+    apply_dir_fill_zeros(&mut trend, cols.choch)?;
+    apply_dir_fill_zeros(&mut trend, cols.displacement)?;
 
     if let Some(col) = cols.displacement
         && col < frame.n_features()
     {
+        let column = frame.feature_column(col)?;
         for (i, slot) in inducement.iter_mut().enumerate().take(n) {
-            if quantize_dir(frame.feature_at(i, col)) != 0 {
+            if valid_value(&column, i).is_some_and(|value| quantize_dir(value) != 0) {
                 *slot = 1;
             }
         }
@@ -1282,7 +1272,7 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
         }
     }
 
-    (
+    Ok((
         ob,
         fvg,
         liq,
@@ -1294,5 +1284,5 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
         eqh,
         eql,
         displacement,
-    )
+    ))
 }

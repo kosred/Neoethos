@@ -1,39 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaNama;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context as CudaContext;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use std::collections::VecDeque;
 use std::convert::AsRef;
 use std::error::Error;
@@ -61,92 +31,6 @@ impl<'a> AsRef<[f64]> for NamaInput<'a> {
     }
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32PyNama {
-    pub(crate) inner: DeviceArrayF32,
-    _ctx: Arc<CudaContext>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32PyNama {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let rows = self.inner.rows;
-        let cols = self.inner.cols;
-        d.set_item("shape", (rows, cols))?;
-        d.set_item("typestr", "<f4")?;
-        let item = std::mem::size_of::<f32>();
-        d.set_item("strides", (cols * item, item))?;
-        let ptr_int: usize = if rows == 0 || cols == 0 {
-            0
-        } else {
-            self.inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr_int, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum NamaData<'a> {
     Candles {
@@ -162,10 +46,6 @@ pub struct NamaOutput {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct NamaParams {
     pub period: Option<usize>,
 }
@@ -1023,7 +903,6 @@ pub fn nama_into_slice(dst: &mut [f64], input: &NamaInput, k: Kernel) -> Result<
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn nama_into(input: &NamaInput, out: &mut [f64]) -> Result<(), NamaError> {
     nama_into_slice(out, input, Kernel::Auto)
 }
@@ -1480,345 +1359,10 @@ fn nama_batch_inner(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "nama")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn nama_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::PyArray1;
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = NamaParams {
-        period: Some(period),
-    };
-    let input = NamaInput::from_slice(slice_in, params);
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [slice_in.len()], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| nama_into_slice(out_slice, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out_arr)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "NamaStream")]
-pub struct NamaStreamPy {
-    stream: NamaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl NamaStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let s = NamaStream::try_new(NamaParams {
-            period: Some(period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(NamaStreamPy { stream: s })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update_source(value)
-    }
-
-    fn update_ohlc(
-        &mut self,
-        src: f64,
-        high: f64,
-        low: f64,
-        prev_close: Option<f64>,
-    ) -> Option<f64> {
-        self.stream.update_ohlc(src, high, low, prev_close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "nama_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn nama_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::PyArray1;
-    let slice_in = data.as_slice()?;
-    let sweep = NamaBatchRange {
-        period: period_range,
-    };
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_flat = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| -> Result<(), NamaError> {
-        for (r, prm) in combos.iter().enumerate() {
-            let start = r * cols;
-            let input = NamaInput::from_slice(slice_in, *prm);
-            nama_into_slice(&mut out_flat[start..start + cols], &input, kern)?;
-        }
-        Ok(())
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "nama_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn nama_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32PyNama> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = NamaBatchRange {
-        period: period_range,
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaNama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .nama_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out, cuda.context_arc(), cuda.device_id()))
-    })?;
-
-    Ok(DeviceArrayF32PyNama {
-        inner,
-        _ctx: ctx,
-        _device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "nama_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn nama_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32PyNama> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected a 2D array (time, series)"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat_in = data_tm_f32.as_slice()?;
-
-    let params = NamaParams {
-        period: Some(period),
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaNama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .nama_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out, cuda.context_arc(), cuda.device_id()))
-    })?;
-
-    Ok(DeviceArrayF32PyNama {
-        inner,
-        _ctx: ctx,
-        _device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nama_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    if data.is_empty() {
-        return Err(JsValue::from_str("Input data slice is empty"));
-    }
-    if period == 0 || period > data.len() {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-    let params = NamaParams {
-        period: Some(period),
-    };
-    let input = NamaInput::from_slice(data, params);
-    let mut output = vec![0.0; data.len()];
-    nama_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NamaBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NamaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<NamaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = nama_batch)]
-pub fn nama_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: NamaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = NamaBatchRange {
-        period: cfg.period_range,
-    };
-    let output = nama_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = NamaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nama_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nama_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nama_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to nama_into"));
-    }
-    if period == 0 || period > len {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = NamaParams {
-            period: Some(period),
-        };
-        let input = NamaInput::from_slice(data, params);
-        if in_ptr == out_ptr {
-            let mut tmp = vec![0.0; len];
-            nama_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            nama_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = nama_batch_into)]
-pub fn nama_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to nama_batch_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = NamaBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-        for (r, prm) in combos.iter().enumerate() {
-            let start = r * cols;
-            let inp = NamaInput::from_slice(data, *prm);
-            nama_into_slice(&mut out[start..start + cols], &inp, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nama_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = nama_js(data, period)?;
-    crate::write_wasm_f64_output("nama_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nama_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = nama_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("nama_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     macro_rules! skip_if_unsupported {
         ($kernel:expr, $test_name:expr) => {
@@ -1878,8 +1422,8 @@ mod tests {
     fn check_nama_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = NamaParams { period: Some(30) };
         let input = NamaInput::from_candles(&candles, "close", params);
@@ -1909,7 +1453,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_nama_into_matches_api() {
         let n = 256usize;
@@ -1948,8 +1491,8 @@ mod tests {
 
     fn check_nama_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = NamaInput::with_default_candles(&candles);
         match input.data {
@@ -2166,8 +1709,8 @@ mod tests {
 
     fn check_batch_sweep(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = NamaBatchBuilder::new()
             .kernel(kernel)
@@ -2277,9 +1820,9 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn check_nama_no_poison_patterns_scalar() -> Result<(), Box<dyn Error>> {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let out = nama_with_kernel(&NamaInput::with_default_candles(&c), Kernel::Scalar)?.values;
         for (i, &v) in out.iter().enumerate() {

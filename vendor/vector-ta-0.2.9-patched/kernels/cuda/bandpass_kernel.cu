@@ -251,9 +251,8 @@ void bandpass_many_series_one_param_time_major_from_hp_f32(
 // NEOETHOS f64 LANE  --  closer 4, round 3
 //
 // CPU reference: `bandpass_fill_bp` (src/indicators/bandpass.rs:303-370),
-// which is the ONLY path `bandpass_output_into_slice` (:652) takes for the
-// `Bp` field, and `Bp` is what `output_id == "value"` resolves to
-// (dispatch/cpu_batch.rs:14152). The bp series is built from
+// which is the path `bandpass_output_into_slice` takes for the canonical `bp`
+// field. The bp series is built from
 // `highpass_scalar` (moving_averages/highpass.rs:438) and then
 // `bandpass_scalar` (bandpass.rs:718).
 //
@@ -275,24 +274,23 @@ static __forceinline__ __device__ double bandpass_neo_qnan() {
     return __longlong_as_double(0x7ff8000000000000ULL);
 }
 
-extern "C" __global__
-void bandpass_neo_batch_f64(const double* __restrict__ prices,
-                            int n,
-                            const int* __restrict__ periods,
-                            int n_combos,
-                            int first_valid,
-                            double* __restrict__ out) {
-    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
-    if (combo >= n_combos) return;
-    if (n <= 0) return;
-
-    double* __restrict__ row = out + (size_t)combo * (size_t)n;
+static __forceinline__ __device__
+void neo_bandpass_row_f64(const double* __restrict__ prices,
+                          int n,
+                          int period,
+                          double bandwidth,
+                          int first_valid,
+                          double* __restrict__ row_bp,
+                          double* __restrict__ row_bp_normalized,
+                          double* __restrict__ row_signal,
+                          double* __restrict__ row_trigger) {
     const double nn = bandpass_neo_qnan();
-
-    const int period = periods[combo];
-    // cpu_batch.rs:14180 -- the batch's only other parameter, and the lane
-    // sweeps `period` alone, so this is the CPU's default at every row.
-    const double bandwidth = 0.3;
+    for (int i = 0; i < n; ++i) {
+        if (row_bp) row_bp[i] = nn;
+        if (row_bp_normalized) row_bp_normalized[i] = nn;
+        if (row_signal) row_signal[i] = nn;
+        if (row_trigger) row_trigger[i] = nn;
+    }
 
     // bandpass.rs:255 -- `position(|x| x.is_finite())`, which is the
     // `F64FirstValidRule::CloseFinite` this row declares.
@@ -305,16 +303,28 @@ void bandpass_neo_batch_f64(const double* __restrict__ prices,
     if (first >= n) refused = true;
     if (period <= 0 || period > n) refused = true;
     if (!refused && (n - first) < period) refused = true;
+    if (!isfinite(bandwidth) || bandwidth <= 0.0 || bandwidth > 1.0) refused = true;
 
     // bandpass.rs:277-286. `f64::round` is half-away-from-zero and so is the
     // CUDA double `round`, so the two agree bit for bit.
-    long long hp_period_ll = 0;
-    long long trig_period_ll = 0;
+    int hp_period = 0;
+    int trig_period = 0;
     if (!refused) {
-        hp_period_ll = (long long)round(4.0 * (double)period / bandwidth);
-        trig_period_ll = (long long)round(((double)period / bandwidth) / 1.5);
-        if (hp_period_ll < 2) refused = true;
-        if (trig_period_ll < 2) refused = true;
+        const double hp_period_rounded = round(4.0 * (double)period / bandwidth);
+        const double trig_period_rounded = round(((double)period / bandwidth) / 1.5);
+        // Rust's positive float-to-usize cast saturates. Any value above this
+        // row's length is rejected immediately by the downstream high-pass,
+        // so compare in f64 before narrowing to the CUDA int ABI.
+        if (!isfinite(hp_period_rounded) || hp_period_rounded < 2.0 || hp_period_rounded > (double)n) {
+            refused = true;
+        }
+        if (!isfinite(trig_period_rounded) || trig_period_rounded < 2.0 || trig_period_rounded > (double)n) {
+            refused = true;
+        }
+        if (!refused) {
+            hp_period = (int)hp_period_rounded;
+            trig_period = (int)trig_period_rounded;
+        }
     }
 
     // highpass.rs:313-316 -- a SEPARATE scan, `!is_nan`, which names an
@@ -326,10 +336,8 @@ void bandpass_neo_batch_f64(const double* __restrict__ prices,
     }
     if (first_hp < 0) refused = true;
 
-    int hp_period = 0;
     double hp_theta = 0.0;
     if (!refused) {
-        hp_period = (int)hp_period_ll;
         // highpass_with_kernel, :318-330: every refusal it makes.
         if (n <= 2 || hp_period <= 0 || hp_period > n) refused = true;
         else if ((n - first_hp) < hp_period) refused = true;
@@ -340,10 +348,7 @@ void bandpass_neo_batch_f64(const double* __restrict__ prices,
         }
     }
 
-    if (refused) {
-        for (int i = 0; i < n; ++i) row[i] = nn;
-        return;
-    }
+    if (refused) return;
 
     // bandpass.rs:317-318 -- warm_bp, and :331 bp_start = warm_bp - 2. The
     // highpass length check above guarantees first_hp + 2 <= n, so warm_bp is
@@ -368,9 +373,6 @@ void bandpass_neo_batch_f64(const double* __restrict__ prices,
     const double bp_c = beta * (1.0 + alpha_bp);
     const double bp_d = -alpha_bp;
 
-    const int nan_end = warm_bp < n ? warm_bp : n;
-    for (int i = 0; i < nan_end; ++i) row[i] = nn;
-
     // One ascending pass. `hp_cur/hp_m1/hp_m2` carry the highpass series;
     // `y_m1/y_m2` carry the bandpass recursion. bp_start == first_hp, so the
     // two stages advance in lockstep and the relative index j = i - bp_start
@@ -378,6 +380,7 @@ void bandpass_neo_batch_f64(const double* __restrict__ prices,
     double hp_cur = 0.0, hp_m1 = 0.0, hp_m2 = 0.0;
     double x_m1 = 0.0;
     double y_m1 = 0.0, y_m2 = 0.0;
+    double peak = 0.0;
 
     for (int i = first_hp; i < n; ++i) {
         const double x = prices[i];
@@ -403,11 +406,98 @@ void bandpass_neo_batch_f64(const double* __restrict__ prices,
             y = fma(bp_d, y_m2, fma(bp_c, y_m1, bp_a * delta));
         }
 
-        if (i >= warm_bp) row[i] = y;
+        if (i >= warm_bp) {
+            if (row_bp) row_bp[i] = y;
+            if (row_bp_normalized) {
+                peak *= 0.991;
+                const double absolute = fabs(y);
+                if (absolute > peak) peak = absolute;
+                row_bp_normalized[i] = peak != 0.0 ? y / peak : 0.0;
+            }
+        }
 
         hp_m2 = hp_m1;
         hp_m1 = hp_cur;
         y_m2 = y_m1;
         y_m1 = y;
     }
+
+    if (!row_bp_normalized || (!row_trigger && !row_signal) || warm_bp >= n) return;
+
+    // `bandpass_output_into_slice` invokes highpass on the normalized suffix.
+    // That helper performs its own first-!NaN scan and seeds the recurrence at
+    // that exact element, so do not substitute the outer finite-price index.
+    int first_trigger = -1;
+    for (int i = warm_bp; i < n; ++i) {
+        if (!isnan(row_bp_normalized[i])) {
+            first_trigger = i;
+            break;
+        }
+    }
+    if (first_trigger < 0) return;
+
+    const int trigger_len = n - warm_bp;
+    const int trigger_first_relative = first_trigger - warm_bp;
+    if (trigger_len <= 2 || trig_period <= 0 || trig_period > trigger_len) return;
+    if ((trigger_len - trigger_first_relative) < trig_period) return;
+
+    const double trigger_theta = 2.0 * M_PI / (double)trig_period;
+    const double trigger_cos = cos(trigger_theta);
+    if (fabs(trigger_cos) < 1e-15) return;
+    const double trigger_alpha = 1.0 + ((sin(trigger_theta) - 1.0) / trigger_cos);
+    const double trigger_c = 1.0 - 0.5 * trigger_alpha;
+    const double trigger_oma = 1.0 - trigger_alpha;
+
+    double trigger_x_prev = row_bp_normalized[first_trigger];
+    double trigger_y_prev = trigger_x_prev;
+    if (row_trigger) row_trigger[first_trigger] = trigger_y_prev;
+    if (row_signal) row_signal[first_trigger] = 0.0;
+    for (int i = first_trigger + 1; i < n; ++i) {
+        const double current = row_bp_normalized[i];
+        const double trigger_value =
+            fma(trigger_oma, trigger_y_prev, trigger_c * (current - trigger_x_prev));
+        if (row_trigger) row_trigger[i] = trigger_value;
+        if (row_signal) {
+            row_signal[i] = current < trigger_value
+                ? 1.0
+                : (current > trigger_value ? -1.0 : 0.0);
+        }
+        trigger_x_prev = current;
+        trigger_y_prev = trigger_value;
+    }
+}
+
+extern "C" __global__
+void bandpass_neo_batch_f64(const double* __restrict__ prices,
+                            int n,
+                            const int* __restrict__ periods,
+                            int n_combos,
+                            int first_valid,
+                            double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    double* __restrict__ row_bp = out + (size_t)combo * (size_t)n;
+    neo_bandpass_row_f64(prices, n, periods[combo], 0.3, first_valid,
+                         row_bp, nullptr, nullptr, nullptr);
+}
+
+extern "C" __global__
+void bandpass_production_f64(const double* __restrict__ prices,
+                             int n,
+                             const int* __restrict__ periods,
+                             const double* __restrict__ bandwidths,
+                             int n_combos,
+                             int first_valid,
+                             double* __restrict__ out_bp,
+                             double* __restrict__ out_bp_normalized,
+                             double* __restrict__ out_signal,
+                             double* __restrict__ out_trigger) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    const size_t offset = (size_t)combo * (size_t)n;
+    neo_bandpass_row_f64(prices, n, periods[combo], bandwidths[combo], first_valid,
+                         out_bp + offset,
+                         out_bp_normalized + offset,
+                         out_signal + offset,
+                         out_trigger + offset);
 }

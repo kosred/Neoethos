@@ -6,9 +6,9 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Gene {
     pub indices: Vec<usize>,
-    pub weights: Vec<f32>,
-    pub long_threshold: f32,
-    pub short_threshold: f32,
+    pub weights: Vec<f64>,
+    pub long_threshold: f64,
+    pub short_threshold: f64,
     pub fitness: f64,
     pub sharpe_ratio: f64,
     pub win_rate: f64,
@@ -337,10 +337,7 @@ pub const COMMISSION_SIDES_PER_ROUND_TRIP: f64 = 2.0;
 ///
 /// This has ZERO expected value in money. Charging the true cost creates no
 /// edge; it stops the search from selecting candidates on a subsidy.
-pub(crate) fn round_trip_commission_per_lot(
-    quoted_per_lot: f64,
-    quoted_is_per_side: bool,
-) -> f64 {
+pub(crate) fn round_trip_commission_per_lot(quoted_per_lot: f64, quoted_is_per_side: bool) -> f64 {
     if quoted_is_per_side {
         quoted_per_lot * COMMISSION_SIDES_PER_ROUND_TRIP
     } else {
@@ -434,14 +431,9 @@ pub(crate) fn infer_market_cost_profile(
             // currency, so ask the store for the bridging pair before giving up
             // — this is the accurate path, since it uses the broker's own pip
             // value rather than the estimator's reconstruction of it.
-            if let Some(rate) =
-                crate::fx_rates::quote_to_account(&meta.quote, &account_currency)
-            {
-                let converted = meta.pip_value_in_account(
-                    &account_currency,
-                    Some(rate),
-                    live_or_typical,
-                );
+            if let Some(rate) = crate::fx_rates::quote_to_account(&meta.quote, &account_currency) {
+                let converted =
+                    meta.pip_value_in_account(&account_currency, Some(rate), live_or_typical);
                 if converted.is_finite() && converted > 0.0 {
                     // Said out loud, because a silent success is how the
                     // original defect stayed hidden: nothing in a result made
@@ -479,8 +471,8 @@ pub(crate) fn infer_market_cost_profile(
     //      ⚠ UNREACHABLE FROM DISCOVERY (stated 2026-08-10). Every discovery
     //      run fills step (1) from `risk.*`:
     //      `DiscoveryConfig::from_settings` computes
-    //      `evaluation_spread_pips = risk.backtest_spread_pips +
-    //      risk.slippage_pips` and a round-trip commission from
+    //      `evaluation_spread_pips = risk.backtest_spread_pips + 2 *
+    //      risk.slippage_pips` (slippage is per fill) and a round-trip commission from
     //      `risk.commission_per_lot` (or broker metadata), passes both as the
     //      explicit override through `DiscoveryConfig::evaluation_config`, and
     //      `run_discovery_cycle` refuses a non-finite override — so the
@@ -493,25 +485,23 @@ pub(crate) fn infer_market_cost_profile(
     //      `resolve_and_log_duplicate_knobs` in discovery.rs. Step (2) survives
     //      only as a library fallback for non-discovery callers that pass
     //      `None`.
-    //   3. **SymbolMetadata** broker-authoritative value — the new
-    //      typed boundary populated by the cTrader connector.
+    //   3. **SymbolMetadata** screening assumption. The persisted field has no
+    //      per-value quote provenance; current cTrader capture leaves it None.
     //   4. Asset-class synthetic default — LAST RESORT, kept only so
     //      that pre-F-126 `data/symbol_metadata.json` files (which
     //      have neither field) keep working. Logs a `tracing::warn!`
     //      so operators see the synthetic-fallback was taken.
     //
-    // When `data/symbol_metadata.json` is populated from cTrader
-    // (`ProtoOASymbol::spread` + commission schedule), step (4) is
-    // never reached. Operator's real-data policy 2026-05-24 is
-    // honoured: synthetic only when broker silence + no operator
-    // override leaves no other choice.
+    // An operator-authored `data/symbol_metadata.json` may populate the spread
+    // assumption. It remains broad-screening input, never historical Bid/Ask
+    // or execution evidence.
     // F-301 (2026-05-28): kill the synthetic-spread fallback. The
     // previous code returned a per-asset-class default (1.5 / 2.5 /
     // 8.0 / 1.0 pips) with a tracing::warn — which meant every novel
-    // symbol with no broker data silently got fake numbers, and the
-    // GA produced backtests using spread that didn't match the live
-    // market. The operator's directive 2026-05-24: "ολα τα νουμερα
-    // απο τον σερβερ", and that includes spread.
+    // symbol with no explicit assumption silently got fake numbers, and the
+    // GA produced backtests using spread that didn't match the live market.
+    // `ProtoOASymbol` has no historical spread field, so this boundary must
+    // never describe an operator-authored scalar as broker quote evidence.
     //
     // Resolution chain unchanged at the top; on miss:
     //   - tracing::error! with the symbol context (operators see the
@@ -539,14 +529,12 @@ pub(crate) fn infer_market_cost_profile(
                 target: "neoethos_search::cost_model",
                 symbol = %symbol,
                 asset_class = symbol_kind(&symbol),
-                "F-301 fail-loud: no broker spread for this symbol. \
+                "F-301 fail-loud: no screening spread assumption for this symbol. \
                  SymbolMetadata has no `typical_spread_pips`, no \
                  operator override, and no cost.spread_pips. Synthetic \
                  fallback REMOVED — returning NaN so the eval kernel \
                  zero-trades this candidate instead of silently using \
-                 1.5 pips. Action: populate data/symbol_metadata.json \
-                 from cTrader ProtoOASymbol.spread (run \
-                 --rebuild-symbol-metadata) OR set \
+                 1.5 pips. Action: set \
                  settings.risk.backtest_spread_pips in config.yaml."
             );
             f64::NAN
@@ -738,7 +726,7 @@ impl Gene {
             self.weights = vec![1.0; self.indices.len()];
         }
 
-        let mut terms: Vec<(usize, f32)> = self
+        let mut terms: Vec<(usize, f64)> = self
             .indices
             .iter()
             .copied()
@@ -751,7 +739,7 @@ impl Gene {
             .collect();
         terms.sort_by_key(|(idx, _)| *idx);
 
-        let mut merged: Vec<(usize, f32)> = Vec::with_capacity(terms.len());
+        let mut merged: Vec<(usize, f64)> = Vec::with_capacity(terms.len());
         for (idx, weight) in terms {
             if let Some((last_idx, last_weight)) = merged.last_mut()
                 && *last_idx == idx
@@ -822,7 +810,7 @@ pub struct SearchResult {
     pub metrics: Vec<[f64; 11]>,
     /// Effective SMC gate used for the metrics in this result. This is the
     /// annealed final-generation value, not the static runtime start value.
-    pub effective_smc_gate_threshold: f32,
+    pub effective_smc_gate_threshold: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -851,18 +839,21 @@ pub struct EvaluationConfig {
     pub spread_pips: f64,
     pub commission_per_trade: f64,
     pub pip_value_per_lot: f64,
-    pub smc_gate_threshold: f32,
-    pub smc_weight_ob: f32,
-    pub smc_weight_fvg: f32,
-    pub smc_weight_liq: f32,
-    pub smc_weight_mtf: f32,
-    pub smc_weight_premium: f32,
-    pub smc_weight_inducement: f32,
-    pub smc_weight_bos: f32,
-    pub smc_weight_choch: f32,
-    pub smc_weight_eqh: f32,
-    pub smc_weight_eql: f32,
-    pub smc_weight_displacement: f32,
+    pub swap_long_pips_per_day: f64,
+    pub swap_short_pips_per_day: f64,
+    pub pnl_conversion_fee_rate: f64,
+    pub smc_gate_threshold: f64,
+    pub smc_weight_ob: f64,
+    pub smc_weight_fvg: f64,
+    pub smc_weight_liq: f64,
+    pub smc_weight_mtf: f64,
+    pub smc_weight_premium: f64,
+    pub smc_weight_inducement: f64,
+    pub smc_weight_bos: f64,
+    pub smc_weight_choch: f64,
+    pub smc_weight_eqh: f64,
+    pub smc_weight_eql: f64,
+    pub smc_weight_displacement: f64,
     /// scoring_version 5 (2026-07-02): when `true` the GA evolves under the
     /// Kelly log-growth objective (`scoring::ga_fitness_growth`) instead of
     /// the prop-firm consistency formula. Set by the discovery driver for
@@ -916,6 +907,9 @@ impl Default for EvaluationConfig {
             spread_pips: f64::NAN,
             commission_per_trade: f64::NAN,
             pip_value_per_lot: f64::NAN,
+            swap_long_pips_per_day: f64::NAN,
+            swap_short_pips_per_day: f64::NAN,
+            pnl_conversion_fee_rate: f64::NAN,
             smc_gate_threshold: smc.gate_threshold,
             smc_weight_ob: smc.w_ob,
             smc_weight_fvg: smc.w_fvg,
@@ -955,6 +949,9 @@ impl EvaluationConfig {
             pip_value_per_lot: profile.pip_value_per_lot,
             spread_pips: profile.spread_pips,
             commission_per_trade: profile.commission_per_trade,
+            swap_long_pips_per_day: profile.swap_long_pips_per_day,
+            swap_short_pips_per_day: profile.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: profile.pnl_conversion_fee_rate,
             // EXIT GEOMETRY REMOVED FROM HERE 2026-08-09.
             //
             // What stood here: `trailing_enabled: true`, `trailing_be_trigger_r:
@@ -1031,9 +1028,9 @@ mod tests {
     fn normalize_repairs_invalid_numeric_fields() {
         let mut gene = Gene {
             indices: vec![0],
-            weights: vec![f32::NAN],
-            long_threshold: f32::NAN,
-            short_threshold: f32::NAN,
+            weights: vec![f64::NAN],
+            long_threshold: f64::NAN,
+            short_threshold: f64::NAN,
             tp_pips: f64::NAN,
             sl_pips: -1.0,
             ..Default::default()
@@ -1142,7 +1139,8 @@ mod cross_pair_currency_tests {
     /// in the log that its numbers are wrong.
     #[test]
     fn the_lenient_path_remains_reachable_when_explicitly_enabled() {
-        let mut overrides = crate::genetic::runtime_overrides::CostProfileRuntimeOverrides::default();
+        let mut overrides =
+            crate::genetic::runtime_overrides::CostProfileRuntimeOverrides::default();
         assert!(
             overrides.reject_pip_fallback,
             "refusing must be the unconfigured default"

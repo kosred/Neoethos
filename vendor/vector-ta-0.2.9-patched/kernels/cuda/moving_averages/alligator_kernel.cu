@@ -245,16 +245,16 @@ void alligator_many_series_one_param_f32(const float* __restrict__ prices_tm,
 
 
 // =============================================================================
-// NeoEthos f64 lane — added in place, f64 end to end.
+// NeoEthos f64 lane - added in place, f64 end to end.
 //
 // CPU reference: src/indicators/alligator.rs
-//   * `alligator_with_kernel` (:300) — first_valid = first non-NaN of the
+//   * `alligator_with_kernel` (:300) - first_valid = first non-NaN of the
 //     SOURCE, and the source is `hl2` (cpu_batch.rs:13912
 //     `extract_slice_input("alligator", req.data, "hl2")`), NOT close. Handing
 //     this kernel close computes a different indicator.
-//   * `alligator_scalar` (:552) — jaw/teeth/lips NaN prefixes are
+//   * `alligator_scalar` (:552) - jaw/teeth/lips NaN prefixes are
 //     `first + period - 1 + offset`, one per line.
-//   * `alligator_smma_scalar` (:706) — the arithmetic reproduced below.
+//   * `alligator_smma_scalar` (:706) - the arithmetic reproduced below.
 //
 // PERIOD-INVARIANT. `compute_alligator_batch` (cpu_batch.rs:13938) reads
 // jaw_period 13 / jaw_offset 8, teeth_period 8 / teeth_offset 5,
@@ -267,10 +267,10 @@ void alligator_many_series_one_param_f32(const float* __restrict__ prices_tm,
 //
 // ROUNDING COUNT. The CPU recurrence is
 //     smma = (smma * scale + x) * inv_period;
-// — multiply, add, multiply: THREE roundings, and NOT a `mul_add`. Written
+// - multiply, add, multiply: THREE roundings, and NOT a `mul_add`. Written
 // literally here; `-fmad=false` keeps nvcc from fusing the first two.
 //
-// The seed is `sum / period` — a true divide, not a multiply by the reciprocal.
+// The seed is `sum / period` - a true divide, not a multiply by the reciprocal.
 //
 // Sequential: `smma` carries across bars. One thread per column.
 // =============================================================================
@@ -289,13 +289,13 @@ __device__ __forceinline__ void nef_alligator_line(const double* __restrict__ sr
 {
     const double QNAN = nef_qnan_alli();
 
-    // alligator_scalar:553 — warm = first + period - 1 + offset.
+    // alligator_scalar:553 - warm = first + period - 1 + offset.
     long long warm_ll = (long long)first_valid + (long long)period - 1 + (long long)offset;
     int warm = warm_ll > (long long)n ? n : (int)warm_ll;
     if (warm < 0) warm = 0;
     for (int i = 0; i < warm; ++i) row[i] = QNAN;
     // Bars after the warm prefix that the shifted write never reaches keep the
-    // CPU's NaN too — the CPU leaves them at the prefix value only when
+    // CPU's NaN too - the CPU leaves them at the prefix value only when
     // shifted_index >= len, which cannot happen below warm.
     for (int i = warm; i < n; ++i) row[i] = QNAN;
 
@@ -400,13 +400,15 @@ void neoethos_alligator_lips_f64(const double* __restrict__ hl2,
 // (cpu_batch.rs:13912) calls `extract_slice_input("alligator", req.data,
 // "hl2")`. Declared `Hl2Slice` for the same reason `cci`/`mfi` declare hlc3.
 //
-// PERIOD-INVARIANT. The batch arm reads jaw/teeth/lips period and offset
-// (13/8, 8/5, 5/3) and has no `period` parameter.
+// GENERIC PRIMARY ABI ONLY: the source-stable one-matrix dispatcher has one
+// otherwise-generic `periods` argument, but Alligator's real contract is the
+// six jaw/teeth/lips period-and-offset fields carried by the typed entry point.
 //
-// PRIMARY OUTPUT: `jaw`. cpu_batch.rs:13914 maps output_id "value" to
-// `AlligatorOutputField::Jaw`. Teeth and lips are separate series and this
-// lane carries one matrix per launch; the three are INDEPENDENT smoothings of
-// the same input, so dropping two changes no value of the first.
+// PRIMARY OUTPUT: `jaw`. The generic source-stable f64 dispatcher below keeps
+// its one-matrix ABI, while `alligator_outputs_f64` is the canonical typed
+// three-output entry point. Jaw, teeth and lips are independent smoothings of
+// the same resident hl2 input and the full entry point computes all three in
+// one parameter-row launch.
 //
 // ARITHMETIC ORDER: the SMMA update is
 // `value = (value * scale + data_point) * inv_period` with
@@ -424,7 +426,7 @@ void neoethos_alligator_lips_f64(const double* __restrict__ hl2,
 // `alligator_avx2` and `alligator_avx512` both call `alligator_scalar`
 // verbatim (alligator.rs:590-620), so there is one CPU answer on every host.
 //
-// WARMUP: `first + jaw_period - 1 + jaw_offset` for the jaw series.
+// WARMUP: `first + period - 1 + offset`, independently for each output.
 // ===========================================================================
 
 #ifndef NEO_S1_QNAN_DEFINED
@@ -495,4 +497,96 @@ extern "C" __global__ void neoethos_alligator_batch_f64(
             if (shifted < n) row[shifted] = value;
         }
     }
+}
+
+__device__ __forceinline__ void neo_alligator_smma_row_f64(
+    const double* __restrict__ hl2,
+    int n,
+    int first_valid,
+    int period,
+    int offset,
+    double* __restrict__ row)
+{
+    const double scale = (double)(period - 1);
+    const double inv_period = 1.0 / (double)period;
+    double sum = 0.0;
+    double value = 0.0;
+    bool ready = false;
+
+    for (int i = first_valid; i < n; ++i) {
+        const double data_point = hl2[i];
+        const int relative = i - first_valid;
+        if (!ready) {
+            if (relative < period) {
+                sum += data_point;
+                if (relative == period - 1) {
+                    value = sum / (double)period;
+                    ready = true;
+                    const long long shifted = (long long)i + (long long)offset;
+                    if (shifted < (long long)n) row[(int)shifted] = value;
+                }
+            }
+        } else {
+            value = (value * scale + data_point) * inv_period;
+            const long long shifted = (long long)i + (long long)offset;
+            if (shifted < (long long)n) row[(int)shifted] = value;
+        }
+    }
+}
+
+// Canonical production ABI: one thread owns one exact six-parameter tuple and
+// emits jaw/teeth/lips together. Parameters are columns rather than a packed
+// struct so host and device do not depend on C/Rust layout or padding.
+extern "C" __global__ void alligator_outputs_f64(
+    const double* __restrict__ hl2,
+    int n,
+    const int* __restrict__ jaw_periods,
+    const int* __restrict__ jaw_offsets,
+    const int* __restrict__ teeth_periods,
+    const int* __restrict__ teeth_offsets,
+    const int* __restrict__ lips_periods,
+    const int* __restrict__ lips_offsets,
+    int n_rows,
+    int first_valid,
+    double* __restrict__ out_jaw,
+    double* __restrict__ out_teeth,
+    double* __restrict__ out_lips)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_rows) return;
+
+    double* __restrict__ jaw = out_jaw + (size_t)r * (size_t)n;
+    double* __restrict__ teeth = out_teeth + (size_t)r * (size_t)n;
+    double* __restrict__ lips = out_lips + (size_t)r * (size_t)n;
+    for (int i = 0; i < n; ++i) {
+        jaw[i] = neo_s1_qnan();
+        teeth[i] = neo_s1_qnan();
+        lips[i] = neo_s1_qnan();
+    }
+
+    const int jaw_period = jaw_periods[r];
+    const int jaw_offset = jaw_offsets[r];
+    const int teeth_period = teeth_periods[r];
+    const int teeth_offset = teeth_offsets[r];
+    const int lips_period = lips_periods[r];
+    const int lips_offset = lips_offsets[r];
+    const int needed = max(jaw_period, max(teeth_period, lips_period));
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (jaw_period <= 0) || (jaw_period > n) ||
+        (teeth_period <= 0) || (teeth_period > n) ||
+        (lips_period <= 0) || (lips_period > n) ||
+        (jaw_offset < 0) || (jaw_offset > n) ||
+        (teeth_offset < 0) || (teeth_offset > n) ||
+        (lips_offset < 0) || (lips_offset > n) ||
+        ((n - first_valid) < needed);
+    if (declined) return;
+
+    neo_alligator_smma_row_f64(
+        hl2, n, first_valid, jaw_period, jaw_offset, jaw);
+    neo_alligator_smma_row_f64(
+        hl2, n, first_valid, teeth_period, teeth_offset, teeth);
+    neo_alligator_smma_row_f64(
+        hl2, n, first_valid, lips_period, lips_offset, lips);
 }

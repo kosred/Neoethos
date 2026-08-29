@@ -43,6 +43,28 @@ pub fn ma_param_schema(ma_type: &str) -> &'static [MaParamInfo] {
                 notes: None,
             },
         ],
+        "buff_averages" => &[
+            MaParamInfo {
+                key: "fast_period",
+                label: "Fast Period",
+                kind: MaParamKind::Int,
+                default: 5.0,
+                min: Some(1.0),
+                max: None,
+                step: Some(1.0),
+                notes: Some("Must be an integer > 0 and no greater than slow_period."),
+            },
+            MaParamInfo {
+                key: "slow_period",
+                label: "Slow Period",
+                kind: MaParamKind::Int,
+                default: 20.0,
+                min: Some(1.0),
+                max: None,
+                step: Some(1.0),
+                notes: Some("Must be an integer > 0."),
+            },
+        ],
         "corrected_moving_average" | "cma" => &[],
         "n_order_ema" => &[MaParamInfo {
             key: "order",

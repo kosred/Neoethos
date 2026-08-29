@@ -23,13 +23,13 @@ use crate::contracts::{Direction, LiveBar, PortfolioEntry, Signal, SignalEngine,
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MlDecision {
     /// `[p_neutral, p_buy, p_sell]` from the ensemble's directional voters.
-    pub dir_probs: [f32; 3],
+    pub dir_probs: [f64; 3],
     /// Regime gate ∈ [0,1] (1.0 = no gate; → 0 shrinks/vetoes in a range/
     /// disagreeing regime).
-    pub regime_gate: f32,
+    pub regime_gate: f64,
     /// Anomaly scale ∈ [0,1] (1.0 = no penalty; 0.0 = hard veto on an extreme
     /// anomaly).
-    pub anomaly_scale: f32,
+    pub anomaly_scale: f64,
 }
 
 impl MlDecision {
@@ -338,21 +338,36 @@ mod tests {
             symbol: "EURUSD".to_string(),
             base_tf: "H1".to_string(),
             higher_tfs: Vec::new(),
-            source: StrategySource::Gene { id: "x".to_string() },
+            source: StrategySource::Gene {
+                id: "x".to_string(),
+            },
             mode: TradeMode::PropFirm,
         }
     }
 
     fn strong_buy() -> MlDecision {
-        MlDecision { dir_probs: [0.05, 0.9, 0.05], regime_gate: 1.0, anomaly_scale: 1.0 }
+        MlDecision {
+            dir_probs: [0.05, 0.9, 0.05],
+            regime_gate: 1.0,
+            anomaly_scale: 1.0,
+        }
     }
     fn strong_sell() -> MlDecision {
-        MlDecision { dir_probs: [0.05, 0.05, 0.9], regime_gate: 1.0, anomaly_scale: 1.0 }
+        MlDecision {
+            dir_probs: [0.05, 0.05, 0.9],
+            regime_gate: 1.0,
+            anomaly_scale: 1.0,
+        }
     }
 
     #[test]
     fn genes_only_is_byte_identical_to_precomputed() {
-        let dirs = vec![Direction::Long, Direction::Flat, Direction::Short, Direction::Long];
+        let dirs = vec![
+            Direction::Long,
+            Direction::Flat,
+            Direction::Short,
+            Direction::Long,
+        ];
         let mut blended = BlendedSignalEngine::genes_only("EURUSD", dirs.clone());
         let mut baseline = PrecomputedSignalEngine::new("EURUSD", dirs);
         let e = entry();
@@ -368,40 +383,77 @@ mod tests {
     #[test]
     fn ml_never_flips_direction() {
         // Gene says Long; ML screams sell. Output must be Long or Flat, NEVER Short.
-        let cfg = BlendConfig { mode: BlendMode::MlConfirm, ..Default::default() };
-        let mut eng = BlendedSignalEngine::new("EURUSD", vec![Direction::Long], vec![strong_sell()], cfg);
+        let cfg = BlendConfig {
+            mode: BlendMode::MlConfirm,
+            ..Default::default()
+        };
+        let mut eng =
+            BlendedSignalEngine::new("EURUSD", vec![Direction::Long], vec![strong_sell()], cfg);
         let sig = eng.evaluate(&entry(), &[]);
-        assert_ne!(sig.dir, Direction::Short, "ML must never flip the gene direction");
+        assert_ne!(
+            sig.dir,
+            Direction::Short,
+            "ML must never flip the gene direction"
+        );
         assert!(matches!(sig.dir, Direction::Long | Direction::Flat));
     }
 
     #[test]
     fn ml_never_creates_trade_from_flat() {
-        let cfg = BlendConfig { mode: BlendMode::MlConfirm, ..Default::default() };
-        let mut eng = BlendedSignalEngine::new("EURUSD", vec![Direction::Flat], vec![strong_buy()], cfg);
+        let cfg = BlendConfig {
+            mode: BlendMode::MlConfirm,
+            ..Default::default()
+        };
+        let mut eng =
+            BlendedSignalEngine::new("EURUSD", vec![Direction::Flat], vec![strong_buy()], cfg);
         let sig = eng.evaluate(&entry(), &[]);
-        assert_eq!(sig.dir, Direction::Flat, "ML must never manufacture a trade from Flat");
+        assert_eq!(
+            sig.dir,
+            Direction::Flat,
+            "ML must never manufacture a trade from Flat"
+        );
         assert_eq!(sig.confidence, 0.0);
     }
 
     #[test]
     fn gate_floor_keeps_a_healthy_gene_bar_tradeable() {
         // Lukewarm ML agreement (p_side 0.4), healthy gates -> trades at the floor.
-        let cfg = BlendConfig { mode: BlendMode::MlConfirm, ..Default::default() };
-        let lukewarm = MlDecision { dir_probs: [0.3, 0.4, 0.3], regime_gate: 1.0, anomaly_scale: 1.0 };
+        let cfg = BlendConfig {
+            mode: BlendMode::MlConfirm,
+            ..Default::default()
+        };
+        let lukewarm = MlDecision {
+            dir_probs: [0.3, 0.4, 0.3],
+            regime_gate: 1.0,
+            anomaly_scale: 1.0,
+        };
         let (dir, conf) = blend_decision(Direction::Long, &lukewarm, &cfg);
         assert_eq!(dir, Direction::Long);
         // tolerance accommodates the f32->f64 widening of dir_probs (0.4f32).
-        assert!((conf - 0.4).abs() < 1e-6, "expected agreement 0.4, got {conf}");
+        assert!(
+            (conf - 0.4).abs() < 1e-6,
+            "expected agreement 0.4, got {conf}"
+        );
     }
 
     #[test]
     fn hard_anomaly_veto_sets_flat_not_min_volume() {
         // Strong ML buy agreement, but anomaly_scale 0 -> hard veto -> Flat.
-        let cfg = BlendConfig { mode: BlendMode::MlScale, ..Default::default() };
-        let anomalous = MlDecision { dir_probs: [0.05, 0.9, 0.05], regime_gate: 1.0, anomaly_scale: 0.0 };
+        let cfg = BlendConfig {
+            mode: BlendMode::MlScale,
+            ..Default::default()
+        };
+        let anomalous = MlDecision {
+            dir_probs: [0.05, 0.9, 0.05],
+            regime_gate: 1.0,
+            anomaly_scale: 0.0,
+        };
         let (dir, conf) = blend_decision(Direction::Long, &anomalous, &cfg);
-        assert_eq!(dir, Direction::Flat, "hard anomaly veto must skip the trade");
+        assert_eq!(
+            dir,
+            Direction::Flat,
+            "hard anomaly veto must skip the trade"
+        );
         assert_eq!(conf, 0.0);
     }
 
@@ -417,7 +469,10 @@ mod tests {
         assert_eq!(out_of_range.veto_below, d.veto_below);
 
         let inverted = BlendConfig::from_config_values(BlendMode::MlScale, Some(0.10), Some(0.80));
-        assert_eq!(inverted.gate_floor, d.gate_floor, "inverted pair must revert both");
+        assert_eq!(
+            inverted.gate_floor, d.gate_floor,
+            "inverted pair must revert both"
+        );
         assert_eq!(inverted.veto_below, d.veto_below);
 
         let good = BlendConfig::from_config_values(BlendMode::MlScale, Some(0.50), Some(0.20));
@@ -437,9 +492,16 @@ mod tests {
     /// moved a live position size by accident.
     #[test]
     fn unset_config_is_byte_identical_to_the_old_default_literal() {
-        for mode in [BlendMode::GenesOnly, BlendMode::MlConfirm, BlendMode::MlScale] {
+        for mode in [
+            BlendMode::GenesOnly,
+            BlendMode::MlConfirm,
+            BlendMode::MlScale,
+        ] {
             let via_ctor = BlendConfig::from_config_values(mode, None, None);
-            let via_literal = BlendConfig { mode, ..Default::default() };
+            let via_literal = BlendConfig {
+                mode,
+                ..Default::default()
+            };
             assert_eq!(
                 via_ctor, via_literal,
                 "from_config_values(None, None) must reproduce the shipped default for {mode:?}"
@@ -461,12 +523,22 @@ mod tests {
     #[test]
     fn mlconfirm_vetoes_disagreement_but_mlscale_shrinks() {
         // ML disagrees with gene Long (p_buy 0.1 < veto_below 0.15).
-        let disagree = MlDecision { dir_probs: [0.2, 0.1, 0.7], regime_gate: 1.0, anomaly_scale: 1.0 };
-        let confirm = BlendConfig { mode: BlendMode::MlConfirm, ..Default::default() };
+        let disagree = MlDecision {
+            dir_probs: [0.2, 0.1, 0.7],
+            regime_gate: 1.0,
+            anomaly_scale: 1.0,
+        };
+        let confirm = BlendConfig {
+            mode: BlendMode::MlConfirm,
+            ..Default::default()
+        };
         let (d, _) = blend_decision(Direction::Long, &disagree, &confirm);
         assert_eq!(d, Direction::Flat, "MlConfirm vetoes on disagreement");
 
-        let scale = BlendConfig { mode: BlendMode::MlScale, ..Default::default() };
+        let scale = BlendConfig {
+            mode: BlendMode::MlScale,
+            ..Default::default()
+        };
         let (d, c) = blend_decision(Direction::Long, &disagree, &scale);
         assert_eq!(d, Direction::Long, "MlScale keeps direction, just shrinks");
         // agreement floored to gate_floor 0.34 * 1 * 1 = 0.34

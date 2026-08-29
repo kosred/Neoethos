@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::mem::ManuallyDrop;
@@ -48,10 +30,6 @@ pub enum VwapZscoreWithSignalsOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VwapZscoreWithSignalsParams {
     pub length: Option<usize>,
     pub upper_bottom: Option<f64>,
@@ -641,23 +619,20 @@ fn vwap_zscore_with_signals_output_row_from_slices(
             let sd = variance.sqrt();
             if sd.is_finite() && sd > 0.0 {
                 let zvwap = (close[i] - mean) / sd;
-                value = match field {
-                    VwapZscoreWithSignalsOutputField::Zvwap => zvwap,
-                    VwapZscoreWithSignalsOutputField::SupportSignal => {
-                        if zvwap < lower_bottom {
-                            1.0
-                        } else {
-                            0.0
+                value =
+                    match field {
+                        VwapZscoreWithSignalsOutputField::Zvwap => zvwap,
+                        VwapZscoreWithSignalsOutputField::SupportSignal => {
+                            if zvwap < lower_bottom {
+                                1.0
+                            } else {
+                                0.0
+                            }
                         }
-                    }
-                    VwapZscoreWithSignalsOutputField::ResistanceSignal => {
-                        if zvwap > upper_bottom {
-                            1.0
-                        } else {
-                            0.0
+                        VwapZscoreWithSignalsOutputField::ResistanceSignal => {
+                            if zvwap > upper_bottom { 1.0 } else { 0.0 }
                         }
-                    }
-                };
+                    };
             }
         }
         out[i] = value;
@@ -828,7 +803,6 @@ pub fn vwap_zscore_with_signals_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn vwap_zscore_with_signals_into(
     input: &VwapZscoreWithSignalsInput,
@@ -1284,476 +1258,15 @@ pub fn vwap_zscore_with_signals_batch_inner_into(
     Ok(out.combos)
 }
 
-#[cfg(feature = "python")]
-#[pyclass(name = "VwapZscoreWithSignalsStream")]
-pub struct VwapZscoreWithSignalsStreamPy {
-    inner: VwapZscoreWithSignalsStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VwapZscoreWithSignalsStreamPy {
-    #[new]
-    #[pyo3(signature = (length=20, upper_bottom=2.5, lower_bottom=-2.5))]
-    fn new(length: usize, upper_bottom: f64, lower_bottom: f64) -> PyResult<Self> {
-        let inner = VwapZscoreWithSignalsStream::try_new(VwapZscoreWithSignalsParams {
-            length: Some(length),
-            upper_bottom: Some(upper_bottom),
-            lower_bottom: Some(lower_bottom),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    fn update(&mut self, close: f64, volume: f64) -> Option<(f64, f64, f64)> {
-        self.inner.update(close, volume)
-    }
-
-    fn warmup_period(&self) -> usize {
-        self.inner.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vwap_zscore_with_signals")]
-#[pyo3(signature = (close, volume, length=20, upper_bottom=2.5, lower_bottom=-2.5, kernel=None))]
-pub fn vwap_zscore_with_signals_py<'py>(
-    py: Python<'py>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    upper_bottom: f64,
-    lower_bottom: f64,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let close = close.as_slice()?;
-    let volume = volume.as_slice()?;
-    if close.len() != volume.len() {
-        return Err(PyValueError::new_err("Close/volume slice length mismatch"));
-    }
-    let kern = validate_kernel(kernel, false)?;
-    let input = VwapZscoreWithSignalsInput::from_slices(
-        close,
-        volume,
-        VwapZscoreWithSignalsParams {
-            length: Some(length),
-            upper_bottom: Some(upper_bottom),
-            lower_bottom: Some(lower_bottom),
-        },
-    );
-    let out = py
-        .allow_threads(|| vwap_zscore_with_signals_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.zvwap.into_pyarray(py),
-        out.support_signal.into_pyarray(py),
-        out.resistance_signal.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vwap_zscore_with_signals_batch")]
-#[pyo3(signature = (
-    close,
-    volume,
-    length_range=(20, 20, 0),
-    upper_bottom_range=(2.5, 2.5, 0.0),
-    lower_bottom_range=(-2.5, -2.5, 0.0),
-    kernel=None
-))]
-pub fn vwap_zscore_with_signals_batch_py<'py>(
-    py: Python<'py>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    upper_bottom_range: (f64, f64, f64),
-    lower_bottom_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let close = close.as_slice()?;
-    let volume = volume.as_slice()?;
-    if close.len() != volume.len() {
-        return Err(PyValueError::new_err("Close/volume slice length mismatch"));
-    }
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = VwapZscoreWithSignalsBatchRange {
-        length: length_range,
-        upper_bottom: upper_bottom_range,
-        lower_bottom: lower_bottom_range,
-    };
-    let combos = expand_grid_vwap_zscore_with_signals(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let zvwap_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let support_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let resistance_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let zvwap_slice = unsafe { zvwap_arr.as_slice_mut()? };
-    let support_slice = unsafe { support_arr.as_slice_mut()? };
-    let resistance_slice = unsafe { resistance_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            vwap_zscore_with_signals_batch_inner_into(
-                close,
-                volume,
-                &sweep,
-                batch.to_non_batch(),
-                zvwap_slice,
-                support_slice,
-                resistance_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("zvwap", zvwap_arr.reshape((rows, cols))?)?;
-    dict.set_item("support_signal", support_arr.reshape((rows, cols))?)?;
-    dict.set_item("resistance_signal", resistance_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(20) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "upper_bottoms",
-        combos
-            .iter()
-            .map(|combo| combo.upper_bottom.unwrap_or(2.5))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "lower_bottoms",
-        combos
-            .iter()
-            .map(|combo| combo.lower_bottom.unwrap_or(-2.5))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_vwap_zscore_with_signals_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(vwap_zscore_with_signals_py, module)?)?;
-    module.add_function(wrap_pyfunction!(vwap_zscore_with_signals_batch_py, module)?)?;
-    module.add_class::<VwapZscoreWithSignalsStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "vwap_zscore_with_signals_js")]
-pub fn vwap_zscore_with_signals_js(
-    close: &[f64],
-    volume: &[f64],
-    length: usize,
-    upper_bottom: f64,
-    lower_bottom: f64,
-) -> Result<JsValue, JsValue> {
-    let input = VwapZscoreWithSignalsInput::from_slices(
-        close,
-        volume,
-        VwapZscoreWithSignalsParams {
-            length: Some(length),
-            upper_bottom: Some(upper_bottom),
-            lower_bottom: Some(lower_bottom),
-        },
-    );
-    let out = vwap_zscore_with_signals(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let result = js_sys::Object::new();
-
-    let zvwap = js_sys::Float64Array::new_with_length(out.zvwap.len() as u32);
-    zvwap.copy_from(&out.zvwap);
-    js_sys::Reflect::set(&result, &JsValue::from_str("zvwap"), &zvwap)?;
-
-    let support = js_sys::Float64Array::new_with_length(out.support_signal.len() as u32);
-    support.copy_from(&out.support_signal);
-    js_sys::Reflect::set(&result, &JsValue::from_str("support_signal"), &support)?;
-
-    let resistance = js_sys::Float64Array::new_with_length(out.resistance_signal.len() as u32);
-    resistance.copy_from(&out.resistance_signal);
-    js_sys::Reflect::set(
-        &result,
-        &JsValue::from_str("resistance_signal"),
-        &resistance,
-    )?;
-
-    Ok(result.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwap_zscore_with_signals_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwap_zscore_with_signals_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwap_zscore_with_signals_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    zvwap_ptr: *mut f64,
-    support_ptr: *mut f64,
-    resistance_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    upper_bottom: f64,
-    lower_bottom: f64,
-) -> Result<(), JsValue> {
-    if close_ptr.is_null()
-        || volume_ptr.is_null()
-        || zvwap_ptr.is_null()
-        || support_ptr.is_null()
-        || resistance_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let input = VwapZscoreWithSignalsInput::from_slices(
-            close,
-            volume,
-            VwapZscoreWithSignalsParams {
-                length: Some(length),
-                upper_bottom: Some(upper_bottom),
-                lower_bottom: Some(lower_bottom),
-            },
-        );
-        let alias = close_ptr == zvwap_ptr
-            || close_ptr == support_ptr
-            || close_ptr == resistance_ptr
-            || volume_ptr == zvwap_ptr
-            || volume_ptr == support_ptr
-            || volume_ptr == resistance_ptr;
-        if alias {
-            let mut zvwap_tmp = vec![0.0; len];
-            let mut support_tmp = vec![0.0; len];
-            let mut resistance_tmp = vec![0.0; len];
-            vwap_zscore_with_signals_into_slices(
-                &mut zvwap_tmp,
-                &mut support_tmp,
-                &mut resistance_tmp,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(zvwap_ptr, len).copy_from_slice(&zvwap_tmp);
-            std::slice::from_raw_parts_mut(support_ptr, len).copy_from_slice(&support_tmp);
-            std::slice::from_raw_parts_mut(resistance_ptr, len).copy_from_slice(&resistance_tmp);
-        } else {
-            let zvwap_out = std::slice::from_raw_parts_mut(zvwap_ptr, len);
-            let support_out = std::slice::from_raw_parts_mut(support_ptr, len);
-            let resistance_out = std::slice::from_raw_parts_mut(resistance_ptr, len);
-            vwap_zscore_with_signals_into_slices(
-                zvwap_out,
-                support_out,
-                resistance_out,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VwapZscoreWithSignalsBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub upper_bottom_range: Option<(f64, f64, f64)>,
-    pub lower_bottom_range: Option<(f64, f64, f64)>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VwapZscoreWithSignalsBatchJsOutput {
-    pub zvwap: Vec<f64>,
-    pub support_signal: Vec<f64>,
-    pub resistance_signal: Vec<f64>,
-    pub combos: Vec<VwapZscoreWithSignalsParams>,
-    pub lengths: Vec<usize>,
-    pub upper_bottoms: Vec<f64>,
-    pub lower_bottoms: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "vwap_zscore_with_signals_batch_js")]
-pub fn vwap_zscore_with_signals_batch_js(
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: VwapZscoreWithSignalsBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = VwapZscoreWithSignalsBatchRange {
-        length: config.length_range,
-        upper_bottom: config.upper_bottom_range.unwrap_or((2.5, 2.5, 0.0)),
-        lower_bottom: config.lower_bottom_range.unwrap_or((-2.5, -2.5, 0.0)),
-    };
-    let out =
-        vwap_zscore_with_signals_batch_inner(close, volume, &sweep, detect_best_kernel(), false)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&VwapZscoreWithSignalsBatchJsOutput {
-        lengths: out
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(20))
-            .collect(),
-        upper_bottoms: out
-            .combos
-            .iter()
-            .map(|combo| combo.upper_bottom.unwrap_or(2.5))
-            .collect(),
-        lower_bottoms: out
-            .combos
-            .iter()
-            .map(|combo| combo.lower_bottom.unwrap_or(-2.5))
-            .collect(),
-        zvwap: out.zvwap,
-        support_signal: out.support_signal,
-        resistance_signal: out.resistance_signal,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwap_zscore_with_signals_batch_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    zvwap_ptr: *mut f64,
-    support_ptr: *mut f64,
-    resistance_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    upper_bottom_start: f64,
-    upper_bottom_end: f64,
-    upper_bottom_step: f64,
-    lower_bottom_start: f64,
-    lower_bottom_end: f64,
-    lower_bottom_step: f64,
-) -> Result<usize, JsValue> {
-    if close_ptr.is_null()
-        || volume_ptr.is_null()
-        || zvwap_ptr.is_null()
-        || support_ptr.is_null()
-        || resistance_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    let sweep = VwapZscoreWithSignalsBatchRange {
-        length: (length_start, length_end, length_step),
-        upper_bottom: (upper_bottom_start, upper_bottom_end, upper_bottom_step),
-        lower_bottom: (lower_bottom_start, lower_bottom_end, lower_bottom_step),
-    };
-    let combos = expand_grid_vwap_zscore_with_signals(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    unsafe {
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let zvwap_out = std::slice::from_raw_parts_mut(zvwap_ptr, total);
-        let support_out = std::slice::from_raw_parts_mut(support_ptr, total);
-        let resistance_out = std::slice::from_raw_parts_mut(resistance_ptr, total);
-        vwap_zscore_with_signals_batch_inner_into(
-            close,
-            volume,
-            &sweep,
-            detect_best_kernel(),
-            zvwap_out,
-            support_out,
-            resistance_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwap_zscore_with_signals_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    length: usize,
-    upper_bottom: f64,
-    lower_bottom: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vwap_zscore_with_signals_js(close, volume, length, upper_bottom, lower_bottom)?;
-    crate::write_wasm_object_f64_outputs("vwap_zscore_with_signals_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwap_zscore_with_signals_batch_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vwap_zscore_with_signals_batch_js(close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "vwap_zscore_with_signals_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     fn load_close_volume() -> Result<(Vec<f64>, Vec<f64>), Box<dyn Error>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
-        Ok((candles.close, candles.volume))
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
+        Ok((candles.close.clone(), candles.volume.clone()))
     }
 
     fn assert_series_eq(actual: &[f64], expected: &[f64]) {

@@ -43,8 +43,9 @@
 
 pub mod classifier;
 
-pub use classifier::{infer_regime_canonical, Regime, RegimeClassifierVersion,
-    REGIME_CLASSIFIER_VERSION_CURRENT};
+pub use classifier::{
+    REGIME_CLASSIFIER_VERSION_CURRENT, Regime, RegimeClassifierVersion, infer_regime_canonical,
+};
 
 #[cfg(test)]
 mod tests {

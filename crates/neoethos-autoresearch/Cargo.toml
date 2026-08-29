@@ -27,6 +27,7 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 # Companion of rand 0.9, already resolved in Cargo.lock by neoethos-search.
@@ -34,10 +35,6 @@ rand = { workspace = true }
 # replayable from (session_seed, sweep_index) alone (design §3), which
 # `rand::rng()` cannot promise across platforms or rand releases.
 rand_chacha = "0.9.0"
-# The shuffle control rotates the FEATURE BLOCK and nothing else, and a
-# `FeatureFrame` is rebuilt from an `Array2<f32>`. The workspace pin, so this is
-# an edge in the graph and not a second copy of ndarray.
-ndarray = { workspace = true }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAPABILITY FEATURES — each one turns on a probe, not a behaviour.
@@ -59,6 +56,11 @@ ndarray = { workspace = true }
 # ─────────────────────────────────────────────────────────────────────────────
 [features]
 default = []
+# CUDA-enabled CLI builds use the one-shot prepared Search/Data typestate. The
+# standalone default remains toolchain-free and retains the CPU compatibility
+# executor until the baseline physical-inventory carrier is available without
+# compiling native CUDA.
+gpu-cuda = ["neoethos-search/gpu-cuda", "neoethos-data/gpu-cuda"]
 # §14.6 — StreamingPlan::start_cursor
 search-streaming-start-cursor = []
 # §14.3 — ResolvedConfigStamp::ga_seed (without it, replicates are identified by

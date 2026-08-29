@@ -49,6 +49,17 @@ pub fn stable_sigmoid_f32(value: f32) -> f32 {
     }
 }
 
+/// Numerically-stable logistic sigmoid for shared f64 model math.
+pub fn stable_sigmoid_f64(value: f64) -> f64 {
+    if value >= 0.0 {
+        let z = (-value).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = value.exp();
+        z / (1.0 + z)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +87,8 @@ mod tests {
         assert!(stable_sigmoid_f32(-50.0) < 0.001);
         assert!(stable_sigmoid_f32(f32::INFINITY).is_finite());
         assert!(stable_sigmoid_f32(f32::NEG_INFINITY).is_finite());
+        assert!((stable_sigmoid_f64(0.0) - 0.5).abs() < 1e-12);
+        assert!(stable_sigmoid_f64(1000.0).is_finite());
+        assert!(stable_sigmoid_f64(-1000.0).is_finite());
     }
 }

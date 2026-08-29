@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -73,10 +57,6 @@ pub enum AdjustableMaAlternatingExtremitiesOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdjustableMaAlternatingExtremitiesParams {
     pub length: Option<usize>,
     pub mult: Option<f64>,
@@ -261,7 +241,9 @@ impl AdjustableMaAlternatingExtremitiesBuilder {
 pub enum AdjustableMaAlternatingExtremitiesError {
     #[error("adjustable_ma_alternating_extremities: input data slice is empty")]
     EmptyInputData,
-    #[error("adjustable_ma_alternating_extremities: data length mismatch: high={high}, low={low}, close={close}")]
+    #[error(
+        "adjustable_ma_alternating_extremities: data length mismatch: high={high}, low={low}, close={close}"
+    )]
     DataLengthMismatch {
         high: usize,
         low: usize,
@@ -269,9 +251,13 @@ pub enum AdjustableMaAlternatingExtremitiesError {
     },
     #[error("adjustable_ma_alternating_extremities: all values are NaN")]
     AllValuesNaN,
-    #[error("adjustable_ma_alternating_extremities: invalid length: length = {length}, data length = {data_len}")]
+    #[error(
+        "adjustable_ma_alternating_extremities: invalid length: length = {length}, data length = {data_len}"
+    )]
     InvalidLength { length: usize, data_len: usize },
-    #[error("adjustable_ma_alternating_extremities: not enough valid data: needed = {needed}, valid = {valid}")]
+    #[error(
+        "adjustable_ma_alternating_extremities: not enough valid data: needed = {needed}, valid = {valid}"
+    )]
     NotEnoughValidData { needed: usize, valid: usize },
     #[error("adjustable_ma_alternating_extremities: invalid mult: {mult}")]
     InvalidMult { mult: f64 },
@@ -279,11 +265,17 @@ pub enum AdjustableMaAlternatingExtremitiesError {
     InvalidAlpha { alpha: f64 },
     #[error("adjustable_ma_alternating_extremities: invalid beta: {beta}")]
     InvalidBeta { beta: f64 },
-    #[error("adjustable_ma_alternating_extremities: degenerate kernel weights for alpha={alpha}, beta={beta}")]
+    #[error(
+        "adjustable_ma_alternating_extremities: degenerate kernel weights for alpha={alpha}, beta={beta}"
+    )]
     DegenerateKernel { alpha: f64, beta: f64 },
-    #[error("adjustable_ma_alternating_extremities: output length mismatch: expected {expected}, got {got}")]
+    #[error(
+        "adjustable_ma_alternating_extremities: output length mismatch: expected {expected}, got {got}"
+    )]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error("adjustable_ma_alternating_extremities: invalid range: start={start}, end={end}, step={step}")]
+    #[error(
+        "adjustable_ma_alternating_extremities: invalid range: start={start}, end={end}, step={step}"
+    )]
     InvalidRange {
         start: String,
         end: String,
@@ -483,63 +475,27 @@ pub fn adjustable_ma_alternating_extremities_output_into_slice(
     match field {
         AdjustableMaAlternatingExtremitiesOutputField::Ma
         | AdjustableMaAlternatingExtremitiesOutputField::SmoothedClose => {
-            weighted_filter_into(
-                prepared.close,
-                prepared.first,
-                prepared.length,
-                &prepared.weights,
-                dst,
-            );
+            weighted_filter_into(&prepared, prepared.close, dst);
         }
         AdjustableMaAlternatingExtremitiesOutputField::SmoothedHigh => {
-            weighted_filter_into(
-                prepared.high,
-                prepared.first,
-                prepared.length,
-                &prepared.weights,
-                dst,
-            );
+            weighted_filter_into(&prepared, prepared.high, dst);
         }
         AdjustableMaAlternatingExtremitiesOutputField::SmoothedLow => {
-            weighted_filter_into(
-                prepared.low,
-                prepared.first,
-                prepared.length,
-                &prepared.weights,
-                dst,
-            );
+            weighted_filter_into(&prepared, prepared.low, dst);
         }
         AdjustableMaAlternatingExtremitiesOutputField::SmoothedOpen => {
             let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
-            weighted_filter_into(
-                prepared.close,
-                prepared.first,
-                prepared.length,
-                &prepared.weights,
-                &mut ma,
-            );
-            compute_smoothed_open(&ma, prepared.warmups.ma, dst);
+            weighted_filter_into(&prepared, prepared.close, &mut ma);
+            compute_smoothed_open(&prepared, &ma, dst);
         }
         AdjustableMaAlternatingExtremitiesOutputField::Upper => {
             let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
-            weighted_filter_into(
-                prepared.close,
-                prepared.first,
-                prepared.length,
-                &prepared.weights,
-                &mut ma,
-            );
+            weighted_filter_into(&prepared, prepared.close, &mut ma);
             compute_selected_deviation_band(&prepared, &ma, dst, true);
         }
         AdjustableMaAlternatingExtremitiesOutputField::Lower => {
             let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
-            weighted_filter_into(
-                prepared.close,
-                prepared.first,
-                prepared.length,
-                &prepared.weights,
-                &mut ma,
-            );
+            weighted_filter_into(&prepared, prepared.close, &mut ma);
             compute_selected_deviation_band(&prepared, &ma, dst, false);
         }
         AdjustableMaAlternatingExtremitiesOutputField::Extremity
@@ -548,13 +504,7 @@ pub fn adjustable_ma_alternating_extremities_output_into_slice(
             let mut ma = alloc_with_nan_prefix(prepared.len, prepared.warmups.ma);
             let mut upper = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
             let mut lower = alloc_with_nan_prefix(prepared.len, prepared.warmups.bands);
-            weighted_filter_into(
-                prepared.close,
-                prepared.first,
-                prepared.length,
-                &prepared.weights,
-                &mut ma,
-            );
+            weighted_filter_into(&prepared, prepared.close, &mut ma);
             compute_deviation_bands(&prepared, &ma, &mut upper, &mut lower);
             compute_selected_state_output(&prepared, &upper, &lower, dst, field);
         }
@@ -622,16 +572,17 @@ fn prepare_input<'a>(
         return Err(AdjustableMaAlternatingExtremitiesError::InvalidBeta { beta });
     }
     let needed = (length * 2) - 1;
-    if len - first < needed {
+    let longest_run = longest_finite_hlc_run(high, low, close);
+    if longest_run < needed {
         return Err(
             AdjustableMaAlternatingExtremitiesError::NotEnoughValidData {
                 needed,
-                valid: len - first,
+                valid: longest_run,
             },
         );
     }
 
-    let weights = build_weights(length, alpha, beta)?;
+    let weights = adjustable_ma_alternating_extremities_exact_weights(length, alpha, beta)?;
     let ma_warm = first + length - 1;
     Ok(PreparedInput {
         high,
@@ -652,7 +603,54 @@ fn prepare_input<'a>(
 }
 
 #[inline]
-fn build_weights(
+fn longest_finite_hlc_run(high: &[f64], low: &[f64], close: &[f64]) -> usize {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for index in 0..close.len() {
+        if high[index].is_finite() && low[index].is_finite() && close[index].is_finite() {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+#[inline]
+fn for_each_finite_hlc_run(
+    prepared: &PreparedInput<'_>,
+    min_len: usize,
+    mut visit: impl FnMut(usize, usize),
+) {
+    let mut cursor = 0usize;
+    while cursor < prepared.len {
+        while cursor < prepared.len
+            && !(prepared.high[cursor].is_finite()
+                && prepared.low[cursor].is_finite()
+                && prepared.close[cursor].is_finite())
+        {
+            cursor += 1;
+        }
+        let run_start = cursor;
+        while cursor < prepared.len
+            && prepared.high[cursor].is_finite()
+            && prepared.low[cursor].is_finite()
+            && prepared.close[cursor].is_finite()
+        {
+            cursor += 1;
+        }
+        let run_end = cursor;
+        if run_end.saturating_sub(run_start) >= min_len {
+            visit(run_start, run_end);
+        }
+    }
+}
+
+/// Builds the canonical normalized coefficient row consumed by both the CPU
+/// implementation and the resident f64 CUDA launcher.
+#[inline]
+pub(crate) fn adjustable_ma_alternating_extremities_exact_weights(
     length: usize,
     alpha: f64,
     beta: f64,
@@ -691,60 +689,37 @@ fn compute_into_slices(
     smoothed_close: &mut [f64],
 ) {
     let _ = prepared.kernel;
-    weighted_filter_into(
-        prepared.close,
-        prepared.first,
-        prepared.length,
-        &prepared.weights,
-        ma,
-    );
-    weighted_filter_into(
-        prepared.high,
-        prepared.first,
-        prepared.length,
-        &prepared.weights,
-        smoothed_high,
-    );
-    weighted_filter_into(
-        prepared.low,
-        prepared.first,
-        prepared.length,
-        &prepared.weights,
-        smoothed_low,
-    );
+    weighted_filter_into(prepared, prepared.close, ma);
+    weighted_filter_into(prepared, prepared.high, smoothed_high);
+    weighted_filter_into(prepared, prepared.low, smoothed_low);
     smoothed_close.copy_from_slice(ma);
-    compute_smoothed_open(ma, prepared.warmups.ma, smoothed_open);
+    compute_smoothed_open(prepared, ma, smoothed_open);
     compute_deviation_bands(prepared, ma, upper, lower);
     compute_state_and_extremity(prepared, upper, lower, extremity, state, changed);
 }
 
 #[inline]
-fn weighted_filter_into(
-    source: &[f64],
-    first: usize,
-    length: usize,
-    weights: &[f64],
-    out: &mut [f64],
-) {
-    let start = first + length - 1;
-    for i in start..source.len() {
-        let mut acc = 0.0;
-        for j in 0..length {
-            acc += source[i - j] * weights[j];
+fn weighted_filter_into(prepared: &PreparedInput<'_>, source: &[f64], out: &mut [f64]) {
+    for_each_finite_hlc_run(prepared, prepared.length, |run_start, run_end| {
+        let start = run_start + prepared.length - 1;
+        for i in start..run_end {
+            let mut acc = 0.0;
+            for j in 0..prepared.length {
+                acc += source[i - j] * prepared.weights[j];
+            }
+            out[i] = acc;
         }
-        out[i] = acc;
-    }
+    });
 }
 
 #[inline]
-fn compute_smoothed_open(smoothed_close: &[f64], ma_warm: usize, out: &mut [f64]) {
-    let start = ma_warm + 2;
-    if start >= smoothed_close.len() {
-        return;
-    }
-    for i in start..smoothed_close.len() {
-        out[i] = 0.5 * (smoothed_close[i - 1] + smoothed_close[i - 2]);
-    }
+fn compute_smoothed_open(prepared: &PreparedInput<'_>, smoothed_close: &[f64], out: &mut [f64]) {
+    for_each_finite_hlc_run(prepared, prepared.length + 2, |run_start, run_end| {
+        let start = run_start + prepared.length + 1;
+        for i in start..run_end {
+            out[i] = 0.5 * (smoothed_close[i - 1] + smoothed_close[i - 2]);
+        }
+    });
 }
 
 #[inline]
@@ -754,22 +729,25 @@ fn compute_deviation_bands(
     upper: &mut [f64],
     lower: &mut [f64],
 ) {
-    let ma_start = prepared.warmups.ma;
-    let band_start = prepared.warmups.bands;
-    let mut rolling = 0.0;
-    for i in ma_start..=band_start {
-        rolling += (prepared.close[i] - ma[i]).abs();
-    }
-    let first_dev = (rolling / prepared.length as f64) * prepared.mult;
-    upper[band_start] = ma[band_start] + first_dev;
-    lower[band_start] = ma[band_start] - first_dev;
-    for i in (band_start + 1)..prepared.len {
-        rolling += (prepared.close[i] - ma[i]).abs();
-        rolling -= (prepared.close[i - prepared.length] - ma[i - prepared.length]).abs();
-        let dev = (rolling / prepared.length as f64) * prepared.mult;
-        upper[i] = ma[i] + dev;
-        lower[i] = ma[i] - dev;
-    }
+    let needed = (prepared.length * 2) - 1;
+    for_each_finite_hlc_run(prepared, needed, |run_start, run_end| {
+        let ma_start = run_start + prepared.length - 1;
+        let band_start = run_start + needed - 1;
+        let mut rolling = 0.0;
+        for i in ma_start..=band_start {
+            rolling += (prepared.close[i] - ma[i]).abs();
+        }
+        let first_dev = (rolling / prepared.length as f64) * prepared.mult;
+        upper[band_start] = ma[band_start] + first_dev;
+        lower[band_start] = ma[band_start] - first_dev;
+        for i in (band_start + 1)..run_end {
+            rolling += (prepared.close[i] - ma[i]).abs();
+            rolling -= (prepared.close[i - prepared.length] - ma[i - prepared.length]).abs();
+            let dev = (rolling / prepared.length as f64) * prepared.mult;
+            upper[i] = ma[i] + dev;
+            lower[i] = ma[i] - dev;
+        }
+    });
 }
 
 #[inline]
@@ -779,24 +757,27 @@ fn compute_selected_deviation_band(
     out: &mut [f64],
     upper: bool,
 ) {
-    let ma_start = prepared.warmups.ma;
-    let band_start = prepared.warmups.bands;
-    let mut rolling = 0.0;
-    for i in ma_start..=band_start {
-        rolling += (prepared.close[i] - ma[i]).abs();
-    }
-    let first_dev = (rolling / prepared.length as f64) * prepared.mult;
-    out[band_start] = if upper {
-        ma[band_start] + first_dev
-    } else {
-        ma[band_start] - first_dev
-    };
-    for i in (band_start + 1)..prepared.len {
-        rolling += (prepared.close[i] - ma[i]).abs();
-        rolling -= (prepared.close[i - prepared.length] - ma[i - prepared.length]).abs();
-        let dev = (rolling / prepared.length as f64) * prepared.mult;
-        out[i] = if upper { ma[i] + dev } else { ma[i] - dev };
-    }
+    let needed = (prepared.length * 2) - 1;
+    for_each_finite_hlc_run(prepared, needed, |run_start, run_end| {
+        let ma_start = run_start + prepared.length - 1;
+        let band_start = run_start + needed - 1;
+        let mut rolling = 0.0;
+        for i in ma_start..=band_start {
+            rolling += (prepared.close[i] - ma[i]).abs();
+        }
+        let first_dev = (rolling / prepared.length as f64) * prepared.mult;
+        out[band_start] = if upper {
+            ma[band_start] + first_dev
+        } else {
+            ma[band_start] - first_dev
+        };
+        for i in (band_start + 1)..run_end {
+            rolling += (prepared.close[i] - ma[i]).abs();
+            rolling -= (prepared.close[i - prepared.length] - ma[i - prepared.length]).abs();
+            let dev = (rolling / prepared.length as f64) * prepared.mult;
+            out[i] = if upper { ma[i] + dev } else { ma[i] - dev };
+        }
+    });
 }
 
 #[inline]
@@ -816,38 +797,42 @@ fn compute_state_and_extremity(
     state: &mut [f64],
     changed: &mut [f64],
 ) {
-    let start = prepared.warmups.bands;
-    state[start] = 0.0;
-    changed[start] = 0.0;
-    extremity[start] = lower[start];
-    for i in (start + 1)..prepared.len {
-        let prev_state = state[i - 1];
-        let cross_high = pine_cross(
-            prepared.high[i - 1],
-            upper[i - 1],
-            prepared.high[i],
-            upper[i],
-        );
-        let cross_low = pine_cross(prepared.low[i - 1], lower[i - 1], prepared.low[i], lower[i]);
-        let next_state = if cross_high {
-            1.0
-        } else if cross_low {
-            0.0
-        } else {
-            prev_state
-        };
-        state[i] = next_state;
-        changed[i] = if (next_state - prev_state).abs() > 0.0 {
-            1.0
-        } else {
-            0.0
-        };
-        extremity[i] = if next_state >= 0.5 {
-            upper[i]
-        } else {
-            lower[i]
-        };
-    }
+    let needed = (prepared.length * 2) - 1;
+    for_each_finite_hlc_run(prepared, needed, |run_start, run_end| {
+        let start = run_start + needed - 1;
+        state[start] = 0.0;
+        changed[start] = 0.0;
+        extremity[start] = lower[start];
+        for i in (start + 1)..run_end {
+            let prev_state = state[i - 1];
+            let cross_high = pine_cross(
+                prepared.high[i - 1],
+                upper[i - 1],
+                prepared.high[i],
+                upper[i],
+            );
+            let cross_low =
+                pine_cross(prepared.low[i - 1], lower[i - 1], prepared.low[i], lower[i]);
+            let next_state = if cross_high {
+                1.0
+            } else if cross_low {
+                0.0
+            } else {
+                prev_state
+            };
+            state[i] = next_state;
+            changed[i] = if (next_state - prev_state).abs() > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+            extremity[i] = if next_state >= 0.5 {
+                upper[i]
+            } else {
+                lower[i]
+            };
+        }
+    });
 }
 
 #[inline]
@@ -858,49 +843,53 @@ fn compute_selected_state_output(
     out: &mut [f64],
     field: AdjustableMaAlternatingExtremitiesOutputField,
 ) {
-    let start = prepared.warmups.bands;
-    let mut prev_state = 0.0;
-    out[start] = match field {
-        AdjustableMaAlternatingExtremitiesOutputField::Extremity => lower[start],
-        AdjustableMaAlternatingExtremitiesOutputField::State
-        | AdjustableMaAlternatingExtremitiesOutputField::Changed => 0.0,
-        _ => unreachable!(),
-    };
-    for i in (start + 1)..prepared.len {
-        let cross_high = pine_cross(
-            prepared.high[i - 1],
-            upper[i - 1],
-            prepared.high[i],
-            upper[i],
-        );
-        let cross_low = pine_cross(prepared.low[i - 1], lower[i - 1], prepared.low[i], lower[i]);
-        let next_state = if cross_high {
-            1.0
-        } else if cross_low {
-            0.0
-        } else {
-            prev_state
-        };
-        out[i] = match field {
-            AdjustableMaAlternatingExtremitiesOutputField::Extremity => {
-                if next_state >= 0.5 {
-                    upper[i]
-                } else {
-                    lower[i]
-                }
-            }
-            AdjustableMaAlternatingExtremitiesOutputField::State => next_state,
-            AdjustableMaAlternatingExtremitiesOutputField::Changed => {
-                if (next_state - prev_state).abs() > 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
+    let needed = (prepared.length * 2) - 1;
+    for_each_finite_hlc_run(prepared, needed, |run_start, run_end| {
+        let start = run_start + needed - 1;
+        let mut prev_state = 0.0;
+        out[start] = match field {
+            AdjustableMaAlternatingExtremitiesOutputField::Extremity => lower[start],
+            AdjustableMaAlternatingExtremitiesOutputField::State
+            | AdjustableMaAlternatingExtremitiesOutputField::Changed => 0.0,
             _ => unreachable!(),
         };
-        prev_state = next_state;
-    }
+        for i in (start + 1)..run_end {
+            let cross_high = pine_cross(
+                prepared.high[i - 1],
+                upper[i - 1],
+                prepared.high[i],
+                upper[i],
+            );
+            let cross_low =
+                pine_cross(prepared.low[i - 1], lower[i - 1], prepared.low[i], lower[i]);
+            let next_state = if cross_high {
+                1.0
+            } else if cross_low {
+                0.0
+            } else {
+                prev_state
+            };
+            out[i] = match field {
+                AdjustableMaAlternatingExtremitiesOutputField::Extremity => {
+                    if next_state >= 0.5 {
+                        upper[i]
+                    } else {
+                        lower[i]
+                    }
+                }
+                AdjustableMaAlternatingExtremitiesOutputField::State => next_state,
+                AdjustableMaAlternatingExtremitiesOutputField::Changed => {
+                    if (next_state - prev_state).abs() > 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                _ => unreachable!(),
+            };
+            prev_state = next_state;
+        }
+    });
 }
 
 #[derive(Clone, Debug)]
@@ -1405,7 +1394,7 @@ impl AdjustableMaAlternatingExtremitiesStream {
         if !mult.is_finite() || mult < 1.0 {
             return Err(AdjustableMaAlternatingExtremitiesError::InvalidMult { mult });
         }
-        let weights = build_weights(length, alpha, beta)?;
+        let weights = adjustable_ma_alternating_extremities_exact_weights(length, alpha, beta)?;
         Ok(Self {
             length,
             mult,
@@ -1432,6 +1421,7 @@ impl AdjustableMaAlternatingExtremitiesStream {
         close: f64,
     ) -> Option<AdjustableMaAlternatingExtremitiesStreamOutput> {
         if !(high.is_finite() && low.is_finite() && close.is_finite()) {
+            self.reset_segment();
             return None;
         }
         push_ring(&mut self.highs, self.length, high);
@@ -1505,6 +1495,22 @@ impl AdjustableMaAlternatingExtremitiesStream {
             smoothed_close: ma,
         })
     }
+
+    #[inline]
+    fn reset_segment(&mut self) {
+        self.highs.clear();
+        self.lows.clear();
+        self.closes.clear();
+        self.abs_diffs.clear();
+        self.rolling_abs_sum = 0.0;
+        self.prev_high = None;
+        self.prev_low = None;
+        self.prev_upper = None;
+        self.prev_lower = None;
+        self.prev_state = 0.0;
+        self.last_close_1 = None;
+        self.last_close_2 = None;
+    }
 }
 
 #[inline]
@@ -1533,404 +1539,6 @@ unsafe fn mu_slice_as_f64_slice_mut(buf: &mut ManuallyDrop<Vec<MaybeUninit<f64>>
 unsafe fn vec_f64_from_mu_guard(buf: ManuallyDrop<Vec<MaybeUninit<f64>>>) -> Vec<f64> {
     let mut buf = buf;
     Vec::from_raw_parts(buf.as_mut_ptr() as *mut f64, buf.len(), buf.capacity())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adjustable_ma_alternating_extremities")]
-#[pyo3(signature = (high, low, close, length=DEFAULT_LENGTH, mult=DEFAULT_MULT, alpha=DEFAULT_ALPHA, beta=DEFAULT_BETA, kernel=None))]
-pub fn adjustable_ma_alternating_extremities_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    mult: f64,
-    alpha: f64,
-    beta: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = AdjustableMaAlternatingExtremitiesInput::from_slices(
-        high,
-        low,
-        close,
-        AdjustableMaAlternatingExtremitiesParams {
-            length: Some(length),
-            mult: Some(mult),
-            alpha: Some(alpha),
-            beta: Some(beta),
-        },
-    );
-    let output = py
-        .allow_threads(|| adjustable_ma_alternating_extremities_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("ma", output.ma.into_pyarray(py))?;
-    dict.set_item("upper", output.upper.into_pyarray(py))?;
-    dict.set_item("lower", output.lower.into_pyarray(py))?;
-    dict.set_item("extremity", output.extremity.into_pyarray(py))?;
-    dict.set_item("state", output.state.into_pyarray(py))?;
-    dict.set_item("changed", output.changed.into_pyarray(py))?;
-    dict.set_item("smoothed_open", output.smoothed_open.into_pyarray(py))?;
-    dict.set_item("smoothed_high", output.smoothed_high.into_pyarray(py))?;
-    dict.set_item("smoothed_low", output.smoothed_low.into_pyarray(py))?;
-    dict.set_item("smoothed_close", output.smoothed_close.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adjustable_ma_alternating_extremities_batch")]
-#[pyo3(signature = (high, low, close, length_range, mult_range, alpha_range, beta_range, kernel=None))]
-pub fn adjustable_ma_alternating_extremities_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    alpha_range: (f64, f64, f64),
-    beta_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            adjustable_ma_alternating_extremities_batch_with_kernel(
-                high,
-                low,
-                close,
-                &AdjustableMaAlternatingExtremitiesBatchRange {
-                    length: length_range,
-                    mult: mult_range,
-                    alpha: alpha_range,
-                    beta: beta_range,
-                },
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let total = output.rows * output.cols;
-    let arrays = [
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-    ];
-    unsafe { arrays[0].as_slice_mut()? }.copy_from_slice(&output.ma);
-    unsafe { arrays[1].as_slice_mut()? }.copy_from_slice(&output.upper);
-    unsafe { arrays[2].as_slice_mut()? }.copy_from_slice(&output.lower);
-    unsafe { arrays[3].as_slice_mut()? }.copy_from_slice(&output.extremity);
-    unsafe { arrays[4].as_slice_mut()? }.copy_from_slice(&output.state);
-    unsafe { arrays[5].as_slice_mut()? }.copy_from_slice(&output.changed);
-    unsafe { arrays[6].as_slice_mut()? }.copy_from_slice(&output.smoothed_open);
-    unsafe { arrays[7].as_slice_mut()? }.copy_from_slice(&output.smoothed_high);
-    unsafe { arrays[8].as_slice_mut()? }.copy_from_slice(&output.smoothed_low);
-    unsafe { arrays[9].as_slice_mut()? }.copy_from_slice(&output.smoothed_close);
-
-    let dict = PyDict::new(py);
-    dict.set_item("ma", arrays[0].reshape((output.rows, output.cols))?)?;
-    dict.set_item("upper", arrays[1].reshape((output.rows, output.cols))?)?;
-    dict.set_item("lower", arrays[2].reshape((output.rows, output.cols))?)?;
-    dict.set_item("extremity", arrays[3].reshape((output.rows, output.cols))?)?;
-    dict.set_item("state", arrays[4].reshape((output.rows, output.cols))?)?;
-    dict.set_item("changed", arrays[5].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "smoothed_open",
-        arrays[6].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "smoothed_high",
-        arrays[7].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "smoothed_low",
-        arrays[8].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "smoothed_close",
-        arrays[9].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "mults",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.mult.unwrap_or(DEFAULT_MULT))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "alphas",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "betas",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.beta.unwrap_or(DEFAULT_BETA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdjustableMaAlternatingExtremitiesStream")]
-pub struct AdjustableMaAlternatingExtremitiesStreamPy {
-    stream: AdjustableMaAlternatingExtremitiesStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdjustableMaAlternatingExtremitiesStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, mult=DEFAULT_MULT, alpha=DEFAULT_ALPHA, beta=DEFAULT_BETA))]
-    fn new(length: usize, mult: f64, alpha: f64, beta: f64) -> PyResult<Self> {
-        let stream = AdjustableMaAlternatingExtremitiesStream::try_new(
-            AdjustableMaAlternatingExtremitiesParams {
-                length: Some(length),
-                mult: Some(mult),
-                alpha: Some(alpha),
-                beta: Some(beta),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(
-        &mut self,
-        high: f64,
-        low: f64,
-        close: f64,
-    ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
-        self.stream.update(high, low, close).map(|out| {
-            (
-                out.ma,
-                out.upper,
-                out.lower,
-                out.extremity,
-                out.state,
-                out.changed,
-                out.smoothed_open,
-                out.smoothed_high,
-                out.smoothed_low,
-                out.smoothed_close,
-            )
-        })
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdjustableMaAlternatingExtremitiesJsOutput {
-    pub ma: Vec<f64>,
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub extremity: Vec<f64>,
-    pub state: Vec<f64>,
-    pub changed: Vec<f64>,
-    pub smoothed_open: Vec<f64>,
-    pub smoothed_high: Vec<f64>,
-    pub smoothed_low: Vec<f64>,
-    pub smoothed_close: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adjustable_ma_alternating_extremities_js)]
-pub fn adjustable_ma_alternating_extremities_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    mult: f64,
-    alpha: f64,
-    beta: f64,
-) -> Result<JsValue, JsValue> {
-    let input = AdjustableMaAlternatingExtremitiesInput::from_slices(
-        high,
-        low,
-        close,
-        AdjustableMaAlternatingExtremitiesParams {
-            length: Some(length),
-            mult: Some(mult),
-            alpha: Some(alpha),
-            beta: Some(beta),
-        },
-    );
-    let output = adjustable_ma_alternating_extremities_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&AdjustableMaAlternatingExtremitiesJsOutput {
-        ma: output.ma,
-        upper: output.upper,
-        lower: output.lower,
-        extremity: output.extremity,
-        state: output.state,
-        changed: output.changed,
-        smoothed_open: output.smoothed_open,
-        smoothed_high: output.smoothed_high,
-        smoothed_low: output.smoothed_low,
-        smoothed_close: output.smoothed_close,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdjustableMaAlternatingExtremitiesBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub mult_range: (f64, f64, f64),
-    pub alpha_range: (f64, f64, f64),
-    pub beta_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdjustableMaAlternatingExtremitiesBatchJsOutput {
-    pub ma: Vec<f64>,
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub extremity: Vec<f64>,
-    pub state: Vec<f64>,
-    pub changed: Vec<f64>,
-    pub smoothed_open: Vec<f64>,
-    pub smoothed_high: Vec<f64>,
-    pub smoothed_low: Vec<f64>,
-    pub smoothed_close: Vec<f64>,
-    pub lengths: Vec<usize>,
-    pub mults: Vec<f64>,
-    pub alphas: Vec<f64>,
-    pub betas: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adjustable_ma_alternating_extremities_batch)]
-pub fn adjustable_ma_alternating_extremities_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: AdjustableMaAlternatingExtremitiesBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let output = adjustable_ma_alternating_extremities_batch_with_kernel(
-        high,
-        low,
-        close,
-        &AdjustableMaAlternatingExtremitiesBatchRange {
-            length: cfg.length_range,
-            mult: cfg.mult_range,
-            alpha: cfg.alpha_range,
-            beta: cfg.beta_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&AdjustableMaAlternatingExtremitiesBatchJsOutput {
-        ma: output.ma,
-        upper: output.upper,
-        lower: output.lower,
-        extremity: output.extremity,
-        state: output.state,
-        changed: output.changed,
-        smoothed_open: output.smoothed_open,
-        smoothed_high: output.smoothed_high,
-        smoothed_low: output.smoothed_low,
-        smoothed_close: output.smoothed_close,
-        lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH))
-            .collect(),
-        mults: output
-            .combos
-            .iter()
-            .map(|combo| combo.mult.unwrap_or(DEFAULT_MULT))
-            .collect(),
-        alphas: output
-            .combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect(),
-        betas: output
-            .combos
-            .iter()
-            .map(|combo| combo.beta.unwrap_or(DEFAULT_BETA))
-            .collect(),
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adjustable_ma_alternating_extremities_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    mult: f64,
-    alpha: f64,
-    beta: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value =
-        adjustable_ma_alternating_extremities_js(high, low, close, length, mult, alpha, beta)?;
-    crate::write_wasm_object_f64_outputs(
-        "adjustable_ma_alternating_extremities_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adjustable_ma_alternating_extremities_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adjustable_ma_alternating_extremities_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "adjustable_ma_alternating_extremities_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]
@@ -1964,6 +1572,296 @@ mod tests {
             low.push(base - 1.5 - (i as f64 * 0.07).sin().abs());
         }
         (high, low, close)
+    }
+
+    fn assert_series_close(lhs: &[f64], rhs: &[f64]) {
+        assert_eq!(lhs.len(), rhs.len());
+        for (index, (&actual, &expected)) in lhs.iter().zip(rhs).enumerate() {
+            if actual.is_nan() && expected.is_nan() {
+                continue;
+            }
+            let tolerance = 1e-11 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "mismatch at {index}: actual={actual:?} expected={expected:?} \
+                 tolerance={tolerance}"
+            );
+        }
+    }
+
+    /// Direct formula oracle derived from the published kernel equation and
+    /// extremity rules. It deliberately recomputes every deviation window and
+    /// does not call any production helper, stream, or batch implementation.
+    fn independent_formula(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        length: usize,
+        mult: f64,
+        alpha: f64,
+        beta: f64,
+    ) -> AdjustableMaAlternatingExtremitiesOutput {
+        let len = close.len();
+        let mut output = AdjustableMaAlternatingExtremitiesOutput {
+            ma: vec![f64::NAN; len],
+            upper: vec![f64::NAN; len],
+            lower: vec![f64::NAN; len],
+            extremity: vec![f64::NAN; len],
+            state: vec![f64::NAN; len],
+            changed: vec![f64::NAN; len],
+            smoothed_open: vec![f64::NAN; len],
+            smoothed_high: vec![f64::NAN; len],
+            smoothed_low: vec![f64::NAN; len],
+            smoothed_close: vec![f64::NAN; len],
+        };
+        let denominator = (length - 1) as f64;
+        let mut weights: Vec<f64> = (0..length)
+            .map(|index| {
+                let x = index as f64 / denominator;
+                (core::f64::consts::TAU * x.powf(alpha)).sin() * (1.0 - x.powf(beta))
+            })
+            .collect();
+        let weight_sum: f64 = weights.iter().sum();
+        for weight in &mut weights {
+            *weight /= weight_sum;
+        }
+
+        let mut cursor = 0usize;
+        while cursor < len {
+            while cursor < len
+                && !(high[cursor].is_finite()
+                    && low[cursor].is_finite()
+                    && close[cursor].is_finite())
+            {
+                cursor += 1;
+            }
+            let run_start = cursor;
+            while cursor < len
+                && high[cursor].is_finite()
+                && low[cursor].is_finite()
+                && close[cursor].is_finite()
+            {
+                cursor += 1;
+            }
+            let run_end = cursor;
+            if run_end.saturating_sub(run_start) < length {
+                continue;
+            }
+
+            let ma_start = run_start + length - 1;
+            for index in ma_start..run_end {
+                let mut close_value = 0.0;
+                let mut high_value = 0.0;
+                let mut low_value = 0.0;
+                for offset in 0..length {
+                    close_value += close[index - offset] * weights[offset];
+                    high_value += high[index - offset] * weights[offset];
+                    low_value += low[index - offset] * weights[offset];
+                }
+                output.ma[index] = close_value;
+                output.smoothed_close[index] = close_value;
+                output.smoothed_high[index] = high_value;
+                output.smoothed_low[index] = low_value;
+            }
+            for index in (ma_start + 2)..run_end {
+                output.smoothed_open[index] = 0.5 * (output.ma[index - 1] + output.ma[index - 2]);
+            }
+
+            let needed = (length * 2) - 1;
+            if run_end - run_start < needed {
+                continue;
+            }
+            let band_start = run_start + needed - 1;
+            for index in band_start..run_end {
+                let deviation = (0..length)
+                    .map(|offset| (close[index - offset] - output.ma[index - offset]).abs())
+                    .sum::<f64>()
+                    / length as f64
+                    * mult;
+                output.upper[index] = output.ma[index] + deviation;
+                output.lower[index] = output.ma[index] - deviation;
+            }
+
+            let mut state = 0.0_f64;
+            output.state[band_start] = state;
+            output.changed[band_start] = 0.0;
+            output.extremity[band_start] = output.lower[band_start];
+            for index in (band_start + 1)..run_end {
+                let crossed_high = (high[index] > output.upper[index]
+                    && high[index - 1] <= output.upper[index - 1])
+                    || (high[index] < output.upper[index]
+                        && high[index - 1] >= output.upper[index - 1]);
+                let crossed_low = (low[index] > output.lower[index]
+                    && low[index - 1] <= output.lower[index - 1])
+                    || (low[index] < output.lower[index]
+                        && low[index - 1] >= output.lower[index - 1]);
+                let next_state = if crossed_high {
+                    1.0
+                } else if crossed_low {
+                    0.0
+                } else {
+                    state
+                };
+                output.state[index] = next_state;
+                output.changed[index] = f64::from(next_state != state);
+                output.extremity[index] = if next_state >= 0.5 {
+                    output.upper[index]
+                } else {
+                    output.lower[index]
+                };
+                state = next_state;
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn formula_and_validity_recover_independently_after_a_gap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut high, mut low, mut close) = sample_ohlc(220);
+        high[90] = f64::NAN;
+        low[90] = f64::NAN;
+        close[90] = f64::NAN;
+        let params = AdjustableMaAlternatingExtremitiesParams {
+            length: Some(8),
+            mult: Some(1.75),
+            alpha: Some(1.0),
+            beta: Some(0.5),
+        };
+        let actual = adjustable_ma_alternating_extremities(
+            &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                params.clone(),
+            ),
+        )?;
+        let expected = independent_formula(&high, &low, &close, 8, 1.75, 1.0, 0.5);
+
+        assert_series_close(&actual.ma, &expected.ma);
+        assert_series_close(&actual.upper, &expected.upper);
+        assert_series_close(&actual.lower, &expected.lower);
+        assert_series_close(&actual.extremity, &expected.extremity);
+        assert_series_close(&actual.state, &expected.state);
+        assert_series_close(&actual.changed, &expected.changed);
+        assert_series_close(&actual.smoothed_open, &expected.smoothed_open);
+        assert_series_close(&actual.smoothed_high, &expected.smoothed_high);
+        assert_series_close(&actual.smoothed_low, &expected.smoothed_low);
+        assert_series_close(&actual.smoothed_close, &expected.smoothed_close);
+        for (field, expected_series) in [
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Ma,
+                expected.ma.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Upper,
+                expected.upper.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Lower,
+                expected.lower.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Extremity,
+                expected.extremity.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::State,
+                expected.state.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::Changed,
+                expected.changed.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::SmoothedOpen,
+                expected.smoothed_open.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::SmoothedHigh,
+                expected.smoothed_high.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::SmoothedLow,
+                expected.smoothed_low.as_slice(),
+            ),
+            (
+                AdjustableMaAlternatingExtremitiesOutputField::SmoothedClose,
+                expected.smoothed_close.as_slice(),
+            ),
+        ] {
+            let mut selected = vec![f64::NAN; close.len()];
+            adjustable_ma_alternating_extremities_output_into_slice(
+                &mut selected,
+                &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                    &high,
+                    &low,
+                    &close,
+                    params.clone(),
+                ),
+                Kernel::Scalar,
+                field,
+            )?;
+            assert_series_close(&selected, expected_series);
+        }
+        assert!(
+            expected.upper[105].is_finite(),
+            "the second finite segment must recover after its own 15-bar warmup"
+        );
+
+        let mut stream = AdjustableMaAlternatingExtremitiesStream::try_new(params)?;
+        for index in 0..close.len() {
+            let streamed = stream.update(high[index], low[index], close[index]);
+            if expected.upper[index].is_finite() {
+                let streamed = streamed.expect("the stream must recover on the same bar");
+                assert!((streamed.upper - expected.upper[index]).abs() <= 1e-10);
+                assert!((streamed.lower - expected.lower[index]).abs() <= 1e-10);
+                assert_eq!(streamed.state, expected.state[index]);
+                assert_eq!(streamed.changed, expected.changed[index]);
+            } else {
+                assert!(
+                    streamed.is_none(),
+                    "the stream bridged an undefined window at index {index}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_family_requires_one_complete_finite_hlc_run() {
+        let mut high = (0..21)
+            .map(|index| 101.0 + index as f64)
+            .collect::<Vec<_>>();
+        let mut low = (0..21).map(|index| 99.0 + index as f64).collect::<Vec<_>>();
+        let mut close = (0..21)
+            .map(|index| 100.0 + index as f64)
+            .collect::<Vec<_>>();
+        high[10] = f64::NAN;
+        low[10] = f64::NAN;
+        close[10] = f64::NAN;
+        let error = adjustable_ma_alternating_extremities(
+            &AdjustableMaAlternatingExtremitiesInput::from_slices(
+                &high,
+                &low,
+                &close,
+                AdjustableMaAlternatingExtremitiesParams {
+                    length: Some(8),
+                    mult: Some(1.75),
+                    alpha: Some(1.0),
+                    beta: Some(0.5),
+                },
+            ),
+        )
+        .expect_err("two incomplete segments cannot form one valid output window");
+        assert!(matches!(
+            error,
+            AdjustableMaAlternatingExtremitiesError::NotEnoughValidData {
+                needed: 15,
+                valid: 10
+            }
+        ));
     }
 
     #[test]

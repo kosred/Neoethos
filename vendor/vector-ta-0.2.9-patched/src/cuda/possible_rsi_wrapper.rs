@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 //! `possible_rsi` on the card.
 //!
@@ -19,10 +19,10 @@
 //! naming the indicator.
 
 use crate::cuda::f64_launch::{
-    checked_mul, plan_slots, scratch_elems, validate_launch, LaunchPlanError, DEFAULT_HEADROOM,
+    DEFAULT_HEADROOM, LaunchPlanError, checked_mul, plan_slots, scratch_elems, validate_launch,
 };
 use crate::indicators::possible_rsi::{
-    expand_grid_possible_rsi, PossibleRsiBatchRange, PossibleRsiParams,
+    PossibleRsiBatchRange, PossibleRsiParams, expand_grid_possible_rsi,
 };
 use cust::context::Context;
 use cust::device::Device;
@@ -229,15 +229,20 @@ impl CudaPossibleRsi {
             return Err(CudaPossibleRsiError::InvalidInput("empty input".into()));
         }
         if !data.iter().any(|value| value.is_finite()) {
-            return Err(CudaPossibleRsiError::InvalidInput("all values are NaN".into()));
+            return Err(CudaPossibleRsiError::InvalidInput(
+                "all values are NaN".into(),
+            ));
         }
 
         // The three string-valued parameters live on `base` and are NOT swept
         // (`expand_grid_checked`, :1740 — it clones them into every combo), so
         // they resolve once here rather than per row.
         let rsi_mode = rsi_mode_code(base.rsi_mode.as_deref().unwrap_or("regular"))?;
-        let normalization_mode =
-            normalization_code(base.normalization_mode.as_deref().unwrap_or("gaussian_fisher"))?;
+        let normalization_mode = normalization_code(
+            base.normalization_mode
+                .as_deref()
+                .unwrap_or("gaussian_fisher"),
+        )?;
         let signal_type =
             signal_type_code(base.signal_type.as_deref().unwrap_or("zeroline_crossover"))?;
         let run_highpass = base.run_highpass.unwrap_or(false);
@@ -333,12 +338,18 @@ impl CudaPossibleRsi {
                 what: "doubles/slot",
             })?;
         let ints_per_slot = checked_mul(INDICATOR, "deques/slot", 2, deque_cap)?;
-        let bytes_per_slot = checked_mul(INDICATOR, "double bytes/slot", doubles_per_slot, f64_size)?
-            .checked_add(checked_mul(INDICATOR, "int bytes/slot", ints_per_slot, i32_size)?)
-            .ok_or(LaunchPlanError::SizeOverflow {
-                indicator: INDICATOR,
-                what: "bytes/slot",
-            })?;
+        let bytes_per_slot =
+            checked_mul(INDICATOR, "double bytes/slot", doubles_per_slot, f64_size)?
+                .checked_add(checked_mul(
+                    INDICATOR,
+                    "int bytes/slot",
+                    ints_per_slot,
+                    i32_size,
+                )?)
+                .ok_or(LaunchPlanError::SizeOverflow {
+                    indicator: INDICATOR,
+                    what: "bytes/slot",
+                })?;
         let fixed_bytes = checked_mul(INDICATOR, "output bytes", output_elems, 7 * f64_size)?
             .checked_add(cols * f64_size)
             .and_then(|b| {
@@ -350,7 +361,13 @@ impl CudaPossibleRsi {
                 what: "fixed bytes",
             })?;
 
-        let plan = plan_slots(INDICATOR, rows, fixed_bytes, bytes_per_slot, DEFAULT_HEADROOM)?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )?;
         let scratch_doubles =
             scratch_elems(INDICATOR, "double scratch", plan.slots, doubles_per_slot)?;
         let scratch_ints = scratch_elems(INDICATOR, "int scratch", plan.slots, ints_per_slot)?;

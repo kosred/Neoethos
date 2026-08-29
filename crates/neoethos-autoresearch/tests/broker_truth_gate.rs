@@ -1,12 +1,13 @@
 use std::cell::Cell;
 
+use neoethos_autoresearch::QuoteValidatedOosTouchEvidenceV1;
 use neoethos_autoresearch::journal::OosWindow;
 use neoethos_autoresearch::runner::{
-    OosEvidence, PromotionPortfolio, RunArgs, SearchOutcome, SearchRequest, SweepExecutor,
-    run_with_executor,
+    PromotionPortfolio, RunArgs, SearchOutcome, SearchRequest, SweepExecutor, run_with_executor,
 };
-use neoethos_autoresearch::session::SweepId;
+use neoethos_autoresearch::session::{DatasetReceiptV1, SweepId};
 use neoethos_core::config::Settings;
+use neoethos_data::{BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe};
 use neoethos_search::DiscoveryConfig;
 
 #[derive(Default)]
@@ -36,6 +37,10 @@ impl SweepExecutor for InvocationProbe {
         self.called("windows")
     }
 
+    fn dataset_receipt(&self) -> &DatasetReceiptV1 {
+        panic!("broker gate invoked executor method dataset_receipt")
+    }
+
     fn execute(&mut self, _request: &SearchRequest<'_>) -> anyhow::Result<SearchOutcome> {
         self.called("execute")
     }
@@ -50,7 +55,7 @@ impl SweepExecutor for InvocationProbe {
         _slot: usize,
         _config: &DiscoveryConfig,
         _portfolio: &PromotionPortfolio,
-    ) -> anyhow::Result<OosEvidence> {
+    ) -> anyhow::Result<QuoteValidatedOosTouchEvidenceV1> {
         self.called("evaluate_oos")
     }
 }
@@ -72,10 +77,21 @@ fn public_runner_refuses_before_executor_or_artifact_work() {
 
     let settings = Settings::default();
     let mut executor = InvocationProbe::default();
+    let identity = CanonicalDatasetIdentity::external(
+        "broker-truth-gate",
+        "EURUSD",
+        CanonicalTimeframe::M5,
+        BarTimestampConvention::BarOpen,
+    )
+    .expect("valid test dataset identity");
     let result = run_with_executor(
-        RunArgs::new("EURUSD"),
+        RunArgs::new(identity),
         &settings,
-        DiscoveryConfig::default(),
+        DiscoveryConfig {
+            evaluation_symbol: "EURUSD".to_owned(),
+            timeframe_label: "M5".to_owned(),
+            ..DiscoveryConfig::default()
+        },
         &mut executor,
     );
 

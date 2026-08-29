@@ -26,10 +26,6 @@ pub enum AroonOscData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct AroonOscParams {
     pub length: Option<usize>,
 }
@@ -317,6 +313,9 @@ pub fn aroon_osc_scalar_highlow_into(
     first: usize,
     out: &mut [f64],
 ) {
+    // Official TA-Lib authority: scan a period-plus-one-bar window and let the
+    // latest equal high/low replace the older extreme.
+    // https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_AROONOSC.c
     let len = low.len();
     let window = length + 1;
     let start_i = first + length;
@@ -338,12 +337,12 @@ pub fn aroon_osc_scalar_highlow_into(
             let mut j = first + 1;
             while j <= start_i {
                 let hv = *h_ptr.add(j);
-                if hv > max {
+                if hv >= max {
                     max = hv;
                     maxi = j;
                 }
                 let lv = *l_ptr.add(j);
-                if lv < min {
+                if lv <= min {
                     min = lv;
                     mini = j;
                 }
@@ -361,13 +360,13 @@ pub fn aroon_osc_scalar_highlow_into(
                     let mut k = start + 1;
                     while k <= i {
                         let hv = *h_ptr.add(k);
-                        if hv > max {
+                        if hv >= max {
                             max = hv;
                             maxi = k;
                         }
                         k += 1;
                     }
-                } else if bar_h > max {
+                } else if bar_h >= max {
                     maxi = i;
                     max = bar_h;
                 }
@@ -379,13 +378,13 @@ pub fn aroon_osc_scalar_highlow_into(
                     let mut k = start + 1;
                     while k <= i {
                         let lv = *l_ptr.add(k);
-                        if lv < min {
+                        if lv <= min {
                             min = lv;
                             mini = k;
                         }
                         k += 1;
                     }
-                } else if bar_l < min {
+                } else if bar_l <= min {
                     mini = i;
                     min = bar_l;
                 }
@@ -412,11 +411,7 @@ pub fn aroon_osc_scalar_highlow_into(
 
     #[inline(always)]
     fn dec_wrap(x: usize, cap: usize) -> usize {
-        if x == 0 {
-            cap - 1
-        } else {
-            x - 1
-        }
+        if x == 0 { cap - 1 } else { x - 1 }
     }
     #[inline(always)]
     fn inc_wrap(x: &mut usize, cap: usize) {
@@ -432,7 +427,7 @@ pub fn aroon_osc_scalar_highlow_into(
             let last = dec_wrap(hi_tail, cap);
             let last_idx = dq_hi[last];
             let last_val = high[last_idx];
-            if last_val < v_hi {
+            if last_val <= v_hi {
                 hi_tail = last;
                 hi_len -= 1;
             } else {
@@ -448,7 +443,7 @@ pub fn aroon_osc_scalar_highlow_into(
             let last = dec_wrap(lo_tail, cap);
             let last_idx = dq_lo[last];
             let last_val = low[last_idx];
-            if last_val > v_lo {
+            if last_val >= v_lo {
                 lo_tail = last;
                 lo_len -= 1;
             } else {
@@ -478,7 +473,7 @@ pub fn aroon_osc_scalar_highlow_into(
             let last = dec_wrap(hi_tail, cap);
             let last_idx = dq_hi[last];
             let last_val = high[last_idx];
-            if last_val < v_hi {
+            if last_val <= v_hi {
                 hi_tail = last;
                 hi_len -= 1;
             } else {
@@ -494,7 +489,7 @@ pub fn aroon_osc_scalar_highlow_into(
             let last = dec_wrap(lo_tail, cap);
             let last_idx = dq_lo[last];
             let last_val = low[last_idx];
-            if last_val > v_lo {
+            if last_val >= v_lo {
                 lo_tail = last;
                 lo_len -= 1;
             } else {
@@ -1151,7 +1146,7 @@ impl AroonOscStream {
 
         while self.hi_len > 0 {
             let last = self.dec_wrap(self.hi_tail);
-            if self.hi_val[last] < h {
+            if self.hi_val[last] <= h {
                 self.hi_tail = last;
                 self.hi_len -= 1;
             } else {
@@ -1165,7 +1160,7 @@ impl AroonOscStream {
 
         while self.lo_len > 0 {
             let last = self.dec_wrap(self.lo_tail);
-            if self.lo_val[last] > l {
+            if self.lo_val[last] >= l {
                 self.lo_tail = last;
                 self.lo_len -= 1;
             } else {
@@ -1194,69 +1189,40 @@ impl AroonOscStream {
     #[inline(always)]
     fn inc_wrap(&self, x: usize) -> usize {
         let y = x + 1;
-        if y == self.cap {
-            0
-        } else {
-            y
-        }
+        if y == self.cap { 0 } else { y }
     }
     #[inline(always)]
     fn dec_wrap(&self, x: usize) -> usize {
-        if x == 0 {
-            self.cap - 1
-        } else {
-            x - 1
-        }
+        if x == 0 { self.cap - 1 } else { x - 1 }
     }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    length: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = aroonosc_js(high, low, length)?;
-    crate::write_wasm_f64_output("aroonosc_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = aroonosc_batch_js(high, low, length_start, length_end, length_step)?;
-    crate::write_wasm_f64_output("aroonosc_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroon_osc_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = aroon_osc_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "aroon_osc_batch_unified_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
+
+    #[test]
+    fn talib_latest_tie_is_shared_by_scalar_and_stream() {
+        let high = [10.0, 10.0, 9.0];
+        let low = [5.0, 6.0, 5.0];
+        let mut out = [f64::NAN; 3];
+        aroon_osc_scalar_highlow_into(&high, &low, 2, 0, &mut out);
+        assert_eq!(out[2].to_bits(), (-50.0f64).to_bits());
+
+        let mut stream = AroonOscStream::try_new(AroonOscParams { length: Some(2) })
+            .expect("valid Aroon oscillator stream");
+        assert_eq!(stream.update(10.0, 5.0), None);
+        assert_eq!(stream.update(10.0, 6.0), None);
+        assert_eq!(
+            stream
+                .update(9.0, 5.0)
+                .expect("first Aroon oscillator output")
+                .to_bits(),
+            (-50.0f64).to_bits()
+        );
+    }
 
     #[test]
     fn test_aroonosc_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
@@ -1315,8 +1281,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = AroonOscParams { length: Some(20) };
         let input = AroonOscInput::from_candles(&candles, partial_params);
         let result = aroon_osc_with_kernel(&input, kernel)?;
@@ -1328,8 +1294,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AroonOscInput::with_default_candles(&candles);
         let result = aroon_osc_with_kernel(&input, kernel)?;
         let expected_last_five = [-50.0, -50.0, -50.0, -50.0, -42.8571];
@@ -1362,8 +1328,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AroonOscInput::with_default_candles(&candles);
         match input.data {
             AroonOscData::Candles { .. } => {}
@@ -1377,8 +1343,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = AroonOscParams { length: Some(10) };
         let first_input = AroonOscInput::from_candles(&candles, first_params);
         let first_result = aroon_osc_with_kernel(&first_input, kernel)?;
@@ -1400,8 +1366,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AroonOscInput::with_default_candles(&candles);
         let result = aroon_osc_with_kernel(&input, kernel)?;
         if result.values.len() > 50 {
@@ -1423,8 +1389,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_lengths = vec![5, 14, 25, 50, 100, 200];
 
@@ -1449,23 +1415,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with length {}",
-						test_name, val, bits, i, length
-					);
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with length {}",
+                        test_name, val, bits, i, length
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with length {}",
-						test_name, val, bits, i, length
-					);
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with length {}",
+                        test_name, val, bits, i, length
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with length {}",
-						test_name, val, bits, i, length
-					);
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with length {}",
+                        test_name, val, bits, i, length
+                    );
                 }
             }
         }
@@ -1772,8 +1738,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = AroonOscBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c)?;
@@ -1787,8 +1753,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -1866,598 +1832,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::{CudaAroonOsc, DeviceArrayF32Aroonosc};
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "aroonosc")]
-#[pyo3(signature = (high, low, length=14, kernel=None))]
-pub fn aroon_osc_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    if high_slice.len() != low_slice.len() {
-        return Err(PyValueError::new_err(format!(
-            "High and low arrays must have same length. Got high: {}, low: {}",
-            high_slice.len(),
-            low_slice.len()
-        )));
-    }
-
-    if length == 0 {
-        return Err(PyValueError::new_err(
-            "Invalid length: length must be greater than 0",
-        ));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = AroonOscParams {
-        length: Some(length),
-    };
-    let aroon_in = AroonOscInput::from_slices_hl(high_slice, low_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| aroon_osc_with_kernel(&aroon_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AroonOscStream")]
-pub struct AroonOscStreamPy {
-    stream: AroonOscStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AroonOscStreamPy {
-    #[new]
-    fn new(length: usize) -> PyResult<Self> {
-        let params = AroonOscParams {
-            length: Some(length),
-        };
-        let stream =
-            AroonOscStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AroonOscStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "aroonosc_batch")]
-#[pyo3(signature = (high, low, length_range, kernel=None))]
-pub fn aroon_osc_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    if high_slice.len() != low_slice.len() {
-        return Err(PyValueError::new_err(format!(
-            "High and low arrays must have same length. Got high: {}, low: {}",
-            high_slice.len(),
-            low_slice.len()
-        )));
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = AroonOscBatchRange {
-        length: length_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = high_slice.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| -> Result<Vec<AroonOscParams>, AroonOscError> {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-
-            aroon_osc_batch_inner_into(high_slice, low_slice, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub struct PrimaryCtxGuard {
-    dev: i32,
-    ctx: cust::sys::CUcontext,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl PrimaryCtxGuard {
-    fn new(device_id: u32) -> Result<Self, cust::error::CudaError> {
-        unsafe {
-            let mut ctx: cust::sys::CUcontext = core::ptr::null_mut();
-            let dev = device_id as i32;
-            let res = cust::sys::cuDevicePrimaryCtxRetain(&mut ctx as *mut _, dev);
-            if res != cust::sys::CUresult::CUDA_SUCCESS {
-                return Err(cust::error::CudaError::UnknownError);
-            }
-            Ok(PrimaryCtxGuard { dev, ctx })
-        }
-    }
-    #[inline]
-    unsafe fn push_current(&self) {
-        let _ = cust::sys::cuCtxSetCurrent(self.ctx);
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl Drop for PrimaryCtxGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = cust::sys::cuDevicePrimaryCtxRelease_v2(self.dev);
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct AroonOscDeviceArrayF32Py {
-    inner: Option<DeviceArrayF32Aroonosc>,
-    device_id: u32,
-    pc_guard: PrimaryCtxGuard,
-}
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl AroonOscDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        use pyo3::types::PyDict;
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr_val: usize = if inner.rows == 0 || inner.cols == 0 {
-            0
-        } else {
-            inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl Drop for AroonOscDeviceArrayF32Py {
-    fn drop(&mut self) {
-        unsafe {
-            self.pc_guard.push_current();
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "aroonosc_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, length_range, device_id=0))]
-pub fn aroonosc_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    length_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<AroonOscDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use pyo3::exceptions::PyValueError;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high = high_f32.as_slice()?;
-    let low = low_f32.as_slice()?;
-    if high.len() != low.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-
-    let sweep = AroonOscBatchRange {
-        length: length_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda =
-            CudaAroonOsc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.aroonosc_batch_dev(high, low, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let guard =
-        PrimaryCtxGuard::new(device_id as u32).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(AroonOscDeviceArrayF32Py {
-        inner: Some(inner),
-        device_id: device_id as u32,
-        pc_guard: guard,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "aroonosc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, length, device_id=0))]
-pub fn aroonosc_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    length: usize,
-    device_id: usize,
-) -> PyResult<AroonOscDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-    use pyo3::exceptions::PyValueError;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape_h = high_tm_f32.shape();
-    let shape_l = low_tm_f32.shape();
-    if shape_h != shape_l || shape_h.len() != 2 {
-        return Err(PyValueError::new_err("high/low must be same 2D shape"));
-    }
-    let rows = shape_h[0];
-    let cols = shape_h[1];
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let inner = py.allow_threads(|| {
-        let cuda =
-            CudaAroonOsc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.aroonosc_many_series_one_param_time_major_dev(h, l, cols, rows, length)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let guard =
-        PrimaryCtxGuard::new(device_id as u32).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(AroonOscDeviceArrayF32Py {
-        inner: Some(inner),
-        device_id: device_id as u32,
-        pc_guard: guard,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_js(high: &[f64], low: &[f64], length: usize) -> Result<Vec<f64>, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str(&format!(
-            "High and low arrays must have same length. Got high: {}, low: {}",
-            high.len(),
-            low.len()
-        )));
-    }
-
-    let params = AroonOscParams {
-        length: Some(length),
-    };
-    let input = AroonOscInput::from_slices_hl(high, low, params);
-
-    aroon_osc_with_kernel(&input, Kernel::Auto)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_batch_js(
-    high: &[f64],
-    low: &[f64],
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str(&format!(
-            "High and low arrays must have same length. Got high: {}, low: {}",
-            high.len(),
-            low.len()
-        )));
-    }
-
-    let sweep = AroonOscBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-
-    aroon_osc_batch_slice(high, low, &sweep, Kernel::Auto)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_batch_metadata_js(
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AroonOscBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut metadata = Vec::with_capacity(combos.len());
-
-    for combo in combos {
-        metadata.push(combo.length.unwrap() as f64);
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AroonOscBatchConfig {
-    pub length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AroonOscBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AroonOscParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = aroonosc_batch)]
-pub fn aroon_osc_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str(&format!(
-            "High and low arrays must have same length. Got high: {}, low: {}",
-            high.len(),
-            low.len()
-        )));
-    }
-
-    let config: AroonOscBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AroonOscBatchRange {
-        length: config.length_range,
-    };
-
-    let output = aroon_osc_batch_slice(high, low, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = AroonOscBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let params = AroonOscParams {
-            length: Some(length),
-        };
-        let input = AroonOscInput::from_slices_hl(high, low, params);
-
-        if high_ptr == out_ptr || low_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            aroon_osc_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            aroon_osc_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroonosc_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let sweep = AroonOscBatchRange {
-            length: (length_start, length_end, length_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let expected_len = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("aroonosc: length range too large"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, expected_len);
-
-        let high_overlaps = (high_ptr as usize) < (out_ptr as usize + expected_len * 8)
-            && (high_ptr as usize + len * 8) > (out_ptr as usize);
-        let low_overlaps = (low_ptr as usize) < (out_ptr as usize + expected_len * 8)
-            && (low_ptr as usize + len * 8) > (out_ptr as usize);
-
-        if high_overlaps || low_overlaps {
-            let mut temp = vec![0.0; expected_len];
-            aroon_osc_batch_into_slice(high, low, &sweep, Kernel::Auto, false, &mut temp)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            out.copy_from_slice(&temp);
-        } else {
-            aroon_osc_batch_into_slice(high, low, &sweep, Kernel::Auto, false, out)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(rows)
-    }
 }

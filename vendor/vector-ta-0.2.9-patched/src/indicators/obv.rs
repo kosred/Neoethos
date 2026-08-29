@@ -1,11 +1,10 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
-    alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
+    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
+    make_uninit_matrix,
 };
 use aligned_vec::{AVec, CACHELINE_ALIGN};
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -161,16 +160,7 @@ pub fn obv_with_kernel(input: &ObvInput, kernel: Kernel) -> Result<ObvOutput, Ob
 
     let mut out = alloc_with_nan_prefix(close.len(), first);
 
-    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-    let chosen = match kernel {
-        Kernel::Auto => Kernel::Avx2,
-        other => other,
-    };
-    #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-    let chosen = match kernel {
-        Kernel::Auto => Kernel::Scalar,
-        other => other,
-    };
+    let chosen = resolve_obv_kernel(kernel);
 
     unsafe {
         match chosen {
@@ -186,7 +176,14 @@ pub fn obv_with_kernel(input: &ObvInput, kernel: Kernel) -> Result<ObvOutput, Ob
     Ok(ObvOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+#[inline(always)]
+fn resolve_obv_kernel(kernel: Kernel) -> Kernel {
+    match kernel {
+        Kernel::Auto => detect_best_kernel(),
+        other => other,
+    }
+}
+
 #[inline]
 pub fn obv_into(input: &ObvInput, out: &mut [f64]) -> Result<(), ObvError> {
     let (close, volume) = input.as_refs();
@@ -194,11 +191,22 @@ pub fn obv_into(input: &ObvInput, out: &mut [f64]) -> Result<(), ObvError> {
 }
 
 #[inline(always)]
+fn obv_step(prev_obv: f64, close: f64, prev_close: f64, volume: f64) -> f64 {
+    if close > prev_close {
+        prev_obv + volume
+    } else if close < prev_close {
+        prev_obv - volume
+    } else {
+        prev_obv
+    }
+}
+
+#[inline(always)]
 pub fn obv_scalar(close: &[f64], volume: &[f64], first_valid: usize, out: &mut [f64]) {
-    let mut prev_obv = 0.0f64;
+    let mut prev_obv = volume[first_valid];
     let mut prev_close = unsafe { *close.get_unchecked(first_valid) };
     unsafe {
-        *out.get_unchecked_mut(first_valid) = 0.0;
+        *out.get_unchecked_mut(first_valid) = prev_obv;
     }
 
     let mut i = first_valid + 1;
@@ -206,8 +214,7 @@ pub fn obv_scalar(close: &[f64], volume: &[f64], first_valid: usize, out: &mut [
         unsafe {
             let c = *close.get_unchecked(i);
             let v = *volume.get_unchecked(i);
-            let s = ((c > prev_close) as i32 - (c < prev_close) as i32) as f64;
-            prev_obv = v.mul_add(s, prev_obv);
+            prev_obv = obv_step(prev_obv, c, prev_close, v);
             *out.get_unchecked_mut(i) = prev_obv;
             prev_close = c;
         }
@@ -218,57 +225,9 @@ pub fn obv_scalar(close: &[f64], volume: &[f64], first_valid: usize, out: &mut [
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 #[inline]
 pub unsafe fn obv_avx2(close: &[f64], volume: &[f64], first_valid: usize, out: &mut [f64]) {
-    use core::arch::x86_64::*;
-    let len = close.len();
-    let mut prev_obv = 0.0f64;
-    let mut prev_close = *close.get_unchecked(first_valid);
-    *out.get_unchecked_mut(first_valid) = 0.0;
-
-    let mut i = first_valid + 1;
-    let end = len;
-
-    let one = _mm_set1_pd(1.0);
-    let neg_one = _mm_set1_pd(-1.0);
-    let zero = _mm_setzero_pd();
-
-    while i + 1 < end {
-        let c = _mm_loadu_pd(close.as_ptr().add(i));
-
-        let prev = _mm_set_pd(*close.get_unchecked(i), prev_close);
-
-        let gt = _mm_cmpgt_pd(c, prev);
-        let lt = _mm_cmplt_pd(c, prev);
-        let pos = _mm_and_pd(gt, one);
-        let neg = _mm_and_pd(lt, neg_one);
-        let sign = _mm_add_pd(pos, neg);
-
-        let vol = _mm_loadu_pd(volume.as_ptr().add(i));
-        let dv = _mm_mul_pd(vol, sign);
-
-        let dv0 = _mm_cvtsd_f64(dv);
-        let dv1 = _mm_cvtsd_f64(_mm_unpackhi_pd(dv, dv));
-
-        let res0 = dv0 + prev_obv;
-        let res1 = dv1 + res0;
-
-        let res = _mm_set_pd(res1, res0);
-        _mm_storeu_pd(out.as_mut_ptr().add(i), res);
-
-        prev_obv = res1;
-
-        let c_hi = _mm_unpackhi_pd(c, c);
-        prev_close = _mm_cvtsd_f64(c_hi);
-
-        i += 2;
-    }
-
-    if i < end {
-        let c = *close.get_unchecked(i);
-        let v = *volume.get_unchecked(i);
-        let s = ((c > prev_close) as i32 - (c < prev_close) as i32) as f64;
-        prev_obv = v.mul_add(s, prev_obv);
-        *out.get_unchecked_mut(i) = prev_obv;
-    }
+    // OBV is a recurrence. SIMD re-association changes the accumulator, so
+    // the named AVX route deliberately shares the canonical sequential lane.
+    obv_scalar(close, volume, first_valid, out)
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -385,17 +344,15 @@ impl ObvStream {
         if !self.initialized {
             if !close.is_nan() && !volume.is_nan() {
                 self.prev_close = close;
-                self.prev_obv = 0.0;
+                self.prev_obv = volume;
                 self.initialized = true;
-                return Some(0.0);
+                return Some(volume);
             } else {
                 return None;
             }
         }
 
-        let s = ((close > self.prev_close) as i32 - (close < self.prev_close) as i32) as f64;
-
-        self.prev_obv = volume.mul_add(s, self.prev_obv);
+        self.prev_obv = obv_step(self.prev_obv, close, self.prev_close, volume);
 
         self.prev_close = close;
 
@@ -637,35 +594,86 @@ fn expand_grid(_r: &ObvBatchRange) -> Vec<ObvParams> {
     vec![ObvParams::default()]
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn obv_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = obv_js(close, volume)?;
-    crate::write_wasm_f64_output("obv_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn obv_batch_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = obv_batch_js(close, volume)?;
-    crate::write_wasm_selected_object_f64_outputs("obv_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
+    #[test]
+    fn obv_auto_uses_the_authoritative_runtime_detector() {
+        assert_eq!(
+            resolve_obv_kernel(Kernel::Auto),
+            crate::utilities::helpers::detect_best_kernel()
+        );
+        for explicit in [Kernel::Scalar, Kernel::Avx2, Kernel::Avx512] {
+            assert_eq!(resolve_obv_kernel(explicit), explicit);
+        }
+    }
+
+    #[test]
+    fn talib_obv_lookback_zero_seeds_the_first_output_with_volume() {
+        let close = [10.0];
+        let volume = [5.0];
+        let input = ObvInput::from_slices(&close, &volume, ObvParams);
+
+        let output = obv_with_kernel(&input, Kernel::Scalar).expect("TA-Lib OBV seed");
+
+        assert_eq!(output.values, [5.0]);
+    }
+
+    #[test]
+    fn talib_obv_stream_uses_sequential_add_subtract_and_flat_carry() {
+        let close = [10.0, 11.0, 10.0, 10.0];
+        let volume = [5.0, 7.0, 3.0, 9.0];
+        let expected = [5.0, 12.0, 9.0, 9.0];
+        let mut stream = ObvStream::new();
+
+        let actual: Vec<f64> = close
+            .into_iter()
+            .zip(volume)
+            .map(|(close, volume)| stream.update(close, volume).expect("valid OBV bar"))
+            .collect();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn talib_obv_scalar_and_batch_are_bit_identical() {
+        let close = [f64::NAN, 10.0, 11.0, 10.0, 10.0];
+        let volume = [f64::NAN, 5.0, 7.0, 3.0, 9.0];
+        let expected = [f64::NAN, 5.0, 12.0, 9.0, 9.0];
+        let input = ObvInput::from_slices(&close, &volume, ObvParams);
+
+        let scalar = obv_with_kernel(&input, Kernel::Scalar).expect("scalar OBV");
+        let batch = obv_batch_slice(&close, &volume, Kernel::ScalarBatch).expect("batch OBV");
+
+        assert_eq!(scalar.values[0].is_nan(), expected[0].is_nan());
+        assert_eq!(batch.values[0].is_nan(), expected[0].is_nan());
+        for index in 1..expected.len() {
+            assert_eq!(scalar.values[index].to_bits(), expected[index].to_bits());
+            assert_eq!(batch.values[index].to_bits(), expected[index].to_bits());
+            assert_eq!(
+                batch.values[index].to_bits(),
+                scalar.values[index].to_bits()
+            );
+        }
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    #[test]
+    fn talib_obv_named_avx_routes_preserve_the_sequential_recurrence() {
+        let close = [10.0, 11.0, 10.0, 10.0];
+        let volume = [5.0, 7.0, 3.0, f64::INFINITY];
+        let expected = [5.0, 12.0, 9.0, 9.0];
+        let input = ObvInput::from_slices(&close, &volume, ObvParams);
+
+        for kernel in [Kernel::Avx2, Kernel::Avx512] {
+            let output = obv_with_kernel(&input, kernel).expect("named AVX OBV");
+            assert_eq!(output.values, expected);
+        }
+    }
+
     #[test]
     fn test_obv_into_matches_api() {
         let n = 256usize;
@@ -738,19 +746,19 @@ mod tests {
     }
     fn check_obv_csv_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close = source_type(&candles, "close");
         let volume = source_type(&candles, "volume");
         let input = ObvInput::from_candles(&candles, ObvParams::default());
         let obv_result = obv_with_kernel(&input, kernel)?;
         assert_eq!(obv_result.values.len(), close.len());
         let last_five_expected = [
-            -329661.6180239202,
-            -329767.87639284023,
-            -329889.94421654026,
-            -329801.35075036023,
-            -330218.2007503602,
+            -327518.33864076994,
+            -327624.59700968995,
+            -327746.66483339,
+            -327658.07136720995,
+            -328074.9213672099,
         ];
         let start_idx = obv_result.values.len() - 5;
         let result_tail = &obv_result.values[start_idx..];
@@ -796,8 +804,8 @@ mod tests {
     fn check_obv_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close = source_type(&candles, "close");
         let volume = source_type(&candles, "volume");
 
@@ -852,8 +860,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec!["Testing OBV batch with default configuration"];
 
@@ -959,8 +967,8 @@ mod tests {
 
                 prop_assert_eq!(
                     out[first_idx],
-                    0.0,
-                    "First valid OBV at index {} should be 0, got {}",
+                    volume[first_idx],
+                    "First valid OBV at index {} should equal first volume, got {}",
                     first_idx,
                     out[first_idx]
                 );
@@ -1026,8 +1034,8 @@ mod tests {
                     for i in first_idx..out.len() {
                         if !out[i].is_nan() {
                             prop_assert!(
-                                out[i].abs() < 1e-9,
-                                "OBV should remain at 0 for constant price, got {} at index {}",
+                                (out[i] - volume[first_idx]).abs() < 1e-9,
+                                "OBV should remain at first volume for constant price, got {} at index {}",
                                 out[i],
                                 i
                             );
@@ -1036,7 +1044,7 @@ mod tests {
                 }
 
                 if close.windows(2).all(|w| w[1] > w[0]) {
-                    let mut expected_obv = 0.0;
+                    let mut expected_obv = volume[first_idx];
                     for i in first_idx..out.len() {
                         if i > first_idx {
                             expected_obv += volume[i];
@@ -1052,7 +1060,7 @@ mod tests {
                 }
 
                 if close.windows(2).all(|w| w[1] < w[0]) {
-                    let mut expected_obv = 0.0;
+                    let mut expected_obv = volume[first_idx];
                     for i in first_idx..out.len() {
                         if i > first_idx {
                             expected_obv -= volume[i];
@@ -1137,16 +1145,7 @@ pub fn obv_into_slice(
         .position(|(c, v)| !c.is_nan() && !v.is_nan())
         .ok_or(ObvError::AllValuesNaN)?;
 
-    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-    let chosen = match kern {
-        Kernel::Auto => Kernel::Avx2,
-        other => other,
-    };
-    #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-    let chosen = match kern {
-        Kernel::Auto => Kernel::Scalar,
-        other => other,
-    };
+    let chosen = resolve_obv_kernel(kern);
 
     unsafe {
         match chosen {
@@ -1162,315 +1161,5 @@ pub fn obv_into_slice(
     for v in &mut dst[..first] {
         *v = f64::NAN;
     }
-    Ok(())
-}
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "obv")]
-#[pyo3(signature = (close, volume, kernel=None))]
-pub fn obv_py<'py>(
-    py: Python<'py>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let close_slice: &[f64];
-    let volume_slice: &[f64];
-    let owned_close;
-    let owned_volume;
-    close_slice = if let Ok(s) = close.as_slice() {
-        s
-    } else {
-        owned_close = close.to_owned_array();
-        owned_close.as_slice().unwrap()
-    };
-    volume_slice = if let Ok(s) = volume.as_slice() {
-        s
-    } else {
-        owned_volume = volume.to_owned_array();
-        owned_volume.as_slice().unwrap()
-    };
-    let kern = validate_kernel(kernel, false)?;
-
-    let input = ObvInput::from_slices(close_slice, volume_slice, ObvParams::default());
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| obv_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ObvStream")]
-pub struct ObvStreamPy {
-    stream: ObvStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ObvStreamPy {
-    #[new]
-    pub fn new() -> PyResult<Self> {
-        Ok(ObvStreamPy {
-            stream: ObvStream::new(),
-        })
-    }
-
-    pub fn update(&mut self, close: f64, volume: f64) -> Option<f64> {
-        self.stream.update(close, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "obv_batch")]
-#[pyo3(signature = (close, volume, kernel=None))]
-pub fn obv_batch_py<'py>(
-    py: Python<'py>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let close_slice: &[f64];
-    let volume_slice: &[f64];
-    let owned_close;
-    let owned_volume;
-    close_slice = if let Ok(s) = close.as_slice() {
-        s
-    } else {
-        owned_close = close.to_owned_array();
-        owned_close.as_slice().unwrap()
-    };
-    volume_slice = if let Ok(s) = volume.as_slice() {
-        s
-    } else {
-        owned_volume = volume.to_owned_array();
-        owned_volume.as_slice().unwrap()
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let rows: usize = 1;
-    let cols = close_slice.len();
-
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [expected], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        let kernel = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-
-        obv_batch_inner_into(close_slice, volume_slice, kernel, slice_out)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaObv;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "obv_cuda_batch_dev")]
-#[pyo3(signature = (close, volume, device_id=0))]
-pub fn obv_cuda_batch_dev_py(
-    py: Python<'_>,
-    close: PyReadonlyArray1<'_, f32>,
-    volume: PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    if close_slice.len() != volume_slice.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaObv::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.obv_batch_dev(close_slice, volume_slice)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dev = make_device_array_py(device_id, inner)?;
-    Ok(dev)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "obv_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (close_tm, volume_tm, cols, rows, device_id=0))]
-pub fn obv_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    close_tm: PyReadonlyArray1<'_, f32>,
-    volume_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let close_slice = close_tm.as_slice()?;
-    let volume_slice = volume_tm.as_slice()?;
-    let elems = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("cols*rows overflow"))?;
-    if close_slice.len() != volume_slice.len() || close_slice.len() != elems {
-        return Err(PyValueError::new_err("mismatched input sizes or dims"));
-    }
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaObv::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.obv_many_series_one_param_time_major_dev(close_slice, volume_slice, cols, rows)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dev = make_device_array_py(device_id, inner)?;
-    Ok(dev)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn obv_js(close: &[f64], volume: &[f64]) -> Result<Vec<f64>, JsValue> {
-    let mut output = vec![0.0; close.len()];
-
-    obv_into_slice(&mut output, close, volume, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn obv_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if close_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer passed to obv_into"));
-    }
-
-    unsafe {
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        if close_ptr == out_ptr || volume_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            obv_into_slice(&mut temp, close, volume, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            obv_into_slice(out, close, volume, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn obv_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn obv_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn obv_batch_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if close_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to obv_batch_into"));
-    }
-    unsafe {
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        obv_into_slice(out, close, volume, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(1)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ObvBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = obv_batch)]
-pub fn obv_batch_js(close: &[f64], volume: &[f64]) -> Result<JsValue, JsValue> {
-    let mut output = vec![0.0; close.len()];
-
-    obv_into_slice(&mut output, close, volume, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = ObvBatchJsOutput {
-        values: output,
-        rows: 1,
-        cols: close.len(),
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(feature = "python")]
-pub fn register_obv_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(obv_py, m)?)?;
-    m.add_function(wrap_pyfunction!(obv_batch_py, m)?)?;
     Ok(())
 }

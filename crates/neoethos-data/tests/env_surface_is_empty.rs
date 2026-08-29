@@ -120,7 +120,11 @@ fn no_production_env_reads_in_neoethos_data() {
         // Whole-file test modules. This crate declares them at the parent with
         // `#[cfg(all(test, ..))] mod device_tests;`, so the file itself carries
         // no marker to find — the convention is the name.
-        let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let name = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if name == "tests.rs" || name.ends_with("_tests.rs") {
             continue;
         }

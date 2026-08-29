@@ -12,9 +12,8 @@
 #[cfg(test)]
 mod ctrader_integration_tests {
     use crate::app_services::ctrader_data::{
-        CTraderChartHistoryRequest, CTraderSymbolInfo, CTraderSymbolLookupRequest,
-        load_historical_bars_only_with_transport,
-        parse_trendbars_response, resolve_symbol_with_transport,
+        CTraderSymbolInfo, CTraderSymbolLookupRequest, parse_trendbars_response,
+        resolve_symbol_with_transport,
     };
     use crate::app_services::ctrader_live_auth::{
         CTraderAccountDiscoveryRequest, CTraderEnvironment,
@@ -112,12 +111,6 @@ mod ctrader_integration_tests {
     fn symbol_by_id_ok(symbol_id: i64, digits: i32) -> String {
         format!(
             r#"{{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{{"symbol":[{{"symbolId":{symbol_id},"digits":{digits},"pipPosition":4,"tradingMode":0}}]}}}}"#
-        )
-    }
-
-    fn trendbars_ok(symbol_id: i64, period: &str) -> String {
-        format!(
-            r#"{{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{{"period":"{period}","symbolId":{symbol_id},"trendbar":[{{"volume":10,"low":110000,"deltaOpen":30,"deltaClose":80,"deltaHigh":150,"utcTimestampInMinutes":28500000}}],"hasMore":false}}}}"#
         )
     }
 
@@ -263,48 +256,6 @@ mod ctrader_integration_tests {
         .expect_err("bad credentials must fail");
 
         assert!(err.to_string().contains("INVALID_CLIENT"));
-    }
-
-    // ─── Historical bars fetch ──────────────────────────────────────────────
-
-    #[test]
-    fn bars_only_flow_sends_9_messages_and_returns_bar() {
-        // Each production send_sequence call opens a fresh WSS connection,
-        // so symbol list, symbol detail, and trendbars each authenticate.
-        let transport = SequenceTransport::with(vec![
-            Ok(app_auth_ok()),
-            Ok(account_auth_ok(712345)),
-            Ok(symbols_list_ok(712345, &[("EURUSD", 14)])),
-            Ok(app_auth_ok()),
-            Ok(account_auth_ok(712345)),
-            Ok(symbol_by_id_ok(14, 5)),
-            Ok(app_auth_ok()),
-            Ok(account_auth_ok(712345)),
-            Ok(trendbars_ok(14, "M15")),
-        ]);
-
-        let result = load_historical_bars_only_with_transport(
-            &transport,
-            &CTraderChartHistoryRequest {
-                client_id: "cid".into(),
-                client_secret: "csec".into(),
-                access_token: "tok".into(),
-                environment: CTraderEnvironment::Demo,
-                account_id: "712345".into(),
-                symbol_name: "EURUSD".into(),
-                timeframe: "M15".into(),
-                from_timestamp_ms: 1_709_000_000_000,
-                to_timestamp_ms: 1_710_000_000_000,
-                count: Some(96),
-            },
-        )
-        .expect("bars-only fetch should succeed");
-
-        assert_eq!(transport.sent_count(), 9);
-        assert_eq!(result.bars.len(), 1);
-        assert!(!result.has_more);
-        assert!((result.bars[0].low - 1.10000).abs() < 1e-9);
-        assert!((result.bars[0].close - 1.10080).abs() < 1e-9);
     }
 
     // ─── Account discovery flow ─────────────────────────────────────────────

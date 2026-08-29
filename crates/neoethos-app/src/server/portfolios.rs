@@ -40,7 +40,9 @@ fn find_artifacts(root: &Path) -> Vec<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for ent in rd.flatten() {
             visited += 1;
             if visited > 200_000 {
@@ -83,13 +85,21 @@ fn read_entry(p: &Path) -> PortfolioEntry {
     }
 
     let path = std::fs::canonicalize(p)
-        .map(|c| c.display().to_string().trim_start_matches(r"\\?\").to_string())
+        .map(|c| {
+            c.display()
+                .to_string()
+                .trim_start_matches(r"\\?\")
+                .to_string()
+        })
         .unwrap_or_else(|_| p.display().to_string());
     let blacklisted = crate::app_services::strategy_blacklist::is_blacklisted(&path);
 
     PortfolioEntry {
         path,
-        file_name: p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+        file_name: p
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default(),
         symbol,
         base_tf,
         gene_count,
@@ -103,7 +113,13 @@ pub async fn list(State(state): State<AppApiState>) -> Json<PortfoliosDto> {
     let cache_dir = Settings::from_yaml(state.config_path())
         .map(|s| s.system.cache_dir)
         .unwrap_or_else(|_| PathBuf::from("cache"));
-    let mut portfolios: Vec<PortfolioEntry> = find_artifacts(&cache_dir).iter().map(|p| read_entry(p)).collect();
+    let mut portfolios: Vec<PortfolioEntry> = find_artifacts(&cache_dir)
+        .iter()
+        .map(|p| read_entry(p))
+        .collect();
     portfolios.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
-    Json(PortfoliosDto { count: portfolios.len(), portfolios })
+    Json(PortfoliosDto {
+        count: portfolios.len(),
+        portfolios,
+    })
 }

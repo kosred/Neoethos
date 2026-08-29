@@ -1,27 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -42,10 +24,6 @@ pub struct LrsiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct LrsiParams {
     pub alpha: Option<f64>,
 }
@@ -166,7 +144,6 @@ pub fn lrsi(input: &LrsiInput) -> Result<LrsiOutput, LrsiError> {
     lrsi_with_kernel(input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn lrsi_into(input: &LrsiInput, out: &mut [f64]) -> Result<(), LrsiError> {
     lrsi_into_slice(out, input, Kernel::Auto)
@@ -322,30 +299,6 @@ pub fn lrsi_into_slice(dst: &mut [f64], input: &LrsiInput, kern: Kernel) -> Resu
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lrsi_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    alpha: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = lrsi_js(high, low, alpha)?;
-    crate::write_wasm_f64_output("lrsi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lrsi_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = lrsi_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs("lrsi_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests_into_api {
     use super::*;
@@ -375,13 +328,8 @@ mod tests_into_api {
         let base = lrsi(&input)?.values;
 
         let mut out = vec![0.0f64; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             lrsi_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            lrsi_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(base.len(), out.len());
@@ -939,175 +887,16 @@ unsafe fn lrsi_row_avx512_long(price: &[f64], first: usize, alpha: f64, out: &mu
     lrsi_scalar(price, alpha, first, out)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lrsi_js(high: &[f64], low: &[f64], alpha: f64) -> Result<Vec<f64>, JsValue> {
-    let params = LrsiParams { alpha: Some(alpha) };
-    let input = LrsiInput::from_slices(high, low, params);
-
-    let mut output = vec![0.0; high.len()];
-    lrsi_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LrsiBatchConfig {
-    pub alpha_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LrsiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<LrsiParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = lrsi_batch)]
-pub fn lrsi_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: LrsiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = LrsiBatchRange {
-        alpha: config.alpha_range,
-    };
-    let result = lrsi_batch_with_kernel(high, low, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let output = LrsiBatchJsOutput {
-        values: result.values,
-        combos: result.combos,
-        rows: result.rows,
-        cols: result.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lrsi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lrsi_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lrsi_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    alpha: f64,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to lrsi_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let params = LrsiParams { alpha: Some(alpha) };
-        let input = LrsiInput::from_slices(high, low, params);
-
-        if high_ptr == out_ptr || low_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            lrsi_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            lrsi_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lrsi_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    alpha_start: f64,
-    alpha_end: f64,
-    alpha_step: f64,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to lrsi_batch_into"));
-    }
-
-    if !(0.0 < alpha_start && alpha_start <= 1.0) {
-        return Err(JsValue::from_str(&format!(
-            "Invalid alpha_start: {}",
-            alpha_start
-        )));
-    }
-    if !(0.0 < alpha_end && alpha_end <= 1.0) {
-        return Err(JsValue::from_str(&format!(
-            "Invalid alpha_end: {}",
-            alpha_end
-        )));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let sweep = LrsiBatchRange {
-            alpha: (alpha_start, alpha_end, alpha_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in lrsi_batch"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let row_kernel = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-        lrsi_batch_inner_into(high, low, &sweep, row_kernel, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_lrsi_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = LrsiParams { alpha: None };
         let input = LrsiInput::from_candles(&candles, default_params);
         let output = lrsi_with_kernel(&input, kernel)?;
@@ -1117,8 +906,8 @@ mod tests {
 
     fn check_lrsi_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = LrsiInput::from_candles(&candles, LrsiParams::default());
         let lrsi_result = lrsi_with_kernel(&input, kernel)?;
         assert_eq!(lrsi_result.values.len(), candles.close.len());
@@ -1140,8 +929,8 @@ mod tests {
 
     fn check_lrsi_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = LrsiInput::with_default_candles(&candles);
         let output = lrsi_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -1197,8 +986,8 @@ mod tests {
 
     fn check_lrsi_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let high = candles.select_candle_field("high").unwrap();
         let low = candles.select_candle_field("low").unwrap();
 
@@ -1236,8 +1025,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_lrsi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let len = candles.close.len();
         let mut high = AVec::<f64>::with_capacity(CACHELINE_ALIGN, len);
@@ -1731,8 +1520,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = LrsiBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -1755,8 +1544,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let slice_end = c.close.len().min(1000);
         let high_slice = &c.high[..slice_end];
@@ -1962,164 +1751,4 @@ fn lrsi_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "lrsi")]
-#[pyo3(signature = (high, low, alpha, kernel=None))]
-pub fn lrsi_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    alpha: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = LrsiParams { alpha: Some(alpha) };
-    let inp = LrsiInput::from_slices(h, l, params);
-
-    let vec_out: Vec<f64> = py
-        .allow_threads(|| lrsi_with_kernel(&inp, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(vec_out.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "LrsiStream")]
-pub struct LrsiStreamPy {
-    stream: LrsiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl LrsiStreamPy {
-    #[new]
-    fn new(alpha: f64) -> PyResult<Self> {
-        let params = LrsiParams { alpha: Some(alpha) };
-        let stream =
-            LrsiStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(LrsiStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
-        let price = (high + low) / 2.0;
-        self.stream.update(price)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "lrsi_batch")]
-#[pyo3(signature = (high, low, alpha_range, kernel=None))]
-pub fn lrsi_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    alpha_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let sweep = LrsiBatchRange { alpha: alpha_range };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = h.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let resolved = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        let row_kernel = match resolved {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => unreachable!(),
-        };
-        lrsi_batch_inner_into(h, l, &sweep, row_kernel, true, out_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "alphas",
-        combos
-            .iter()
-            .map(|p| p.alpha.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "lrsi_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, alpha_range, device_id=0))]
-pub fn lrsi_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    alpha_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::CudaLrsi;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-    let sweep = LrsiBatchRange { alpha: alpha_range };
-    let inner = py.allow_threads(|| {
-        let mut cuda =
-            CudaLrsi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.lrsi_batch_dev(h, l, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "lrsi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, alpha, device_id=0))]
-pub fn lrsi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    alpha: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::CudaLrsi;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let rows = high_tm_f32.shape()[0];
-    let cols = high_tm_f32.shape()[1];
-    if low_tm_f32.shape() != [rows, cols] {
-        return Err(PyValueError::new_err("mismatched matrix shapes"));
-    }
-    let inner = py.allow_threads(|| {
-        let mut cuda =
-            CudaLrsi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.lrsi_many_series_one_param_time_major_dev(h, l, cols, rows, alpha)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
 }

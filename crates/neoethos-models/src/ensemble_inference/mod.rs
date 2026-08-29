@@ -83,7 +83,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use polars::prelude::DataFrame;
+use neoethos_data::{FeatureCellValidity, FeatureFrame};
+use neoethos_execution_budget::CpuLease;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::capabilities::ModelFamily;
@@ -302,11 +303,34 @@ pub fn expert_role(name: &str) -> Option<ExpertRole> {
         // every other classifier here. `swarm_forecaster` joined the
         // same day (D1.2.8): a modest forecast-lean voter on the LAST
         // row only, neutral abstain elsewhere (see `swarm_adapter`).
-        "lightgbm" | "xgboost" | "xgboost_rf" | "xgboost_dart" | "catboost" | "catboost_alt"
-        | "sklears_tree" | "mlp" | "kan" | "tabnet" | "nbeats" | "nbeatsx_nf" | "tide"
-        | "tide_nf" | "transformer" | "patchtst" | "timesnet" | "elasticnet" | "logistic"
-        | "bayes_logit" | "meta_blender" | "probability_calibrator" | "conformal_gate"
-        | "meta_stack" | "online_pa" | "online_hoeffding" | "neat" | "neuro_evo"
+        "lightgbm"
+        | "xgboost"
+        | "xgboost_rf"
+        | "xgboost_dart"
+        | "catboost"
+        | "catboost_alt"
+        | "sklears_tree"
+        | "mlp"
+        | "kan"
+        | "tabnet"
+        | "nbeats"
+        | "nbeatsx_nf"
+        | "tide"
+        | "tide_nf"
+        | "transformer"
+        | "patchtst"
+        | "timesnet"
+        | "elasticnet"
+        | "logistic"
+        | "bayes_logit"
+        | "meta_blender"
+        | "probability_calibrator"
+        | "conformal_gate"
+        | "meta_stack"
+        | "online_pa"
+        | "online_hoeffding"
+        | "neat"
+        | "neuro_evo"
         | "swarm_forecaster" => Some(ExpertRole::Direction),
         _ => None,
     }
@@ -321,23 +345,32 @@ pub fn expert_role(name: &str) -> Option<ExpertRole> {
 pub struct EnsembleDecision {
     /// `[p_neutral, p_buy, p_sell]` from the directional voters only
     /// (hmm_regime / isolation_forest removed from this vote).
-    pub dir_probs: [f32; 3],
+    pub dir_probs: [f64; 3],
     /// Regime gate g ∈ [0,1] from `hmm_regime` (1.0 when absent — never a
     /// veto-by-accident on missing data).
-    pub regime_gate: f32,
+    pub regime_gate: f64,
     /// Anomaly scale s ∈ [0,1] from `isolation_forest` (1.0 when absent;
     /// 0.0 = hard veto on an extreme anomaly).
-    pub anomaly_scale: f32,
+    pub anomaly_scale: f64,
+    /// Explicit row validity. Invalid rows carry NaN numeric payloads and
+    /// cannot be thresholded, ranked, or converted into a trade.
+    pub validity: FeatureCellValidity,
 }
 
 impl EnsembleDecision {
-    /// Neutral decision (no directional lean, no gate, no veto) — used for
-    /// warmup/NaN rows where the ensemble abstains.
-    pub fn neutral() -> Self {
+    /// Construct an explicitly ineligible decision. This is deliberately not
+    /// a numeric neutral vote: warmup/gap rows must remain distinguishable
+    /// from a valid mathematical probability.
+    pub fn invalid(reason: FeatureCellValidity) -> Self {
+        assert!(
+            !reason.is_valid(),
+            "invalid decision requires an invalidity reason"
+        );
         Self {
-            dir_probs: [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
-            regime_gate: 1.0,
-            anomaly_scale: 1.0,
+            dir_probs: [f64::NAN; 3],
+            regime_gate: f64::NAN,
+            anomaly_scale: f64::NAN,
+            validity: reason,
         }
     }
 }
@@ -347,7 +380,7 @@ impl EnsembleDecision {
 /// `g = (p_buy + p_sell) * posterior_mass_on_the_voted_side` ∈ [0,1].
 /// A range regime (p_range→1) or a posterior disagreeing with the vote → g→0
 /// (shrink/veto); an agreeing trend → g→1.
-pub fn regime_gate_from_posterior(dir_probs: [f32; 3], posterior: [f32; 3]) -> f32 {
+pub fn regime_gate_from_posterior(dir_probs: [f64; 3], posterior: [f64; 3]) -> f64 {
     // Direction the vote picked: buy (col1) vs sell (col2); neutral lean -> no
     // gate amplification basis, fall back to (1 - p_range).
     let trend_mass = (posterior[1] + posterior[2]).clamp(0.0, 1.0);
@@ -362,7 +395,7 @@ pub fn regime_gate_from_posterior(dir_probs: [f32; 3], posterior: [f32; 3]) -> f
 /// Pure anomaly-scale math: map a raw anomaly score `a` ∈ [0,1] to a confidence
 /// multiplier ∈ [0,1]. Below `lo` → 1.0 (no penalty); ramps down linearly to
 /// `hi`; at/above `hi` → 0.0 (hard veto).
-pub fn anomaly_scale_from_score(a: f32, lo: f32, hi: f32) -> f32 {
+pub fn anomaly_scale_from_score(a: f64, lo: f64, hi: f64) -> f64 {
     if !(a.is_finite()) {
         return 1.0;
     }
@@ -388,10 +421,37 @@ pub struct ExpertPrediction {
     /// `[0, 1]` summing to ~1.0 (the validator tolerates a small
     /// rounding slack). For `ActionValues3` arbitrary reals. For
     /// `Forecast1` arbitrary reals. For `AnomalyScore` `[0.0, 1.0]`.
-    pub values: Vec<f32>,
+    pub values: Vec<f64>,
+    /// Whether this row is eligible to enter aggregation. Invalid rows must
+    /// carry NaN payloads and are propagated as abstentions, never as zeros or
+    /// uniform probabilities.
+    pub validity: FeatureCellValidity,
 }
 
 impl ExpertPrediction {
+    pub fn valid(kind: ExpertOutputKind, values: Vec<f64>) -> Result<Self> {
+        let prediction = Self {
+            kind,
+            values,
+            validity: FeatureCellValidity::Valid,
+        };
+        prediction.validate()?;
+        Ok(prediction)
+    }
+
+    pub fn invalid(kind: ExpertOutputKind, reason: FeatureCellValidity) -> Result<Self> {
+        if reason.is_valid() {
+            anyhow::bail!("invalid prediction requires an explicit invalidity reason");
+        }
+        let prediction = Self {
+            kind,
+            values: vec![f64::NAN; kind.expected_length()],
+            validity: reason,
+        };
+        prediction.validate()?;
+        Ok(prediction)
+    }
+
     /// Sanity-check that the values length and ranges match
     /// `kind`. Aggregators MUST call this before combining;
     /// `MockExpert` does call it in tests so a future trait impl
@@ -405,6 +465,15 @@ impl ExpertPrediction {
                 expected,
                 self.values.len()
             );
+        }
+        if !self.validity.is_valid() {
+            if self.values.iter().any(|value| !value.is_nan()) {
+                anyhow::bail!(
+                    "invalid ExpertPrediction ({}) must carry only NaN payloads",
+                    self.validity.as_str()
+                );
+            }
+            return Ok(());
         }
         for v in &self.values {
             if !v.is_finite() {
@@ -425,7 +494,7 @@ impl ExpertPrediction {
                         anyhow::bail!("{:?} probability out of [0, 1]: {}", self.kind, v);
                     }
                 }
-                let sum: f32 = self.values.iter().sum();
+                let sum: f64 = self.values.iter().sum();
                 if (sum - 1.0).abs() > 1e-2 {
                     anyhow::bail!(
                         "{:?} probabilities do not sum to 1.0: sum = {}",
@@ -470,7 +539,7 @@ impl ExpertPrediction {
 ///   violations surface at unit-test time, not at the broker fill
 ///   path.
 /// - **`feature_columns`** returns the columns the expert was
-///   trained on, in the order it expects them in the DataFrame.
+///   trained on, in the order it expects them in the feature frame.
 ///   The registry can use this to detect column-layout drift after
 ///   a retraining session.
 pub trait ExpertModel: Send + Sync {
@@ -481,12 +550,41 @@ pub trait ExpertModel: Send + Sync {
     /// What kind of native output this expert produces.
     fn output_kind(&self) -> ExpertOutputKind;
     /// Column names this expert was trained on, in the order it
-    /// expects them in the input DataFrame.
+    /// expects them in the input feature frame.
     fn feature_columns(&self) -> &[String];
     /// Run inference. Returns one [`ExpertPrediction`] per row of
-    /// `df`. Implementations must validate via
+    /// `frame`. Implementations must validate via
     /// [`ExpertPrediction::validate`] before returning.
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>>;
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>>;
+}
+
+/// Build a zero-copy logical projection in the exact order recorded by one
+/// expert artifact. Different experts may legitimately use different subsets;
+/// forcing one shared column list made those experts impossible to connect.
+pub(super) fn project_expert_frame(
+    frame: &FeatureFrame,
+    expected: &[String],
+    expert_name: &str,
+) -> Result<FeatureFrame> {
+    if expected.is_empty() {
+        anyhow::bail!(
+            "expert '{expert_name}' has no recorded feature columns; refusing an unbound input"
+        );
+    }
+    let mut indices = Vec::with_capacity(expected.len());
+    for name in expected {
+        let index = frame
+            .names
+            .iter()
+            .position(|candidate| candidate == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "feature '{name}' required by expert '{expert_name}' is absent from the shared frame"
+                )
+            })?;
+        indices.push(index);
+    }
+    frame.select_columns(&indices)
 }
 
 // ---------------------------------------------------------------------------
@@ -840,8 +938,7 @@ impl ExpertRegistry {
                             .and_then(|n| n.to_str())
                             .and_then(|n| n.strip_prefix(&format!("{name}_")))
                             .is_some_and(|suffix| {
-                                !suffix.is_empty()
-                                    && suffix.chars().all(|c| c.is_ascii_digit())
+                                !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
                             })
                 })
                 .collect();
@@ -996,7 +1093,11 @@ const MAX_SAC_FINAL_ALPHA: f64 = 1_000.0;
 /// `load_with_partial` is a lower-level primitive used by tests and is left
 /// unscreened deliberately, so a test can assert on an unfiltered outcome.
 fn numeric_sanity_screen(root: &Path, outcome: &mut ExpertLoadOutcome) {
-    let names: Vec<String> = outcome.loaded.iter().map(|e| e.name().to_string()).collect();
+    let names: Vec<String> = outcome
+        .loaded
+        .iter()
+        .map(|e| e.name().to_string())
+        .collect();
 
     // Collect what each artifact recorded about its own training.
     let mut losses: Vec<(String, f64)> = Vec::new();
@@ -1160,8 +1261,8 @@ impl ExpertModel for RenamedExpert {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
-        self.inner.predict(df)
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        self.inner.predict(frame, lease)
     }
 }
 
@@ -1178,8 +1279,8 @@ impl Default for ExpertRegistry {
 /// Load-reporting contract over a set of loaded experts.
 ///
 /// **2026-08-09 (batch D4): this trait no longer produces predictions.** It
-/// used to require `fn predict(&self, df) -> Array2<f32>`, a flat
-/// `[p_neutral, p_buy, p_sell]` average over every Classification3 expert.
+/// used to expose a flat `[p_neutral, p_buy, p_sell]` average over every
+/// Classification3 expert.
 /// That method had exactly one implementation and zero production callers —
 /// the live loop and the replay loop both call
 /// [`super::soft_voting::SoftVotingEnsemble::predict_with_roles`], which
@@ -1211,10 +1312,32 @@ pub trait EnsemblePredictor: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polars::prelude::*;
+    use neoethos_data::FeatureColumnF64;
+    use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sample_frame(rows: usize) -> FeatureFrame {
+        let column = FeatureColumnF64::new(
+            "f1",
+            (0..rows).map(|row| row as f64 + 1.0).collect(),
+            vec![FeatureCellValidity::Valid; rows],
+        )
+        .expect("valid test feature");
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            vec![column],
+        )
+        .expect("valid test frame")
+    }
+
+    fn one_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("test lease")
+    }
 
     // -- ExpertPrediction validate ---------------------------------------
 
@@ -1223,6 +1346,7 @@ mod tests {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::Classification3,
             values: vec![0.2, 0.5, 0.3],
+            validity: FeatureCellValidity::Valid,
         };
         assert!(pred.validate().is_ok());
     }
@@ -1232,6 +1356,7 @@ mod tests {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::Classification3,
             values: vec![0.5, 0.5],
+            validity: FeatureCellValidity::Valid,
         };
         let err = pred.validate().expect_err("must reject");
         assert!(err.to_string().contains("expects 3 values"));
@@ -1241,7 +1366,8 @@ mod tests {
     fn classification3_rejects_non_finite() {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::Classification3,
-            values: vec![0.5, f32::NAN, 0.5],
+            values: vec![0.5, f64::NAN, 0.5],
+            validity: FeatureCellValidity::Valid,
         };
         assert!(pred.validate().is_err());
     }
@@ -1251,6 +1377,7 @@ mod tests {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::Classification3,
             values: vec![-0.1, 0.5, 0.6],
+            validity: FeatureCellValidity::Valid,
         };
         assert!(pred.validate().is_err());
     }
@@ -1260,6 +1387,7 @@ mod tests {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::Classification3,
             values: vec![0.5, 0.5, 0.5], // sums to 1.5
+            validity: FeatureCellValidity::Valid,
         };
         assert!(pred.validate().is_err());
     }
@@ -1269,6 +1397,7 @@ mod tests {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::AnomalyScore,
             values: vec![0.42],
+            validity: FeatureCellValidity::Valid,
         };
         assert!(pred.validate().is_ok());
     }
@@ -1278,6 +1407,7 @@ mod tests {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::AnomalyScore,
             values: vec![1.5],
+            validity: FeatureCellValidity::Valid,
         };
         assert!(pred.validate().is_err());
     }
@@ -1287,6 +1417,7 @@ mod tests {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::Forecast1,
             values: vec![-12.5],
+            validity: FeatureCellValidity::Valid,
         };
         assert!(pred.validate().is_ok());
     }
@@ -1296,6 +1427,7 @@ mod tests {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::ActionValues3,
             values: vec![-1.5, 3.7, 0.0],
+            validity: FeatureCellValidity::Valid,
         };
         assert!(pred.validate().is_ok());
     }
@@ -1315,7 +1447,7 @@ mod tests {
     struct MockExpert {
         name: String,
         feature_columns: Vec<String>,
-        constant_probs: [f32; 3],
+        constant_probs: [f64; 3],
     }
 
     impl ExpertModel for MockExpert {
@@ -1331,12 +1463,17 @@ mod tests {
         fn feature_columns(&self) -> &[String] {
             &self.feature_columns
         }
-        fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
-            let n = df.height();
+        fn predict(
+            &self,
+            frame: &FeatureFrame,
+            _lease: &CpuLease,
+        ) -> Result<Vec<ExpertPrediction>> {
+            let n = frame.n_samples();
             let out: Vec<ExpertPrediction> = (0..n)
                 .map(|_| ExpertPrediction {
                     kind: ExpertOutputKind::Classification3,
                     values: self.constant_probs.to_vec(),
+                    validity: FeatureCellValidity::Valid,
                 })
                 .collect();
             for p in &out {
@@ -1481,7 +1618,10 @@ mod tests {
         for (n, _) in healthy {
             assert!(kept.contains(&n), "healthy peer {n} must keep voting");
         }
-        assert!(kept.contains(&"lightgbm"), "unscreened artifact must survive");
+        assert!(
+            kept.contains(&"lightgbm"),
+            "unscreened artifact must survive"
+        );
         for bad in ["tide", "tide_nf", "sac"] {
             assert!(!kept.contains(&bad), "{bad} must be refused");
             assert!(
@@ -1757,8 +1897,8 @@ mod tests {
             feature_columns: vec!["f1".to_string()],
             constant_probs: [0.2, 0.5, 0.3],
         };
-        let df = df!("f1" => &[1.0_f32, 2.0, 3.0]).expect("df");
-        let preds = exp.predict(&df).expect("predict");
+        let frame = sample_frame(3);
+        let preds = exp.predict(&frame, &one_worker_lease()).expect("predict");
         assert_eq!(preds.len(), 3);
         for p in &preds {
             assert_eq!(p.kind, ExpertOutputKind::Classification3);

@@ -1,16 +1,4 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyUntypedArrayMethods};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::moving_averages::sma::{sma_with_kernel, SmaInput, SmaParams};
+use crate::indicators::moving_averages::sma::{SmaInput, SmaParams, sma_with_kernel};
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{alloc_with_nan_prefix, detect_best_kernel};
@@ -36,10 +24,6 @@ pub struct TtmSqueezeOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TtmSqueezeParams {
     pub length: Option<usize>,
     pub bb_mult: Option<f64>,
@@ -982,11 +966,7 @@ impl TtmSqueezeStream {
                 let hc = (high - pc).abs();
                 let lc = (low - pc).abs();
                 if hl >= hc {
-                    if hl >= lc {
-                        hl
-                    } else {
-                        lc
-                    }
+                    if hl >= lc { hl } else { lc }
                 } else if hc >= lc {
                     hc
                 } else {
@@ -1187,17 +1167,9 @@ pub unsafe fn ttm_squeeze_scalar_classic(
                 let hc = (*high.get_unchecked(i) - pc).abs();
                 let lc = (*low.get_unchecked(i) - pc).abs();
                 if hl >= hc {
-                    if hl >= lc {
-                        hl
-                    } else {
-                        lc
-                    }
+                    if hl >= lc { hl } else { lc }
                 } else {
-                    if hc >= lc {
-                        hc
-                    } else {
-                        lc
-                    }
+                    if hc >= lc { hc } else { lc }
                 }
             };
             *trbuf.get_unchecked_mut(trpos) = tr_val;
@@ -1404,359 +1376,6 @@ pub unsafe fn ttm_squeeze_scalar_classic(
     }
 
     Ok(())
-}
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ttm_squeeze")]
-#[pyo3(signature = (high, low, close, length=20, bb_mult=2.0, kc_mult_high=1.0, kc_mult_mid=1.5, kc_mult_low=2.0, kernel=None))]
-pub fn ttm_squeeze_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    length: usize,
-    bb_mult: f64,
-    kc_mult_high: f64,
-    kc_mult_mid: f64,
-    kc_mult_low: f64,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    if h.len() != l.len() || l.len() != c.len() {
-        return Err(PyValueError::new_err(format!(
-            "ttm_squeeze: Inconsistent slice lengths - high={}, low={}, close={}",
-            h.len(),
-            l.len(),
-            c.len()
-        )));
-    }
-
-    let params = TtmSqueezeParams {
-        length: Some(length),
-        bb_mult: Some(bb_mult),
-        kc_mult_high: Some(kc_mult_high),
-        kc_mult_mid: Some(kc_mult_mid),
-        kc_mult_low: Some(kc_mult_low),
-    };
-
-    let input = TtmSqueezeInput::from_slices(h, l, c, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    let mut momentum = vec![f64::NAN; c.len()];
-    let mut squeeze = vec![f64::NAN; c.len()];
-
-    py.allow_threads(|| ttm_squeeze_into_slices(&mut momentum, &mut squeeze, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((momentum.into_pyarray(py), squeeze.into_pyarray(py)))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaTtmSqueeze};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyReadonlyArray1;
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ttm_squeeze_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, length_range, bb_mult_range, kc_high_range, kc_mid_range, kc_low_range, device_id=0))]
-pub fn ttm_squeeze_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: PyReadonlyArray1<'_, f32>,
-    low_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    length_range: (usize, usize, usize),
-    bb_mult_range: (f64, f64, f64),
-    kc_high_range: (f64, f64, f64),
-    kc_mid_range: (f64, f64, f64),
-    kc_low_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = TtmSqueezeBatchRange {
-        length: length_range,
-        bb_mult: bb_mult_range,
-        kc_high: kc_high_range,
-        kc_mid: kc_mid_range,
-        kc_low: kc_low_range,
-    };
-    let (mo, sq, ctx, dev_id_u32) = py.allow_threads(|| {
-        let cuda =
-            CudaTtmSqueeze::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id_u32 = cuda.device_id();
-        match cuda.ttm_squeeze_batch_dev(h, l, c, &sweep) {
-            Ok((mo, sq)) => Ok((mo, sq, ctx, dev_id_u32)),
-            Err(e) => Err(PyValueError::new_err(e.to_string())),
-        }
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: mo,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id_u32),
-        },
-        DeviceArrayF32Py {
-            inner: sq,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id_u32),
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ttm_squeeze_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, length, bb_mult, kc_high, kc_mid, kc_low, device_id=0))]
-pub fn ttm_squeeze_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: PyReadonlyArray1<'_, f32>,
-    low_tm_f32: PyReadonlyArray1<'_, f32>,
-    close_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    length: usize,
-    bb_mult: f32,
-    kc_high: f32,
-    kc_mid: f32,
-    kc_low: f32,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let (mo, sq, ctx, dev_id_u32) = py.allow_threads(|| {
-        let cuda =
-            CudaTtmSqueeze::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id_u32 = cuda.device_id();
-        match cuda.ttm_squeeze_many_series_one_param_time_major_dev(
-            h, l, c, cols, rows, length, bb_mult, kc_high, kc_mid, kc_low,
-        ) {
-            Ok((mo, sq)) => Ok((mo, sq, ctx, dev_id_u32)),
-            Err(e) => Err(PyValueError::new_err(e.to_string())),
-        }
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: mo,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id_u32),
-        },
-        DeviceArrayF32Py {
-            inner: sq,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id_u32),
-        },
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "TtmSqueezeStream")]
-pub struct TtmSqueezeStreamPy {
-    stream: TtmSqueezeStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl TtmSqueezeStreamPy {
-    #[new]
-    fn new(
-        length: usize,
-        bb_mult: f64,
-        kc_mult_high: f64,
-        kc_mult_mid: f64,
-        kc_mult_low: f64,
-    ) -> PyResult<Self> {
-        let params = TtmSqueezeParams {
-            length: Some(length),
-            bb_mult: Some(bb_mult),
-            kc_mult_high: Some(kc_mult_high),
-            kc_mult_mid: Some(kc_mult_mid),
-            kc_mult_low: Some(kc_mult_low),
-        };
-        Ok(Self {
-            stream: TtmSqueezeStream::try_new(params)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TtmSqueezeJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ttm_squeeze)]
-pub fn ttm_squeeze_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    bb_mult: f64,
-    kc_mult_high: f64,
-    kc_mult_mid: f64,
-    kc_mult_low: f64,
-) -> Result<JsValue, JsValue> {
-    let params = TtmSqueezeParams {
-        length: Some(length),
-        bb_mult: Some(bb_mult),
-        kc_mult_high: Some(kc_mult_high),
-        kc_mult_mid: Some(kc_mult_mid),
-        kc_mult_low: Some(kc_mult_low),
-    };
-
-    let input = TtmSqueezeInput::from_slices(high, low, close, params);
-
-    let result = ttm_squeeze(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let cols = result.momentum.len();
-    let mut values = Vec::with_capacity(2 * cols);
-    values.extend_from_slice(&result.momentum);
-    values.extend_from_slice(&result.squeeze);
-
-    let js_result = TtmSqueezeJsResult {
-        values,
-        rows: 2,
-        cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_result)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ttm_squeeze_into)]
-pub fn ttm_squeeze_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    bb_mult: f64,
-    kc_mult_high: f64,
-    kc_mult_mid: f64,
-    kc_mult_low: f64,
-    out_momentum: &mut [f64],
-    out_squeeze: &mut [f64],
-) -> Result<(), JsValue> {
-    if high.len() != low.len() || low.len() != close.len() {
-        return Err(JsValue::from_str("slice length mismatch"));
-    }
-    if out_momentum.len() != close.len() || out_squeeze.len() != close.len() {
-        return Err(JsValue::from_str("output length mismatch"));
-    }
-
-    let params = TtmSqueezeParams {
-        length: Some(length),
-        bb_mult: Some(bb_mult),
-        kc_mult_high: Some(kc_mult_high),
-        kc_mult_mid: Some(kc_mult_mid),
-        kc_mult_low: Some(kc_mult_low),
-    };
-
-    let input = TtmSqueezeInput::from_slices(high, low, close, params);
-
-    ttm_squeeze_into_slices(out_momentum, out_squeeze, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_squeeze_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    core::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_squeeze_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ttm_squeeze_into_ptrs)]
-pub fn ttm_squeeze_into_js_ptrs(
-    high: *const f64,
-    low: *const f64,
-    close: *const f64,
-    out_momentum: *mut f64,
-    out_squeeze: *mut f64,
-    len: usize,
-    length: usize,
-    bb_mult: f64,
-    kc_high: f64,
-    kc_mid: f64,
-    kc_low: f64,
-) -> Result<(), JsValue> {
-    if high.is_null()
-        || low.is_null()
-        || close.is_null()
-        || out_momentum.is_null()
-        || out_squeeze.is_null()
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    if len == 0 {
-        return Err(JsValue::from_str("ttm_squeeze: Input data slice is empty."));
-    }
-
-    if length == 0 || length > len {
-        return Err(JsValue::from_str(&format!(
-            "ttm_squeeze: Invalid period: period = {}, data length = {}",
-            length, len
-        )));
-    }
-
-    unsafe {
-        let h = core::slice::from_raw_parts(high, len);
-        let l = core::slice::from_raw_parts(low, len);
-        let c = core::slice::from_raw_parts(close, len);
-
-        let params = TtmSqueezeParams {
-            length: Some(length),
-            bb_mult: Some(bb_mult),
-            kc_mult_high: Some(kc_high),
-            kc_mult_mid: Some(kc_mid),
-            kc_mult_low: Some(kc_low),
-        };
-
-        let input = TtmSqueezeInput::from_slices(h, l, c, params);
-        let out = ttm_squeeze(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let dst_momentum = core::slice::from_raw_parts_mut(out_momentum, len);
-        let dst_squeeze = core::slice::from_raw_parts_mut(out_squeeze, len);
-        dst_momentum.copy_from_slice(&out.momentum);
-        dst_squeeze.copy_from_slice(&out.squeeze);
-
-        Ok(())
-    }
 }
 
 use crate::utilities::helpers::{
@@ -2413,200 +2032,10 @@ pub fn ttm_squeeze_batch_with_kernel(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ttm_squeeze_batch")]
-#[pyo3(signature = (high, low, close, length_range, bb_mult_range, kc_high_range, kc_mid_range, kc_low_range, kernel=None))]
-pub fn ttm_squeeze_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    bb_mult_range: (f64, f64, f64),
-    kc_high_range: (f64, f64, f64),
-    kc_mid_range: (f64, f64, f64),
-    kc_low_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let sweep = TtmSqueezeBatchRange {
-        length: length_range,
-        bb_mult: bb_mult_range,
-        kc_high: kc_high_range,
-        kc_mid: kc_mid_range,
-        kc_low: kc_low_range,
-    };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let out = py
-        .allow_threads(|| ttm_squeeze_batch_with_kernel(h, l, c, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-    let dict = pyo3::types::PyDict::new(py);
-
-    let mom = unsafe { PyArray1::<f64>::from_vec(py, out.momentum).reshape((rows, cols))? };
-    let sqz = unsafe { PyArray1::<f64>::from_vec(py, out.squeeze).reshape((rows, cols))? };
-
-    dict.set_item("momentum", mom)?;
-    dict.set_item("squeeze", sqz)?;
-    dict.set_item(
-        "lengths",
-        out.combos
-            .iter()
-            .map(|p| p.length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "bb_mults",
-        out.combos
-            .iter()
-            .map(|p| p.bb_mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "kc_highs",
-        out.combos
-            .iter()
-            .map(|p| p.kc_mult_high.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "kc_mids",
-        out.combos
-            .iter()
-            .map(|p| p.kc_mult_mid.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "kc_lows",
-        out.combos
-            .iter()
-            .map(|p| p.kc_mult_low.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TtmSqueezeBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub bb_mult_range: (f64, f64, f64),
-    pub kc_high_range: (f64, f64, f64),
-    pub kc_mid_range: (f64, f64, f64),
-    pub kc_low_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TtmSqueezeBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub combos: Vec<TtmSqueezeParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ttm_squeeze_batch")]
-pub fn ttm_squeeze_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: TtmSqueezeBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = TtmSqueezeBatchRange {
-        length: cfg.length_range,
-        bb_mult: cfg.bb_mult_range,
-        kc_high: cfg.kc_high_range,
-        kc_mid: cfg.kc_mid_range,
-        kc_low: cfg.kc_low_range,
-    };
-
-    let out = ttm_squeeze_batch_with_kernel(high, low, close, &sweep, detect_best_batch_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(2 * out.rows * out.cols);
-    for r in 0..out.rows {
-        let s = r * out.cols;
-        values.extend_from_slice(&out.momentum[s..s + out.cols]);
-        values.extend_from_slice(&out.squeeze[s..s + out.cols]);
-    }
-
-    let js = TtmSqueezeBatchJsOutput {
-        values,
-        rows: out.rows * 2,
-        cols: out.cols,
-        combos: out.combos,
-    };
-
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_squeeze_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    bb_mult: f64,
-    kc_mult_high: f64,
-    kc_mult_mid: f64,
-    kc_mult_low: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ttm_squeeze_js(
-        high,
-        low,
-        close,
-        length,
-        bb_mult,
-        kc_mult_high,
-        kc_mult_mid,
-        kc_mult_low,
-    )?;
-    crate::write_wasm_object_f64_outputs("ttm_squeeze_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_squeeze_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ttm_squeeze_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ttm_squeeze_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     macro_rules! skip_if_unsupported {
@@ -2626,8 +2055,8 @@ mod tests {
 
     fn check_ttm_squeeze_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = TtmSqueezeInput::with_default_candles(&candles);
         let result = ttm_squeeze_with_kernel(&input, kernel)?;
@@ -2714,8 +2143,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = TtmSqueezeParams {
             length: None,
@@ -2739,8 +2168,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = TtmSqueezeInput::with_default_candles(&candles);
         let result = ttm_squeeze_with_kernel(&input, kernel)?;
@@ -2881,8 +2310,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = TtmSqueezeInput::with_default_candles(&candles);
         let result = ttm_squeeze_with_kernel(&input, kernel)?;
@@ -2912,8 +2341,8 @@ mod tests {
 
     fn check_ttm_squeeze_builder(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let result = TtmSqueezeBuilder::new()
             .length(30)
@@ -2932,8 +2361,8 @@ mod tests {
 
     fn check_ttm_squeeze_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = TtmSqueezeParams::default();
         let mut stream = TtmSqueezeStream::try_new(params.clone())?;
@@ -2965,8 +2394,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_ttm_squeeze_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             TtmSqueezeParams::default(),
@@ -3038,7 +2467,7 @@ mod tests {
 
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let out = TtmSqueezeBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&candles)?;
@@ -3052,7 +2481,7 @@ mod tests {
 
     fn check_batch_sweep_count(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let out = TtmSqueezeBatchBuilder::new()
             .kernel(kernel)
             .length_range(20, 24, 1)
@@ -3146,8 +2575,8 @@ mod tests {
 
     #[test]
     fn test_ttm_squeeze_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = TtmSqueezeInput::with_default_candles(&candles);
 
@@ -3182,8 +2611,8 @@ mod tests {
     }
 
     #[test]
-    fn ttm_squeeze_scalar_batch_matches_single_scalar_on_dispatch_fixture(
-    ) -> Result<(), Box<dyn Error>> {
+    fn ttm_squeeze_scalar_batch_matches_single_scalar_on_dispatch_fixture()
+    -> Result<(), Box<dyn Error>> {
         let len = 192usize;
         let open: Vec<f64> = (0..len)
             .map(|i| 100.0f64 + (i as f64 * 0.1) + ((i as f64) * 0.03).sin())

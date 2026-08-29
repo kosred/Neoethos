@@ -1,14 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::volume_weighted_stochastic_rsi::{
-    expand_grid_volume_weighted_stochastic_rsi, VolumeWeightedStochasticRsiBatchRange,
-    VolumeWeightedStochasticRsiParams,
+    VolumeWeightedStochasticRsiBatchRange, VolumeWeightedStochasticRsiParams,
+    expand_grid_volume_weighted_stochastic_rsi,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};

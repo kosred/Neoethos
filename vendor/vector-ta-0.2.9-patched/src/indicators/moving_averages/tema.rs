@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -12,29 +12,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaTema;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum TemaData<'a> {
@@ -87,10 +64,6 @@ impl<'a> AsRef<[f64]> for TemaInput<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TemaParams {
     pub period: Option<usize>,
 }
@@ -200,7 +173,6 @@ pub fn tema_with_kernel(input: &TemaInput, kernel: Kernel) -> Result<TemaOutput,
     Ok(TemaOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn tema_into(input: &TemaInput, out: &mut [f64]) -> Result<(), TemaError> {
     let (data, period, first, len, chosen) = tema_prepare(input, Kernel::Auto)?;
@@ -731,46 +703,11 @@ unsafe fn tema_row_avx512_long(data: &[f64], first: usize, period: usize, out: &
     tema_scalar(data, period, first, out)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tema_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = tema_js(data, period)?;
-    crate::write_wasm_f64_output("tema_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tema_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = tema_batch_js(data, period_start, period_end, period_step)?;
-    crate::write_wasm_f64_output("tema_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tema_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = tema_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("tema_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_tema_into_matches_api() -> Result<(), Box<dyn Error>> {
@@ -786,13 +723,8 @@ mod tests {
         let baseline = tema(&input)?.values;
 
         let mut out = vec![0.0; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             tema_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            tema_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -817,8 +749,8 @@ mod tests {
 
     fn check_tema_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = TemaParams { period: None };
         let input = TemaInput::from_candles(&candles, "close", default_params);
         let output = tema_with_kernel(&input, kernel)?;
@@ -827,8 +759,8 @@ mod tests {
     }
     fn check_tema_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = TemaInput::from_candles(&candles, "close", TemaParams::default());
         let result = tema_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -855,8 +787,8 @@ mod tests {
     }
     fn check_tema_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = TemaInput::with_default_candles(&candles);
         match input.data {
             TemaData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -933,8 +865,8 @@ mod tests {
     }
     fn check_tema_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = TemaParams { period: Some(9) };
         let first_input = TemaInput::from_candles(&candles, "close", first_params);
         let first_result = tema_with_kernel(&first_input, kernel)?;
@@ -946,8 +878,8 @@ mod tests {
     }
     fn check_tema_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = TemaInput::from_candles(&candles, "close", TemaParams { period: Some(9) });
         let res = tema_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -965,8 +897,8 @@ mod tests {
     }
     fn check_tema_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 9;
         let input = TemaInput::from_candles(
             &candles,
@@ -1033,8 +965,8 @@ mod tests {
     fn check_tema_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_periods = vec![5, 9, 14, 20, 50, 100, 200];
 
@@ -1062,23 +994,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
             }
         }
@@ -1099,8 +1031,8 @@ mod tests {
         use proptest::prelude::*;
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_data = &candles.close;
 
         let strat = (
@@ -1310,8 +1242,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = TemaBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1360,8 +1292,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (5, 15, 2),
@@ -1591,184 +1523,6 @@ fn tema_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "tema")]
-#[pyo3(signature = (data, period, kernel=None))]
-
-pub fn tema_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = TemaParams {
-        period: Some(period),
-    };
-    let result_vec: Vec<f64> = if let Ok(slice_in) = data.as_slice() {
-        let tema_in = TemaInput::from_slice(slice_in, params);
-        py.allow_threads(|| tema_with_kernel(&tema_in, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    } else {
-        let owned = data.as_array().to_owned();
-        let slice_in = owned.as_slice().expect("owned array should be contiguous");
-        let tema_in = TemaInput::from_slice(slice_in, params);
-        py.allow_threads(|| tema_with_kernel(&tema_in, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    };
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "TemaStream")]
-pub struct TemaStreamPy {
-    stream: TemaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl TemaStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = TemaParams {
-            period: Some(period),
-        };
-        let stream =
-            TemaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(TemaStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "tema_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-
-pub fn tema_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = TemaBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            tema_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "tema_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn tema_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = TemaBatchRange {
-        period: period_range,
-    };
-
-    let inner = py.allow_threads(|| -> Result<_, PyErr> {
-        let cuda = CudaTema::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = cuda
-            .tema_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        Ok(inner)
-    })?;
-    make_device_array_py(device_id, inner)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "tema_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, period, device_id=0))]
-pub fn tema_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    use numpy::PyUntypedArrayMethods;
-
-    let rows = prices_tm_f32.shape()[0];
-    let cols = prices_tm_f32.shape()[1];
-
-    let prices_flat = prices_tm_f32.as_slice()?;
-
-    let inner = py.allow_threads(|| -> Result<_, PyErr> {
-        let cuda = CudaTema::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = cuda
-            .tema_many_series_one_param_time_major_dev(prices_flat, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        Ok(inner)
-    })?;
-    make_device_array_py(device_id, inner)
-}
-
 #[inline]
 pub fn tema_into_slice(dst: &mut [f64], input: &TemaInput, kern: Kernel) -> Result<(), TemaError> {
     let (data, period, first, len, chosen) = tema_prepare(input, kern)?;
@@ -1785,210 +1539,4 @@ pub fn tema_into_slice(dst: &mut [f64], input: &TemaInput, kern: Kernel) -> Resu
         *v = f64::NAN;
     }
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tema_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    if data.is_empty() {
-        return Err(JsValue::from_str("Input data slice is empty"));
-    }
-    if period == 0 || period > data.len() {
-        return Err(JsValue::from_str(&format!(
-            "Invalid period: {} (data length: {})",
-            period,
-            data.len()
-        )));
-    }
-
-    if data.iter().all(|&x| x.is_nan()) {
-        return Err(JsValue::from_str("All values are NaN"));
-    }
-
-    let first_valid = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
-    let valid_count = data.len() - first_valid;
-    if valid_count < period {
-        return Err(JsValue::from_str(&format!(
-            "Not enough valid data: need {} but only {} valid values after NaN values",
-            period, valid_count
-        )));
-    }
-
-    if period > 1 {
-        let lookback = (period - 1) * 3;
-        if first_valid + lookback >= data.len() {
-            return Ok(vec![f64::NAN; data.len()]);
-        }
-    }
-
-    let params = TemaParams {
-        period: Some(period),
-    };
-    let input = TemaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    tema_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TemaBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TemaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<TemaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = tema_batch)]
-pub fn tema_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: TemaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = TemaBatchRange {
-        period: config.period_range,
-    };
-
-    let output = tema_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = TemaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(since = "1.0.0", note = "Use tema_batch instead")]
-pub fn tema_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = TemaBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    tema_batch_inner(data, &sweep, Kernel::Scalar, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tema_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tema_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tema_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to tema_into"));
-    }
-
-    if len == 0 {
-        return Err(JsValue::from_str("Input data slice is empty"));
-    }
-    if period == 0 || period > len {
-        return Err(JsValue::from_str(&format!(
-            "Invalid period: {} (data length: {})",
-            period, len
-        )));
-    }
-
-    let data = unsafe { std::slice::from_raw_parts(in_ptr, len) };
-
-    if period > 1 && !data.iter().all(|&x| x.is_nan()) {
-        let lookback = (period - 1) * 3;
-        if lookback >= len {
-            let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, len) };
-            out.fill(f64::NAN);
-            return Ok(());
-        }
-    }
-
-    let params = TemaParams {
-        period: Some(period),
-    };
-    let input = TemaInput::from_slice(data, params);
-
-    if in_ptr == out_ptr {
-        let mut temp = vec![0.0; len];
-        tema_into_slice(&mut temp, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, len) };
-        out.copy_from_slice(&temp);
-    } else {
-        let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, len) };
-        tema_into_slice(out, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tema_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to tema_batch_into"));
-    }
-
-    let data = unsafe { std::slice::from_raw_parts(in_ptr, len) };
-    let sweep = TemaBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total_size = rows * cols;
-
-    let out_slice = unsafe { std::slice::from_raw_parts_mut(out_ptr, total_size) };
-
-    tema_batch_inner_into(data, &sweep, Kernel::Auto, false, out_slice)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(rows)
 }

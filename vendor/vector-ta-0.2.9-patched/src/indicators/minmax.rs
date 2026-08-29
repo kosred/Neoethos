@@ -1,40 +1,16 @@
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::error::Error;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum MinmaxData<'a> {
@@ -58,10 +34,6 @@ pub struct MinmaxOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MinmaxParams {
     pub order: Option<usize>,
 }
@@ -301,7 +273,6 @@ pub fn minmax_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn minmax_into(
     input: &MinmaxInput,
@@ -417,260 +388,6 @@ pub fn minmax_with_kernel(
     })
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::minmax_wrapper::CudaMinmax;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "MinmaxDeviceArrayF32", unsendable)]
-pub struct MinmaxDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl MinmaxDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        let row_stride = self
-            .cols
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| PyValueError::new_err("stride overflow in __cuda_array_interface__"))?;
-        d.set_item("strides", (row_stride, std::mem::size_of::<f32>()))?;
-        let buf = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let ptr = buf.as_device_ptr().as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<(u8, u8)>,
-        dl_device: Option<(i32, i32)>,
-        copy: Option<bool>,
-    ) -> PyResult<PyObject> {
-        let _ = stream;
-        let _ = max_version;
-
-        if let Some((_ty, dev)) = dl_device {
-            if dev != self.device_id as i32 {
-                return Err(PyValueError::new_err("dlpack device mismatch"));
-            }
-        }
-        if matches!(copy, Some(true)) {
-            return Err(PyValueError::new_err(
-                "copy=True not supported for MinmaxDeviceArrayF32",
-            ));
-        }
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        export_f32_cuda_dlpack_2d(py, buf, self.rows, self.cols, self.device_id as i32, None)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "minmax_cuda_batch_dev")]
-#[pyo3(signature = (high, low, order_range=(3,3,0), device_id=0))]
-pub fn minmax_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f32>,
-    low: numpy::PyReadonlyArray1<'py, f32>,
-    order_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    if !crate::cuda::cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-    let sweep = MinmaxBatchRange { order: order_range };
-    let (quad, combos, ctx, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda = CudaMinmax::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (quad, combos) = cuda
-            .minmax_batch_dev(hs, ls, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((quad, combos, cuda.context_arc(), cuda.device_id()))
-    })?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "is_min",
-        Py::new(
-            py,
-            MinmaxDeviceArrayF32Py {
-                buf: Some(quad.is_min),
-                rows: combos.len(),
-                cols: hs.len(),
-                ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "is_max",
-        Py::new(
-            py,
-            MinmaxDeviceArrayF32Py {
-                buf: Some(quad.is_max),
-                rows: combos.len(),
-                cols: hs.len(),
-                ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "last_min",
-        Py::new(
-            py,
-            MinmaxDeviceArrayF32Py {
-                buf: Some(quad.last_min),
-                rows: combos.len(),
-                cols: hs.len(),
-                ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "last_max",
-        Py::new(
-            py,
-            MinmaxDeviceArrayF32Py {
-                buf: Some(quad.last_max),
-                rows: combos.len(),
-                cols: hs.len(),
-                ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    use numpy::IntoPyArray;
-    dict.set_item(
-        "orders",
-        combos
-            .iter()
-            .map(|p| p.order.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", hs.len())?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "minmax_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, order=3, device_id=0))]
-pub fn minmax_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm: numpy::PyReadonlyArray2<'py, f32>,
-    low_tm: numpy::PyReadonlyArray2<'py, f32>,
-    order: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    if !crate::cuda::cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sh = high_tm.shape();
-    let sl = low_tm.shape();
-    if sh.len() != 2 || sl.len() != 2 || sh != sl {
-        return Err(PyValueError::new_err(
-            "expected 2D arrays with identical shape",
-        ));
-    }
-    let rows = sh[0];
-    let cols = sh[1];
-    let hflat = high_tm.as_slice()?;
-    let lflat = low_tm.as_slice()?;
-    let params = MinmaxParams { order: Some(order) };
-    let (quad, ctx, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda = CudaMinmax::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let quad = cuda
-            .minmax_many_series_one_param_time_major_dev(hflat, lflat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((quad, cuda.context_arc(), cuda.device_id()))
-    })?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item(
-        "is_min",
-        Py::new(
-            py,
-            MinmaxDeviceArrayF32Py {
-                buf: Some(quad.is_min),
-                rows,
-                cols,
-                ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "is_max",
-        Py::new(
-            py,
-            MinmaxDeviceArrayF32Py {
-                buf: Some(quad.is_max),
-                rows,
-                cols,
-                ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "last_min",
-        Py::new(
-            py,
-            MinmaxDeviceArrayF32Py {
-                buf: Some(quad.last_min),
-                rows,
-                cols,
-                ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "last_max",
-        Py::new(
-            py,
-            MinmaxDeviceArrayF32Py {
-                buf: Some(quad.last_max),
-                rows,
-                cols,
-                ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("order", order)?;
-    Ok(dict)
-}
-
 #[inline]
 pub fn minmax_scalar(
     high: &[f64],
@@ -684,19 +401,11 @@ pub fn minmax_scalar(
 ) {
     #[inline(always)]
     fn fmin(a: f64, b: f64) -> f64 {
-        if a < b {
-            a
-        } else {
-            b
-        }
+        if a < b { a } else { b }
     }
     #[inline(always)]
     fn fmax(a: f64, b: f64) -> f64 {
-        if a > b {
-            a
-        } else {
-            b
-        }
+        if a > b { a } else { b }
     }
 
     let len = high.len();
@@ -2005,458 +1714,16 @@ pub unsafe fn minmax_row_avx512_long(
     )
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "minmax")]
-#[pyo3(signature = (high, low, order, kernel=None))]
-pub fn minmax_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    order: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = MinmaxParams { order: Some(order) };
-    let input = MinmaxInput::from_slices(high_slice, low_slice, params);
-
-    let output = py
-        .allow_threads(|| minmax_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        output.is_min.into_pyarray(py),
-        output.is_max.into_pyarray(py),
-        output.last_min.into_pyarray(py),
-        output.last_max.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MinmaxStream")]
-pub struct MinmaxStreamPy {
-    stream: MinmaxStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MinmaxStreamPy {
-    #[new]
-    fn new(order: usize) -> PyResult<Self> {
-        let params = MinmaxParams { order: Some(order) };
-        let stream =
-            MinmaxStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(MinmaxStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> (Option<f64>, Option<f64>, f64, f64) {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "minmax_batch")]
-#[pyo3(signature = (high, low, order_range, kernel=None))]
-pub fn minmax_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    order_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = MinmaxBatchRange { order: order_range };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = high_slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in minmax_batch_py"))?;
-
-    let is_min_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let is_max_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let last_min_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let last_max_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let is_min_slice = unsafe { is_min_arr.as_slice_mut()? };
-    let is_max_slice = unsafe { is_max_arr.as_slice_mut()? };
-    let last_min_slice = unsafe { last_min_arr.as_slice_mut()? };
-    let last_max_slice = unsafe { last_max_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            minmax_batch_inner_into(
-                high_slice,
-                low_slice,
-                &sweep,
-                simd,
-                true,
-                is_min_slice,
-                is_max_slice,
-                last_min_slice,
-                last_max_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("is_min", is_min_arr.reshape((rows, cols))?)?;
-    dict.set_item("is_max", is_max_arr.reshape((rows, cols))?)?;
-    dict.set_item("last_min", last_min_arr.reshape((rows, cols))?)?;
-    dict.set_item("last_max", last_max_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "orders",
-        combos
-            .iter()
-            .map(|p| p.order.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MinmaxResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn minmax_js(high: &[f64], low: &[f64], order: usize) -> Result<JsValue, JsValue> {
-    let input = MinmaxInput::from_slices(high, low, MinmaxParams { order: Some(order) });
-
-    let out =
-        minmax_with_kernel(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let len = high.len();
-    let mut values = Vec::with_capacity(4 * len);
-    values.extend_from_slice(&out.is_min);
-    values.extend_from_slice(&out.is_max);
-    values.extend_from_slice(&out.last_min);
-    values.extend_from_slice(&out.last_max);
-
-    let result = MinmaxResult {
-        values,
-        rows: 4,
-        cols: len,
-    };
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn minmax_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn minmax_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn minmax_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    is_min_ptr: *mut f64,
-    is_max_ptr: *mut f64,
-    last_min_ptr: *mut f64,
-    last_max_ptr: *mut f64,
-    len: usize,
-    order: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || is_min_ptr.is_null()
-        || is_max_ptr.is_null()
-        || last_min_ptr.is_null()
-        || last_max_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer passed to minmax_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        if order == 0 || order > len {
-            return Err(JsValue::from_str("Invalid order"));
-        }
-
-        let params = MinmaxParams { order: Some(order) };
-        let input = MinmaxInput::from_slices(high, low, params);
-
-        let input_ptrs = [high_ptr as *const u8, low_ptr as *const u8];
-        let output_ptrs = [
-            is_min_ptr as *mut u8,
-            is_max_ptr as *mut u8,
-            last_min_ptr as *mut u8,
-            last_max_ptr as *mut u8,
-        ];
-
-        let mut needs_temp = false;
-        for &inp in &input_ptrs {
-            for &out in &output_ptrs {
-                if inp == out {
-                    needs_temp = true;
-                    break;
-                }
-            }
-            if needs_temp {
-                break;
-            }
-        }
-
-        if needs_temp {
-            let mut temp_is_min = vec![0.0; len];
-            let mut temp_is_max = vec![0.0; len];
-            let mut temp_last_min = vec![0.0; len];
-            let mut temp_last_max = vec![0.0; len];
-
-            minmax_into_slice(
-                &mut temp_is_min,
-                &mut temp_is_max,
-                &mut temp_last_min,
-                &mut temp_last_max,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let is_min_out = std::slice::from_raw_parts_mut(is_min_ptr, len);
-            let is_max_out = std::slice::from_raw_parts_mut(is_max_ptr, len);
-            let last_min_out = std::slice::from_raw_parts_mut(last_min_ptr, len);
-            let last_max_out = std::slice::from_raw_parts_mut(last_max_ptr, len);
-
-            is_min_out.copy_from_slice(&temp_is_min);
-            is_max_out.copy_from_slice(&temp_is_max);
-            last_min_out.copy_from_slice(&temp_last_min);
-            last_max_out.copy_from_slice(&temp_last_max);
-        } else {
-            let is_min_out = std::slice::from_raw_parts_mut(is_min_ptr, len);
-            let is_max_out = std::slice::from_raw_parts_mut(is_max_ptr, len);
-            let last_min_out = std::slice::from_raw_parts_mut(last_min_ptr, len);
-            let last_max_out = std::slice::from_raw_parts_mut(last_max_ptr, len);
-
-            minmax_into_slice(
-                is_min_out,
-                is_max_out,
-                last_min_out,
-                last_max_out,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MinmaxBatchConfig {
-    pub order_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MinmaxBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<MinmaxParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = minmax_batch)]
-pub fn minmax_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: MinmaxBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = MinmaxBatchRange {
-        order: cfg.order_range,
-    };
-    let out = minmax_batch_with_kernel(high, low, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow in minmax_batch_unified_js"))?;
-    let cap = total
-        .checked_mul(4)
-        .ok_or_else(|| JsValue::from_str("capacity overflow in minmax_batch_unified_js"))?;
-    let mut values = Vec::with_capacity(cap);
-
-    for series in 0..4 {
-        for r in 0..rows {
-            let (src, start) = match series {
-                0 => (&out.is_min, r * cols),
-                1 => (&out.is_max, r * cols),
-                2 => (&out.last_min, r * cols),
-                _ => (&out.last_max, r * cols),
-            };
-            values.extend_from_slice(&src[start..start + cols]);
-        }
-    }
-
-    let js_out = MinmaxBatchJsOutput {
-        values,
-        combos: out.combos,
-        rows: 4 * rows,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&js_out).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn minmax_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    is_min_ptr: *mut f64,
-    is_max_ptr: *mut f64,
-    last_min_ptr: *mut f64,
-    last_max_ptr: *mut f64,
-    len: usize,
-    order_start: usize,
-    order_end: usize,
-    order_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || is_min_ptr.is_null()
-        || is_max_ptr.is_null()
-        || last_min_ptr.is_null()
-        || last_max_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to minmax_batch_into",
-        ));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let sweep = MinmaxBatchRange {
-            order: (order_start, order_end, order_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in minmax_batch_into"))?;
-
-        let is_min_out = std::slice::from_raw_parts_mut(is_min_ptr, total);
-        let is_max_out = std::slice::from_raw_parts_mut(is_max_ptr, total);
-        let last_min_out = std::slice::from_raw_parts_mut(last_min_ptr, total);
-        let last_max_out = std::slice::from_raw_parts_mut(last_max_ptr, total);
-
-        minmax_batch_inner_into(
-            high,
-            low,
-            &sweep,
-            Kernel::Auto,
-            false,
-            is_min_out,
-            is_max_out,
-            last_min_out,
-            last_max_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn minmax_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    order: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = minmax_js(high, low, order)?;
-    crate::write_wasm_object_f64_outputs("minmax_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn minmax_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = minmax_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "minmax_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_minmax_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MinmaxParams { order: None };
         let input = MinmaxInput::from_candles(&candles, "high", "low", params);
         let output = minmax_with_kernel(&input, kernel)?;
@@ -2466,8 +1733,8 @@ mod tests {
 
     fn check_minmax_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MinmaxParams { order: Some(3) };
         let input = MinmaxInput::from_candles(&candles, "high", "low", params);
         let output = minmax_with_kernel(&input, kernel)?;
@@ -2592,8 +1859,8 @@ mod tests {
     fn check_minmax_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             MinmaxParams::default(),
@@ -2627,29 +1894,44 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
 							 in {} with params: order={} (param set {})",
-							test_name, val, bits, i, array_name,
-							params.order.unwrap_or(3), param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            array_name,
+                            params.order.unwrap_or(3),
+                            param_idx
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
 							 in {} with params: order={} (param set {})",
-							test_name, val, bits, i, array_name,
-							params.order.unwrap_or(3), param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            array_name,
+                            params.order.unwrap_or(3),
+                            param_idx
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
 							 in {} with params: order={} (param set {})",
-							test_name, val, bits, i, array_name,
-							params.order.unwrap_or(3), param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            array_name,
+                            params.order.unwrap_or(3),
+                            param_idx
+                        );
                     }
                 }
             }
@@ -2703,8 +1985,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = MinmaxBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
         let def = MinmaxParams::default();
         let row = output.is_min_for(&def).expect("default row missing");
@@ -2745,7 +2027,6 @@ mod tests {
         let mut last_min = vec![0.0; n];
         let mut last_max = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             minmax_into(
                 &input,
@@ -2802,8 +2083,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2841,20 +2122,34 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) in {} with params: order={}",
-							test, cfg_idx, val, bits, row, col, idx, array_name,
-							combo.order.unwrap_or(3)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            array_name,
+                            combo.order.unwrap_or(3)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) in {} with params: order={}",
-							test, cfg_idx, val, bits, row, col, idx, array_name,
-							combo.order.unwrap_or(3)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            array_name,
+                            combo.order.unwrap_or(3)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {

@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail};
-use cubecl::cuda::{CudaDevice, CudaRuntime};
+use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::*;
 use ndarray::Array2;
 use std::collections::HashMap;
 use symbios_neat::{Activation, GraphTopology, NeatGenome, NodeId, NodeType};
+
+use crate::cubecl_lifecycle::{cubecl_cuda_client, cubecl_residency_scope};
 
 const CLASS_COUNT: usize = 3;
 
@@ -220,11 +222,7 @@ fn neat_population_metrics_kernel(
     }
 }
 
-pub(crate) fn neat_cuda_kernel_enabled(policy: &str) -> bool {
-    crate::common::cuda_kernel_enabled(policy)
-}
-
-fn cuda_device_id(policy: &str) -> usize {
+fn cuda_device_id(policy: &str) -> Result<usize> {
     crate::common::cuda_device_id_from_policy(policy)
 }
 
@@ -461,18 +459,10 @@ fn launch_population_metrics_kernel(
         unsafe { ArrayArg::from_raw_parts(features_handle.clone(), features_flat.len()) },
         unsafe { ArrayArg::from_raw_parts(labels_handle.clone(), labels.len()) },
         unsafe { ArrayArg::from_raw_parts(node_counts_handle.clone(), batch.node_counts.len()) },
-        unsafe {
-            ArrayArg::from_raw_parts(node_offsets_handle.clone(), batch.node_offsets.len())
-        },
-        unsafe {
-            ArrayArg::from_raw_parts(edge_offsets_handle.clone(), batch.edge_offsets.len())
-        },
-        unsafe {
-            ArrayArg::from_raw_parts(edge_sources_handle.clone(), batch.edge_sources.len())
-        },
-        unsafe {
-            ArrayArg::from_raw_parts(edge_weights_handle.clone(), batch.edge_weights.len())
-        },
+        unsafe { ArrayArg::from_raw_parts(node_offsets_handle.clone(), batch.node_offsets.len()) },
+        unsafe { ArrayArg::from_raw_parts(edge_offsets_handle.clone(), batch.edge_offsets.len()) },
+        unsafe { ArrayArg::from_raw_parts(edge_sources_handle.clone(), batch.edge_sources.len()) },
+        unsafe { ArrayArg::from_raw_parts(edge_weights_handle.clone(), batch.edge_weights.len()) },
         unsafe {
             ArrayArg::from_raw_parts(activation_handle.clone(), batch.activation_codes.len())
         },
@@ -483,15 +473,9 @@ fn launch_population_metrics_kernel(
         unsafe {
             ArrayArg::from_raw_parts(output_indices_handle.clone(), batch.output_indices.len())
         },
-        unsafe {
-            ArrayArg::from_raw_parts(bias_indices_handle.clone(), batch.bias_indices.len())
-        },
-        unsafe {
-            ArrayArg::from_raw_parts(eval_offsets_handle.clone(), batch.eval_offsets.len())
-        },
-        unsafe {
-            ArrayArg::from_raw_parts(eval_indices_handle.clone(), batch.eval_indices.len())
-        },
+        unsafe { ArrayArg::from_raw_parts(bias_indices_handle.clone(), batch.bias_indices.len()) },
+        unsafe { ArrayArg::from_raw_parts(eval_offsets_handle.clone(), batch.eval_offsets.len()) },
+        unsafe { ArrayArg::from_raw_parts(eval_indices_handle.clone(), batch.eval_indices.len()) },
         unsafe {
             ArrayArg::from_raw_parts(complexity_handle.clone(), batch.complexity_penalties.len())
         },
@@ -552,8 +536,8 @@ pub(crate) fn try_population_scores_cuda(
     }
 
     let batch = flatten_population(population, input_dim)?;
-    let device = CudaDevice::new(cuda_device_id(policy));
-    let client = CudaRuntime::client(&device);
+    let _cubecl_call_residency = cubecl_residency_scope();
+    let client = cubecl_cuda_client(cuda_device_id(policy)?);
     let train_metrics =
         launch_population_metrics_kernel(&client, &batch, train_features, train_labels, input_dim)?;
     let val_metrics = if val_labels.is_empty() {
@@ -577,4 +561,48 @@ pub(crate) fn try_population_scores_cuda(
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use ndarray::array;
+    use rand::SeedableRng;
+    use rand_xoshiro::Xoroshiro128PlusPlus;
+    use symbios_neat::{NeatConfig, NeatGenome};
+
+    use super::try_population_scores_cuda;
+
+    #[test]
+    fn neat_cuda_population_metrics_launch_real_kernel() {
+        let config = NeatConfig::minimal(2, 3);
+        let mut rng = Xoroshiro128PlusPlus::seed_from_u64(7);
+        let population = vec![
+            NeatGenome::fully_connected(config.clone(), &mut rng),
+            NeatGenome::minimal(config),
+        ];
+        let train_features = array![
+            [0.25_f32, -0.5_f32],
+            [0.75_f32, 0.125_f32],
+            [-0.4_f32, 0.9_f32],
+            [0.6_f32, -0.2_f32],
+        ];
+        let train_labels = [0_usize, 1, 2, 1];
+        let val_features = array![[0.1_f32, 0.2_f32], [-0.3_f32, 0.8_f32]];
+        let val_labels = [0_usize, 2];
+
+        let metrics = try_population_scores_cuda(
+            &population,
+            &train_features,
+            &train_labels,
+            &val_features,
+            &val_labels,
+            "gpu:0",
+        )
+        .expect("mandatory NEAT CUDA kernel launch");
+
+        assert_eq!(metrics.len(), population.len());
+        assert!(metrics.iter().all(|metric| metric.fitness.is_finite()));
+        assert!(metrics.iter().all(|metric| metric.loss.is_finite()));
+        assert!(metrics.iter().all(|metric| metric.accuracy.is_finite()));
+    }
 }

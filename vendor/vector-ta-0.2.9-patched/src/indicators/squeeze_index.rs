@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -73,10 +55,6 @@ pub struct SqueezeIndexOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct SqueezeIndexParams {
     pub conv: Option<f64>,
     pub length: Option<usize>,
@@ -598,7 +576,6 @@ pub fn squeeze_index_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn squeeze_index_into(
     input: &SqueezeIndexInput,
@@ -1015,316 +992,15 @@ pub fn squeeze_index_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "squeeze_index")]
-#[pyo3(signature = (data, conv=DEFAULT_CONV, length=DEFAULT_LENGTH, kernel=None))]
-pub fn squeeze_index_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    conv: f64,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = SqueezeIndexInput::from_slice(
-        data,
-        SqueezeIndexParams {
-            conv: Some(conv),
-            length: Some(length),
-        },
-    );
-    let output = py
-        .allow_threads(|| squeeze_index_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(output.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "SqueezeIndexStream")]
-pub struct SqueezeIndexStreamPy {
-    stream: SqueezeIndexStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl SqueezeIndexStreamPy {
-    #[new]
-    #[pyo3(signature = (conv=DEFAULT_CONV, length=DEFAULT_LENGTH))]
-    fn new(conv: f64, length: usize) -> PyResult<Self> {
-        let stream = SqueezeIndexStream::try_new(SqueezeIndexParams {
-            conv: Some(conv),
-            length: Some(length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "squeeze_index_batch")]
-#[pyo3(signature = (data, conv_range, length_range, kernel=None))]
-pub fn squeeze_index_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    conv_range: (f64, f64, f64),
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = SqueezeIndexBatchRange {
-        conv: conv_range,
-        length: length_range,
-    };
-
-    let combos =
-        expand_grid_squeeze_index(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            squeeze_index_batch_inner_into(data, &sweep, batch.to_non_batch(), true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "convs",
-        combos
-            .iter()
-            .map(|combo| combo.conv.unwrap_or(DEFAULT_CONV))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_squeeze_index_module(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(squeeze_index_py, module)?)?;
-    module.add_function(wrap_pyfunction!(squeeze_index_batch_py, module)?)?;
-    module.add_class::<SqueezeIndexStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "squeeze_index_js")]
-pub fn squeeze_index_js(data: &[f64], conv: f64, length: usize) -> Result<Vec<f64>, JsValue> {
-    let input = SqueezeIndexInput::from_slice(
-        data,
-        SqueezeIndexParams {
-            conv: Some(conv),
-            length: Some(length),
-        },
-    );
-    let mut output = vec![0.0; data.len()];
-    squeeze_index_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_index_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_index_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_index_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    conv: f64,
-    length: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let input = SqueezeIndexInput::from_slice(
-            data,
-            SqueezeIndexParams {
-                conv: Some(conv),
-                length: Some(length),
-            },
-        );
-        if data_ptr == out_ptr {
-            let mut tmp = vec![0.0; len];
-            squeeze_index_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            squeeze_index_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SqueezeIndexBatchConfig {
-    pub conv_range: (f64, f64, f64),
-    pub length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SqueezeIndexBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<SqueezeIndexParams>,
-    pub convs: Vec<f64>,
-    pub lengths: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "squeeze_index_batch_js")]
-pub fn squeeze_index_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: SqueezeIndexBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = SqueezeIndexBatchRange {
-        conv: config.conv_range,
-        length: config.length_range,
-    };
-    let output = squeeze_index_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&SqueezeIndexBatchJsOutput {
-        convs: output
-            .combos
-            .iter()
-            .map(|combo| combo.conv.unwrap_or(DEFAULT_CONV))
-            .collect(),
-        lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH))
-            .collect(),
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_index_batch_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    conv_start: f64,
-    conv_end: f64,
-    conv_step: f64,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = SqueezeIndexBatchRange {
-        conv: (conv_start, conv_end, conv_step),
-        length: (length_start, length_end, length_step),
-    };
-    let combos =
-        expand_grid_squeeze_index(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        squeeze_index_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_index_output_into_js(
-    data: &[f64],
-    conv: f64,
-    length: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = squeeze_index_js(data, conv, length)?;
-    crate::write_wasm_f64_output("squeeze_index_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn squeeze_index_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = squeeze_index_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("squeeze_index_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     fn load_close() -> Result<Vec<f64>, Box<dyn Error>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
-        Ok(candles.close)
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
+        Ok(candles.close.clone())
     }
 
     fn approx_eq_or_nan(lhs: &[f64], rhs: &[f64], tol: f64) {

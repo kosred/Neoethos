@@ -1,12 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::{CudaHighpass, DeviceArrayF32};
 use crate::indicators::bandpass::{BandPassBatchRange, BandPassParams};
 use cust::context::{CacheConfig, Context};
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::collections::HashMap;
@@ -129,9 +129,7 @@ impl CudaBandpass {
         let device = Device::get_device(device_id as u32)?;
         let context = Context::new(device)?;
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/bandpass_kernel.ptx"));
         let module = crate::load_cuda_embedded_module!("bandpass_kernel")?;
-        let highpass_ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/highpass_kernel.ptx"));
         let highpass_module = crate::load_cuda_embedded_module!("highpass_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

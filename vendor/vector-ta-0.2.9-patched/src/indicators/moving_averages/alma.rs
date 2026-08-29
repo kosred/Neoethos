@@ -1,34 +1,12 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
-use crate::utilities::helpers::{
-    alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
-    make_uninit_matrix,
-};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
+use crate::utilities::helpers::{alloc_with_nan_prefix, init_matrix_prefixes, make_uninit_matrix};
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
@@ -68,10 +46,6 @@ pub struct AlmaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AlmaParams {
     pub period: Option<usize>,
     pub offset: Option<f64>,
@@ -128,6 +102,54 @@ impl<'a> AlmaInput<'a> {
     pub fn get_sigma(&self) -> f64 {
         self.params.sigma.unwrap_or(6.0)
     }
+}
+
+/// Exact mathematical variant used by NeoEthos canonical feature artifacts.
+///
+/// TradingView's published `ta.alma` reference leaves the Gaussian centre
+/// unrounded by default (`floor = false`) and applies weights from the oldest
+/// to the newest sample. The separate name prevents the floored LEAN variant
+/// from being substituted silently under the same feature identity.
+pub(crate) const ALMA_TRADINGVIEW_NONFLOORED_SEMANTICS_V1: &str =
+    "alma.tradingview.nonfloored.oldest-to-newest.v1";
+
+/// Build the one canonical unnormalised Gaussian coefficient row.
+///
+/// Every CPU execution shape and the resident CUDA uploader consume this same
+/// byte row. This is deliberately the published division form instead of a
+/// reciprocal rewrite: those expressions are equal over the reals but are not
+/// an interchangeable floating-point execution contract.
+pub(crate) fn alma_exact_weight_row(
+    period: usize,
+    offset: f64,
+    sigma: f64,
+) -> Result<(Vec<f64>, f64), AlmaError> {
+    if period == 0 {
+        return Err(AlmaError::InvalidPeriod {
+            period,
+            data_len: 0,
+        });
+    }
+    if sigma <= 0.0 || !sigma.is_finite() {
+        return Err(AlmaError::InvalidSigma { sigma });
+    }
+    if !(0.0..=1.0).contains(&offset) || !offset.is_finite() {
+        return Err(AlmaError::InvalidOffset { offset });
+    }
+
+    let _semantics = ALMA_TRADINGVIEW_NONFLOORED_SEMANTICS_V1;
+    let m = offset * (period - 1) as f64;
+    let s = period as f64 / sigma;
+    let s2 = 2.0 * s * s;
+    let mut norm = 0.0;
+    let mut weights = Vec::with_capacity(period);
+    for i in 0..period {
+        let diff = i as f64 - m;
+        let weight = (-(diff * diff) / s2).exp();
+        norm += weight;
+        weights.push(weight);
+    }
+    Ok((weights, 1.0 / norm))
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -331,42 +353,17 @@ fn alma_prepare<'a>(
         return Err(AlmaError::InvalidOffset { offset });
     }
 
-    let m = offset * (period - 1) as f64;
-    let s = period as f64 / sigma;
-    let s2 = 2.0 * s * s;
-
+    let (exact_weights, inv_norm) = alma_exact_weight_row(period, offset, sigma)?;
     let aligned_period = ((period + 7) / 8) * 8;
     let mut weights: AVec<f64> = AVec::with_capacity(CACHELINE_ALIGN, aligned_period);
     weights.resize(aligned_period, 0.0);
-
-    let inv_s2 = 1.0 / s2;
-    let mut norm = 0.0;
-
-    for i in 0..period {
-        let diff = i as f64 - m;
-        let w = (-diff * diff * inv_s2).exp();
-        weights[i] = w;
-        norm += w;
-    }
-    let inv_norm = 1.0 / norm;
+    weights[..period].copy_from_slice(&exact_weights);
 
     let chosen = match kernel {
-        Kernel::Auto if period == 9 => Kernel::Scalar,
-        Kernel::Auto => {
-            let detected = detect_best_kernel();
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            {
-                if matches!(detected, Kernel::Avx512) && len >= 262_144 {
-                    Kernel::Avx2
-                } else {
-                    detected
-                }
-            }
-            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-            {
-                detected
-            }
-        }
+        // The former host-feature dispatch made `Auto` emit AVX2/FMA bits on
+        // AMD Zen and a different reduction on AVX-512 hosts. Canonical feature
+        // identity cannot depend on which CPU happened to prepare the frame.
+        Kernel::Auto => Kernel::Scalar,
         k => k,
     };
 
@@ -404,7 +401,6 @@ pub fn alma_into_slice(dst: &mut [f64], input: &AlmaInput, kern: Kernel) -> Resu
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn alma_into(input: &AlmaInput, out: &mut [f64]) -> Result<(), AlmaError> {
     let (data, weights, period, first, inv_n, chosen) = alma_prepare(input, Kernel::Auto)?;
@@ -966,25 +962,14 @@ impl AlmaStream {
             return Err(AlmaError::InvalidSigma { sigma });
         }
 
-        let m = offset * (period - 1) as f64;
-        let s = period as f64 / sigma;
-        let s2 = 2.0 * s * s;
-
+        let (exact_weights, inv_norm) = alma_exact_weight_row(period, offset, sigma)?;
         let mut weights = AVec::<f64>::with_capacity(CACHELINE_ALIGN, period);
         weights.resize(period, 0.0);
-
-        let mut norm = 0.0;
-        for i in 0..period {
-            let diff = i as f64 - m;
-            let w = (-(diff * diff) / s2).exp();
-            weights[i] = w;
-            norm += w;
-        }
-        let inv_norm = 1.0 / norm;
+        weights.copy_from_slice(&exact_weights);
 
         let buffer = vec![f64::NAN; period];
         let buf2 = vec![f64::NAN; period * 2];
-        let kernel = detect_best_kernel();
+        let kernel = Kernel::Scalar;
 
         Ok(Self {
             period,
@@ -1227,7 +1212,7 @@ pub fn alma_batch_with_kernel(
     k: Kernel,
 ) -> Result<AlmaBatchOutput, AlmaError> {
     let kernel = match k {
-        Kernel::Auto => detect_best_batch_kernel(),
+        Kernel::Auto => Kernel::ScalarBatch,
         other if other.is_batch() => other,
         _ => return Err(AlmaError::InvalidKernelForBatch(k)),
     };
@@ -1494,17 +1479,9 @@ fn alma_batch_inner_into(
             return Err(AlmaError::InvalidOffset { offset });
         }
 
-        let m = offset * (period - 1) as f64;
-        let s = period as f64 / sigma;
-        let s2 = 2.0 * s * s;
-
-        let mut norm = 0.0;
-        for i in 0..period {
-            let w = (-(i as f64 - m).powi(2) / s2).exp();
-            flat_w[row * max_p + i] = w;
-            norm += w;
-        }
-        inv_norms[row] = 1.0 / norm;
+        let (exact_weights, inv_norm) = alma_exact_weight_row(period, offset, sigma)?;
+        flat_w[row * max_p..row * max_p + period].copy_from_slice(&exact_weights);
+        inv_norms[row] = inv_norm;
     }
     let out_uninit = unsafe {
         std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len())
@@ -1517,7 +1494,7 @@ fn alma_batch_inner_into(
     init_matrix_prefixes(out_uninit, cols, &warm);
 
     let actual_kern = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
+        Kernel::Auto => Kernel::ScalarBatch,
         k => k,
     };
 
@@ -1877,42 +1854,18 @@ unsafe fn long_kernel_with_tail(
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alma_output_into_js(
-    data: &[f64],
-    period: usize,
-    offset: f64,
-    sigma: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = alma_js(data, period, offset, sigma)?;
-    crate::write_wasm_f64_output("alma_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alma_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = alma_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("alma_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_alma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = AlmaParams {
             period: None,
@@ -1928,8 +1881,8 @@ mod tests {
 
     fn check_alma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AlmaInput::from_candles(&candles, "close", AlmaParams::default());
         let result = alma_with_kernel(&input, kernel)?;
@@ -1958,8 +1911,8 @@ mod tests {
 
     fn check_alma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AlmaInput::with_default_candles(&candles);
         match input.data {
@@ -2083,8 +2036,8 @@ mod tests {
 
     fn check_alma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = AlmaParams {
             period: Some(9),
@@ -2128,8 +2081,8 @@ mod tests {
 
     fn check_alma_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AlmaInput::from_candles(
             &candles,
@@ -2158,8 +2111,8 @@ mod tests {
     fn check_alma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 9;
         let offset = 0.85;
@@ -2213,8 +2166,8 @@ mod tests {
     fn check_alma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             AlmaParams::default(),
@@ -2476,7 +2429,6 @@ mod tests {
     #[cfg(feature = "proptest")]
     generate_all_alma_tests!(check_alma_property);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_alma_into_matches_api() -> Result<(), Box<dyn Error>> {
         let mut data = vec![f64::NAN; 3];
@@ -2511,8 +2463,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = AlmaBatchBuilder::new()
             .kernel(kernel)
@@ -2565,8 +2517,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = AlmaBatchBuilder::new()
             .kernel(kernel)
@@ -2587,8 +2539,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 0.0, 1.0, 0.2, 1.0, 10.0, 3.0),
@@ -2622,53 +2574,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
                         at row {} col {} (flat index {}) with params: period={}, offset={}, sigma={}",
-						test,
-						cfg_idx,
-						val,
-						bits,
-						row,
-						col,
-						idx,
-						combo.period.unwrap_or(9),
-						combo.offset.unwrap_or(0.85),
-						combo.sigma.unwrap_or(6.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(9),
+                        combo.offset.unwrap_or(0.85),
+                        combo.sigma.unwrap_or(6.0)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
                         at row {} col {} (flat index {}) with params: period={}, offset={}, sigma={}",
-						test,
-						cfg_idx,
-						val,
-						bits,
-						row,
-						col,
-						idx,
-						combo.period.unwrap_or(9),
-						combo.offset.unwrap_or(0.85),
-						combo.sigma.unwrap_or(6.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(9),
+                        combo.offset.unwrap_or(0.85),
+                        combo.sigma.unwrap_or(6.0)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
                         at row {} col {} (flat index {}) with params: period={}, offset={}, sigma={}",
-						test,
-						cfg_idx,
-						val,
-						bits,
-						row,
-						col,
-						idx,
-						combo.period.unwrap_or(9),
-						combo.offset.unwrap_or(0.85),
-						combo.sigma.unwrap_or(6.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(9),
+                        combo.offset.unwrap_or(0.85),
+                        combo.sigma.unwrap_or(6.0)
+                    );
                 }
             }
         }
@@ -2718,522 +2670,5 @@ mod tests {
                 simd_val
             );
         }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "alma")]
-#[pyo3(signature = (data, period, offset, sigma, kernel=None))]
-
-pub fn alma_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    offset: f64,
-    sigma: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = AlmaParams {
-        period: Some(period),
-        offset: Some(offset),
-        sigma: Some(sigma),
-    };
-
-    let result_vec: Vec<f64> = if let Ok(slice_in) = data.as_slice() {
-        let alma_in = AlmaInput::from_slice(slice_in, params);
-        py.allow_threads(|| alma_with_kernel(&alma_in, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    } else {
-        let owned = data.as_array().to_owned();
-        let slice_in = owned.as_slice().expect("owned array should be contiguous");
-        let alma_in = AlmaInput::from_slice(slice_in, params);
-        let out = py
-            .allow_threads(|| alma_with_kernel(&alma_in, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        out
-    };
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AlmaStream")]
-pub struct AlmaStreamPy {
-    stream: AlmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AlmaStreamPy {
-    #[new]
-    fn new(period: usize, offset: f64, sigma: f64) -> PyResult<Self> {
-        let params = AlmaParams {
-            period: Some(period),
-            offset: Some(offset),
-            sigma: Some(sigma),
-        };
-        let stream =
-            AlmaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AlmaStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "alma_batch")]
-#[pyo3(signature = (data, period_range, offset_range, sigma_range, kernel=None))]
-
-pub fn alma_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    offset_range: (f64, f64, f64),
-    sigma_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-
-    let sweep = AlmaBatchRange {
-        period: period_range,
-        offset: offset_range,
-        sigma: sigma_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            alma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "offsets",
-        combos
-            .iter()
-            .map(|p| p.offset.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "sigmas",
-        combos
-            .iter()
-            .map(|p| p.sigma.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "alma_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, offset_range, sigma_range, device_id=0))]
-pub fn alma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    offset_range: (f64, f64, f64),
-    sigma_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::CudaAlma;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in: &[f32] = data_f32.as_slice()?;
-    let sweep = AlmaBatchRange {
-        period: period_range,
-        offset: offset_range,
-        sigma: sigma_range,
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAlma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = device_id as u32;
-        cuda.alma_batch_dev(slice_in, &sweep)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "alma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, offset, sigma, device_id=0))]
-pub fn alma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    offset: f64,
-    sigma: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::CudaAlma;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in: &[f32] = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = AlmaParams {
-        period: Some(period),
-        offset: Some(offset),
-        sigma: Some(sigma),
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAlma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = device_id as u32;
-        cuda.alma_multi_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(feature = "python")]
-pub fn register_alma_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(alma_py, m)?)?;
-    m.add_function(wrap_pyfunction!(alma_batch_py, m)?)?;
-    m.add_class::<AlmaStreamPy>()?;
-
-    #[cfg(feature = "cuda")]
-    {
-        m.add_class::<DeviceArrayF32Py>()?;
-        m.add_function(wrap_pyfunction!(alma_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(alma_cuda_many_series_one_param_dev_py, m)?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alma_js(data: &[f64], period: usize, offset: f64, sigma: f64) -> Result<Vec<f64>, JsValue> {
-    let params = AlmaParams {
-        period: Some(period),
-        offset: Some(offset),
-        sigma: Some(sigma),
-    };
-    let input = AlmaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    alma_into_slice(&mut output, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AlmaBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub offset_range: (f64, f64, f64),
-    pub sigma_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AlmaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AlmaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = alma_batch)]
-pub fn alma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: AlmaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AlmaBatchRange {
-        period: config.period_range,
-        offset: config.offset_range,
-        sigma: config.sigma_range,
-    };
-
-    let output = alma_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = AlmaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alma_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alma_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alma_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    offset: f64,
-    sigma: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to alma_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = AlmaParams {
-            period: Some(period),
-            offset: Some(offset),
-            sigma: Some(sigma),
-        };
-        let input = AlmaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            alma_into_slice(&mut temp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            alma_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-)]
-pub struct AlmaContext {
-    weights: AVec<f64>,
-    inv_norm: f64,
-    period: usize,
-    first: usize,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(deprecated)]
-impl AlmaContext {
-    #[wasm_bindgen(constructor)]
-    #[deprecated(
-        since = "1.0.0",
-        note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-    )]
-    pub fn new(period: usize, offset: f64, sigma: f64) -> Result<AlmaContext, JsValue> {
-        if period == 0 {
-            return Err(JsValue::from_str("Invalid period: 0"));
-        }
-        if !(0.0..=1.0).contains(&offset) || offset.is_nan() || offset.is_infinite() {
-            return Err(JsValue::from_str(&format!("Invalid offset: {}", offset)));
-        }
-        if sigma <= 0.0 {
-            return Err(JsValue::from_str(&format!("Invalid sigma: {}", sigma)));
-        }
-
-        let m = offset * (period - 1) as f64;
-        let s = period as f64 / sigma;
-        let s2 = 2.0 * s * s;
-
-        let mut weights: AVec<f64> = AVec::with_capacity(CACHELINE_ALIGN, period);
-        weights.resize(period, 0.0);
-        let mut norm = 0.0;
-
-        for i in 0..period {
-            let w = (-(i as f64 - m).powi(2) / s2).exp();
-            weights[i] = w;
-            norm += w;
-        }
-
-        let inv_norm = 1.0 / norm;
-
-        Ok(AlmaContext {
-            weights,
-            inv_norm,
-            period,
-            first: 0,
-            kernel: detect_best_kernel(),
-        })
-    }
-
-    pub fn update_into(
-        &self,
-        in_ptr: *const f64,
-        out_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if len < self.period {
-            return Err(JsValue::from_str("Data length less than period"));
-        }
-
-        unsafe {
-            let data = std::slice::from_raw_parts(in_ptr, len);
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-            let first = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
-
-            if in_ptr == out_ptr {
-                let mut temp = vec![0.0; len];
-                alma_compute_into(
-                    data,
-                    self.weights.as_slice(),
-                    self.period,
-                    first,
-                    self.inv_norm,
-                    self.kernel,
-                    &mut temp,
-                );
-
-                out.copy_from_slice(&temp);
-            } else {
-                alma_compute_into(
-                    data,
-                    self.weights.as_slice(),
-                    self.period,
-                    first,
-                    self.inv_norm,
-                    self.kernel,
-                    out,
-                );
-            }
-
-            for i in 0..(first + self.period - 1) {
-                out[i] = f64::NAN;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn get_warmup_period(&self) -> usize {
-        self.period - 1
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alma_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    offset_start: f64,
-    offset_end: f64,
-    offset_step: f64,
-    sigma_start: f64,
-    sigma_end: f64,
-    sigma_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to alma_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = AlmaBatchRange {
-            period: (period_start, period_end, period_step),
-            offset: (offset_start, offset_end, offset_step),
-            sigma: (sigma_start, sigma_end, sigma_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        alma_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
     }
 }

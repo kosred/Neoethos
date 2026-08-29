@@ -66,7 +66,10 @@ impl PortfolioRegistry {
             anyhow::anyhow!("portfolio manifest {} not readable: {e}", path.display())
         })?;
         let entries: Vec<PortfolioEntry> = serde_json::from_str(&raw).map_err(|e| {
-            anyhow::anyhow!("portfolio manifest {} is not a valid PortfolioEntry array: {e}", path.display())
+            anyhow::anyhow!(
+                "portfolio manifest {} is not a valid PortfolioEntry array: {e}",
+                path.display()
+            )
         })?;
         Ok(Self::from_entries(entries))
     }

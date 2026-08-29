@@ -1,6 +1,4 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaHma;
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -9,8 +7,6 @@ use crate::utilities::helpers::{
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -42,10 +38,6 @@ pub struct HmaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct HmaParams {
     pub period: Option<usize>,
 }
@@ -188,7 +180,6 @@ pub fn hma(input: &HmaInput) -> Result<HmaOutput, HmaError> {
     hma_with_kernel(input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn hma_into(input: &HmaInput, out: &mut [f64]) -> Result<(), HmaError> {
     hma_into_internal(input, out)
 }
@@ -1226,331 +1217,6 @@ fn expand_grid_hma(r: &HmaBatchRange) -> Vec<HmaParams> {
     expand_grid(r)
 }
 
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "hma")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn hma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = HmaParams {
-        period: Some(period),
-    };
-    let hma_in = HmaInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| hma_with_kernel(&hma_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "hma_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn hma_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = HmaBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            hma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-                .map(|(combos, _, _)| combos)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "hma_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn hma_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32HmaPy, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    use numpy::IntoPyArray;
-    use pyo3::types::PyDict;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = HmaBatchRange {
-        period: period_range,
-    };
-
-    let (inner, combos, stream_u64, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaHma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let res = cuda
-            .hma_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((res.0, res.1, cuda.stream_handle_u64(), ctx, dev_id))
-    })?;
-
-    let dict = PyDict::new(py);
-    let periods: Vec<u64> = combos.iter().map(|c| c.period.unwrap() as u64).collect();
-    dict.set_item("periods", periods.into_pyarray(py))?;
-
-    dict.set_item("cai_version", 3u64)?;
-    dict.set_item("cai_typestr", "<f4")?;
-    dict.set_item("cai_shape", (inner.rows as u64, inner.cols as u64))?;
-    dict.set_item("cai_strides_bytes", ((inner.cols as u64) * 4u64, 4u64))?;
-    dict.set_item("stream", 0u64)?;
-
-    Ok((
-        DeviceArrayF32HmaPy::new(inner, ctx, dev_id, stream_u64),
-        dict,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "hma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn hma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32HmaPy> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = HmaParams {
-        period: Some(period),
-    };
-
-    let (inner, ctx, dev_id, stream_u64) = py.allow_threads(|| {
-        let cuda = CudaHma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .hma_multi_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id, cuda.stream_handle_u64()))
-    })?;
-
-    Ok(DeviceArrayF32HmaPy::new(inner, ctx, dev_id, stream_u64))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "HmaStream")]
-pub struct HmaStreamPy {
-    inner: HmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl HmaStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = HmaParams {
-            period: Some(period),
-        };
-        let stream =
-            HmaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(HmaStreamPy { inner: stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Hma", unsendable)]
-pub struct DeviceArrayF32HmaPy {
-    pub(crate) inner: crate::cuda::moving_averages::DeviceArrayF32,
-    _ctx_guard: std::sync::Arc<cust::context::Context>,
-    _device_id: u32,
-    _stream: u64,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32HmaPy {
-    #[new]
-    fn py_new() -> PyResult<Self> {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "use factory methods from CUDA functions",
-        ))
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let d = pyo3::types::PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        let size = self.inner.rows.saturating_mul(self.inner.cols);
-        let ptr_val: usize = if size == 0 {
-            0
-        } else {
-            self.inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-        use pyo3::ffi as pyffi;
-        use std::ffi::{c_void, CString};
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            crate::cuda::moving_averages::DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        return export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound);
-
-        if false {};
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32HmaPy {
-    pub fn new(
-        inner: crate::cuda::moving_averages::DeviceArrayF32,
-        ctx_guard: std::sync::Arc<cust::context::Context>,
-        device_id: u32,
-        stream_u64: u64,
-    ) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-            _stream: stream_u64,
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 #[inline]
 pub fn hma_into_slice(dst: &mut [f64], input: &HmaInput, kern: Kernel) -> Result<(), HmaError> {
     let data: &[f64] = input.as_ref();
@@ -1565,272 +1231,13 @@ pub fn hma_into_slice(dst: &mut [f64], input: &HmaInput, kern: Kernel) -> Result
     hma_with_kernel_into(input, kern, dst)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = HmaParams {
-        period: Some(period),
-    };
-    let input = HmaInput::from_slice(data, params);
-
-    let first = data
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| JsValue::from_str("All NaN"))?;
-    let sqrt_len = (period as f64).sqrt().floor() as usize;
-    if period == 0 || sqrt_len == 0 || data.len() - first < period + sqrt_len - 1 {
-        return Err(JsValue::from_str("Invalid or insufficient data"));
-    }
-    let first_out = first + period + sqrt_len - 2;
-
-    let mut output = alloc_with_nan_prefix(data.len(), first_out);
-    hma_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HmaBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HmaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<HmaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = hma_batch)]
-pub fn hma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: HmaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = HmaBatchRange {
-        period: config.period_range,
-    };
-
-    let kernel = if cfg!(target_arch = "wasm32") {
-        Kernel::ScalarBatch
-    } else {
-        Kernel::Auto
-    };
-
-    let output = hma_batch_inner(data, &sweep, kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = HmaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = HmaBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let kernel = if cfg!(target_arch = "wasm32") {
-        Kernel::ScalarBatch
-    } else {
-        Kernel::Auto
-    };
-
-    let output = hma_batch_inner(data, &sweep, kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output.values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Vec<f64> {
-    let periods: Vec<usize> = if period_step == 0 || period_start == period_end {
-        vec![period_start]
-    } else {
-        (period_start..=period_end).step_by(period_step).collect()
-    };
-
-    periods.iter().map(|&p| p as f64).collect()
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to hma_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = HmaParams {
-            period: Some(period),
-        };
-        let input = HmaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            hma_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            hma_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to hma_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = HmaBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        let kernel = if cfg!(target_arch = "wasm32") {
-            Kernel::ScalarBatch
-        } else {
-            Kernel::Auto
-        };
-
-        hma_batch_inner_into(data, &sweep, kernel, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_hma_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(hma_py, m)?)?;
-    m.add_function(wrap_pyfunction!(hma_batch_py, m)?)?;
-    m.add_class::<HmaStreamPy>()?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_class::<DeviceArrayF32HmaPy>()?;
-        m.add_function(wrap_pyfunction!(hma_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(hma_cuda_many_series_one_param_dev_py, m)?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = hma_js(data, period)?;
-    crate::write_wasm_f64_output("hma_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = hma_batch_js(data, period_start, period_end, period_step)?;
-    crate::write_wasm_f64_output("hma_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hma_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = hma_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("hma_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use proptest::prelude::*;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_hma_into_matches_api() -> Result<(), Box<dyn Error>> {
         let data: Vec<f64> = (0..512)
@@ -1855,8 +1262,8 @@ mod tests {
 
     fn check_hma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = HmaParams { period: None };
         let input_default = HmaInput::from_candles(&candles, "close", default_params);
         let output_default = hma_with_kernel(&input_default, kernel)?;
@@ -1866,8 +1273,8 @@ mod tests {
 
     fn check_hma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = HmaInput::with_default_candles(&candles);
         let result = hma_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -1942,8 +1349,8 @@ mod tests {
 
     fn check_hma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = HmaParams { period: Some(5) };
         let first_input = HmaInput::from_candles(&candles, "close", first_params);
         let first_result = hma_with_kernel(&first_input, kernel)?;
@@ -1961,8 +1368,8 @@ mod tests {
 
     fn check_hma_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = HmaParams::default();
         let period = params.period.unwrap_or(5) * 2;
         let input = HmaInput::from_candles(&candles, "close", params);
@@ -2005,8 +1412,8 @@ mod tests {
 
     fn check_hma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 5;
         let input = HmaInput::from_candles(
             &candles,
@@ -2053,8 +1460,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_data = &candles.close;
 
         let strat = (
@@ -2237,8 +1644,8 @@ mod tests {
     fn check_hma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             HmaParams::default(),
@@ -2356,8 +1763,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = HmaBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2385,8 +1792,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 5, 1),

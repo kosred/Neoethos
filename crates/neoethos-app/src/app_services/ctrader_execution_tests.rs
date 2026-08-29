@@ -116,6 +116,8 @@ fn execution_event_maps_filled_outcome_with_realized_pnl() {
     assert_eq!(outcome.order_id, Some(8001));
     assert_eq!(outcome.position_id, Some(9001));
     assert_eq!(outcome.deal_id, Some(3001));
+    assert_eq!(outcome.filled_volume_raw_centi_units, Some(10_000_000));
+    assert!(outcome.volume_scale_evidence.is_none());
     assert_eq!(outcome.trade_side.as_deref(), Some("BUY"));
     assert_eq!(outcome.order_type.as_deref(), Some("MARKET"));
     assert_eq!(outcome.lot_size, Some(100000.0));
@@ -362,6 +364,8 @@ fn validate_execution_outcome_rejects_symbol_mismatch_for_new_order() {
         lot_size: Some(1000.0),
         requested_lot_size: Some(1000.0),
         filled_lot_size: None,
+        filled_volume_raw_centi_units: None,
+        volume_scale_evidence: None,
         execution_price: None,
         gross_profit: None,
         fee: None,

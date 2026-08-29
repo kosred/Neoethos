@@ -49,12 +49,340 @@
 //!   re-emit as an augmented FeatureFrame.
 
 use super::super::Ohlcv;
+use super::features::{FeatureCellValidity, FeatureColumnF64};
+use super::timestamps::validate_canonical_millisecond_timestamps;
+use anyhow::{Context, Result, ensure};
+use std::collections::HashSet;
 
 /// Default rolling windows for cross-pair correlation and
 /// z-scored spread. Mid-frequency forex defaults: 10, 20, 50,
 /// 100 bars cover scalping (10–20), swing (50), and position
 /// (100) horizons.
 pub const DEFAULT_CROSS_PAIR_WINDOWS: &[usize] = &[10, 20, 50, 100];
+
+/// Version 2 removes index fallback and numeric warmup sentinels, adds bounded
+/// causal as-of alignment, and carries typed validity through every output.
+pub const CROSS_PAIR_TRANSFORM_SEMANTIC_VERSION: u32 = 2;
+
+/// Build the internal f64 value-plus-validity cross-pair columns used while the
+/// public feature/model boundary is migrated atomically in Tasks 5B-9.
+///
+/// Unlike [`compute_cross_pair_features`], this boundary never guesses row
+/// alignment when timestamps are absent, never encodes warmup/staleness as a
+/// numeric zero or an untyped NaN, and never forward-fills an observation past
+/// `max_staleness_ms`. Every related observation is selected causally with
+/// `related_timestamp <= base_timestamp`.
+pub fn compute_cross_pair_feature_columns_f64(
+    base: &Ohlcv,
+    related: &[(String, &Ohlcv)],
+    windows: &[usize],
+    max_staleness_ms: i64,
+) -> Result<Vec<FeatureColumnF64>> {
+    ensure!(
+        max_staleness_ms >= 0,
+        "cross-pair max staleness must be non-negative"
+    );
+    if base.is_empty() || related.is_empty() {
+        return Ok(Vec::new());
+    }
+    ensure!(!windows.is_empty(), "cross-pair windows must not be empty");
+    let mut unique_windows = HashSet::with_capacity(windows.len());
+    for &window in windows {
+        ensure!(window >= 2, "cross-pair windows must be at least two bars");
+        ensure!(
+            unique_windows.insert(window),
+            "duplicate cross-pair window {window}"
+        );
+    }
+
+    let base_timestamps = validate_cross_pair_input("base", base)?;
+    let base_returns = typed_log_returns(&base.close);
+    let mut columns = Vec::with_capacity(related.len() * (1 + windows.len() * 2));
+    let mut column_symbols = HashSet::with_capacity(related.len());
+
+    for (related_name, related_ohlcv) in related {
+        let sanitized = sanitize_symbol_for_column_name(related_name);
+        ensure!(
+            !sanitized.is_empty(),
+            "related symbol `{related_name}` has no safe column identity"
+        );
+        ensure!(
+            column_symbols.insert(sanitized.clone()),
+            "related symbol `{related_name}` collides with another cross-pair column identity `{sanitized}`"
+        );
+        let related_timestamps = validate_cross_pair_input(related_name, related_ohlcv)?;
+        let aligned = align_related_close_typed(
+            base_timestamps,
+            related_timestamps,
+            &related_ohlcv.close,
+            max_staleness_ms,
+        );
+        let related_returns = typed_log_returns_from_cells(&aligned);
+
+        for &window in windows {
+            columns.push(typed_rolling_pearson(
+                format!("xcorr_{sanitized}_{window}"),
+                &base_returns,
+                &related_returns,
+                window,
+            )?);
+        }
+
+        let spread = typed_log_spread(format!("spread_{sanitized}"), &base.close, &aligned)?;
+        columns.push(spread.clone());
+        for &window in windows {
+            columns.push(typed_rolling_zscore(
+                format!("spread_z_{sanitized}_{window}"),
+                &spread,
+                window,
+            )?);
+        }
+    }
+
+    Ok(columns)
+}
+
+fn validate_cross_pair_input<'a>(label: &str, input: &'a Ohlcv) -> Result<&'a [i64]> {
+    let timestamps = input
+        .timestamp
+        .as_deref()
+        .with_context(|| format!("cross-pair input `{label}` has no canonical timestamp column"))?;
+    ensure!(
+        timestamps.len() == input.close.len(),
+        "cross-pair input `{label}` has {} timestamps but {} close values",
+        timestamps.len(),
+        input.close.len()
+    );
+    validate_canonical_millisecond_timestamps(timestamps)
+        .with_context(|| format!("validate cross-pair input `{label}` timestamps"))?;
+    Ok(timestamps)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeatureCellF64 {
+    value: f64,
+    validity: FeatureCellValidity,
+}
+
+impl FeatureCellF64 {
+    const fn invalid(validity: FeatureCellValidity) -> Self {
+        Self {
+            value: f64::NAN,
+            validity,
+        }
+    }
+
+    fn from_positive_price(value: f64) -> Self {
+        if value.is_finite() && value > 0.0 {
+            Self {
+                value,
+                validity: FeatureCellValidity::Valid,
+            }
+        } else {
+            Self::invalid(FeatureCellValidity::NonFinite)
+        }
+    }
+}
+
+fn align_related_close_typed(
+    base_timestamps: &[i64],
+    related_timestamps: &[i64],
+    related_close: &[f64],
+    max_staleness_ms: i64,
+) -> Vec<FeatureCellF64> {
+    let mut output = Vec::with_capacity(base_timestamps.len());
+    let mut related_index = 0usize;
+
+    for &base_timestamp in base_timestamps {
+        while related_index + 1 < related_timestamps.len()
+            && related_timestamps[related_index + 1] <= base_timestamp
+        {
+            related_index += 1;
+        }
+        if related_timestamps[related_index] > base_timestamp {
+            output.push(FeatureCellF64::invalid(
+                FeatureCellValidity::AlignmentMissing,
+            ));
+            continue;
+        }
+        if base_timestamp - related_timestamps[related_index] > max_staleness_ms {
+            output.push(FeatureCellF64::invalid(FeatureCellValidity::Stale));
+            continue;
+        }
+        output.push(FeatureCellF64::from_positive_price(
+            related_close[related_index],
+        ));
+    }
+    output
+}
+
+fn typed_log_returns(closes: &[f64]) -> Vec<FeatureCellF64> {
+    let cells = closes
+        .iter()
+        .copied()
+        .map(FeatureCellF64::from_positive_price)
+        .collect::<Vec<_>>();
+    typed_log_returns_from_cells(&cells)
+}
+
+fn typed_log_returns_from_cells(cells: &[FeatureCellF64]) -> Vec<FeatureCellF64> {
+    let mut output = Vec::with_capacity(cells.len());
+    if cells.is_empty() {
+        return output;
+    }
+    output.push(FeatureCellF64::invalid(FeatureCellValidity::Warmup));
+    for pair in cells.windows(2) {
+        if !pair[0].validity.is_valid() {
+            output.push(FeatureCellF64::invalid(pair[0].validity));
+        } else if !pair[1].validity.is_valid() {
+            output.push(FeatureCellF64::invalid(pair[1].validity));
+        } else {
+            output.push(FeatureCellF64 {
+                value: pair[1].value.ln() - pair[0].value.ln(),
+                validity: FeatureCellValidity::Valid,
+            });
+        }
+    }
+    output
+}
+
+fn typed_log_spread(
+    name: String,
+    base_close: &[f64],
+    related_close: &[FeatureCellF64],
+) -> Result<FeatureColumnF64> {
+    ensure!(
+        base_close.len() == related_close.len(),
+        "cross-pair spread inputs have different lengths"
+    );
+    let mut values = Vec::with_capacity(base_close.len());
+    let mut validity = Vec::with_capacity(base_close.len());
+    for (&base, related) in base_close.iter().zip(related_close) {
+        if !related.validity.is_valid() {
+            values.push(f64::NAN);
+            validity.push(related.validity);
+        } else if !base.is_finite() || base <= 0.0 {
+            values.push(f64::NAN);
+            validity.push(FeatureCellValidity::NonFinite);
+        } else {
+            values.push(base.ln() - related.value.ln());
+            validity.push(FeatureCellValidity::Valid);
+        }
+    }
+    FeatureColumnF64::new(name, values, validity)
+}
+
+fn first_invalidity(
+    mut cells: impl Iterator<Item = FeatureCellValidity>,
+) -> Option<FeatureCellValidity> {
+    cells.find(|validity| !validity.is_valid())
+}
+
+fn typed_rolling_pearson(
+    name: String,
+    left: &[FeatureCellF64],
+    right: &[FeatureCellF64],
+    window: usize,
+) -> Result<FeatureColumnF64> {
+    ensure!(
+        left.len() == right.len(),
+        "correlation inputs differ in length"
+    );
+    let mut values = vec![f64::NAN; left.len()];
+    let mut validity = vec![FeatureCellValidity::Warmup; left.len()];
+    if left.len() < window {
+        return FeatureColumnF64::new(name, values, validity);
+    }
+
+    for end in (window - 1)..left.len() {
+        let start = end + 1 - window;
+        if let Some(reason) = first_invalidity(
+            left[start..=end]
+                .iter()
+                .chain(&right[start..=end])
+                .map(|cell| cell.validity),
+        ) {
+            validity[end] = reason;
+            continue;
+        }
+        let count = window as f64;
+        let mean_left = left[start..=end].iter().map(|cell| cell.value).sum::<f64>() / count;
+        let mean_right = right[start..=end]
+            .iter()
+            .map(|cell| cell.value)
+            .sum::<f64>()
+            / count;
+        let mut left_ss = 0.0;
+        let mut right_ss = 0.0;
+        let mut cross = 0.0;
+        for (left_cell, right_cell) in left[start..=end].iter().zip(&right[start..=end]) {
+            let left_delta = left_cell.value - mean_left;
+            let right_delta = right_cell.value - mean_right;
+            left_ss += left_delta * left_delta;
+            right_ss += right_delta * right_delta;
+            cross += left_delta * right_delta;
+        }
+        let denominator = (left_ss * right_ss).sqrt();
+        if !denominator.is_finite() {
+            validity[end] = FeatureCellValidity::NonFinite;
+        } else if denominator == 0.0 {
+            validity[end] = FeatureCellValidity::ZeroDenominator;
+        } else {
+            let value = (cross / denominator).clamp(-1.0, 1.0);
+            if value.is_finite() {
+                values[end] = value;
+                validity[end] = FeatureCellValidity::Valid;
+            } else {
+                validity[end] = FeatureCellValidity::NonFinite;
+            }
+        }
+    }
+    FeatureColumnF64::new(name, values, validity)
+}
+
+fn typed_rolling_zscore(
+    name: String,
+    source: &FeatureColumnF64,
+    window: usize,
+) -> Result<FeatureColumnF64> {
+    let mut values = vec![f64::NAN; source.len()];
+    let mut validity = vec![FeatureCellValidity::Warmup; source.len()];
+    if source.len() < window {
+        return FeatureColumnF64::new(name, values, validity);
+    }
+
+    for end in (window - 1)..source.len() {
+        let start = end + 1 - window;
+        if let Some(reason) = first_invalidity(source.validity[start..=end].iter().copied()) {
+            validity[end] = reason;
+            continue;
+        }
+        let count = window as f64;
+        let mean = source.values[start..=end].iter().sum::<f64>() / count;
+        let sum_squared_deviation = source.values[start..=end]
+            .iter()
+            .map(|value| {
+                let delta = *value - mean;
+                delta * delta
+            })
+            .sum::<f64>();
+        let standard_deviation = (sum_squared_deviation / count).sqrt();
+        if !standard_deviation.is_finite() {
+            validity[end] = FeatureCellValidity::NonFinite;
+        } else if standard_deviation == 0.0 {
+            validity[end] = FeatureCellValidity::ZeroDenominator;
+        } else {
+            let value = (source.values[end] - mean) / standard_deviation;
+            if value.is_finite() {
+                values[end] = value;
+                validity[end] = FeatureCellValidity::Valid;
+            } else {
+                validity[end] = FeatureCellValidity::NonFinite;
+            }
+        }
+    }
+    FeatureColumnF64::new(name, values, validity)
+}
 
 /// Build cross-pair feature columns for one base symbol against
 /// any number of related symbols.

@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -70,10 +52,6 @@ pub enum AdaptiveBandpassTriggerOscillatorOutputField {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdaptiveBandpassTriggerOscillatorParams {
     pub delta: Option<f64>,
     pub alpha: Option<f64>,
@@ -217,6 +195,108 @@ fn median3(x: f64, y: f64, z: f64) -> f64 {
     (x + y + z) - x.min(y.min(z)) - x.max(y.max(z))
 }
 
+/* FreeBSD msun k_cos/k_sin and the small-argument s_cos reduction.
+ *
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ * Developed at SunPro/SunSoft. Permission to use, copy, modify, and
+ * distribute this software is freely granted, provided this notice is
+ * preserved.
+ *
+ * Adaptive Bandpass only calls cosine with finite positive arguments below
+ * 2*pi/3 because length >= 6 and 0 < delta < 1. Keeping this bounded copy in
+ * both the Rust scalar and CUDA translation unit prevents a host-libm versus
+ * CUDA-libdevice ULP split from being amplified by the recursive filter.
+ */
+#[inline(always)]
+fn abto_ms_k_cos(x: f64, y: f64) -> f64 {
+    let c1 = f64::from_bits(0x3fa555555555554c);
+    let c2 = f64::from_bits(0xbf56c16c16c15177);
+    let c3 = f64::from_bits(0x3efa01a019cb1590);
+    let c4 = f64::from_bits(0xbe927e4f809c52ad);
+    let c5 = f64::from_bits(0x3e21ee9ebdb4b1c4);
+    let c6 = f64::from_bits(0xbda8fae9be8838d4);
+    let z = x * x;
+    let w2 = z * z;
+    let r = z * (c1 + z * (c2 + z * c3)) + w2 * w2 * (c4 + z * (c5 + z * c6));
+    let hz = 0.5 * z;
+    let w = 1.0 - hz;
+    w + (((1.0 - w) - hz) + (z * r - x * y))
+}
+
+#[inline(always)]
+fn abto_ms_k_sin(x: f64, y: f64) -> f64 {
+    let s1 = f64::from_bits(0xbfc5555555555549);
+    let s2 = f64::from_bits(0x3f8111111110f8a6);
+    let s3 = f64::from_bits(0xbf2a01a019c161d5);
+    let s4 = f64::from_bits(0x3ec71de357b1fe7d);
+    let s5 = f64::from_bits(0xbe5ae5e68a2b9ceb);
+    let s6 = f64::from_bits(0x3de5d93a5acfd57c);
+    let z = x * x;
+    let w = z * z;
+    let r = s2 + z * (s3 + z * s4) + z * w * (s5 + z * s6);
+    let v = z * x;
+    x - ((z * (0.5 * y - v * r) - y) - v * s1)
+}
+
+#[inline(always)]
+fn abto_reduce_pio2_near_half_pi(x: f64, high: u32) -> (f64, f64) {
+    let inv_pio2 = f64::from_bits(0x3fe4_5f30_6dc9_c883);
+    let to_int = f64::from_bits(0x4338_0000_0000_0000);
+    let pio2_1 = f64::from_bits(0x3ff9_21fb_5440_0000);
+    let pio2_1t = f64::from_bits(0x3dd0_b461_1a62_6331);
+    let pio2_2 = f64::from_bits(0x3dd0_b461_1a60_0000);
+    let pio2_2t = f64::from_bits(0x3ba3_198a_2e03_7073);
+    let pio2_3 = f64::from_bits(0x3ba3_198a_2e00_0000);
+    let pio2_3t = f64::from_bits(0x397b_839a_2520_49c1);
+
+    let tmp = x * inv_pio2 + to_int;
+    let f_n = tmp - to_int;
+    debug_assert_eq!(f_n, 1.0);
+    let mut r = x - f_n * pio2_1;
+    let mut w = f_n * pio2_1t;
+    let mut y0 = r - w;
+    let ex = (high >> 20) as i32;
+    let mut ey = ((y0.to_bits() >> 52) & 0x7ff) as i32;
+    if ex - ey > 16 {
+        let t = r;
+        w = f_n * pio2_2;
+        r = t - w;
+        w = f_n * pio2_2t - ((t - r) - w);
+        y0 = r - w;
+        ey = ((y0.to_bits() >> 52) & 0x7ff) as i32;
+        if ex - ey > 49 {
+            let t = r;
+            w = f_n * pio2_3;
+            r = t - w;
+            w = f_n * pio2_3t - ((t - r) - w);
+            y0 = r - w;
+        }
+    }
+    let y1 = (r - y0) - w;
+    (y0, y1)
+}
+
+#[inline(always)]
+fn abto_deterministic_cos(x: f64) -> f64 {
+    debug_assert!(x.is_finite() && x >= 0.0 && x < 2.0 * PI / 3.0);
+    let high = ((x.to_bits() >> 32) as u32) & 0x7fff_ffff;
+    if high <= 0x3fe9_21fb {
+        return abto_ms_k_cos(x, 0.0);
+    }
+    let (y0, y1) = if high & 0x000f_ffff == 0x0009_21fb {
+        // Near pi/2 the direct two-term subtraction loses too many bits.
+        // Mirror msun's medium argument reduction for this cancellation case.
+        abto_reduce_pio2_near_half_pi(x, high)
+    } else {
+        let pio2_1 = f64::from_bits(0x3ff9_21fb_5440_0000);
+        let pio2_1t = f64::from_bits(0x3dd0_b461_1a62_6331);
+        let z = x - pio2_1;
+        let y0 = z - pio2_1t;
+        (y0, (z - y0) - pio2_1t)
+    };
+    -abto_ms_k_sin(y0, y1)
+}
+
 #[inline(always)]
 fn count_valid_values(data: &[f64]) -> usize {
     data.iter().filter(|value| value.is_finite()).count()
@@ -358,8 +438,11 @@ impl AdaptiveBandpassTriggerOscillatorStream {
         let mut lead = f64::NAN;
         if index >= IN_PHASE_WARMUP {
             let length = p.max(6.0);
-            let beta = (2.0 * PI / length).cos();
-            let cos_angle = (4.0 * PI * self.params.delta / length).cos();
+            // Host libm and CUDA libdevice are both accurate but are not
+            // bit-identical. This recursive filter amplifies a 1-ULP cosine
+            // difference, so both lanes use the same bounded msun routine.
+            let beta = abto_deterministic_cos(2.0 * PI / length);
+            let cos_angle = abto_deterministic_cos(4.0 * PI * self.params.delta / length);
             let denom = if cos_angle.abs() < FLOAT_TOL {
                 if cos_angle.is_sign_negative() {
                     -FLOAT_TOL
@@ -598,7 +681,6 @@ pub fn adaptive_bandpass_trigger_oscillator_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn adaptive_bandpass_trigger_oscillator_into(
     input: &AdaptiveBandpassTriggerOscillatorInput,
     in_phase_out: &mut [f64],
@@ -608,10 +690,6 @@ pub fn adaptive_bandpass_trigger_oscillator_into(
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdaptiveBandpassTriggerOscillatorBatchRange {
     pub delta: (f64, f64, f64),
     pub alpha: (f64, f64, f64),
@@ -974,380 +1052,10 @@ pub fn adaptive_bandpass_trigger_oscillator_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "adaptive_bandpass_trigger_oscillator")]
-#[pyo3(signature = (data, delta=DEFAULT_DELTA, alpha=DEFAULT_ALPHA, kernel=None))]
-pub fn adaptive_bandpass_trigger_oscillator_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    delta: f64,
-    alpha: f64,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = AdaptiveBandpassTriggerOscillatorInput::from_slice(
-        data,
-        AdaptiveBandpassTriggerOscillatorParams {
-            delta: Some(delta),
-            alpha: Some(alpha),
-        },
-    );
-    let output = py
-        .allow_threads(|| adaptive_bandpass_trigger_oscillator_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        output.in_phase.into_pyarray(py),
-        output.lead.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdaptiveBandpassTriggerOscillatorStream")]
-pub struct AdaptiveBandpassTriggerOscillatorStreamPy {
-    stream: AdaptiveBandpassTriggerOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdaptiveBandpassTriggerOscillatorStreamPy {
-    #[new]
-    #[pyo3(signature = (delta=DEFAULT_DELTA, alpha=DEFAULT_ALPHA))]
-    fn new(delta: f64, alpha: f64) -> PyResult<Self> {
-        let stream = AdaptiveBandpassTriggerOscillatorStream::try_new(
-            AdaptiveBandpassTriggerOscillatorParams {
-                delta: Some(delta),
-                alpha: Some(alpha),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.stream.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adaptive_bandpass_trigger_oscillator_batch")]
-#[pyo3(signature = (data, delta_range=(DEFAULT_DELTA, DEFAULT_DELTA, 0.0), alpha_range=(DEFAULT_ALPHA, DEFAULT_ALPHA, 0.0), kernel=None))]
-pub fn adaptive_bandpass_trigger_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    delta_range: (f64, f64, f64),
-    alpha_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = AdaptiveBandpassTriggerOscillatorBatchRange {
-        delta: delta_range,
-        alpha: alpha_range,
-    };
-    let combos = expand_grid_adaptive_bandpass_trigger_oscillator(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let in_phase_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let lead_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let in_phase_slice = unsafe { in_phase_arr.as_slice_mut()? };
-    let lead_slice = unsafe { lead_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch_kernel = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            adaptive_bandpass_trigger_oscillator_batch_inner_into(
-                data,
-                &sweep,
-                batch_kernel.to_non_batch(),
-                true,
-                in_phase_slice,
-                lead_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("in_phase", in_phase_arr.reshape((rows, cols))?)?;
-    dict.set_item("lead", lead_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "deltas",
-        combos
-            .iter()
-            .map(|combo| combo.delta.unwrap_or(DEFAULT_DELTA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "alphas",
-        combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_adaptive_bandpass_trigger_oscillator_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(
-        adaptive_bandpass_trigger_oscillator_py,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        adaptive_bandpass_trigger_oscillator_batch_py,
-        module
-    )?)?;
-    module.add_class::<AdaptiveBandpassTriggerOscillatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "adaptive_bandpass_trigger_oscillator_js")]
-pub fn adaptive_bandpass_trigger_oscillator_js(
-    data: &[f64],
-    delta: f64,
-    alpha: f64,
-) -> Result<JsValue, JsValue> {
-    let input = AdaptiveBandpassTriggerOscillatorInput::from_slice(
-        data,
-        AdaptiveBandpassTriggerOscillatorParams {
-            delta: Some(delta),
-            alpha: Some(alpha),
-        },
-    );
-    let output = adaptive_bandpass_trigger_oscillator(&input)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let result = js_sys::Object::new();
-
-    let in_phase = js_sys::Float64Array::new_with_length(output.in_phase.len() as u32);
-    in_phase.copy_from(&output.in_phase);
-    js_sys::Reflect::set(&result, &JsValue::from_str("in_phase"), &in_phase)?;
-
-    let lead = js_sys::Float64Array::new_with_length(output.lead.len() as u32);
-    lead.copy_from(&output.lead);
-    js_sys::Reflect::set(&result, &JsValue::from_str("lead"), &lead)?;
-
-    Ok(result.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_bandpass_trigger_oscillator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_bandpass_trigger_oscillator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_bandpass_trigger_oscillator_into(
-    data_ptr: *const f64,
-    in_phase_ptr: *mut f64,
-    lead_ptr: *mut f64,
-    len: usize,
-    delta: f64,
-    alpha: f64,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || in_phase_ptr.is_null() || lead_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let input = AdaptiveBandpassTriggerOscillatorInput::from_slice(
-            data,
-            AdaptiveBandpassTriggerOscillatorParams {
-                delta: Some(delta),
-                alpha: Some(alpha),
-            },
-        );
-        let alias = data_ptr == in_phase_ptr || data_ptr == lead_ptr;
-        if alias {
-            let mut in_phase_tmp = vec![0.0; len];
-            let mut lead_tmp = vec![0.0; len];
-            adaptive_bandpass_trigger_oscillator_into_slices(
-                &mut in_phase_tmp,
-                &mut lead_tmp,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(in_phase_ptr, len).copy_from_slice(&in_phase_tmp);
-            std::slice::from_raw_parts_mut(lead_ptr, len).copy_from_slice(&lead_tmp);
-        } else {
-            adaptive_bandpass_trigger_oscillator_into_slices(
-                std::slice::from_raw_parts_mut(in_phase_ptr, len),
-                std::slice::from_raw_parts_mut(lead_ptr, len),
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveBandpassTriggerOscillatorBatchConfig {
-    pub delta_range: (f64, f64, f64),
-    pub alpha_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveBandpassTriggerOscillatorBatchJsOutput {
-    pub in_phase: Vec<f64>,
-    pub lead: Vec<f64>,
-    pub combos: Vec<AdaptiveBandpassTriggerOscillatorParams>,
-    pub deltas: Vec<f64>,
-    pub alphas: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "adaptive_bandpass_trigger_oscillator_batch_js")]
-pub fn adaptive_bandpass_trigger_oscillator_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: AdaptiveBandpassTriggerOscillatorBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = AdaptiveBandpassTriggerOscillatorBatchRange {
-        delta: config.delta_range,
-        alpha: config.alpha_range,
-    };
-    let output =
-        adaptive_bandpass_trigger_oscillator_batch_inner(data, &sweep, detect_best_kernel(), false)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&AdaptiveBandpassTriggerOscillatorBatchJsOutput {
-        deltas: output
-            .combos
-            .iter()
-            .map(|combo| combo.delta.unwrap_or(DEFAULT_DELTA))
-            .collect(),
-        alphas: output
-            .combos
-            .iter()
-            .map(|combo| combo.alpha.unwrap_or(DEFAULT_ALPHA))
-            .collect(),
-        in_phase: output.in_phase,
-        lead: output.lead,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_bandpass_trigger_oscillator_batch_into(
-    data_ptr: *const f64,
-    in_phase_ptr: *mut f64,
-    lead_ptr: *mut f64,
-    len: usize,
-    delta_start: f64,
-    delta_end: f64,
-    delta_step: f64,
-    alpha_start: f64,
-    alpha_end: f64,
-    alpha_step: f64,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || in_phase_ptr.is_null() || lead_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    let sweep = AdaptiveBandpassTriggerOscillatorBatchRange {
-        delta: (delta_start, delta_end, delta_step),
-        alpha: (alpha_start, alpha_end, alpha_step),
-    };
-    let combos = expand_grid_adaptive_bandpass_trigger_oscillator(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        adaptive_bandpass_trigger_oscillator_batch_inner_into(
-            data,
-            &sweep,
-            detect_best_kernel(),
-            false,
-            std::slice::from_raw_parts_mut(in_phase_ptr, total),
-            std::slice::from_raw_parts_mut(lead_ptr, total),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_bandpass_trigger_oscillator_output_into_js(
-    data: &[f64],
-    delta: f64,
-    alpha: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adaptive_bandpass_trigger_oscillator_js(data, delta, alpha)?;
-    crate::write_wasm_object_f64_outputs(
-        "adaptive_bandpass_trigger_oscillator_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_bandpass_trigger_oscillator_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adaptive_bandpass_trigger_oscillator_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "adaptive_bandpass_trigger_oscillator_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn sample_close(length: usize) -> Vec<f64> {
         let mut out = vec![f64::NAN; length];
@@ -1424,7 +1132,7 @@ mod tests {
     #[test]
     fn adaptive_bandpass_trigger_oscillator_builder_supports_candles() {
         let candles =
-            read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let out = AdaptiveBandpassTriggerOscillatorBuilder::new()
             .delta(0.1)
             .alpha(0.07)
@@ -1523,5 +1231,46 @@ mod tests {
         assert_eq!(batch.cols, close.len());
         assert_eq!(batch.in_phase.len(), 6 * close.len());
         assert_eq!(batch.lead.len(), 6 * close.len());
+    }
+
+    #[test]
+    fn deterministic_cos_matches_high_precision_golden_domain() {
+        // Correctly rounded f64 values generated from a 200-decimal reference
+        // over the complete cosine domain reachable by this indicator:
+        // beta in (0, pi/3] and cos_angle in (0, 2*pi/3).
+        let cases = [
+            (f64::from_bits(0x0000000000000000), 0x3ff0000000000000),
+            (f64::from_bits(0x3e10000000000000), 0x3ff0000000000000),
+            (f64::from_bits(0x3fb999999999999a), 0x3fefd712f9a817c1),
+            (f64::from_bits(0x3fd61cba4abb22be), 0x3fee1be4fb35bbbd),
+            (f64::from_bits(0x3fdba3e8dd69eb6e), 0x3fed0fd10e88ff77),
+            (f64::from_bits(0x3fe921fb54442d17), 0x3fe6a09e667f3bcd),
+            (f64::from_bits(0x3fe921fb54442d18), 0x3fe6a09e667f3bcd),
+            (f64::from_bits(0x3fe921fb54442d19), 0x3fe6a09e667f3bcc),
+            (f64::from_bits(0x3ff0000000000000), 0x3fe14a280fb5068c),
+            (f64::from_bits(0x3ff0c152382d7365), 0x3fe0000000000001),
+            (f64::from_bits(0x3ff8000000000000), 0x3fb21bd54fc5f9a7),
+            (f64::from_bits(0x3ff921fb54442d18), 0x3c91a62633145c07),
+            (f64::from_bits(0x4000000000000000), 0xbfdaa22657537205),
+            (f64::from_bits(0x4000c152382d7364), 0xbfdffffffffffff5),
+        ];
+        let ordered_bits = |bits: u64| {
+            if bits >> 63 == 0 {
+                bits | (1_u64 << 63)
+            } else {
+                !bits
+            }
+        };
+        for (input, correctly_rounded_bits) in cases {
+            let actual_bits = abto_deterministic_cos(input).to_bits();
+            let ulp = ordered_bits(actual_bits).abs_diff(ordered_bits(correctly_rounded_bits));
+            assert!(
+                ulp <= 1,
+                "pinned cosine exceeded one ULP from the correctly-rounded reference for \
+                 input={input:?}: actual={:?} reference={:?} ulp={ulp}",
+                f64::from_bits(actual_bits),
+                f64::from_bits(correctly_rounded_bits),
+            );
+        }
     }
 }

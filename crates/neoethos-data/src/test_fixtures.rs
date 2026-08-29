@@ -37,10 +37,18 @@
 //! enough for the warm-up of every existing indicator (longest is the
 //! Hurst-100 window used by the feature builder).
 
-use crate::{FeatureFrame, Ohlcv};
+use crate::{FeatureCellValidity, FeatureColumnF64, FeatureFrame, Ohlcv};
 use anyhow::{Context, Result};
 use ndarray::Array2;
+use neoethos_dataset_contracts::{
+    BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe,
+};
+use neoethos_feature_contracts::{
+    DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOutputV1, FeaturePlanV1,
+    SourceArtifactBindingV1, SourceSegmentV1,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Embedded JSON dump of the canonical EURUSD M1 sample. The path
 /// is relative to this source file via `include_str!` so the data
@@ -54,7 +62,8 @@ const EURUSD_M1_100BARS_JSON: &str = include_str!("../test_fixtures/eurusd_m1_10
 /// workspace convention — see `neoethos_core::utils::clock`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct CTraderBarRow {
-    /// Bar-close Unix ms (UTC).
+    /// Bar-open Unix ms (UTC). cTrader defines `utcTimestampInMinutes` as
+    /// the timestamp of the bar's opening tick.
     t: i64,
     /// Open price.
     o: f64,
@@ -146,16 +155,167 @@ pub fn ctrader_sample_ohlcv() -> Ohlcv {
 pub fn ctrader_sample_feature_frame() -> FeatureFrame {
     let ohlcv = ctrader_sample_ohlcv();
     let n = ohlcv.close.len();
-    let mut data = Array2::<f32>::zeros((n, 2));
+    let mut close_minus_open = Vec::with_capacity(n);
+    let mut range_pips = Vec::with_capacity(n);
     for i in 0..n {
-        data[(i, 0)] = (ohlcv.close[i] - ohlcv.open[i]) as f32;
-        data[(i, 1)] = ((ohlcv.high[i] - ohlcv.low[i]) * 1e4) as f32;
+        close_minus_open.push(ohlcv.close[i] - ohlcv.open[i]);
+        range_pips.push((ohlcv.high[i] - ohlcv.low[i]) * 1e4);
     }
-    FeatureFrame {
-        timestamps: ohlcv.timestamp.clone().unwrap_or_default(),
-        names: vec!["close_minus_open".to_string(), "range_pips".to_string()],
-        data: crate::FeatureData::InMemory(data),
+    let columns = vec![
+        FeatureColumnF64::new(
+            "close_minus_open",
+            close_minus_open,
+            vec![FeatureCellValidity::Valid; n],
+        )
+        .expect("fixture body column"),
+        FeatureColumnF64::new(
+            "range_pips",
+            range_pips,
+            vec![FeatureCellValidity::Valid; n],
+        )
+        .expect("fixture range column"),
+    ];
+    ctrader_test_feature_frame_from_columns(
+        ohlcv
+            .timestamp
+            .clone()
+            .expect("embedded fixture has timestamps"),
+        columns,
+    )
+    .expect("embedded f64 feature frame")
+}
+
+/// Build an f64/validity-aware feature frame for adversarial search tests while
+/// retaining the same typed plan and dataset provenance as production frames.
+///
+/// This deliberately lives under `test_fixtures`: it is not a compatibility
+/// replacement for the removed `FeatureFrame::from_array` runtime API. Callers
+/// must provide canonical Unix-millisecond timestamps and explicit validity.
+pub fn ctrader_test_feature_frame_from_columns(
+    timestamps: Vec<i64>,
+    columns: Vec<FeatureColumnF64>,
+) -> Result<FeatureFrame> {
+    anyhow::ensure!(
+        !timestamps.is_empty(),
+        "test feature timestamps must not be empty"
+    );
+    anyhow::ensure!(
+        !columns.is_empty(),
+        "test feature frame must contain columns"
+    );
+    for column in &columns {
+        anyhow::ensure!(
+            column.len() == timestamps.len(),
+            "test feature column `{}` has {} rows; timestamps have {}",
+            column.name,
+            column.len(),
+            timestamps.len()
+        );
     }
+
+    let identity = CanonicalDatasetIdentity::external(
+        "embedded-ctrader-fixture-unverified",
+        ctrader_sample_symbol(),
+        CanonicalTimeframe::M1,
+        BarTimestampConvention::BarOpen,
+    )
+    .expect("fixture dataset identity");
+    let fixture_hash: [u8; 32] = Sha256::digest(EURUSD_M1_100BARS_JSON.as_bytes()).into();
+    let source_node_id = "source:embedded-ctrader-fixture";
+    let outputs = columns
+        .iter()
+        .map(|column| FeatureOutputV1::f64(column.name.clone(), 1))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let source = FeatureNodeV1::source(
+        source_node_id,
+        identity.clone(),
+        "neoethos.test-fixture-derived-features.f64.v1",
+        1,
+        outputs,
+        fixture_hash,
+    )?;
+    let names = columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    let plan = FeaturePlanV1::new(vec![source], names)?;
+    let provenance = DatasetFeatureArtifactProvenanceV1::new(
+        &plan,
+        vec![SourceArtifactBindingV1::new(
+            source_node_id,
+            identity,
+            "neoethos.embedded-test-fixture.v1",
+            fixture_hash,
+            "embedded-fixture-v1",
+            fixture_hash,
+            BarTimestampConvention::BarOpen,
+            vec![SourceSegmentV1::new(
+                0,
+                timestamps.len() as u64,
+                timestamps[0],
+                timestamps[timestamps.len() - 1],
+            )?],
+        )?],
+    )?;
+    FeatureFrame::from_columns(timestamps, columns, plan, provenance)
+}
+
+/// Convenience adapter for legacy test matrices. The matrix is f64-only and
+/// every non-finite cell becomes explicitly invalid; it cannot reintroduce the
+/// removed f32 production contract.
+pub fn ctrader_test_feature_frame_from_matrix(
+    timestamps: Vec<i64>,
+    names: Vec<String>,
+    matrix: Array2<f64>,
+) -> Result<FeatureFrame> {
+    anyhow::ensure!(
+        matrix.nrows() == timestamps.len(),
+        "test feature matrix has {} rows; timestamps have {}",
+        matrix.nrows(),
+        timestamps.len()
+    );
+    anyhow::ensure!(
+        matrix.ncols() == names.len(),
+        "test feature matrix has {} columns; names have {}",
+        matrix.ncols(),
+        names.len()
+    );
+    let columns = names
+        .into_iter()
+        .enumerate()
+        .map(|(column_index, name)| {
+            let values = matrix.column(column_index).to_vec();
+            let validity = values
+                .iter()
+                .map(|value| {
+                    if value.is_finite() {
+                        FeatureCellValidity::Valid
+                    } else {
+                        FeatureCellValidity::NonFinite
+                    }
+                })
+                .collect();
+            FeatureColumnF64::new(name, values, validity)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ctrader_test_feature_frame_from_columns(timestamps, columns)
+}
+
+/// Produce a canonical M1 Unix-millisecond grid anchored at the captured
+/// cTrader fixture. Tests may vary values and row count without falling back to
+/// the removed seconds/nanoseconds inference path.
+pub fn canonical_test_timestamps(rows: usize) -> Vec<i64> {
+    let start = ctrader_sample_ohlcv()
+        .timestamp
+        .and_then(|timestamps| timestamps.first().copied())
+        .expect("embedded fixture has a first timestamp");
+    (0..rows)
+        .map(|row| {
+            start
+                .checked_add((row as i64) * 60_000)
+                .expect("test timestamp grid must fit i64")
+        })
+        .collect()
 }
 
 /// Convenience helper for tests that want just the first `n` bars.
@@ -165,18 +325,12 @@ pub fn ctrader_sample_ohlcv_first(n: usize) -> Ohlcv {
     let full = ctrader_sample_ohlcv();
     let count = n.min(full.close.len());
     Ohlcv {
-        timestamp: full
-            .timestamp
-            .as_ref()
-            .map(|ts| ts[..count].to_vec()),
+        timestamp: full.timestamp.as_ref().map(|ts| ts[..count].to_vec()),
         open: full.open[..count].to_vec(),
         high: full.high[..count].to_vec(),
         low: full.low[..count].to_vec(),
         close: full.close[..count].to_vec(),
-        volume: full
-            .volume
-            .as_ref()
-            .map(|v| v[..count].to_vec()),
+        volume: full.volume.as_ref().map(|v| v[..count].to_vec()),
     }
 }
 

@@ -466,16 +466,14 @@ fn engine_error(
 mod tests {
     use super::*;
     use crate::gpu_native::engine::{
-        BacktestEngine, DatasetHandle, DeviceEventHandle, DeviceFilterPolicy,
-        DeviceMetricsHandle, DeviceSelectionHandle, EngineCapabilities, EngineError,
-        EngineIdentity, EngineStatus, GeneBufferHandle, GpuDiscoverySession, HostSurvivorSummary,
-        ScenarioBufferHandle, SynchronizationMode,
+        BacktestEngine, DatasetHandle, DeviceEventHandle, DeviceFilterPolicy, DeviceMetricsHandle,
+        DeviceSelectionHandle, EngineCapabilities, EngineError, EngineIdentity, EngineStatus,
+        GeneBufferHandle, GpuDiscoverySession, HostSurvivorSummary, ScenarioBufferHandle,
+        SynchronizationMode,
     };
     use crate::gpu_native::population_fixture::TinyPopulationFixture;
     use crate::gpu_native::prototype_bc::PrototypeKind;
-    use crate::gpu_native::prototype_population::{
-        PropFirmRequirement, PrototypeBcRequirements,
-    };
+    use crate::gpu_native::prototype_population::{PropFirmRequirement, PrototypeBcRequirements};
 
     struct PoisonEngine {
         session: GpuDiscoverySession,

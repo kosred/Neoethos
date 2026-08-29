@@ -6,34 +6,37 @@
 #include <math.h>
 #include <math_constants.h>
 
+// Official latest-tie/lookback/output authority:
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_AROONOSC.c
+
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
 
 
 __device__ __forceinline__
-void max_earliest_update(float v, int i, float &best_v, int &best_i) {
-    if (v > best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
+void max_latest_update(float v, int i, float &best_v, int &best_i) {
+    if (v > best_v || (v == best_v && i > best_i)) { best_v = v; best_i = i; }
 }
 
 
 __device__ __forceinline__
-void min_earliest_update(float v, int i, float &best_v, int &best_i) {
-    if (v < best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
+void min_latest_update(float v, int i, float &best_v, int &best_i) {
+    if (v < best_v || (v == best_v && i > best_i)) { best_v = v; best_i = i; }
 }
 
 
 __device__ __forceinline__
-void warp_argmaxmin_earliest(float &max_v, int &max_i, float &min_v, int &min_i, unsigned mask) {
+void warp_argmaxmin_latest(float &max_v, int &max_i, float &min_v, int &min_i, unsigned mask) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         float mv = __shfl_down_sync(mask, max_v, offset);
         int   mi = __shfl_down_sync(mask, max_i, offset);
-        if (mv > max_v || (mv == max_v && mi < max_i)) { max_v = mv; max_i = mi; }
+        if (mv > max_v || (mv == max_v && mi > max_i)) { max_v = mv; max_i = mi; }
 
         float nv = __shfl_down_sync(mask, min_v, offset);
         int   ni = __shfl_down_sync(mask, min_i, offset);
-        if (nv < min_v || (nv == min_v && ni < min_i)) { min_v = nv; min_i = ni; }
+        if (nv < min_v || (nv == min_v && ni > min_i)) { min_v = nv; min_i = ni; }
     }
 }
 
@@ -94,12 +97,12 @@ void aroonosc_batch_f32(const float* __restrict__ high,
         for (int j = start + lane; j <= t; j += WARP_SIZE) {
             const float h = high[j];
             const float l = low[j];
-            max_earliest_update(h, j, max_v, max_i);
-            min_earliest_update(l, j, min_v, min_i);
+            max_latest_update(h, j, max_v, max_i);
+            min_latest_update(l, j, min_v, min_i);
         }
 
 
-        warp_argmaxmin_earliest(max_v, max_i, min_v, min_i, mask);
+        warp_argmaxmin_latest(max_v, max_i, min_v, min_i, mask);
 
         if (lane == 0) {
             float v = (float)(max_i - min_i) * scale;
@@ -156,9 +159,9 @@ void aroonosc_many_series_one_param_f32(const float* __restrict__ high_tm,
 
         for (int j = start + 1; j <= t; ++j) {
             const float h = high_tm[j * stride + s];
-            if (h > hi_val) { hi_val = h; hi_idx = j; }
+            if (h >= hi_val) { hi_val = h; hi_idx = j; }
             const float l = low_tm[j * stride + s];
-            if (l < lo_val) { lo_val = l; lo_idx = j; }
+            if (l <= lo_val) { lo_val = l; lo_idx = j; }
         }
         float v = (float)(hi_idx - lo_idx) * scale;
         v = fminf(100.0f, fmaxf(-100.0f, v));
@@ -175,20 +178,16 @@ void aroonosc_many_series_one_param_f32(const float* __restrict__ high_tm,
 //     start_i = first + length          <- warmup is +length, NOT +length-1
 //     scale   = 100.0 / length
 //     window  = [i - length, i]  (length + 1 bars)
-//     maxi    = the EARLIEST index in the window attaining the window max
-//     mini    = the EARLIEST index in the window attaining the window min
+//     maxi    = the LATEST index in the window attaining the window max
+//     mini    = the LATEST index in the window attaining the window min
 //     v       = (maxi - mini) * scale
 //     out[i]  = v.max(-100.0).min(100.0)
 //
-// "EARLIEST index" is not a detail. The CPU keeps a running (max, maxi) and
-// only replaces it on a STRICT `>` — so on a tie the older index wins — and
-// when the held index falls out of the window it rescans from the window start
-// with the same strict `>`. A scan that used `>=` would pick the LATEST index
-// and change the oscillator by up to 100 points on any flat stretch. This
-// kernel rescans the window with strict `>` / `<` from the window start, which
-// reproduces the invariant exactly.
+// "LATEST index" is part of TA-Lib's identity: its `>=` / `<=` comparisons
+// replace an older equal extreme. This can change the oscillator by up to 100
+// points on a flat stretch, so both CPU and CUDA retain the inclusive tests.
 //
-// NaN: `hv > max` is false for a NaN `hv`, so the CPU silently skips NaN bars
+// NaN: `hv >= max` is false for a NaN `hv`, so the CPU silently skips NaN bars
 // and keeps the last real extreme. Using fmax/fmin here would be WRONG in the
 // other direction — it would also have to track an index, and fmax carries
 // none. The comparison chain is the faithful form and it is retained; what is
@@ -240,9 +239,9 @@ void aroonosc_batch_f64(const double* __restrict__ high,
         double mn = low[wstart];
         for (int k = wstart + 1; k <= i; ++k) {
             const double hv = high[k];
-            if (hv > mx) { mx = hv; maxi = k; }
+            if (hv >= mx) { mx = hv; maxi = k; }
             const double lv = low[k];
-            if (lv < mn) { mn = lv; mini = k; }
+            if (lv <= mn) { mn = lv; mini = k; }
         }
 
         const double v = (static_cast<double>(maxi) - static_cast<double>(mini)) * scale;

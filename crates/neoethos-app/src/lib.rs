@@ -22,19 +22,15 @@ pub mod server;
 /// The headless `main.rs` binary did all five of these inline; the in-process
 /// Tauri desktop shell (`neoethos-desktop`) did NONE of them, so config.yaml
 /// runtime knobs — search population/generation overrides, hardware CPU
-/// budget, feature normalization + stale-HTF rebuild, tree-model threads, and
+/// budget, feature normalization, tree-model threads, and
 /// the app-server runtime — were silently IGNORED in the shipped desktop app
 /// while working in the CLI/headless binary. Both entry points now call this.
 pub fn install_runtime_overrides_from_settings(settings: &neoethos_core::Settings) {
     neoethos_search::install_search_runtime_overrides_from_settings(settings);
     neoethos_models::tree_models::config::install_tree_runtime_from_settings(settings);
     neoethos_models::statistical::common::install_statistical_runtime_from_settings(settings);
-    neoethos_models::genetic::install_genetic_runtime_from_settings(settings);
     neoethos_core::system::install_hardware_runtime_overrides_from_settings(settings);
-    neoethos_data::install_data_runtime_overrides(
-        settings.models.data_runtime.normalize_features,
-        settings.models.data_runtime.rebuild_stale_higher_tfs,
-    );
+    neoethos_data::install_data_runtime_overrides(settings.models.data_runtime.normalize_features);
     app_services::env_overrides::install_app_runtime_overrides(settings.app_runtime.clone());
     // 2026-08-10 config consolidation, non-negotiable #4: a retired env var
     // that is still exported must SAY SO. This is the last thing the installer

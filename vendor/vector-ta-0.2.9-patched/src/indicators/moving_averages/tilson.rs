@@ -1,19 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::tilson_wrapper::DeviceArrayF32Tilson;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::{CudaTilson, CudaTilsonError};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -23,19 +13,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for TilsonInput<'a> {
     #[inline(always)]
@@ -73,10 +50,6 @@ pub struct TilsonOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct TilsonParams {
     pub period: Option<usize>,
     pub volume_factor: Option<f64>,
@@ -252,7 +225,6 @@ pub fn tilson_with_kernel(
     Ok(TilsonOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn tilson_into(input: &TilsonInput, out: &mut [f64]) -> Result<(), TilsonError> {
     let (data, period, v_factor, first, len, chosen) = tilson_prepare(input, Kernel::Auto)?;
 
@@ -1518,67 +1490,16 @@ impl TilsonStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tilson_output_into_js(
-    data: &[f64],
-    period: usize,
-    volume_factor: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = tilson_js(data, period, volume_factor)?;
-    crate::write_wasm_f64_output("tilson_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tilson_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    v_factor_start: f64,
-    v_factor_end: f64,
-    v_factor_step: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = tilson_batch_js(
-        data,
-        period_start,
-        period_end,
-        period_step,
-        v_factor_start,
-        v_factor_end,
-        v_factor_step,
-    )?;
-    crate::write_wasm_f64_output("tilson_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tilson_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = tilson_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "tilson_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_tilson_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = TilsonParams {
             period: None,
@@ -1592,8 +1513,8 @@ mod tests {
 
     fn check_tilson_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = TilsonInput::from_candles(&candles, "close", TilsonParams::default());
         let result = tilson_with_kernel(&input, kernel)?;
@@ -1622,8 +1543,8 @@ mod tests {
 
     fn check_tilson_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = TilsonInput::with_default_candles(&candles);
         match input.data {
@@ -1718,8 +1639,8 @@ mod tests {
 
     fn check_tilson_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = TilsonParams {
             period: Some(5),
@@ -1744,8 +1665,8 @@ mod tests {
 
     fn check_tilson_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = TilsonInput::from_candles(
             &candles,
@@ -1773,8 +1694,8 @@ mod tests {
     fn check_tilson_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 5;
         let v_factor = 0.0;
@@ -1848,8 +1769,8 @@ mod tests {
     fn check_tilson_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_periods = vec![3, 5, 8, 10, 15, 20, 30, 50];
         let test_v_factors = vec![0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0];
@@ -2101,8 +2022,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = TilsonBatchBuilder::new()
             .kernel(kernel)
@@ -2155,8 +2076,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (3, 10, 2, 0.0, 0.5, 0.25),
@@ -2236,7 +2157,6 @@ mod tests {
 
         let mut out = vec![0.0; data.len()];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             tilson_into(&input, &mut out)?;
 
@@ -2440,662 +2360,4 @@ fn tilson_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "tilson")]
-#[pyo3(signature = (data, period, volume_factor=None, kernel=None))]
-
-pub fn tilson_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    volume_factor: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = TilsonParams {
-        period: Some(period),
-        volume_factor: volume_factor.or(Some(0.0)),
-    };
-    let tilson_in = TilsonInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| tilson_with_kernel(&tilson_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "TilsonStream")]
-pub struct TilsonStreamPy {
-    stream: TilsonStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl TilsonStreamPy {
-    #[new]
-    fn new(period: usize, volume_factor: Option<f64>) -> PyResult<Self> {
-        let params = TilsonParams {
-            period: Some(period),
-            volume_factor: volume_factor.or(Some(0.0)),
-        };
-        let stream =
-            TilsonStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(TilsonStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "tilson_batch")]
-#[pyo3(signature = (data, period_range, volume_factor_range=None, kernel=None))]
-
-pub fn tilson_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    volume_factor_range: Option<(f64, f64, f64)>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = TilsonBatchRange {
-        period: period_range,
-        volume_factor: volume_factor_range.unwrap_or((0.0, 0.0, 0.0)),
-    };
-
-    let combos_dim = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos_dim.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("dimensions too large to allocate"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-
-            tilson_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "volume_factors",
-        combos
-            .iter()
-            .map(|p| p.volume_factor.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "tilson_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, volume_factor_range=None, device_id=0))]
-pub fn tilson_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    volume_factor_range: Option<(f64, f64, f64)>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32TilsonPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = TilsonBatchRange {
-        period: period_range,
-        volume_factor: volume_factor_range.unwrap_or((0.0, 0.0, 0.0)),
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaTilson::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.tilson_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32TilsonPy { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "tilson_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, volume_factor, device_id=0))]
-pub fn tilson_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    volume_factor: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32TilsonPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    use numpy::PyUntypedArrayMethods;
-
-    let flat = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = TilsonParams {
-        period: Some(period),
-        volume_factor: Some(volume_factor),
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaTilson::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.tilson_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32TilsonPy { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32TilsonPy {
-    pub(crate) inner: DeviceArrayF32Tilson,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32TilsonPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = self.inner.ctx.clone();
-        let device_id = self.inner.device_id;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Tilson {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx,
-                device_id,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "tilson_into")]
-#[pyo3(signature = (data, period, volume_factor=None, kernel=None))]
-pub fn tilson_into_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    volume_factor: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let out = unsafe { PyArray1::<f64>::new(py, [slice_in.len()], false) };
-    let slice_out = unsafe { out.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = TilsonParams {
-        period: Some(period),
-        volume_factor: Some(volume_factor.unwrap_or(0.0)),
-    };
-    let input = TilsonInput::from_slice(slice_in, params);
-
-    py.allow_threads(|| tilson_into_slice(slice_out, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TilsonBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub volume_factor_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TilsonBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<TilsonParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = tilson_js)]
-
-pub fn tilson_js(data: &[f64], period: usize, volume_factor: f64) -> Result<Vec<f64>, JsValue> {
-    let params = TilsonParams {
-        period: Some(period),
-        volume_factor: Some(volume_factor),
-    };
-    let input = TilsonInput::from_slice(data, params);
-    let mut out = vec![0.0; data.len()];
-    tilson_into_slice(&mut out, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = tilson_batch_js)]
-
-pub fn tilson_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    v_factor_start: f64,
-    v_factor_end: f64,
-    v_factor_step: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = TilsonBatchRange {
-        period: (period_start, period_end, period_step),
-        volume_factor: (v_factor_start, v_factor_end, v_factor_step),
-    };
-
-    let output = tilson_batch_with_kernel(data, &sweep, Kernel::ScalarBatch)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output.values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = tilson_batch_metadata_js)]
-
-pub fn tilson_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    v_factor_start: f64,
-    v_factor_end: f64,
-    v_factor_step: f64,
-) -> Vec<f64> {
-    let sweep = TilsonBatchRange {
-        period: (period_start, period_end, period_step),
-        volume_factor: (v_factor_start, v_factor_end, v_factor_step),
-    };
-
-    let combos = match expand_grid(&sweep) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let mut result = Vec::with_capacity(combos.len() * 2);
-
-    for combo in &combos {
-        result.push(combo.period.unwrap() as f64);
-    }
-
-    for combo in &combos {
-        result.push(combo.volume_factor.unwrap());
-    }
-
-    result
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = tilson_batch)]
-pub fn tilson_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: TilsonBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = TilsonBatchRange {
-        period: config.period_range,
-        volume_factor: config.volume_factor_range,
-    };
-
-    let output = tilson_batch_with_kernel(data, &sweep, Kernel::ScalarBatch)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = TilsonBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tilson_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tilson_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tilson_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    volume_factor: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to tilson_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = TilsonParams {
-            period: Some(period),
-            volume_factor: Some(volume_factor),
-        };
-        let input = TilsonInput::from_slice(data, params);
-
-        let first = data
-            .iter()
-            .position(|&x| !x.is_nan())
-            .ok_or_else(|| JsValue::from_str("All values are NaN"))?;
-
-        let warmup = first + 6 * (period - 1);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![f64::NAN; len];
-            tilson_compute_into(
-                data,
-                period,
-                volume_factor,
-                first,
-                Kernel::Scalar,
-                &mut temp,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::ptr::copy_nonoverlapping(temp.as_ptr(), out_ptr, len);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-            for i in 0..warmup.min(len) {
-                out[i] = f64::NAN;
-            }
-            tilson_compute_into(data, period, volume_factor, first, Kernel::Scalar, out)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn tilson_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    v_factor_start: f64,
-    v_factor_end: f64,
-    v_factor_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to tilson_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = TilsonBatchRange {
-            period: (period_start, period_end, period_step),
-            volume_factor: (v_factor_start, v_factor_end, v_factor_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows * cols;
-
-        if total == 0 {
-            return Err(JsValue::from_str("Invalid batch configuration"));
-        }
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        tilson_batch_inner_into(data, &sweep, Kernel::Scalar, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-)]
-pub struct TilsonContext {
-    period: usize,
-    c1: f64,
-    c2: f64,
-    c3: f64,
-    c4: f64,
-    kernel: Kernel,
-
-    ema1: f64,
-    ema2: f64,
-    ema3: f64,
-    ema4: f64,
-    ema5: f64,
-    ema6: f64,
-    initialized: bool,
-    warmup_count: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(deprecated)]
-impl TilsonContext {
-    #[wasm_bindgen(constructor)]
-    #[deprecated(
-        since = "1.0.0",
-        note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-    )]
-    pub fn new(period: usize, volume_factor: f64) -> Result<TilsonContext, JsValue> {
-        if period == 0 {
-            return Err(JsValue::from_str("Invalid period: 0"));
-        }
-        if volume_factor.is_nan() || volume_factor.is_infinite() {
-            return Err(JsValue::from_str(&format!(
-                "Invalid volume factor: {}",
-                volume_factor
-            )));
-        }
-
-        let c1 = -volume_factor.powi(3);
-        let c2 = 3.0 * volume_factor.powi(2) + 3.0 * volume_factor.powi(3);
-        let c3 = -6.0 * volume_factor.powi(2) - 3.0 * volume_factor - 3.0 * volume_factor.powi(3);
-        let c4 = 1.0 + 3.0 * volume_factor + volume_factor.powi(3) + 3.0 * volume_factor.powi(2);
-
-        Ok(TilsonContext {
-            period,
-            c1,
-            c2,
-            c3,
-            c4,
-            kernel: Kernel::Scalar,
-            ema1: 0.0,
-            ema2: 0.0,
-            ema3: 0.0,
-            ema4: 0.0,
-            ema5: 0.0,
-            ema6: 0.0,
-            initialized: false,
-            warmup_count: 0,
-        })
-    }
-
-    #[wasm_bindgen]
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        if value.is_nan() {
-            return None;
-        }
-
-        let alpha = 2.0 / (self.period as f64 + 1.0);
-
-        if !self.initialized {
-            self.ema1 = value;
-            self.ema2 = value;
-            self.ema3 = value;
-            self.ema4 = value;
-            self.ema5 = value;
-            self.ema6 = value;
-            self.initialized = true;
-        } else {
-            self.ema1 = alpha * value + (1.0 - alpha) * self.ema1;
-            self.ema2 = alpha * self.ema1 + (1.0 - alpha) * self.ema2;
-            self.ema3 = alpha * self.ema2 + (1.0 - alpha) * self.ema3;
-            self.ema4 = alpha * self.ema3 + (1.0 - alpha) * self.ema4;
-            self.ema5 = alpha * self.ema4 + (1.0 - alpha) * self.ema5;
-            self.ema6 = alpha * self.ema5 + (1.0 - alpha) * self.ema6;
-        }
-
-        self.warmup_count += 1;
-
-        if self.warmup_count <= 6 * (self.period - 1) {
-            None
-        } else {
-            Some(
-                self.c1 * self.ema6
-                    + self.c2 * self.ema5
-                    + self.c3 * self.ema4
-                    + self.c4 * self.ema3,
-            )
-        }
-    }
-
-    #[wasm_bindgen]
-    pub fn reset(&mut self) {
-        self.ema1 = 0.0;
-        self.ema2 = 0.0;
-        self.ema3 = 0.0;
-        self.ema4 = 0.0;
-        self.ema5 = 0.0;
-        self.ema6 = 0.0;
-        self.initialized = false;
-        self.warmup_count = 0;
-    }
-
-    #[wasm_bindgen]
-    pub fn get_warmup_period(&self) -> usize {
-        6 * (self.period - 1)
-    }
 }

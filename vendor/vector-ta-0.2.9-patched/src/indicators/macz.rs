@@ -1,31 +1,13 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use js_sys;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
-use crate::indicators::moving_averages::sma::{sma_with_kernel, SmaInput, SmaParams};
-use crate::indicators::stddev::{stddev_with_kernel, StdDevInput, StdDevParams};
+use crate::indicators::moving_averages::sma::{SmaInput, SmaParams, sma_with_kernel};
+use crate::indicators::stddev::{StdDevInput, StdDevParams, stddev_with_kernel};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -87,10 +69,6 @@ pub struct MaczOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MaczParams {
     pub fast_length: Option<usize>,
     pub slow_length: Option<usize>,
@@ -773,7 +751,6 @@ pub fn macz(input: &MaczInput) -> Result<MaczOutput, MaczError> {
     macz_with_kernel(input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn macz_into(input: &MaczInput, out: &mut [f64]) -> Result<(), MaczError> {
     macz_into_slice(out, input, Kernel::Auto)
 }
@@ -985,11 +962,7 @@ pub unsafe fn macz_scalar_classic(
             let e2 = sum2_lz * inv_lz;
             let var = (-2.0 * vwap_i).mul_add(e, e2) + vwap_i * vwap_i;
             let sd = var.max(0.0).sqrt();
-            if sd > 0.0 {
-                (x - vwap_i) / sd
-            } else {
-                0.0
-            }
+            if sd > 0.0 { (x - vwap_i) / sd } else { 0.0 }
         } else {
             f64::NAN
         };
@@ -1842,11 +1815,7 @@ impl MaczStream {
         #[inline(always)]
         fn add_off(i: usize, off: usize, n: usize) -> usize {
             let j = i + off;
-            if j >= n {
-                j - n
-            } else {
-                j
-            }
+            if j >= n { j - n } else { j }
         }
 
         let leaving_fast_idx = add_off(idx, self.off_fast, bsz);
@@ -2009,880 +1978,15 @@ impl MaczStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "macz")]
-#[pyo3(signature = (data, volume=None, fast_length=12, slow_length=25, signal_length=9, lengthz=20, length_stdev=25, a=1.0, b=1.0, use_lag=false, gamma=0.02, kernel=None))]
-pub fn macz_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    volume: Option<PyReadonlyArray1<'py, f64>>,
-    fast_length: usize,
-    slow_length: usize,
-    signal_length: usize,
-    lengthz: usize,
-    length_stdev: usize,
-    a: f64,
-    b: f64,
-    use_lag: bool,
-    gamma: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = MaczParams {
-        fast_length: Some(fast_length),
-        slow_length: Some(slow_length),
-        signal_length: Some(signal_length),
-        lengthz: Some(lengthz),
-        length_stdev: Some(length_stdev),
-        a: Some(a),
-        b: Some(b),
-        use_lag: Some(use_lag),
-        gamma: Some(gamma),
-    };
-
-    let result_vec: Vec<f64> = if let Some(vol) = volume {
-        let v = vol.as_slice()?;
-        let input = MaczInput::from_slice_with_volume(slice_in, v, params);
-        py.allow_threads(|| macz_with_kernel(&input, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    } else {
-        let input = MaczInput::from_slice(slice_in, params);
-        py.allow_threads(|| macz_with_kernel(&input, kern).map(|o| o.values))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-    };
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaMacz;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "macz_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, volume_f32=None, fast_length_range=(12,12,0), slow_length_range=(25,25,0), signal_length_range=(9,9,0), lengthz_range=(20,20,0), length_stdev_range=(25,25,0), a_range=(1.0,1.0,0.0), b_range=(1.0,1.0,0.0), device_id=0))]
-pub fn macz_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    volume_f32: Option<numpy::PyReadonlyArray1<'py, f32>>,
-    fast_length_range: (usize, usize, usize),
-    slow_length_range: (usize, usize, usize),
-    signal_length_range: (usize, usize, usize),
-    lengthz_range: (usize, usize, usize),
-    length_stdev_range: (usize, usize, usize),
-    a_range: (f64, f64, f64),
-    b_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let price = data_f32.as_slice()?;
-    let volume_opt: Option<&[f32]> = volume_f32.as_ref().map(|v| v.as_slice()).transpose()?;
-    let sweep = MaczBatchRange {
-        fast_length: fast_length_range,
-        slow_length: slow_length_range,
-        signal_length: signal_length_range,
-        lengthz: lengthz_range,
-        length_stdev: length_stdev_range,
-        a: a_range,
-        b: b_range,
-    };
-
-    let ((inner, inner_ctx, inner_dev_id), combos) = py.allow_threads(|| {
-        let cuda = CudaMacz::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.macz_batch_dev(price, volume_opt, &sweep)
-            .map(|(inner, combos)| ((inner, ctx, dev_id), combos))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "fast_lengths",
-        combos
-            .iter()
-            .map(|p| p.fast_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_lengths",
-        combos
-            .iter()
-            .map(|p| p.slow_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signal_lengths",
-        combos
-            .iter()
-            .map(|p| p.signal_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "lengthz",
-        combos
-            .iter()
-            .map(|p| p.lengthz.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "length_stdev",
-        combos
-            .iter()
-            .map(|p| p.length_stdev.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "a",
-        combos
-            .iter()
-            .map(|p| p.a.unwrap_or(1.0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "b",
-        combos
-            .iter()
-            .map(|p| p.b.unwrap_or(1.0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok((
-        DeviceArrayF32Py {
-            inner,
-            _ctx: Some(inner_ctx),
-            device_id: Some(inner_dev_id),
-        },
-        dict,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "macz_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (close_tm_f32, volume_tm_f32, cols, rows, fast_length=12, slow_length=25, signal_length=9, lengthz=20, length_stdev=25, a=1.0, b=1.0, use_lag=false, gamma=0.02, device_id=0))]
-pub fn macz_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    close_tm_f32: numpy::PyReadonlyArray1<'py, f32>,
-    volume_tm_f32: Option<numpy::PyReadonlyArray1<'py, f32>>,
-    cols: usize,
-    rows: usize,
-    fast_length: usize,
-    slow_length: usize,
-    signal_length: usize,
-    lengthz: usize,
-    length_stdev: usize,
-    a: f64,
-    b: f64,
-    use_lag: bool,
-    gamma: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let price_tm = close_tm_f32.as_slice()?;
-    let vol_tm_opt: Option<&[f32]> = volume_tm_f32.as_ref().map(|v| v.as_slice()).transpose()?;
-    let params = MaczParams {
-        fast_length: Some(fast_length),
-        slow_length: Some(slow_length),
-        signal_length: Some(signal_length),
-        lengthz: Some(lengthz),
-        length_stdev: Some(length_stdev),
-        a: Some(a),
-        b: Some(b),
-        use_lag: Some(use_lag),
-        gamma: Some(gamma),
-    };
-    let (inner, inner_ctx, inner_dev_id) = py.allow_threads(|| {
-        let cuda = CudaMacz::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.macz_many_series_one_param_time_major_dev(price_tm, vol_tm_opt, cols, rows, &params)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(inner_ctx),
-        device_id: Some(inner_dev_id),
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MaczStream")]
-pub struct MaczStreamPy {
-    stream: MaczStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MaczStreamPy {
-    #[new]
-    fn new(
-        fast_length: usize,
-        slow_length: usize,
-        signal_length: usize,
-        lengthz: usize,
-        length_stdev: usize,
-        a: f64,
-        b: f64,
-        use_lag: bool,
-        gamma: f64,
-    ) -> PyResult<Self> {
-        let params = MaczParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-            signal_length: Some(signal_length),
-            lengthz: Some(lengthz),
-            length_stdev: Some(length_stdev),
-            a: Some(a),
-            b: Some(b),
-            use_lag: Some(use_lag),
-            gamma: Some(gamma),
-        };
-        let stream = MaczStream::new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(MaczStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64, volume: Option<f64>) -> Option<f64> {
-        self.stream.update(value, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "macz_batch")]
-#[pyo3(signature = (data, volume=None, fast_length_range=(12,12,0), slow_length_range=(25,25,0), signal_length_range=(9,9,0), lengthz_range=(20,20,0), length_stdev_range=(25,25,0), a_range=(1.0,1.0,0.0), b_range=(1.0,1.0,0.0), use_lag_range=(false,false,false), gamma_range=(0.02,0.02,0.0), kernel=None))]
-pub fn macz_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    volume: Option<numpy::PyReadonlyArray1<'py, f64>>,
-    fast_length_range: (usize, usize, usize),
-    slow_length_range: (usize, usize, usize),
-    signal_length_range: (usize, usize, usize),
-    lengthz_range: (usize, usize, usize),
-    length_stdev_range: (usize, usize, usize),
-    a_range: (f64, f64, f64),
-    b_range: (f64, f64, f64),
-    use_lag_range: (bool, bool, bool),
-    gamma_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let vol_opt: Option<&[f64]> = volume.as_ref().map(|v| v.as_slice()).transpose()?;
-    let sweep = MaczBatchRange {
-        fast_length: fast_length_range,
-        slow_length: slow_length_range,
-        signal_length: signal_length_range,
-        lengthz: lengthz_range,
-        length_stdev: length_stdev_range,
-        a: a_range,
-        b: b_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-    let combos = expand_grid_macz(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total_len = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in macz_batch_py"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total_len], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => Kernel::ScalarBatch,
-                k => k,
-            };
-            macz_batch_inner_into_vol(slice_in, vol_opt, &sweep, k, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fast_lengths",
-        combos
-            .iter()
-            .map(|p| p.fast_length.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_lengths",
-        combos
-            .iter()
-            .map(|p| p.slow_length.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signal_lengths",
-        combos
-            .iter()
-            .map(|p| p.signal_length.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "lengthz",
-        combos
-            .iter()
-            .map(|p| p.lengthz.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "length_stdev",
-        combos
-            .iter()
-            .map(|p| p.length_stdev.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "a",
-        combos
-            .iter()
-            .map(|p| p.a.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "b",
-        combos
-            .iter()
-            .map(|p| p.b.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_js(
-    data: &[f64],
-    fast_length: usize,
-    slow_length: usize,
-    signal_length: usize,
-    lengthz: usize,
-    length_stdev: usize,
-    a: f64,
-    b: f64,
-    use_lag: bool,
-    gamma: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let params = MaczParams {
-        fast_length: Some(fast_length),
-        slow_length: Some(slow_length),
-        signal_length: Some(signal_length),
-        lengthz: Some(lengthz),
-        length_stdev: Some(length_stdev),
-        a: Some(a),
-        b: Some(b),
-        use_lag: Some(use_lag),
-        gamma: Some(gamma),
-    };
-
-    let input = MaczInput::from_slice(data, params);
-
-    macz(&input)
-        .map(|o| o.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_start: usize,
-    fast_end: usize,
-    fast_step: usize,
-    slow_start: usize,
-    slow_end: usize,
-    slow_step: usize,
-    sig_start: usize,
-    sig_end: usize,
-    sig_step: usize,
-    lz_start: usize,
-    lz_end: usize,
-    lz_step: usize,
-    lsd_start: usize,
-    lsd_end: usize,
-    lsd_step: usize,
-    a_start: f64,
-    a_end: f64,
-    a_step: f64,
-    b_start: f64,
-    b_end: f64,
-    b_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to macz_batch_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = MaczBatchRange {
-            fast_length: (fast_start, fast_end, fast_step),
-            slow_length: (slow_start, slow_end, slow_step),
-            signal_length: (sig_start, sig_end, sig_step),
-            lengthz: (lz_start, lz_end, lz_step),
-            length_stdev: (lsd_start, lsd_end, lsd_step),
-            a: (a_start, a_end, a_step),
-            b: (b_start, b_end, b_step),
-        };
-        let combos = expand_grid_macz(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in macz_batch_into"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        macz_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_batch_into_with_volume(
-    in_ptr: *const f64,
-    vol_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_start: usize,
-    fast_end: usize,
-    fast_step: usize,
-    slow_start: usize,
-    slow_end: usize,
-    slow_step: usize,
-    sig_start: usize,
-    sig_end: usize,
-    sig_step: usize,
-    lz_start: usize,
-    lz_end: usize,
-    lz_step: usize,
-    lsd_start: usize,
-    lsd_end: usize,
-    lsd_step: usize,
-    a_start: f64,
-    a_end: f64,
-    a_step: f64,
-    b_start: f64,
-    b_end: f64,
-    b_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || vol_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to macz_batch_into_with_volume",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let volume = std::slice::from_raw_parts(vol_ptr, len);
-        let sweep = MaczBatchRange {
-            fast_length: (fast_start, fast_end, fast_step),
-            slow_length: (slow_start, slow_end, slow_step),
-            signal_length: (sig_start, sig_end, sig_step),
-            lengthz: (lz_start, lz_end, lz_step),
-            length_stdev: (lsd_start, lsd_end, lsd_step),
-            a: (a_start, a_end, a_step),
-            b: (b_start, b_end, b_step),
-        };
-        let combos = expand_grid_macz(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows.checked_mul(cols).ok_or_else(|| {
-            JsValue::from_str("rows*cols overflow in macz_batch_into_with_volume")
-        })?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        macz_batch_inner_into_vol(data, Some(volume), &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_length: usize,
-    slow_length: usize,
-    signal_length: usize,
-    lengthz: usize,
-    length_stdev: usize,
-    a: f64,
-    b: f64,
-    use_lag: bool,
-    gamma: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = MaczParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-            signal_length: Some(signal_length),
-            lengthz: Some(lengthz),
-            length_stdev: Some(length_stdev),
-            a: Some(a),
-            b: Some(b),
-            use_lag: Some(use_lag),
-            gamma: Some(gamma),
-        };
-        let input = MaczInput::from_slice(data, params);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        macz_into_slice(out, &input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "macz")]
-pub fn macz_wasm_zero_copy(
-    data: &[f64],
-    out_ptr: *mut f64,
-    fast_length: usize,
-    slow_length: usize,
-    signal_length: usize,
-    lengthz: usize,
-    length_stdev: usize,
-    a: f64,
-    b: f64,
-    use_lag: bool,
-    gamma: f64,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str("Output pointer is null"));
-    }
-
-    unsafe {
-        let out_slice = std::slice::from_raw_parts_mut(out_ptr, data.len());
-        let params = MaczParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-            signal_length: Some(signal_length),
-            lengthz: Some(lengthz),
-            length_stdev: Some(length_stdev),
-            a: Some(a),
-            b: Some(b),
-            use_lag: Some(use_lag),
-            gamma: Some(gamma),
-        };
-
-        let input = MaczInput::from_slice(data, params);
-        macz_into_slice(out_slice, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_batch(
-    data: &[f64],
-    volume: Option<Vec<f64>>,
-    fast_length_range: Vec<usize>,
-    slow_length_range: Vec<usize>,
-    signal_length_range: Vec<usize>,
-    lengthz_range: Vec<usize>,
-    length_stdev_range: Vec<usize>,
-    a_range: Vec<f64>,
-    b_range: Vec<f64>,
-    use_lag_range: JsValue,
-    gamma_range: Vec<f64>,
-) -> Result<JsValue, JsValue> {
-    if fast_length_range.len() != 3
-        || slow_length_range.len() != 3
-        || signal_length_range.len() != 3
-        || lengthz_range.len() != 3
-        || length_stdev_range.len() != 3
-        || a_range.len() != 3
-        || b_range.len() != 3
-        || gamma_range.len() != 3
-    {
-        return Err(JsValue::from_str(
-            "All ranges must have exactly 3 elements: [start, end, step]",
-        ));
-    }
-
-    let use_lag_arr = js_sys::Array::from(&use_lag_range);
-    if use_lag_arr.length() != 3 {
-        return Err(JsValue::from_str(
-            "use_lag_range must have exactly 3 elements",
-        ));
-    }
-    let use_lag = use_lag_arr.get(0).as_bool().unwrap_or(false);
-
-    let sweep = MaczBatchRange {
-        fast_length: (
-            fast_length_range[0],
-            fast_length_range[1],
-            fast_length_range[2],
-        ),
-        slow_length: (
-            slow_length_range[0],
-            slow_length_range[1],
-            slow_length_range[2],
-        ),
-        signal_length: (
-            signal_length_range[0],
-            signal_length_range[1],
-            signal_length_range[2],
-        ),
-        lengthz: (lengthz_range[0], lengthz_range[1], lengthz_range[2]),
-        length_stdev: (
-            length_stdev_range[0],
-            length_stdev_range[1],
-            length_stdev_range[2],
-        ),
-        a: (a_range[0], a_range[1], a_range[2]),
-        b: (b_range[0], b_range[1], b_range[2]),
-    };
-
-    let volume_ref = volume.as_deref();
-    let output = if let Some(vol) = volume_ref {
-        macz_batch_slice_vol(data, Some(vol), &sweep, detect_best_kernel())
-    } else {
-        macz_batch_slice(data, &sweep, detect_best_kernel())
-    }
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let result = MaczBatchJsOutput {
-        values: vec![output.values.clone()],
-        fast_lengths: output
-            .combos
-            .iter()
-            .map(|c| c.fast_length.unwrap_or(12))
-            .collect(),
-        slow_lengths: output
-            .combos
-            .iter()
-            .map(|c| c.slow_length.unwrap_or(25))
-            .collect(),
-        signal_lengths: output
-            .combos
-            .iter()
-            .map(|c| c.signal_length.unwrap_or(9))
-            .collect(),
-    };
-
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_batch_zero_copy(
-    data: &[f64],
-    volume: Option<Vec<f64>>,
-    out_ptr: *mut f64,
-    fast_length_range: Vec<usize>,
-    slow_length_range: Vec<usize>,
-    signal_length_range: Vec<usize>,
-    lengthz_range: Vec<usize>,
-    length_stdev_range: Vec<usize>,
-    a_range: Vec<f64>,
-    b_range: Vec<f64>,
-    use_lag_range: JsValue,
-    gamma_range: Vec<f64>,
-) -> Result<usize, JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str("Output pointer is null"));
-    }
-
-    if fast_length_range.len() != 3
-        || slow_length_range.len() != 3
-        || signal_length_range.len() != 3
-        || lengthz_range.len() != 3
-        || length_stdev_range.len() != 3
-        || a_range.len() != 3
-        || b_range.len() != 3
-        || gamma_range.len() != 3
-    {
-        return Err(JsValue::from_str(
-            "All ranges must have exactly 3 elements: [start, end, step]",
-        ));
-    }
-
-    let use_lag_arr = js_sys::Array::from(&use_lag_range);
-    if use_lag_arr.length() != 3 {
-        return Err(JsValue::from_str(
-            "use_lag_range must have exactly 3 elements",
-        ));
-    }
-    let use_lag = use_lag_arr.get(0).as_bool().unwrap_or(false);
-
-    let sweep = MaczBatchRange {
-        fast_length: (
-            fast_length_range[0],
-            fast_length_range[1],
-            fast_length_range[2],
-        ),
-        slow_length: (
-            slow_length_range[0],
-            slow_length_range[1],
-            slow_length_range[2],
-        ),
-        signal_length: (
-            signal_length_range[0],
-            signal_length_range[1],
-            signal_length_range[2],
-        ),
-        lengthz: (lengthz_range[0], lengthz_range[1], lengthz_range[2]),
-        length_stdev: (
-            length_stdev_range[0],
-            length_stdev_range[1],
-            length_stdev_range[2],
-        ),
-        a: (a_range[0], a_range[1], a_range[2]),
-        b: (b_range[0], b_range[1], b_range[2]),
-    };
-
-    let num_combinations = 1;
-
-    unsafe {
-        let out_slice = std::slice::from_raw_parts_mut(out_ptr, num_combinations * data.len());
-        let volume_ref = volume.as_deref();
-
-        let params = MaczParams {
-            fast_length: Some(fast_length_range[0]),
-            slow_length: Some(slow_length_range[0]),
-            signal_length: Some(signal_length_range[0]),
-            lengthz: Some(lengthz_range[0]),
-            length_stdev: Some(length_stdev_range[0]),
-            a: Some(a_range[0]),
-            b: Some(b_range[0]),
-            use_lag: Some(use_lag),
-            gamma: Some(gamma_range[0]),
-        };
-
-        let input = if let Some(vol) = volume_ref {
-            MaczInput {
-                data: MaczData::SliceWithVolume { data, volume: vol },
-                params,
-            }
-        } else {
-            MaczInput::from_slice(data, params)
-        };
-
-        macz_into_slice(&mut out_slice[..data.len()], &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(num_combinations)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MaczBatchJsOutput {
-    pub values: Vec<Vec<f64>>,
-    pub fast_lengths: Vec<usize>,
-    pub slow_lengths: Vec<usize>,
-    pub signal_lengths: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MaczBatchConfig {
-    pub fast_length_min: usize,
-    pub fast_length_max: usize,
-    pub fast_length_step: usize,
-    pub slow_length_min: usize,
-    pub slow_length_max: usize,
-    pub slow_length_step: usize,
-    pub signal_length_min: usize,
-    pub signal_length_max: usize,
-    pub signal_length_step: usize,
-    pub lengthz: usize,
-    pub length_stdev: usize,
-    pub a: f64,
-    pub b: f64,
-    pub use_lag: bool,
-    pub gamma: f64,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macz_output_into_js(
-    data: &[f64],
-    fast_length: usize,
-    slow_length: usize,
-    signal_length: usize,
-    lengthz: usize,
-    length_stdev: usize,
-    a: f64,
-    b: f64,
-    use_lag: bool,
-    gamma: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = macz_js(
-        data,
-        fast_length,
-        slow_length,
-        signal_length,
-        lengthz,
-        length_stdev,
-        a,
-        b,
-        use_lag,
-        gamma,
-    )?;
-    crate::write_wasm_f64_output("macz_output_into_js", &values, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_macz_into_matches_api() -> Result<(), Box<dyn Error>> {
         let n = 256usize;
@@ -2917,8 +2021,8 @@ mod tests {
 
     fn check_macz_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = MaczParams {
             fast_length: None,
@@ -2942,8 +2046,8 @@ mod tests {
 
     fn check_macz_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = MaczParams::default();
         let input = MaczInput::from_candles(&candles, "close", params);
@@ -3328,8 +2432,8 @@ mod tests {
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let output = MaczBatchBuilder::new()
             .kernel(kernel)
@@ -3406,8 +2510,8 @@ mod tests {
 
     fn check_macz_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let fp = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(fp)?;
+        let fp = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(fp)?;
         let input = MaczInput::with_default_candles_auto_volume(&c);
         match input.data {
             MaczData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -3420,8 +2524,8 @@ mod tests {
 
     fn check_macz_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let fp = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(fp)?;
+        let fp = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(fp)?;
         let v = vec![1.0; c.close.len()];
         let first = MaczInput::from_candles_with_volume(&c, "close", &v, MaczParams::default());
         let a = macz_with_kernel(&first, kernel)?;
@@ -3434,8 +2538,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_macz_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let fp = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(fp)?;
+        let fp = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(fp)?;
         let v = vec![1.0; c.close.len()];
         let input = MaczInput::from_candles_with_volume(&c, "close", &v, MaczParams::default());
         let out = macz_with_kernel(&input, kernel)?;
@@ -3471,8 +2575,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = MaczBatchBuilder::new()
             .kernel(kernel)
             .fast_range(10, 12, 1)
@@ -3502,8 +2606,8 @@ mod tests {
 
     fn check_batch_with_volume(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = MaczBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -3868,9 +2972,9 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn check_macz_batch_no_poison() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let sweep = MaczBatchRange::default();
         let out = macz_batch_with_kernel(&c.close, &sweep, Kernel::ScalarBatch)?;
         for (idx, &v) in out.values.iter().enumerate() {

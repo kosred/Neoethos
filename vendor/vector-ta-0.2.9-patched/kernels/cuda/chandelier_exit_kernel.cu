@@ -398,15 +398,16 @@ extern "C" __global__ void chandelier_exit_many_series_one_param_time_major_f32(
 //   src/indicators/atr.rs
 //   `first_valid_hlc`            (:197) — ATR's OWN first-valid
 //   `atr_compute_into_scalar`    (:319) — the Wilder seed and update
-//   Batch route: `cpu_batch.rs:14231` sweeps `period`; mult = 3.0,
-//   use_close = true, and the "value" output is `long_stop` (`:14263`).
+//   Canonical production sweeps `period`; mult = 3.0 and use_close = true.
+//   The exact registered outputs are `long_stop` and `short_stop`, both emitted
+//   by the resident pair entry below.
 //
 // FIRST-VALID: `HlcCloseOnly`, NOT the common rule.
 //   With `use_close == true` — the batch default — `ce_first_valid` returns
 //   `close.iter().position(|x| !x.is_nan())` and NEVER LOOKS AT high or low.
-//   That is the `adxr` rule. (With `use_close == false` it would be the MIN of
-//   the three firsts, which is a fourth rule again and is unreachable from the
-//   batch route; the kernel implements it anyway so the branch is not a trap.)
+//   That is the `adxr` rule. (With `use_close == false` it is the MIN of the
+//   three firsts, a fourth rule retained for the standalone/public ABI; the
+//   canonical resident feature route fails closed before admitting it.)
 //
 // TWO DIFFERENT FIRST-VALID INDICES LIVE IN THIS ONE KERNEL.
 //   The stop recurrence uses `ce_first_valid`. The ATR it consumes is produced
@@ -441,34 +442,36 @@ __device__ __forceinline__ double neo_s2_qnan() {
     return __longlong_as_double(0x7ff8000000000000LL);
 }
 
-extern "C" __global__ void neoethos_chandelier_exit_batch_f64(
+__device__ __forceinline__ void chandelier_exit_row_f64(
     const double* __restrict__ high,
     const double* __restrict__ low,
     const double* __restrict__ close,
     int n,
-    const int* __restrict__ periods,
-    int n_combos,
+    int period,
+    double mult,
+    bool use_close,
     int first_valid,
-    double* __restrict__ out)
+    int* __restrict__ dq_max,
+    int* __restrict__ dq_min,
+    int deque_scratch_cap,
+    double* __restrict__ row_long_stop,
+    double* __restrict__ row_short_stop)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= n_combos) return;
-
-    double* __restrict__ row = out + (size_t)r * (size_t)n;
-    const int period = periods[r];
-    const double mult = 3.0;        // ChandelierExitParams::get_mult -> 3.0
-    const bool use_close = true;    // ... ::get_use_close -> true
+    const bool emit_short = row_short_stop != nullptr;
+    for (int i = 0; i < n; ++i) {
+        row_long_stop[i] = neo_s2_qnan();
+        if (emit_short) row_short_stop[i] = neo_s2_qnan();
+    }
 
     const bool declined =
         (n <= 0) ||
-        (period <= 0) || (period > n) || (period > CE_MAX_PERIOD) ||
+        (period <= 0) || (period > n) ||
         (first_valid < 0) || (first_valid >= n);
-    if (declined) {
-        for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
-        return;
-    }
+    if (declined) return;
 
-    for (int i = 0; i < n; ++i) row[i] = neo_s2_qnan();
+    int cap = 1;
+    while (cap < period && cap > 0) cap <<= 1;
+    if (cap <= 0 || cap > deque_scratch_cap || dq_max == nullptr || dq_min == nullptr) return;
 
     // ---- ce_first_valid -------------------------------------------------
     int fc = -1;
@@ -533,14 +536,10 @@ extern "C" __global__ void neoethos_chandelier_exit_batch_f64(
     double short_raw_prev = neo_s2_qnan();
     int prev_dir = 1;
 
-    // Monotone deques over the max/min source. `cap` is the CPU's
-    // `period.next_power_of_two()`, and the head/tail are free-running
-    // counters masked into it — reproduced so the wrap behaviour matches.
-    int cap = 1;
-    while (cap < period) cap <<= 1;
+    // Monotone deques over the max/min source. `cap` is the CPU's exact
+    // `period.next_power_of_two()`, while production supplies runtime-sized
+    // resident scratch and the preserved primary supplies its original cap.
     const int mask = cap - 1;
-    int dq_max[CE_MAX_PERIOD * 2];
-    int dq_min[CE_MAX_PERIOD * 2];
     unsigned hmax = 0u, tmax = 0u, hmin = 0u, tmin = 0u;
 
     const double* src_max = use_close ? close : high;
@@ -614,6 +613,75 @@ extern "C" __global__ void neoethos_chandelier_exit_batch_f64(
         short_raw_prev = ss;
         prev_dir = d;
 
-        row[i] = (d == 1) ? ls : neo_s2_qnan();
+        row_long_stop[i] = (d == 1) ? ls : neo_s2_qnan();
+        if (emit_short) row_short_stop[i] = (d == -1) ? ss : neo_s2_qnan();
     }
+}
+
+extern "C" __global__ void chandelier_exit_outputs_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    const double* __restrict__ mults,
+    int use_close,
+    int rows,
+    int first_valid,
+    int deque_scratch_cap,
+    int* __restrict__ max_deque_scratch,
+    int* __restrict__ min_deque_scratch,
+    double* __restrict__ out_long_stop,
+    double* __restrict__ out_short_stop)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || n <= 0) return;
+
+    const size_t output_offset = (size_t)row * (size_t)n;
+    const size_t scratch_offset = (size_t)row * (size_t)deque_scratch_cap;
+    chandelier_exit_row_f64(
+        high,
+        low,
+        close,
+        n,
+        periods[row],
+        mults[row],
+        use_close != 0,
+        first_valid,
+        max_deque_scratch + scratch_offset,
+        min_deque_scratch + scratch_offset,
+        deque_scratch_cap,
+        out_long_stop + output_offset,
+        out_short_stop + output_offset);
+}
+
+extern "C" __global__ void neoethos_chandelier_exit_batch_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_combos || n <= 0) return;
+
+    int dq_max[CE_MAX_PERIOD * 2];
+    int dq_min[CE_MAX_PERIOD * 2];
+    chandelier_exit_row_f64(
+        high,
+        low,
+        close,
+        n,
+        periods[row],
+        3.0,
+        true,
+        first_valid,
+        dq_max,
+        dq_min,
+        CE_MAX_PERIOD,
+        out + (size_t)row * (size_t)n,
+        nullptr);
 }

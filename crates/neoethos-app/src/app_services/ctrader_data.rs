@@ -1,13 +1,21 @@
+use crate::app_services::ctrader_historical_admission::HistoricalRequestCancellation;
+use crate::app_services::ctrader_historical_page::{
+    CTraderPersistentHistoricalSession, CTraderPersistentHistoricalWire,
+};
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE,
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
-    build_application_auth_request, build_get_trendbars_request,
-    build_symbol_by_id_request, build_symbols_list_request,
-    parse_ctrader_error_payload, parse_open_api_envelope, trendbar_period_value,
+    CTraderOpenApiSessionResponse, CTraderOpenApiTransport, ProductionCTraderOpenApiSession,
+    ProductionCTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
+    build_get_trendbars_request, build_symbol_by_id_request, build_symbols_list_request,
+    ctrader_historical_session_error_from_response, parse_ctrader_error_payload,
+    parse_open_api_envelope, trendbar_period_value,
+};
+use crate::app_services::ctrader_tick_delta::{
+    decode_ctrader_tick_deltas, validate_ctrader_tick_response_identity,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -117,8 +125,7 @@ pub struct CTraderSymbolsListResult {
 /// response. The explicit discriminants below match the proto's
 /// `enum ProtoOATradingMode` declared values exactly.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq,
-    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+    Debug, Clone, Copy, PartialEq, Eq, serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
 )]
 #[repr(u8)]
 pub enum TradingModeProto {
@@ -144,8 +151,7 @@ pub enum TradingModeProto {
 ///   (i.e. value 5 means 0.005%); used for equities.
 /// - `QuoteCcyPerLot`: quote-currency per 1 lot (CFDs in non-USD).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq,
-    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+    Debug, Clone, Copy, PartialEq, Eq, serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
 )]
 #[repr(u8)]
 pub enum CommissionType {
@@ -161,8 +167,7 @@ pub enum CommissionType {
 ///
 /// Proto file: `OpenApiModelMessages.proto:216-219`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq,
-    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+    Debug, Clone, Copy, PartialEq, Eq, serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
 )]
 #[repr(u8)]
 pub enum MinCommissionType {
@@ -179,8 +184,7 @@ pub enum MinCommissionType {
 ///
 /// Proto file: `OpenApiModelMessages.proto:230-234`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq,
-    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+    Debug, Clone, Copy, PartialEq, Eq, serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
 )]
 #[repr(u8)]
 pub enum SwapCalculationType {
@@ -195,8 +199,7 @@ pub enum SwapCalculationType {
 /// Proto file: `OpenApiModelMessages.proto:210-213`. cTrader's JSON
 /// proxy uses the `SYMBOL_DISTANCE_IN_*` prefix.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq,
-    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+    Debug, Clone, Copy, PartialEq, Eq, serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
 )]
 #[repr(u8)]
 pub enum SymbolDistanceType {
@@ -210,8 +213,7 @@ pub enum SymbolDistanceType {
 ///
 /// Proto file: `OpenApiModelMessages.proto:184-193`.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq,
-    serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
+    Debug, Clone, Copy, PartialEq, Eq, serde_repr::Deserialize_repr, serde_repr::Serialize_repr,
 )]
 #[repr(u8)]
 pub enum DayOfWeek {
@@ -478,7 +480,7 @@ pub struct HistoricalBar {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoricalBarsResult {
     pub symbol_id: i64,
-    pub timeframe: String,
+    pub timeframe: neoethos_core::CanonicalTimeframe,
     pub bars: Vec<HistoricalBar>,
     pub has_more: bool,
     pub warnings: Vec<String>,
@@ -518,8 +520,27 @@ pub struct CTraderChartHistoryRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTraderHistoricalBarsFetchResult {
     pub symbol: CTraderSymbolInfo,
+    pub symbol_id: i64,
+    pub timeframe: neoethos_core::CanonicalTimeframe,
     pub bars: Vec<HistoricalBar>,
     pub has_more: bool,
+}
+
+impl CTraderHistoricalBarsFetchResult {
+    pub fn validate_identity(
+        &self,
+        expected_symbol_id: i64,
+        expected_timeframe: neoethos_core::CanonicalTimeframe,
+    ) -> Result<()> {
+        if self.symbol_id != expected_symbol_id || self.timeframe != expected_timeframe {
+            return Err(anyhow!(
+                "cTrader trendbar response identity mismatch: requested/resolved symbol id {expected_symbol_id} timeframe {expected_timeframe}, response symbol id {} timeframe {}",
+                self.symbol_id,
+                self.timeframe
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -798,7 +819,7 @@ struct TrendbarsEnvelope {
 struct TrendbarsPayload {
     period: Value,
     #[serde(rename = "symbolId")]
-    symbol_id: i64,
+    symbol_id: Option<i64>,
     #[serde(rename = "hasMore")]
     has_more: Option<bool>,
     #[serde(default)]
@@ -821,6 +842,8 @@ struct TrendbarPayload {
 
 #[derive(Debug, Deserialize)]
 struct TickDataEnvelope {
+    #[serde(rename = "clientMsgId")]
+    client_msg_id: String,
     #[serde(rename = "payloadType")]
     payload_type: u32,
     payload: TickDataPayload,
@@ -828,11 +851,11 @@ struct TickDataEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct TickDataPayload {
-    #[serde(rename = "symbolId")]
-    symbol_id: Option<i64>,
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
     #[serde(rename = "hasMore")]
     has_more: bool,
-    #[serde(rename = "tickData", default)]
+    #[serde(rename = "tickData")]
     tick_data: Vec<TickPayload>,
 }
 
@@ -882,9 +905,7 @@ pub fn parse_symbols_list_response(response_json: &str) -> Result<CTraderSymbols
 /// Indices, Commodities, Stocks, Cryptocurrencies, ETFs, ...).
 /// Used by the catalog bootstrap to map a user-supplied allow-list
 /// of class names to broker-defined IDs.
-pub fn parse_asset_class_list_response(
-    response_json: &str,
-) -> Result<Vec<CTraderAssetClassInfo>> {
+pub fn parse_asset_class_list_response(response_json: &str) -> Result<Vec<CTraderAssetClassInfo>> {
     let envelope: AssetClassListEnvelope = serde_json::from_str(response_json)
         .context("failed to parse cTrader asset class list response")?;
     if envelope.payload_type
@@ -1040,10 +1061,7 @@ pub fn parse_symbol_by_id_response(response_json: &str) -> Result<Vec<CTraderSym
                 digits: symbol.digits,
                 pip_position: symbol.pip_position,
                 is_archived: false,
-                is_trading_enabled: matches!(
-                    symbol.trading_mode,
-                    Some(TradingModeProto::Enabled)
-                ),
+                is_trading_enabled: matches!(symbol.trading_mode, Some(TradingModeProto::Enabled)),
                 min_volume: symbol.min_volume,
                 max_volume: symbol.max_volume,
                 step_volume: symbol.step_volume,
@@ -1068,32 +1086,60 @@ pub fn parse_trendbars_response(
         ));
     }
 
-    let timeframe = trendbar_period_label(&envelope.payload.period)?;
+    // ProtoOAGetTrendbarsRes marks symbolId optional. Exact clientMsgId and
+    // account correlation are already enforced by the persistent wire; when
+    // the broker echoes symbolId it must still agree with that bound request.
+    let response_symbol_id = envelope.payload.symbol_id.unwrap_or(symbol.symbol_id);
+    if response_symbol_id != symbol.symbol_id {
+        return Err(anyhow!(
+            "cTrader trendbar response symbol mismatch: requested {}, received {}",
+            symbol.symbol_id,
+            response_symbol_id
+        ));
+    }
+    let timeframe = trendbar_period(&envelope.payload.period)?;
     let bars = envelope
         .payload
         .trendbar
         .into_iter()
-        .map(|trendbar| HistoricalBar {
-            timestamp_ms: i64::from(trendbar.utc_timestamp_in_minutes.unwrap_or_default()) * 60_000,
-            open: relative_price_to_absolute(
-                trendbar.low + trendbar.delta_open.unwrap_or_default() as i64,
-                symbol.digits,
-            ),
-            high: relative_price_to_absolute(
-                trendbar.low + trendbar.delta_high.unwrap_or_default() as i64,
-                symbol.digits,
-            ),
-            low: relative_price_to_absolute(trendbar.low, symbol.digits),
-            close: relative_price_to_absolute(
-                trendbar.low + trendbar.delta_close.unwrap_or_default() as i64,
-                symbol.digits,
-            ),
-            volume: trendbar.volume,
+        .enumerate()
+        .map(|(row, trendbar)| -> Result<HistoricalBar> {
+            let minutes = trendbar.utc_timestamp_in_minutes.with_context(|| {
+                format!("cTrader trendbar row {row} is missing utcTimestampInMinutes")
+            })?;
+            let timestamp_ms = i64::from(minutes).checked_mul(60_000).with_context(|| {
+                format!("cTrader trendbar row {row} utcTimestampInMinutes overflows milliseconds")
+            })?;
+            let relative_with_delta = |field: &str, delta: Option<u64>| -> Result<i64> {
+                let delta = i64::try_from(delta.unwrap_or_default()).with_context(|| {
+                    format!("cTrader trendbar row {row} {field} delta exceeds i64")
+                })?;
+                trendbar.low.checked_add(delta).with_context(|| {
+                    format!("cTrader trendbar row {row} {field} relative price overflows i64")
+                })
+            };
+            Ok(HistoricalBar {
+                timestamp_ms,
+                open: relative_price_to_absolute(
+                    relative_with_delta("open", trendbar.delta_open)?,
+                    symbol.digits,
+                ),
+                high: relative_price_to_absolute(
+                    relative_with_delta("high", trendbar.delta_high)?,
+                    symbol.digits,
+                ),
+                low: relative_price_to_absolute(trendbar.low, symbol.digits),
+                close: relative_price_to_absolute(
+                    relative_with_delta("close", trendbar.delta_close)?,
+                    symbol.digits,
+                ),
+                volume: trendbar.volume,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(HistoricalBarsResult {
-        symbol_id: envelope.payload.symbol_id,
+        symbol_id: response_symbol_id,
         timeframe,
         bars,
         has_more: envelope.payload.has_more.unwrap_or(false),
@@ -1103,6 +1149,8 @@ pub fn parse_trendbars_response(
 
 pub fn parse_tick_data_response(
     response_json: &str,
+    expected_account_id: i64,
+    expected_client_msg_id: &str,
     symbol: &CTraderSymbolInfo,
 ) -> Result<HistoricalTicksResult> {
     let envelope: TickDataEnvelope = serde_json::from_str(response_json)
@@ -1114,122 +1162,406 @@ pub fn parse_tick_data_response(
         ));
     }
 
-    let mut ticks = Vec::with_capacity(envelope.payload.tick_data.len());
-    let mut previous_timestamp: Option<i64> = None;
-    let mut previous_tick_raw: Option<i64> = None;
-    for tick in envelope.payload.tick_data {
-        let timestamp_ms = match previous_timestamp {
-            None => tick.timestamp,
-            Some(previous) => previous - tick.timestamp,
-        };
-        previous_timestamp = Some(timestamp_ms);
-        // 2026-07-18 deep-audit fix: per the Spotware spec BOTH fields of
-        // `ProtoOATickData` are delta-compressed — the first (newest) tick
-        // carries absolute values, every later one a delta from the previous
-        // tick, decoded with the SAME subtraction convention as `timestamp`.
-        // The old code delta-decoded only the timestamp and treated each raw
-        // `tick` as an absolute price, so every tick after the first came out
-        // as a near-zero delta. (Latent — no production caller yet; the
-        // real-data fixture test remains the TODO gating live use.)
-        let raw_price = match previous_tick_raw {
-            None => tick.tick,
-            Some(previous) => previous - tick.tick,
-        };
-        previous_tick_raw = Some(raw_price);
-        ticks.push(HistoricalTick {
-            timestamp_ms,
-            price: relative_price_to_absolute(raw_price, symbol.digits),
-        });
-    }
-    ticks.sort_by_key(|tick| tick.timestamp_ms);
+    let TickDataEnvelope {
+        client_msg_id,
+        payload:
+            TickDataPayload {
+                ctid_trader_account_id,
+                has_more,
+                tick_data,
+            },
+        ..
+    } = envelope;
+    validate_ctrader_tick_response_identity(
+        expected_account_id,
+        expected_client_msg_id,
+        ctid_trader_account_id,
+        &client_msg_id,
+    )?;
+    let mut ticks = decode_ctrader_tick_deltas(
+        tick_data
+            .into_iter()
+            .map(|tick| (tick.timestamp, tick.tick)),
+        |raw_price| relative_price_to_absolute(raw_price, symbol.digits),
+    )
+    .context("failed to decode cTrader signed tick deltas")?
+    .into_iter()
+    .map(|tick| HistoricalTick {
+        timestamp_ms: tick.timestamp_ms,
+        price: tick.price,
+    })
+    .collect::<Vec<_>>();
+    // The decoder has already proved strict newest-first wire order. Reverse
+    // the complete result rather than sorting/repairing malformed broker data.
+    ticks.reverse();
 
     Ok(HistoricalTicksResult {
-        symbol_id: match envelope.payload.symbol_id {
-            Some(symbol_id) if symbol_id != symbol.symbol_id => {
-                return Err(anyhow!(
-                    "unexpected cTrader tick-data symbol id: {}",
-                    symbol_id
-                ));
-            }
-            Some(symbol_id) => symbol_id,
-            None => symbol.symbol_id,
-        },
+        // `ProtoOAGetTickDataRes` does not echo `symbolId`. This identity comes
+        // from the request already bound above by exact account + clientMsgId.
+        symbol_id: symbol.symbol_id,
         ticks,
-        has_more: envelope.payload.has_more,
+        has_more,
     })
 }
 
-pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
-    transport: &T,
-    request: &CTraderChartHistoryRequest,
-) -> Result<CTraderHistoricalBarsFetchResult> {
-    let resolved = resolve_symbol_with_transport(
-        transport,
-        &CTraderSymbolLookupRequest {
-            client_id: request.client_id.clone(),
-            client_secret: request.client_secret.clone(),
-            access_token: request.access_token.clone(),
-            environment: request.environment,
-            account_id: request.account_id.clone(),
-            symbol_name: request.symbol_name.clone(),
-        },
-    )?;
-    let trendbar_period = trendbar_period_value(&request.timeframe)?;
-    // `ProductionCTraderOpenApiTransport::send_sequence` opens a fresh
-    // WSS connection per call and cTrader requires ProtoOAApplicationAuthReq
-    // + ProtoOAAccountAuthReq on every new socket — otherwise the next
-    // data-bearing request (trendbars here) comes back as ProtoOAErrorRes,
-    // which parse_trendbars_response then chokes on with the unhelpful
-    // "failed to parse cTrader trendbars response". Mirror the
-    // re-auth pattern already used by `resolve_symbol_with_transport` for
-    // the symbol-by-id call.
-    let auth_responses = transport.send_sequence(&[
-        build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
-        build_account_auth_request(resolved.account_id, &request.access_token, "account-auth-1"),
-        build_get_trendbars_request(
-            resolved.account_id,
-            resolved.light_symbol.symbol_id,
-            trendbar_period,
-            request.from_timestamp_ms,
-            request.to_timestamp_ms,
-            request.count,
-            "trendbars-1",
-        ),
-    ])?;
+#[derive(Debug, Deserialize)]
+struct CTraderAccountBoundResponseEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: CTraderAccountBoundResponsePayload,
+}
 
-    if auth_responses.len() < 3 {
-        // Same partial-response error walking we do in resolve_symbol —
-        // send_sequence early-exits on ProtoOAErrorRes so the cTrader
-        // error code lives in the last envelope we got back.
-        for response in &auth_responses {
-            let envelope = parse_open_api_envelope(response)?;
-            if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-                return Err(anyhow!(
-                    "cTrader trendbars sequence failed (step {}): {}",
-                    auth_responses.len(),
-                    parse_ctrader_error_payload(&envelope.payload)?
-                ));
-            }
-        }
+#[derive(Debug, Deserialize)]
+struct CTraderAccountBoundResponsePayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
+}
+
+fn ensure_ctrader_response_account_id(
+    response_json: &str,
+    expected_payload_type: u32,
+    expected_account_id: i64,
+) -> Result<()> {
+    let envelope: CTraderAccountBoundResponseEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse account-bound cTrader response identity")?;
+    if envelope.payload_type != expected_payload_type {
         return Err(anyhow!(
-            "expected 3 cTrader auth/trendbars responses, received {}",
-            auth_responses.len()
+            "unexpected account-bound cTrader payload type: expected {expected_payload_type}, got {}",
+            envelope.payload_type
         ));
     }
+    if envelope.payload.ctid_trader_account_id != expected_account_id {
+        return Err(anyhow!(
+            "cTrader response account mismatch: expected {expected_account_id}, received {}",
+            envelope.payload.ctid_trader_account_id
+        ));
+    }
+    Ok(())
+}
 
-    let trendbars = parse_trendbars_response(&auth_responses[2], &resolved.symbol)?;
-    Ok(CTraderHistoricalBarsFetchResult {
-        symbol: resolved.symbol.clone(),
-        bars: trendbars.bars,
-        has_more: trendbars.has_more,
-    })
+fn send_historical_session_request(
+    session: &mut ProductionCTraderOpenApiSession,
+    message: &crate::app_services::ctrader_messages::CTraderOpenApiJsonMessage,
+    cancellation: &HistoricalRequestCancellation,
+) -> Result<String> {
+    match session.send_one(message, Some(cancellation))? {
+        CTraderOpenApiSessionResponse::Expected(response) => Ok(response),
+        CTraderOpenApiSessionResponse::BrokerError(response) => {
+            Err(ctrader_historical_session_error_from_response(&response)?
+                .context("cTrader historical session failed"))
+        }
+    }
+}
+
+/// One authenticated cTrader connection for an entire bounded historical
+/// capture. Application/account authentication and symbol resolution happen
+/// once; every page then uses the same socket and its connection-local quota.
+struct CTraderTrendbarsPageRequest {
+    timeframe: neoethos_core::CanonicalTimeframe,
+    from_timestamp_ms: i64,
+    to_timestamp_ms: i64,
+    count: Option<u32>,
+}
+
+struct ProductionCTraderPersistentHistoricalWire {
+    request: CTraderChartHistoryRequest,
+    account_id: i64,
+    cancellation: HistoricalRequestCancellation,
+    session: Option<ProductionCTraderOpenApiSession>,
+    light_symbol: Option<CTraderLightSymbolInfo>,
+    resolved: Option<CTraderResolvedSymbol>,
+}
+
+impl ProductionCTraderPersistentHistoricalWire {
+    fn new(
+        request: &CTraderChartHistoryRequest,
+        cancellation: &HistoricalRequestCancellation,
+    ) -> Result<Self> {
+        let account_id = request
+            .account_id
+            .parse::<i64>()
+            .context("cTrader account id must be numeric")?;
+        Ok(Self {
+            request: request.clone(),
+            account_id,
+            cancellation: cancellation.clone(),
+            session: None,
+            light_symbol: None,
+            resolved: None,
+        })
+    }
+
+    fn session_mut(&mut self) -> Result<&mut ProductionCTraderOpenApiSession> {
+        self.session
+            .as_mut()
+            .context("cTrader historical wire is not connected")
+    }
+
+    fn resolved(&self) -> Result<&CTraderResolvedSymbol> {
+        self.resolved
+            .as_ref()
+            .context("cTrader historical symbol resolution is incomplete")
+    }
+}
+
+fn qualify_historical_stage<T>(stage: &'static str, result: Result<T>) -> Result<T> {
+    result.with_context(|| format!("cTrader historical stage {stage} failed"))
+}
+
+impl CTraderPersistentHistoricalWire for ProductionCTraderPersistentHistoricalWire {
+    type Error = anyhow::Error;
+    type Page = CTraderHistoricalBarsFetchResult;
+    type PageRequest = CTraderTrendbarsPageRequest;
+
+    fn connect(&mut self) -> Result<()> {
+        qualify_historical_stage(
+            "connect",
+            (|| {
+                let transport = ProductionCTraderOpenApiTransport::new(
+                    self.request.environment.endpoint_host(),
+                );
+                self.session = Some(transport.connect_session(Some(&self.cancellation))?);
+                Ok(())
+            })(),
+        )
+    }
+
+    fn application_auth(&mut self) -> Result<()> {
+        qualify_historical_stage(
+            "application-auth",
+            (|| {
+                let application_auth = build_application_auth_request(
+                    &self.request.client_id,
+                    &self.request.client_secret,
+                    "history-application-auth",
+                );
+                let cancellation = self.cancellation.clone();
+                let response = send_historical_session_request(
+                    self.session_mut()?,
+                    &application_auth,
+                    &cancellation,
+                )?;
+                ensure_success_payload_type(
+                    &response,
+                    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+                )
+            })(),
+        )
+    }
+
+    fn account_auth(&mut self) -> Result<()> {
+        qualify_historical_stage(
+            "account-auth",
+            (|| {
+                let account_auth = build_account_auth_request(
+                    self.account_id,
+                    &self.request.access_token,
+                    "history-account-auth",
+                );
+                let cancellation = self.cancellation.clone();
+                let response = send_historical_session_request(
+                    self.session_mut()?,
+                    &account_auth,
+                    &cancellation,
+                )?;
+                ensure_ctrader_response_account_id(
+                    &response,
+                    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+                    self.account_id,
+                )
+            })(),
+        )
+    }
+
+    fn symbols_list(&mut self) -> Result<()> {
+        qualify_historical_stage(
+            "symbols-list",
+            (|| {
+                let symbols_request =
+                    build_symbols_list_request(self.account_id, false, "history-symbols");
+                let cancellation = self.cancellation.clone();
+                let response = send_historical_session_request(
+                    self.session_mut()?,
+                    &symbols_request,
+                    &cancellation,
+                )?;
+                ensure_ctrader_response_account_id(
+                    &response,
+                    CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE,
+                    self.account_id,
+                )?;
+                let symbols = parse_symbols_list_response(&response)?;
+                if symbols.account_id != self.account_id {
+                    return Err(anyhow!(
+                        "cTrader symbols response account mismatch: expected {}, received {}",
+                        self.account_id,
+                        symbols.account_id
+                    ));
+                }
+                let requested_key = normalize_symbol_key(&self.request.symbol_name);
+                let light_symbol = symbols
+                    .symbols
+                    .into_iter()
+                    .find(|symbol| normalize_symbol_key(&symbol.symbol_name) == requested_key)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cTrader symbol '{}' was not found for this account",
+                            self.request.symbol_name
+                        )
+                    })?;
+                self.light_symbol = Some(light_symbol);
+                Ok(())
+            })(),
+        )
+    }
+
+    fn symbol_detail(&mut self) -> Result<()> {
+        qualify_historical_stage(
+            "symbol-detail",
+            (|| {
+                let light_symbol = self
+                    .light_symbol
+                    .clone()
+                    .context("cTrader light symbol resolution is incomplete")?;
+                let symbol_request = build_symbol_by_id_request(
+                    self.account_id,
+                    &[light_symbol.symbol_id],
+                    "history-symbol-detail",
+                );
+                let cancellation = self.cancellation.clone();
+                let response = send_historical_session_request(
+                    self.session_mut()?,
+                    &symbol_request,
+                    &cancellation,
+                )?;
+                ensure_ctrader_response_account_id(
+                    &response,
+                    CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE,
+                    self.account_id,
+                )?;
+                let mut symbol = parse_symbol_by_id_response(&response)?
+                    .into_iter()
+                    .find(|symbol| symbol.symbol_id == light_symbol.symbol_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cTrader full symbol metadata missing for symbol {}",
+                            light_symbol.symbol_id
+                        )
+                    })?;
+                symbol.symbol_name = light_symbol.symbol_name.clone();
+                symbol.display_name = light_symbol
+                    .description
+                    .clone()
+                    .filter(|description| !description.trim().is_empty())
+                    .unwrap_or_else(|| light_symbol.symbol_name.clone());
+                self.resolved = Some(CTraderResolvedSymbol {
+                    account_id: self.account_id,
+                    light_symbol,
+                    symbol,
+                });
+                Ok(())
+            })(),
+        )
+    }
+
+    fn trendbars(&mut self, client_msg_id: String, page: Self::PageRequest) -> Result<Self::Page> {
+        qualify_historical_stage(
+            "trendbars",
+            (|| {
+                let resolved = self.resolved()?.clone();
+                let request = build_get_trendbars_request(
+                    resolved.account_id,
+                    resolved.symbol.symbol_id,
+                    trendbar_period_value(page.timeframe.as_str())?,
+                    page.from_timestamp_ms,
+                    page.to_timestamp_ms,
+                    page.count,
+                    client_msg_id,
+                );
+                let cancellation = self.cancellation.clone();
+                let response =
+                    send_historical_session_request(self.session_mut()?, &request, &cancellation)?;
+                ensure_ctrader_response_account_id(
+                    &response,
+                    CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE,
+                    resolved.account_id,
+                )?;
+                let trendbars = parse_trendbars_response(&response, &resolved.symbol)?;
+                let result = CTraderHistoricalBarsFetchResult {
+                    symbol: resolved.symbol.clone(),
+                    symbol_id: trendbars.symbol_id,
+                    timeframe: trendbars.timeframe,
+                    bars: trendbars.bars,
+                    has_more: trendbars.has_more,
+                };
+                result.validate_identity(resolved.symbol.symbol_id, page.timeframe)?;
+                Ok(result)
+            })(),
+        )
+    }
+}
+
+pub(crate) struct CTraderAuthenticatedHistoricalSession {
+    session: CTraderPersistentHistoricalSession<ProductionCTraderPersistentHistoricalWire>,
+}
+
+impl CTraderAuthenticatedHistoricalSession {
+    pub(crate) fn connect(
+        request: &CTraderChartHistoryRequest,
+        cancellation: &HistoricalRequestCancellation,
+    ) -> Result<Self> {
+        let wire = ProductionCTraderPersistentHistoricalWire::new(request, cancellation)?;
+        Ok(Self {
+            session: CTraderPersistentHistoricalSession::establish(wire)?,
+        })
+    }
+
+    #[cfg(feature = "broker-history-service")]
+    pub(crate) fn resolved_symbol(&self) -> &CTraderResolvedSymbol {
+        self.session
+            .wire()
+            .resolved()
+            .expect("established cTrader session has resolved symbol")
+    }
+
+    pub(crate) fn next_trendbars(
+        &mut self,
+        timeframe: neoethos_core::CanonicalTimeframe,
+        from_timestamp_ms: i64,
+        to_timestamp_ms: i64,
+        count: Option<u32>,
+    ) -> Result<CTraderHistoricalBarsFetchResult> {
+        self.session.next_trendbars(CTraderTrendbarsPageRequest {
+            timeframe,
+            from_timestamp_ms,
+            to_timestamp_ms,
+            count,
+        })
+    }
 }
 
 pub fn load_historical_bars_only(
     request: &CTraderChartHistoryRequest,
 ) -> Result<CTraderHistoricalBarsFetchResult> {
-    let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
-    load_historical_bars_only_with_transport(&transport, request)
+    let requested_timeframe = request
+        .timeframe
+        .trim()
+        .to_ascii_uppercase()
+        .parse::<neoethos_core::CanonicalTimeframe>()
+        .map_err(|_| {
+            anyhow!(
+                "unsupported cTrader trendbar period label {}",
+                request.timeframe
+            )
+        })?;
+    let cancellation = HistoricalRequestCancellation::new();
+    let mut session = CTraderAuthenticatedHistoricalSession::connect(request, &cancellation)?;
+    session.next_trendbars(
+        requested_timeframe,
+        request.from_timestamp_ms,
+        request.to_timestamp_ms,
+        request.count,
+    )
 }
 
 pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
@@ -1394,38 +1726,21 @@ fn round_to_digits(value: f64, digits: i32) -> f64 {
     (value * factor).round() / factor
 }
 
-fn trendbar_period_label(value: &Value) -> Result<String> {
+fn trendbar_period(value: &Value) -> Result<neoethos_core::CanonicalTimeframe> {
     if let Some(label) = value.as_str() {
-        return Ok(label.to_string());
+        return label
+            .trim()
+            .to_ascii_uppercase()
+            .parse::<neoethos_core::CanonicalTimeframe>()
+            .map_err(|_| anyhow!("unsupported cTrader trendbar period {label}"));
     }
     let period = value
         .as_i64()
         .context("cTrader trendbar period is missing")?;
-    // cTrader emits its own M2/M4/M10 codes (2/4/6), but those are
-    // outside our canonical 12-timeframe set; we reject rather than
-    // returning a label that downstream pipelines do not know how to
-    // resample, train, or evaluate against.
-    let label = match period {
-        1 => "M1",
-        3 => "M3",
-        5 => "M5",
-        7 => "M15",
-        8 => "M30",
-        9 => "H1",
-        10 => "H4",
-        11 => "H12",
-        12 => "D1",
-        13 => "W1",
-        14 => "MN1",
-        2 | 4 | 6 => {
-            return Err(anyhow!(
-                "cTrader trendbar period {} (M2/M4/M10) is outside the canonical timeframe set",
-                period
-            ));
-        }
-        other => return Err(anyhow!("unsupported cTrader trendbar period {}", other)),
-    };
-    Ok(label.to_string())
+    let protocol_code = i32::try_from(period)
+        .map_err(|_| anyhow!("cTrader trendbar period {period} is outside i32"))?;
+    neoethos_core::CanonicalTimeframe::from_ctrader_protocol_code(protocol_code)
+        .map_err(|_| anyhow!("unsupported cTrader trendbar period {period}"))
 }
 
 // **2026-05-27 Phase A**: previously the wire-shape held
@@ -1447,22 +1762,19 @@ mod tests {
     use super::*;
     use crate::app_services::ctrader_messages::CTraderOpenApiJsonMessage;
 
+    #[test]
+    fn historical_session_errors_preserve_the_exact_failed_stage() {
+        let error = qualify_historical_stage::<()>("account-auth", Err(anyhow!("broker-sentinel")))
+            .expect_err("stage-qualified failure");
+        let chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert_eq!(chain[0], "cTrader historical stage account-auth failed");
+        assert!(chain.iter().any(|message| message == "broker-sentinel"));
+    }
+
     struct StubTransport {
         sent: std::sync::Mutex<Vec<CTraderOpenApiJsonMessage>>,
         responses: std::sync::Mutex<Vec<anyhow::Result<String>>>,
-    }
-
-    impl StubTransport {
-        fn with_responses(responses: Vec<anyhow::Result<String>>) -> Self {
-            Self {
-                sent: std::sync::Mutex::new(Vec::new()),
-                responses: std::sync::Mutex::new(responses),
-            }
-        }
-
-        fn sent_len(&self) -> usize {
-            self.sent.lock().expect("sent lock").len()
-        }
     }
 
     impl CTraderOpenApiTransport for StubTransport {
@@ -1569,8 +1881,14 @@ mod tests {
             .as_ref()
             .expect("financials projection must be present");
         assert_eq!(financials.trading_mode, Some(TradingModeProto::Enabled));
-        assert_eq!(financials.commission_type, Some(CommissionType::UsdPerMillionUsd));
-        assert_eq!(financials.precise_trading_commission_rate, Some(4_500_000_000));
+        assert_eq!(
+            financials.commission_type,
+            Some(CommissionType::UsdPerMillionUsd)
+        );
+        assert_eq!(
+            financials.precise_trading_commission_rate,
+            Some(4_500_000_000)
+        );
         assert_eq!(financials.commission_rate_decimal(), Some(45.0));
         assert_eq!(
             financials.swap_calculation_type,
@@ -1732,7 +2050,7 @@ mod tests {
             parse_trendbars_response(&response.to_string(), &symbol).expect("trendbars response");
 
         assert_eq!(result.symbol_id, 1);
-        assert_eq!(result.timeframe, "M15");
+        assert_eq!(result.timeframe, neoethos_core::CanonicalTimeframe::M15);
         assert_eq!(result.bars.len(), 1);
         assert_eq!(result.bars[0].timestamp_ms, 28_333_333_i64 * 60_000);
         assert!((result.bars[0].low - 1.10000).abs() < 1e-9);
@@ -1744,7 +2062,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_data_response_normalizes_relative_prices_and_descending_timestamps() {
+    fn trendbars_response_rejects_missing_or_overflowing_broker_timestamp() {
         let symbol = CTraderSymbolInfo {
             symbol_id: 1,
             symbol_name: "EUR/USD".to_string(),
@@ -1760,55 +2078,109 @@ mod tests {
             pnl_conversion_fee_rate: None,
             financials: None,
         };
-        // 2026-08-09: this fixture was FAILING on master before batch D2 touched
-        // anything — `cargo test -p neoethos-app --lib` reproduced it on an
-        // unmodified `ctrader_data.rs`. It was written for the pre-2026-07-18
-        // reading in which every `tick` was an absolute price. The 2026-07-18
-        // deep-audit fix (see `parse_tick_data_response` above) made `tick`
-        // delta-compressed like `timestamp` — decoded as
-        // `value[i] = value[i-1] - delta[i]` per the Spotware spec — but this
-        // hand-crafted payload was never updated, so the second entry decoded to
-        // 110120 - 110100 = 20 → 0.00020 instead of the asserted 1.10100.
-        // The timestamp half of the same fixture WAS updated (250 is a delta),
-        // which is why only the price assertion blew up.
-        //
-        // Fixed here by making the price a delta too: 110120 - 20 = 110100.
-        // The assertions are unchanged — they now describe what the shipped
-        // parser actually does. NOTE the file's own TODO(real-data) still
-        // stands: this is a synthetic payload, and the real gate on using tick
-        // download live is a captured broker response.
+
+        for timestamp in [serde_json::Value::Null, serde_json::json!(i64::MAX)] {
+            let mut trendbar = serde_json::json!({
+                "volume": 12,
+                "low": 110000,
+                "deltaOpen": 25,
+                "deltaClose": 75,
+                "deltaHigh": 140
+            });
+            if !timestamp.is_null() {
+                trendbar["utcTimestampInMinutes"] = timestamp;
+            }
+            let response = serde_json::json!({
+                "clientMsgId": "trendbars-1",
+                "payloadType": 2138,
+                "payload": {
+                    "period": "M15",
+                    "symbolId": 1,
+                    "hasMore": false,
+                    "trendbar": [trendbar]
+                }
+            });
+            let error = parse_trendbars_response(&response.to_string(), &symbol)
+                .expect_err("missing or overflowing broker time must fail closed");
+            let chain = format!("{error:#}");
+            assert!(
+                chain.contains("utcTimestampInMinutes") || chain.contains("expected u32"),
+                "unexpected error: {chain}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_tick_data_response_adds_signed_deltas_then_reverses() {
+        let symbol = CTraderSymbolInfo {
+            symbol_id: 1,
+            symbol_name: "EUR/USD".to_string(),
+            display_name: "EUR/USD".to_string(),
+            digits: 5,
+            pip_position: 4,
+            is_archived: false,
+            is_trading_enabled: true,
+            min_volume: None,
+            max_volume: None,
+            step_volume: None,
+            lot_size: None,
+            pnl_conversion_fee_rate: None,
+            financials: None,
+        };
+        // Exact prefix of `ten_year_tick_samples[0].raw_wire_preview` in the
+        // safe Demo artifact `ctrader-direct-14tf-sample.json`, SHA-256
+        // D465484FD0BF6F5DC9F1D3CA945020C172C4C547D347B774A29566F3B2E9AF14.
+        // First timestamp/tick are absolute. Later signed values are added to
+        // the prior decoded values; the broker wire order is newest-first.
         let response = serde_json::json!({
             "clientMsgId": "ticks-1",
             "payloadType": 2146,
             "payload": {
+                "ctidTraderAccountId": 712345,
                 "hasMore": true,
                 "tickData": [
-                    {
-                        "timestamp": 1_700_000_000_000i64,
-                        "tick": 110120
-                    },
-                    {
-                        "timestamp": 250,
-                        "tick": 20
-                    }
+                    {"timestamp": 1_471_446_060_064i64, "tick": 112742},
+                    {"timestamp": -1708, "tick": 1},
+                    {"timestamp": -805, "tick": -2},
+                    {"timestamp": -194, "tick": -1},
+                    {"timestamp": -192, "tick": -1},
+                    {"timestamp": -187, "tick": 1}
                 ]
             }
         });
 
-        let result = parse_tick_data_response(&response.to_string(), &symbol).expect("tick data");
+        let result = parse_tick_data_response(&response.to_string(), 712345, "ticks-1", &symbol)
+            .expect("tick data");
 
         assert_eq!(result.symbol_id, 1);
-        assert_eq!(result.ticks.len(), 2);
-        assert!(result.ticks[0].timestamp_ms < result.ticks[1].timestamp_ms);
-        assert_eq!(result.ticks[0].timestamp_ms, 1_699_999_999_750);
-        assert_eq!(result.ticks[1].timestamp_ms, 1_700_000_000_000);
-        assert!((result.ticks[0].price - 1.10100).abs() < 1e-9);
-        assert!((result.ticks[1].price - 1.10120).abs() < 1e-9);
+        assert_eq!(
+            result
+                .ticks
+                .iter()
+                .map(|tick| tick.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![
+                1_471_446_056_978,
+                1_471_446_057_165,
+                1_471_446_057_357,
+                1_471_446_057_551,
+                1_471_446_058_356,
+                1_471_446_060_064,
+            ]
+        );
+        assert_eq!(
+            result
+                .ticks
+                .iter()
+                .map(|tick| (tick.price * 100_000.0).round() as i64)
+                .collect::<Vec<_>>(),
+            vec![112_740, 112_739, 112_740, 112_741, 112_743, 112_742]
+        );
         assert!(result.has_more);
     }
 
     #[test]
-    fn tick_data_response_rejects_mismatched_symbol_id() {
+    fn tick_data_response_requires_and_matches_official_identity_fields() {
         let symbol = CTraderSymbolInfo {
             symbol_id: 1,
             symbol_name: "EUR/USD".to_string(),
@@ -1828,7 +2200,7 @@ mod tests {
             "clientMsgId": "ticks-1",
             "payloadType": 2146,
             "payload": {
-                "symbolId": 2,
+                "ctidTraderAccountId": 712345,
                 "hasMore": false,
                 "tickData": [
                     {
@@ -1839,55 +2211,68 @@ mod tests {
             }
         });
 
-        let err = parse_tick_data_response(&response.to_string(), &symbol)
-            .expect_err("mismatched symbol id should fail");
+        let result = parse_tick_data_response(&response.to_string(), 712345, "ticks-1", &symbol)
+            .expect("official response shape");
+        assert_eq!(result.symbol_id, symbol.symbol_id);
+
+        let mut missing_client_msg_id = response.clone();
+        missing_client_msg_id
+            .as_object_mut()
+            .expect("response object")
+            .remove("clientMsgId");
+        let err = parse_tick_data_response(
+            &missing_client_msg_id.to_string(),
+            712345,
+            "ticks-1",
+            &symbol,
+        )
+        .expect_err("missing clientMsgId must fail");
         assert!(
-            err.to_string()
-                .contains("unexpected cTrader tick-data symbol id"),
+            format!("{err:#}").contains("clientMsgId"),
             "unexpected error: {err}"
         );
-    }
 
+        let mut missing_account_id = response.clone();
+        missing_account_id["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("ctidTraderAccountId");
+        let err =
+            parse_tick_data_response(&missing_account_id.to_string(), 712345, "ticks-1", &symbol)
+                .expect_err("missing ctidTraderAccountId must fail");
+        assert!(
+            format!("{err:#}").contains("ctidTraderAccountId"),
+            "unexpected error: {err}"
+        );
 
-    #[test]
-    fn bars_only_backend_loads_symbol_metadata_then_trendbars_without_ticks() {
-        // Every production send_sequence opens a fresh WSS connection, so
-        // symbol list, symbol detail, and trendbars each re-auth.
-        let transport = StubTransport::with_responses(vec![
-            Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"symbols-1","payloadType":2115,"payload":{"ctidTraderAccountId":712345,"symbol":[{"symbolId":14,"symbolName":"EURUSD","enabled":true,"description":"Euro vs Dollar"}]}}"#.to_string()),
-            // Re-auth on the second WSS connection (before symbol-by-id):
-            Ok(r#"{"clientMsgId":"app-auth-2","payloadType":2101,"payload":{}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"account-auth-2","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":0}]}}"#.to_string()),
-            // Re-auth on the third WSS connection (before trendbars):
-            Ok(r#"{"clientMsgId":"app-auth-3","payloadType":2101,"payload":{}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"account-auth-3","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-            Ok(r#"{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{"period":"M15","symbolId":14,"trendbar":[{"volume":9,"low":109950,"deltaOpen":50,"deltaClose":125,"deltaHigh":225,"utcTimestampInMinutes":28500000}],"hasMore":false}}"#.to_string()),
-        ]);
+        let mut missing_tick_data = response.clone();
+        missing_tick_data["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("tickData");
+        assert!(
+            parse_tick_data_response(&missing_tick_data.to_string(), 712345, "ticks-1", &symbol,)
+                .is_err(),
+            "missing tickData must fail"
+        );
 
-        let result = load_historical_bars_only_with_transport(
-            &transport,
-            &CTraderChartHistoryRequest {
-                client_id: "client".to_string(),
-                client_secret: "secret".to_string(),
-                access_token: "token".to_string(),
-                environment: CTraderEnvironment::Demo,
-                account_id: "712345".to_string(),
-                symbol_name: "EURUSD".to_string(),
-                timeframe: "M15".to_string(),
-                from_timestamp_ms: 1_709_000_000_000,
-                to_timestamp_ms: 1_710_000_000_000,
-                count: Some(96),
-            },
-        )
-        .expect("bars-only history");
+        let mut missing_has_more = response.clone();
+        missing_has_more["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("hasMore");
+        assert!(
+            parse_tick_data_response(&missing_has_more.to_string(), 712345, "ticks-1", &symbol,)
+                .is_err(),
+            "missing hasMore must fail"
+        );
 
-        assert_eq!(result.symbol.symbol_name, "EURUSD");
-        assert_eq!(result.bars.len(), 1);
-        assert_eq!(result.bars[0].close, 1.10075);
-        assert!(!result.has_more);
-        assert_eq!(transport.sent_len(), 9);
+        let err = parse_tick_data_response(&response.to_string(), 999, "ticks-1", &symbol)
+            .expect_err("mismatched account must fail");
+        assert!(err.to_string().contains("account mismatch"), "{err}");
+
+        let err = parse_tick_data_response(&response.to_string(), 712345, "ticks-2", &symbol)
+            .expect_err("mismatched client message must fail");
+        assert!(err.to_string().contains("client message mismatch"), "{err}");
     }
 }

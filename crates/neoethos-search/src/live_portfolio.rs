@@ -21,22 +21,35 @@
 //! [`project_features_to_effective`] (the same by-name selection discovery's
 //! forward-test path uses).
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
-use neoethos_data::{FeatureData, FeatureFrame};
+use neoethos_data::{CanonicalDatasetIdentity, CanonicalTimeframe, FeatureFrame};
+use neoethos_dataset_contracts::CanonicalDatasetScope;
 use serde::{Deserialize, Serialize};
 
 use crate::Gene;
+use crate::data_selection::{
+    CanonicalSearchArtifactEnvelopeV2, CanonicalSearchArtifactScopeV2, CanonicalSearchInput,
+    CanonicalSearchWindowRoleV1, ExactCanonicalSeries,
+};
 use crate::discovery::DiscoveryResult;
 
 /// Bumped when the artifact's shape changes incompatibly.
-pub const LIVE_PORTFOLIO_SCHEMA_VERSION: u32 = 1;
+pub const LIVE_PORTFOLIO_SCHEMA_VERSION: u32 = 3;
 
 /// Everything the autonomous trader needs to evaluate a discovered portfolio on
 /// fresh data with backtest parity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LivePortfolioArtifact {
     pub schema_version: u32,
+    /// Full immutable dataset/generation/manifest/Vortex/feature-plan authority
+    /// for this portfolio. No neighboring file or current publication is used
+    /// to reconstruct it.
+    pub search_scope: CanonicalSearchArtifactScopeV2,
+    /// Exact resolved search configuration used by the discovery run.
+    pub search_config_hash: String,
     pub symbol: String,
     pub base_tf: String,
     pub higher_tfs: Vec<String>,
@@ -61,23 +74,19 @@ pub struct LivePortfolioArtifact {
     /// at the export boundary, so this file — the only artifact a live run reads
     /// — could not tell such a gene from one profitable across the whole band.
     ///
-    /// `#[serde(default)]`: artifacts written before this field existed load
-    /// with it EMPTY, and empty means UNMEASURED, not "all survived". Read it
-    /// through [`LivePortfolioArtifact::cost_band_for`], which spells that out.
-    #[serde(default)]
     pub cost_band: Vec<(String, crate::discovery::CostBandVerdict)>,
 }
 
 impl LivePortfolioArtifact {
     pub fn from_discovery(
-        symbol: &str,
-        base_tf: &str,
-        higher_tfs: &[String],
         normalize_features: bool,
         result: &DiscoveryResult,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        result.validate_evaluated_scopes()?;
+        let search_scope = result.selection_scope()?.clone();
+        let (anchor, higher_tfs) = direct_timeframe_authority(&search_scope)?;
         let genes = drop_retired_rules(
-            oos_surviving_genes(result),
+            oos_surviving_genes(result)?,
             &result.effective_feature_names,
         );
         // Only the genes that actually ship, in the order they ship: a verdict
@@ -93,24 +102,278 @@ impl LivePortfolioArtifact {
                 )
             })
             .collect();
-        Self {
+        let artifact = Self {
             schema_version: LIVE_PORTFOLIO_SCHEMA_VERSION,
-            symbol: symbol.to_string(),
-            base_tf: base_tf.to_string(),
-            higher_tfs: higher_tfs.to_vec(),
+            search_scope,
+            search_config_hash: result.search_config_hash.clone(),
+            symbol: anchor.symbol_name().to_owned(),
+            base_tf: anchor.timeframe().as_str().to_owned(),
+            higher_tfs,
             effective_feature_names: result.effective_feature_names.clone(),
             normalize_features,
             genes,
             cost_band,
+        };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    /// Validate the complete persisted contract. This is called both before an
+    /// atomic write and after every load; a valid-looking display symbol can
+    /// never override the embedded exact receipt.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema_version == LIVE_PORTFOLIO_SCHEMA_VERSION,
+            "unsupported live-portfolio schema version {}; expected {}",
+            self.schema_version,
+            LIVE_PORTFOLIO_SCHEMA_VERSION
+        );
+
+        // Reuse the canonical authority validator instead of growing a second
+        // spelling of the fnv64/scope rules in this artifact module.
+        CanonicalSearchArtifactEnvelopeV2::new(
+            "neoethos.live-portfolio-authority.v3",
+            self.search_scope.clone(),
+            self.search_config_hash.clone(),
+            (),
+        )
+        .map_err(anyhow::Error::new)?;
+        let receipt = self.search_scope.receipt();
+        let anchor_id = receipt.anchor_dataset_identity();
+        let anchor_bindings = receipt
+            .source_bindings()
+            .iter()
+            .filter(|binding| binding.dataset_identity() == anchor_id)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            anchor_bindings.len() == 1,
+            "live portfolio scope requires exactly one receipt anchor binding; found {}",
+            anchor_bindings.len()
+        );
+        let segments = anchor_bindings[0].segments();
+        anyhow::ensure!(
+            !segments.is_empty(),
+            "live portfolio receipt anchor has no segments"
+        );
+        anyhow::ensure!(
+            segments
+                .windows(2)
+                .all(|adjacent| adjacent[0].row_end() == adjacent[1].row_start()),
+            "live portfolio selection scope cannot cover disjoint anchor segments"
+        );
+        let first = segments.first().expect("segments checked non-empty");
+        let last = segments.last().expect("segments checked non-empty");
+        let selected = self.search_scope.evaluated_window();
+        anyhow::ensure!(
+            selected.row_start() == first.row_start()
+                && selected.timestamp_start_ms() == first.timestamp_start_ms(),
+            "live portfolio selection scope must start at the receipt anchor"
+        );
+        match selected.role() {
+            CanonicalSearchWindowRoleV1::DiscoveryInput => anyhow::ensure!(
+                selected.row_end() == last.row_end()
+                    && selected.timestamp_end_ms() == last.timestamp_end_ms(),
+                "live portfolio DiscoveryInput scope must exactly cover the receipt anchor"
+            ),
+            CanonicalSearchWindowRoleV1::InSample => anyhow::ensure!(
+                selected.row_end() < last.row_end()
+                    && selected.timestamp_end_ms() < last.timestamp_end_ms(),
+                "live portfolio InSample scope must be a strict receipt-anchor prefix"
+            ),
+            role => anyhow::bail!(
+                "live portfolio selection scope has unsupported role {role:?}; expected discovery_input or in_sample"
+            ),
         }
+
+        let (anchor, expected_higher_tfs) = direct_timeframe_authority(&self.search_scope)?;
+        anyhow::ensure!(
+            self.symbol == anchor.symbol_name(),
+            "live portfolio symbol {} disagrees with search-scope anchor symbol {}",
+            self.symbol,
+            anchor.symbol_name()
+        );
+        anyhow::ensure!(
+            self.base_tf == anchor.timeframe().as_str(),
+            "live portfolio base timeframe {} disagrees with search-scope anchor timeframe {}",
+            self.base_tf,
+            anchor.timeframe()
+        );
+        anyhow::ensure!(
+            self.higher_tfs == expected_higher_tfs,
+            "live portfolio direct higher-timeframe set/order {:?} disagrees with receipt {:?}",
+            self.higher_tfs,
+            expected_higher_tfs
+        );
+
+        anyhow::ensure!(
+            !self.effective_feature_names.is_empty(),
+            "live portfolio effective feature ordering is empty"
+        );
+        let mut feature_names = HashSet::with_capacity(self.effective_feature_names.len());
+        for (index, name) in self.effective_feature_names.iter().enumerate() {
+            anyhow::ensure!(
+                !name.trim().is_empty(),
+                "live portfolio effective feature name {index} is empty"
+            );
+            anyhow::ensure!(
+                feature_names.insert(name.as_str()),
+                "live portfolio effective feature ordering contains duplicate `{name}`"
+            );
+        }
+
+        anyhow::ensure!(
+            self.cost_band.len() == self.genes.len(),
+            "live portfolio has {} genes but {} cost-band rows",
+            self.genes.len(),
+            self.cost_band.len()
+        );
+        let mut strategy_ids = HashSet::with_capacity(self.genes.len());
+        for (position, (gene, (cost_strategy_id, _))) in
+            self.genes.iter().zip(&self.cost_band).enumerate()
+        {
+            anyhow::ensure!(
+                !gene.strategy_id.trim().is_empty(),
+                "live portfolio gene {position} has an empty strategy id"
+            );
+            anyhow::ensure!(
+                strategy_ids.insert(gene.strategy_id.as_str()),
+                "live portfolio contains duplicate strategy id `{}`",
+                gene.strategy_id
+            );
+            anyhow::ensure!(
+                cost_strategy_id == &gene.strategy_id,
+                "live portfolio cost-band row {position} belongs to `{cost_strategy_id}` but gene is `{}`",
+                gene.strategy_id
+            );
+            anyhow::ensure!(
+                gene.indices.len() == gene.weights.len(),
+                "live portfolio gene `{}` has {} indices but {} weights",
+                gene.strategy_id,
+                gene.indices.len(),
+                gene.weights.len()
+            );
+            anyhow::ensure!(
+                gene.indices.windows(2).all(|pair| pair[0] < pair[1]),
+                "live portfolio gene `{}` indices are not strictly ordered and unique",
+                gene.strategy_id
+            );
+            for (term, (&feature_index, &weight)) in
+                gene.indices.iter().zip(&gene.weights).enumerate()
+            {
+                anyhow::ensure!(
+                    feature_index < self.effective_feature_names.len(),
+                    "live portfolio gene `{}` term {term} references feature {feature_index}, but the exact ordering has {} columns",
+                    gene.strategy_id,
+                    self.effective_feature_names.len()
+                );
+                anyhow::ensure!(
+                    weight.is_finite(),
+                    "live portfolio gene `{}` term {term} has a non-finite weight",
+                    gene.strategy_id
+                );
+            }
+            for (label, value) in [
+                ("long_threshold", gene.long_threshold),
+                ("short_threshold", gene.short_threshold),
+                ("tp_pips", gene.tp_pips),
+                ("sl_pips", gene.sl_pips),
+                ("stop_vol_mult", gene.stop_vol_mult),
+            ] {
+                anyhow::ensure!(
+                    value.is_finite(),
+                    "live portfolio gene `{}` has non-finite {label}",
+                    gene.strategy_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Reopen the exact canonical generations named by this artifact and prove
+    /// the rebuilt feature plan/provenance equals the embedded search receipt.
+    pub fn load_exact_search_input(
+        &self,
+        data_root: impl AsRef<Path>,
+    ) -> anyhow::Result<CanonicalSearchInput> {
+        self.validate()?;
+        let anchor = self
+            .search_scope
+            .receipt()
+            .validate()
+            .map_err(anyhow::Error::new)?;
+        let higher_timeframes = self
+            .higher_tfs
+            .iter()
+            .map(|timeframe| {
+                timeframe.parse::<CanonicalTimeframe>().map_err(|error| {
+                    anyhow::anyhow!("invalid receipt-derived direct timeframe {timeframe}: {error}")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let exact = ExactCanonicalSeries::open(data_root.as_ref().to_path_buf(), anchor)
+            .map_err(anyhow::Error::new)?;
+        let input = exact
+            .load_search_input(&higher_timeframes)
+            .map_err(anyhow::Error::new)?;
+        let rebuilt_receipt = input.receipt().map_err(anyhow::Error::new)?;
+        self.search_scope
+            .validate_against_receipt(&rebuilt_receipt)
+            .map_err(anyhow::Error::new)?;
+        Ok(input)
+    }
+
+    /// Verify that a live cTrader session is the same environment/account/symbol
+    /// authority captured by discovery. The app supplies values returned by the
+    /// broker itself, not settings or a filename.
+    pub fn validate_ctrader_runtime_binding(
+        &self,
+        environment: neoethos_data::CTraderEnvironment,
+        account_id: i64,
+        symbol_id: i64,
+        symbol_name: &str,
+    ) -> anyhow::Result<()> {
+        self.validate()?;
+        let anchor = self
+            .search_scope
+            .receipt()
+            .validate()
+            .map_err(anyhow::Error::new)?;
+        let CanonicalDatasetScope::CTrader {
+            environment: expected_environment,
+            account_id: expected_account_id,
+            symbol_id: expected_symbol_id,
+            ..
+        } = anchor.scope()
+        else {
+            anyhow::bail!(
+                "live portfolio search receipt is not cTrader broker data; external research data cannot authorize live execution"
+            );
+        };
+        anyhow::ensure!(
+            *expected_environment == environment,
+            "live cTrader environment {} disagrees with portfolio receipt {}",
+            environment.as_str(),
+            expected_environment.as_str()
+        );
+        anyhow::ensure!(
+            *expected_account_id == account_id,
+            "live cTrader account {account_id} disagrees with portfolio receipt account {expected_account_id}"
+        );
+        anyhow::ensure!(
+            *expected_symbol_id == symbol_id && anchor.symbol_name() == symbol_name,
+            "live cTrader symbol {symbol_name}/{symbol_id} disagrees with portfolio receipt {}/{}",
+            anchor.symbol_name(),
+            expected_symbol_id
+        );
+        Ok(())
     }
 
     /// The cost-band verdict recorded for `strategy_id` in THIS artifact.
     ///
-    /// A gene with no row is [`CostBandVerdict::Unmeasured`] — which is what an
-    /// artifact written before the field existed reports for every gene. It is
-    /// deliberately not `SurvivesBand`: "we did not measure" and "it passed"
-    /// are different answers, and only one of them supports deploying.
+    /// A gene with no row is [`CostBandVerdict::Unmeasured`], never
+    /// `SurvivesBand`. Strict v3 validation rejects such a missing row on load;
+    /// the fallback is only defensive for an in-memory value mutated after
+    /// validation.
     pub fn cost_band_for(&self, strategy_id: &str) -> crate::discovery::CostBandVerdict {
         self.cost_band
             .iter()
@@ -118,6 +381,45 @@ impl LivePortfolioArtifact {
             .map(|(_, verdict)| *verdict)
             .unwrap_or(crate::discovery::CostBandVerdict::Unmeasured)
     }
+}
+
+fn direct_timeframe_authority(
+    search_scope: &CanonicalSearchArtifactScopeV2,
+) -> anyhow::Result<(CanonicalDatasetIdentity, Vec<String>)> {
+    search_scope.validate().map_err(anyhow::Error::new)?;
+    let anchor = search_scope
+        .receipt()
+        .validate()
+        .map_err(anyhow::Error::new)?;
+    let mut direct_timeframes = BTreeSet::new();
+    for binding in search_scope.receipt().source_bindings() {
+        let identity = CanonicalDatasetIdentity::from_path_component(binding.dataset_identity())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "live portfolio source binding `{}` has an invalid dataset identity: {error}",
+                    binding.source_node_id()
+                )
+            })?;
+        if identity.scope() == anchor.scope()
+            && identity.symbol_name() == anchor.symbol_name()
+            && identity.bar_timestamp_convention() == anchor.bar_timestamp_convention()
+        {
+            anyhow::ensure!(
+                direct_timeframes.insert(identity.timeframe()),
+                "live portfolio receipt contains duplicate direct {} generation for the anchor series",
+                identity.timeframe()
+            );
+        }
+    }
+    anyhow::ensure!(
+        direct_timeframes.remove(&anchor.timeframe()),
+        "live portfolio receipt has no exact direct base-timeframe binding"
+    );
+    let higher_tfs = direct_timeframes
+        .into_iter()
+        .map(|timeframe| timeframe.as_str().to_owned())
+        .collect();
+    Ok((anchor, higher_tfs))
 }
 
 /// Process-wide set of RETIRED trading rules, installed once at startup from
@@ -151,11 +453,9 @@ pub fn install_retired_rules_from_settings(s: &neoethos_core::Settings) {
 pub fn current_retired_rules() -> &'static neoethos_core::strategy_identity::RetiredRules {
     static EMPTY: std::sync::OnceLock<neoethos_core::strategy_identity::RetiredRules> =
         std::sync::OnceLock::new();
-    RETIRED_RULES
-        .get()
-        .unwrap_or_else(|| {
-            EMPTY.get_or_init(neoethos_core::strategy_identity::RetiredRules::default)
-        })
+    RETIRED_RULES.get().unwrap_or_else(|| {
+        EMPTY.get_or_init(neoethos_core::strategy_identity::RetiredRules::default)
+    })
 }
 
 /// AUTO-CULL GATE — item #219, 2026-08-10.
@@ -199,8 +499,7 @@ fn drop_retired_rules(genes: Vec<Gene>, feature_names: &[String]) -> Vec<Gene> {
                 continue;
             }
         };
-        let fingerprint =
-            neoethos_core::strategy_identity::gene_rule_fingerprint(&value, &names);
+        let fingerprint = neoethos_core::strategy_identity::gene_rule_fingerprint(&value, &names);
         if retired.contains(&fingerprint) {
             tracing::warn!(
                 target: "neoethos_search::live_portfolio",
@@ -232,53 +531,31 @@ fn drop_retired_rules(genes: Vec<Gene>, feature_names: &[String]) -> Vec<Gene> {
 /// This gate applies at the ONE artifact the autonomous trader consumes.
 /// Matching is by `stable_json_hash(gene)`, the same hash
 /// `compute_discovery_forward_test_artifacts` stamps into each artifact's
-/// `scope.strategy_hash`, so no positional assumptions are made.
+/// strict strategy identity, so no positional assumptions are made.
 ///
-/// When the result carries NO forward-test artifacts (legacy caller, tests,
-/// or tail computation failed non-fatally) every member is kept and a
-/// warning says the live portfolio ships without OOS evidence.
-fn oos_surviving_genes(result: &DiscoveryResult) -> Vec<Gene> {
-    if result.portfolio.is_empty() {
-        return Vec::new();
-    }
-    if result.forward_test_validation_artifacts.is_empty() {
-        tracing::warn!(
-            target: "neoethos_search::live_portfolio",
-            members = result.portfolio.len(),
-            "live portfolio has NO forward-test artifacts — the OOS gate cannot run, \
-             all members are kept WITHOUT held-out-tail evidence"
-        );
-        return result.portfolio.clone();
-    }
+/// Missing, duplicated, extra, or substituted validation evidence fails closed
+/// before any live artifact is constructed.
+fn oos_surviving_genes(result: &DiscoveryResult) -> anyhow::Result<Vec<Gene>> {
+    result.validate_complete_promotion_evidence()?;
     let passing: std::collections::HashSet<&str> = result
         .forward_test_validation_artifacts
         .iter()
-        .filter(|a| a.summary.metrics.net_profit > 0.0)
-        .map(|a| a.scope.strategy_hash.as_str())
+        .filter(|artifact| artifact.summary().metrics.net_profit > 0.0)
+        .map(|artifact| artifact.strategy_identity().exact_gene_hash())
         .collect();
     let mut kept = Vec::with_capacity(result.portfolio.len());
     for gene in &result.portfolio {
-        match crate::artifact_io::stable_json_hash(gene) {
-            Ok(hash) if passing.contains(hash.as_str()) => kept.push(gene.clone()),
-            Ok(hash) => tracing::info!(
+        let hash = crate::artifact_io::stable_json_hash(gene)?;
+        if passing.contains(hash.as_str()) {
+            kept.push(gene.clone());
+        } else {
+            tracing::info!(
                 target: "neoethos_search::live_portfolio",
                 strategy_hash = %hash,
                 strategy_id = %gene.strategy_id,
                 "OOS gate: dropped from LIVE portfolio — non-positive net profit on the \
                  held-out tail (it remains in the discovery artifacts for inspection)"
-            ),
-            Err(err) => {
-                // Serialization of a Gene basically cannot fail; if it ever
-                // does, keeping the member (loudly) beats silently emptying
-                // the live portfolio over an infrastructure hiccup.
-                tracing::warn!(
-                    target: "neoethos_search::live_portfolio",
-                    strategy_id = %gene.strategy_id,
-                    error = %err,
-                    "OOS gate: could not hash gene — keeping it WITHOUT tail evidence"
-                );
-                kept.push(gene.clone());
-            }
+            );
         }
     }
     if kept.is_empty() {
@@ -296,7 +573,7 @@ fn oos_surviving_genes(result: &DiscoveryResult) -> Vec<Gene> {
             "OOS gate: live portfolio filtered by held-out-tail profitability"
         );
     }
-    kept
+    Ok(kept)
 }
 
 /// Write the live portfolio artifact as pretty JSON. Additive — does NOT touch
@@ -304,28 +581,12 @@ fn oos_surviving_genes(result: &DiscoveryResult) -> Vec<Gene> {
 /// data-runtime overrides so the trader knows whether discovery normalized.
 pub fn save_live_portfolio_json(
     path: impl AsRef<Path>,
-    symbol: &str,
-    base_tf: &str,
-    higher_tfs: &[String],
     result: &DiscoveryResult,
 ) -> anyhow::Result<()> {
     let normalize_features = neoethos_data::current_data_runtime_overrides().normalize_features;
-    let artifact = LivePortfolioArtifact::from_discovery(
-        symbol,
-        base_tf,
-        higher_tfs,
-        normalize_features,
-        result,
-    );
-    let json = serde_json::to_string_pretty(&artifact)
-        .map_err(|e| anyhow::anyhow!("failed to serialize live portfolio artifact: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to write live portfolio artifact to {}: {e}",
-            path.as_ref().display()
-        )
-    })?;
-    Ok(())
+    let artifact = LivePortfolioArtifact::from_discovery(normalize_features, result)?;
+    artifact.validate()?;
+    crate::artifact_io::write_json_atomic(path, &artifact)
 }
 
 /// Load a live portfolio artifact written by [`save_live_portfolio_json`].
@@ -342,6 +603,7 @@ pub fn load_live_portfolio_json(path: impl AsRef<Path>) -> anyhow::Result<LivePo
             path.as_ref().display()
         )
     })?;
+    artifact.validate()?;
     Ok(artifact)
 }
 
@@ -376,53 +638,228 @@ pub fn project_features_to_effective(
             })?;
         keep_indices.push(idx);
     }
-    let n_rows = raw.n_samples();
-    let mut projected = ndarray::Array2::<f32>::zeros((n_rows, keep_indices.len()));
-    for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
-        projected
-            .column_mut(new_idx)
-            .assign(&raw.feature_column(orig_idx));
-    }
-    Ok(FeatureFrame {
-        timestamps: raw.timestamps.clone(),
-        names: effective_feature_names.to_vec(),
-        data: FeatureData::InMemory(projected),
-    })
+    raw.select_columns(&keep_indices)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn sample_discovery_result() -> crate::discovery::DiscoveryResult {
+        let gene = Gene {
+            strategy_id: "sample-live-gene".to_owned(),
+            indices: vec![0],
+            weights: vec![1.0],
+            ..Gene::default()
+        };
+        sample_discovery_result_for(vec![gene])
+    }
+
+    fn sample_discovery_result_for(portfolio: Vec<Gene>) -> crate::discovery::DiscoveryResult {
+        use crate::validation::{
+            CanonicalBacktestArtifactFile, ForwardTestSummary, ForwardTestValidationArtifactFile,
+            PropFirmRiskRules, PropFirmRiskValidationArtifactFile, PropFirmRiskValidationSummary,
+            WalkforwardSummary, WalkforwardValidationArtifactFile,
+        };
+
+        const CONFIG_HASH: &str = "fnv64:0123456789abcdef";
+        let (search_input_receipt, selection_scope, holdout_scope) = sample_discovery_authority();
+        let canonical_backtest_artifacts = portfolio
+            .iter()
+            .map(|gene| {
+                CanonicalBacktestArtifactFile::new(
+                    selection_scope.clone(),
+                    CONFIG_HASH,
+                    gene,
+                    crate::eval::BacktestMetrics::from_metric_array([0.0; 11]),
+                )
+                .expect("strict canonical live fixture")
+            })
+            .collect();
+        let walkforward_validation_artifacts = portfolio
+            .iter()
+            .map(|gene| {
+                WalkforwardValidationArtifactFile::new(
+                    selection_scope.clone(),
+                    CONFIG_HASH,
+                    gene,
+                    WalkforwardSummary {
+                        walk_forward_splits: 1,
+                        avg_pnl: 1.0,
+                        avg_win_rate: 0.5,
+                        avg_max_dd: 0.0,
+                        avg_max_consec_losses: 0.0,
+                        avg_daily_min_dd: 0.0,
+                        avg_max_daily_loss: 0.0,
+                        any_daily_loss_breach: false,
+                        any_consistency_violation: false,
+                        any_trade_limit_violation: false,
+                        all_min_trading_days_ok: true,
+                        splits: Vec::new(),
+                    },
+                )
+                .expect("strict walk-forward live fixture")
+            })
+            .collect();
+        let forward_test_validation_artifacts = portfolio
+            .iter()
+            .map(|gene| {
+                let mut metrics = [0.0; 11];
+                metrics[0] = 1.0;
+                metrics[8] = 1.0;
+                ForwardTestValidationArtifactFile::new(
+                    holdout_scope.clone(),
+                    CONFIG_HASH,
+                    gene,
+                    ForwardTestSummary {
+                        bars: 20,
+                        metrics: crate::eval::BacktestMetrics::from_metric_array(metrics),
+                        span_days: 1.0,
+                    },
+                )
+                .expect("strict forward-test live fixture")
+            })
+            .collect();
+        let prop_firm_validation_artifacts = portfolio
+            .iter()
+            .map(|gene| {
+                PropFirmRiskValidationArtifactFile::new(
+                    holdout_scope.clone(),
+                    CONFIG_HASH,
+                    gene,
+                    PropFirmRiskValidationSummary {
+                        rules: PropFirmRiskRules::default(),
+                        trades_observed: 1,
+                        trading_days_observed: 1,
+                        max_daily_loss_pct_observed: 0.0,
+                        max_overall_drawdown_pct_observed: 0.0,
+                        largest_profit_share_observed: 0.0,
+                        max_trades_per_day_observed: 1,
+                        net_return_pct: 0.01,
+                        daily_loss_breach: false,
+                        overall_drawdown_breach: false,
+                        consistency_violation: false,
+                        trade_limit_violation: false,
+                        min_trading_days_ok: true,
+                        profit_target_met: true,
+                        all_rules_passed: true,
+                    },
+                )
+                .expect("strict prop-firm live fixture")
+            })
+            .collect();
+        let mut validation_gates = crate::discovery::DiscoveryValidationGates::pending();
+        validation_gates.walkforward_passed = true;
+        validation_gates.cpcv_passed = true;
+        crate::discovery::DiscoveryResult {
+            search_input_receipt,
+            selection_scope,
+            holdout_scope: Some(holdout_scope),
+            search_config_hash: CONFIG_HASH.to_string(),
+            cost_band_by_strategy: Vec::new(),
+            portfolio,
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["close_minus_open".to_string()],
+            validation_gates,
+            canonical_backtest_artifacts,
+            walkforward_validation_artifacts,
+            forward_test_validation_artifacts,
+            prop_firm_validation_artifacts,
+            funnel_profile: None,
+            effective_smc_gate_threshold: f64::NAN,
+        }
+    }
+
+    fn legacy_v1_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "symbol": "EURUSD",
+            "base_tf": "M1",
+            "higher_tfs": [],
+            "effective_feature_names": ["close_minus_open"],
+            "normalize_features": false,
+            "genes": [],
+            "cost_band": []
+        })
+    }
+
+    fn valid_v3_artifact() -> LivePortfolioArtifact {
+        LivePortfolioArtifact::from_discovery(false, &sample_discovery_result())
+            .expect("valid v3 artifact")
+    }
+
+    fn write_test_json(label: &str, value: &serde_json::Value) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "neoethos_live_portfolio_{label}_{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(value).expect("serialize test JSON"),
+        )
+        .expect("write test live portfolio");
+        path
+    }
+
+    fn sample_search_input_receipt() -> crate::data_selection::CanonicalSearchInputReceiptV2 {
+        let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let anchor = features.provenance().bindings()[0]
+            .dataset_identity()
+            .clone();
+        crate::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(&anchor, &features)
+            .expect("canonical search test receipt")
+    }
+
+    fn sample_discovery_authority() -> (
+        crate::data_selection::CanonicalSearchInputReceiptV2,
+        CanonicalSearchArtifactScopeV2,
+        CanonicalSearchArtifactScopeV2,
+    ) {
+        let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+        let receipt = sample_search_input_receipt();
+        let input = crate::data_selection::CanonicalSearchRunInputV2::new_for_test_values(
+            receipt.clone(),
+            &features,
+            &ohlcv,
+        )
+        .expect("canonical live test input");
+        let selection_scope = CanonicalSearchArtifactScopeV2::from_run_input_range(
+            CanonicalSearchWindowRoleV1::InSample,
+            &input,
+            0..80,
+        )
+        .expect("canonical InSample live test scope");
+        let holdout_scope = CanonicalSearchArtifactScopeV2::from_run_input_range(
+            CanonicalSearchWindowRoleV1::Holdout,
+            &input,
+            80..100,
+        )
+        .expect("canonical Holdout live test scope");
+        (receipt, selection_scope, holdout_scope)
+    }
+
     #[test]
     fn artifact_round_trips_through_json() {
         let mut gene = Gene::default();
-        gene.indices = vec![0, 2];
-        gene.weights = vec![0.5, -0.25];
+        gene.indices = vec![0];
+        gene.weights = vec![0.5];
         gene.long_threshold = 0.1;
         gene.short_threshold = -0.1;
         gene.strategy_id = "test-gene".to_string();
 
-        let artifact = LivePortfolioArtifact {
-            schema_version: LIVE_PORTFOLIO_SCHEMA_VERSION,
-            symbol: "EURGBP".to_string(),
-            base_tf: "D1".to_string(),
-            higher_tfs: vec!["W1".to_string()],
-            effective_feature_names: vec![
-                "rsi".to_string(),
-                "atr".to_string(),
-                "W1_rsi".to_string(),
-            ],
-            normalize_features: false,
-            genes: vec![gene],
-            cost_band: vec![(
-                "test-gene".to_string(),
-                crate::discovery::CostBandVerdict::OptimisticEdgeOnly,
-            )],
-        };
+        let mut result = sample_discovery_result_for(vec![gene]);
+        result.cost_band_by_strategy = vec![(
+            "test-gene".to_string(),
+            crate::discovery::CostBandVerdict::OptimisticEdgeOnly,
+        )];
+        let artifact = LivePortfolioArtifact::from_discovery(false, &result).unwrap();
 
         let json = serde_json::to_string(&artifact).unwrap();
         let back: LivePortfolioArtifact = serde_json::from_str(&json).unwrap();
+        back.validate().unwrap();
         assert_eq!(artifact, back, "artifact must survive a JSON round-trip");
         // The verdict has to survive the round trip too — it is the whole point
         // of carrying it (audit #71), and a silently dropped field would look
@@ -439,32 +876,105 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_receipt_free_v1_even_when_the_old_payload_is_well_formed() {
+        let value = legacy_v1_artifact();
+        let path = write_test_json("reject_v1", &value);
+
+        let error = load_live_portfolio_json(&path)
+            .expect_err("v1 has no immutable receipt/config authority and must fail closed");
+        assert!(
+            error.to_string().contains("schema")
+                || error.to_string().contains("authority")
+                || error.to_string().contains("search_scope"),
+            "failure should name the unsupported schema/authority boundary: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_unknown_fields_instead_of_ignoring_them() {
+        let mut value = serde_json::to_value(valid_v3_artifact()).expect("serialize valid v3");
+        value
+            .as_object_mut()
+            .expect("artifact is an object")
+            .insert("future_semantics".to_string(), serde_json::json!(true));
+        let path = write_test_json("reject_unknown", &value);
+
+        let error = load_live_portfolio_json(&path)
+            .expect_err("unknown persisted semantics must fail closed");
+        assert!(
+            error.to_string().contains("unknown field") || error.to_string().contains("schema"),
+            "failure should name the unknown/unsupported contract: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_display_identity_that_disagrees_with_embedded_scope() {
+        let mut value = serde_json::to_value(valid_v3_artifact()).expect("serialize valid v3");
+        let object = value.as_object_mut().expect("artifact is an object");
+        object.insert("symbol".to_string(), serde_json::json!("GBPUSD"));
+        let path = write_test_json("reject_scope_mismatch", &value);
+
+        let error = load_live_portfolio_json(&path)
+            .expect_err("display symbol must not override the exact receipt anchor");
+        assert!(
+            error.to_string().contains("symbol") || error.to_string().contains("scope"),
+            "failure should name the scope/display mismatch: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn from_discovery_derives_identity_from_the_result_receipt() {
+        let result = sample_discovery_result();
+        let artifact = LivePortfolioArtifact::from_discovery(false, &result).unwrap();
+
+        assert_eq!(artifact.symbol, "EURUSD");
+        assert_eq!(artifact.base_tf, "M1");
+        assert!(artifact.higher_tfs.is_empty());
+    }
+
+    #[test]
+    fn live_broker_binding_rejects_an_external_research_receipt() {
+        let artifact = valid_v3_artifact();
+        let error = artifact
+            .validate_ctrader_runtime_binding(
+                neoethos_data::CTraderEnvironment::Demo,
+                42,
+                1,
+                "EURUSD",
+            )
+            .expect_err("an external research receipt cannot authorize cTrader execution");
+        assert!(error.to_string().contains("cTrader"));
+    }
+
+    #[test]
     fn project_selects_and_reorders_by_name() {
         // raw frame: 3 cols [a, b, c]; effective wants [c, a] (subset + reorder).
-        let data = ndarray::array![[1.0_f32, 2.0, 3.0], [4.0, 5.0, 6.0],];
-        let raw = FeatureFrame {
-            timestamps: vec![0, 1],
-            names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            data: FeatureData::InMemory(data),
-        };
+        let data = ndarray::array![[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0],];
+        let raw = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+            neoethos_data::test_fixtures::canonical_test_timestamps(2),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            data,
+        )
+        .expect("valid f64 test frame");
         let effective = vec!["c".to_string(), "a".to_string()];
         let projected = project_features_to_effective(&raw, &effective).unwrap();
         assert_eq!(projected.names, effective);
         assert_eq!(projected.n_features(), 2);
         // column 0 == raw "c" == [3, 6]; column 1 == raw "a" == [1, 4]
-        assert_eq!(projected.feature_at(0, 0), 3.0);
-        assert_eq!(projected.feature_at(1, 0), 6.0);
-        assert_eq!(projected.feature_at(0, 1), 1.0);
-        assert_eq!(projected.feature_at(1, 1), 4.0);
+        assert_eq!(projected.cell(0, 0).unwrap().value, 3.0);
+        assert_eq!(projected.cell(1, 0).unwrap().value, 6.0);
+        assert_eq!(projected.cell(0, 1).unwrap().value, 1.0);
+        assert_eq!(projected.cell(1, 1).unwrap().value, 4.0);
     }
 
     #[test]
     fn oos_gate_drops_tail_losers_and_keeps_tail_winners() {
-        use crate::validation::{
-            ForwardTestSummary, ForwardTestValidationArtifactFile, ForwardTestValidationScope,
-        };
+        use crate::validation::{ForwardTestSummary, ForwardTestValidationArtifactFile};
 
-        fn gene(id: &str, long_threshold: f32) -> Gene {
+        fn gene(id: &str, long_threshold: f64) -> Gene {
             Gene {
                 strategy_id: id.to_string(),
                 indices: vec![0],
@@ -474,52 +984,42 @@ mod tests {
                 ..Gene::default()
             }
         }
-        fn artifact(gene: &Gene, net_profit: f64) -> ForwardTestValidationArtifactFile {
-            let scope = ForwardTestValidationScope {
-                dataset_hash: "tail-hash".to_string(),
-                evaluation_config_hash: "eval-hash".to_string(),
-                strategy_hash: crate::artifact_io::stable_json_hash(gene).unwrap(),
-                temporal_scope: neoethos_core::contracts::TemporalScopeHashes {
-                    temporal_contract_hash: "t".to_string(),
-                    timestamp_policy_hash: "ts".to_string(),
-                    feature_availability_policy_hash: "fa".to_string(),
-                    label_policy_hash: "lp".to_string(),
-                },
-            };
+        fn artifact(
+            gene: &Gene,
+            holdout_scope: &CanonicalSearchArtifactScopeV2,
+            net_profit: f64,
+        ) -> ForwardTestValidationArtifactFile {
             let summary = ForwardTestSummary {
-                bars: 10,
+                bars: 20,
                 metrics: crate::eval::BacktestMetrics::from_metric_array([
                     net_profit, 1.0, 100_000.0, 0.01, 0.5, 1.2, 1.0, 0.0, 4.0, 0.8, 0.005,
                 ]),
                 span_days: 1.0,
             };
-            ForwardTestValidationArtifactFile::new(scope, summary)
+            ForwardTestValidationArtifactFile::new(
+                holdout_scope.clone(),
+                "fnv64:0123456789abcdef",
+                gene,
+                summary,
+            )
+            .expect("strict forward-test live fixture")
         }
 
         // Distinct genes so their stable hashes differ.
         let winner = gene("winner", 0.4);
         let loser = gene("loser", 0.6);
-        let mut result = crate::discovery::DiscoveryResult {
-            cost_band_by_strategy: Vec::new(),
-            portfolio: vec![winner.clone(), loser.clone()],
-            candidates: Vec::new(),
-            quality_metrics: Vec::new(),
-            logged_trades: Vec::new(),
-            effective_feature_names: vec!["rsi".to_string()],
-            validation_gates: crate::discovery::DiscoveryValidationGates::pending(),
-            canonical_backtest_artifacts: Vec::new(),
-            walkforward_validation_artifacts: Vec::new(),
-            forward_test_validation_artifacts: vec![
-                artifact(&winner, 42.0),
-                artifact(&loser, -3.0),
-            ],
-            prop_firm_validation_artifacts: Vec::new(),
-            funnel_profile: None,
+        let mut result = sample_discovery_result_for(vec![winner.clone(), loser.clone()]);
+        let holdout_scope = result
+            .holdout_scope
+            .as_ref()
+            .expect("strict live fixture holdout")
+            .clone();
+        result.forward_test_validation_artifacts = vec![
+            artifact(&winner, &holdout_scope, 42.0),
+            artifact(&loser, &holdout_scope, -3.0),
+        ];
 
-            effective_smc_gate_threshold: f32::NAN,
-        };
-
-        let live = LivePortfolioArtifact::from_discovery("EURUSD", "M1", &[], false, &result);
+        let live = LivePortfolioArtifact::from_discovery(false, &result).unwrap();
         assert_eq!(
             live.genes
                 .iter()
@@ -529,25 +1029,26 @@ mod tests {
             "only the tail-profitable strategy may reach the live portfolio"
         );
 
-        // Without forward-test evidence the gate cannot run: keep everyone
-        // (the legacy/test path), never silently empty the portfolio.
+        // Live is an authority boundary: missing held-out evidence must refuse
+        // the artifact, never silently keep every in-sample winner.
         result.forward_test_validation_artifacts.clear();
-        let live = LivePortfolioArtifact::from_discovery("EURUSD", "M1", &[], false, &result);
-        assert_eq!(
-            live.genes.len(),
-            2,
-            "no artifacts → no gate → all members kept"
+        let error = LivePortfolioArtifact::from_discovery(false, &result)
+            .expect_err("missing forward-test evidence must fail closed for live");
+        assert!(
+            error.to_string().contains("forward_test") && error.to_string().contains("missing"),
+            "unexpected error: {error:#}"
         );
     }
 
     #[test]
     fn project_errors_on_missing_feature() {
-        let data = ndarray::array![[1.0_f32, 2.0]];
-        let raw = FeatureFrame {
-            timestamps: vec![0],
-            names: vec!["a".to_string(), "b".to_string()],
-            data: FeatureData::InMemory(data),
-        };
+        let data = ndarray::array![[1.0_f64, 2.0]];
+        let raw = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+            neoethos_data::test_fixtures::canonical_test_timestamps(1),
+            vec!["a".to_string(), "b".to_string()],
+            data,
+        )
+        .expect("valid f64 test frame");
         let effective = vec!["a".to_string(), "missing".to_string()];
         assert!(project_features_to_effective(&raw, &effective).is_err());
     }

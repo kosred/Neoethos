@@ -59,9 +59,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use polars::prelude::DataFrame;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, project_expert_frame};
 use crate::base::ExpertModel as BaseExpertModel;
 use crate::deep_models::{KANExpert, MLPExpert, TabNetExpert};
 use crate::runtime::capabilities::ModelFamily;
@@ -108,10 +109,11 @@ impl ExpertModel for MlpAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "mlp predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -171,10 +173,11 @@ impl ExpertModel for KanAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "kan predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -234,10 +237,11 @@ impl ExpertModel for TabNetAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "tabnet predict_proba failed")?;
         classification3_per_row(&probs)
     }

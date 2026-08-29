@@ -9,9 +9,7 @@ use thiserror::Error;
 pub enum MaBatchDispatchError {
     #[error("Unknown moving average type: {ma_type}")]
     UnknownType { ma_type: String },
-    #[error(
-        "{indicator} does not support period-sweep batch dispatch; use the indicator directly"
-    )]
+    #[error("{indicator} does not support period-sweep batch dispatch; use the indicator directly")]
     NotPeriodBased { indicator: &'static str },
     #[error("{indicator} requires candles (timestamp/volume/OHLC); pass MaData::Candles")]
     RequiresCandles { indicator: &'static str },
@@ -361,7 +359,7 @@ pub fn ma_batch_with_kernel_and_typed_params<'a>(
                     value: f64::NAN,
                     reason: "expected 'mama' or 'fama'",
                 }
-                .into())
+                .into());
             }
         };
         return Ok(MaBatchOutput {
@@ -400,7 +398,7 @@ pub fn ma_batch_with_kernel_and_typed_params<'a>(
                     value: f64::NAN,
                     reason: "expected 'predict' or 'trigger'",
                 }
-                .into())
+                .into());
             }
         };
         let cols = series.len();
@@ -455,7 +453,7 @@ pub fn ma_batch_with_kernel_and_typed_params<'a>(
         let rows = out.rows;
         let cols = out.cols;
         let series = match output.as_str() {
-            "corrected" | "value" => out.corrected,
+            "corrected" => out.corrected,
             "t3" => out.t3,
             _ => {
                 return Err(MaBatchDispatchError::InvalidParam {
@@ -464,7 +462,7 @@ pub fn ma_batch_with_kernel_and_typed_params<'a>(
                     value: f64::NAN,
                     reason: "expected 'corrected' or 't3'",
                 }
-                .into())
+                .into());
             }
         };
         return Ok(MaBatchOutput {
@@ -543,7 +541,7 @@ pub fn ma_batch_with_kernel_and_typed_params<'a>(
                     value: f64::NAN,
                     reason: "expected 'fast' or 'slow'",
                 }
-                .into())
+                .into());
             }
         };
 
@@ -630,8 +628,8 @@ pub fn ma_batch_with_kernel_and_typed_params<'a>(
             .unwrap_or("fast")
             .to_ascii_lowercase();
         let values = match output.as_str() {
-            "fast" | "fast_buff" => out.fast,
-            "slow" | "slow_buff" => out.slow,
+            "fast" => out.fast,
+            "slow" => out.slow,
             _ => {
                 return Err(MaBatchDispatchError::InvalidParam {
                     indicator: "buff_averages",
@@ -639,7 +637,7 @@ pub fn ma_batch_with_kernel_and_typed_params<'a>(
                     value: f64::NAN,
                     reason: "expected 'fast' or 'slow'",
                 }
-                .into())
+                .into());
             }
         };
 

@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -12,125 +12,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, moving_averages::CudaDecycler};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::decycler_wrapper::DeviceArrayF32Decycler as DeviceArrayF32Inner;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DecyclerDeviceArrayF32", unsendable)]
-pub struct DeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32Inner,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = self.inner.ctx.clone();
-        let device_id = self.inner.device_id;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Inner {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx,
-                device_id,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
 
 impl<'a> AsRef<[f64]> for DecyclerInput<'a> {
     #[inline(always)]
@@ -173,10 +54,6 @@ pub struct DecyclerOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DecyclerParams {
     pub hp_period: Option<usize>,
     pub k: Option<f64>,
@@ -397,7 +274,6 @@ pub fn decycler_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn decycler_into(input: &DecyclerInput, out: &mut [f64]) -> Result<(), DecyclerError> {
     decycler_into_slice(out, input, Kernel::Auto)
@@ -1069,38 +945,11 @@ pub fn expand_grid_decycler(r: &DecyclerBatchRange) -> Result<Vec<DecyclerParams
     expand_grid(r)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decycler_output_into_js(
-    data: &[f64],
-    hp_period: usize,
-    k: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = decycler_js(data, hp_period, k)?;
-    crate::write_wasm_f64_output("decycler_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decycler_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = decycler_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "decycler_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     #[test]
@@ -1115,13 +964,8 @@ mod tests {
         let baseline = decycler(&input)?.values;
 
         let mut out = vec![0.0; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             decycler_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            decycler_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1150,8 +994,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = DecyclerParams {
             hp_period: None,
             k: None,
@@ -1180,8 +1024,8 @@ mod tests {
 
     fn check_decycler_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_prices = candles
             .select_candle_field("close")
             .expect("Failed to extract close prices");
@@ -1262,8 +1106,8 @@ mod tests {
 
     fn check_decycler_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = DecyclerParams {
             hp_period: Some(30),
             k: None,
@@ -1283,8 +1127,8 @@ mod tests {
 
     fn check_decycler_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_prices = &candles.close;
         let period = 125;
         let params = DecyclerParams {
@@ -1310,8 +1154,8 @@ mod tests {
     fn check_decycler_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DecyclerParams::default(),
@@ -1480,8 +1324,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = DecyclerBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1530,8 +1374,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 0.1, 1.0, 0.3),
@@ -1820,196 +1664,6 @@ mod tests {
     generate_all_decycler_tests!(check_decycler_property);
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "decycler")]
-#[pyo3(signature = (data, hp_period=None, k=None, kernel=None))]
-pub fn decycler_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    hp_period: Option<usize>,
-    k: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = DecyclerParams { hp_period, k };
-    let decycler_in = DecyclerInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| decycler_with_kernel(&decycler_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DecyclerStream")]
-pub struct DecyclerStreamPy {
-    stream: DecyclerStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DecyclerStreamPy {
-    #[new]
-    fn new(hp_period: Option<usize>, k: Option<f64>) -> PyResult<Self> {
-        let params = DecyclerParams { hp_period, k };
-        let stream =
-            DecyclerStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(DecyclerStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "decycler_batch")]
-#[pyo3(signature = (data, hp_period_range, k_range, kernel=None))]
-pub fn decycler_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    hp_period_range: (usize, usize, usize),
-    k_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-    use std::mem::MaybeUninit;
-
-    let slice_in = data.as_slice()?;
-    let sweep = DecyclerBatchRange {
-        hp_period: hp_period_range,
-        k: k_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let first = slice_in.iter().position(|x| !x.is_nan()).unwrap_or(0);
-    let warmup = first + 2;
-    for row in 0..rows {
-        let row_start = row * cols;
-        for i in 0..warmup.min(cols) {
-            slice_out[row_start + i] = f64::NAN;
-        }
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            decycler_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "hp_periods",
-        combos
-            .iter()
-            .map(|p| p.hp_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ks",
-        combos
-            .iter()
-            .map(|p| p.k.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "decycler_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, hp_period_range=(125, 125, 0), k_range=(0.707, 0.707, 0.0), device_id=0))]
-pub fn decycler_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    hp_period_range: (usize, usize, usize),
-    k_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = DecyclerBatchRange {
-        hp_period: hp_period_range,
-        k: k_range,
-    };
-    let inner = py.allow_threads(|| -> PyResult<_> {
-        let cuda =
-            CudaDecycler::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.decycler_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "decycler_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, hp_period, k, device_id=0))]
-pub fn decycler_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    hp_period: usize,
-    k: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if hp_period < 2 {
-        return Err(PyValueError::new_err("hp_period must be >= 2"));
-    }
-    if !(k > 0.0) || !k.is_finite() {
-        return Err(PyValueError::new_err("k must be positive and finite"));
-    }
-
-    let flat = data_tm_f32.as_slice()?;
-    let shape = data_tm_f32.shape();
-    let series_len = shape[0];
-    let num_series = shape[1];
-    let params = DecyclerParams {
-        hp_period: Some(hp_period),
-        k: Some(k),
-    };
-    let inner = py.allow_threads(|| -> PyResult<_> {
-        let cuda =
-            CudaDecycler::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.decycler_many_series_one_param_time_major_dev(flat, num_series, series_len, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py { inner })
-}
-
 #[inline(always)]
 fn decycler_batch_inner_into(
     data: &[f64],
@@ -2109,151 +1763,4 @@ fn decycler_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decycler_js(data: &[f64], hp_period: usize, k: f64) -> Result<Vec<f64>, JsValue> {
-    let params = DecyclerParams {
-        hp_period: Some(hp_period),
-        k: Some(k),
-    };
-    let input = DecyclerInput::from_slice(data, params);
-    let mut output = vec![0.0; data.len()];
-    decycler_into_slice(&mut output, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decycler_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    hp_period: usize,
-    k: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = DecyclerParams {
-            hp_period: Some(hp_period),
-            k: Some(k),
-        };
-        let input = DecyclerInput::from_slice(data, params);
-
-        if in_ptr == out_ptr as *const f64 {
-            let mut tmp = vec![0.0; len];
-            decycler_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            decycler_into_slice(
-                std::slice::from_raw_parts_mut(out_ptr, len),
-                &input,
-                detect_best_kernel(),
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decycler_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decycler_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DecyclerBatchConfig {
-    pub hp_period_range: (usize, usize, usize),
-    pub k_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DecyclerBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<DecyclerParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = decycler_batch)]
-pub fn decycler_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: DecyclerBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = DecyclerBatchRange {
-        hp_period: cfg.hp_period_range,
-        k: cfg.k_range,
-    };
-
-    let out = decycler_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = DecyclerBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decycler_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    hp_start: usize,
-    hp_end: usize,
-    hp_step: usize,
-    k_start: f64,
-    k_end: f64,
-    k_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = DecyclerBatchRange {
-            hp_period: (hp_start, hp_end, hp_step),
-            k: (k_start, k_end, k_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        decycler_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
 }

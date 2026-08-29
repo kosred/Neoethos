@@ -42,5 +42,8 @@
 #
 # Keep the file VALID TOML — cubecl PANICS at startup on a malformed config
 # rather than ignoring it.
+[compilation]
+cache = "target"
+
 [streaming]
 max_streams = 1

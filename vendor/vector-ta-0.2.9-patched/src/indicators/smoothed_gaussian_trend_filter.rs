@@ -1,17 +1,3 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::indicators::atr::{AtrParams, AtrStream};
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
@@ -19,8 +5,6 @@ use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -54,10 +38,6 @@ pub struct SmoothedGaussianTrendFilterOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct SmoothedGaussianTrendFilterParams {
     pub gaussian_length: Option<usize>,
     pub poles: Option<usize>,
@@ -292,9 +272,7 @@ pub enum SmoothedGaussianTrendFilterError {
         "smoothed_gaussian_trend_filter: Output length mismatch: expected={expected}, got={got}"
     )]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error(
-        "smoothed_gaussian_trend_filter: Invalid range: start={start}, end={end}, step={step}"
-    )]
+    #[error("smoothed_gaussian_trend_filter: Invalid range: start={start}, end={end}, step={step}")]
     InvalidRange {
         start: String,
         end: String,
@@ -551,11 +529,7 @@ impl PineSupertrendState {
         let direction = if !self.prev_atr_valid {
             1.0
         } else if self.prev_supertrend == self.prev_upper {
-            if src > upper {
-                -1.0
-            } else {
-                1.0
-            }
+            if src > upper { -1.0 } else { 1.0 }
         } else if src < lower {
             1.0
         } else {
@@ -915,7 +889,6 @@ pub fn smoothed_gaussian_trend_filter_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn smoothed_gaussian_trend_filter_into(
     input: &SmoothedGaussianTrendFilterInput<'_>,
@@ -935,10 +908,6 @@ pub fn smoothed_gaussian_trend_filter_into(
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct SmoothedGaussianTrendFilterBatchRange {
     pub gaussian_length: (usize, usize, usize),
     pub poles: (usize, usize, usize),
@@ -1127,7 +1096,7 @@ pub fn smoothed_gaussian_trend_filter_batch_with_kernel(
         other => {
             return Err(SmoothedGaussianTrendFilterError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
     smoothed_gaussian_trend_filter_batch_par_slice(
@@ -1429,553 +1398,6 @@ fn smoothed_gaussian_trend_filter_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "smoothed_gaussian_trend_filter")]
-#[pyo3(signature = (high, low, close, gaussian_length=DEFAULT_GAUSSIAN_LENGTH, poles=DEFAULT_POLES, smoothing_length=DEFAULT_SMOOTHING_LENGTH, linreg_offset=DEFAULT_LINREG_OFFSET, kernel=None))]
-pub fn smoothed_gaussian_trend_filter_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    gaussian_length: usize,
-    poles: usize,
-    smoothing_length: usize,
-    linreg_offset: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let input = SmoothedGaussianTrendFilterInput::from_slices(
-        high,
-        low,
-        close,
-        SmoothedGaussianTrendFilterParams {
-            gaussian_length: Some(gaussian_length),
-            poles: Some(poles),
-            smoothing_length: Some(smoothing_length),
-            linreg_offset: Some(linreg_offset),
-        },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| smoothed_gaussian_trend_filter_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.filter.into_pyarray(py),
-        out.supertrend.into_pyarray(py),
-        out.trend.into_pyarray(py),
-        out.ranging.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "SmoothedGaussianTrendFilterStream")]
-pub struct SmoothedGaussianTrendFilterStreamPy {
-    stream: SmoothedGaussianTrendFilterStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl SmoothedGaussianTrendFilterStreamPy {
-    #[new]
-    #[pyo3(signature = (gaussian_length=DEFAULT_GAUSSIAN_LENGTH, poles=DEFAULT_POLES, smoothing_length=DEFAULT_SMOOTHING_LENGTH, linreg_offset=DEFAULT_LINREG_OFFSET))]
-    fn new(
-        gaussian_length: usize,
-        poles: usize,
-        smoothing_length: usize,
-        linreg_offset: usize,
-    ) -> PyResult<Self> {
-        let stream =
-            SmoothedGaussianTrendFilterStream::try_new(SmoothedGaussianTrendFilterParams {
-                gaussian_length: Some(gaussian_length),
-                poles: Some(poles),
-                smoothing_length: Some(smoothing_length),
-                linreg_offset: Some(linreg_offset),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64, f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "smoothed_gaussian_trend_filter_batch")]
-#[pyo3(signature = (high, low, close, gaussian_length_range, poles_range, smoothing_length_range, linreg_offset_range, kernel=None))]
-pub fn smoothed_gaussian_trend_filter_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    gaussian_length_range: (usize, usize, usize),
-    poles_range: (usize, usize, usize),
-    smoothing_length_range: (usize, usize, usize),
-    linreg_offset_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let sweep = SmoothedGaussianTrendFilterBatchRange {
-        gaussian_length: gaussian_length_range,
-        poles: poles_range,
-        smoothing_length: smoothing_length_range,
-        linreg_offset: linreg_offset_range,
-    };
-    let combos = expand_grid_smoothed_gaussian_trend_filter(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let filter_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let supertrend_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let trend_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let ranging_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_filter = unsafe { filter_arr.as_slice_mut()? };
-    let out_supertrend = unsafe { supertrend_arr.as_slice_mut()? };
-    let out_trend = unsafe { trend_arr.as_slice_mut()? };
-    let out_ranging = unsafe { ranging_arr.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        smoothed_gaussian_trend_filter_batch_inner_into(
-            high,
-            low,
-            close,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            out_filter,
-            out_supertrend,
-            out_trend,
-            out_ranging,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let gaussian_lengths: Vec<usize> = combos
-        .iter()
-        .map(|params| params.gaussian_length.unwrap_or(DEFAULT_GAUSSIAN_LENGTH))
-        .collect();
-    let poles: Vec<usize> = combos
-        .iter()
-        .map(|params| params.poles.unwrap_or(DEFAULT_POLES))
-        .collect();
-    let smoothing_lengths: Vec<usize> = combos
-        .iter()
-        .map(|params| params.smoothing_length.unwrap_or(DEFAULT_SMOOTHING_LENGTH))
-        .collect();
-    let linreg_offsets: Vec<usize> = combos
-        .iter()
-        .map(|params| params.linreg_offset.unwrap_or(DEFAULT_LINREG_OFFSET))
-        .collect();
-
-    let dict = PyDict::new(py);
-    dict.set_item("filter", filter_arr.reshape((rows, cols))?)?;
-    dict.set_item("supertrend", supertrend_arr.reshape((rows, cols))?)?;
-    dict.set_item("trend", trend_arr.reshape((rows, cols))?)?;
-    dict.set_item("ranging", ranging_arr.reshape((rows, cols))?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("gaussian_lengths", gaussian_lengths.into_pyarray(py))?;
-    dict.set_item("poles", poles.into_pyarray(py))?;
-    dict.set_item("smoothing_lengths", smoothing_lengths.into_pyarray(py))?;
-    dict.set_item("linreg_offsets", linreg_offsets.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_smoothed_gaussian_trend_filter_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(smoothed_gaussian_trend_filter_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        smoothed_gaussian_trend_filter_batch_py,
-        m
-    )?)?;
-    m.add_class::<SmoothedGaussianTrendFilterStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SmoothedGaussianTrendFilterWasmOutput {
-    filter: Vec<f64>,
-    supertrend: Vec<f64>,
-    trend: Vec<f64>,
-    ranging: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "smoothed_gaussian_trend_filter")]
-pub fn smoothed_gaussian_trend_filter_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    gaussian_length: usize,
-    poles: usize,
-    smoothing_length: usize,
-    linreg_offset: usize,
-) -> Result<JsValue, JsValue> {
-    let input = SmoothedGaussianTrendFilterInput::from_slices(
-        high,
-        low,
-        close,
-        SmoothedGaussianTrendFilterParams {
-            gaussian_length: Some(gaussian_length),
-            poles: Some(poles),
-            smoothing_length: Some(smoothing_length),
-            linreg_offset: Some(linreg_offset),
-        },
-    );
-    let out = smoothed_gaussian_trend_filter_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&SmoothedGaussianTrendFilterWasmOutput {
-        filter: out.filter,
-        supertrend: out.supertrend,
-        trend: out.trend,
-        ranging: out.ranging,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn smoothed_gaussian_trend_filter_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    gaussian_length: usize,
-    poles: usize,
-    smoothing_length: usize,
-    linreg_offset: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to smoothed_gaussian_trend_filter_into",
-        ));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len * 4);
-        let (out_filter, rest) = out.split_at_mut(len);
-        let (out_supertrend, rest) = rest.split_at_mut(len);
-        let (out_trend, out_ranging) = rest.split_at_mut(len);
-        let input = SmoothedGaussianTrendFilterInput::from_slices(
-            high,
-            low,
-            close,
-            SmoothedGaussianTrendFilterParams {
-                gaussian_length: Some(gaussian_length),
-                poles: Some(poles),
-                smoothing_length: Some(smoothing_length),
-                linreg_offset: Some(linreg_offset),
-            },
-        );
-        smoothed_gaussian_trend_filter_into_slice(
-            out_filter,
-            out_supertrend,
-            out_trend,
-            out_ranging,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "smoothed_gaussian_trend_filter_into_host")]
-pub fn smoothed_gaussian_trend_filter_into_host(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    out_ptr: *mut f64,
-    gaussian_length: usize,
-    poles: usize,
-    smoothing_length: usize,
-    linreg_offset: usize,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to smoothed_gaussian_trend_filter_into_host",
-        ));
-    }
-
-    unsafe {
-        let out = std::slice::from_raw_parts_mut(out_ptr, close.len() * 4);
-        let (out_filter, rest) = out.split_at_mut(close.len());
-        let (out_supertrend, rest) = rest.split_at_mut(close.len());
-        let (out_trend, out_ranging) = rest.split_at_mut(close.len());
-        let input = SmoothedGaussianTrendFilterInput::from_slices(
-            high,
-            low,
-            close,
-            SmoothedGaussianTrendFilterParams {
-                gaussian_length: Some(gaussian_length),
-                poles: Some(poles),
-                smoothing_length: Some(smoothing_length),
-                linreg_offset: Some(linreg_offset),
-            },
-        );
-        smoothed_gaussian_trend_filter_into_slice(
-            out_filter,
-            out_supertrend,
-            out_trend,
-            out_ranging,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn smoothed_gaussian_trend_filter_alloc(len: usize) -> *mut f64 {
-    let mut buf = vec![0.0_f64; len * 4];
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn smoothed_gaussian_trend_filter_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len * 4);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SmoothedGaussianTrendFilterBatchConfig {
-    gaussian_length_range: Vec<usize>,
-    poles_range: Vec<usize>,
-    smoothing_length_range: Vec<usize>,
-    linreg_offset_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SmoothedGaussianTrendFilterBatchOutputWasm {
-    filter: Vec<f64>,
-    supertrend: Vec<f64>,
-    trend: Vec<f64>,
-    ranging: Vec<f64>,
-    rows: usize,
-    cols: usize,
-    combos: Vec<SmoothedGaussianTrendFilterParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "smoothed_gaussian_trend_filter_batch")]
-pub fn smoothed_gaussian_trend_filter_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: SmoothedGaussianTrendFilterBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.gaussian_length_range.len() != 3
-        || config.poles_range.len() != 3
-        || config.smoothing_length_range.len() != 3
-        || config.linreg_offset_range.len() != 3
-    {
-        return Err(JsValue::from_str(
-            "Invalid config: ranges must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = SmoothedGaussianTrendFilterBatchRange {
-        gaussian_length: (
-            config.gaussian_length_range[0],
-            config.gaussian_length_range[1],
-            config.gaussian_length_range[2],
-        ),
-        poles: (
-            config.poles_range[0],
-            config.poles_range[1],
-            config.poles_range[2],
-        ),
-        smoothing_length: (
-            config.smoothing_length_range[0],
-            config.smoothing_length_range[1],
-            config.smoothing_length_range[2],
-        ),
-        linreg_offset: (
-            config.linreg_offset_range[0],
-            config.linreg_offset_range[1],
-            config.linreg_offset_range[2],
-        ),
-    };
-
-    let out =
-        smoothed_gaussian_trend_filter_batch_inner(high, low, close, &sweep, Kernel::Auto, false)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&SmoothedGaussianTrendFilterBatchOutputWasm {
-        filter: out.filter,
-        supertrend: out.supertrend,
-        trend: out.trend,
-        ranging: out.ranging,
-        rows: out.rows,
-        cols: out.cols,
-        combos: out.combos,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn smoothed_gaussian_trend_filter_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    filter_ptr: *mut f64,
-    supertrend_ptr: *mut f64,
-    trend_ptr: *mut f64,
-    ranging_ptr: *mut f64,
-    len: usize,
-    gaussian_length_start: usize,
-    gaussian_length_end: usize,
-    gaussian_length_step: usize,
-    poles_start: usize,
-    poles_end: usize,
-    poles_step: usize,
-    smoothing_length_start: usize,
-    smoothing_length_end: usize,
-    smoothing_length_step: usize,
-    linreg_offset_start: usize,
-    linreg_offset_end: usize,
-    linreg_offset_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || filter_ptr.is_null()
-        || supertrend_ptr.is_null()
-        || trend_ptr.is_null()
-        || ranging_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to smoothed_gaussian_trend_filter_batch_into",
-        ));
-    }
-
-    let sweep = SmoothedGaussianTrendFilterBatchRange {
-        gaussian_length: (
-            gaussian_length_start,
-            gaussian_length_end,
-            gaussian_length_step,
-        ),
-        poles: (poles_start, poles_end, poles_step),
-        smoothing_length: (
-            smoothing_length_start,
-            smoothing_length_end,
-            smoothing_length_step,
-        ),
-        linreg_offset: (linreg_offset_start, linreg_offset_end, linreg_offset_step),
-    };
-    let combos = expand_grid_smoothed_gaussian_trend_filter(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*len overflow"))?;
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out_filter = std::slice::from_raw_parts_mut(filter_ptr, total);
-        let out_supertrend = std::slice::from_raw_parts_mut(supertrend_ptr, total);
-        let out_trend = std::slice::from_raw_parts_mut(trend_ptr, total);
-        let out_ranging = std::slice::from_raw_parts_mut(ranging_ptr, total);
-        smoothed_gaussian_trend_filter_batch_inner_into(
-            high,
-            low,
-            close,
-            &sweep,
-            Kernel::Auto,
-            false,
-            out_filter,
-            out_supertrend,
-            out_trend,
-            out_ranging,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn smoothed_gaussian_trend_filter_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    gaussian_length: usize,
-    poles: usize,
-    smoothing_length: usize,
-    linreg_offset: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = smoothed_gaussian_trend_filter_js(
-        high,
-        low,
-        close,
-        gaussian_length,
-        poles,
-        smoothing_length,
-        linreg_offset,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "smoothed_gaussian_trend_filter_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn smoothed_gaussian_trend_filter_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = smoothed_gaussian_trend_filter_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "smoothed_gaussian_trend_filter_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1983,10 +1405,12 @@ mod tests {
     use crate::indicators::dispatch::{
         IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
     };
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn load_candles() -> Candles {
-        read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").expect("candles")
+        (*read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")
+            .expect("candles"))
+        .clone()
     }
 
     fn assert_series_eq(lhs: &[f64], rhs: &[f64]) {
@@ -2075,8 +1499,8 @@ mod tests {
     }
 
     #[test]
-    fn smoothed_gaussian_trend_filter_stream_matches_batch(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn smoothed_gaussian_trend_filter_stream_matches_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
         let candles = load_candles();
         let input = SmoothedGaussianTrendFilterInput::with_default_candles(&candles);
         let batch = smoothed_gaussian_trend_filter(&input)?;
@@ -2113,8 +1537,8 @@ mod tests {
     }
 
     #[test]
-    fn smoothed_gaussian_trend_filter_batch_single_matches_single(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn smoothed_gaussian_trend_filter_batch_single_matches_single()
+    -> Result<(), Box<dyn std::error::Error>> {
         let candles = load_candles();
         let batch = smoothed_gaussian_trend_filter_batch_with_kernel(
             &candles.high,
@@ -2136,8 +1560,8 @@ mod tests {
     }
 
     #[test]
-    fn smoothed_gaussian_trend_filter_dispatch_matches_direct(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn smoothed_gaussian_trend_filter_dispatch_matches_direct()
+    -> Result<(), Box<dyn std::error::Error>> {
         let candles = load_candles();
         let direct = smoothed_gaussian_trend_filter(
             &SmoothedGaussianTrendFilterInput::with_default_candles(&candles),

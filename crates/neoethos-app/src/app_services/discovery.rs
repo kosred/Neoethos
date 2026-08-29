@@ -11,8 +11,10 @@ use neoethos_core::{
     sectioned_log::{SectionedRunRecord, SubsystemSection},
 };
 use neoethos_data::{
-    MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
-    prepare_multitimeframe_features,
+    CanonicalDatasetIdentity, CanonicalDatasetScope, CanonicalDatasetSeriesReceiptV1,
+    CanonicalTimeframe, DatasetDiscovery, PinnedCanonicalSeriesV1, SelectedDatasetGenerationV1,
+    SymbolDataset, discover_canonical_dataset_identities, pin_exact_canonical_series_v1,
+    prepare_multitimeframe_features, require_direct_timeframes,
 };
 // `DiscoveryValidationGates` is used by the sibling tests file
 // (`discovery_tests.rs::success_snapshot_carries_candidate_and_portfolio_counters`),
@@ -21,9 +23,12 @@ use neoethos_data::{
 // `use super::*;`.
 #[cfg(test)]
 use neoethos_search::DiscoveryValidationGates;
+use neoethos_search::data_selection::{
+    CanonicalSearchArtifactEnvelopeV2, CanonicalSearchInputReceiptV2,
+};
 use neoethos_search::{
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, PropFirmRiskRules,
-    ensure_non_empty_portfolio,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, PROMOTION_SUMMARY_ARTIFACT_KIND_V3,
+    PromotionSummaryAuthorityPayloadV3, PropFirmRiskRules, ensure_non_empty_portfolio,
     save_canonical_backtest_artifacts, save_discovery_profile_json,
     save_forward_test_validation_artifacts, save_funnel_json, save_portfolio_json,
     save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
@@ -37,8 +42,10 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub struct DiscoveryRequest {
     pub data_root: PathBuf,
-    pub symbol: String,
-    pub base_tf: String,
+    /// Exact manifests plus reader leases, with no decoded OHLCV values. The
+    /// selected prepared CPU/native factory consumes this pin after device
+    /// admission, so the worker cannot follow a newer `current` pointer.
+    pub pinned_input: Arc<PinnedDiscoveryInput>,
     pub higher_tfs: Vec<String>,
     pub config: DiscoveryConfig,
     /// Prop-firm rule set applied to the OOS prop-firm validation pass.
@@ -48,18 +55,345 @@ pub struct DiscoveryRequest {
 }
 
 impl DiscoveryRequest {
+    pub fn symbol(&self) -> &str {
+        self.dataset_identity().symbol_name()
+    }
+
+    pub fn base_tf(&self) -> &'static str {
+        self.dataset_identity().timeframe().as_str()
+    }
+
+    pub fn dataset_identity(&self) -> &CanonicalDatasetIdentity {
+        self.pinned_input.receipt().anchor().identity()
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.symbol.trim().is_empty() {
-            anyhow::bail!("discovery request symbol must not be empty");
-        }
-        if self.base_tf.trim().is_empty() {
-            anyhow::bail!("discovery request base timeframe must not be empty");
-        }
         if self.data_root.as_os_str().is_empty() {
             anyhow::bail!("discovery request data root must not be empty");
         }
+        let higher = self.canonical_higher_timeframes()?;
+        self.pinned_input.validate(&higher)?;
         Ok(())
     }
+
+    fn canonical_higher_timeframes(&self) -> Result<Vec<String>> {
+        canonical_higher_timeframes(self.dataset_identity().timeframe(), &self.higher_tfs)
+    }
+}
+
+/// One immutable, directly downloaded/imported timeframe set held for the
+/// complete discovery lifetime. Construction is private to the exact pinning
+/// functions below so callers cannot pair a receipt with unrelated values.
+#[derive(Debug)]
+pub struct PinnedDiscoveryInput {
+    receipt: CanonicalDatasetSeriesReceiptV1,
+    pinned_series: Mutex<Option<PinnedCanonicalSeriesV1>>,
+}
+
+impl PinnedDiscoveryInput {
+    pub const fn receipt(&self) -> &CanonicalDatasetSeriesReceiptV1 {
+        &self.receipt
+    }
+
+    fn validate(&self, higher_tfs: &[String]) -> Result<()> {
+        self.receipt.validate()?;
+        let anchor = self.receipt.anchor().identity();
+        let mut required = vec![anchor.timeframe()];
+        for label in higher_tfs {
+            let timeframe = label
+                .parse::<CanonicalTimeframe>()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if !required.contains(&timeframe) {
+                required.push(timeframe);
+            }
+        }
+        let received = self
+            .receipt
+            .direct_timeframes()
+            .iter()
+            .map(|selected| selected.identity().timeframe())
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            required.len() == received.len()
+                && required
+                    .iter()
+                    .all(|timeframe| received.contains(timeframe)),
+            "pinned discovery receipt does not exactly match the requested direct timeframe set"
+        );
+        Ok(())
+    }
+
+    fn take_pinned_series_v1(&self) -> Result<PinnedCanonicalSeriesV1> {
+        self.pinned_series
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pinned canonical series lock is poisoned"))?
+            .take()
+            .context("pinned canonical series was already consumed by another factory")
+    }
+}
+
+#[derive(Debug)]
+pub struct DirectTimeframeAcquisitionRequired {
+    missing: Vec<CanonicalDatasetIdentity>,
+}
+
+impl std::fmt::Display for DirectTimeframeAcquisitionRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let missing = self
+            .missing
+            .iter()
+            .map(CanonicalDatasetIdentity::to_path_component)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "direct timeframe acquisition required before discovery: [{missing}]"
+        )
+    }
+}
+
+impl std::error::Error for DirectTimeframeAcquisitionRequired {}
+
+/// Resolve metadata for the operator-selected anchor and every explicitly
+/// requested higher timeframe, then pin exact manifests and reader leases
+/// without decoding values. Missing data is an acquisition request, never an
+/// instruction for the discovery worker to mutate its own inputs.
+pub fn pin_discovery_input(
+    root: &std::path::Path,
+    anchor: SelectedDatasetGenerationV1,
+    higher_tfs: &[String],
+) -> Result<PinnedDiscoveryInput> {
+    anchor.validate()?;
+    anyhow::ensure!(!root.as_os_str().is_empty(), "discovery data root is empty");
+    anyhow::ensure!(
+        root.is_dir(),
+        "discovery data root is not a directory: {}",
+        root.display()
+    );
+
+    let base = anchor.identity().timeframe();
+    let higher = canonical_higher_timeframes(base, higher_tfs)?;
+    let mut required = vec![base];
+    required.extend(higher.iter().map(|label| {
+        label
+            .parse::<CanonicalTimeframe>()
+            .expect("canonical higher timeframe was already parsed")
+    }));
+
+    let inventory = DatasetDiscovery::scan_metadata(root)?;
+    let mut selected = Vec::with_capacity(required.len());
+    let mut missing = Vec::new();
+    for timeframe in required {
+        if timeframe == base {
+            selected.push(anchor.clone());
+            continue;
+        }
+        let identity = identity_for_timeframe(anchor.identity(), timeframe)?;
+        let identity_path = identity.to_path_component();
+        let matches = inventory
+            .entries
+            .iter()
+            .filter(|entry| entry.dataset_identity == identity_path)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => {
+                let expected_root = root.join(&identity_path);
+                if expected_root.exists() {
+                    let diagnostics = inventory
+                        .skipped
+                        .iter()
+                        .filter(|skipped| skipped.path.starts_with(&expected_root))
+                        .map(|skipped| {
+                            format!("{}: {}", skipped.reason.category(), skipped.reason.detail())
+                        })
+                        .collect::<Vec<_>>();
+                    anyhow::bail!(
+                        "direct timeframe dataset {identity_path} exists but is not a verified canonical generation: [{}]",
+                        diagnostics.join("; ")
+                    );
+                }
+                missing.push(identity);
+            }
+            [entry] => selected.push(SelectedDatasetGenerationV1::new(
+                identity,
+                entry.generation.clone(),
+                entry.manifest_binding_sha256.clone(),
+            )?),
+            _ => anyhow::bail!(
+                "canonical inventory contains duplicate entries for exact identity {identity_path}"
+            ),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(DirectTimeframeAcquisitionRequired { missing }.into());
+    }
+
+    let receipt = CanonicalDatasetSeriesReceiptV1::new(anchor, selected.clone())?;
+    let pinned_series = pin_exact_canonical_series_v1(root, receipt.clone())?;
+    let pinned = PinnedDiscoveryInput {
+        receipt,
+        pinned_series: Mutex::new(Some(pinned_series)),
+    };
+    pinned.validate(&higher)?;
+    Ok(pinned)
+}
+
+/// Non-interactive callers first resolve exactly one canonical identity, then
+/// snapshot its current metadata into a typed receipt and enter the same exact
+/// generation pinning path as the HTTP API.
+pub fn pin_current_discovery_input(
+    root: &std::path::Path,
+    identity: &CanonicalDatasetIdentity,
+    higher_tfs: &[String],
+) -> Result<PinnedDiscoveryInput> {
+    let manifest =
+        neoethos_data::core::dataset_manifest::read_current_manifest_metadata(root, identity)?;
+    pin_discovery_input(
+        root,
+        SelectedDatasetGenerationV1::from_manifest(&manifest)?,
+        higher_tfs,
+    )
+}
+
+fn canonical_higher_timeframes(
+    base: CanonicalTimeframe,
+    higher_tfs: &[String],
+) -> Result<Vec<String>> {
+    let mut parsed = Vec::with_capacity(higher_tfs.len());
+    for raw in higher_tfs {
+        let label = raw.trim().to_uppercase();
+        let timeframe = label
+            .parse::<CanonicalTimeframe>()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            timeframe > base,
+            "higher timeframe {timeframe} must be strictly above base {base}"
+        );
+        anyhow::ensure!(
+            !parsed.contains(&timeframe),
+            "duplicate higher timeframe {timeframe}"
+        );
+        parsed.push(timeframe);
+    }
+    Ok(parsed
+        .into_iter()
+        .map(|timeframe| timeframe.as_str().to_owned())
+        .collect())
+}
+
+/// Background jobs do not have an interactive dataset picker. They may reuse
+/// a symbol/timeframe hint only when it resolves to exactly one canonical
+/// source/account series. Zero or multiple matches fail closed and print every
+/// candidate identity so the operator can make the selection explicit.
+pub fn resolve_unique_background_dataset_identity(
+    root: &std::path::Path,
+    symbol: &str,
+    base_tf: &str,
+) -> Result<CanonicalDatasetIdentity> {
+    let identities = discover_canonical_dataset_identities(root, symbol)?;
+    select_unique_background_identity(identities, symbol, base_tf)
+}
+
+fn select_unique_background_identity(
+    identities: Vec<CanonicalDatasetIdentity>,
+    symbol: &str,
+    base_tf: &str,
+) -> Result<CanonicalDatasetIdentity> {
+    let timeframe = base_tf
+        .trim()
+        .to_uppercase()
+        .parse::<CanonicalTimeframe>()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut all_candidates = identities
+        .iter()
+        .map(CanonicalDatasetIdentity::to_path_component)
+        .collect::<Vec<_>>();
+    all_candidates.sort();
+    let mut matches = identities
+        .into_iter()
+        .filter(|identity| {
+            identity.symbol_name().eq_ignore_ascii_case(symbol) && identity.timeframe() == timeframe
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(CanonicalDatasetIdentity::to_path_component);
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => anyhow::bail!(
+            "background discovery found no exact canonical identity for {} {}; candidates=[{}]",
+            symbol.trim().to_uppercase(),
+            timeframe,
+            all_candidates.join(", ")
+        ),
+        count => anyhow::bail!(
+            "background discovery found {count} canonical identities for {} {}; explicit dataset identity required; candidates=[{}]",
+            symbol.trim().to_uppercase(),
+            timeframe,
+            matches
+                .iter()
+                .map(CanonicalDatasetIdentity::to_path_component)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn identity_for_timeframe(
+    selected: &CanonicalDatasetIdentity,
+    timeframe: CanonicalTimeframe,
+) -> Result<CanonicalDatasetIdentity> {
+    let convention = selected.bar_timestamp_convention();
+    match selected.scope() {
+        CanonicalDatasetScope::External { source_namespace } => CanonicalDatasetIdentity::external(
+            source_namespace.clone(),
+            selected.symbol_name(),
+            timeframe,
+            convention,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string())),
+        CanonicalDatasetScope::CTrader {
+            environment,
+            server,
+            account_id,
+            symbol_id,
+        } => CanonicalDatasetIdentity::ctrader(
+            *environment,
+            server.clone(),
+            *account_id,
+            *symbol_id,
+            selected.symbol_name(),
+            timeframe,
+            convention,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string())),
+    }
+}
+
+fn required_direct_timeframes(request: &DiscoveryRequest) -> Result<Vec<CanonicalTimeframe>> {
+    let mut required = Vec::new();
+    let mut push = |timeframe: CanonicalTimeframe| {
+        if !required.contains(&timeframe) {
+            required.push(timeframe);
+        }
+    };
+    push(request.dataset_identity().timeframe());
+    for label in &request.higher_tfs {
+        push(
+            label
+                .trim()
+                .to_uppercase()
+                .parse::<CanonicalTimeframe>()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        );
+    }
+    Ok(required)
+}
+
+fn validate_direct_timeframe_artifacts(
+    dataset: &SymbolDataset,
+    selected: &CanonicalDatasetIdentity,
+    required: &[CanonicalTimeframe],
+) -> Result<()> {
+    require_direct_timeframes(dataset, selected, required)
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +432,48 @@ fn requested_discovery_counters(request: &DiscoveryRequest) -> Vec<(String, u64)
 
 fn requested_discovery_highlights(request: &DiscoveryRequest) -> Vec<(String, String)> {
     let mut highlights = vec![
-        ("symbol".to_string(), request.symbol.clone()),
-        ("base_tf".to_string(), request.base_tf.clone()),
+        ("symbol".to_string(), request.symbol().to_owned()),
+        ("base_tf".to_string(), request.base_tf().to_owned()),
+        (
+            "dataset_identity".to_string(),
+            request.dataset_identity().to_path_component(),
+        ),
+        (
+            "dataset_generation".to_string(),
+            request
+                .pinned_input
+                .receipt()
+                .anchor()
+                .generation_id()
+                .to_owned(),
+        ),
+        (
+            "dataset_manifest_binding_sha256".to_string(),
+            request
+                .pinned_input
+                .receipt()
+                .anchor()
+                .manifest_binding_sha256()
+                .to_owned(),
+        ),
+        (
+            "direct_dataset_generations".to_string(),
+            request
+                .pinned_input
+                .receipt()
+                .direct_timeframes()
+                .iter()
+                .map(|selected| {
+                    format!(
+                        "{}:{}:{}",
+                        selected.identity().timeframe(),
+                        selected.generation_id(),
+                        selected.manifest_binding_sha256()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
         (
             "higher_tfs".to_string(),
             if request.higher_tfs.is_empty() {
@@ -522,7 +896,7 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
     if let Some(best_oos) = result
         .forward_test_validation_artifacts
         .iter()
-        .map(|artifact| artifact.summary.metrics.sharpe)
+        .map(|artifact| artifact.summary().metrics.sharpe)
         .filter(|v| v.is_finite())
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
     {
@@ -634,8 +1008,11 @@ pub fn start_discovery_job(
     mut request: DiscoveryRequest,
     tx: mpsc::Sender<ServiceEvent>,
 ) -> Result<DiscoveryJobHandle> {
-    request.config.timeframe_label = request.base_tf.clone();
     request.validate()?;
+    request.higher_tfs = request.canonical_higher_timeframes()?;
+    request.config.timeframe_label = request.base_tf().to_owned();
+    request.config.evaluation_symbol = request.symbol().to_owned();
+    request.config.higher_timeframes = request.higher_tfs.clone();
 
     let handle = DiscoveryJobHandle::new();
     let cancel = handle.cancel.clone();
@@ -643,8 +1020,12 @@ pub fn start_discovery_job(
     snapshot.state = JobState::Running;
     snapshot.progress = JobProgress {
         percent: Some(0.05),
-        stage: "loading_data".to_string(),
-        message: format!("loading symbol dataset for {}", request.symbol),
+        stage: "using_pinned_data".to_string(),
+        message: format!(
+            "using pinned exact dataset generation {} @ {}",
+            request.pinned_input.receipt().anchor().generation_id(),
+            request.dataset_identity().to_path_component()
+        ),
     };
     snapshot.report = JobReport {
         counters: requested_discovery_counters(&request),
@@ -654,8 +1035,8 @@ pub fn start_discovery_job(
             JobEventLevel::Info,
             format!(
                 "planned discovery for {} {} with population={}, generations={}, candidate_count={}, portfolio_size={}",
-                request.symbol,
-                request.base_tf,
+                request.symbol(),
+                request.base_tf(),
                 request.config.population,
                 request.config.generations,
                 request.config.candidate_count,
@@ -663,8 +1044,9 @@ pub fn start_discovery_job(
             ),
         ),
         summary: format!(
-            "loading discovery dataset for {} on {}",
-            request.symbol, request.base_tf
+            "using pinned discovery dataset for {} on {}",
+            request.symbol(),
+            request.base_tf()
         ),
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
@@ -673,13 +1055,19 @@ pub fn start_discovery_job(
     log_discovery_event(
         "ui_discovery_job",
         "STARTED",
-        format!("starting discovery for {}", request.symbol),
+        format!(
+            "starting discovery for {} ({})",
+            request.symbol(),
+            request.dataset_identity().to_path_component()
+        ),
     );
 
     tokio::spawn(async move {
         if cancel.is_requested() {
-            let cancelled =
-                cancelled_snapshot_from(snapshot, "operator cancelled discovery before data load");
+            let cancelled = cancelled_snapshot_from(
+                snapshot,
+                "operator cancelled discovery before feature preparation",
+            );
             send_event(&tx, ServiceEvent::DiscoveryUpdated(cancelled.clone()));
             log_discovery_event(
                 "ui_discovery_job",
@@ -689,183 +1077,31 @@ pub fn start_discovery_job(
             return;
         }
 
-        let load_request = request.clone();
-        let dataset = match tokio::task::spawn_blocking(move || {
-            load_symbol_dataset(&load_request.data_root, &load_request.symbol)
-        })
-        .await
-        {
-            Ok(Ok(dataset)) => dataset,
-            Ok(Err(err)) => {
+        let required_direct = match required_direct_timeframes(&request) {
+            Ok(required) => required,
+            Err(err) => {
                 let failed = failed_snapshot_from(snapshot, err);
                 send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
                 log_discovery_event("ui_discovery_job", "FAILED", failed.report.summary.clone());
                 return;
             }
-            Err(err) => {
-                let failed = failed_snapshot_from(
-                    snapshot,
-                    anyhow::anyhow!("discovery data load join error: {err}"),
-                );
-                send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
-                log_discovery_event("ui_discovery_job", "FAILED", failed.report.summary.clone());
-                return;
-            }
         };
-
-        // ── Auto-fetch missing history (operator-chosen over a hard
-        // fail) ───────────────────────────────────────────────────────
-        // Discovery's `ensure_sufficient_history` floor aborts the run when
-        // the local cache is too short. If the base timeframe is below the
-        // floor, pull the required window straight from cTrader and reload
-        // before building features — so Discovery runs on real broker history
-        // instead of failing.
-        //
-        // ── W2-18 / E-10 (2026-08-10) ────────────────────────────────────
-        // This read `NEOETHOS_BOT_MIN_HISTORY_YEARS` from the environment. The
-        // SEARCH takes the same floor from
-        // `models.discovery_runtime.min_history_years`
-        // (`DiscoveryRuntimeOverrides::from_settings`, wired into every
-        // `DiscoveryConfig::from_settings`), so there were two ways to set one
-        // number and nothing checked that they agreed. With the env var unset
-        // — the normal case — this block computed a floor of 0 and never
-        // fetched, while the search then aborted the run on the very shortage
-        // the auto-fetch exists to repair.
-        //
-        // It now reads the SAME resolved value the search will enforce,
-        // straight off the request's own `DiscoveryConfig`. There is no second
-        // number to disagree with: if the search would abort on the floor,
-        // this block fetches for exactly that floor.
-        let mut dataset = dataset;
-        let min_years = request.config.runtime_overrides.min_history_years;
-        if min_years > 0 {
-            let have = dataset
-                .frames
-                .get(&request.base_tf)
-                .map(|f| f.close.len())
-                .unwrap_or(0);
-            let required = (min_years as usize).saturating_mul(
-                neoethos_search::discovery::approx_bars_per_year(&request.base_tf),
-            );
-            if required > 0 && have < required {
-                snapshot.progress = JobProgress {
-                    percent: Some(0.15),
-                    stage: "fetching_history".to_string(),
-                    message: format!(
-                        "history short for {} {} ({}/{} bars) — auto-fetching ~{}y from cTrader…",
-                        request.symbol, request.base_tf, have, required, min_years
-                    ),
-                };
-                send_event(&tx, ServiceEvent::DiscoveryUpdated(snapshot.clone()));
-                log_discovery_event(
-                    "ui_discovery_job",
-                    "FETCHING",
-                    format!(
-                        "auto-fetching ~{}y of {} {} from cTrader (have {} / need {} bars)",
-                        min_years, request.symbol, request.base_tf, have, required
-                    ),
-                );
-                let fetch_symbol = request.symbol.clone();
-                let fetch_tf = request.base_tf.clone();
-                let fetch_root = request.data_root.clone();
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                // Calendar window + 1-month cushion so weekend/holiday
-                // gaps don't starve the trading-bar count.
-                let day_ms: i64 = 24 * 60 * 60 * 1000;
-                let from_ms = now_ms - ((min_years as i64) * 365 + 30) * day_ms;
-                let fetched = tokio::task::spawn_blocking(move || {
-                    crate::app_services::broker_api::download_history_blocking(
-                        &fetch_symbol,
-                        &fetch_tf,
-                        from_ms,
-                        now_ms,
-                        &fetch_root,
-                    )
-                })
-                .await;
-                match fetched {
-                    Ok(Ok(outcome)) => {
-                        log_discovery_event(
-                            "ui_discovery_job",
-                            "FETCHED",
-                            format!(
-                                "auto-fetched {} bars of {} {} from cTrader",
-                                outcome.bar_count, request.symbol, request.base_tf
-                            ),
-                        );
-                        let reload = request.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            load_symbol_dataset(&reload.data_root, &reload.symbol)
-                        })
-                        .await
-                        {
-                            Ok(Ok(reloaded)) => dataset = reloaded,
-                            Ok(Err(err)) => {
-                                let failed = failed_snapshot_from(snapshot, err);
-                                send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
-                                log_discovery_event(
-                                    "ui_discovery_job",
-                                    "FAILED",
-                                    failed.report.summary.clone(),
-                                );
-                                return;
-                            }
-                            Err(err) => {
-                                let failed = failed_snapshot_from(
-                                    snapshot,
-                                    anyhow::anyhow!("history reload join error: {err}"),
-                                );
-                                send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
-                                log_discovery_event(
-                                    "ui_discovery_job",
-                                    "FAILED",
-                                    failed.report.summary.clone(),
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        // Broker fetch failed — proceed and let the
-                        // downstream `ensure_sufficient_history` surface
-                        // the precise error rather than masking it here.
-                        log_discovery_event(
-                            "ui_discovery_job",
-                            "FETCH_FAILED",
-                            format!(
-                                "auto-fetch of {} {} failed: {err}",
-                                request.symbol, request.base_tf
-                            ),
-                        );
-                    }
-                    Err(err) => {
-                        log_discovery_event(
-                            "ui_discovery_job",
-                            "FETCH_FAILED",
-                            format!(
-                                "auto-fetch join error for {} {}: {err}",
-                                request.symbol, request.base_tf
-                            ),
-                        );
-                    }
-                }
-            }
-        }
+        let selected_timeframe_count = request.pinned_input.receipt().direct_timeframes().len();
 
         snapshot.progress = JobProgress {
             percent: Some(0.35),
             stage: "preparing_features".to_string(),
-            message: format!("preparing multi-timeframe features for {}", request.symbol),
+            message: format!(
+                "preparing multi-timeframe features for {}",
+                request.symbol()
+            ),
         };
         snapshot.report = JobReport {
             counters: requested_discovery_counters(&request)
                 .into_iter()
                 .chain(std::iter::once((
-                    "loaded_timeframes".to_string(),
-                    dataset.frames.len() as u64,
+                    "selected_timeframes".to_string(),
+                    selected_timeframe_count as u64,
                 )))
                 .collect(),
             highlights: requested_discovery_highlights(&request),
@@ -873,15 +1109,15 @@ pub fn start_discovery_job(
                 &snapshot.report.events,
                 JobEventLevel::Info,
                 format!(
-                    "loaded {} timeframe frame(s) for {}",
-                    dataset.frames.len(),
-                    request.symbol
+                    "selected {} exact timeframe generation(s) for {}",
+                    selected_timeframe_count,
+                    request.symbol()
                 ),
             ),
             summary: format!(
-                "loaded {} timeframe frames for {}",
-                dataset.frames.len(),
-                request.symbol
+                "selected {} exact timeframe generations for {}",
+                selected_timeframe_count,
+                request.symbol()
             ),
             log_path: Some(canonical_log_path().display().to_string()),
             ..JobReport::default()
@@ -889,8 +1125,10 @@ pub fn start_discovery_job(
         send_event(&tx, ServiceEvent::DiscoveryUpdated(snapshot.clone()));
 
         if cancel.is_requested() {
-            let cancelled =
-                cancelled_snapshot_from(snapshot, "operator cancelled discovery after data load");
+            let cancelled = cancelled_snapshot_from(
+                snapshot,
+                "operator cancelled discovery after pinned-data validation",
+            );
             send_event(&tx, ServiceEvent::DiscoveryUpdated(cancelled.clone()));
             log_discovery_event(
                 "ui_discovery_job",
@@ -909,30 +1147,85 @@ pub fn start_discovery_job(
             message: format!(
                 "building the feature cube for {} ({}) — dense timeframes (M1–M5) \
                  can take a long time; the app is working, not frozen",
-                request.symbol, request.base_tf
+                request.symbol(),
+                request.base_tf()
             ),
         };
         send_event(&tx, ServiceEvent::DiscoveryUpdated(snapshot.clone()));
 
         let feature_request = request.clone();
+        let feature_input = Arc::clone(&request.pinned_input);
         let feature_handle = tokio::task::spawn_blocking(move || {
-            let dataset =
-                ensure_timeframes_with_resample(&dataset, &feature_request.base_tf, MANDATORY_TFS)?;
-            let higher_refs: Vec<&str> = feature_request
-                .higher_tfs
-                .iter()
-                .map(|tf| tf.as_str())
-                .collect();
-            let features =
-                prepare_multitimeframe_features(&dataset, &feature_request.base_tf, &higher_refs)?;
-            let base_ohlcv = dataset
-                .frames
-                .get(&feature_request.base_tf)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("base timeframe missing: {}", feature_request.base_tf)
-                })?;
-            Ok::<_, anyhow::Error>((features, base_ohlcv))
+            #[cfg(feature = "gpu-nvidia")]
+            {
+                neoethos_search::prepare_canonical_discovery_run_input_v3(
+                    |no_physical_gpu_admission| {
+                        let pinned_series = feature_input.take_pinned_series_v1()?;
+                        let dataset = pinned_series.into_cpu_dataset_after_no_physical_gpu_v1(
+                            &no_physical_gpu_admission,
+                        )?;
+                        validate_direct_timeframe_artifacts(
+                            &dataset,
+                            feature_request.dataset_identity(),
+                            &required_direct,
+                        )?;
+                        let higher_refs: Vec<&str> = feature_request
+                            .higher_tfs
+                            .iter()
+                            .map(|tf| tf.as_str())
+                            .collect();
+                        let features = prepare_multitimeframe_features(
+                            &dataset,
+                            feature_request.base_tf(),
+                            &higher_refs,
+                        )?;
+                        let base_frame = dataset.canonical_frame(feature_request.base_tf())?;
+                        let input = neoethos_search::data_selection::CanonicalSearchInput::from_prepared_canonical_frame(
+                            feature_request.dataset_identity().clone(),
+                            base_frame,
+                            features,
+                        )?;
+                        Ok((input, no_physical_gpu_admission))
+                    },
+                    || {
+                        anyhow::bail!(
+                            "full native Discovery workspace-plan sealing is not integrated; refusing host feature materialization on a physical GPU"
+                        )
+                    },
+                    |_admitted_native_run| {
+                        anyhow::bail!(
+                            "resident native Data materialization is unreachable until the complete workspace plan is sealed"
+                        )
+                    },
+                )
+            }
+            #[cfg(not(feature = "gpu-nvidia"))]
+            {
+                let pinned_series = feature_input.take_pinned_series_v1()?;
+                let dataset = pinned_series.into_cpu_dataset_without_native_adapter_v1()?;
+                validate_direct_timeframe_artifacts(
+                    &dataset,
+                    feature_request.dataset_identity(),
+                    &required_direct,
+                )?;
+                let higher_refs: Vec<&str> = feature_request
+                    .higher_tfs
+                    .iter()
+                    .map(|tf| tf.as_str())
+                    .collect();
+                let features = prepare_multitimeframe_features(
+                    &dataset,
+                    feature_request.base_tf(),
+                    &higher_refs,
+                )?;
+                let base_frame = dataset.canonical_frame(feature_request.base_tf())?;
+                neoethos_search::data_selection::CanonicalSearchInput::from_prepared_canonical_frame(
+                    feature_request.dataset_identity().clone(),
+                    base_frame,
+                    features,
+                )
+                .map_err(anyhow::Error::new)
+            }
         });
 
         // Heartbeat: the build above is a single opaque call that can run for
@@ -943,7 +1236,7 @@ pub fn start_discovery_job(
         // fresh build from starting after Stop.
         let hb_tx = tx.clone();
         let mut hb_snapshot = snapshot.clone();
-        let hb_symbol = request.symbol.clone();
+        let hb_symbol = request.symbol().to_owned();
         let hb_started = std::time::Instant::now();
         let heartbeat = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -964,8 +1257,8 @@ pub fn start_discovery_job(
         let feature_build = feature_handle.await;
         heartbeat.abort();
 
-        let (features, base_ohlcv) = match feature_build {
-            Ok(Ok(parts)) => parts,
+        let prepared_input = match feature_build {
+            Ok(Ok(prepared_input)) => prepared_input,
             Ok(Err(err)) => {
                 let failed = failed_snapshot_from(snapshot, err);
                 send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
@@ -982,18 +1275,34 @@ pub fn start_discovery_job(
                 return;
             }
         };
+        #[cfg(feature = "gpu-nvidia")]
+        let prepared_shape = prepared_input.shape();
+        #[cfg(not(feature = "gpu-nvidia"))]
+        let prepared_shape = Ok((
+            prepared_input.features().n_samples(),
+            prepared_input.features().n_features(),
+        ));
+        let (feature_rows, feature_columns) = match prepared_shape {
+            Ok(shape) => shape,
+            Err(err) => {
+                let failed = failed_snapshot_from(snapshot, err);
+                send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
+                log_discovery_event("ui_discovery_job", "FAILED", failed.report.summary.clone());
+                return;
+            }
+        };
 
         snapshot.progress = JobProgress {
             percent: Some(0.75),
             stage: "running_discovery".to_string(),
-            message: format!("evaluating strategy candidates for {}", request.symbol),
+            message: format!("evaluating strategy candidates for {}", request.symbol()),
         };
         snapshot.report = JobReport {
             counters: requested_discovery_counters(&request)
                 .into_iter()
                 .chain([
-                    ("feature_rows".to_string(), features.n_samples() as u64),
-                    ("feature_columns".to_string(), features.names.len() as u64),
+                    ("feature_rows".to_string(), feature_rows as u64),
+                    ("feature_columns".to_string(), feature_columns as u64),
                 ])
                 .collect(),
             highlights: requested_discovery_highlights(&request),
@@ -1002,15 +1311,14 @@ pub fn start_discovery_job(
                 JobEventLevel::Info,
                 format!(
                     "prepared feature frame {}x{} for {}",
-                    features.n_samples(),
-                    features.names.len(),
-                    request.symbol
+                    feature_rows,
+                    feature_columns,
+                    request.symbol()
                 ),
             ),
             summary: format!(
                 "prepared {} rows x {} columns for discovery",
-                features.n_samples(),
-                features.names.len()
+                feature_rows, feature_columns
             ),
             log_path: Some(canonical_log_path().display().to_string()),
             ..JobReport::default()
@@ -1088,24 +1396,36 @@ pub fn start_discovery_job(
             // orchestrator — those two used to run discovery on the FULL
             // series with no holdout at all.
             let resolved_config = search_request.config.clone().apply_mode_overrides();
-            let result = neoethos_search::run_discovery_cycle_with_holdout_and_progress(
-                &features,
-                &base_ohlcv,
-                &resolved_config,
-                search_request.prop_firm_rules,
-                move |event| {
-                    if let Ok(mut last) = last_event_for_progress.lock() {
-                        *last = std::time::Instant::now();
-                    }
-                    if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
-                        apply_backend_discovery_event(&mut snapshot, &event);
-                        send_event(
-                            &tx_progress,
-                            ServiceEvent::DiscoveryUpdated(snapshot.clone()),
-                        );
-                    }
-                },
-            )?;
+            let progress = move |event| {
+                if let Ok(mut last) = last_event_for_progress.lock() {
+                    *last = std::time::Instant::now();
+                }
+                if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
+                    apply_backend_discovery_event(&mut snapshot, &event);
+                    send_event(
+                        &tx_progress,
+                        ServiceEvent::DiscoveryUpdated(snapshot.clone()),
+                    );
+                }
+            };
+            #[cfg(feature = "gpu-nvidia")]
+            let result =
+                neoethos_search::run_prepared_canonical_discovery_with_holdout_and_progress_v3(
+                    prepared_input,
+                    &resolved_config,
+                    search_request.prop_firm_rules,
+                    progress,
+                )?;
+            #[cfg(not(feature = "gpu-nvidia"))]
+            let result = {
+                let run_input = prepared_input.as_run_input().map_err(anyhow::Error::new)?;
+                neoethos_search::run_discovery_cycle_with_holdout_and_progress(
+                    &run_input,
+                    &resolved_config,
+                    search_request.prop_firm_rules,
+                    progress,
+                )?
+            };
 
             // Operator Stop during the GA: the search returned early with
             // whatever it had. Do NOT export a cancelled run — bail with a
@@ -1122,7 +1442,8 @@ pub fn start_discovery_job(
             // no trace of WHICH stage rejected everything.
             let funnel_out_path = PathBuf::from("cache").join("discovery").join(format!(
                 "{}_{}.json",
-                search_request.symbol, search_request.base_tf
+                search_request.symbol(),
+                search_request.base_tf()
             ));
             if let Some(parent) = funnel_out_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -1137,7 +1458,7 @@ pub fn start_discovery_job(
 
             ensure_non_empty_portfolio(
                 &result,
-                &format!("{} {}", search_request.symbol, search_request.base_tf),
+                &format!("{} {}", search_request.symbol(), search_request.base_tf()),
             )?;
 
             // Forward-test + prop-firm artifacts on the held-out 20% tail are
@@ -1146,7 +1467,8 @@ pub fn start_discovery_job(
 
             let out_path = PathBuf::from("cache").join("discovery").join(format!(
                 "{}_{}.json",
-                search_request.symbol, search_request.base_tf
+                search_request.symbol(),
+                search_request.base_tf()
             ));
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1157,13 +1479,7 @@ pub fn start_discovery_job(
             // Additive + non-fatal.
             {
                 let live_path = out_path.with_extension("live_portfolio.json");
-                if let Err(err) = neoethos_search::save_live_portfolio_json(
-                    &live_path,
-                    &search_request.symbol,
-                    &search_request.base_tf,
-                    &resolved_config.higher_timeframes,
-                    &result,
-                ) {
+                if let Err(err) = neoethos_search::save_live_portfolio_json(&live_path, &result) {
                     tracing::warn!(
                         target: "neoethos_app::discovery",
                         error = %err,
@@ -1288,7 +1604,7 @@ pub fn start_discovery_job(
             tracing::warn!(
                 target: "neoethos_app::discovery::targets",
                 error = %err,
-                symbol = %request.symbol,
+                symbol = %request.symbol(),
                 "failed to write model_targets.json — operator can still inspect the discovery snapshot in-memory"
             );
         }
@@ -1307,13 +1623,14 @@ pub fn start_discovery_job(
 /// Written by `start_discovery_job` after each successful job.
 /// Filename: `<data_root>/discovery_targets/<symbol>_<base_tf>_model_targets.json`.
 ///
-/// The schema is intentionally small — Training only needs to know
-/// (a) which symbol/timeframe the portfolio targets and (b) which
-/// strategies were accepted (so the operator can pick an ensemble
-/// configuration around them). Quality metrics, candidates list,
-/// and trade logs stay in the in-memory `DiscoveryResult` /
-/// JobSnapshot path; this file is the minimal hand-off only.
+/// Version 3 is the fail-closed promotion evidence hand-off. It carries the
+/// exact search receipt/config identity plus a typed copy of the canonical
+/// promotion-summary envelope written from the same [`DiscoveryResult`]. The
+/// currently embedded summary is diagnostic v3 evidence and cannot mint a
+/// live-copy permit; search-core must first produce exact composite v3 scope.
+/// Symbol/timeframe labels alone never authorize a copy.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelTargetsFile {
     /// Bump this whenever the schema changes incompatibly. Readers
     /// that see a version they don't recognise should refuse the
@@ -1324,11 +1641,26 @@ pub struct ModelTargetsFile {
     pub higher_tfs: Vec<String>,
     /// ISO-8601 UTC at the moment the file was written.
     pub discovered_at_utc: String,
+    pub search_input_receipt: CanonicalSearchInputReceiptV2,
+    pub search_input_receipt_sha256: String,
+    pub search_config_hash: String,
+    pub promotion_summary_authority: StoredPromotionSummaryAuthorityV3,
     pub portfolio: Vec<ModelTargetEntry>,
+}
+
+/// Exact typed authority copied from the canonical promotion-summary sidecar.
+/// The loader reloads the canonical file and requires whole-envelope equality;
+/// this embedded value is not a reconstruction from request labels.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredPromotionSummaryAuthorityV3 {
+    pub canonical_file_name: String,
+    pub envelope: CanonicalSearchArtifactEnvelopeV2<PromotionSummaryAuthorityPayloadV3>,
 }
 
 /// One accepted strategy from the portfolio.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelTargetEntry {
     pub strategy_id: String,
     pub fitness: f64,
@@ -1338,21 +1670,16 @@ pub struct ModelTargetEntry {
     /// **F-330**: peak-to-trough drawdown as a PERCENTAGE. The GA's
     /// `Gene::max_drawdown` is a fraction (0.25 = 25%); we ×100 at
     /// write time so the promotion gate + UI speak percentages
-    /// consistently. `#[serde(default)]` keeps pre-F-330
-    /// model_targets.json files readable (they get 0.0, which the gate
-    /// treats as "no drawdown recorded" — a permissive default for
-    /// legacy files rather than a spurious rejection).
-    #[serde(default)]
+    /// consistently. Version 3 rejects a missing value; legacy targets are
+    /// intentionally not promotion authorities.
     pub max_drawdown_pct: f64,
-    /// **F-330**: gross profit / gross loss. Defaulted for backward
-    /// compat with pre-F-330 files.
-    #[serde(default)]
+    /// **F-330**: gross profit / gross loss. Required by strict v3.
     pub profit_factor: f64,
 }
 
 /// Current `ModelTargetsFile::schema_version`. Bump when the schema
 /// changes; the reader on the Training side asserts on this.
-pub const MODEL_TARGETS_SCHEMA_VERSION: u32 = 1;
+pub const MODEL_TARGETS_SCHEMA_VERSION: u32 = 3;
 
 /// `discovery_targets/<symbol>_<base_tf>_model_targets.json` path
 /// resolver. Public so Training can read the same path Discovery
@@ -1367,6 +1694,19 @@ pub fn model_targets_path_for(
         .join(format!("{symbol}_{base_tf}_model_targets.json"))
 }
 
+/// Canonical promotion authority stored beside the v3 target hand-off. Keeping
+/// both under `data_root` avoids ambient-CWD lookup and makes the bound file
+/// name deterministic for the strict reader.
+pub fn promotion_summary_path_for(
+    data_root: &std::path::Path,
+    symbol: &str,
+    base_tf: &str,
+) -> std::path::PathBuf {
+    data_root
+        .join("discovery_targets")
+        .join(format!("{symbol}_{base_tf}_promotion_summary.json"))
+}
+
 /// Write the model-targets file using neoethos_core's atomic-rename
 /// helper (no partial files, no half-fsync risks).
 fn write_model_targets_for_discovery(
@@ -1374,11 +1714,45 @@ fn write_model_targets_for_discovery(
     result: &neoethos_search::DiscoveryResult,
 ) -> Result<()> {
     use neoethos_core::storage::json::write_json_atomic;
-    let path = model_targets_path_for(&request.data_root, &request.symbol, &request.base_tf);
+    let path = model_targets_path_for(&request.data_root, request.symbol(), request.base_tf());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create discovery_targets dir at {}", parent.display()))?;
     }
+    let summary_path =
+        promotion_summary_path_for(&request.data_root, request.symbol(), request.base_tf());
+    save_promotion_summary_json(&summary_path, result).with_context(|| {
+        format!(
+            "write canonical promotion summary authority at {}",
+            summary_path.display()
+        )
+    })?;
+    let summary_bytes = std::fs::read(&summary_path).with_context(|| {
+        format!(
+            "reload canonical promotion summary authority at {}",
+            summary_path.display()
+        )
+    })?;
+    let summary_authority =
+        CanonicalSearchArtifactEnvelopeV2::<PromotionSummaryAuthorityPayloadV3>::from_json_bytes(
+            &summary_bytes,
+        )
+        .map_err(anyhow::Error::new)?;
+    result.validate_evaluated_scopes()?;
+    let expected_scope = result.selection_scope()?.clone();
+    summary_authority
+        .validate_against(
+            PROMOTION_SUMMARY_ARTIFACT_KIND_V3,
+            &result.search_config_hash,
+            &result.search_input_receipt,
+            expected_scope.evaluated_window(),
+        )
+        .map_err(anyhow::Error::new)?;
+    let search_input_receipt_sha256 = result.search_input_receipt_sha256()?;
+    anyhow::ensure!(
+        summary_authority.scope().receipt_sha256() == search_input_receipt_sha256,
+        "canonical promotion summary receipt digest disagrees with DiscoveryResult"
+    );
     let now = chrono::Utc::now().to_rfc3339();
     let portfolio: Vec<ModelTargetEntry> = result
         .portfolio
@@ -1396,10 +1770,21 @@ fn write_model_targets_for_discovery(
         .collect();
     let file = ModelTargetsFile {
         schema_version: MODEL_TARGETS_SCHEMA_VERSION,
-        symbol: request.symbol.clone(),
-        base_tf: request.base_tf.clone(),
+        symbol: request.symbol().to_owned(),
+        base_tf: request.base_tf().to_owned(),
         higher_tfs: request.higher_tfs.clone(),
         discovered_at_utc: now,
+        search_input_receipt: result.search_input_receipt.clone(),
+        search_input_receipt_sha256: result.search_input_receipt_sha256()?,
+        search_config_hash: result.search_config_hash.clone(),
+        promotion_summary_authority: StoredPromotionSummaryAuthorityV3 {
+            canonical_file_name: summary_path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .context("canonical promotion summary filename is not UTF-8")?
+                .to_owned(),
+            envelope: summary_authority,
+        },
         portfolio,
     };
     write_json_atomic(&path, &file)

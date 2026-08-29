@@ -515,6 +515,11 @@ pub struct ResolvedConfigStamp {
     pub cost_pips_round_trip: f64,
     pub swap_long_pips_per_day: f64,
     pub swap_short_pips_per_day: f64,
+    /// Whether the evaluator force-closes and blocks entries around the
+    /// weekend boundary. This changes trade outcomes, so an older stamp that
+    /// did not bind the decision is intentionally not deserializable as the
+    /// current authority.
+    pub kill_zones_enabled: bool,
     /// The per-UTC-bucket spread curve, or `None` for a FLAT spread charged at
     /// 03:00 Tokyo and at the London open alike. Without this in the hash, a
     /// flat-spread run and a per-hour-curve run hash identically.
@@ -590,6 +595,7 @@ struct StampBody<'a> {
     cost_pips_round_trip: f64,
     swap_long_pips_per_day: f64,
     swap_short_pips_per_day: f64,
+    kill_zones_enabled: bool,
     session_spread_pips: Option<[f64; 3]>,
     cost_band_pips: Option<(f64, f64)>,
     prefilter_top_k: usize,
@@ -701,9 +707,15 @@ pub fn config_hash_for(
 ) -> Option<String> {
     let inputs = payoff_inputs_for_config(config, pip_value_per_lot);
     let ceiling = max_achievable_payoff(&inputs).ok()?;
-    stamp_resolved_config(config, &inputs, ceiling, pip_value_per_lot, normalize_features)
-        .ok()
-        .map(|s| s.config_hash)
+    stamp_resolved_config(
+        config,
+        &inputs,
+        ceiling,
+        pip_value_per_lot,
+        normalize_features,
+    )
+    .ok()
+    .map(|s| s.config_hash)
 }
 
 /// Stamp the resolved configuration. Pure: takes every ambient value as an
@@ -740,6 +752,7 @@ pub fn stamp_resolved_config(
         cost_pips_round_trip: inputs.cost_pips_round_trip,
         swap_long_pips_per_day: config.swap_long_pips_per_day,
         swap_short_pips_per_day: config.swap_short_pips_per_day,
+        kill_zones_enabled: config.kill_zones_enabled,
         session_spread_pips: config.session_spread_pips,
         cost_band_pips: config.cost_band_pips,
         prefilter_top_k: config.runtime_overrides.prefilter_top_k,
@@ -789,6 +802,7 @@ pub fn stamp_resolved_config(
         cost_pips_round_trip: body.cost_pips_round_trip,
         swap_long_pips_per_day: body.swap_long_pips_per_day,
         swap_short_pips_per_day: body.swap_short_pips_per_day,
+        kill_zones_enabled: body.kill_zones_enabled,
         session_spread_pips: body.session_spread_pips,
         cost_band_pips: body.cost_band_pips,
         prefilter_top_k: body.prefilter_top_k,

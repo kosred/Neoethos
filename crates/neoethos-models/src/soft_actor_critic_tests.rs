@@ -15,7 +15,8 @@ use crate::burn_models::InferBackend;
 use crate::rl::TradingTransition;
 use anyhow::Result;
 use burn::prelude::*;
-use polars::prelude::{DataFrame, NamedFrom, Series};
+use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame};
+use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -35,7 +36,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 /// Build a small deterministic feature frame + 3-class label series.
 /// 4 features, `rows` rows, labels in {-1, 0, 1} on a slow cycle so the
 /// reward triplets are non-degenerate.
-fn fixture_frame(rows: usize) -> (DataFrame, Series) {
+fn fixture_frame(rows: usize) -> (FeatureFrame, Vec<i32>) {
     let mut f0 = Vec::with_capacity(rows);
     let mut f1 = Vec::with_capacity(rows);
     let mut f2 = Vec::with_capacity(rows);
@@ -55,19 +56,29 @@ fn fixture_frame(rows: usize) -> (DataFrame, Series) {
             _ => -1_i32,
         });
     }
-    let df = DataFrame::new(vec![
-        Series::new("f0".into(), f0).into(),
-        Series::new("f1".into(), f1).into(),
-        Series::new("f2".into(), f2).into(),
-        Series::new("f3".into(), f3).into(),
-    ])
-    .expect("build fixture frame");
-    let labels = Series::new("label".into(), labels);
-    (df, labels)
+    let columns = vec![
+        FeatureColumnF64::new("f0", f0, vec![FeatureCellValidity::Valid; rows]).expect("valid f0"),
+        FeatureColumnF64::new("f1", f1, vec![FeatureCellValidity::Valid; rows]).expect("valid f1"),
+        FeatureColumnF64::new("f2", f2, vec![FeatureCellValidity::Valid; rows]).expect("valid f2"),
+        FeatureColumnF64::new("f3", f3, vec![FeatureCellValidity::Valid; rows]).expect("valid f3"),
+    ];
+    let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+        neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+        columns,
+    )
+    .expect("build typed fixture frame");
+    (frame, labels)
+}
+
+fn one_worker_lease() -> CpuLease {
+    let width = WorkerLimit::new(1).expect("one worker");
+    CpuPermitBroker::new(width)
+        .acquire(CpuPermitRequest::local(width))
+        .expect("isolated SAC test lease")
 }
 
 fn trained_agent(rows: usize) -> SoftActorCritic {
-    let (df, labels) = fixture_frame(rows);
+    let (frame, labels) = fixture_frame(rows);
     let mut agent = SoftActorCritic::with_hidden_dim(4, 32)
         .with_train_schedule(4, 32)
         .with_gamma(0.95)
@@ -75,7 +86,7 @@ fn trained_agent(rows: usize) -> SoftActorCritic {
         .with_learning_rate(1e-3)
         .with_episode_layout(8, 32);
     agent
-        .train_on_frame(&df, &labels)
+        .train_on_frame(&frame, &labels, &one_worker_lease())
         .expect("sac training should succeed on the fixture");
     agent
 }
@@ -149,12 +160,7 @@ fn update_step_reduces_critic_loss_on_a_tiny_fixture() {
         .with_tau(0.05)
         .with_learning_rate(5e-3);
     // bootstrap runtime identity (train_on_frame normally sets these).
-    agent.feature_columns = vec![
-        "f0".into(),
-        "f1".into(),
-        "f2".into(),
-        "f3".into(),
-    ];
+    agent.feature_columns = vec!["f0".into(), "f1".into(), "f2".into(), "f3".into()];
 
     let batch: Vec<SacTuple> = (0..16)
         .map(|i| {
@@ -261,7 +267,10 @@ fn save_load_round_trips_and_reproduces_inference() -> Result<()> {
 
     // metadata sidecar must exist and parse as the canonical 3-class map.
     assert!(path.join("config.json").exists());
-    assert!(path.join(crate::statistical::common::METADATA_FILE_NAME).exists());
+    assert!(
+        path.join(crate::statistical::common::METADATA_FILE_NAME)
+            .exists()
+    );
 
     let _ = std::fs::remove_dir_all(&path);
     Ok(())
@@ -270,13 +279,13 @@ fn save_load_round_trips_and_reproduces_inference() -> Result<()> {
 #[test]
 fn predict_runtime_emits_canonical_three_class_predictions() -> Result<()> {
     let agent = trained_agent(192);
-    let (df, _) = fixture_frame(5);
+    let (frame, _) = fixture_frame(5);
     // predict_runtime requires the exact training feature schema.
-    let preds = agent.predict_runtime(&df)?;
+    let preds = agent.predict_runtime(&frame, &one_worker_lease())?;
     assert_eq!(preds.len(), 5);
     for pred in &preds {
         let probs = pred.class_probabilities();
-        let sum: f32 = probs.iter().sum();
+        let sum: f64 = probs.iter().sum();
         assert!((sum - 1.0).abs() < 1e-4, "runtime probs must sum to 1");
         assert!(pred.metadata().execution_backend.is_some());
     }
@@ -300,9 +309,9 @@ fn save_rejects_untrained_agent() {
 #[test]
 fn predict_runtime_rejects_untrained_agent() {
     let agent = SoftActorCritic::with_hidden_dim(4, 16);
-    let (df, _) = fixture_frame(3);
+    let (frame, _) = fixture_frame(3);
     let err = agent
-        .predict_runtime(&df)
+        .predict_runtime(&frame, &one_worker_lease())
         .expect_err("cold sac should not run inference");
     assert!(
         err.to_string().contains("untrained runtime state"),

@@ -57,7 +57,9 @@ fn stats(path: &Path) -> (bool, bool, u64, usize, Option<i64>) {
     let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for ent in rd.flatten() {
             visited += 1;
             if visited > 200_000 {
@@ -82,7 +84,12 @@ fn stats(path: &Path) -> (bool, bool, u64, usize, Option<i64>) {
 
 fn abs(p: &Path) -> String {
     std::fs::canonicalize(p)
-        .map(|c| c.display().to_string().trim_start_matches(r"\\?\").to_string())
+        .map(|c| {
+            c.display()
+                .to_string()
+                .trim_start_matches(r"\\?\")
+                .to_string()
+        })
         .unwrap_or_else(|_| p.display().to_string())
 }
 
@@ -107,7 +114,9 @@ fn count_suffix(root: &Path, suffix: &str) -> usize {
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for ent in rd.flatten() {
             visited += 1;
             if visited > 200_000 {
@@ -137,12 +146,27 @@ pub async fn paths(State(state): State<AppApiState>) -> Json<StoragePathsDto> {
     let models_dir = PathBuf::from("models");
 
     let mut entries = vec![
-        entry("config", "Engine config (config.yaml)", "config", state.config_path().to_path_buf()),
+        entry(
+            "config",
+            "Engine config (config.yaml)",
+            "config",
+            state.config_path().to_path_buf(),
+        ),
         entry("data", "Market data (Vortex)", "data", data_dir.clone()),
         entry("models", "Trained models", "models", models_dir),
         entry("cache", "Engine cache", "cache", cache_dir.clone()),
-        entry("journal", "Trade journal", "journal", data_dir.join("journal")),
-        entry("logs", "Logs", "logs", neoethos_core::logging::default_log_dir()),
+        entry(
+            "journal",
+            "Trade journal",
+            "journal",
+            data_dir.join("journal"),
+        ),
+        entry(
+            "logs",
+            "Logs",
+            "logs",
+            neoethos_core::logging::default_log_dir(),
+        ),
     ];
 
     // Strategies = the discovered live-portfolio artifacts under cache/.

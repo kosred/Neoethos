@@ -20,7 +20,9 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::app_services::broker_api::fetch_recent_chart_bars_blocking;
+use crate::app_services::broker_api::{
+    fetch_broker_symbols_blocking, fetch_recent_chart_bars_blocking,
+};
 use crate::app_services::live_trading::bars_to_ohlcv;
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +66,10 @@ fn signals_for_frames(
     let dataset = neoethos_data::SymbolDataset {
         symbol: artifact.symbol.clone(),
         frames,
+        // Broker-fetched comparison bars have no immutable generation receipt.
+        // The canonical feature builder must fail closed instead of treating
+        // this transient window as historical authority.
+        source_artifacts: std::collections::HashMap::new(),
     };
     let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
     let raw =
@@ -77,7 +83,8 @@ fn signals_for_frames(
         &aligned,
         &base_ohlcv,
         pip_size,
-    );
+    )
+    .context("synthesize parity gene signals from the validated feature frame")?;
     let ts = base_ohlcv.timestamp.clone().unwrap_or_default();
     // Feature rows align to the TAIL of the ohlcv (warmup rows dropped) — pair
     // each signal with its bar timestamp from the tail.
@@ -136,6 +143,30 @@ pub fn run_live_parity_check(
     if artifact.genes.is_empty() {
         anyhow::bail!("portfolio '{portfolio_path}' has no genes");
     }
+    let broker_symbols = fetch_broker_symbols_blocking()
+        .context("resolve active cTrader identity for strict v2 parity check")?;
+    let broker_environment = match broker_symbols.environment {
+        value if value.eq_ignore_ascii_case("demo") => neoethos_data::CTraderEnvironment::Demo,
+        value if value.eq_ignore_ascii_case("live") => neoethos_data::CTraderEnvironment::Live,
+        value => anyhow::bail!("active cTrader environment `{value}` is not canonical"),
+    };
+    let matching_symbols = broker_symbols
+        .symbols
+        .iter()
+        .filter(|candidate| candidate.symbol_name == artifact.symbol)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matching_symbols.len() == 1,
+        "active cTrader account exposes {} exact `{}` symbols; expected one",
+        matching_symbols.len(),
+        artifact.symbol
+    );
+    artifact.validate_ctrader_runtime_binding(
+        broker_environment,
+        broker_symbols.account_id,
+        matching_symbols[0].symbol_id,
+        &matching_symbols[0].symbol_name,
+    )?;
     let pip_size = broker_truth
         .exact_pip_size_v1(&artifact.symbol)
         .map_err(anyhow::Error::new)?;
@@ -166,7 +197,9 @@ pub fn run_live_parity_check(
     let mut max_tp_delta = 0.0f64;
 
     for w in window_signals.iter().rev().take(compare_tail) {
-        let Some(r) = ref_by_ts.get(&w.0) else { continue };
+        let Some(r) = ref_by_ts.get(&w.0) else {
+            continue;
+        };
         compared += 1;
         if r.1 != w.1 {
             mismatches += 1;

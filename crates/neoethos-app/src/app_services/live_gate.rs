@@ -40,6 +40,7 @@ use neoethos_core::domain::demo_gate::{
 };
 use neoethos_core::domain::promotion_gate::PromotionMetrics;
 
+use crate::app_services::broker_api::fetch_broker_symbols_blocking;
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::journal_stats::{compute_stats, max_drawdown_from_trade_pnl};
 use crate::app_services::journal_store::{
@@ -135,48 +136,25 @@ pub fn active_env_is_live() -> bool {
     )
 }
 
-/// Read the BACKTEST [`PromotionMetrics`] for a `*.live_portfolio.json` from its
-/// sibling `*.quality.json` (written by discovery). Units are normalised to
-/// match the gate + the journal: `win_rate` as a fraction, `max_drawdown_pct`
-/// as a PERCENT (quality.json stores it as a fraction, e.g. 0.118 → 11.8).
-fn backtest_metrics_for(portfolio_path: &str) -> Result<PromotionMetrics> {
-    let p = std::path::Path::new(portfolio_path);
-    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-    // discovery writes `<base>.json.live_portfolio.json` + `<base>.json.quality.json`
-    let stem = name
-        .strip_suffix(".live_portfolio.json")
-        .unwrap_or(name);
-    let dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let qpath = dir.join(format!("{stem}.quality.json"));
-    let text = std::fs::read_to_string(&qpath)
-        .with_context(|| format!("read backtest quality {}", qpath.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse quality {}", qpath.display()))?;
-    // quality.json is an ARRAY of per-gene records; use the most-traded gene as
-    // the representative backtest (matches the Strategy Report's choice).
-    let trades_of = |x: &serde_json::Value| x.get("total_trades").and_then(|t| t.as_f64()).unwrap_or(0.0);
-    let obj = if let Some(arr) = v.as_array() {
-        arr.iter()
-            .max_by(|a, b| trades_of(a).partial_cmp(&trades_of(b)).unwrap_or(std::cmp::Ordering::Equal))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null)
-    } else {
-        v
-    };
-    let f = |k: &str| obj.get(k).and_then(|x| x.as_f64());
-
-    let mut win_rate = f("win_rate").unwrap_or(0.0);
+/// Read the BACKTEST [`PromotionMetrics`] from the full genes embedded in the
+/// already-validated v3 live-portfolio artifact. A filename-derived sibling quality file is
+/// neither generation-bound nor configuration-bound and is never consulted.
+fn backtest_metrics_for(genes: &[neoethos_search::Gene]) -> Result<PromotionMetrics> {
+    let gene = genes
+        .iter()
+        .max_by_key(|gene| gene.trades_count)
+        .context("strict v3 live portfolio has no genes for the promotion gate")?;
+    let mut win_rate = gene.win_rate;
     if win_rate > 1.0 {
         win_rate /= 100.0; // defensive: accept a percent too
     }
-    let dd_frac = f("max_drawdown_pct").unwrap_or(0.0);
 
     Ok(PromotionMetrics {
-        sharpe: f("sharpe_ratio").unwrap_or(0.0),
+        sharpe: gene.sharpe_ratio,
         win_rate,
-        profit_factor: f("profit_factor").unwrap_or(0.0),
-        max_drawdown_pct: dd_frac * 100.0,
-        trades: f("total_trades").unwrap_or(0.0) as u64,
+        profit_factor: gene.profit_factor,
+        max_drawdown_pct: gene.max_drawdown * 100.0,
+        trades: gene.trades_count as u64,
     })
 }
 
@@ -214,8 +192,32 @@ pub fn evaluate_for_portfolio(portfolio_path: &str) -> Result<DemoForwardDecisio
 
     let artifact = neoethos_search::load_live_portfolio_json(portfolio_path)
         .with_context(|| format!("load live portfolio {portfolio_path}"))?;
+    let broker_symbols = fetch_broker_symbols_blocking()
+        .context("resolve active cTrader identity for strict v3 promotion gate")?;
+    let broker_environment = match broker_symbols.environment {
+        value if value.eq_ignore_ascii_case("demo") => neoethos_data::CTraderEnvironment::Demo,
+        value if value.eq_ignore_ascii_case("live") => neoethos_data::CTraderEnvironment::Live,
+        value => anyhow::bail!("active cTrader environment `{value}` is not canonical"),
+    };
+    let matching_symbols = broker_symbols
+        .symbols
+        .iter()
+        .filter(|candidate| candidate.symbol_name == artifact.symbol)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matching_symbols.len() == 1,
+        "active cTrader account exposes {} exact `{}` symbols; expected one",
+        matching_symbols.len(),
+        artifact.symbol
+    );
+    artifact.validate_ctrader_runtime_binding(
+        broker_environment,
+        broker_symbols.account_id,
+        matching_symbols[0].symbol_id,
+        &matching_symbols[0].symbol_name,
+    )?;
+    let backtest = backtest_metrics_for(&artifact.genes)?;
     let symbol = artifact.symbol;
-    let backtest = backtest_metrics_for(portfolio_path)?;
 
     // 2026-08-04: ONE load, used for BOTH the data root and the gate
     // thresholds. This function used to load a `Settings` here, take only
@@ -324,23 +326,33 @@ mod tests {
 
     #[test]
     fn backtest_metrics_convert_drawdown_fraction_to_percent() {
-        let dir = std::env::temp_dir().join(format!("neo_gate_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = dir.join("X_H1.json.quality.json");
-        // Real format: an ARRAY of per-gene records; the most-traded wins.
-        std::fs::write(
-            &q,
-            r#"[{"win_rate":0.30,"profit_factor":1.0,"sharpe_ratio":0.5,"max_drawdown_pct":0.4,"total_trades":12},
-                {"win_rate":0.45,"profit_factor":1.78,"sharpe_ratio":4.28,"max_drawdown_pct":0.118,"total_trades":300}]"#,
-        )
-        .unwrap();
-        let pf = dir.join("X_H1.json.live_portfolio.json");
-        let m = backtest_metrics_for(pf.to_str().unwrap()).unwrap();
+        let genes = vec![
+            neoethos_search::Gene {
+                win_rate: 0.30,
+                profit_factor: 1.0,
+                sharpe_ratio: 0.5,
+                max_drawdown: 0.4,
+                trades_count: 12,
+                ..Default::default()
+            },
+            neoethos_search::Gene {
+                win_rate: 0.45,
+                profit_factor: 1.78,
+                sharpe_ratio: 4.28,
+                max_drawdown: 0.118,
+                trades_count: 300,
+                ..Default::default()
+            },
+        ];
+        let m = backtest_metrics_for(&genes).unwrap();
         assert!((m.win_rate - 0.45).abs() < 1e-9);
         assert!((m.profit_factor - 1.78).abs() < 1e-9);
-        assert!((m.max_drawdown_pct - 11.8).abs() < 1e-6, "dd% = {}", m.max_drawdown_pct);
+        assert!(
+            (m.max_drawdown_pct - 11.8).abs() < 1e-6,
+            "dd% = {}",
+            m.max_drawdown_pct
+        );
         assert_eq!(m.trades, 300);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn trade(env: Option<&str>) -> ClosedTrade {
@@ -431,7 +443,10 @@ mod tests {
         let scoped = max_drawdown_from_trade_pnl(&trades, 1000.0).expect("measurable");
         let (pct, source) = resolve_gate_drawdown(Some(scoped), trades.len());
         assert_eq!(source, SCOPED_DD);
-        assert!(pct < 2.0, "this strategy risked ~2%, not the account's: {pct}");
+        assert!(
+            pct < 2.0,
+            "this strategy risked ~2%, not the account's: {pct}"
+        );
     }
 
     /// FAIL-CLOSED. The drawdown criterion is a CAP, so an unmeasurable
@@ -488,12 +503,8 @@ mod tests {
             max_drawdown_pct: 0.0,
             trades: 0,
         };
-        let decision = evaluate_demo_forward_gate(
-            0,
-            &zero,
-            &zero,
-            &DemoForwardGateConfig::default(),
-        );
+        let decision =
+            evaluate_demo_forward_gate(0, &zero, &zero, &DemoForwardGateConfig::default());
         assert!(!decision.eligible, "zero fills can never be eligible");
     }
 

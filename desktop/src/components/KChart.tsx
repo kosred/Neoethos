@@ -1,19 +1,21 @@
 import { useEffect, useRef } from "react";
 import { init, dispose, type Chart, type KLineData, type DeepPartial, type Styles } from "klinecharts";
 import { brokerChart, chartHistory, type Candle, type Tick } from "../api";
+import {
+  CANONICAL_BROKER_TIMEFRAMES,
+  isCanonicalBrokerTimeframe,
+  type CanonicalBrokerTimeframe,
+} from "../timeframes";
 
-// ── timeframe → klinecharts period + seconds ────────────────────────────────
-const PERIOD: Record<string, { type: "minute" | "hour" | "day" | "week" | "month"; span: number }> = {
-  M1: { type: "minute", span: 1 }, M3: { type: "minute", span: 3 }, M5: { type: "minute", span: 5 },
+// Exact direct broker timeframe to klinecharts display period.
+const PERIOD: Record<CanonicalBrokerTimeframe, { type: "minute" | "hour" | "day" | "week" | "month"; span: number }> = {
+  M1: { type: "minute", span: 1 }, M2: { type: "minute", span: 2 },
+  M3: { type: "minute", span: 3 }, M4: { type: "minute", span: 4 },
+  M5: { type: "minute", span: 5 }, M10: { type: "minute", span: 10 },
   M15: { type: "minute", span: 15 }, M30: { type: "minute", span: 30 },
   H1: { type: "hour", span: 1 }, H4: { type: "hour", span: 4 }, H12: { type: "hour", span: 12 },
   D1: { type: "day", span: 1 }, W1: { type: "week", span: 1 }, MN1: { type: "month", span: 1 },
 };
-const TF_SECONDS: Record<string, number> = {
-  M1: 60, M3: 180, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, H12: 43200,
-  D1: 86400, W1: 604800, MN1: 2592000,
-};
-
 // FX price precision heuristic (JPY pairs 3, metals 2, majors 5).
 const precisionFor = (sym: string) => {
   const s = sym.toUpperCase();
@@ -95,8 +97,6 @@ export default function KChart({
   const chartRef = useRef<Chart | null>(null);
   const symRef = useRef(symbol);
   const tfRef = useRef(timeframe);
-  const barCbRef = useRef<((d: KLineData) => void) | null>(null);
-  const formingRef = useRef<KLineData | null>(null);
   symRef.current = symbol;
   tfRef.current = timeframe;
 
@@ -113,7 +113,7 @@ export default function KChart({
       getBars: async ({ type, timestamp, callback }) => {
         const sym = symRef.current;
         const tf = tfRef.current;
-        if (!sym || !tf) { callback([], false); return; }
+        if (!sym || !isCanonicalBrokerTimeframe(tf)) { callback([], false); return; }
         try {
           if (type === "init") {
             const c = await brokerChart(sym, tf, 800);
@@ -131,8 +131,6 @@ export default function KChart({
           callback([], false);
         }
       },
-      subscribeBar: ({ callback }) => { barCbRef.current = callback; },
-      unsubscribeBar: () => { barCbRef.current = null; formingRef.current = null; },
     });
 
     const ro = new ResizeObserver(() => chart.resize());
@@ -140,8 +138,6 @@ export default function KChart({
 
     return () => {
       ro.disconnect();
-      barCbRef.current = null;
-      formingRef.current = null;
       chartRef.current = null;
       dispose(elRef.current!);
     };
@@ -150,10 +146,9 @@ export default function KChart({
   // symbol / timeframe → reload (triggers a fresh getBars("init"))
   useEffect(() => {
     const chart = chartRef.current;
-    if (!chart || !symbol || !timeframe) return;
-    formingRef.current = null;
+    if (!chart || !symbol || !isCanonicalBrokerTimeframe(timeframe)) return;
     chart.setSymbol({ ticker: symbol, pricePrecision: precisionFor(symbol), volumePrecision: 0 });
-    chart.setPeriod(PERIOD[timeframe] ?? { type: "hour", span: 1 });
+    chart.setPeriod(PERIOD[timeframe]);
   }, [symbol, timeframe]);
 
   // indicator selection → single indicator at a time (price overlay or sub-pane)
@@ -170,34 +165,56 @@ export default function KChart({
     }
   }, [indicator]);
 
-  // live forming candle: fold the current symbol's tick into the current bar
-  useEffect(() => {
-    const cb = barCbRef.current;
-    if (!cb || !liveTick || liveTick.symbolName !== symbol) return;
-    const tfSec = TF_SECONDS[timeframe] ?? 60;
-    const price = liveTick.midPrice;
-    const bucketMs = Math.floor(liveTick.brokerTimestampMs / 1000 / tfSec) * tfSec * 1000;
-    const prev = formingRef.current;
-    const bar: KLineData =
-      prev && prev.timestamp === bucketMs
-        ? { ...prev, high: Math.max(prev.high, price), low: Math.min(prev.low, price), close: price }
-        : { timestamp: bucketMs, open: price, high: price, low: price, close: price };
-    formingRef.current = bar;
-    cb(bar);
-  }, [liveTick, symbol, timeframe]);
-
   const draw = (name: string) => chartRef.current?.createOverlay(name);
   const clearDrawings = () => chartRef.current?.removeOverlay();
+  const invalidTimeframe =
+    timeframe.length > 0 && !isCanonicalBrokerTimeframe(timeframe);
+  const currentPriceMarker =
+    liveTick &&
+    liveTick.symbolName === symbol &&
+    Number.isFinite(liveTick.midPrice)
+      ? liveTick.midPrice
+      : null;
 
   return (
     <div style={{ position: "absolute", inset: 0, background: "#0f1117" }}>
+      {invalidTimeframe && (
+        <div
+          className="banner warn"
+          style={{ position: "absolute", zIndex: 2, inset: 12, bottom: "auto" }}
+        >
+          Unsupported broker timeframe {timeframe}. Select one exact direct period:{" "}
+          {CANONICAL_BROKER_TIMEFRAMES.join(", ")}.
+        </div>
+      )}
+      {currentPriceMarker !== null && (
+        <div
+          className="kchart-live-price-marker"
+          style={{
+            position: "absolute",
+            zIndex: 2,
+            right: 12,
+            top: 48,
+            pointerEvents: "none",
+          }}
+        >
+          LIVE {currentPriceMarker.toFixed(precisionFor(symbol))}
+        </div>
+      )}
       <div className="kchart-tools">
         {DRAW_TOOLS.map((t) => (
           <button key={t.name} title={t.title} onClick={() => draw(t.name)}>{t.label}</button>
         ))}
         <button title="Clear all drawings" className="danger" onClick={clearDrawings}>✕</button>
       </div>
-      <div ref={elRef} style={{ position: "absolute", inset: 0 }} />
+      <div
+        ref={elRef}
+        style={{
+          position: "absolute",
+          inset: 0,
+          visibility: invalidTimeframe ? "hidden" : "visible",
+        }}
+      />
     </div>
   );
 }

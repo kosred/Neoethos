@@ -10,10 +10,6 @@ set -euo pipefail
 # Fall back to the directory of this script if invoked directly.
 APPDIR="${APPDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 
-# Ensure bundled libraries, if any are added later, are picked up by the
-# dynamic linker without requiring system installs.
-export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${LD_LIBRARY_PATH:-}"
-
 # Point the binary at the packaged data root. The legacy variable stays for
 # compatibility with older runtime probes during the rename window.
 export NEOETHOS_BUNDLED_DATA="${APPDIR}/usr/share/neoethos"

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 //! The f64 dispatch lane.
 //!
@@ -45,6 +45,7 @@ use crate::cuda::device_types_f64::{
     CudaDeviceOhlcF64Ref, CudaDeviceOhlcvF64Ref, CudaDeviceSliceF64Ref,
 };
 use crate::cuda::neoethos_f64_wrapper::{CudaF64Indicators, F64Inputs, F64Kernel};
+use crate::indicators::registry::get_indicator;
 
 // ---------------------------------------------------------------------------
 // Request / response vocabulary, mirroring the f32 side one for one
@@ -103,7 +104,9 @@ impl IndicatorCudaDataRefF64<'_> {
 /// [`super::types::IndicatorCudaDeviceDataRef`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndicatorCudaDeviceDataRefF64 {
-    Slice { values: CudaDeviceSliceF64Ref },
+    Slice {
+        values: CudaDeviceSliceF64Ref,
+    },
     Ohlc(CudaDeviceOhlcF64Ref),
     Ohlcv(CudaDeviceOhlcvF64Ref),
     HighLow(CudaDeviceHighLowF64Ref),
@@ -186,6 +189,12 @@ pub enum IndicatorCudaSeriesF64 {
 #[derive(Debug)]
 pub struct IndicatorCudaOutputF64 {
     pub indicator_id: String,
+    /// Exact registry output represented by `series`.
+    ///
+    /// The f64 lane currently exposes the primary (first declared) output of
+    /// each indicator. Carrying the identity with the buffer prevents a
+    /// successful multi-output launch from being labelled as another column.
+    pub output_id: &'static str,
     pub series: IndicatorCudaSeriesF64,
     pub rows: usize,
     pub cols: usize,
@@ -210,6 +219,42 @@ pub struct F64KernelSpec {
     /// per indicator rather than per input shape, because three of the
     /// high/low/close indicators do NOT use the rule the other three use.
     pub first_valid: F64FirstValidRule,
+}
+
+impl F64KernelSpec {
+    /// Exact feature output emitted by this primary f64 kernel.
+    ///
+    /// The custom f64 kernels were written against the primary column of each
+    /// vector-ta indicator, which is the first output in the authoritative
+    /// registry. This method makes that existing contract executable instead
+    /// of leaving downstream code to guess an output name from a successful
+    /// launch. Complete multi-output GPU coverage still requires a separate
+    /// route for every remaining registry output.
+    pub fn primary_output_id(&self) -> Option<&'static str> {
+        // These four are handled by the CPU dispatcher's explicit by-name
+        // branch and therefore have no registry row. EMD Trend is the one
+        // registered compatibility exception: its preserved primary ABI
+        // emits `average`, while canonical production bypasses that ABI and
+        // launches all four named outputs together.
+        let explicit_primary = match self.indicator_id {
+            "rolling_skewness_kurtosis" => Some("skewness"),
+            "rolling_z_score_trend" => Some("zscore"),
+            "historical_volatility_percentile" => Some("hvp"),
+            "ict_propulsion_block" => Some("bullish_high"),
+            "emd_trend" => Some("average"),
+            _ => None,
+        };
+        if explicit_primary.is_some() {
+            return explicit_primary;
+        }
+        match get_indicator(self.indicator_id) {
+            Some(info) => info.outputs.first().map(|output| output.id),
+            // The remaining by-name dispatcher rows expose their primary via
+            // the literal `value` alias. They still need full registry/output
+            // restoration before non-primary columns can enter GpuOnly.
+            None => Some("value"),
+        }
+    }
 }
 
 /// How the CPU reference computes `first_valid`.
@@ -270,7 +315,6 @@ pub enum F64FirstValidRule {
     // Four more rules, all found by reading the CPU `*_prepare` rather than by
     // assuming. Each one shifts the whole series relative to `AllInputsNonNan`
     // on real data, which is why none of them is folded into it.
-
     /// The MAX of INDEPENDENT first-non-NaN scans over the series the input
     /// kind names -- the two-series twin of
     /// [`Self::HlcMaxOfIndependentFirsts`]. `donchian.rs:183-188` scans high
@@ -283,6 +327,12 @@ pub enum F64FirstValidRule {
     /// (`first_valid_hilo`). Stricter than non-NaN: an INFINITE high is
     /// skipped by the CPU and would be accepted by `AllInputsNonNan`.
     HighLowFinite,
+
+    /// The midpoint formed in the CPU's exact order, `(high + low) / 2.0`, is
+    /// finite. Fisher v2 needs this stricter rule: individually finite
+    /// `f64::MAX` inputs overflow while forming the midpoint, so
+    /// [`Self::HighLowFinite`] would seed the recurrence one bar too early.
+    HighLowMidpointFinite,
 
     /// high and low both finite AND strictly positive at the same index --
     /// `parkinson_volatility.rs:214-223` (`is_valid_high_low` /
@@ -344,7 +394,6 @@ pub enum F64FirstValidRule {
     // Three more, all read from the CPU prepare rather than assumed. The first
     // two scan the SAME four series and are still different rules -- which is
     // exactly why neither is folded into `AllInputsNonNan`.
-
     /// open, high, low and close ALL `is_finite` at the same index --
     /// `accumulation_swing_index.rs:245`, `daily_factor.rs:258`. Open is an
     /// INPUT to both, so the Hlc rules would seed `prev_open` from a bar the
@@ -466,7 +515,9 @@ pub enum F64InputKind {
     OpenCloseVolume,
 
     // ------------------------------------------------------ closer 6, round 3
-    /// (hlcc4, volume) -- `elastic_volume_weighted_moving_average` alone.
+    /// An explicit (hlcc4, volume) source pair. No registered f64 row currently
+    /// selects it; it remains a distinct type for any future indicator whose
+    /// semantic source really is HLCC4 rather than close.
     ///
     /// A FIFTH price source paired with volume, and it is its own kind for the
     /// reason [`Self::CloseVolume`] and [`Self::Hlc3Volume`] are two kinds over
@@ -474,10 +525,9 @@ pub enum F64InputKind {
     /// and swapping them computes a different indicator while passing every
     /// length and device check on the way through.
     ///
-    /// EVWMA's declared default source is `hlcc4`
-    /// (`elastic_volume_weighted_moving_average.rs:113`,
-    /// `with_default_candles`), the same evidence that put the `velocity`
-    /// family on [`Self::Hlcc4Slice`].
+    /// EVWMA deliberately does not use this kind: its creator/publisher default
+    /// and its direct API source are close, so its f64 row declares
+    /// [`Self::CloseVolume`].
     Hlcc4Volume,
 }
 
@@ -736,7 +786,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc3Volume,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ---------------------------------------------------------------- batch 2
     //
     // WHY THESE, AND WHY NOT THE ONES THE BRIEF NAMED.
@@ -812,7 +861,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseVolume,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // Volatility / directional. `natr` and `adxr` are the two remaining
     // Wilder-family recurrences that are reachable; both are sequential.
     F64KernelSpec {
@@ -833,7 +881,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseVolume,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // Pointwise and windowed. These are the only ones in this batch that are
     // parallel over (combo, bar), because they are the only ones whose CPU
     // reference has no cross-bar state.
@@ -873,7 +920,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ---------------------------------------------------------------- shard 2
     //
     // `wilders` LEAVES THE WITHHELD LIST.
@@ -926,7 +972,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ------------------------------------------------------------ shard 2
     //
     // Kernels written in the indicator's OWN `.cu` file, beside the f32 entry
@@ -1023,7 +1068,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ---------------------------------------------------------------- shard 6
     //
     // Every row below names an entry point in the INDICATOR'S OWN `.cu` file,
@@ -1036,12 +1080,12 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // `*_prepare`, not inferred from its input shape. Four of them are NOT the
     // common rule and each would shift the whole series if it were.
 
-    // --- single price series, CPU source `close`, common first-valid rule.
+    // --- single price series, CPU source `close`, finite first-valid rule.
     F64KernelSpec {
         indicator_id: "fwma",
         kernel: F64Kernel::Fwma,
         input: F64InputKind::CloseSlice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        first_valid: F64FirstValidRule::CloseFinite,
     },
     F64KernelSpec {
         indicator_id: "hwma",
@@ -1115,7 +1159,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // --- high/low/close, all three non-NaN at the SAME index.
     F64KernelSpec {
         indicator_id: "ttm_trend",
@@ -1129,7 +1172,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // --- (high, low) with no close.
     F64KernelSpec {
         indicator_id: "cvi",
@@ -1143,7 +1185,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::HighLow,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // --- the four that do NOT use the common rule. Read the rule's doc
     //     comment for the CPU line each one came from.
     F64KernelSpec {
@@ -1170,7 +1211,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::ConsecutiveValidReturnPair,
     },
-
     // --- `vwap` LEAVES THE WITHHELD LIST.
     //
     // It was withheld because vector-ta answered "what is vwap" two ways. The
@@ -1197,7 +1237,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::TimestampCloseVolume,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     // ------------------------------------------------------------ shard 2
     //
     // Kernels written in the indicator's OWN `.cu` file, beside the f32 entry
@@ -1228,7 +1267,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::HighLow,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ---------------------------------------------------------------- shard 1
     //
     // Nineteen indicators whose f64 kernel was written INTO THE FILE THE
@@ -1256,14 +1294,16 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // the two.
     //
     // PERIOD-INVARIANT ids in this block (their CPU batch arm never reads the
-    // swept `period`): apo, vidya, gatorosc, ppo, pma, alligator, nvi, stochf,
+    // swept `period`): vidya, ppo, pma, alligator, nvi, stochf,
     // emv, kvo. They emit identical rows for every period, faithfully -- see
     // `F64Kernel::is_period_invariant`.
+    // APO instead consumes the requested long-period anchor and reconstructs
+    // its short period with the registry's exact 10:20 ratio.
     //
-    // MULTI-OUTPUT ids emit the series the CPU's `output_id: "value"` maps to,
-    // and only that one: alligator -> jaw, gatorosc -> upper, stochf -> k,
-    // fisher -> fisher, pma -> predict. Named here so a caller cannot mistake
-    // a one-matrix result for the whole indicator.
+    // The preserved generic primary ABI emits one registered primary series.
+    // Gator Oscillator now consumes its anchor and scales the same three-length
+    // registry tuple as hpc_ta; canonical production uses the separate
+    // four-output resident ABI so no primary replay stands in for named rows.
     F64KernelSpec {
         indicator_id: "apo",
         kernel: F64Kernel::Apo,
@@ -1346,7 +1386,7 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         indicator_id: "fisher",
         kernel: F64Kernel::Fisher,
         input: F64InputKind::HighLow,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        first_valid: F64FirstValidRule::HighLowMidpointFinite,
     },
     F64KernelSpec {
         indicator_id: "safezonestop",
@@ -1378,7 +1418,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlcv,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ------------------------------------------------------------- shard 4
     //
     // Twenty-four indicators whose kernel lives in the file the indicator
@@ -1598,18 +1637,16 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::OpenCloseVolume,
         first_valid: F64FirstValidRule::CloseFinite,
     },
-    // cci_cycle.rs:409 scans the single close series. PERIOD-INVARIANT:
-    // cpu_batch.rs:3454 reads `length` (10) and `factor` (0.5). `length` is
-    // pinned at 10 for a second reason as well -- `cci_cycle_compute_from_
-    // parts:526` sends `length > 16` to `fused_pf_and_normalize_scalar`, a
-    // different function from the `naive_` one this kernel mirrors.
+    // Classic semantic-v9 starts at bar zero, emits zero while its creator
+    // pipeline warms, and resets at every non-finite close. The kernel derives
+    // all of that state locally, so a host first-valid index is intentionally
+    // ignored. The host still refuses anchors above the compiled ring.
     F64KernelSpec {
         indicator_id: "cci_cycle",
         kernel: F64Kernel::CciCycle,
         input: F64InputKind::CloseSlice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        first_valid: F64FirstValidRule::Ignored,
     },
-
     // ----------------------------------------------------------- shard 3
     //
     // Twenty-five indicators whose f64 kernel was written into the `.cu` file
@@ -1645,7 +1682,8 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-    // PERIOD-INVARIANT: the CPU batch reads named parameters, never `period`.
+    // AO consumes the requested long-period anchor and reconstructs the short
+    // period with the registry's exact 5:34 ratio.
     F64KernelSpec {
         indicator_id: "ao",
         kernel: F64Kernel::Ao,
@@ -1791,21 +1829,13 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ---------------------------------------------------------------- closer 6
     //
-    // Three multi-output indicators the earlier batches skipped for exactly
-    // that reason -- `resolve_output_id` (cpu_batch.rs:2185) errors for a
-    // multi-output id when `hpc_ta` calls with `output_id: None`, so the
-    // comment on batch 2 above reads "an f64 kernel for any of them would have
-    // nothing to be checked against".
-    //
-    // THAT IS TRUE OF `hpc_ta`'S CALL, NOT OF THE INDICATOR. Each of these
-    // CPU batch functions answers `output_id == "value"` perfectly well and
-    // names which column it means: emd -> upperband (cpu_batch.rs:14554),
-    // keltner -> upper_band (:6232), stoch -> k (:5603). The oracle exists;
-    // it is reached by asking for "value" explicitly rather than by passing
-    // None. Each kernel emits that column and its `.cu` header says so.
+    // Three multi-output indicators with compatibility primary f64 kernels.
+    // `F64KernelSpec::primary_output_id` resolves the exact registry-primary
+    // identity; it does not invent a `value` alias. EMD production bypasses
+    // this upper-only compatibility symbol and uses its named resident triple
+    // route, while Keltner and Stoch remain primary-only here.
     F64KernelSpec {
         indicator_id: "emd",
         kernel: F64Kernel::Emd,
@@ -1835,7 +1865,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         // simultaneously.
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ------------------------------------------------------------- closer 4
     //
     // Seven indicators whose f64 kernel was written INTO THE FILE THE
@@ -1912,7 +1941,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // --- high/low/close, all three non-NaN at the SAME index.
     // random_walk_index.rs:247 uses `first_valid_hlc`, the simultaneous scan
     // -- NOT adx's max-of-independent-firsts and NOT adxr's close-only.
@@ -1923,7 +1951,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // --- the two that do NOT use the common rule.
     F64KernelSpec {
         indicator_id: "qstick",
@@ -1947,7 +1974,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         // is close and not hlc3.
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ------------------------------------------------------------- closer 3
     //
     // Six kernels written into the file each indicator already ships in --
@@ -2212,10 +2238,10 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-    /// The "value" column is `average` (cpu_batch.rs:14604), and `average` is
-    /// `ma("sma", src, 28)` (emd_trend.rs:684-695) -- the SAME computation the `sma`
-    /// row above performs, at a pinned length. The envelope and the direction state
-    /// machine feed the other four outputs and never this one.
+    /// Compatibility primary `average` is `ma("sma", src, 28)`. Canonical
+    /// production is a typed four-output route over the registered `length`
+    /// parameter and never treats the preserved fixed-default ABI as the
+    /// registry's first (`direction`) output.
     F64KernelSpec {
         indicator_id: "emd_trend",
         kernel: F64Kernel::EmdTrend,
@@ -2223,13 +2249,14 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
     /// PERIOD-SWEPT (`ma_batch.rs:1881` reads a parameter named `period`; `offset`
-    /// defaults to 4). Warmup is `first + period + offset + 1` (epma.rs:1069), not
-    /// `first + period - 1`.
+    /// defaults to 4). Bounded-faithful f64 v1 accepts periods through 260,
+    /// rejects the singular integer weight sum, and uses the first finite close.
+    /// Warmup is `first + period + offset + 1`, not `first + period - 1`.
     F64KernelSpec {
         indicator_id: "epma",
         kernel: F64Kernel::Epma,
         input: F64InputKind::CloseSlice,
-        first_valid: F64FirstValidRule::AllInputsNonNan,
+        first_valid: F64FirstValidRule::CloseFinite,
     },
     /// PERIOD-SWEPT (cpu_batch.rs:3117, default 5). Warmup `first + period - 1`
     /// (fosc.rs:212).
@@ -2258,7 +2285,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ---------------------------------------------------------------- closer 1
     //
     // Twenty indicators that had a `.cu` file and NO lane entry point. Each one
@@ -2274,7 +2300,7 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // (series..., n, periods, n_combos, first_valid, out). A row pointing at
     // one of the old symbols would have mismatched the ABI and read the stack.
     //
-    // FIFTEEN OF THE TWENTY ARE PERIOD-INVARIANT, and that is faithful rather
+    // FOURTEEN OF THE TWENTY ARE PERIOD-INVARIANT, and that is faithful rather
     // than lazy: their CPU batch functions read NAMED parameters --
     // `ema_length`/`signal_length`, `rsi_length`/`alpha`, `short_length`/
     // `medium_length`/`long_length`, `atr_length`/`percentile_length`,
@@ -2282,9 +2308,9 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // A caller sweeping [7,21,50,100,200] gets five identical CPU columns, so
     // the kernel emits five identical rows and `is_period_invariant` says so.
     //
-    // FIVE ARE GENUINELY PERIOD-SWEPT: bull_power_vs_bear_power, cg, dm,
-    // donchian_channel_width and dpo each read a parameter literally named
-    // `period`.
+    // SIX ARE GENUINELY PERIOD-SWEPT: bull_power_vs_bear_power, cg, dm,
+    // donchian_channel_width, dpo and garman_klass_volatility each consume
+    // the requested anchor.
     // `..._row_field_from_slice` (:521) walks from index 0 with a fresh stream and
     // resets it on any non-finite bar; the prepare first index never reaches it.
     F64KernelSpec {
@@ -2347,7 +2373,9 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         first_valid: F64FirstValidRule::OpenCloseFinite,
     },
     // `atr_percentile_into_slice` (:636) discards the prepare first index and the
-    // row walks from 0 with per-bar validity flags rather than a warmup.
+    // row walks from 0 with per-bar validity flags. The requested anchor is the
+    // percentile window and reconstructs the ATR window with the registry's
+    // exact 10:50 ratio.
     F64KernelSpec {
         indicator_id: "atr_percentile",
         kernel: F64Kernel::AtrPercentile,
@@ -2419,8 +2447,9 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::Ignored,
     },
-    // PERIOD-SWEPT. Column is `plus` (cpu_batch.rs:6057). `dm_prepare` (:191) zips
-    // high and low and takes the first index where BOTH are non-NaN.
+    // PERIOD-SWEPT. The preserved primary is canonical `plus`; the typed full
+    // route emits canonical `plus` then `minus`. `dm_prepare` zips high and low
+    // and takes the first index where BOTH are non-NaN.
     F64KernelSpec {
         indicator_id: "dm",
         kernel: F64Kernel::Dm,
@@ -2455,9 +2484,9 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Ohlc4,
         first_valid: F64FirstValidRule::OpenCloseNonNan,
     },
-    /// PERIOD-INVARIANT (cpu_batch.rs:15968/:15974 read `length` 20 and `smooth` 10).
-    /// The EMA rate comes from SMOOTH, not from the window length. Column
-    /// `forward_backward` (cpu_batch.rs:15993).
+    /// PERIOD-SWEPT on canonical length; smooth remains the exact registry
+    /// default 10 for the production extension. The EMA rate comes from
+    /// SMOOTH, not from the window length. Primary column forward_backward.
     F64KernelSpec {
         indicator_id: "forward_backward_exponential_oscillator",
         kernel: F64Kernel::ForwardBackwardExponentialOscillator,
@@ -2478,17 +2507,16 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-    /// PERIOD-INVARIANT (cpu_batch.rs:7229-7235 read atr_length / base_multiplier /
-    /// noise_threshold / expansion_alpha). `open` never enters the arithmetic but it
-    /// DOES gate validity (`is_valid_ohlc`, :354), so dropping it would carry trend
-    /// state across a gap the CPU breaks. Column `band` (cpu_batch.rs:7254).
+    /// The canonical registry maps the admitted sweep onto `atr_length`; the
+    /// remaining three parameters retain their exact scalar defaults. `open`
+    /// never enters the arithmetic but it DOES gate validity, so dropping it
+    /// would carry trend state across a gap the CPU breaks. Primary column `band`.
     F64KernelSpec {
         indicator_id: "evasive_supertrend",
         kernel: F64Kernel::EvasiveSupertrend,
         input: F64InputKind::Ohlc4,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ------------------------------------------------------ closer 6, round 2
     //
     // Eight indicators that had NO double-in/double-out entry point anywhere
@@ -2496,7 +2524,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // carries a "NEOETHOS f64 LANE  --  closer 6" section written against the
     // CPU reference named in that section's header, and each of those files is
     // listed in build.rs's fast-math opt-out.
-
     /// PERIOD-SWEPT (cpu_batch.rs:15582 reads a parameter literally named
     /// `period`, default 5). Column `sine` (:15594). The kernel reproduces
     /// BOTH CPU paths: `msw_period5_into` (msw.rs:764) forms its angles as
@@ -2601,7 +2628,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // listed with its CPU file:line in the `DECLARED` table in
     // `first_valid_departures_are_declared`, which is what stops a rule from
     // being asserted here and never checked.
-
     /// `mwdx_scalar`, moving_averages/mwdx.rs:284. One fma per bar, seeded from
     /// the first non-NaN close (:308). PERIOD-INVARIANT: the only parameter is
     /// `factor`, default 0.2 (:119).
@@ -2611,7 +2637,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     /// `lrsi_scalar_hl`, lrsi.rs:397. Four carried Laguerre stages, each one
     /// `mul_add`. PERIOD-INVARIANT: the only parameter is `alpha`, default 0.2
     /// (cpu_batch.rs:3481).
@@ -2625,23 +2650,24 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::HighLow,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
-    /// `pivot_scalar`, pivot.rs:536, mode-3 arm (:670-721). Emits `pp`, which
-    /// is what the dispatcher returns for "value" (cpu_batch.rs:16743).
+    /// The reviewed default Pivot formula (mode 3) emits `pp`, which is what
+    /// the generic dispatcher returns for `value`. Output bar `t` reads the
+    /// high/low/close of period `t-1`; the first output is therefore undefined.
+    /// All five formulas and all nine named levels use the explicit resident
+    /// OHLC route rather than this primary-only compatibility entry point.
     /// PERIOD-INVARIANT: the only parameter is `mode`, default 3 (:16734) --
     /// an integer selecting WHICH formula runs, and a period list cannot stand
     /// in for it.
     ///
-    /// `Hlc` and not `Ohlc4`: the batch extractor hands the CPU an `open`
-    /// slice, but the mode-3 arm never reads it and the first-valid scan covers
-    /// high, low and close only (:271-282).
+    /// `Hlc` and not `Ohlc4`: mode 3 reads only the previous period's high,
+    /// low and close. Formula-specific open semantics live in the explicit
+    /// nine-output route.
     F64KernelSpec {
         indicator_id: "pivot",
         kernel: F64Kernel::Pivot,
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     /// `kaufmanstop_scalar_classic_sma`, kaufmanstop.rs:2093 -- the NaN-aware
     /// form, which is bit-identical to the fast path (:2160) on NaN-free data
     /// and is the form the fast path RESTARTS INTO the moment it meets a NaN
@@ -2653,7 +2679,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::HighLow,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     /// `sgf_compute_into`, moving_averages/sgf.rs:570, with `sgf_dot` (:479)
     /// and `build_endpoint_sgf_weights` (:331). PERIOD-SWEPT; `poly_order` is
     /// its default 2 (:87), so the kernel solves a 3x3 normal system per row
@@ -2664,7 +2689,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     /// `polynomial_regression_extrapolation_scalar`,
     /// polynomial_regression_extrapolation.rs:542, with
     /// `build_forecast_weights_uncached` (:410). PERIOD-SWEPT via `length`
@@ -2676,17 +2700,15 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
-    /// `compute_dual_ulcer_index_selected_row`, dual_ulcer_index.rs:566. Emits
-    /// the LONG ULCER series, which is what the dispatcher returns for "value"
-    /// (cpu_batch.rs:6700-6706). PERIOD-SWEPT (:6723).
+    /// `compute_dual_ulcer_index_selected_row`, dual_ulcer_index.rs:544. Emits
+    /// the canonical LONG ULCER primary. PERIOD-SWEPT; the typed resident route
+    /// emits the complete long/short/threshold family in one launch.
     F64KernelSpec {
         indicator_id: "dual_ulcer_index",
         kernel: F64Kernel::DualUlcerIndex,
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `HullButterflyOscillatorStream::update`,
     /// hull_butterfly_oscillator.rs:404, driven from
     /// `..._selected_row_from_slice` (:517). Emits the OSCILLATOR series --
@@ -2699,7 +2721,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `compute_into_slices`, range_oscillator.rs:974 (general arm), with
     /// `AtrState::update` (:276) and `compute_weighted_ma` (:537). Emits the
     /// OSCILLATOR series, of which "value" is an alias
@@ -2711,7 +2732,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `compute_run`, market_structure_trailing_stop.rs:486, driven by
     /// `compute_row` (:604). Emits the TRAILING STOP series, of which "value"
     /// is an alias (cpu_batch.rs:7197-7201). PERIOD-SWEPT via `length`
@@ -2728,8 +2748,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Ohlc4,
         first_valid: F64FirstValidRule::Ignored,
     },
-
-
     // -------------------------------------------------- closer 4, round 2
     //
     // Fifteen indicators that had a `.cu` file and, for four of them, a
@@ -2861,8 +2879,8 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // Twenty-five rows. Every kernel behind them was written INTO the .cu file
     // its indicator already ships in, against the CPU reference named in that
     // file's "NEOETHOS f64 LANE  --  closer 3" header, and each emits the
-    // column the CPU batch produces for `output_id == "value"` -- except the
-    // two named below, whose batch has no `value` alias at all.
+    // registered canonical primary column. Output identity comes from the
+    // registry, never from a legacy `value` alias.
     //
     // WHY EVERY ONE OF THEM DECLARES `Ignored`, AND WHY THAT IS A CONTRACT
     // RATHER THAN A SHRUG. `first_valid` is not a tolerance-sized detail: it
@@ -3071,7 +3089,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Ohlc4,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     // ------------------------------------------------------ closer 6, round 3
     //
     // Six indicators that had NO CUDA presence at all before this round: no
@@ -3079,8 +3096,9 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // its own translation unit under `kernels/cuda/moving_averages/`, written
     // against the CPU reference named in the kernel header.
 
-    // (hlcc4, volume). `Hlcc4Volume` because the declared default source is
-    // `hlcc4` (:113) and volume is a second input, not metadata.
+    // (close, volume). `CloseVolume` is the production/search v1 source; the
+    // creator/publisher daily default is close and volume is a second input,
+    // not metadata. The separate direct API remains fixed-gamma-N.
     // `PriceVolumeFinite` because `find_first_valid` (:308-317) scans BOTH with
     // `is_finite`. The kernel takes the `use_volume_sum == true` branch
     // (:382), which is the branch the period-sweeping route selects --
@@ -3089,7 +3107,7 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     F64KernelSpec {
         indicator_id: "elastic_volume_weighted_moving_average",
         kernel: F64Kernel::ElasticVolumeWeightedMovingAverage,
-        input: F64InputKind::Hlcc4Volume,
+        input: F64InputKind::CloseVolume,
         first_valid: F64FirstValidRule::PriceVolumeFinite,
     },
     // Emits the PRIMARY output, the corrected line (registry.rs:537).
@@ -3141,8 +3159,9 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     //
     // Ten rows. Every one names a `*_neo_batch_f64` entry point written into
     // the indicator's OWN .cu file against the CPU reference quoted in that
-    // file's header, and every one emits the column the CPU batch produces for
-    // `output_id == "value"`.
+    // file's header. Each emits its exact documented primary; AlphaTrend's is
+    // canonical registry output `k1`, and its CPU dispatcher accepts only
+    // `k1`/`k2` rather than a retired `value` alias.
     //
     // NINE DECLARE `Ignored` AND ONE DECLARES `HlcCloseOnly`, and the split is
     // read from the CPU rather than chosen. Eight of the nine walk every bar
@@ -3229,7 +3248,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlcv,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     // ------------------------------------------------------ closer 4, round 3
     //
     // Ten rows. Every kernel behind them was written INTO the `.cu` file its
@@ -3243,9 +3261,8 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // contain the token `double` at all. There was no f64 symbol for a row to
     // point at, so the lane could not reach these ten indicators and answered
     // `CudaF64KernelMissing` for every one of them.
-
-    /// `bandpass.rs:303` -- the `bp` column, which is what `value` resolves to
-    /// (cpu_batch.rs:14152). `CloseFinite` because `bandpass_prepare:255`
+    /// `bandpass.rs:303` -- the canonical `bp` column.
+    /// `CloseFinite` because `bandpass_prepare:255`
     /// scans with `is_finite`, not `!is_nan`: an infinite bar is SKIPPED by
     /// the CPU and would be accepted by `AllInputsNonNan`.
     F64KernelSpec {
@@ -3254,7 +3271,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::CloseFinite,
     },
-
     /// `buff_averages.rs:599` -- the FAST buff, the `output` default in
     /// `ma_batch.rs:629`. `Ignored` and derived in the kernel: `buff_averages_
     /// prepare:470` scans PRICE ALONE, and under `AllInputsNonNan` a
@@ -3268,7 +3284,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseVolume,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `cora_wave.rs:246`. `AllInputsNonNan` is exact here: `cora_wave_
     /// prepare:325` is `position(|x| !x.is_nan())` over the single close
     /// series.
@@ -3278,7 +3293,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     /// `dma.rs:296`. `dma_prepare:395` is `!is_nan` over close.
     F64KernelSpec {
         indicator_id: "dma",
@@ -3286,7 +3300,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     /// `fvg_trailing_stop.rs:1035` -- the UPPER band (cpu_batch.rs:14884).
     /// `Ignored` because the batch takes `fvg_trailing_stop_with_kernel`
     /// (:1040), which allocates with `alloc_uninit_f64` and applies NO warmup
@@ -3297,19 +3310,17 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::Ignored,
     },
-
-    /// `halftrend.rs:298` -- the `halftrend` column (cpu_batch.rs:14979).
-    /// `Ignored` and derived in the kernel: `first_valid_ohlc` (:291) takes
-    /// the MIN of three INDEPENDENT scans, which no declared rule expresses --
-    /// `HlcMaxOfIndependentFirsts` is the MAX and names a LATER bar, and the
-    /// index sets both the NaN prefix and the ATR and SMA seed windows.
+    /// `halftrend.rs:298` -- the `halftrend` primary column. The preserved
+    /// generic f64 ABI consumes each requested value as `atr_period`, while
+    /// production uses the resident six-output ABI and its shared exact row.
+    /// `Ignored` and derived in the kernel: `first_valid_ohlc` (:291) takes the
+    /// MIN of three INDEPENDENT scans, which no declared rule expresses.
     F64KernelSpec {
         indicator_id: "halftrend",
         kernel: F64Kernel::Halftrend,
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `mod_god_mode.rs:555` -- the WAVETREND column (cpu_batch.rs:15556).
     /// `Hlcv` because the batch default is `use_volume = true`
     /// (cpu_batch.rs:15521) and the money-flow term reads `volume[i]`.
@@ -3322,7 +3333,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlcv,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `ott.rs:275`. `ott_prepare:349` is `!is_nan` over close, and the VAR
     /// moving average rescans the same series to the same index, so the NaN
     /// prefix is that index.
@@ -3332,7 +3342,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     /// `otto.rs:1599` -- the HOTT column (cpu_batch.rs:15680). `Ignored`
     /// because `otto_with_kernel:1605` allocates with
     /// `alloc_with_nan_prefix(len, 0)` -- there is NO warmup prefix, both
@@ -3344,7 +3353,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `prb.rs:938` -- the `values` column (cpu_batch.rs:15857).
     /// `prb_with_kernel:1385` is `!is_nan` over close.
     F64KernelSpec {
@@ -3353,7 +3361,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::AllInputsNonNan,
     },
-
     // ------------------------------------------------------ closer 2, round 3
     //
     // Ten indicators whose `.cu` file ALREADY held a real double-in/double-out
@@ -3408,7 +3415,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // indicator is named after. The other eight emit what `output_id ==
     // "value"` resolves to: trailing_stop, value, normalized_volume, value,
     // plotline, range_top, value and rsi_ma1.
-
     /// `neighboring_trailing_stop.rs:858` -- the `trailing_stop` column
     /// (cpu_batch.rs:9043, `"trailing_stop" | "value"`).
     F64KernelSpec {
@@ -3417,7 +3423,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `nonlinear_regression_zero_lag_moving_average.rs:729` -- the `value`
     /// column (cpu_batch.rs:7666).
     F64KernelSpec {
@@ -3426,7 +3431,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `normalized_resonator.rs:731` -- the `oscillator` column. Source hl2.
     F64KernelSpec {
         indicator_id: "normalized_resonator",
@@ -3434,7 +3438,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hl2Slice,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `normalized_volume_true_range.rs:791` -- the `normalized_volume` column
     /// (`"normalized_volume" || "value"`). Open is an input.
     F64KernelSpec {
@@ -3443,7 +3446,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Ohlcv5,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `possible_rsi.rs:1359` -- the `value` column. The ONLY row of this batch
     /// that is period-SWEPT: its CPU batch reads a parameter literally named
     /// `period` (default 32) and it is the RSI length.
@@ -3453,7 +3455,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `price_moving_average_ratio_percentile.rs:715` -- the `plotline` column
     /// (`"plotline" || "value"`), which at the CPU default `line_mode = "pmar"`
     /// is `pmar` itself (:707-710). Volume is bound and unread at ma_type
@@ -3465,7 +3466,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseVolume,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `range_breakout_signals.rs:1381` -- the `range_top` column
     /// (`"range_top" || "value"`). Open and volume are inputs.
     F64KernelSpec {
@@ -3474,7 +3474,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Ohlcv5,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `range_filtered_trend_signals.rs:744` -- the `kalman` column. Its CPU
     /// batch REJECTS "value".
     F64KernelSpec {
@@ -3483,7 +3482,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::Hlc,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `regression_slope_oscillator.rs:564` -- the `value` column.
     F64KernelSpec {
         indicator_id: "regression_slope_oscillator",
@@ -3491,7 +3489,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
         input: F64InputKind::CloseSlice,
         first_valid: F64FirstValidRule::Ignored,
     },
-
     /// `relative_strength_index_wave_indicator.rs:708` -- the `rsi_ma1` column
     /// (`"rsi_ma1" || "value"`). The third pointer is the SOURCE, default close.
     F64KernelSpec {
@@ -3508,12 +3505,12 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     // parameter list rather than the lane ABI. Each file now carries a
     // `*_neo_batch_f64` entry point beside what it had, written against the
     // CPU reference named in that file's `NEOETHOS f64 LANE  --  closer 1,
-    // round 3` header. All ten are PERIOD-INVARIANT, so `first_valid` is
-    // `Ignored` and every swept period gives the same column.
-    // Emits `basis`. The CPU batch (cpu_batch.rs:8850-8946) accepts eighteen
-    // output ids and has NO `value` alias, so a parity run must name the column;
-    // `basis` is aliased `middle` there and is the series every band is offset
-    // from. `Ohlc4` because `valid_bar` reads all four and the source is hlc3.
+    // round 3` header. `first_valid` is ignored because each row resets at
+    // every invalid bar; period handling remains indicator-specific.
+    // Emits canonical `middle`. The primary ABI consumes every requested
+    // length through the same exact f64 row authority as the full eighteen-
+    // output ABI. `Ohlc4` because validity reads all four while the canonical
+    // source is HLC3.
     F64KernelSpec {
         indicator_id: "fibonacci_entry_bands",
         kernel: F64Kernel::FibonacciEntryBands,
@@ -3595,7 +3592,6 @@ pub const F64_KERNELS: &[F64KernelSpec] = &[
     },
 ];
 
-
 /// Kernels that are WRITTEN, COMPILED and deliberately NOT REGISTERED.
 ///
 /// # Why a written kernel would be withheld
@@ -3656,7 +3652,296 @@ pub fn f64_kernel_for(indicator_id: &str) -> Option<&'static F64KernelSpec> {
     F64_KERNELS
         .iter()
         .find(|spec| spec.indicator_id == indicator_id)
+}
 
+/// Whether an exact named output has a resident f64 CUDA route.
+///
+/// Primary outputs are derived from the authoritative indicator registry.
+/// Additional outputs enter this match only after their real multi-output
+/// kernel has been connected to the shared CUDA session and proven to leave
+/// the result on the selected device. This is deliberately not inferred from
+/// a successful primary launch: one primary kernel cannot stand in for a
+/// different named feature column.
+pub fn has_f64_resident_output_route(indicator_id: &str, output_id: &str) -> bool {
+    if f64_kernel_for(indicator_id).and_then(F64KernelSpec::primary_output_id) == Some(output_id) {
+        return true;
+    }
+
+    matches!(
+        (indicator_id, output_id),
+        ("absolute_strength_index_oscillator", "signal" | "histogram")
+            | (
+                "adaptive_bounds_rsi",
+                "lower"
+                    | "lower_mid"
+                    | "middle"
+                    | "upper_mid"
+                    | "upper"
+                    | "regime"
+                    | "regime_flip"
+                    | "lower_signal"
+                    | "upper_signal"
+            )
+            | (
+                "adjustable_ma_alternating_extremities",
+                "upper"
+                    | "lower"
+                    | "extremity"
+                    | "state"
+                    | "changed"
+                    | "smoothed_open"
+                    | "smoothed_high"
+                    | "smoothed_low"
+                    | "smoothed_close"
+            )
+            | (
+                "bulls_v_bears",
+                "bull"
+                    | "bear"
+                    | "ma"
+                    | "upper"
+                    | "lower"
+                    | "bullish_signal"
+                    | "bearish_signal"
+                    | "zero_cross_up"
+                    | "zero_cross_down"
+            )
+            | (
+                "range_oscillator",
+                "ma" | "upper_band"
+                    | "lower_band"
+                    | "range_width"
+                    | "in_range"
+                    | "trend"
+                    | "break_up"
+                    | "break_down"
+            )
+            | (
+                "pivot",
+                "r4" | "r3" | "r2" | "r1" | "s1" | "s2" | "s3" | "s4"
+            )
+            | ("acosc", "change")
+            | ("autocorrelation_indicator", "correlation")
+            | ("bandpass", "bp_normalized" | "signal" | "trigger")
+            | ("bollinger_bands", "middle" | "lower")
+            | ("buff_averages", "slow")
+            | (
+                "candle_strength_oscillator",
+                "highs" | "lows" | "mid" | "long_signal" | "short_signal"
+            )
+            | ("chandelier_exit", "short_stop")
+            | ("cksp", "short_values")
+            | ("correlation_cycle", "imag" | "angle" | "state")
+            | ("cycle_channel_oscillator", "slow")
+            | ("daily_factor", "ema" | "signal")
+            | ("damiani_volatmeter", "anti")
+            | ("di", "minus")
+            | ("dm", "minus")
+            | ("donchian", "middle")
+            | ("donchian", "lower")
+            | ("dual_ulcer_index", "short_ulcer")
+            | ("dual_ulcer_index", "threshold")
+            | ("dvdiqqe", "fast_tl" | "slow_tl" | "center_line")
+            | ("didi_index", "long" | "crossover" | "crossunder")
+            | (
+                "directional_imbalance_index",
+                "down" | "bulls" | "bears" | "upper" | "lower"
+            )
+            | (
+                "cyberpunk_value_trend_analyzer",
+                "value_trend_lag"
+                    | "deviation_index"
+                    | "overbought_signal"
+                    | "buy_signal"
+                    | "sell_signal"
+            )
+            | ("aroon", "down")
+            | ("aso", "bears")
+            | ("alligator", "teeth" | "lips")
+            | ("alphatrend", "k2")
+            | ("andean_oscillator", "bear" | "signal")
+            | ("adaptive_macd", "signal" | "hist")
+            | ("adaptive_momentum_oscillator", "ama")
+            | ("adaptive_schaff_trend_cycle", "histogram")
+            | ("ehlers_adaptive_cg", "trigger")
+            | ("ehlers_adaptive_cyber_cycle", "trigger")
+            | ("ehlers_autocorrelation_periodogram", "normalized_power")
+            | (
+                "ehlers_linear_extrapolation_predictor",
+                "filter" | "state" | "go_long" | "go_short"
+            )
+            | ("ehlers_undersampled_double_moving_average", "slow")
+            | ("ema_deviation_corrected_t3", "t3")
+            | ("emd", "middleband" | "lowerband")
+            | ("emd_trend", "direction" | "upper" | "lower")
+            | ("eri", "bear")
+            | ("evasive_supertrend", "state" | "noisy" | "changed")
+            | ("fisher", "signal")
+            | (
+                "forward_backward_exponential_oscillator",
+                "backward" | "histogram"
+            )
+            | ("fvg_trailing_stop", "lower" | "upper_ts" | "lower_ts")
+            | ("gatorosc", "lower" | "upper_change" | "lower_change")
+            | (
+                "halftrend",
+                "trend" | "atr_high" | "atr_low" | "buy_signal" | "sell_signal"
+            )
+            | (
+                "fibonacci_trailing_stop",
+                "long_stop" | "short_stop" | "direction"
+            )
+            | (
+                "ehlers_data_sampling_relative_strength_indicator",
+                "original_rsi" | "signal"
+            )
+            | ("ehlers_pma", "trigger")
+            | ("ehlers_simple_cycle_indicator", "trigger")
+            | ("adaptive_bandpass_trigger_oscillator", "lead")
+            | (
+                "trend_flow_trail",
+                "alpha_trail_bullish"
+                    | "alpha_trail_bearish"
+                    | "alpha_dir"
+                    | "mfi"
+                    | "tp_upper"
+                    | "tp_lower"
+                    | "alpha_trail_bullish_switch"
+                    | "alpha_trail_bearish_switch"
+                    | "mfi_overbought"
+                    | "mfi_oversold"
+                    | "mfi_cross_up_mid"
+                    | "mfi_cross_down_mid"
+                    | "price_cross_alpha_trail_up"
+                    | "price_cross_alpha_trail_down"
+                    | "mfi_above_90"
+                    | "mfi_below_10"
+            )
+            | (
+                "market_structure_confluence",
+                "upper_band"
+                    | "lower_band"
+                    | "structure_direction"
+                    | "bullish_arrow"
+                    | "bearish_arrow"
+                    | "bullish_change"
+                    | "bearish_change"
+                    | "hh"
+                    | "lh"
+                    | "hl"
+                    | "ll"
+                    | "bullish_bos"
+                    | "bullish_choch"
+                    | "bearish_bos"
+                    | "bearish_choch"
+            )
+            | (
+                "hema_trend_levels",
+                "slow_hema"
+                    | "trend_direction"
+                    | "bar_state"
+                    | "bullish_crossover"
+                    | "bearish_crossunder"
+                    | "box_offset"
+                    | "bull_box_top"
+                    | "bull_box_bottom"
+                    | "bear_box_top"
+                    | "bear_box_bottom"
+                    | "bullish_test"
+                    | "bearish_test"
+                    | "bullish_test_level"
+                    | "bearish_test_level"
+            )
+            | (
+                "ichimoku_oscillator",
+                "ma" | "conversion"
+                    | "base"
+                    | "chikou"
+                    | "current_kumo_a"
+                    | "current_kumo_b"
+                    | "future_kumo_a"
+                    | "future_kumo_b"
+                    | "max_level"
+                    | "high_level"
+                    | "low_level"
+                    | "min_level"
+            )
+            | (
+                "range_filtered_trend_signals",
+                "supertrend"
+                    | "upper_band"
+                    | "lower_band"
+                    | "trend"
+                    | "kalman_trend"
+                    | "state"
+                    | "market_trending"
+                    | "market_ranging"
+                    | "short_term_bullish"
+                    | "short_term_bearish"
+                    | "long_term_bullish"
+                    | "long_term_bearish"
+            )
+            | (
+                "ict_propulsion_block",
+                "bullish_low"
+                    | "bullish_kind"
+                    | "bullish_active"
+                    | "bullish_mitigated"
+                    | "bullish_new"
+                    | "bearish_high"
+                    | "bearish_low"
+                    | "bearish_kind"
+                    | "bearish_active"
+                    | "bearish_mitigated"
+                    | "bearish_new"
+            )
+            | (
+                "vdubus_divergence_wave_pattern_generator",
+                "fast_climax"
+                    | "fast_rounded"
+                    | "fast_predator"
+                    | "slow_standard"
+                    | "slow_climax"
+                    | "slow_rounded"
+                    | "slow_predator"
+                    | "opposing_force"
+                    | "macd"
+                    | "signal"
+                    | "hist"
+            )
+            | (
+                "kase_peak_oscillator_with_divergences",
+                "max_peak_value"
+                    | "min_peak_value"
+                    | "market_extreme"
+                    | "regular_bullish"
+                    | "hidden_bullish"
+                    | "regular_bearish"
+                    | "hidden_bearish"
+                    | "go_long"
+                    | "go_short"
+            )
+            | (
+                "fibonacci_entry_bands",
+                "trend"
+                    | "upper_0618"
+                    | "upper_1000"
+                    | "upper_1618"
+                    | "upper_2618"
+                    | "lower_0618"
+                    | "lower_1000"
+                    | "lower_1618"
+                    | "lower_2618"
+                    | "tp_long_band"
+                    | "tp_short_band"
+                    | "go_long"
+                    | "go_short"
+                    | "rejection_long"
+                    | "rejection_short"
+                    | "long_bounce"
+                    | "short_bounce"
+            )
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3804,9 +4089,7 @@ pub fn resolve_f64_kernel(
 }
 
 /// The `__global__` entry point an f64 request for `indicator_id` will launch.
-pub fn resolve_f64_entry_point(
-    indicator_id: &str,
-) -> Result<&'static str, IndicatorDispatchError> {
+pub fn resolve_f64_entry_point(indicator_id: &str) -> Result<&'static str, IndicatorDispatchError> {
     Ok(resolve_f64_kernel(indicator_id)?.kernel.entry_point())
 }
 
@@ -3819,10 +4102,7 @@ fn inputs_for(
     data: IndicatorCudaDeviceDataRefF64,
 ) -> Result<F64Inputs, IndicatorDispatchError> {
     let mismatch = |wanted: &str| IndicatorDispatchError::DataLengthMismatch {
-        details: format!(
-            "{}: the f64 device lane needs {wanted}",
-            spec.indicator_id
-        ),
+        details: format!("{}: the f64 device lane needs {wanted}", spec.indicator_id),
     };
 
     match (spec.input, data) {
@@ -4013,8 +4293,8 @@ fn inputs_for(
 ///
 /// `engine` is held by the caller so a whole frame pays ONE module load rather
 /// than one per indicator — this crate has no module cache, and the f32 lane's
-/// dispatcher constructs a fresh wrapper (and therefore a fresh JIT) on every
-/// call.
+/// dispatcher constructs a fresh wrapper (and therefore reloads its exact
+/// native module) on every call.
 pub fn compute_cuda_device_f64(
     engine: &CudaF64Indicators,
     req: IndicatorCudaDeviceRequestF64<'_>,
@@ -4046,6 +4326,13 @@ pub fn compute_cuda_device_f64(
 
     let rows = result.rows;
     let entry_point = spec.kernel.entry_point();
+    let output_id =
+        spec.primary_output_id()
+            .ok_or_else(|| IndicatorDispatchError::ComputeFailed {
+                indicator: req.indicator_id.to_string(),
+                details: "registered f64 kernel has no primary registry output identity"
+                    .to_string(),
+            })?;
 
     let series = match req.target {
         CudaOutputTargetF64::Host => {
@@ -4075,6 +4362,7 @@ pub fn compute_cuda_device_f64(
 
     Ok(IndicatorCudaOutputF64 {
         indicator_id: req.indicator_id.to_string(),
+        output_id,
         series,
         rows,
         cols,
@@ -4265,18 +4553,32 @@ mod tests {
         const DECLARED: &[(&str, F64FirstValidRule)] = &[
             // adosc.rs:331 -- `first = 0` outright, cumulative from bar zero
             ("adosc", F64FirstValidRule::Ignored),
+            // rsmk.rs:318-334 -- first-valid is scanned over a derived log
+            // ratio, where either NaN input or an exactly-zero compare value
+            // makes the derived cell NaN. No shared input rule represents
+            // that zero-divisor condition.
+            ("rsmk", F64FirstValidRule::Ignored),
             // ------------------------------------------- closer 4, round 2
             // kase_peak_oscillator_with_divergences.rs -- the stream resets on any bar
             // whose high, low or close is non-finite OR non-positive; no variant
             // expresses `finite AND > 0` on three series
-            ("kase_peak_oscillator_with_divergences", F64FirstValidRule::Ignored),
+            (
+                "kase_peak_oscillator_with_divergences",
+                F64FirstValidRule::Ignored,
+            ),
             // keltner_channel_width_oscillator.rs:400 is_valid_bar -- finite
             // h/l/c/source AND `high >= low`, an ORDERING condition no variant
             // expresses
-            ("keltner_channel_width_oscillator", F64FirstValidRule::Ignored),
+            (
+                "keltner_channel_width_oscillator",
+                F64FirstValidRule::Ignored,
+            ),
             // leavitt_convolution_acceleration.rs:776 -- `first` bounds the leading
             // NaN fill only; the stream resets on any non-finite bar
-            ("leavitt_convolution_acceleration", F64FirstValidRule::Ignored),
+            (
+                "leavitt_convolution_acceleration",
+                F64FirstValidRule::Ignored,
+            ),
             // market_meanness_index.rs:456 -- the stream walks from 0 and resets; the
             // CPU's dirty path leaves post-prefix misses uninitialised
             ("market_meanness_index", F64FirstValidRule::Ignored),
@@ -4329,11 +4631,20 @@ mod tests {
             ("vwap_zscore_with_signals", F64FirstValidRule::Ignored),
             // ------------------------------------------- closer 1
             // absolute_strength_index_oscillator.rs:521
-            ("absolute_strength_index_oscillator", F64FirstValidRule::Ignored),
+            (
+                "absolute_strength_index_oscillator",
+                F64FirstValidRule::Ignored,
+            ),
             // accumulation_swing_index.rs:245
-            ("accumulation_swing_index", F64FirstValidRule::Ohlc4AllFinite),
+            (
+                "accumulation_swing_index",
+                F64FirstValidRule::Ohlc4AllFinite,
+            ),
             // adaptive_bandpass_trigger_oscillator.rs:490
-            ("adaptive_bandpass_trigger_oscillator", F64FirstValidRule::Ignored),
+            (
+                "adaptive_bandpass_trigger_oscillator",
+                F64FirstValidRule::Ignored,
+            ),
             // adaptive_bounds_rsi.rs:670
             ("adaptive_bounds_rsi", F64FirstValidRule::Ignored),
             // adaptive_macd.rs:789
@@ -4353,7 +4664,10 @@ mod tests {
             // daily_factor.rs:258
             ("daily_factor", F64FirstValidRule::Ohlc4AllFinite),
             // decisionpoint_breadth_swenlin_trading_oscillator.rs:329
-            ("decisionpoint_breadth_swenlin_trading_oscillator", F64FirstValidRule::Ignored),
+            (
+                "decisionpoint_breadth_swenlin_trading_oscillator",
+                F64FirstValidRule::Ignored,
+            ),
             // didi_index.rs:480
             ("didi_index", F64FirstValidRule::Ignored),
             // disparity_index.rs:564
@@ -4408,7 +4722,10 @@ mod tests {
             // l2_ehlers_signal_to_noise.rs:263 -- `first_valid_triple` needs
             // source/high/low all `is_finite`, and the source is hl2, i.e.
             // exactly "high and low both finite".
-            ("l2_ehlers_signal_to_noise", F64FirstValidRule::HighLowFinite),
+            (
+                "l2_ehlers_signal_to_noise",
+                F64FirstValidRule::HighLowFinite,
+            ),
             // kairi_relative_index.rs:732 -- `compute_default_sma50_into` fills
             // the output with NaN and walks from index 0, so there is no
             // first-valid index to declare and no warmup prefix to imply.
@@ -4424,11 +4741,17 @@ mod tests {
             // start before a RETURN exists, and a return needs two consecutive
             // finite, strictly positive closes. `AllInputsNonNan` would name a
             // bar at least one earlier and would accept a zero previous close.
-            ("ewma_volatility", F64FirstValidRule::ConsecutiveValidReturnPair),
+            (
+                "ewma_volatility",
+                F64FirstValidRule::ConsecutiveValidReturnPair,
+            ),
             // gopalakrishnan_range_index.rs:337 `valid_high_low_bar` -- both
             // series `is_finite`, which rejects an infinite high that the
             // `!is_nan` scan would accept.
-            ("gopalakrishnan_range_index", F64FirstValidRule::HighLowFinite),
+            (
+                "gopalakrishnan_range_index",
+                F64FirstValidRule::HighLowFinite,
+            ),
             // garman_klass_volatility.rs:346 `validity_summary` -- all FOUR
             // prices finite AND strictly positive, because `gk_term` (:315)
             // takes ln(high/low) and ln(close/open). No rule here expresses
@@ -4471,6 +4794,12 @@ mod tests {
             //   same answer with one run, so there is no single first-valid
             //   index that describes the output.
             ("market_structure_trailing_stop", F64FirstValidRule::Ignored),
+            // epma.rs:263 -- bounded-faithful f64 v1 starts at the first
+            // finite close; infinity is not an admissible seed.
+            ("epma", F64FirstValidRule::CloseFinite),
+            // fwma.rs:463 -- bounded-faithful f64 v2 also starts at the first
+            // finite close; a leading infinity is not an admissible seed.
+            ("fwma", F64FirstValidRule::CloseFinite),
             // ------------------------------------------- closer 4, round 3
             // bandpass.rs:255 -- `position(|x| x.is_finite())`, not `!is_nan`.
             //   An INFINITE bar is skipped by the CPU and would be accepted by
@@ -4499,6 +4828,10 @@ mod tests {
             //   warmup prefix at all and both passes walk from bar 0, so a
             //   first-valid index would name a bar the CPU never skips.
             ("otto", F64FirstValidRule::Ignored),
+            // cci_cycle.rs Classic semantic-v9 -- startup is an explicit zero
+            // series and every non-finite close resets all recurrence state.
+            // The strict kernel therefore derives admission per bar.
+            ("cci_cycle", F64FirstValidRule::Ignored),
             // ------------------------------------------------------- closer 7
             //
             // Seven rows that declared `AllInputsNonNan` while their CPU
@@ -4542,12 +4875,150 @@ mod tests {
             ("ehlers_simple_cycle_indicator", F64FirstValidRule::Ignored),
             // ehlers_smoothed_adaptive_momentum_kernel.cu:271
             //   `(void)first_valid;`
-            ("ehlers_smoothed_adaptive_momentum", F64FirstValidRule::Ignored),
+            (
+                "ehlers_smoothed_adaptive_momentum",
+                F64FirstValidRule::Ignored,
+            ),
             // forward_backward_exponential_oscillator_kernel.cu:238
             //   `(void)first_valid;`
             (
                 "forward_backward_exponential_oscillator",
                 F64FirstValidRule::Ignored,
+            ),
+            // Every row below has its CPU source/line and the reason for the
+            // non-common rule beside its authoritative F64_KERNELS entry.
+            // Keep this second id+rule list deliberately mechanical: it makes
+            // a newly-added departure fail until both the primary registry
+            // audit and this independent drift guard are updated.
+            ("fisher", F64FirstValidRule::HighLowMidpointFinite),
+            ("vertical_horizontal_filter", F64FirstValidRule::CloseFinite),
+            ("wave_smoother", F64FirstValidRule::CloseFinite),
+            ("trend_trigger_factor", F64FirstValidRule::HighLowFinite),
+            ("alphatrend", F64FirstValidRule::HlcCloseOnly),
+            ("aso", F64FirstValidRule::HlcCloseOnly),
+            ("chandelier_exit", F64FirstValidRule::HlcCloseOnly),
+            ("ultosc", F64FirstValidRule::HlcConsecutivePairNonNan),
+            ("adaptive_schaff_trend_cycle", F64FirstValidRule::Ignored),
+            (
+                "adjustable_ma_alternating_extremities",
+                F64FirstValidRule::Ignored,
+            ),
+            ("autocorrelation_indicator", F64FirstValidRule::Ignored),
+            ("avsl", F64FirstValidRule::Ignored),
+            ("bulls_v_bears", F64FirstValidRule::Ignored),
+            ("candle_strength_oscillator", F64FirstValidRule::Ignored),
+            ("corrected_moving_average", F64FirstValidRule::Ignored),
+            ("cyberpunk_value_trend_analyzer", F64FirstValidRule::Ignored),
+            ("cycle_channel_oscillator", F64FirstValidRule::Ignored),
+            ("demand_index", F64FirstValidRule::Ignored),
+            ("directional_imbalance_index", F64FirstValidRule::Ignored),
+            ("dynamic_momentum_index", F64FirstValidRule::Ignored),
+            ("ehlers_adaptive_cg", F64FirstValidRule::Ignored),
+            ("ehlers_adaptive_cyber_cycle", F64FirstValidRule::Ignored),
+            (
+                "ehlers_autocorrelation_periodogram",
+                F64FirstValidRule::Ignored,
+            ),
+            (
+                "ehlers_data_sampling_relative_strength_indicator",
+                F64FirstValidRule::Ignored,
+            ),
+            (
+                "ehlers_linear_extrapolation_predictor",
+                F64FirstValidRule::Ignored,
+            ),
+            ("ema_deviation_corrected_t3", F64FirstValidRule::Ignored),
+            ("exponential_trend", F64FirstValidRule::Ignored),
+            ("fibonacci_entry_bands", F64FirstValidRule::Ignored),
+            ("fibonacci_trailing_stop", F64FirstValidRule::Ignored),
+            ("fvg_positioning_average", F64FirstValidRule::Ignored),
+            ("geometric_bias_oscillator", F64FirstValidRule::Ignored),
+            ("goertzel_cycle_composite_wave", F64FirstValidRule::Ignored),
+            (
+                "grover_llorens_cycle_oscillator",
+                F64FirstValidRule::Ignored,
+            ),
+            ("half_causal_estimator", F64FirstValidRule::Ignored),
+            ("hema_trend_levels", F64FirstValidRule::Ignored),
+            (
+                "historical_volatility_percentile",
+                F64FirstValidRule::Ignored,
+            ),
+            ("historical_volatility_rank", F64FirstValidRule::Ignored),
+            ("ichimoku_oscillator", F64FirstValidRule::Ignored),
+            ("ict_propulsion_block", F64FirstValidRule::Ignored),
+            ("insync_index", F64FirstValidRule::Ignored),
+            ("intraday_momentum_index", F64FirstValidRule::Ignored),
+            ("linear_regression_intensity", F64FirstValidRule::Ignored),
+            ("logarithmic_moving_average", F64FirstValidRule::Ignored),
+            ("macd_wave_signal_pro", F64FirstValidRule::Ignored),
+            ("macz", F64FirstValidRule::Ignored),
+            ("mama", F64FirstValidRule::Ignored),
+            ("mesa_stochastic_multi_length", F64FirstValidRule::Ignored),
+            (
+                "moving_average_cross_probability",
+                F64FirstValidRule::Ignored,
+            ),
+            (
+                "multi_length_stochastic_average",
+                F64FirstValidRule::Ignored,
+            ),
+            ("n_order_ema", F64FirstValidRule::Ignored),
+            ("neighboring_trailing_stop", F64FirstValidRule::Ignored),
+            (
+                "nonlinear_regression_zero_lag_moving_average",
+                F64FirstValidRule::Ignored,
+            ),
+            ("normalized_resonator", F64FirstValidRule::Ignored),
+            ("normalized_volume_true_range", F64FirstValidRule::Ignored),
+            ("possible_rsi", F64FirstValidRule::Ignored),
+            (
+                "price_moving_average_ratio_percentile",
+                F64FirstValidRule::Ignored,
+            ),
+            ("range_breakout_signals", F64FirstValidRule::Ignored),
+            ("range_filtered_trend_signals", F64FirstValidRule::Ignored),
+            ("regression_slope_oscillator", F64FirstValidRule::Ignored),
+            (
+                "relative_strength_index_wave_indicator",
+                F64FirstValidRule::Ignored,
+            ),
+            ("reversal_signals", F64FirstValidRule::Ignored),
+            ("rolling_z_score_trend", F64FirstValidRule::Ignored),
+            ("trend_continuation_factor", F64FirstValidRule::Ignored),
+            ("trend_direction_force_index", F64FirstValidRule::Ignored),
+            ("trend_follower", F64FirstValidRule::Ignored),
+            (
+                "vdubus_divergence_wave_pattern_generator",
+                F64FirstValidRule::Ignored,
+            ),
+            (
+                "velocity_acceleration_convergence_divergence_indicator",
+                F64FirstValidRule::Ignored,
+            ),
+            (
+                "velocity_acceleration_indicator",
+                F64FirstValidRule::Ignored,
+            ),
+            ("volatility_ratio_adaptive_rsx", F64FirstValidRule::Ignored),
+            ("volume_energy_reservoirs", F64FirstValidRule::Ignored),
+            (
+                "volume_weighted_relative_strength_index",
+                F64FirstValidRule::Ignored,
+            ),
+            ("volume_weighted_rsi", F64FirstValidRule::Ignored),
+            ("volume_weighted_stochastic_rsi", F64FirstValidRule::Ignored),
+            ("wad", F64FirstValidRule::Ignored),
+            ("zig_zag_channels", F64FirstValidRule::Ignored),
+            ("yang_zhang_volatility", F64FirstValidRule::Ohlc4AllNonNan),
+            ("qstick", F64FirstValidRule::OpenCloseNonNan),
+            (
+                "elastic_volume_weighted_moving_average",
+                F64FirstValidRule::PriceVolumeFinite,
+            ),
+            (
+                "volume_zone_oscillator",
+                F64FirstValidRule::VolumeFiniteOnly,
             ),
         ];
 
@@ -4575,5 +5046,70 @@ mod tests {
                 spec.indicator_id
             );
         }
+    }
+
+    #[test]
+    fn evwma_rolling_f64_v1_declares_close_volume_and_finite_pair_admission() {
+        let spec = f64_kernel_for("elastic_volume_weighted_moving_average")
+            .expect("rolling EVWMA f64 kernel must remain registered");
+        assert_eq!(spec.input, F64InputKind::CloseVolume);
+        assert_eq!(spec.first_valid, F64FirstValidRule::PriceVolumeFinite);
+    }
+
+    #[test]
+    fn fwma_v2_declares_finite_close_admission_for_leading_infinity() {
+        let close = [f64::INFINITY, 1.0, 2.0, 3.0];
+        let cpu_first = close
+            .iter()
+            .position(|value| value.is_finite())
+            .expect("fixture has a finite tail");
+        let common_non_nan_first = close
+            .iter()
+            .position(|value| !value.is_nan())
+            .expect("fixture has a non-NaN value");
+        assert_eq!(cpu_first, 1);
+        assert_eq!(common_non_nan_first, 0);
+
+        let spec = f64_kernel_for("fwma").expect("strict FWMA f64 route remains registered");
+        assert_eq!(spec.input, F64InputKind::CloseSlice);
+        assert_eq!(spec.first_valid, F64FirstValidRule::CloseFinite);
+
+        let available = close.len() - cpu_first;
+        assert!(available < close.len(), "p=len must be rejected");
+        assert!(
+            available >= close.len() - 1,
+            "p<=len-1 must remain admissible"
+        );
+    }
+
+    #[test]
+    fn fisher_v2_declares_finite_midpoint_admission() {
+        let high = [f64::INFINITY, f64::MAX, 1.0];
+        let low = [0.0, f64::MAX, 1.0];
+        let common_non_nan_first = high
+            .iter()
+            .zip(&low)
+            .position(|(high, low)| !high.is_nan() && !low.is_nan())
+            .unwrap();
+        let finite_pair_first = high
+            .iter()
+            .zip(&low)
+            .position(|(high, low)| high.is_finite() && low.is_finite())
+            .unwrap();
+        let finite_midpoint_first = high
+            .iter()
+            .zip(&low)
+            .position(|(high, low)| ((*high + *low) / 2.0).is_finite())
+            .unwrap();
+        assert_eq!(common_non_nan_first, 0, "leading infinity is non-NaN");
+        assert_eq!(finite_pair_first, 1, "MAX inputs are individually finite");
+        assert_eq!(
+            finite_midpoint_first, 2,
+            "MAX + MAX overflows before the Fisher midpoint scaling"
+        );
+
+        let spec = f64_kernel_for("fisher").expect("strict Fisher f64 route remains registered");
+        assert_eq!(spec.input, F64InputKind::HighLow);
+        assert_eq!(spec.first_valid, F64FirstValidRule::HighLowMidpointFinite);
     }
 }

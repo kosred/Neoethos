@@ -1,22 +1,12 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
@@ -1316,308 +1306,16 @@ unsafe fn vi_prefix_avx512(
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ViJsResult {
-    pub plus: Vec<f64>,
-    pub minus: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_js(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Result<JsValue, JsValue> {
-    let mut plus = vec![0.0; high.len()];
-    let mut minus = vec![0.0; high.len()];
-
-    vi_into_slice_wasm(
-        &mut plus,
-        &mut minus,
-        high,
-        low,
-        close,
-        period,
-        detect_best_kernel(),
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let result = ViJsResult { plus, minus };
-
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let mut result = vec![0.0; high.len() * 2];
-
-    let (plus_slice, minus_slice) = result.split_at_mut(high.len());
-
-    vi_into_slice_wasm(
-        plus_slice,
-        minus_slice,
-        high,
-        low,
-        close,
-        period,
-        detect_best_kernel(),
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(result)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len * 2);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len * 2);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    plus_ptr: *mut f64,
-    minus_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || plus_ptr.is_null()
-        || minus_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let plus_out = std::slice::from_raw_parts_mut(plus_ptr, len);
-        let minus_out = std::slice::from_raw_parts_mut(minus_ptr, len);
-
-        vi_into_slice_wasm(
-            plus_out,
-            minus_out,
-            high,
-            low,
-            close,
-            period,
-            detect_best_kernel(),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ViBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ViBatchJsOutput {
-    pub plus: Vec<f64>,
-    pub minus: Vec<f64>,
-    pub periods: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = vi_batch)]
-pub fn vi_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: ViBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = ViBatchRange {
-        period: config.period_range,
-    };
-    let output = vi_batch_with_kernel(high, low, close, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let periods: Vec<usize> = output
-        .combos
-        .iter()
-        .map(|p| p.period.unwrap_or(14))
-        .collect();
-
-    let js_output = ViBatchJsOutput {
-        plus: output.plus,
-        minus: output.minus,
-        periods,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    plus_ptr: *mut f64,
-    minus_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || plus_ptr.is_null()
-        || minus_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = ViBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in vi_into"))?;
-
-        let plus_out = std::slice::from_raw_parts_mut(plus_ptr, total);
-        let minus_out = std::slice::from_raw_parts_mut(minus_ptr, total);
-
-        let _ = vi_batch_inner_into(
-            high,
-            low,
-            close,
-            &sweep,
-            Kernel::Auto,
-            false,
-            plus_out,
-            minus_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-pub fn vi_into_slice_wasm(
-    dst_plus: &mut [f64],
-    dst_minus: &mut [f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    kern: Kernel,
-) -> Result<(), ViError> {
-    let params = ViParams {
-        period: Some(period),
-    };
-    let input = ViInput::from_slices(high, low, close, params);
-    vi_into_slice(dst_plus, dst_minus, &input, kern)
-}
-
-#[cfg(feature = "python")]
-pub fn register_vi_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(vi_py, m)?)?;
-    m.add_function(wrap_pyfunction!(vi_batch_py, m)?)?;
-    m.add_class::<ViStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = vi_unified_js(high, low, close, period)?;
-    crate::write_wasm_f64_output("vi_unified_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vi_js(high, low, close, period)?;
-    crate::write_wasm_object_f64_outputs("vi_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vi_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vi_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("vi_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_vi_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = ViParams { period: None };
         let input = ViInput::from_candles(&candles, default_params);
         let output = vi_with_kernel(&input, kernel)?;
@@ -1627,8 +1325,8 @@ mod tests {
     }
     fn check_vi_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = ViInput::from_candles(&candles, ViParams::default());
         let result = vi_with_kernel(&input, kernel)?;
         let expected_last_five_plus = [
@@ -1674,8 +1372,8 @@ mod tests {
     }
     fn check_vi_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = ViInput::with_default_candles(&candles);
         let output = vi_with_kernel(&input, kernel)?;
         assert_eq!(output.plus.len(), candles.close.len());
@@ -1726,8 +1424,8 @@ mod tests {
     }
     fn check_vi_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = ViInput::from_candles(&candles, ViParams::default());
         let res = vi_with_kernel(&input, kernel)?;
         assert_eq!(res.plus.len(), candles.close.len());
@@ -1748,8 +1446,8 @@ mod tests {
     fn check_vi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             ViParams::default(),
@@ -1778,41 +1476,41 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in plus array \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in plus array \
 						 with params: period={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(14),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in plus array \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in plus array \
 						 with params: period={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(14),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in plus array \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in plus array \
 						 with params: period={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(14),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
             }
 
@@ -1825,41 +1523,41 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in minus array \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in minus array \
 						 with params: period={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(14),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in minus array \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in minus array \
 						 with params: period={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(14),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in minus array \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in minus array \
 						 with params: period={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(14),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
             }
         }
@@ -2167,8 +1865,8 @@ mod tests {
     generate_all_vi_tests!(check_vi_property);
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = ViBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
         let def = ViParams::default();
         let row = output.plus_for(&def).expect("default row missing");
@@ -2180,8 +1878,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2342,319 +2040,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vi")]
-#[pyo3(signature = (high, low, close, period, kernel=None))]
-pub fn vi_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    if h.len() != l.len() || h.len() != c.len() {
-        return Err(PyValueError::new_err(format!(
-            "Input data length mismatch: high={}, low={}, close={}",
-            h.len(),
-            l.len(),
-            c.len()
-        )));
-    }
-
-    let params = ViParams {
-        period: Some(period),
-    };
-    let input = ViInput::from_slices(h, l, c, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    let (plus, minus) = py
-        .allow_threads(|| {
-            let mut plus = vec![0.0; h.len()];
-            let mut minus = vec![0.0; h.len()];
-            vi_into_slice(&mut plus, &mut minus, &input, kern).map(|_| (plus, minus))
-        })
-        .map_err(|e: ViError| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("plus", plus.into_pyarray(py))?;
-    d.set_item("minus", minus.into_pyarray(py))?;
-    Ok(d)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vi_batch")]
-#[pyo3(signature = (high, low, close, period_range, kernel=None))]
-pub fn vi_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArray2;
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let sweep = ViBatchRange {
-        period: period_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = h.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in vi_batch_py"))?;
-
-    let out_plus = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_minus = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_plus = unsafe { out_plus.as_slice_mut()? };
-    let slice_minus = unsafe { out_minus.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        let simd = match kern {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            Kernel::Auto => match detect_best_batch_kernel() {
-                Kernel::Avx512Batch => Kernel::Avx2Batch,
-                other => other,
-            }
-            .to_scalar_equivalent(),
-            _ => Kernel::Scalar,
-        };
-
-        vi_batch_inner_into(h, l, c, &sweep, simd, true, slice_plus, slice_minus)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("plus", out_plus.reshape((rows, cols))?)?;
-    d.set_item("minus", out_minus.reshape((rows, cols))?)?;
-    d.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ViStream")]
-pub struct ViStreamPy {
-    stream: ViStream,
-    prev_high: Option<f64>,
-    prev_low: Option<f64>,
-    prev_close: Option<f64>,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ViStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let s = ViStream::try_new(ViParams {
-            period: Some(period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self {
-            stream: s,
-            prev_high: None,
-            prev_low: None,
-            prev_close: None,
-        })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        match (self.prev_high, self.prev_low, self.prev_close) {
-            (Some(ph), Some(pl), Some(pc)) => {
-                let result = self.stream.update(high, low, close, pl, ph, pc);
-                self.prev_high = Some(high);
-                self.prev_low = Some(low);
-                self.prev_close = Some(close);
-                result
-            }
-            _ => {
-                self.prev_high = Some(high);
-                self.prev_low = Some(low);
-                self.prev_close = Some(close);
-                None
-            }
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-trait BatchToScalar {
-    fn to_scalar_equivalent(self) -> Kernel;
-}
-#[cfg(feature = "python")]
-impl BatchToScalar for Kernel {
-    fn to_scalar_equivalent(self) -> Kernel {
-        match self {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            Kernel::Auto => Kernel::Scalar,
-            k => k,
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::vi_wrapper::CudaVi;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::DeviceArrayF32Py;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vi_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, period_range, device_id=0))]
-pub fn vi_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    if h.len() != l.len() || h.len() != c.len() {
-        return Err(PyValueError::new_err("Input data length mismatch"));
-    }
-    let sweep = ViBatchRange {
-        period: period_range,
-    };
-    let ((pair, combos), ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.vi_batch_dev(h, l, c, &sweep)
-            .map(|res| (res, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "plus",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: pair.a,
-                _ctx: Some(ctx.clone()),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "minus",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: pair.b,
-                _ctx: Some(ctx),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", h.len())?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, period, device_id=0))]
-pub fn vi_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    close_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = high_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array for high"));
-    }
-    if low_tm_f32.shape() != shape || close_tm_f32.shape() != shape {
-        return Err(PyValueError::new_err(
-            "input arrays must share the same shape",
-        ));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let params = ViParams {
-        period: Some(period),
-    };
-    let (pair, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.vi_many_series_one_param_time_major_dev(h, l, c, cols, rows, &params)
-            .map(|res| (res, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "plus",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: pair.a,
-                _ctx: Some(ctx.clone()),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "minus",
-        Py::new(
-            py,
-            DeviceArrayF32Py {
-                inner: pair.b,
-                _ctx: Some(ctx),
-                device_id: Some(dev_id),
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("period", period)?;
-    Ok(dict)
 }

@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -8,21 +8,6 @@ use crate::utilities::helpers::{
 use core::arch::x86_64::*;
 use std::error::Error;
 use thiserror::Error;
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum VptData<'a> {
@@ -42,10 +27,6 @@ pub struct VptOutput {
 }
 
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VptParams;
 
 #[derive(Debug, Clone)]
@@ -717,7 +698,6 @@ pub fn vpt_expand_grid() -> Vec<VptParams> {
     vec![VptParams::default()]
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn vpt_into(input: &VptInput, out: &mut [f64]) -> Result<(), VptError> {
     let (price, volume) = match &input.data {
         VptData::Candles { candles, source } => {
@@ -1236,469 +1216,23 @@ pub unsafe fn vpt_row_avx512_long(price: &[f64], volume: &[f64], out: &mut [f64]
     vpt_row_scalar(price, volume, out)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "vpt")]
-#[pyo3(signature = (price, volume, kernel=None))]
-pub fn vpt_py<'py>(
-    py: Python<'py>,
-    price: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let price_slice: &[f64];
-    let volume_slice: &[f64];
-    let owned_price;
-    let owned_volume;
-    price_slice = if let Ok(s) = price.as_slice() {
-        s
-    } else {
-        owned_price = price.to_owned_array();
-        owned_price.as_slice().unwrap()
-    };
-    volume_slice = if let Ok(s) = volume.as_slice() {
-        s
-    } else {
-        owned_volume = volume.to_owned_array();
-        owned_volume.as_slice().unwrap()
-    };
-    let kern = validate_kernel(kernel, false)?;
-
-    let input = VptInput::from_slices(price_slice, volume_slice);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| vpt_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VptStream")]
-pub struct VptStreamPy {
-    stream: VptStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VptStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        Ok(VptStreamPy {
-            stream: VptStream::default(),
-        })
-    }
-
-    fn update(&mut self, price: f64, volume: f64) -> Option<f64> {
-        self.stream.update(price, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vpt_batch")]
-#[pyo3(signature = (price, volume, kernel=None))]
-pub fn vpt_batch_py<'py>(
-    py: Python<'py>,
-    price: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let price_slice: &[f64];
-    let volume_slice: &[f64];
-    let owned_price;
-    let owned_volume;
-    price_slice = if let Ok(s) = price.as_slice() {
-        s
-    } else {
-        owned_price = price.to_owned_array();
-        owned_price.as_slice().unwrap()
-    };
-    volume_slice = if let Ok(s) = volume.as_slice() {
-        s
-    } else {
-        owned_volume = volume.to_owned_array();
-        owned_volume.as_slice().unwrap()
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    if price_slice.is_empty() || volume_slice.is_empty() || price_slice.len() != volume_slice.len()
-    {
-        return Err(PyValueError::new_err(VptError::EmptyInputData.to_string()));
-    }
-
-    let rows: usize = 1;
-    let cols = price_slice.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("vpt_batch: size overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let _combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let combos = vpt_batch_inner_into(
-                price_slice,
-                volume_slice,
-                &VptBatchRange,
-                kernel,
-                true,
-                slice_out,
-            )?;
-            let first_valid =
-                vpt_first_valid(price_slice, volume_slice).ok_or(VptError::NotEnoughValidData {
-                    needed: 2,
-                    valid: 0,
-                })?;
-            for v in &mut slice_out[..=first_valid] {
-                *v = f64::NAN;
-            }
-            Ok::<_, VptError>(combos)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    dict.set_item("params", Vec::<f64>::new().into_pyarray(py))?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaVpt;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vpt_cuda_batch_dev")]
-#[pyo3(signature = (price, volume, device_id=0))]
-pub fn vpt_cuda_batch_dev_py(
-    py: Python<'_>,
-    price: PyReadonlyArray1<'_, f32>,
-    volume: PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<VptDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let price_slice = price.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    if price_slice.len() != volume_slice.len() {
-        return Err(PyValueError::new_err("length mismatch"));
-    }
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVpt::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .vpt_batch_dev(price_slice, volume_slice)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(VptDeviceArrayF32Py {
-        buf: Some(inner.buf),
-        rows: inner.rows,
-        cols: inner.cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vpt_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (price_tm, volume_tm, cols, rows, device_id=0))]
-pub fn vpt_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    price_tm: PyReadonlyArray1<'_, f32>,
-    volume_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    device_id: usize,
-) -> PyResult<VptDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let price_slice = price_tm.as_slice()?;
-    let volume_slice = volume_tm.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVpt::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .vpt_many_series_one_param_time_major_dev(price_slice, volume_slice, cols, rows)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(VptDeviceArrayF32Py {
-        buf: Some(inner.buf),
-        rows: inner.rows,
-        cols: inner.cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpt_js(price: &[f64], volume: &[f64]) -> Result<Vec<f64>, JsValue> {
-    let mut output = vec![0.0; price.len()];
-
-    vpt_into_slice(&mut output, price, volume, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpt_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpt_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpt_into(
-    price_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if price_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let price = std::slice::from_raw_parts(price_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        if price_ptr == out_ptr || volume_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            vpt_into_slice(&mut temp, price, volume, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            vpt_into_slice(out, price, volume, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VptBatchConfig {}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VptBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<VptParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = vpt_batch)]
-pub fn vpt_batch_js(price: &[f64], volume: &[f64], _config: JsValue) -> Result<JsValue, JsValue> {
-    let output = vpt_batch_with_kernel(price, volume, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = VptBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpt_batch_into(
-    price_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if price_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let price = std::slice::from_raw_parts(price_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        if price_ptr == out_ptr || volume_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            vpt_into_slice(&mut temp, price, volume, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            vpt_into_slice(out, price, volume, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(1)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "VptDeviceArrayF32", unsendable)]
-pub struct VptDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl VptDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpt_output_into_js(
-    price: &[f64],
-    volume: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = vpt_js(price, volume)?;
-    crate::write_wasm_f64_output("vpt_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vpt_batch_output_into_js(
-    price: &[f64],
-    volume: &[f64],
-    _config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vpt_batch_js(price, volume, _config)?;
-    crate::write_wasm_selected_object_f64_outputs("vpt_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     #[test]
     fn test_vpt_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VptInput::from_candles(&candles, "close");
 
         let baseline = vpt_with_kernel(&input, Kernel::Scalar)?;
 
         let mut out = vec![0.0f64; candles.close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         vpt_into(&input, &mut out)?;
 
         assert_eq!(baseline.values.len(), out.len());
@@ -1722,8 +1256,8 @@ mod tests {
 
     fn check_vpt_basic_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VptInput::from_candles(&candles, "close");
         let output = vpt_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -1772,8 +1306,8 @@ mod tests {
 
     fn check_vpt_accuracy_from_csv(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VptInput::from_candles(&candles, "close");
         let output = vpt_with_kernel(&input, kernel)?;
 
@@ -1828,8 +1362,8 @@ mod tests {
     fn check_vpt_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_sources = vec!["close", "open", "high", "low"];
 
@@ -2013,8 +1547,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_sources = vec!["close", "open", "high", "low"];
 

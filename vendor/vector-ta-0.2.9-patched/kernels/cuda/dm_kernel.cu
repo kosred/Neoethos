@@ -271,66 +271,77 @@ void dm_many_series_one_param_time_major_f32(
 __device__ __forceinline__ double qnan_f64() {
     return __longlong_as_double(0x7ff8000000000000ULL);
 }
-__device__ __forceinline__ void fill_nan_prefix_f64(double* ptr, int len) {
-    const double nanv = qnan_f64();
-    for (int i = 0; i < len; ++i) ptr[i] = nanv;
-}
-__device__ __forceinline__ void dm_step_f64(double ch, double cl, double& prev_h, double& prev_l,
-                                        double& plus_val, double& minus_val)
+
+// One operation-for-operation f64 authority serves the row-major pair ABI,
+// the time-major public ABI, and the preserved plus-only primary ABI. The
+// input/output strides are elements, not bytes. `minus_out == nullptr` is the
+// primary route and does not change the plus arithmetic.
+__device__ __forceinline__ void dm_row_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int input_stride,
+    int len,
+    int period,
+    int first_valid,
+    double* __restrict__ plus_out,
+    double* __restrict__ minus_out,
+    int output_stride)
 {
-    const double dp = ch - prev_h;
-    const double dm = prev_l - cl;
-    prev_h = ch;
-    prev_l = cl;
+    const double nan = qnan_f64();
+    for (int i = 0; i < len; ++i) {
+        plus_out[i * output_stride] = nan;
+        if (minus_out != nullptr) minus_out[i * output_stride] = nan;
+    }
+    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len) return;
+    if (len - first_valid < period) return;
 
-    // S5 CORRECTION -- the f32 original clamped first and compared the CLAMPED
-    // values (`ap = max(dp,0); am = max(dm,0); take_p = ap > am`). That is a
-    // DIFFERENT predicate from the CPU's at the exact tie `dp == dm > 0`:
-    // `dm.rs:261-265` and `dm.rs:286` require BOTH `diff > 0.0` AND
-    // `diff_p > diff_m` (strictly), so a tie credits NEITHER side and both
-    // outputs are 0.0. The clamped form falls through to `take_p == false` and
-    // credits minus_dm the whole tied amount.
-    //
-    // The tie is not exotic on tick-quantised FX: it is every bar whose high
-    // rose by exactly as many points as its low fell.
-    //
-    // NaN is preserved by construction, and it matches the CPU: a comparison
-    // against NaN is false on both sides, so both predicates fail and both
-    // outputs are 0.0 -- which is what `dm.rs:286-290`'s if/else-if chain does.
-    const bool take_p = (dp > 0.0) && (dp > dm);
-    const bool take_m = (dm > 0.0) && (dm > dp);
-    plus_val  = take_p ? dp : 0.0;
-    minus_val = take_m ? dm : 0.0;
+    const int end_init = first_valid + period - 1;
+    double sum_plus = 0.0;
+    double sum_minus = 0.0;
+    double prev_high = ro_load(high + first_valid * input_stride);
+    double prev_low = ro_load(low + first_valid * input_stride);
+
+    for (int i = first_valid + 1; i <= end_init; ++i) {
+        const double hi = ro_load(high + i * input_stride);
+        const double lo = ro_load(low + i * input_stride);
+        const double diff_p = hi - prev_high;
+        const double diff_m = prev_low - lo;
+        prev_high = hi;
+        prev_low = lo;
+        if (diff_p > 0.0 && diff_p > diff_m) {
+            sum_plus += diff_p;
+        } else if (diff_m > 0.0 && diff_m > diff_p) {
+            sum_minus += diff_m;
+        }
+    }
+
+    plus_out[end_init * output_stride] = sum_plus;
+    if (minus_out != nullptr) minus_out[end_init * output_stride] = sum_minus;
+    if (end_init + 1 >= len) return;
+
+    const double inv_p = 1.0 / (double)period;
+    for (int i = end_init + 1; i < len; ++i) {
+        const double hi = ro_load(high + i * input_stride);
+        const double lo = ro_load(low + i * input_stride);
+        const double diff_p = hi - prev_high;
+        const double diff_m = prev_low - lo;
+        prev_high = hi;
+        prev_low = lo;
+
+        double plus_value = 0.0;
+        double minus_value = 0.0;
+        if (diff_p > 0.0 && diff_p > diff_m) {
+            plus_value = diff_p;
+        } else if (diff_m > 0.0 && diff_m > diff_p) {
+            minus_value = diff_m;
+        }
+        // Keep the shipped scalar CPU branch's three-rounding Wilder update.
+        sum_plus = sum_plus - (sum_plus * inv_p) + plus_value;
+        sum_minus = sum_minus - (sum_minus * inv_p) + minus_value;
+        plus_out[i * output_stride] = sum_plus;
+        if (minus_out != nullptr) minus_out[i * output_stride] = sum_minus;
+    }
 }
-struct CompSum_f64 {
-    double s;
-    double c;
-    __device__ __forceinline__ void init_f64() { s = 0.0; c = 0.0; }
-    __device__ __forceinline__ void add_f64(double x) {
-
-        double y = x - c;
-        double t = s + y;
-        c = (t - s) - y;
-        s = t;
-    }
-    __device__ __forceinline__ double value_f64() const { return s + c; }
-};
-struct CompEMA_f64 {
-    double s;
-    double c;
-    __device__ __forceinline__ void init_f64(double s0) { s = s0; c = 0.0; }
-    __device__ __forceinline__ void update_f64(double one_minus_rp, double x) {
-
-        double prod = s * one_minus_rp;
-        double perr = __fma_rn(s, one_minus_rp, -prod);
-
-        double y = (x + perr) - c;
-        double t = prod + y;
-        c = (t - prod) - y;
-        s = t;
-    }
-    __device__ __forceinline__ double value_f64() const { return s + c; }
-};
 extern "C" __global__
 void dm_batch_f64(const double* __restrict__ high,
                   const double* __restrict__ low,
@@ -343,75 +354,16 @@ void dm_batch_f64(const double* __restrict__ high,
 {
     const int combo = blockIdx.x * blockDim.x + threadIdx.x;
     if (combo >= n_combos) return;
-
-    double* plus_row  = plus_out  + combo * series_len;
-    double* minus_row = minus_out + combo * series_len;
-
-    const int p = periods[combo];
-    if (p <= 0) {
-
-        fill_nan_prefix_f64(plus_row, series_len);
-        fill_nan_prefix_f64(minus_row, series_len);
-        return;
-    }
-    if (first_valid < 0 || first_valid + p - 1 >= series_len) {
-        fill_nan_prefix_f64(plus_row, series_len);
-        fill_nan_prefix_f64(minus_row, series_len);
-        return;
-    }
-
-    const int i0 = first_valid;
-    const int warm_end = i0 + p - 1;
-
-
-    if (warm_end > 0) {
-        fill_nan_prefix_f64(plus_row,  warm_end);
-        fill_nan_prefix_f64(minus_row, warm_end);
-    }
-
-
-    double prev_h = ro_load(high + i0);
-    double prev_l = ro_load(low  + i0);
-
-
-    CompSum_f64 wplus, wminus; wplus.init_f64(); wminus.init_f64();
-    for (int i = i0 + 1; i <= warm_end; ++i) {
-        const double ch = ro_load(high + i);
-        const double cl = ro_load(low  + i);
-        double pv, mv;
-        dm_step_f64(ch, cl, prev_h, prev_l, pv, mv);
-        if (pv != 0.0) wplus.add_f64(pv);
-        if (mv != 0.0) wminus.add_f64(mv);
-    }
-
-
-    plus_row [warm_end] = wplus.value_f64();
-    minus_row[warm_end] = wminus.value_f64();
-
-
-    if (warm_end + 1 >= series_len) return;
-
-    const double rp = 1.0 / (double)p;
-    const double one_minus_rp = 1.0 - rp;
-
-
-    CompEMA_f64 splus, sminus;
-    splus.init_f64(plus_row [warm_end]);
-    sminus.init_f64(minus_row[warm_end]);
-
-    for (int i = warm_end + 1; i < series_len; ++i) {
-        const double ch = ro_load(high + i);
-        const double cl = ro_load(low  + i);
-
-        double pv, mv;
-        dm_step_f64(ch, cl, prev_h, prev_l, pv, mv);
-
-        splus.update_f64(one_minus_rp, pv);
-        sminus.update_f64(one_minus_rp, mv);
-
-        plus_row [i] = splus.value_f64();
-        minus_row[i] = sminus.value_f64();
-    }
+    dm_row_f64(
+        high,
+        low,
+        1,
+        series_len,
+        periods[combo],
+        first_valid,
+        plus_out + combo * series_len,
+        minus_out + combo * series_len,
+        1);
 }
 extern "C" __global__
 void dm_many_series_one_param_time_major_f64(
@@ -426,81 +378,27 @@ void dm_many_series_one_param_time_major_f64(
 {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= cols) return;
-
-    const int fv = first_valids[s];
-    if (period <= 0 || fv < 0 || fv + period - 1 >= rows) {
-
-        for (int t = 0; t < rows; ++t) {
-            const int idx = t * cols + s;
-            plus_tm [idx] = qnan_f64();
-            minus_tm[idx] = qnan_f64();
-        }
-        return;
-    }
-
-
-    auto at = [&](int t) { return t * cols + s; };
-
-    const int i0 = fv;
-    const int warm_end = i0 + period - 1;
-
-
-    for (int t = 0; t < warm_end; ++t) {
-        const int idx = at(t);
-        plus_tm [idx] = qnan_f64();
-        minus_tm[idx] = qnan_f64();
-    }
-
-    double prev_h = ro_load(high_tm + at(i0));
-    double prev_l = ro_load(low_tm  + at(i0));
-
-
-    CompSum_f64 wplus, wminus; wplus.init_f64(); wminus.init_f64();
-    for (int t = i0 + 1; t <= warm_end; ++t) {
-        const double ch = ro_load(high_tm + at(t));
-        const double cl = ro_load(low_tm  + at(t));
-        double pv, mv;
-        dm_step_f64(ch, cl, prev_h, prev_l, pv, mv);
-        if (pv != 0.0) wplus.add_f64(pv);
-        if (mv != 0.0) wminus.add_f64(mv);
-    }
-
-    plus_tm [at(warm_end)] = wplus.value_f64();
-    minus_tm[at(warm_end)] = wminus.value_f64();
-
-    if (warm_end + 1 >= rows) return;
-
-    const double rp = 1.0 / (double)period;
-    const double one_minus_rp = 1.0 - rp;
-
-    CompEMA_f64 splus, sminus;
-    splus.init_f64(plus_tm [at(warm_end)]);
-    sminus.init_f64(minus_tm[at(warm_end)]);
-
-    for (int t = warm_end + 1; t < rows; ++t) {
-        const double ch = ro_load(high_tm + at(t));
-        const double cl = ro_load(low_tm  + at(t));
-        double pv, mv;
-        dm_step_f64(ch, cl, prev_h, prev_l, pv, mv);
-
-        splus.update_f64(one_minus_rp, pv);
-        sminus.update_f64(one_minus_rp, mv);
-
-        plus_tm [at(t)] = splus.value_f64();
-        minus_tm[at(t)] = sminus.value_f64();
-    }
+    dm_row_f64(
+        high_tm + s,
+        low_tm + s,
+        cols,
+        rows,
+        period,
+        first_valids[s],
+        plus_tm + s,
+        minus_tm + s,
+        cols);
 }
 
 
 /* ===========================================================================
  * NEOETHOS f64 LANE - dm (directional movement)
  * ---------------------------------------------------------------------------
- * CPU oracle: src/indicators/dm.rs:313
- *             `dm_compute_selected_scalar::<true>` (the PLUS instantiation),
- *             prepared by `dm_prepare` (:165).
+ * CPU oracle: src/indicators/dm.rs `dm_compute_into_scalar` for the canonical
+ *             plus/minus pair and `dm_compute_selected_scalar::<true>` for the
+ *             preserved PLUS primary, both prepared by `dm_prepare`.
  *
- * COLUMN: `plus`. cpu_batch.rs:6057 maps output_id "value" onto the `+DM`
- * series and "minus" onto `-DM`. Never the minus series silently.
+ * COLUMNS: canonical `plus` then `minus`; no unversioned `value` alias.
  *
  * PERIOD-SWEPT: `compute_dm_batch` reads `period` (default 14).
  *
@@ -543,10 +441,6 @@ void dm_many_series_one_param_time_major_f64(
  * SEQUENTIAL, one thread per combo column: a Wilder recurrence.
  * =========================================================================== */
 
-#ifndef NEO_F64_NAN
-#define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
-#endif
-
 extern "C" __global__
 void dm_neo_batch_f64(const double* __restrict__ high,
                       const double* __restrict__ low,
@@ -558,47 +452,14 @@ void dm_neo_batch_f64(const double* __restrict__ high,
 {
     const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (combo >= n_combos) return;
-
-    const int len = series_len;
-    double* __restrict__ o = out + (size_t)combo * (size_t)len;
-    const int period = periods[combo];
-
-    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
-    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len) return;
-    if (len - first_valid < period) return;      /* dm.rs:200 NotEnoughValidData */
-
-    const int end_init = first_valid + period - 1;
-
-    double sum = 0.0;
-    double prev_high = high[first_valid];
-    double prev_low  = low[first_valid];
-
-    for (int i = first_valid + 1; i <= end_init; ++i) {
-        const double hi = high[i];
-        const double lo = low[i];
-        const double diff_p = hi - prev_high;
-        const double diff_m = prev_low - lo;
-        prev_high = hi;
-        prev_low  = lo;
-        if (diff_p > 0.0 && diff_p > diff_m) sum += diff_p;
-    }
-
-    o[end_init] = sum;
-    if (end_init + 1 >= len) return;
-
-    const double inv_p = 1.0 / (double)period;
-
-    for (int j = end_init + 1; j < len; ++j) {
-        const double hi = high[j];
-        const double lo = low[j];
-        const double diff_p = hi - prev_high;
-        const double diff_m = prev_low - lo;
-        prev_high = hi;
-        prev_low  = lo;
-
-        const double val = (diff_p > 0.0 && diff_p > diff_m) ? diff_p : 0.0;
-        /* THREE roundings, left-associated - the non-fma cfg branch (:387). */
-        sum = sum - (sum * inv_p) + val;
-        o[j] = sum;
-    }
+    dm_row_f64(
+        high,
+        low,
+        1,
+        series_len,
+        periods[combo],
+        first_valid,
+        out + (size_t)combo * (size_t)series_len,
+        nullptr,
+        1);
 }

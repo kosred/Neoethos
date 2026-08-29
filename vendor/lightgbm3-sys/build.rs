@@ -1,9 +1,11 @@
 use cmake::Config;
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
+
+#[path = "../cuda_build_arch.rs"]
+mod cuda_build_arch;
 
 #[derive(Debug)]
 struct DoxygenCallback;
@@ -19,11 +21,23 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let lgbm_root = Path::new(&out_dir).join("lightgbm");
 
-    // copy source code
-    if !lgbm_root.exists() {
-        copy_dir_recursive(Path::new("lightgbm"), &lgbm_root)
-            .unwrap_or_else(|err| panic!("Failed to copy ./lightgbm to {}: {err}", lgbm_root.display()));
+    // Rebuild the private source snapshot on every build-script rerun. Keeping
+    // an existing OUT_DIR copy makes Cargo observe a changed vendored source
+    // while CMake silently compiles the stale bytes from the previous run.
+    if lgbm_root.exists() {
+        fs::remove_dir_all(&lgbm_root).unwrap_or_else(|err| {
+            panic!(
+                "Failed to remove stale LightGBM source snapshot {}: {err}",
+                lgbm_root.display()
+            )
+        });
     }
+    copy_dir_recursive(Path::new("lightgbm"), &lgbm_root).unwrap_or_else(|err| {
+        panic!(
+            "Failed to copy ./lightgbm to {}: {err}",
+            lgbm_root.display()
+        )
+    });
 
     // CMake
     let mut cfg = Config::new(&lgbm_root);
@@ -55,7 +69,14 @@ fn main() {
         );
     }
     if cuda_enabled {
-        cfg.define("USE_CUDA", "1");
+        let architectures = cuda_build_arch::resolve_exact_cuda_architectures()
+            .unwrap_or_else(|error| panic!("lightgbm3-sys: {error}"));
+        cfg.define("USE_CUDA", "1")
+            .define("CMAKE_CUDA_ARCHITECTURES", &architectures.native_only)
+            .define(
+                "NEOETHOS_EXACT_CUDA_ARCHITECTURES",
+                &architectures.native_only,
+            );
     }
     let dst = cfg.build();
 

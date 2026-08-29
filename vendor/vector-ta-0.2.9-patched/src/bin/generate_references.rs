@@ -1,170 +1,172 @@
 extern crate vector_ta;
 
-use vector_ta::indicators::acosc::{acosc, AcoscData, AcoscInput, AcoscParams};
-use vector_ta::indicators::ad::{ad, AdData, AdInput, AdParams};
+use vector_ta::indicators::acosc::{AcoscData, AcoscInput, AcoscParams, acosc};
+use vector_ta::indicators::ad::{AdData, AdInput, AdParams, ad};
 use vector_ta::indicators::adaptive_bounds_rsi::{
-    adaptive_bounds_rsi, AdaptiveBoundsRsiInput, AdaptiveBoundsRsiParams,
+    AdaptiveBoundsRsiInput, AdaptiveBoundsRsiParams, adaptive_bounds_rsi,
 };
 use vector_ta::indicators::adjustable_ma_alternating_extremities::{
-    adjustable_ma_alternating_extremities, AdjustableMaAlternatingExtremitiesInput,
-    AdjustableMaAlternatingExtremitiesParams,
+    AdjustableMaAlternatingExtremitiesInput, AdjustableMaAlternatingExtremitiesParams,
+    adjustable_ma_alternating_extremities,
 };
-use vector_ta::indicators::adosc::{adosc, AdoscData, AdoscInput, AdoscParams};
-use vector_ta::indicators::adx::{adx, AdxData, AdxInput, AdxParams};
-use vector_ta::indicators::adxr::{adxr, AdxrData, AdxrInput, AdxrParams};
-use vector_ta::indicators::alligator::{alligator, AlligatorInput, AlligatorParams};
-use vector_ta::indicators::ao::{ao, AoData, AoInput, AoParams};
-use vector_ta::indicators::apo::{apo, ApoInput, ApoParams};
-use vector_ta::indicators::aroon::{aroon, AroonData, AroonInput, AroonParams};
-use vector_ta::indicators::aroonosc::{aroon_osc, AroonOscData, AroonOscInput, AroonOscParams};
-use vector_ta::indicators::atr::{atr, AtrData, AtrInput, AtrParams};
-use vector_ta::indicators::bandpass::{bandpass, BandPassInput, BandPassParams};
+use vector_ta::indicators::adosc::{AdoscData, AdoscInput, AdoscParams, adosc};
+use vector_ta::indicators::adx::{AdxData, AdxInput, AdxParams, adx};
+use vector_ta::indicators::adxr::{AdxrData, AdxrInput, AdxrParams, adxr};
+use vector_ta::indicators::alligator::{AlligatorInput, AlligatorParams, alligator};
+use vector_ta::indicators::ao::{AoData, AoInput, AoParams, ao};
+use vector_ta::indicators::apo::{ApoInput, ApoParams, apo};
+use vector_ta::indicators::aroon::{AroonData, AroonInput, AroonParams, aroon};
+use vector_ta::indicators::aroonosc::{AroonOscData, AroonOscInput, AroonOscParams, aroon_osc};
+use vector_ta::indicators::atr::{AtrData, AtrInput, AtrParams, atr};
+use vector_ta::indicators::bandpass::{BandPassInput, BandPassParams, bandpass};
 use vector_ta::indicators::bollinger_bands::{
-    bollinger_bands, BollingerBandsInput, BollingerBandsParams,
+    BollingerBandsInput, BollingerBandsParams, bollinger_bands,
 };
 use vector_ta::indicators::bollinger_bands_width::{
-    bollinger_bands_width, BollingerBandsWidthInput, BollingerBandsWidthParams,
+    BollingerBandsWidthInput, BollingerBandsWidthParams, bollinger_bands_width,
 };
-use vector_ta::indicators::bop::{bop, BopInput, BopParams};
-use vector_ta::indicators::cci::{cci, CciInput, CciParams};
-use vector_ta::indicators::cfo::{cfo, CfoInput, CfoParams};
-use vector_ta::indicators::cg::{cg, CgInput, CgParams};
-use vector_ta::indicators::chande::{chande, ChandeData, ChandeInput, ChandeParams};
-use vector_ta::indicators::chop::{chop, ChopData, ChopInput, ChopParams};
-use vector_ta::indicators::cmo::{cmo, CmoInput, CmoParams};
-use vector_ta::indicators::correl_hl::{correl_hl, CorrelHlData, CorrelHlInput, CorrelHlParams};
-use vector_ta::indicators::cvi::{cvi, CviInput, CviParams};
+use vector_ta::indicators::bop::{BopInput, BopParams, bop};
+use vector_ta::indicators::cci::{CciInput, CciParams, cci};
+use vector_ta::indicators::cfo::{CfoInput, CfoParams, cfo};
+use vector_ta::indicators::cg::{CgInput, CgParams, cg};
+use vector_ta::indicators::chande::{ChandeData, ChandeInput, ChandeParams, chande};
+use vector_ta::indicators::chop::{ChopData, ChopInput, ChopParams, chop};
+use vector_ta::indicators::cmo::{CmoInput, CmoParams, cmo};
+use vector_ta::indicators::correl_hl::{CorrelHlData, CorrelHlInput, CorrelHlParams, correl_hl};
+use vector_ta::indicators::cvi::{CviInput, CviParams, cvi};
 
 use serde_json::json;
 use std::env;
 use vector_ta::indicators::damiani_volatmeter::{
-    damiani_volatmeter, DamianiVolatmeterInput, DamianiVolatmeterParams,
+    DamianiVolatmeterInput, DamianiVolatmeterParams, damiani_volatmeter,
 };
-use vector_ta::indicators::decycler::{decycler, DecyclerInput, DecyclerParams};
-use vector_ta::indicators::deviation::{deviation, DeviationInput, DeviationParams};
-use vector_ta::indicators::devstop::{devstop, DevStopData, DevStopInput, DevStopParams};
-use vector_ta::indicators::di::{di, DiData, DiInput, DiParams};
-use vector_ta::indicators::dpo::{dpo, DpoInput, DpoParams};
-use vector_ta::indicators::emv::{emv, EmvInput};
-use vector_ta::indicators::er::{er, ErInput, ErParams};
-use vector_ta::indicators::eri::{eri, EriData, EriInput, EriParams};
-use vector_ta::indicators::fisher::{fisher, FisherInput, FisherParams};
+use vector_ta::indicators::decycler::{DecyclerInput, DecyclerParams, decycler};
+use vector_ta::indicators::deviation::{DeviationInput, DeviationParams, deviation};
+use vector_ta::indicators::devstop::{DevStopData, DevStopInput, DevStopParams, devstop};
+use vector_ta::indicators::di::{DiData, DiInput, DiParams, di};
+use vector_ta::indicators::dpo::{DpoInput, DpoParams, dpo};
+use vector_ta::indicators::emv::{EmvInput, emv};
+use vector_ta::indicators::er::{ErInput, ErParams, er};
+use vector_ta::indicators::eri::{EriData, EriInput, EriParams, eri};
+use vector_ta::indicators::fisher::{FisherInput, FisherParams, fisher};
 use vector_ta::indicators::forward_backward_exponential_oscillator::{
-    forward_backward_exponential_oscillator, ForwardBackwardExponentialOscillatorInput,
-    ForwardBackwardExponentialOscillatorParams,
+    ForwardBackwardExponentialOscillatorInput, ForwardBackwardExponentialOscillatorParams,
+    forward_backward_exponential_oscillator,
 };
-use vector_ta::indicators::kst::{kst, KstInput, KstParams};
-use vector_ta::indicators::kurtosis::{kurtosis, KurtosisInput, KurtosisParams};
+use vector_ta::indicators::kst::{KstInput, KstParams, kst};
+use vector_ta::indicators::kurtosis::{KurtosisInput, KurtosisParams, kurtosis};
 use vector_ta::indicators::linearreg_intercept::{
-    linearreg_intercept, LinearRegInterceptInput, LinearRegInterceptParams,
+    LinearRegInterceptInput, LinearRegInterceptParams, linearreg_intercept,
 };
-use vector_ta::indicators::macz::{macz, MaczInput, MaczParams};
+use vector_ta::indicators::macz::{MaczInput, MaczParams, macz};
 use vector_ta::indicators::market_structure_confluence::{
-    market_structure_confluence, MarketStructureConfluenceInput, MarketStructureConfluenceParams,
+    MarketStructureConfluenceInput, MarketStructureConfluenceParams, market_structure_confluence,
 };
-use vector_ta::indicators::marketefi::{marketefi, MarketefiData, MarketefiInput, MarketefiParams};
-use vector_ta::indicators::mass::{mass, MassInput, MassParams};
-use vector_ta::indicators::mfi::{mfi, MfiData, MfiInput, MfiParams};
-use vector_ta::indicators::midpoint::{midpoint, MidpointInput, MidpointParams};
-use vector_ta::indicators::midprice::{midprice, MidpriceInput, MidpriceParams};
-use vector_ta::indicators::moving_averages::alma::{alma, AlmaInput, AlmaParams};
-use vector_ta::indicators::moving_averages::cwma::{cwma, CwmaInput, CwmaParams};
-use vector_ta::indicators::moving_averages::dema::{dema, DemaInput, DemaParams};
-use vector_ta::indicators::moving_averages::edcf::{edcf, EdcfInput, EdcfParams};
+use vector_ta::indicators::marketefi::{MarketefiData, MarketefiInput, MarketefiParams, marketefi};
+use vector_ta::indicators::mass::{MassInput, MassParams, mass};
+use vector_ta::indicators::mfi::{MfiData, MfiInput, MfiParams, mfi};
+use vector_ta::indicators::midpoint::{MidpointInput, MidpointParams, midpoint};
+use vector_ta::indicators::midprice::{MidpriceInput, MidpriceParams, midprice};
+use vector_ta::indicators::moving_averages::alma::{AlmaInput, AlmaParams, alma};
+use vector_ta::indicators::moving_averages::cwma::{CwmaInput, CwmaParams, cwma};
+use vector_ta::indicators::moving_averages::dema::{DemaInput, DemaParams, dema};
+use vector_ta::indicators::moving_averages::edcf::{EdcfInput, EdcfParams, edcf};
 use vector_ta::indicators::moving_averages::ehlers_ecema::{
-    ehlers_ecema, EhlersEcemaInput, EhlersEcemaParams,
+    EhlersEcemaInput, EhlersEcemaParams, ehlers_ecema,
 };
 use vector_ta::indicators::moving_averages::ehlers_itrend::{
-    ehlers_itrend, EhlersITrendInput, EhlersITrendParams,
+    EhlersITrendInput, EhlersITrendParams, ehlers_itrend,
 };
-use vector_ta::indicators::moving_averages::ema::{ema, EmaInput, EmaParams};
-use vector_ta::indicators::moving_averages::epma::{epma, EpmaInput, EpmaParams};
-use vector_ta::indicators::moving_averages::frama::{frama, FramaInput, FramaParams};
-use vector_ta::indicators::moving_averages::fwma::{fwma, FwmaInput, FwmaParams};
-use vector_ta::indicators::moving_averages::gaussian::{gaussian, GaussianInput, GaussianParams};
-use vector_ta::indicators::moving_averages::highpass::{highpass, HighPassInput, HighPassParams};
+use vector_ta::indicators::moving_averages::ema::{EmaInput, EmaParams, ema};
+use vector_ta::indicators::moving_averages::epma::{EpmaInput, EpmaParams, epma};
+use vector_ta::indicators::moving_averages::frama::{FramaInput, FramaParams, frama};
+use vector_ta::indicators::moving_averages::fwma::{FwmaInput, FwmaParams, fwma};
+use vector_ta::indicators::moving_averages::gaussian::{GaussianInput, GaussianParams, gaussian};
+use vector_ta::indicators::moving_averages::highpass::{HighPassInput, HighPassParams, highpass};
 use vector_ta::indicators::moving_averages::highpass_2_pole::{
-    highpass_2_pole, HighPass2Input, HighPass2Params,
+    HighPass2Input, HighPass2Params, highpass_2_pole,
 };
-use vector_ta::indicators::moving_averages::hma::{hma, HmaInput, HmaParams};
-use vector_ta::indicators::moving_averages::hwma::{hwma, HwmaInput, HwmaParams};
-use vector_ta::indicators::moving_averages::jma::{jma, JmaInput, JmaParams};
-use vector_ta::indicators::moving_averages::jsa::{jsa, JsaInput, JsaParams};
-use vector_ta::indicators::moving_averages::kama::{kama, KamaInput, KamaParams};
-use vector_ta::indicators::moving_averages::linreg::{linreg, LinRegInput, LinRegParams};
-use vector_ta::indicators::moving_averages::maaq::{maaq, MaaqInput, MaaqParams};
-use vector_ta::indicators::moving_averages::mama::{mama, MamaInput, MamaParams};
-use vector_ta::indicators::moving_averages::mwdx::{mwdx, MwdxInput, MwdxParams};
-use vector_ta::indicators::moving_averages::nma::{nma, NmaInput, NmaParams};
-use vector_ta::indicators::moving_averages::pwma::{pwma, PwmaInput, PwmaParams};
-use vector_ta::indicators::moving_averages::reflex::{reflex, ReflexInput, ReflexParams};
-use vector_ta::indicators::moving_averages::sama::{sama, SamaInput, SamaParams};
-use vector_ta::indicators::moving_averages::sinwma::{sinwma, SinWmaInput, SinWmaParams};
-use vector_ta::indicators::moving_averages::sma::{sma, SmaInput, SmaParams};
-use vector_ta::indicators::moving_averages::smma::{smma, SmmaInput, SmmaParams};
-use vector_ta::indicators::moving_averages::sqwma::{sqwma, SqwmaInput, SqwmaParams};
-use vector_ta::indicators::moving_averages::srwma::{srwma, SrwmaInput, SrwmaParams};
+use vector_ta::indicators::moving_averages::hma::{HmaInput, HmaParams, hma};
+use vector_ta::indicators::moving_averages::hwma::{HwmaInput, HwmaParams, hwma};
+use vector_ta::indicators::moving_averages::jma::{JmaInput, JmaParams, jma};
+use vector_ta::indicators::moving_averages::jsa::{JsaInput, JsaParams, jsa};
+use vector_ta::indicators::moving_averages::kama::{KamaInput, KamaParams, kama};
+use vector_ta::indicators::moving_averages::linreg::{LinRegInput, LinRegParams, linreg};
+use vector_ta::indicators::moving_averages::maaq::{MaaqInput, MaaqParams, maaq};
+use vector_ta::indicators::moving_averages::mama::{MamaInput, MamaParams, mama};
+use vector_ta::indicators::moving_averages::mwdx::{MwdxInput, MwdxParams, mwdx};
+use vector_ta::indicators::moving_averages::nma::{NmaInput, NmaParams, nma};
+use vector_ta::indicators::moving_averages::pwma::{PwmaInput, PwmaParams, pwma};
+use vector_ta::indicators::moving_averages::reflex::{ReflexInput, ReflexParams, reflex};
+use vector_ta::indicators::moving_averages::sama::{SamaInput, SamaParams, sama};
+use vector_ta::indicators::moving_averages::sinwma::{SinWmaInput, SinWmaParams, sinwma};
+use vector_ta::indicators::moving_averages::sma::{SmaInput, SmaParams, sma};
+use vector_ta::indicators::moving_averages::smma::{SmmaInput, SmmaParams, smma};
+use vector_ta::indicators::moving_averages::sqwma::{SqwmaInput, SqwmaParams, sqwma};
+use vector_ta::indicators::moving_averages::srwma::{SrwmaInput, SrwmaParams, srwma};
 use vector_ta::indicators::moving_averages::supersmoother::{
-    supersmoother, SuperSmootherInput, SuperSmootherParams,
+    SuperSmootherInput, SuperSmootherParams, supersmoother,
 };
 use vector_ta::indicators::moving_averages::supersmoother_3_pole::{
-    supersmoother_3_pole, SuperSmoother3PoleInput, SuperSmoother3PoleParams,
+    SuperSmoother3PoleInput, SuperSmoother3PoleParams, supersmoother_3_pole,
 };
-use vector_ta::indicators::moving_averages::swma::{swma, SwmaInput, SwmaParams};
-use vector_ta::indicators::moving_averages::tema::{tema, TemaInput, TemaParams};
-use vector_ta::indicators::moving_averages::tilson::{tilson, TilsonInput, TilsonParams};
+use vector_ta::indicators::moving_averages::swma::{SwmaInput, SwmaParams, swma};
+use vector_ta::indicators::moving_averages::tema::{TemaInput, TemaParams, tema};
+use vector_ta::indicators::moving_averages::tilson::{TilsonInput, TilsonParams, tilson};
 use vector_ta::indicators::moving_averages::trendflex::{
-    trendflex, TrendFlexInput, TrendFlexParams,
+    TrendFlexInput, TrendFlexParams, trendflex,
 };
-use vector_ta::indicators::moving_averages::trima::{trima, TrimaInput, TrimaParams};
-use vector_ta::indicators::moving_averages::volatility_adjusted_ma::{vama, VamaInput, VamaParams};
+use vector_ta::indicators::moving_averages::trima::{TrimaInput, TrimaParams, trima};
+use vector_ta::indicators::moving_averages::volatility_adjusted_ma::{VamaInput, VamaParams, vama};
 use vector_ta::indicators::moving_averages::volume_adjusted_ma::{
     VolumeAdjustedMa as volu_ma, VolumeAdjustedMaInput as VoluMaInput,
     VolumeAdjustedMaParams as VoluMaParams,
 };
-use vector_ta::indicators::moving_averages::vpwma::{vpwma, VpwmaInput, VpwmaParams};
-use vector_ta::indicators::moving_averages::vwap::{vwap, VwapInput, VwapParams};
-use vector_ta::indicators::moving_averages::vwma::{vwma, VwmaInput, VwmaParams};
-use vector_ta::indicators::moving_averages::wilders::{wilders, WildersInput, WildersParams};
-use vector_ta::indicators::moving_averages::wma::{wma, WmaInput, WmaParams};
-use vector_ta::indicators::moving_averages::zlema::{zlema, ZlemaInput, ZlemaParams};
-use vector_ta::indicators::pma::{pma, PmaInput, PmaParams};
-use vector_ta::indicators::ppo::{ppo, PpoInput, PpoParams};
+use vector_ta::indicators::moving_averages::vpwma::{VpwmaInput, VpwmaParams, vpwma};
+use vector_ta::indicators::moving_averages::vwap::{VwapInput, VwapParams, vwap};
+use vector_ta::indicators::moving_averages::vwma::{VwmaInput, VwmaParams, vwma};
+use vector_ta::indicators::moving_averages::wilders::{WildersInput, WildersParams, wilders};
+use vector_ta::indicators::moving_averages::wma::{WmaInput, WmaParams, wma};
+use vector_ta::indicators::moving_averages::zlema::{ZlemaInput, ZlemaParams, zlema};
+use vector_ta::indicators::pma::{PmaInput, PmaParams, pma};
+use vector_ta::indicators::ppo::{PpoInput, PpoParams, ppo};
 use vector_ta::indicators::qqe_weighted_oscillator::{
-    qqe_weighted_oscillator, QqeWeightedOscillatorInput, QqeWeightedOscillatorParams,
+    QqeWeightedOscillatorInput, QqeWeightedOscillatorParams, qqe_weighted_oscillator,
 };
 use vector_ta::indicators::range_filtered_trend_signals::{
-    range_filtered_trend_signals, RangeFilteredTrendSignalsInput, RangeFilteredTrendSignalsParams,
+    RangeFilteredTrendSignalsInput, RangeFilteredTrendSignalsParams, range_filtered_trend_signals,
 };
 use vector_ta::indicators::range_oscillator::{
-    range_oscillator, RangeOscillatorInput, RangeOscillatorParams,
+    RangeOscillatorInput, RangeOscillatorParams, range_oscillator,
 };
-use vector_ta::indicators::roc::{roc, RocInput, RocParams};
-use vector_ta::indicators::rocp::{rocp, RocpInput, RocpParams};
-use vector_ta::indicators::rsi::{rsi, RsiInput, RsiParams};
-use vector_ta::indicators::rsx::{rsx, RsxInput, RsxParams};
-use vector_ta::indicators::rvi::{rvi, RviInput, RviParams};
+use vector_ta::indicators::roc::{RocInput, RocParams, roc};
+use vector_ta::indicators::rocp::{RocpInput, RocpParams, rocp};
+use vector_ta::indicators::rsi::{RsiInput, RsiParams, rsi};
+use vector_ta::indicators::rsx::{RsxInput, RsxParams, rsx};
+use vector_ta::indicators::rvi::{RviInput, RviParams, rvi};
 use vector_ta::indicators::squeeze_momentum::{
-    squeeze_momentum, SqueezeMomentumInput, SqueezeMomentumParams,
+    SqueezeMomentumInput, SqueezeMomentumParams, squeeze_momentum,
 };
-use vector_ta::indicators::stddev::{stddev, StdDevInput, StdDevParams};
-use vector_ta::indicators::tsf::{tsf, TsfInput, TsfParams};
-use vector_ta::indicators::ui::{ui, UiInput, UiParams};
-use vector_ta::indicators::var::{var, VarInput, VarParams};
+use vector_ta::indicators::stddev::{StdDevInput, StdDevParams, stddev};
+use vector_ta::indicators::tsf::{TsfInput, TsfParams, tsf};
+use vector_ta::indicators::ui::{UiInput, UiParams, ui};
+use vector_ta::indicators::var::{VarInput, VarParams, var};
 use vector_ta::indicators::volume_weighted_relative_strength_index::{
-    volume_weighted_relative_strength_index, VolumeWeightedRelativeStrengthIndexInput,
-    VolumeWeightedRelativeStrengthIndexParams,
+    VolumeWeightedRelativeStrengthIndexInput, VolumeWeightedRelativeStrengthIndexParams,
+    volume_weighted_relative_strength_index,
 };
-use vector_ta::indicators::vpci::{vpci, VpciInput, VpciParams};
-use vector_ta::indicators::vpt::{vpt, VptInput};
-use vector_ta::indicators::wclprice::{wclprice, WclpriceInput};
-use vector_ta::utilities::data_loader::read_candles_from_csv;
+use vector_ta::indicators::vpci::{VpciInput, VpciParams, vpci};
+use vector_ta::indicators::vpt::{VptInput, vpt};
+use vector_ta::indicators::wclprice::{WclpriceInput, wclprice};
+use vector_ta::utilities::data_loader::read_candles_from_vortex;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <indicator_name> [source]", args[0]);
-        eprintln!("Available indicators: ad, acosc, adx, adosc, adxr, adaptive_bounds_rsi, adjustable_ma_alternating_extremities, alligator, alma, ao, apo, aroon, aroonosc, atr, bandpass, bollinger_bands, bollinger_bands_width, bop, cci, cfo, cg, chop, cwma, decycler, dema, devstop, di, edcf, ehlers_itrend, ema, epma, eri, fisher, forward_backward_exponential_oscillator, frama, fwma, gaussian, highpass_2_pole, highpass, hma, hwma, jma, jsa, kama, kst, kurtosis, linreg, maaq, macz, mama, market_structure_confluence, marketefi, midpoint, midprice, mfi, mwdx, nma, pma, ppo, qqe_weighted_oscillator, range_filtered_trend_signals, range_oscillator, rsx, pwma, reflex, roc, rocp, rsi, rvi, rvi, sama, sinwma, sma, smma, squeeze_momentum, sqwma, srwma, stddev, supersmoother_3_pole, supersmoother, swma, tema, tilson, trendflex, trima, var, volume_weighted_relative_strength_index, vpci, tsf, ui, vwap, vwma, vpwma, wclprice, wilders, wma, zlema");
+        eprintln!(
+            "Available indicators: ad, acosc, adx, adosc, adxr, adaptive_bounds_rsi, adjustable_ma_alternating_extremities, alligator, alma, ao, apo, aroon, aroonosc, atr, bandpass, bollinger_bands, bollinger_bands_width, bop, cci, cfo, cg, chop, cwma, decycler, dema, devstop, di, edcf, ehlers_itrend, ema, epma, eri, fisher, forward_backward_exponential_oscillator, frama, fwma, gaussian, highpass_2_pole, highpass, hma, hwma, jma, jsa, kama, kst, kurtosis, linreg, maaq, macz, mama, market_structure_confluence, marketefi, midpoint, midprice, mfi, mwdx, nma, pma, ppo, qqe_weighted_oscillator, range_filtered_trend_signals, range_oscillator, rsx, pwma, reflex, roc, rocp, rsi, rvi, rvi, sama, sinwma, sma, smma, squeeze_momentum, sqwma, srwma, stddev, supersmoother_3_pole, supersmoother, swma, tema, tilson, trendflex, trima, var, volume_weighted_relative_strength_index, vpci, tsf, ui, vwap, vwma, vpwma, wclprice, wilders, wma, zlema"
+        );
         eprintln!("Available sources: open, high, low, close, volume, hl2, hlc3, ohlc4, hlcc4");
         std::process::exit(1);
     }
@@ -172,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let indicator = &args[1];
     let source = args.get(2).map(|s| s.as_str()).unwrap_or("close");
 
-    let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+    let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
 
     let output = match indicator.as_str() {
         "adaptive_bounds_rsi" => {
@@ -189,11 +191,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "alpha": alpha
                 },
                 "rsi": result.rsi,
-                "lower_bound": result.lower_bound,
+                "lower": result.lower_bound,
                 "lower_mid": result.lower_mid,
-                "mid": result.mid,
+                "middle": result.mid,
                 "upper_mid": result.upper_mid,
-                "upper_bound": result.upper_bound,
+                "upper": result.upper_bound,
                 "regime": result.regime,
                 "regime_flip": result.regime_flip,
                 "lower_signal": result.lower_signal,

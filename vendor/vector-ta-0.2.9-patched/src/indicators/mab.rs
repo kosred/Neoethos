@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
-    make_uninit_matrix,
+    make_uninit_matrix, runtime_supports_kernel,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -73,10 +57,6 @@ pub struct MabOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MabParams {
     pub fast_period: Option<usize>,
     pub slow_period: Option<usize>,
@@ -197,6 +177,8 @@ pub enum MabError {
     InvalidRangeF64 { start: f64, end: f64, step: f64 },
     #[error("mab: non-batch kernel passed to batch path: {0:?}")]
     InvalidKernelForBatch(Kernel),
+    #[error("mab: requested kernel is unsupported by this CPU: {0:?}")]
+    UnsupportedKernel(Kernel),
 }
 
 #[inline(always)]
@@ -283,6 +265,9 @@ fn mab_prepare2<'a>(
         Kernel::Auto => Kernel::Scalar,
         k => k,
     };
+    if !runtime_supports_kernel(chosen) {
+        return Err(MabError::UnsupportedKernel(chosen));
+    }
     let warmup = first + need_total - 1;
     Ok((
         data,
@@ -302,8 +287,8 @@ pub fn mab_into_slice(
     input: &MabInput,
     kern: Kernel,
 ) -> Result<(), MabError> {
-    use crate::indicators::ema::{ema, EmaInput, EmaParams};
-    use crate::indicators::sma::{sma, SmaInput, SmaParams};
+    use crate::indicators::ema::{EmaInput, EmaParams, ema};
+    use crate::indicators::sma::{SmaInput, SmaParams, sma};
 
     let (data, chosen, first, warmup, fast_period, devup, devdn) = mab_prepare2(input, kern)?;
     let slow_period = input.get_slow_period();
@@ -411,7 +396,6 @@ pub fn mab_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn mab_into(
     input: &MabInput,
     upper_dst: &mut [f64],
@@ -448,41 +432,6 @@ pub fn mab_with_kernel(input: &MabInput, kernel: Kernel) -> Result<MabOutput, Ma
     })
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mab_output_into_js(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    devup: f64,
-    devdn: f64,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = mab_js(
-        data,
-        fast_period,
-        slow_period,
-        devup,
-        devdn,
-        fast_ma_type,
-        slow_ma_type,
-    )?;
-    crate::write_wasm_f64_output("mab_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mab_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = mab_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("mab_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod into_parity_tests {
     use super::*;
@@ -507,7 +456,6 @@ mod into_parity_tests {
         let mut mid = vec![0.0; n];
         let mut lo = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             mab_into(&input, &mut up, &mut mid, &mut lo).expect("mab_into should succeed");
         }
@@ -1312,6 +1260,9 @@ fn mab_batch_inner(
         Kernel::Auto => detect_best_batch_kernel(),
         k => k,
     };
+    if !runtime_supports_kernel(kernel) {
+        return Err(MabError::UnsupportedKernel(kernel));
+    }
     let simd = match kernel {
         Kernel::Avx512Batch => Kernel::Avx512,
         Kernel::Avx2Batch => Kernel::Avx2,
@@ -1459,8 +1410,8 @@ fn mab_batch_inner_into(
         });
 
         if all_same_ma {
-            use crate::indicators::ema::{ema, EmaInput, EmaParams};
-            use crate::indicators::sma::{sma, SmaInput, SmaParams};
+            use crate::indicators::ema::{EmaInput, EmaParams, ema};
+            use crate::indicators::sma::{SmaInput, SmaParams, sma};
 
             let n = input.len();
             let first = input.iter().position(|x| !x.is_nan()).unwrap_or(0);
@@ -1657,612 +1608,6 @@ fn mab_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "mab")]
-#[pyo3(signature = (data, fast_period=10, slow_period=50, devup=1.0, devdn=1.0, fast_ma_type="sma", slow_ma_type="sma", kernel=None))]
-pub fn mab_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    fast_period: usize,
-    slow_period: usize,
-    devup: f64,
-    devdn: f64,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let slice_in = data.as_slice()?;
-    let params = MabParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        devup: Some(devup),
-        devdn: Some(devdn),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-    };
-    let input = MabInput::from_slice(slice_in, params);
-
-    let chosen_kernel = validate_kernel(kernel, false)?;
-
-    let result = py
-        .allow_threads(|| match chosen_kernel {
-            Kernel::Auto => mab(&input),
-            k => mab_with_kernel(&input, k),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        result.upperband.into_pyarray(py),
-        result.middleband.into_pyarray(py),
-        result.lowerband.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MabStream")]
-pub struct MabStreamPy {
-    stream: MabStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MabStreamPy {
-    #[new]
-    fn new(
-        fast_period: usize,
-        slow_period: usize,
-        devup: f64,
-        devdn: f64,
-        fast_ma_type: &str,
-        slow_ma_type: &str,
-    ) -> PyResult<Self> {
-        let params = MabParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            devup: Some(devup),
-            devdn: Some(devdn),
-            fast_ma_type: Some(fast_ma_type.to_string()),
-            slow_ma_type: Some(slow_ma_type.to_string()),
-        };
-        let stream =
-            MabStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(MabStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "mab_batch")]
-#[pyo3(signature = (data, fast_period_range, slow_period_range, devup_range=(1.0, 1.0, 0.0), devdn_range=(1.0, 1.0, 0.0), fast_ma_type="sma", slow_ma_type="sma", kernel=None))]
-pub fn mab_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    devup_range: (f64, f64, f64),
-    devdn_range: (f64, f64, f64),
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-
-    let sweep = MabBatchRange {
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        devup: devup_range,
-        devdn: devdn_range,
-        fast_ma_type: (
-            fast_ma_type.to_string(),
-            fast_ma_type.to_string(),
-            "".to_string(),
-        ),
-        slow_ma_type: (
-            slow_ma_type.to_string(),
-            slow_ma_type.to_string(),
-            "".to_string(),
-        ),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    if cols == 0 {
-        return Err(PyValueError::new_err(MabError::EmptyInputData.to_string()));
-    }
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("mab_batch: rows*cols overflow"))?;
-
-    let upper_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let middle_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let lower_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let slice_upper = unsafe { upper_arr.as_slice_mut()? };
-    let slice_middle = unsafe { middle_arr.as_slice_mut()? };
-    let slice_lower = unsafe { lower_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let first_valid = slice_in
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| PyValueError::new_err(MabError::AllValuesNaN.to_string()))?;
-    let valid = cols - first_valid;
-    let warmup_prefixes: Vec<usize> = combos
-        .iter()
-        .map(|p| {
-            let fast = p.fast_period.unwrap();
-            let slow = p.slow_period.unwrap();
-            if fast == 0 || slow == 0 || fast > cols || slow > cols {
-                return Err(MabError::InvalidPeriod {
-                    fast,
-                    slow,
-                    data_len: cols,
-                });
-            }
-            let need_total = fast.max(slow) + fast - 1;
-            if valid < need_total {
-                return Err(MabError::NotEnoughValidData {
-                    needed: need_total,
-                    valid,
-                });
-            }
-            Ok(first_valid + need_total)
-        })
-        .collect::<Result<Vec<_>, MabError>>()
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let mu_upper: &mut [MaybeUninit<f64>] = unsafe {
-        let ptr = upper_arr.as_array_mut().as_mut_ptr();
-        std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<f64>, total)
-    };
-    let mu_middle: &mut [MaybeUninit<f64>] = unsafe {
-        let ptr = middle_arr.as_array_mut().as_mut_ptr();
-        std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<f64>, total)
-    };
-    let mu_lower: &mut [MaybeUninit<f64>] = unsafe {
-        let ptr = lower_arr.as_array_mut().as_mut_ptr();
-        std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<f64>, total)
-    };
-    init_matrix_prefixes(mu_upper, cols, &warmup_prefixes);
-    init_matrix_prefixes(mu_middle, cols, &warmup_prefixes);
-    init_matrix_prefixes(mu_lower, cols, &warmup_prefixes);
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-
-            mab_batch_inner_into(
-                slice_in,
-                &sweep,
-                simd,
-                true,
-                slice_upper,
-                slice_middle,
-                slice_lower,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("upperbands", upper_arr.reshape((rows, cols))?)?;
-    dict.set_item("middlebands", middle_arr.reshape((rows, cols))?)?;
-    dict.set_item("lowerbands", lower_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "devups",
-        combos
-            .iter()
-            .map(|p| p.devup.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "devdns",
-        combos
-            .iter()
-            .map(|p| p.devdn.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MabJsSingle {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "mab")]
-pub fn mab_wasm(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    devup: f64,
-    devdn: f64,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    let params = MabParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        devup: Some(devup),
-        devdn: Some(devdn),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-    };
-    let input = MabInput::from_slice(data, params);
-
-    let mut upper = vec![0.0; data.len()];
-    let mut middle = vec![0.0; data.len()];
-    let mut lower = vec![0.0; data.len()];
-
-    mab_into_slice(
-        &mut upper,
-        &mut middle,
-        &mut lower,
-        &input,
-        detect_best_kernel(),
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(3 * data.len());
-    values.extend_from_slice(&upper);
-    values.extend_from_slice(&middle);
-    values.extend_from_slice(&lower);
-
-    serde_wasm_bindgen::to_value(&MabJsSingle {
-        values,
-        rows: 3,
-        cols: data.len(),
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mab_js(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    devup: f64,
-    devdn: f64,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let params = MabParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        devup: Some(devup),
-        devdn: Some(devdn),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-    };
-    let input = MabInput::from_slice(data, params);
-
-    let mut upper = vec![0.0; data.len()];
-    let mut middle = vec![0.0; data.len()];
-    let mut lower = vec![0.0; data.len()];
-
-    mab_into_slice(
-        &mut upper,
-        &mut middle,
-        &mut lower,
-        &input,
-        detect_best_kernel(),
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut result = Vec::with_capacity(3 * data.len());
-    result.extend_from_slice(&upper);
-    result.extend_from_slice(&middle);
-    result.extend_from_slice(&lower);
-
-    Ok(result)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MabBatchConfig {
-    pub fast_period_range: (usize, usize, usize),
-    pub slow_period_range: (usize, usize, usize),
-    pub devup_range: (f64, f64, f64),
-    pub devdn_range: (f64, f64, f64),
-    pub fast_ma_type: String,
-    pub slow_ma_type: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MabBatchJsOutput {
-    pub upperbands: Vec<f64>,
-    pub middlebands: Vec<f64>,
-    pub lowerbands: Vec<f64>,
-    pub combos: Vec<MabParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = mab_batch)]
-pub fn mab_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: MabBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = MabBatchRange {
-        fast_period: config.fast_period_range,
-        slow_period: config.slow_period_range,
-        devup: config.devup_range,
-        devdn: config.devdn_range,
-        fast_ma_type: (
-            config.fast_ma_type.clone(),
-            config.fast_ma_type.clone(),
-            "".to_string(),
-        ),
-        slow_ma_type: (
-            config.slow_ma_type.clone(),
-            config.slow_ma_type.clone(),
-            "".to_string(),
-        ),
-    };
-
-    let output = mab_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = MabBatchJsOutput {
-        upperbands: output.upperbands,
-        middlebands: output.middlebands,
-        lowerbands: output.lowerbands,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mab_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mab_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mab_into(
-    in_ptr: *const f64,
-    upper_ptr: *mut f64,
-    middle_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    len: usize,
-    fast_period: usize,
-    slow_period: usize,
-    devup: f64,
-    devdn: f64,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || upper_ptr.is_null() || middle_ptr.is_null() || lower_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = MabParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            devup: Some(devup),
-            devdn: Some(devdn),
-            fast_ma_type: Some(fast_ma_type.to_string()),
-            slow_ma_type: Some(slow_ma_type.to_string()),
-        };
-        let input = MabInput::from_slice(data, params);
-
-        let need_temp = in_ptr == upper_ptr || in_ptr == middle_ptr || in_ptr == lower_ptr;
-
-        if need_temp {
-            let mut temp_upper = vec![0.0; len];
-            let mut temp_middle = vec![0.0; len];
-            let mut temp_lower = vec![0.0; len];
-
-            mab_into_slice(
-                &mut temp_upper,
-                &mut temp_middle,
-                &mut temp_lower,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let upper_out = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let middle_out = std::slice::from_raw_parts_mut(middle_ptr, len);
-            let lower_out = std::slice::from_raw_parts_mut(lower_ptr, len);
-
-            upper_out.copy_from_slice(&temp_upper);
-            middle_out.copy_from_slice(&temp_middle);
-            lower_out.copy_from_slice(&temp_lower);
-        } else {
-            let upper_out = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let middle_out = std::slice::from_raw_parts_mut(middle_ptr, len);
-            let lower_out = std::slice::from_raw_parts_mut(lower_ptr, len);
-
-            mab_into_slice(upper_out, middle_out, lower_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mab_batch_into(
-    in_ptr: *const f64,
-    upper_ptr: *mut f64,
-    middle_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    len: usize,
-    fast_period_start: usize,
-    fast_period_end: usize,
-    fast_period_step: usize,
-    slow_period_start: usize,
-    slow_period_end: usize,
-    slow_period_step: usize,
-    devup_start: f64,
-    devup_end: f64,
-    devup_step: f64,
-    devdn_start: f64,
-    devdn_end: f64,
-    devdn_step: f64,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || upper_ptr.is_null() || middle_ptr.is_null() || lower_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer passed to mab_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = MabBatchRange {
-            fast_period: (fast_period_start, fast_period_end, fast_period_step),
-            slow_period: (slow_period_start, slow_period_end, slow_period_step),
-            devup: (devup_start, devup_end, devup_step),
-            devdn: (devdn_start, devdn_end, devdn_step),
-            fast_ma_type: (
-                fast_ma_type.to_string(),
-                fast_ma_type.to_string(),
-                "".to_string(),
-            ),
-            slow_ma_type: (
-                slow_ma_type.to_string(),
-                slow_ma_type.to_string(),
-                "".to_string(),
-            ),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        if cols == 0 {
-            return Err(JsValue::from_str(&MabError::EmptyInputData.to_string()));
-        }
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("mab_batch_into: rows*cols overflow"))?;
-
-        let first_valid = data
-            .iter()
-            .position(|x| !x.is_nan())
-            .ok_or(MabError::AllValuesNaN)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let valid = cols - first_valid;
-        let warmup_prefixes: Vec<usize> = combos
-            .iter()
-            .map(|p| {
-                let fast = p.fast_period.unwrap();
-                let slow = p.slow_period.unwrap();
-                if fast == 0 || slow == 0 || fast > cols || slow > cols {
-                    return Err(MabError::InvalidPeriod {
-                        fast,
-                        slow,
-                        data_len: cols,
-                    });
-                }
-                let need_total = fast.max(slow) + fast - 1;
-                if valid < need_total {
-                    return Err(MabError::NotEnoughValidData {
-                        needed: need_total,
-                        valid,
-                    });
-                }
-                Ok(first_valid + need_total)
-            })
-            .collect::<Result<Vec<_>, MabError>>()
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let mu_upper: &mut [MaybeUninit<f64>] =
-            std::slice::from_raw_parts_mut(upper_ptr as *mut MaybeUninit<f64>, total);
-        let mu_middle: &mut [MaybeUninit<f64>] =
-            std::slice::from_raw_parts_mut(middle_ptr as *mut MaybeUninit<f64>, total);
-        let mu_lower: &mut [MaybeUninit<f64>] =
-            std::slice::from_raw_parts_mut(lower_ptr as *mut MaybeUninit<f64>, total);
-        init_matrix_prefixes(mu_upper, cols, &warmup_prefixes);
-        init_matrix_prefixes(mu_middle, cols, &warmup_prefixes);
-        init_matrix_prefixes(mu_lower, cols, &warmup_prefixes);
-
-        let upper_out = std::slice::from_raw_parts_mut(upper_ptr, total);
-        let middle_out = std::slice::from_raw_parts_mut(middle_ptr, total);
-        let lower_out = std::slice::from_raw_parts_mut(lower_ptr, total);
-
-        mab_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Auto,
-            false,
-            upper_out,
-            middle_out,
-            lower_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
 #[inline]
 pub unsafe fn mab_scalar_classic_sma(
     data: &[f64],
@@ -2357,314 +1702,74 @@ pub unsafe fn mab_scalar_classic_sma(
     Ok(())
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{
-    cuda_available,
-    moving_averages::{mab_wrapper::CudaMabBatchPlan, CudaMab},
-};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::{CopyDestination, DeviceBuffer};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::{PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use pyo3::{pyfunction, PyResult, Python};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "MabCudaBatchPlan", unsendable)]
-pub struct MabCudaBatchPlanPy {
-    cuda: CudaMab,
-    plan: CudaMabBatchPlan,
-    device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl MabCudaBatchPlanPy {
-    #[getter]
-    fn rows(&self) -> usize {
-        self.plan.rows()
-    }
-
-    #[getter]
-    fn cols(&self) -> usize {
-        self.plan.cols()
-    }
-
-    #[getter]
-    fn device_id(&self) -> u32 {
-        self.device_id
-    }
-
-    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        let params = pyo3::types::PyList::empty(py);
-        for p in self.plan.params() {
-            let item = PyDict::new(py);
-            item.set_item("fast_period", p.fast_period.unwrap_or(0))?;
-            item.set_item("slow_period", p.slow_period.unwrap_or(0))?;
-            item.set_item("devup", p.devup.unwrap_or(1.0))?;
-            item.set_item("devdn", p.devdn.unwrap_or(1.0))?;
-            item.set_item("fast_ma_type", p.fast_ma_type.as_deref().unwrap_or("sma"))?;
-            item.set_item("slow_ma_type", p.slow_ma_type.as_deref().unwrap_or("sma"))?;
-            params.append(item)?;
-        }
-        dict.set_item("params", params)?;
-        dict.set_item("rows", self.plan.rows())?;
-        dict.set_item("cols", self.plan.cols())?;
-        dict.set_item("first_valid", self.plan.first_valid())?;
-        dict.set_item("device_id", self.device_id)?;
-        Ok(dict)
-    }
-
-    fn execute<'py>(
-        &mut self,
-        py: Python<'py>,
-        data_f32: PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let slice = data_f32.as_slice()?;
-        let rows = self.plan.rows();
-        let cols = self.plan.cols();
-        if slice.len() != cols {
-            return Err(PyValueError::new_err(format!(
-                "mab CUDA plan input length mismatch: expected {}, got {}",
-                cols,
-                slice.len()
-            )));
-        }
-        let first_valid = slice
-            .iter()
-            .position(|v| !v.is_nan())
-            .ok_or_else(|| PyValueError::new_err("mab CUDA plan input is all NaN"))?;
-        if first_valid != self.plan.first_valid() {
-            return Err(PyValueError::new_err(format!(
-                "mab CUDA plan first_valid mismatch: expected {}, got {}",
-                self.plan.first_valid(),
-                first_valid
-            )));
-        }
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("mab CUDA plan rows*cols overflow"))?;
-        let (upper, middle, lower) =
-            py.allow_threads(|| -> PyResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-                let d_prices = DeviceBuffer::from_slice(slice)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                self.cuda
-                    .launch_mab_batch_plan(&d_prices, &mut self.plan)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                self.cuda
-                    .synchronize()
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                let mut upper = vec![0f32; total];
-                let mut middle = vec![0f32; total];
-                let mut lower = vec![0f32; total];
-                let (upper_buf, middle_buf, lower_buf) = self.plan.outputs();
-                upper_buf
-                    .copy_to(&mut upper)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                middle_buf
-                    .copy_to(&mut middle)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                lower_buf
-                    .copy_to(&mut lower)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                Ok((upper, middle, lower))
-            })?;
-        let dict = self.metadata(py)?;
-        let upper_arr = upper.into_pyarray(py);
-        let middle_arr = middle.into_pyarray(py);
-        let lower_arr = lower.into_pyarray(py);
-        dict.set_item("upper", upper_arr.reshape((rows, cols))?)?;
-        dict.set_item("middle", middle_arr.reshape((rows, cols))?)?;
-        dict.set_item("lower", lower_arr.reshape((rows, cols))?)?;
-        Ok(dict)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "mab_cuda_batch_plan_create")]
-#[pyo3(signature = (series_len, first_valid, fast_period_range, slow_period_range, devup_range=(1.0,1.0,0.0), devdn_range=(1.0,1.0,0.0), fast_ma_type="sma", slow_ma_type="sma", device_id=0))]
-pub fn mab_cuda_batch_plan_create_py(
-    py: Python<'_>,
-    series_len: usize,
-    first_valid: usize,
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    devup_range: (f64, f64, f64),
-    devdn_range: (f64, f64, f64),
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    device_id: usize,
-) -> PyResult<MabCudaBatchPlanPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sweep = MabBatchRange {
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        devup: devup_range,
-        devdn: devdn_range,
-        fast_ma_type: (
-            fast_ma_type.to_string(),
-            fast_ma_type.to_string(),
-            String::new(),
-        ),
-        slow_ma_type: (
-            slow_ma_type.to_string(),
-            slow_ma_type.to_string(),
-            String::new(),
-        ),
-    };
-    let (cuda, plan, dev_id) = py.allow_threads(|| {
-        let cuda = CudaMab::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let plan = cuda
-            .prepare_mab_batch_plan(series_len, first_valid, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((cuda, plan, dev_id))
-    })?;
-    Ok(MabCudaBatchPlanPy {
-        cuda,
-        plan,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "mab_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, fast_period_range, slow_period_range, devup_range=(1.0,1.0,0.0), devdn_range=(1.0,1.0,0.0), fast_ma_type="sma", slow_ma_type="sma", device_id=0))]
-pub fn mab_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    devup_range: (f64, f64, f64),
-    devdn_range: (f64, f64, f64),
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_f32.as_slice()?;
-    let sweep = MabBatchRange {
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        devup: devup_range,
-        devdn: devdn_range,
-        fast_ma_type: (
-            fast_ma_type.to_string(),
-            fast_ma_type.to_string(),
-            String::new(),
-        ),
-        slow_ma_type: (
-            slow_ma_type.to_string(),
-            slow_ma_type.to_string(),
-            String::new(),
-        ),
-    };
-    let (up, mid, lo) = py.allow_threads(|| {
-        let cuda = CudaMab::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (trip, _combos) = cuda
-            .mab_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((trip.upper, trip.middle, trip.lower))
-    })?;
-
-    let up_py = make_device_array_py(device_id, up)?;
-    let mid_py = make_device_array_py(device_id, mid)?;
-    let lo_py = make_device_array_py(device_id, lo)?;
-
-    Ok((up_py, mid_py, lo_py))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "mab_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, fast_period, slow_period, devup=1.0, devdn=1.0, fast_ma_type="sma", slow_ma_type="sma", device_id=0))]
-pub fn mab_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    fast_period: usize,
-    slow_period: usize,
-    devup: f64,
-    devdn: f64,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py, DeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let flat: &[f32] = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = MabParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        devup: Some(devup),
-        devdn: Some(devdn),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-    };
-    let (up, mid, lo) = py.allow_threads(|| {
-        let cuda = CudaMab::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let trip = cuda
-            .mab_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((trip.upper, trip.middle, trip.lower))
-    })?;
-
-    let up_py = make_device_array_py(device_id, up)?;
-    let mid_py = make_device_array_py(device_id, mid)?;
-    let lo_py = make_device_array_py(device_id, lo)?;
-
-    Ok((up_py, mid_py, lo_py))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_vortex;
+    use crate::utilities::helpers::runtime_supports_kernel;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
 
-    macro_rules! skip_if_unsupported {
-        ($kernel:expr, $test_name:expr) => {
-            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-            if matches!(
-                $kernel,
-                Kernel::Avx2 | Kernel::Avx512 | Kernel::Avx2Batch | Kernel::Avx512Batch
-            ) {
-                eprintln!(
-                    "[{}] Skipping - {:?} not supported on WASM",
-                    $test_name, $kernel
-                );
-                return Ok(());
-            }
-            #[cfg(not(all(feature = "nightly-avx", target_arch = "x86_64")))]
-            if matches!(
-                $kernel,
-                Kernel::Avx2 | Kernel::Avx512 | Kernel::Avx2Batch | Kernel::Avx512Batch
-            ) {
-                eprintln!(
-                    "[{}] Skipping - {:?} requires 'nightly-avx' feature",
-                    $test_name, $kernel
-                );
-                return Ok(());
-            }
-        };
+    fn valid_mab_fixture() -> Vec<f64> {
+        (1..=128).map(|value| value as f64).collect()
+    }
+
+    fn one_mab_batch_tuple() -> MabBatchRange {
+        MabBatchRange {
+            fast_period: (10, 10, 0),
+            slow_period: (50, 50, 0),
+            devup: (1.0, 1.0, 0.0),
+            devdn: (1.0, 1.0, 0.0),
+            fast_ma_type: ("sma".to_string(), "sma".to_string(), String::new()),
+            slow_ma_type: ("sma".to_string(), "sma".to_string(), String::new()),
+        }
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    #[test]
+    fn explicit_unsupported_avx512_is_refused_before_target_feature_execution() {
+        if runtime_supports_kernel(Kernel::Avx512) {
+            return;
+        }
+
+        let data = valid_mab_fixture();
+        let input = MabInput::from_slice(&data, MabParams::default());
+        let error = mab_with_kernel(&input, Kernel::Avx512)
+            .expect_err("unsupported explicit AVX-512 must fail before execution");
+        assert!(matches!(error, MabError::UnsupportedKernel(Kernel::Avx512)));
+
+        let mut upper = vec![f64::NAN; data.len()];
+        let mut middle = vec![f64::NAN; data.len()];
+        let mut lower = vec![f64::NAN; data.len()];
+        let error = mab_into_slice(&mut upper, &mut middle, &mut lower, &input, Kernel::Avx512)
+            .expect_err("unsupported explicit AVX-512 slice must fail before execution");
+        assert!(matches!(error, MabError::UnsupportedKernel(Kernel::Avx512)));
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    #[test]
+    fn explicit_unsupported_avx512_batch_is_refused_before_target_feature_execution() {
+        if runtime_supports_kernel(Kernel::Avx512Batch) {
+            return;
+        }
+
+        let data = valid_mab_fixture();
+        let error = mab_batch_inner(&data, &one_mab_batch_tuple(), Kernel::Avx512Batch, false)
+            .expect_err("unsupported explicit AVX-512 batch must fail before execution");
+        assert!(matches!(
+            error,
+            MabError::UnsupportedKernel(Kernel::Avx512Batch)
+        ));
     }
 
     #[cfg(debug_assertions)]
     fn check_mab_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             MabParams::default(),
@@ -2755,47 +1860,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in upperband \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in upperband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in upperband \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in upperband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in upperband \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in upperband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
             }
 
@@ -2808,47 +1922,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in middleband \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in middleband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in middleband \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in middleband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in middleband \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in middleband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
             }
 
@@ -2861,47 +1984,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in lowerband \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in lowerband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in lowerband \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in lowerband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in lowerband \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in lowerband \
 						 with params: fast_period={}, slow_period={}, devup={}, devdn={}, fast_ma_type={}, slow_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(10),
-						params.slow_period.unwrap_or(50),
-						params.devup.unwrap_or(1.0),
-						params.devdn.unwrap_or(1.0),
-						params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(10),
+                        params.slow_period.unwrap_or(50),
+                        params.devup.unwrap_or(1.0),
+                        params.devdn.unwrap_or(1.0),
+                        params.fast_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        params.slow_ma_type.as_ref().unwrap_or(&"sma".to_string()),
+                        param_idx
+                    );
                 }
             }
         }
@@ -2918,8 +2050,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             ((2, 10, 2), (10, 20, 5), (1.0, 1.0, 0.0), (1.0, 1.0, 0.0)),
@@ -2962,38 +2094,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in upperbands \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in upperbands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in upperbands \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in upperbands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in upperbands \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in upperbands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
             }
 
@@ -3009,38 +2159,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in middlebands \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in middlebands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in middlebands \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in middlebands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in middlebands \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in middlebands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
             }
 
@@ -3056,38 +2224,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in lowerbands \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in lowerbands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in lowerbands \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in lowerbands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in lowerbands \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in lowerbands \
 						 at row {} col {} (flat index {}) with params: fast_period={}, slow_period={}, devup={}, devdn={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.fast_period.unwrap_or(10),
-						combo.slow_period.unwrap_or(50),
-						combo.devup.unwrap_or(1.0),
-						combo.devdn.unwrap_or(1.0)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.fast_period.unwrap_or(10),
+                        combo.slow_period.unwrap_or(50),
+                        combo.devup.unwrap_or(1.0),
+                        combo.devdn.unwrap_or(1.0)
+                    );
                 }
             }
         }
@@ -3455,8 +2641,8 @@ mod tests {
 
     fn check_mab_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = MabParams {
             fast_period: None,
             ..MabParams::default()
@@ -3469,8 +2655,8 @@ mod tests {
 
     fn check_mab_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MabParams::default();
         let input = MabInput::from_candles(&candles, "close", params);
         let result = mab_with_kernel(&input, kernel)?;
@@ -3530,8 +2716,8 @@ mod tests {
 
     fn check_mab_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MabInput::with_default_candles(&candles);
         let output = mab_with_kernel(&input, kernel)?;
         assert_eq!(output.upperband.len(), candles.close.len());
@@ -3610,8 +2796,8 @@ mod tests {
 
     fn check_mab_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MabParams::default();
         let first_input = MabInput::from_candles(&candles, "close", params.clone());
         let first_result = mab_with_kernel(&first_input, kernel)?;
@@ -3636,8 +2822,8 @@ mod tests {
 
     fn check_mab_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MabInput::from_candles(&candles, "close", MabParams::default());
         let res = mab_with_kernel(&input, kernel)?;
 
@@ -3671,8 +2857,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let sweep = MabBatchRange {
             fast_period: (10, 10, 0),
@@ -3755,8 +2941,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let sweep = MabBatchRange {
             fast_period: (10, 12, 1),
@@ -3820,19 +3006,19 @@ mod tests {
 			paste::paste! {
 				$(
 					#[test]
-					fn [<$test_fn _scalar_f64>]() {
-						let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+					fn [<$test_fn _scalar_f64>]() -> Result<(), Box<dyn Error>> {
+						$test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar)
 					}
 				)*
 				#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 				$(
 					#[test]
-					fn [<$test_fn _avx2_f64>]() {
-						let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+					fn [<$test_fn _avx2_f64>]() -> Result<(), Box<dyn Error>> {
+						$test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2)
 					}
 					#[test]
-					fn [<$test_fn _avx512_f64>]() {
-						let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+					fn [<$test_fn _avx512_f64>]() -> Result<(), Box<dyn Error>> {
+						$test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512)
 					}
 				)*
 			}
@@ -3842,19 +3028,19 @@ mod tests {
     macro_rules! gen_batch_tests {
         ($fn_name:ident) => {
             paste::paste! {
-                #[test] fn [<$fn_name _scalar>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                #[test] fn [<$fn_name _scalar>]() -> Result<(), Box<dyn Error>> {
+                    $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch)
                 }
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                #[test] fn [<$fn_name _avx2>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                #[test] fn [<$fn_name _avx2>]() -> Result<(), Box<dyn Error>> {
+                    $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch)
                 }
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                #[test] fn [<$fn_name _avx512>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                #[test] fn [<$fn_name _avx512>]() -> Result<(), Box<dyn Error>> {
+                    $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch)
                 }
-                #[test] fn [<$fn_name _auto_detect>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                #[test] fn [<$fn_name _auto_detect>]() -> Result<(), Box<dyn Error>> {
+                    $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto)
                 }
             }
         };

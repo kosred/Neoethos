@@ -40,9 +40,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use ndarray::Array2;
-use polars::prelude::DataFrame;
+use neoethos_data::{FeatureCellValidity, FeatureFrame};
+use neoethos_execution_budget::CpuLease;
 
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, project_expert_frame};
 // The training-side trait — provides `predict_proba`, `fit`, `load`,
 // `save` on every existing expert struct. We rename to disambiguate
 // from our inference-side `super::ExpertModel` trait (same simple
@@ -67,7 +68,14 @@ use crate::tree_models::{CatBoostExpert, LightGBMExpert, SklearsTreeExpert, XGBo
 /// Visible to sibling adapter submodules
 /// ([`super::deep_classification_adapters`], etc.) so every
 /// Classification3 family shares the same row-validator.
-pub(super) fn classification3_per_row(probs: &Array2<f32>) -> Result<Vec<ExpertPrediction>> {
+pub(super) fn classification3_per_row(probs: &Array2<f64>) -> Result<Vec<ExpertPrediction>> {
+    classification3_per_row_with_validity(probs, &vec![FeatureCellValidity::Valid; probs.nrows()])
+}
+
+pub(super) fn classification3_per_row_with_validity(
+    probs: &Array2<f64>,
+    validity: &[FeatureCellValidity],
+) -> Result<Vec<ExpertPrediction>> {
     if probs.ncols() != 3 {
         anyhow::bail!(
             "tree expert predict_proba returned {} columns; ExpertOutputKind::Classification3 \
@@ -75,11 +83,19 @@ pub(super) fn classification3_per_row(probs: &Array2<f32>) -> Result<Vec<ExpertP
             probs.ncols()
         );
     }
+    if validity.len() != probs.nrows() {
+        anyhow::bail!(
+            "classification validity has {} rows; probability matrix has {}",
+            validity.len(),
+            probs.nrows()
+        );
+    }
     let mut out = Vec::with_capacity(probs.nrows());
-    for row in probs.outer_iter() {
+    for (row_index, row) in probs.outer_iter().enumerate() {
         let pred = ExpertPrediction {
             kind: ExpertOutputKind::Classification3,
             values: row.to_vec(),
+            validity: validity[row_index],
         };
         pred.validate()?;
         out.push(pred);
@@ -139,10 +155,11 @@ impl ExpertModel for LightGbmAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "lightgbm predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -230,10 +247,11 @@ impl ExpertModel for XgboostAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| format!("{} predict_proba failed", self.canonical_name))?;
         classification3_per_row(&probs)
     }
@@ -343,10 +361,11 @@ impl ExpertModel for CatboostAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| format!("{} predict_proba failed", self.canonical_name))?;
         classification3_per_row(&probs)
     }
@@ -422,10 +441,11 @@ impl ExpertModel for SklearsTreeAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "sklears_tree predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -597,19 +617,19 @@ mod tests {
     #[test]
     fn classification3_per_row_rejects_wrong_column_count() {
         // Build a (2, 4) matrix — must reject as not-3-columns.
-        let probs = Array2::<f32>::zeros((2, 4));
+        let probs = Array2::<f64>::zeros((2, 4));
         assert!(classification3_per_row(&probs).is_err());
     }
 
     #[test]
     fn classification3_per_row_rejects_row_with_invalid_sum() {
-        let probs = ndarray::array![[0.5_f32, 0.5, 0.5]]; // sums to 1.5
+        let probs = ndarray::array![[0.5_f64, 0.5, 0.5]]; // sums to 1.5
         assert!(classification3_per_row(&probs).is_err());
     }
 
     #[test]
     fn classification3_per_row_accepts_well_formed_matrix() {
-        let probs = ndarray::array![[0.2_f32, 0.5, 0.3], [0.7, 0.2, 0.1], [0.1, 0.1, 0.8]];
+        let probs = ndarray::array![[0.2_f64, 0.5, 0.3], [0.7, 0.2, 0.1], [0.1, 0.1, 0.8]];
         let preds = classification3_per_row(&probs).expect("ok");
         assert_eq!(preds.len(), 3);
         assert_eq!(preds[0].values, vec![0.2, 0.5, 0.3]);

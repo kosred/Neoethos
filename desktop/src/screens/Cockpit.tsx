@@ -12,6 +12,7 @@ import {
   type ExecResult,
 } from "../api";
 import { useSpotStream, useAccountStream } from "../hooks";
+import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
 
 const fmt = (v: number | undefined, d = 2) =>
   v === undefined ? "—" : v.toLocaleString(undefined, { maximumFractionDigits: d });
@@ -22,7 +23,9 @@ export default function Cockpit() {
   const [universe, setUniverse] = useState<BrokerSymbol[]>([]);
   const [symbol, setSymbol] = useState("EURUSD");
   const [tf, setTf] = useState("H1");
-  const [tfs, setTfs] = useState<string[]>(["M1", "M5", "M15", "M30", "H1", "H4", "D1"]);
+  const [tfs, setTfs] = useState<string[]>([
+    ...CANONICAL_BROKER_TIMEFRAMES,
+  ]);
   const [indicator, setIndicator] = useState("");
   const [filter, setFilter] = useState("");
 

@@ -1,16 +1,16 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
-use crate::cuda::moving_averages::ma_selector::{CudaMaData, CudaMaDeviceDataRef, CudaMaSelector};
+use crate::cuda::CudaDeviceSliceF32Ref;
 use crate::cuda::moving_averages::DeviceArrayF32;
+use crate::cuda::moving_averages::ma_selector::{CudaMaData, CudaMaDeviceDataRef, CudaMaSelector};
 use crate::cuda::moving_averages::{CudaEmaError, CudaSmaError, CudaWmaError, CudaZlemaError};
 use crate::cuda::runtime::CudaSession;
-use crate::cuda::CudaDeviceSliceF32Ref;
 use crate::indicators::eri::{EriBatchRange, EriParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -104,11 +104,6 @@ impl CudaEri {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/eri_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("eri_kernel")?;
         let stream = Arc::new(Stream::new(StreamFlags::NON_BLOCKING, None)?);
         Ok(Self {
@@ -123,11 +118,6 @@ impl CudaEri {
     }
 
     pub fn from_session(session: Arc<CudaSession>) -> Result<Self, CudaEriError> {
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/eri_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("eri_kernel")?;
         Ok(Self {
             module,
@@ -351,7 +341,7 @@ impl CudaEri {
                     {
                         Some(v) => v as u64,
                         None => {
-                            return Err(CudaEriError::InvalidInput("row offset overflow".into()))
+                            return Err(CudaEriError::InvalidInput("row offset overflow".into()));
                         }
                     };
                     unsafe {
@@ -461,7 +451,11 @@ impl CudaEri {
             {
                 eprintln!(
                     "[eri] batch kernel (one-series→many-params): block_x={} P={} rows={} ma_type={} first_valid={}",
-                    block_x, periods.len(), len, sweep.ma_type, first_valid
+                    block_x,
+                    periods.len(),
+                    len,
+                    sweep.ma_type,
+                    first_valid
                 );
                 unsafe {
                     (*(self as *const _ as *mut CudaEri)).debug_batch_logged = true;
@@ -514,7 +508,14 @@ impl CudaEri {
             let block: BlockSize = (block_x, 1, 1).into();
             if std::env::var("BENCH_DEBUG").ok().as_deref() == Some("1") && !self.debug_batch_logged
             {
-                eprintln!("[eri] batch kernel (fallback per-row): block_x={} rows={} len={} ma_type={} first_valid={}", block_x, periods.len(), len, sweep.ma_type, first_valid);
+                eprintln!(
+                    "[eri] batch kernel (fallback per-row): block_x={} rows={} len={} ma_type={} first_valid={}",
+                    block_x,
+                    periods.len(),
+                    len,
+                    sweep.ma_type,
+                    first_valid
+                );
                 unsafe {
                     (*(self as *const _ as *mut CudaEri)).debug_batch_logged = true;
                 }
@@ -539,7 +540,7 @@ impl CudaEri {
                     {
                         Some(v) => v,
                         None => {
-                            return Err(CudaEriError::InvalidInput("row offset overflow".into()))
+                            return Err(CudaEriError::InvalidInput("row offset overflow".into()));
                         }
                     };
                     let row_off_bytes = row_bytes as u64;

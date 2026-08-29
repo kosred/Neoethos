@@ -6,55 +6,53 @@
 #include <math.h>
 
 
-static __forceinline__ __device__ float warp_reduce_sum(float v) {
-    unsigned mask = 0xFFFFFFFFu;
-    #pragma unroll
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(mask, v, offset);
-    }
-    return v;
-}
-
-static __forceinline__ __device__ float block_reduce_sum(float v) {
-    __shared__ float warp_sums[32];
-    const int lane = threadIdx.x & (warpSize - 1);
-    const int wid  = threadIdx.x >> 5;
-    v = warp_reduce_sum(v);
-    if (lane == 0) warp_sums[wid] = v;
-    __syncthreads();
-    float block_sum = 0.0f;
-    if (wid == 0 && lane == 0) {
-        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-
-        float c = 0.0f;
-        #pragma unroll 1
-        for (int i = 0; i < num_warps; ++i) {
-            float y = warp_sums[i] - c;
-            float t = block_sum + y;
-            c = (t - block_sum) - y;
-            block_sum = t;
-        }
-        block_sum += c;
-    }
-
-    return (wid == 0 && lane == 0) ? block_sum : 0.0f;
-}
-
-
 __device__ __forceinline__ float dev_nan() { return __int_as_float(0x7fffffff); }
 
+static constexpr double NATR_TA_EPSILON = 1.0e-14;
 
-__device__ __forceinline__ float safe_scale_100_over_close(float c) {
-    return (isfinite(c) && c != 0.0f) ? (100.0f / c) : dev_nan();
+__device__ __forceinline__ double natr_true_range_f32(
+    float high, float low, float previous_close) {
+    const double high_value = (double)high;
+    const double low_value = (double)low;
+    const double previous_close_value = (double)previous_close;
+    double greatest = high_value - low_value;
+    const double high_distance = fabs(previous_close_value - high_value);
+    if (high_distance > greatest) greatest = high_distance;
+    const double low_distance = fabs(previous_close_value - low_value);
+    if (low_distance > greatest) greatest = low_distance;
+    return greatest;
 }
 
+__device__ __forceinline__ double natr_true_range_f64(
+    double high, double low, double previous_close) {
+    double greatest = high - low;
+    const double high_distance = fabs(previous_close - high);
+    if (high_distance > greatest) greatest = high_distance;
+    const double low_distance = fabs(previous_close - low);
+    if (low_distance > greatest) greatest = low_distance;
+    return greatest;
+}
 
-__device__ __forceinline__ void ema_update_kahan(float& atr, float& c, float alpha, float x) {
+__device__ __forceinline__ double natr_wilder_step_f64(
+    double previous, double true_range, int period) {
+    double next = previous;
+    next *= (double)(period - 1);
+    next += true_range;
+    next /= (double)period;
+    return next;
+}
 
-    float y = __fmaf_rn(alpha, x - (atr + c), 0.0f);
-    float t = atr + y;
-    c = (t - atr) - y;
-    atr = t;
+__device__ __forceinline__ float natr_output_f32(double atr, float close, int period) {
+    if (period <= 1) return (float)atr;
+    const double close_value = (double)close;
+    if (close_value > -NATR_TA_EPSILON && close_value < NATR_TA_EPSILON) return 0.0f;
+    return (float)((atr / close_value) * 100.0);
+}
+
+__device__ __forceinline__ float safe_scale_100_over_close(float c) {
+    const double close_value = (double)c;
+    if (close_value > -NATR_TA_EPSILON && close_value < NATR_TA_EPSILON) return 0.0f;
+    return (float)(100.0 / close_value);
 }
 
 extern "C" __global__ void natr_tr_from_hlc_f32(
@@ -74,14 +72,10 @@ extern "C" __global__ void natr_tr_from_hlc_f32(
     const float hi = high[t];
     const float lo = low[t];
     if (t == first_valid) {
-        tr_out[t] = hi - lo;
+        tr_out[t] = 0.0f;
         return;
     }
-    const float pc = close[t - 1];
-    const float hl = hi - lo;
-    const float hc = fabsf(hi - pc);
-    const float lc = fabsf(lo - pc);
-    tr_out[t] = fmaxf(hl, fmaxf(hc, lc));
+    tr_out[t] = (float)natr_true_range_f32(hi, lo, close[t - 1]);
 }
 
 
@@ -105,60 +99,28 @@ extern "C" __global__ void natr_batch_f32(
     float*       __restrict__ out)
 {
     const int combo = blockIdx.x;
-    if (combo >= n_combos) return;
+    if (combo >= n_combos || threadIdx.x != 0) return;
 
     const int period = periods[combo];
-    if (period <= 0) return;
-
-    const int warm = first_valid + period - 1;
     const int base = combo * series_len;
-
-
-    if (first_valid >= series_len || warm >= series_len) {
-        for (int idx = threadIdx.x; idx < series_len; idx += blockDim.x) {
-            out[base + idx] = dev_nan();
-        }
+    if (period <= 0 || first_valid < 0 || first_valid >= series_len ||
+        (series_len - first_valid) <= period) {
+        for (int idx = 0; idx < series_len; ++idx) out[base + idx] = dev_nan();
         return;
     }
 
+    const int warm = first_valid + period;
+    for (int idx = 0; idx < warm; ++idx) out[base + idx] = dev_nan();
 
-    for (int idx = threadIdx.x; idx < warm; idx += blockDim.x) {
-        out[base + idx] = dev_nan();
-    }
-    __syncthreads();
-
-
-    const int start = first_valid;
-    float local_sum = 0.0f;
-    float local_c   = 0.0f;
-    for (int k = threadIdx.x; k < period; k += blockDim.x) {
-        const float v = tr[start + k];
-        float y = v - local_c;
-        float t = local_sum + y;
-        local_c = (t - local_sum) - y;
-        local_sum = t;
-    }
-    local_sum += local_c;
-    const float sum_f = block_reduce_sum(local_sum);
-
-    if (threadIdx.x != 0) return;
-
-    const double inv_p = 1.0 / static_cast<double>(period);
-    double atr = static_cast<double>(sum_f) * inv_p;
-
-
-    {
-        float c = close[warm];
-        float scale = safe_scale_100_over_close(c);
-        out[base + warm] = (scale == scale) ? static_cast<float>(atr * static_cast<double>(scale)) : dev_nan();
-    }
+    double sum = 0.0;
+    for (int idx = first_valid + 1; idx <= warm; ++idx) sum += (double)tr[idx];
+    double atr = sum / (double)period;
+    out[base + warm] = natr_output_f32(atr, close[warm], period);
 
     for (int t = warm + 1; t < series_len; ++t) {
         const double trv = static_cast<double>(tr[t]);
-        atr = (trv - atr) * inv_p + atr;
-        float c = close[t];
-        float scale = safe_scale_100_over_close(c);
-        out[base + t] = (scale == scale) ? static_cast<float>(atr * static_cast<double>(scale)) : dev_nan();
+        atr = natr_wilder_step_f64(atr, trv, period);
+        out[base + t] = natr_output_f32(atr, close[t], period);
     }
 }
 
@@ -173,54 +135,28 @@ extern "C" __global__ void natr_batch_f32_with_inv(
     float*       __restrict__ out)
 {
     const int combo = blockIdx.x;
-    if (combo >= n_combos) return;
+    if (combo >= n_combos || threadIdx.x != 0) return;
 
     const int period = periods[combo];
-    if (period <= 0) return;
-
-    const int warm = first_valid + period - 1;
     const int base = combo * series_len;
-
-    if (first_valid >= series_len || warm >= series_len) {
-        for (int idx = threadIdx.x; idx < series_len; idx += blockDim.x) {
-            out[base + idx] = dev_nan();
-        }
+    if (period <= 0 || first_valid < 0 || first_valid >= series_len ||
+        (series_len - first_valid) <= period) {
+        for (int idx = 0; idx < series_len; ++idx) out[base + idx] = dev_nan();
         return;
     }
 
-    for (int idx = threadIdx.x; idx < warm; idx += blockDim.x) {
-        out[base + idx] = dev_nan();
-    }
-    __syncthreads();
+    const int warm = first_valid + period;
+    for (int idx = 0; idx < warm; ++idx) out[base + idx] = dev_nan();
 
-    const int start = first_valid;
-    float local_sum = 0.0f;
-    float local_c   = 0.0f;
-    for (int k = threadIdx.x; k < period; k += blockDim.x) {
-        const float v = tr[start + k];
-        float y = v - local_c;
-        float t = local_sum + y;
-        local_c = (t - local_sum) - y;
-        local_sum = t;
-    }
-    local_sum += local_c;
-    const float sum_f = block_reduce_sum(local_sum);
-
-    if (threadIdx.x != 0) return;
-
-    const double inv_p = 1.0 / static_cast<double>(period);
-    double atr = static_cast<double>(sum_f) * inv_p;
-
-    {
-        float scale = inv_close100[warm];
-        out[base + warm] = (scale == scale) ? static_cast<float>(atr * static_cast<double>(scale)) : dev_nan();
-    }
+    double sum = 0.0;
+    for (int idx = first_valid + 1; idx <= warm; ++idx) sum += (double)tr[idx];
+    double atr = sum / (double)period;
+    out[base + warm] = period <= 1 ? (float)atr : (float)(atr * (double)inv_close100[warm]);
 
     for (int t = warm + 1; t < series_len; ++t) {
         const double trv = static_cast<double>(tr[t]);
-        atr = (trv - atr) * inv_p + atr;
-        float scale = inv_close100[t];
-        out[base + t] = (scale == scale) ? static_cast<float>(atr * static_cast<double>(scale)) : dev_nan();
+        atr = natr_wilder_step_f64(atr, trv, period);
+        out[base + t] = period <= 1 ? (float)atr : (float)(atr * (double)inv_close100[t]);
     }
 }
 
@@ -236,82 +172,27 @@ extern "C" __global__ void natr_batch_warp_io_f32(
 {
     if (blockDim.x != 32) return;
     const int combo = blockIdx.x;
-    if (combo >= n_combos) return;
+    const int lane = threadIdx.x & (warpSize - 1);
+    if (combo >= n_combos || lane != 0) return;
 
     const int period = periods[combo];
-    if (period <= 0) return;
-
-    const int warm = first_valid + period - 1;
     const int base = combo * series_len;
-
-    const int lane = threadIdx.x & (warpSize - 1);
-    const unsigned mask = 0xFFFFFFFFu;
-
-    if (first_valid >= series_len || warm >= series_len) {
-        for (int idx = lane; idx < series_len; idx += warpSize) {
-            out[base + idx] = dev_nan();
-        }
+    if (period <= 0 || first_valid < 0 || first_valid >= series_len ||
+        (series_len - first_valid) <= period) {
+        for (int idx = 0; idx < series_len; ++idx) out[base + idx] = dev_nan();
         return;
     }
 
-    for (int idx = lane; idx < warm; idx += warpSize) {
-        out[base + idx] = dev_nan();
-    }
+    const int warm = first_valid + period;
+    for (int idx = 0; idx < warm; ++idx) out[base + idx] = dev_nan();
 
-
-    const int start = first_valid;
-    float local_sum = 0.0f;
-    float local_c   = 0.0f;
-    for (int k = lane; k < period; k += warpSize) {
-        const float v = tr[start + k];
-        float y = v - local_c;
-        float t = local_sum + y;
-        local_c = (t - local_sum) - y;
-        local_sum = t;
-    }
-    local_sum += local_c;
-    const float sum_f = warp_reduce_sum(local_sum);
-
-    __shared__ float sh_tr[32];
-    __shared__ float sh_scale[32];
-    __shared__ double sh_atr[32];
-
-    const double inv_p = 1.0 / static_cast<double>(period);
-    double atr = 0.0;
-    if (lane == 0) {
-        atr = static_cast<double>(sum_f) * inv_p;
-    }
-
-    for (int tile = warm; tile < series_len; tile += warpSize) {
-        const int t = tile + lane;
-        const bool valid = (t < series_len);
-
-        if (valid) {
-            sh_tr[lane] = tr[t];
-            sh_scale[lane] = safe_scale_100_over_close(close[t]);
-        }
-        __syncwarp(mask);
-
-        if (lane == 0) {
-            #pragma unroll
-            for (int o = 0; o < 32; ++o) {
-                const int tt = tile + o;
-                if (tt >= series_len) break;
-                if (tt != warm) {
-                    const double trv = static_cast<double>(sh_tr[o]);
-                    atr = (trv - atr) * inv_p + atr;
-                }
-                sh_atr[o] = atr;
-            }
-        }
-        __syncwarp(mask);
-
-        if (valid) {
-            const double a = sh_atr[lane];
-            const float scale = sh_scale[lane];
-            out[base + t] = (scale == scale) ? static_cast<float>(a * static_cast<double>(scale)) : dev_nan();
-        }
-        __syncwarp(mask);
+    double sum = 0.0;
+    for (int idx = first_valid + 1; idx <= warm; ++idx) sum += (double)tr[idx];
+    double atr = sum / (double)period;
+    out[base + warm] = natr_output_f32(atr, close[warm], period);
+    for (int idx = warm + 1; idx < series_len; ++idx) {
+        atr = natr_wilder_step_f64(atr, (double)tr[idx], period);
+        out[base + idx] = natr_output_f32(atr, close[idx], period);
     }
 }
 
@@ -326,81 +207,27 @@ extern "C" __global__ void natr_batch_warp_io_f32_with_inv(
 {
     if (blockDim.x != 32) return;
     const int combo = blockIdx.x;
-    if (combo >= n_combos) return;
+    const int lane = threadIdx.x & (warpSize - 1);
+    if (combo >= n_combos || lane != 0) return;
 
     const int period = periods[combo];
-    if (period <= 0) return;
-
-    const int warm = first_valid + period - 1;
     const int base = combo * series_len;
-
-    const int lane = threadIdx.x & (warpSize - 1);
-    const unsigned mask = 0xFFFFFFFFu;
-
-    if (first_valid >= series_len || warm >= series_len) {
-        for (int idx = lane; idx < series_len; idx += warpSize) {
-            out[base + idx] = dev_nan();
-        }
+    if (period <= 0 || first_valid < 0 || first_valid >= series_len ||
+        (series_len - first_valid) <= period) {
+        for (int idx = 0; idx < series_len; ++idx) out[base + idx] = dev_nan();
         return;
     }
 
-    for (int idx = lane; idx < warm; idx += warpSize) {
-        out[base + idx] = dev_nan();
-    }
+    const int warm = first_valid + period;
+    for (int idx = 0; idx < warm; ++idx) out[base + idx] = dev_nan();
 
-    const int start = first_valid;
-    float local_sum = 0.0f;
-    float local_c   = 0.0f;
-    for (int k = lane; k < period; k += warpSize) {
-        const float v = tr[start + k];
-        float y = v - local_c;
-        float t = local_sum + y;
-        local_c = (t - local_sum) - y;
-        local_sum = t;
-    }
-    local_sum += local_c;
-    const float sum_f = warp_reduce_sum(local_sum);
-
-    __shared__ float sh_tr[32];
-    __shared__ float sh_scale[32];
-    __shared__ double sh_atr[32];
-
-    const double inv_p = 1.0 / static_cast<double>(period);
-    double atr = 0.0;
-    if (lane == 0) {
-        atr = static_cast<double>(sum_f) * inv_p;
-    }
-
-    for (int tile = warm; tile < series_len; tile += warpSize) {
-        const int t = tile + lane;
-        const bool valid = (t < series_len);
-
-        if (valid) {
-            sh_tr[lane] = tr[t];
-            sh_scale[lane] = inv_close100[t];
-        }
-        __syncwarp(mask);
-
-        if (lane == 0) {
-            #pragma unroll
-            for (int o = 0; o < 32; ++o) {
-                const int tt = tile + o;
-                if (tt >= series_len) break;
-                if (tt != warm) {
-                    const double trv = static_cast<double>(sh_tr[o]);
-                    atr = (trv - atr) * inv_p + atr;
-                }
-                sh_atr[o] = atr;
-            }
-        }
-        __syncwarp(mask);
-
-        if (valid) {
-            const double a = sh_atr[lane];
-            const float scale = sh_scale[lane];
-            out[base + t] = (scale == scale) ? static_cast<float>(a * static_cast<double>(scale)) : dev_nan();
-        }
-        __syncwarp(mask);
+    double sum = 0.0;
+    for (int idx = first_valid + 1; idx <= warm; ++idx) sum += (double)tr[idx];
+    double atr = sum / (double)period;
+    out[base + warm] = period <= 1 ? (float)atr : (float)(atr * (double)inv_close100[warm]);
+    for (int idx = warm + 1; idx < series_len; ++idx) {
+        atr = natr_wilder_step_f64(atr, (double)tr[idx], period);
+        out[base + idx] = period <= 1 ? (float)atr : (float)(atr * (double)inv_close100[idx]);
     }
 }
 
@@ -437,68 +264,38 @@ extern "C" __global__ void natr_many_series_one_param_f32(
             continue;
         }
 
-        const int warm_end = fv + period;
-        if (warm_end > series_len) {
+        const int warm = fv + period;
+        if (warm >= series_len) {
             for (int t = lane; t < series_len; t += warpSize) {
                 out_tm[t * stride + s] = dev_nan();
             }
             continue;
         }
 
-        const int warm = warm_end - 1;
         for (int t = lane; t < warm; t += warpSize) {
             out_tm[t * stride + s] = dev_nan();
         }
 
-
-        float local = 0.0f, csum = 0.0f;
-        #pragma unroll 1
-        for (int k = lane; k < period; k += warpSize) {
-            const int t = fv + k;
-            const float h = high_tm[t * stride + s];
-            const float l = low_tm[t * stride + s];
-            float trv;
-            if (t == fv) {
-                trv = h - l;
-            } else {
-                const float pc = close_tm[(t - 1) * stride + s];
-                const float hl = h - l;
-                const float hc = fabsf(h - pc);
-                const float lc = fabsf(l - pc);
-                trv = fmaxf(hl, fmaxf(hc, lc));
-            }
-            float y = trv - csum;
-            float tmp = local + y;
-            csum = (tmp - local) - y;
-            local = tmp;
-        }
-        local += csum;
-        float sum = warp_reduce_sum(local);
-
         if (lane == 0) {
-            const double inv_p = 1.0 / static_cast<double>(period);
-            double atr = static_cast<double>(sum) * inv_p;
-
-            {
-                float c = close_tm[warm * stride + s];
-                float scale = safe_scale_100_over_close(c);
-                out_tm[warm * stride + s] = (scale == scale) ? static_cast<float>(atr * static_cast<double>(scale)) : dev_nan();
+            double sum = 0.0;
+            for (int t = fv + 1; t <= warm; ++t) {
+                sum += natr_true_range_f32(
+                    high_tm[t * stride + s],
+                    low_tm[t * stride + s],
+                    close_tm[(t - 1) * stride + s]);
             }
+            double atr = sum / (double)period;
+            out_tm[warm * stride + s] =
+                natr_output_f32(atr, close_tm[warm * stride + s], period);
 
             for (int t = warm + 1; t < series_len; ++t) {
-                const float h = high_tm[t * stride + s];
-                const float l = low_tm[t * stride + s];
-                const float pc = close_tm[(t - 1) * stride + s];
-                const float hl = h - l;
-                const float hc = fabsf(h - pc);
-                const float lc = fabsf(l - pc);
-                const double trv = static_cast<double>(fmaxf(hl, fmaxf(hc, lc)));
-
-                atr = (trv - atr) * inv_p + atr;
-
-                float c = close_tm[t * stride + s];
-                float scale = safe_scale_100_over_close(c);
-                out_tm[t * stride + s] = (scale == scale) ? static_cast<float>(atr * static_cast<double>(scale)) : dev_nan();
+                const double true_range = natr_true_range_f32(
+                    high_tm[t * stride + s],
+                    low_tm[t * stride + s],
+                    close_tm[(t - 1) * stride + s]);
+                atr = natr_wilder_step_f64(atr, true_range, period);
+                out_tm[t * stride + s] =
+                    natr_output_f32(atr, close_tm[t * stride + s], period);
             }
         }
     }
@@ -510,16 +307,10 @@ extern "C" __global__ void natr_many_series_one_param_f32(
  * ---------------------------------------------------------------------------
  * CPU oracle: src/indicators/natr.rs:288 `natr_scalar`.
  *
- * THE BUG THE BRIEF NAMES, fixed here. The f32 kernels above carry
- *     atr = (atr * pm1 + tr) * inv_p      // three roundings
- * while the CPU carries
- *     atr = (tr - atr).mul_add(inv_p, atr)   // ONE rounding
- * Those are different numbers, and natr feeds a threshold comparison.
- *
- * NaN: `tr1.max(tr2).max(tr3)` is `f64::max`, which RETURNS THE NON-NaN
- * OPERAND. An `a > b ? a : b` chain does the opposite — a comparison against
- * NaN is false, so the NaN survives and poisons every later bar of the
- * recurrence. `fmax` has f64::max's semantics; the chain does not.
+ * TA-Lib authority requires input-order seed accumulation and the Wilder
+ * multiply/add/divide recurrence as three separate operations.  True Range
+ * starts from high-low and conditionally replaces it with the previous-close
+ * distances in that exact order.
  *
  * first_valid rule: natr.rs:226-235 takes fh.max(fl).max(fc) — the MAX of
  * three INDEPENDENT first-non-NaN scans, NOT the first index at which all
@@ -547,41 +338,40 @@ void natr_neo_batch_f64(const double* __restrict__ high,
     double* __restrict__ o = out + (size_t)combo * (size_t)len;
     const int period = periods[combo];
 
-    if (period <= 0 || period > len || first_valid < 0 || first_valid >= len ||
-        (len - first_valid) < period) {
+    if (period <= 0 || period >= len || first_valid < 0 || first_valid >= len ||
+        (len - first_valid) <= period) {
         for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
         return;
     }
 
-    const int warm_end = first_valid + period - 1;
+    const int warm_end = first_valid + period;
     for (int i = 0; i < warm_end && i < len; ++i) o[i] = NEO_F64_NAN;
 
-    const double inv_p = 1.0 / (double)period;
-    const double k100  = 100.0;
-
-    // natr.rs:307 — the FIRST bar's TR is the bare range, with no previous
-    // close. Seeding it as a three-way max against close[first-1] would read a
-    // bar the CPU never looks at.
-    double sum_tr = high[first_valid] - low[first_valid];
+    double sum_tr = 0.0;
     for (int i = first_valid + 1; i <= warm_end; ++i) {
-        const double hi = high[i];
-        const double lo = low[i];
-        const double pc = close[i - 1];
-        const double tr = fmax(fmax(hi - lo, fabs(hi - pc)), fabs(lo - pc));
-        sum_tr += tr;
+        sum_tr += natr_true_range_f64(high[i], low[i], close[i - 1]);
     }
 
-    double atr = sum_tr * inv_p;
+    double atr = sum_tr / (double)period;
     const double c_we = close[warm_end];
-    o[warm_end] = (isfinite(c_we) && c_we != 0.0) ? (atr / c_we) * k100 : NEO_F64_NAN;
+    if (period <= 1) {
+        o[warm_end] = atr;
+    } else if (c_we > -NATR_TA_EPSILON && c_we < NATR_TA_EPSILON) {
+        o[warm_end] = 0.0;
+    } else {
+        o[warm_end] = (atr / c_we) * 100.0;
+    }
 
     for (int idx = warm_end + 1; idx < len; ++idx) {
-        const double hi = high[idx];
-        const double lo = low[idx];
-        const double pc = close[idx - 1];
-        const double tr = fmax(fmax(hi - lo, fabs(hi - pc)), fabs(lo - pc));
-        atr = fma(tr - atr, inv_p, atr);            // ONE rounding, as the CPU
+        const double tr = natr_true_range_f64(high[idx], low[idx], close[idx - 1]);
+        atr = natr_wilder_step_f64(atr, tr, period);
         const double cv = close[idx];
-        o[idx] = (isfinite(cv) && cv != 0.0) ? (atr / cv) * k100 : NEO_F64_NAN;
+        if (period <= 1) {
+            o[idx] = atr;
+        } else if (cv > -NATR_TA_EPSILON && cv < NATR_TA_EPSILON) {
+            o[idx] = 0.0;
+        } else {
+            o[idx] = (atr / cv) * 100.0;
+        }
     }
 }

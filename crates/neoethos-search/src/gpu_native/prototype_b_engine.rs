@@ -59,7 +59,7 @@ impl PrototypeBPopulationInputs {
                     short_threshold: genes.short_thresholds[index],
                     stop_ticks: 0,
                     target_ticks: 0,
-                    stop_vol_multiplier: genes.stop_vol_multipliers[index] as f32,
+                    stop_vol_multiplier: genes.stop_vol_multipliers[index],
                     flags: 0,
                     reserved: 0,
                 }
@@ -84,6 +84,44 @@ impl PrototypeBPopulationInputs {
             settings,
         })
     }
+}
+
+/// Host-to-device bytes copied by the native dataset upload.
+///
+/// Keep this identical to `neoethos_gpu_cuda_population_upload_dataset`: the
+/// transfer ledger is evidence about real traffic, not an estimate based on a
+/// retired element width.
+#[cfg(any(test, feature = "gpu-b-native"))]
+fn prototype_b_dataset_upload_bytes(upload: &PrototypeADatasetUpload) -> u64 {
+    let adaptive_base_len = upload
+        .settings
+        .adaptive_base_pips
+        .as_ref()
+        .map_or(0, Vec::len);
+    (upload.close.len() * 3 * std::mem::size_of::<f64>()
+        + upload.indicators.len() * std::mem::size_of::<f64>()
+        + upload.months.len() * 3 * std::mem::size_of::<i64>()
+        + upload.smc_data.len() * 11 * std::mem::size_of::<i8>()
+        + adaptive_base_len * std::mem::size_of::<f64>()) as u64
+}
+
+/// Host-to-device bytes copied by the native gene upload.
+///
+/// Five f64 values are uploaded per gene (long/short thresholds, fixed stop,
+/// fixed target, and adaptive-stop multiplier), plus f64 CSR and SMC weights.
+/// The scalar gate is assigned in the native session and does not cross a CUDA
+/// memcpy boundary, matching the native diagnostic exactly.
+#[cfg(any(test, feature = "gpu-b-native"))]
+fn prototype_b_gene_upload_bytes(upload: &PrototypeAGeneUpload) -> u64 {
+    let population = upload.population();
+    let terms = upload.indices.len();
+    (population
+        * (std::mem::size_of::<u64>()
+            + 5 * std::mem::size_of::<f64>()
+            + 11 * std::mem::size_of::<i8>())
+        + (population + 1) * std::mem::size_of::<i32>()
+        + terms * (std::mem::size_of::<i32>() + std::mem::size_of::<f64>())
+        + 11 * std::mem::size_of::<f64>()) as u64
 }
 
 /// Reject any population that is outside the declared common B/C intersection
@@ -423,10 +461,7 @@ mod cuda_engine {
                 .upload_dataset(view)
                 .map_err(|error| map_native_error("prototype_b_upload_dataset", error))?;
 
-            let upload_bytes = (upload.close.len() * 3 * size_of::<f64>()
-                + upload.indicators.len() * size_of::<f32>()
-                + upload.months.len() * 3 * size_of::<i64>()
-                + smc_rows.len()) as u64;
+            let upload_bytes = super::prototype_b_dataset_upload_bytes(&upload);
             let handle = self.session.allocate_handle::<DatasetHandle>();
             self.session.transfers().record_dataset_upload(upload_bytes);
             self.session.backend_mut().dataset = Some(DatasetSlot {
@@ -463,10 +498,7 @@ mod cuda_engine {
                 .upload_genes(view)
                 .map_err(|error| map_native_error("prototype_b_upload_genes", error))?;
 
-            let upload_bytes = (upload.candidate_ids.len() * size_of::<u64>()
-                + upload.offsets.len() * size_of::<i32>()
-                + upload.indices.len() * (size_of::<i32>() + size_of::<f32>())
-                + inputs.smc_flags.len()) as u64;
+            let upload_bytes = super::prototype_b_gene_upload_bytes(&upload);
             let handle = self.session.allocate_handle::<GeneBufferHandle>();
             self.session.transfers().record_gene_upload(upload_bytes);
             let resources = self.session.backend_mut();
@@ -702,11 +734,6 @@ mod cuda_engine {
                 .read_diagnostics()
                 .map_err(|error| map_native_error("prototype_b_read_diagnostics", error))
         }
-
-        /// Emitted event count of the most recent evaluation.
-        pub fn emitted_events(&self) -> usize {
-            self.session.backend().session.emitted_events()
-        }
     }
 
     /// Unused-field guard: the dataset slot keeps the flattened SMC rows alive
@@ -753,6 +780,55 @@ mod tests {
         }
         assert_eq!(inputs.smc_flags.len(), genes.population() * 11);
         assert_eq!(inputs.smc_rows.len(), dataset.bars() * 11);
+    }
+
+    #[test]
+    fn prototype_b_f64_adapter_contract_counts_exact_uploaded_bytes() {
+        let (mut dataset, genes, _) = uploads();
+        dataset.settings.adaptive_base_pips = Some(vec![2.0; dataset.bars()]);
+
+        let expected_dataset = dataset.close.len() * 3 * std::mem::size_of::<f64>()
+            + dataset.indicators.len() * std::mem::size_of::<f64>()
+            + dataset.months.len() * 3 * std::mem::size_of::<i64>()
+            + dataset.smc_data.len() * 11 * std::mem::size_of::<i8>()
+            + dataset.bars() * std::mem::size_of::<f64>();
+        assert_eq!(
+            prototype_b_dataset_upload_bytes(&dataset),
+            expected_dataset as u64
+        );
+
+        let population = genes.population();
+        let terms = genes.indices.len();
+        let expected_genes = population
+            * (std::mem::size_of::<u64>()
+                + 5 * std::mem::size_of::<f64>()
+                + 11 * std::mem::size_of::<i8>())
+            + (population + 1) * std::mem::size_of::<i32>()
+            + terms * (std::mem::size_of::<i32>() + std::mem::size_of::<f64>())
+            + 11 * std::mem::size_of::<f64>();
+        assert_eq!(prototype_b_gene_upload_bytes(&genes), expected_genes as u64);
+    }
+
+    #[test]
+    fn prototype_b_f64_adapter_contract_has_no_population_narrowing() {
+        let adapter = include_str!("prototype_b_population_eval.rs");
+        let engine = include_str!("prototype_b_engine.rs");
+        for forbidden in [
+            ["ArrayView2<'_, ", "f32>"].concat(),
+            ["&[", "f32", "]"].concat(),
+            ["Vec<", "f32", ">"].concat(),
+            ["gate_threshold: ", "f32"].concat(),
+        ] {
+            assert!(
+                !adapter.contains(&forbidden),
+                "Prototype B canonical adapter still narrows through {forbidden}"
+            );
+        }
+        let stale_width = ["size_of::<", "f32", ">"].concat();
+        assert!(
+            !engine.contains(&stale_width),
+            "Prototype B transfer accounting still charges an f32 population buffer"
+        );
     }
 
     #[test]
@@ -836,115 +912,6 @@ mod tests {
         let mut values = [1.0_f64; 11];
         values[3] = f64::NAN;
         assert!(compact_rank_fields(&values).is_err());
-    }
-
-    /// Real-device population parity. This test executes; it never reports a
-    /// successful-looking skip. A missing CUDA runtime is the only tolerated
-    /// non-execution, and it is announced explicitly.
-    #[cfg(feature = "gpu-b-native")]
-    #[test]
-    // Ignored, not deleted, and not because it is inconvenient.
-    //
-    // The oracle is a second implementation of the event pipeline: it resolves
-    // an outcome per candidate entry and expects the kernel to have done the
-    // same. The kernel no longer emits events at all — it opens positions from
-    // the signal and decides exits as it walks — so this compares against a
-    // design that is gone, and a failure here says nothing about correctness.
-    //
-    // What replaces it is stronger, not weaker:
-    // `eval::trailing_parity_tests::gpu_matches_cpu_with_a_trailing_stop`
-    // compares the kernel against the CPU engine live trading actually uses,
-    // on P&L rather than exit bars, and passes on a real card.
-    //
-    // Un-ignore by porting the oracle to the walk-based model. Until then this
-    // is dead reference code, and pretending otherwise is how the missing
-    // trailing stop survived a full parity suite for months.
-    #[ignore = "models the retired event pipeline; superseded by gpu_matches_cpu_with_a_trailing_stop"]
-    fn cuda_population_metrics_match_the_canonical_oracle() {
-        use crate::gpu_native::engine::{BacktestEngine, DeviceFilterPolicy};
-        use crate::gpu_native::prototype_population_oracle::evaluate_population_oracle_test_oracle as evaluate_population_oracle;
-
-        let fixture = TinyPopulationFixture::new(4, 192, 4);
-        let workload = fixture
-            .population_workload(PrototypeBcRequirements {
-                prop_firm_state: PropFirmRequirement::NotRequested,
-            })
-            .expect("tiny fixture must produce an eligible B/C workload");
-        let expected = evaluate_population_oracle(&workload).expect("oracle evaluation");
-        let expected_metrics = expected
-            .metrics
-            .iter()
-            .map(|row| row.values)
-            .collect::<Vec<_>>();
-
-        let max_events = workload.genes.population() * workload.dataset.bars();
-        let mut engine = match create_prototype_b_engine(None, 77, max_events) {
-            Ok(engine) => engine,
-            Err(EngineError::UnsupportedCapability { detail, .. }) => {
-                // On a rented GPU a silent skip is worse than a failure: it
-                // reports green while proving nothing and the box is billed.
-                assert!(
-                    std::env::var("NEOETHOS_REQUIRE_GPU").as_deref() != Ok("1"),
-                    "NEOETHOS_REQUIRE_GPU=1 but no CUDA runtime is available: {detail}"
-                );
-                eprintln!("Prototype B CUDA parity skipped: no CUDA runtime ({detail})");
-                return;
-            }
-            Err(error) => panic!("Prototype B session creation failed: {error}"),
-        };
-
-        let dataset = engine
-            .upload_dataset(&workload.dataset.encode().unwrap())
-            .expect("dataset upload");
-        let genes = engine
-            .upload_genes(&workload.genes.encode().unwrap())
-            .expect("gene upload");
-        let scenarios = engine
-            .upload_scenarios(&workload.scenarios.encode().unwrap())
-            .expect("scenario upload");
-        let (metrics, evaluate_event) = engine
-            .evaluate(dataset, genes, scenarios, None)
-            .expect("device evaluation");
-        let (selection, filter_event) = engine
-            .filter(metrics, DeviceFilterPolicy::All, evaluate_event)
-            .expect("device selection");
-        let summary = engine
-            .readback_compact(selection, filter_event)
-            .expect("compact readback");
-
-        assert_eq!(summary.candidate_ids, workload.genes.candidate_ids);
-        assert_eq!(
-            summary.scenario_ids,
-            workload
-                .scenarios
-                .scenarios
-                .iter()
-                .map(|scenario| scenario.scenario_id)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            engine.emitted_events(),
-            expected.events.len(),
-            "device event count must match the canonical emission"
-        );
-
-        // Field-specific tolerance, not bitwise equality: the device is allowed
-        // to contract multiply-add pairs, which the host reference does not.
-        let report =
-            TinyPopulationFixture::compare_final_metrics(&expected_metrics, &summary.metrics);
-        assert!(
-            report.is_match(),
-            "Prototype B level-10 parity failed: {:?}",
-            report.first_divergence
-        );
-
-        // One logical dataset upload, no dense intermediate readback and no
-        // chained re-upload.
-        engine
-            .session()
-            .transfer_snapshot()
-            .assert_device_resident_chain()
-            .expect("device residency invariant");
     }
 
     #[cfg(not(feature = "gpu-b-native"))]

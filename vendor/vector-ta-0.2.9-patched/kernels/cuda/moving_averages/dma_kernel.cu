@@ -1128,8 +1128,9 @@ __global__ void dma_ms1p_tiled_f32_tx1_ty4(const float* __restrict__ prices_tm,
 // carried across bars -- the EMA of price, the two weighted sliding sums that
 // build the hull difference, the weighted sliding sum over the difference
 // ring, and the gain-limited EC recursion whose g is chosen by comparing two
-// candidate residuals. None of that can be rebuilt bar-parallel without
-// changing the rounding.
+// candidate residuals. The creator-defined gain domain is symmetric,
+// -ema_gain_limit..=+ema_gain_limit in integer tenths. None of that can be
+// rebuilt bar-parallel without changing the rounding.
 //
 // The only per-thread array is the difference ring, whose length is
 // round(sqrt(hull_length)); DMA_NEO_MAX_SQRT bounds it and
@@ -1358,13 +1359,15 @@ void dma_neo_batch_f64(const double* __restrict__ data,
                     g_sel = 0.0;
                 } else {
                     const long long limit_i = (long long)ema_gain_limit;
+                    const long long lower_i = -limit_i;
                     const double target = (r / t) * 10.0;
                     long long i0 = dma_neo_floor_to_i64(target);
-                    if (i0 < 0) i0 = 0;
+                    if (i0 < lower_i) i0 = lower_i;
                     else if (i0 > limit_i) i0 = limit_i;
                     const long long i1 = (i0 < limit_i) ? (i0 + 1) : i0;
-                    const double g0 = (double)i0 * 0.1;
-                    const double g1 = (double)i1 * 0.1;
+                    // Dickson's definition constructs gain as value1 / 10.
+                    const double g0 = (double)i0 / 10.0;
+                    const double g1 = (double)i1 / 10.0;
                     const double e0 = fabs(r - t * g0);
                     const double e1 = fabs(r - t * g1);
                     g_sel = (e0 <= e1) ? g0 : g1;

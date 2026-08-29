@@ -870,31 +870,28 @@ extern "C" __global__ void fvg_trailing_stop_many_series_one_param_f32(
 
 
 // ===========================================================================
-// NEOETHOS f64 LANE  --  closer 4, round 3
+// NEOETHOS exact f64 shared authority
 //
-// CPU reference: fvg_ts_scalar (src/indicators/fvg_trailing_stop.rs:172-486).
+// CPU reference: fvg_ts_scalar (src/indicators/fvg_trailing_stop.rs:152-466).
 // At the batch defaults (lookback 5, smoothing 9, reset_on_cross false)
-// fvg_ts_compute_into (:946) routes to fvg_ts_scalar_default_5_9 (:489); that
+// fvg_ts_compute_into routes to fvg_ts_scalar_default_5_9; that
 // function is fvg_ts_scalar with the two windows constant-folded and an
 // ALL_VALID short-circuit on a PREDICATE, not on any arithmetic, so one body
 // reproduces both.
 //
-// OUTPUT: the UPPER band -- compute_fvg_trailing_stop_batch (cpu_batch.rs:14884)
-// resolves output_id == "value" to out.upper.
-//
-// PERIOD-INVARIANT: that batch reads unmitigated_fvg_lookback (5),
-// smoothing_length (9) and reset_on_cross (false) and NEVER `period`
-// (cpu_batch.rs:14862-14867), so a sweep of five periods gets five identical
-// CPU columns and this kernel writes five identical rows.
+// The canonical full route emits [upper, lower, upper_ts, lower_ts] in exactly
+// that order. The preserved primary ABI emits upper only and interprets its
+// period vector as the admitted smoothing_length, with lookback 5 and reset
+// false. Both entry points call the same row below.
 //
 // FIRST-VALID: Ignored, and that is the contract rather than a shrug. The
-// batch calls fvg_trailing_stop_with_kernel (:1040), which allocates with
+// batch calls fvg_trailing_stop_with_kernel, which allocates with
 // alloc_uninit_f64 and applies NO warmup prefix at all -- the prefix in
-// fvg_trailing_stop_into_slices (:1131) is on a different entry point the
+// fvg_trailing_stop_into_slices is on a different entry point the
 // batch does not take. The loop runs from bar 0.
 //
 // SHAPE: one thread per combo walking bars ASCENDING. Two unmitigated-gap
-// buffers are compacted in place at every bar, two nine-wide displacement
+// buffers are compacted in place at every bar, two runtime-sized displacement
 // rings carry a running sum with a NaN count, and the trailing stop is a
 // ratchet whose value reads its own previous value. Nothing here is
 // bar-parallel.
@@ -907,33 +904,32 @@ extern "C" __global__ void fvg_trailing_stop_many_series_one_param_f32(
 // ===========================================================================
 
 #define FVG_TS_NEO_LOOKBACK 5
-#define FVG_TS_NEO_SMOOTH 9
+#define FVG_TS_NEO_MAX_SMOOTHING 200
 
 static __forceinline__ __device__ double fvg_ts_neo_qnan() {
     return __longlong_as_double(0x7ff8000000000000ULL);
 }
 
-extern "C" __global__
-void fvg_trailing_stop_neo_batch_f64(const double* __restrict__ high,
-                                     const double* __restrict__ low,
-                                     const double* __restrict__ close,
-                                     int n,
-                                     const int* __restrict__ periods,
-                                     int n_combos,
-                                     int first_valid,
-                                     double* __restrict__ out) {
-    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
-    if (combo >= n_combos) return;
+static __forceinline__ __device__
+void fvg_trailing_stop_row_f64(const double* __restrict__ high,
+                               const double* __restrict__ low,
+                               const double* __restrict__ close,
+                               int n,
+                               int lookback,
+                               int w,
+                               bool reset_on_cross,
+                               double* __restrict__ bull_buf,
+                               double* __restrict__ bear_buf,
+                               double* __restrict__ bull_ring_vals,
+                               double* __restrict__ bear_ring_vals,
+                               int* __restrict__ bull_ring_nan,
+                               int* __restrict__ bear_ring_nan,
+                               double* __restrict__ upper_row,
+                               double* __restrict__ lower_row,
+                               double* __restrict__ upper_ts_row,
+                               double* __restrict__ lower_ts_row) {
     if (n <= 0) return;
-    (void)periods;      // PERIOD-INVARIANT -- see the header.
-    (void)first_valid;  // Ignored -- see the header.
-
-    double* __restrict__ row = out + (size_t)combo * (size_t)n;
     const double nn = fvg_ts_neo_qnan();
-
-    const int lookback = FVG_TS_NEO_LOOKBACK;
-    const int w = FVG_TS_NEO_SMOOTH;
-    const bool reset_on_cross = false;
 
     // fvg_ts_prepare, :895-917. first_valid_ohlc_status returns usize::MAX
     // when every bar of the triple is NaN, which is AllValuesNaN.
@@ -942,22 +938,20 @@ void fvg_trailing_stop_neo_batch_f64(const double* __restrict__ high,
         if (!isnan(high[i]) && !isnan(low[i]) && !isnan(close[i])) { first = i; break; }
     }
     const int need = 2 + (w > 0 ? w - 1 : 0);
-    if (first < 0 || (n - first) < need) {
-        for (int i = 0; i < n; ++i) row[i] = nn;
+    if (lookback <= 0 || w <= 0 || first < 0 || (n - first) < need) {
+        for (int i = 0; i < n; ++i) {
+            if (upper_row != nullptr) upper_row[i] = nn;
+            if (lower_row != nullptr) lower_row[i] = nn;
+            if (upper_ts_row != nullptr) upper_ts_row[i] = nn;
+            if (lower_ts_row != nullptr) lower_ts_row[i] = nn;
+        }
         return;
     }
 
-    double bull_buf[FVG_TS_NEO_LOOKBACK];
-    double bear_buf[FVG_TS_NEO_LOOKBACK];
     int bull_len = 0, bear_len = 0;
 
     int last_bull_non_na = -1;
     int last_bear_non_na = -1;
-
-    double bull_ring_vals[FVG_TS_NEO_SMOOTH];
-    double bear_ring_vals[FVG_TS_NEO_SMOOTH];
-    bool bull_ring_nan[FVG_TS_NEO_SMOOTH];
-    bool bear_ring_nan[FVG_TS_NEO_SMOOTH];
 
     double bull_sum = 0.0, bear_sum = 0.0;
     int bull_nan_cnt = 0, bear_nan_cnt = 0;
@@ -1155,19 +1149,139 @@ void fvg_trailing_stop_neo_batch_f64(const double* __restrict__ high,
             }
         }
 
-        // :468-486 -- the UPPER column only; the other three are not this
-        // lane's output.
+        // :444-465 -- all four canonical outputs in registry order.
         const bool show = ts_some || ts_prev_some;
+        const double ts_nz = ts_some ? ts_val : ts_prev_val;
         if (os == 1 && show) {
-            row[i] = nn;
+            if (upper_row != nullptr) upper_row[i] = nn;
+            if (lower_row != nullptr) lower_row[i] = bull_disp;
+            if (upper_ts_row != nullptr) upper_ts_row[i] = nn;
+            if (lower_ts_row != nullptr) lower_ts_row[i] = ts_nz;
         } else if (os == -1 && show) {
-            row[i] = bear_disp;
+            if (upper_row != nullptr) upper_row[i] = bear_disp;
+            if (lower_row != nullptr) lower_row[i] = nn;
+            if (upper_ts_row != nullptr) upper_ts_row[i] = ts_nz;
+            if (lower_ts_row != nullptr) lower_ts_row[i] = nn;
         } else {
-            row[i] = nn;
+            if (upper_row != nullptr) upper_row[i] = nn;
+            if (lower_row != nullptr) lower_row[i] = nn;
+            if (upper_ts_row != nullptr) upper_ts_row[i] = nn;
+            if (lower_ts_row != nullptr) lower_ts_row[i] = nn;
         }
 
         ts_prev_some = ts_some;
         ts_prev_val = ts_val;
-        (void)ts_prev_val;
     }
+}
+
+extern "C" __global__
+void fvg_trailing_stop_outputs_f64(const double* __restrict__ high,
+                                   const double* __restrict__ low,
+                                   const double* __restrict__ close,
+                                   int n,
+                                   const int* __restrict__ lookbacks,
+                                   const int* __restrict__ smoothing_lengths,
+                                   const int* __restrict__ reset_on_cross,
+                                   int n_combos,
+                                   int max_lookback,
+                                   int max_smoothing,
+                                   double* __restrict__ bull_gap_scratch,
+                                   double* __restrict__ bear_gap_scratch,
+                                   double* __restrict__ bull_ring_scratch,
+                                   double* __restrict__ bear_ring_scratch,
+                                   int* __restrict__ bull_ring_nan_scratch,
+                                   int* __restrict__ bear_ring_nan_scratch,
+                                   double* __restrict__ upper_out,
+                                   double* __restrict__ lower_out,
+                                   double* __restrict__ upper_ts_out,
+                                   double* __restrict__ lower_ts_out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+
+    const int lookback = lookbacks[combo];
+    const int smoothing_length = smoothing_lengths[combo];
+    double* __restrict__ upper_row = upper_out + (size_t)combo * (size_t)n;
+    double* __restrict__ lower_row = lower_out + (size_t)combo * (size_t)n;
+    double* __restrict__ upper_ts_row = upper_ts_out + (size_t)combo * (size_t)n;
+    double* __restrict__ lower_ts_row = lower_ts_out + (size_t)combo * (size_t)n;
+    if (lookback <= 0 || lookback > max_lookback ||
+        smoothing_length <= 0 || smoothing_length > max_smoothing) {
+        const double nn = fvg_ts_neo_qnan();
+        for (int i = 0; i < n; ++i) {
+            upper_row[i] = nn;
+            lower_row[i] = nn;
+            upper_ts_row[i] = nn;
+            lower_ts_row[i] = nn;
+        }
+        return;
+    }
+
+    fvg_trailing_stop_row_f64(
+        high,
+        low,
+        close,
+        n,
+        lookback,
+        smoothing_length,
+        reset_on_cross[combo] != 0,
+        bull_gap_scratch + (size_t)combo * (size_t)max_lookback,
+        bear_gap_scratch + (size_t)combo * (size_t)max_lookback,
+        bull_ring_scratch + (size_t)combo * (size_t)max_smoothing,
+        bear_ring_scratch + (size_t)combo * (size_t)max_smoothing,
+        bull_ring_nan_scratch + (size_t)combo * (size_t)max_smoothing,
+        bear_ring_nan_scratch + (size_t)combo * (size_t)max_smoothing,
+        upper_row,
+        lower_row,
+        upper_ts_row,
+        lower_ts_row);
+}
+
+// Preserved generic primary ABI. Canonical production bypasses this entry
+// point for the four-output route, but direct f64 callers retain the exact
+// symbol/signature and now receive truthful smoothing_length rows.
+extern "C" __global__
+void fvg_trailing_stop_neo_batch_f64(const double* __restrict__ high,
+                                     const double* __restrict__ low,
+                                     const double* __restrict__ close,
+                                     int n,
+                                     const int* __restrict__ periods,
+                                     int n_combos,
+                                     int first_valid,
+                                     double* __restrict__ out) {
+    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    (void)first_valid;
+
+    double* __restrict__ upper_row = out + (size_t)combo * (size_t)n;
+    const int smoothing_length = periods[combo];
+    if (smoothing_length <= 0 || smoothing_length > FVG_TS_NEO_MAX_SMOOTHING) {
+        const double nn = fvg_ts_neo_qnan();
+        for (int i = 0; i < n; ++i) upper_row[i] = nn;
+        return;
+    }
+
+    double bull_buf[FVG_TS_NEO_LOOKBACK];
+    double bear_buf[FVG_TS_NEO_LOOKBACK];
+    double bull_ring_vals[FVG_TS_NEO_MAX_SMOOTHING];
+    double bear_ring_vals[FVG_TS_NEO_MAX_SMOOTHING];
+    int bull_ring_nan[FVG_TS_NEO_MAX_SMOOTHING];
+    int bear_ring_nan[FVG_TS_NEO_MAX_SMOOTHING];
+    fvg_trailing_stop_row_f64(
+        high,
+        low,
+        close,
+        n,
+        FVG_TS_NEO_LOOKBACK,
+        smoothing_length,
+        false,
+        bull_buf,
+        bear_buf,
+        bull_ring_vals,
+        bear_ring_vals,
+        bull_ring_nan,
+        bear_ring_nan,
+        upper_row,
+        nullptr,
+        nullptr,
+        nullptr);
 }

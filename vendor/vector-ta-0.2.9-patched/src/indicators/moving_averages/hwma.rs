@@ -1,114 +1,16 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{
-    cuda_available,
-    moving_averages::{alma_wrapper::DeviceArrayF32, CudaHwma},
-};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyo3::pyclass(module = "vector_ta", name = "HwmaDeviceArrayF32", unsendable)]
-pub struct HwmaDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyo3::pymethods]
-impl HwmaDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
 
 impl<'a> AsRef<[f64]> for HwmaInput<'a> {
     #[inline(always)]
@@ -146,10 +48,6 @@ pub struct HwmaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct HwmaParams {
     pub na: Option<f64>,
     pub nb: Option<f64>,
@@ -1629,521 +1527,16 @@ pub fn expand_grid_hwma(r: &HwmaBatchRange) -> Vec<HwmaParams> {
     expand_grid(r)
 }
 
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "hwma")]
-#[pyo3(signature = (data, na, nb, nc, kernel=None))]
-pub fn hwma_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    na: f64,
-    nb: f64,
-    nc: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = HwmaParams {
-        na: Some(na),
-        nb: Some(nb),
-        nc: Some(nc),
-    };
-    let input = HwmaInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| hwma_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "hwma_batch")]
-#[pyo3(signature = (data, na_range, nb_range, nc_range, kernel=None))]
-pub fn hwma_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    na_range: (f64, f64, f64),
-    nb_range: (f64, f64, f64),
-    nc_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = HwmaBatchRange {
-        na: na_range,
-        nb: nb_range,
-        nc: nc_range,
-    };
-
-    let rows = expand_grid_checked(&sweep)
-        .map(|v| v.len())
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let (combos_result, _, _) = py
-        .allow_threads(|| {
-            let simd = match kern {
-                Kernel::Auto => Kernel::Scalar,
-                kernel => match kernel {
-                    Kernel::Avx512Batch => Kernel::Avx512,
-                    Kernel::Avx2Batch => Kernel::Avx2,
-                    Kernel::ScalarBatch => Kernel::Scalar,
-                    _ => kernel,
-                },
-            };
-
-            hwma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "na",
-        combos_result
-            .iter()
-            .map(|p| p.na.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "nb",
-        combos_result
-            .iter()
-            .map(|p| p.nb.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "nc",
-        combos_result
-            .iter()
-            .map(|p| p.nc.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "hwma_cuda_batch_dev")]
-#[pyo3(signature = (data, na_range, nb_range, nc_range, device_id=0))]
-pub fn hwma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data: PyReadonlyArray1<'_, f64>,
-    na_range: (f64, f64, f64),
-    nb_range: (f64, f64, f64),
-    nc_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<HwmaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data.as_slice()?;
-    let sweep = HwmaBatchRange {
-        na: na_range,
-        nb: nb_range,
-        nc: nc_range,
-    };
-    let data_f32: Vec<f32> = slice_in.iter().map(|&v| v as f32).collect();
-
-    let (inner, ctx_arc) = py.allow_threads(|| {
-        let cuda = CudaHwma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let out = cuda
-            .hwma_batch_dev(&data_f32, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((out, ctx))
-    })?;
-
-    Ok(HwmaDeviceArrayF32Py {
-        inner,
-        _ctx: ctx_arc,
-        device_id: device_id as u32,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "hwma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, na, nb, nc, device_id=0))]
-pub fn hwma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    na: f64,
-    nb: f64,
-    nc: f64,
-    device_id: usize,
-) -> PyResult<HwmaDeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = HwmaParams {
-        na: Some(na),
-        nb: Some(nb),
-        nc: Some(nc),
-    };
-
-    let (inner, ctx_arc) = py.allow_threads(|| {
-        let cuda = CudaHwma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let out = cuda
-            .hwma_multi_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((out, ctx))
-    })?;
-
-    Ok(HwmaDeviceArrayF32Py {
-        inner,
-        _ctx: ctx_arc,
-        device_id: device_id as u32,
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "HwmaStream")]
-pub struct HwmaStreamPy {
-    inner: HwmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl HwmaStreamPy {
-    #[new]
-    pub fn new(na: f64, nb: f64, nc: f64) -> PyResult<Self> {
-        let params = HwmaParams {
-            na: Some(na),
-            nb: Some(nb),
-            nc: Some(nc),
-        };
-        match HwmaStream::try_new(params) {
-            Ok(stream) => Ok(Self { inner: stream }),
-            Err(e) => Err(PyValueError::new_err(format!("HwmaStream error: {}", e))),
-        }
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-}
-
 #[inline(always)]
 pub fn hwma_into_slice(dst: &mut [f64], input: &HwmaInput, kern: Kernel) -> Result<(), HwmaError> {
     hwma_with_kernel_into(input, kern, dst)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_js(data: &[f64], na: f64, nb: f64, nc: f64) -> Result<Vec<f64>, JsValue> {
-    let params = HwmaParams {
-        na: Some(na),
-        nb: Some(nb),
-        nc: Some(nc),
-    };
-    let input = HwmaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    hwma_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HwmaBatchConfig {
-    pub na_range: (f64, f64, f64),
-    pub nb_range: (f64, f64, f64),
-    pub nc_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HwmaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<HwmaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = hwma_batch)]
-pub fn hwma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: HwmaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = HwmaBatchRange {
-        na: config.na_range,
-        nb: config.nb_range,
-        nc: config.nc_range,
-    };
-
-    let simd = match detect_best_batch_kernel() {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        _ => Kernel::Scalar,
-    };
-
-    let output = hwma_batch_inner(data, &sweep, simd, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = HwmaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = hwma_into)]
-pub fn hwma_ptr_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    na: f64,
-    nb: f64,
-    nc: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to hwma_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if len == 0 {
-            return Err(JsValue::from_str("Empty data"));
-        }
-
-        let params = HwmaParams {
-            na: Some(na),
-            nb: Some(nb),
-            nc: Some(nc),
-        };
-        let input = HwmaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            hwma_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            hwma_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    na_start: f64,
-    na_end: f64,
-    na_step: f64,
-    nb_start: f64,
-    nb_end: f64,
-    nb_step: f64,
-    nc_start: f64,
-    nc_end: f64,
-    nc_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to hwma_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = HwmaBatchRange {
-            na: (na_start, na_end, na_step),
-            nb: (nb_start, nb_end, nb_step),
-            nc: (nc_start, nc_end, nc_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        let simd = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-
-        hwma_batch_inner_into(data, &sweep, simd, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_batch_js(
-    data: &[f64],
-    na_start: f64,
-    na_end: f64,
-    na_step: f64,
-    nb_start: f64,
-    nb_end: f64,
-    nb_step: f64,
-    nc_start: f64,
-    nc_end: f64,
-    nc_step: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = HwmaBatchRange {
-        na: (na_start, na_end, na_step),
-        nb: (nb_start, nb_end, nb_step),
-        nc: (nc_start, nc_end, nc_step),
-    };
-
-    hwma_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_batch_metadata_js(
-    na_start: f64,
-    na_end: f64,
-    na_step: f64,
-    nb_start: f64,
-    nb_end: f64,
-    nb_step: f64,
-    nc_start: f64,
-    nc_end: f64,
-    nc_step: f64,
-) -> Vec<f64> {
-    let sweep = HwmaBatchRange {
-        na: (na_start, na_end, na_step),
-        nb: (nb_start, nb_end, nb_step),
-        nc: (nc_start, nc_end, nc_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let mut result = Vec::new();
-
-    for combo in combos {
-        result.push(combo.na.unwrap());
-        result.push(combo.nb.unwrap());
-        result.push(combo.nc.unwrap());
-    }
-
-    result
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_output_into_js(
-    data: &[f64],
-    na: f64,
-    nb: f64,
-    nc: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = hwma_js(data, na, nb, nc)?;
-    crate::write_wasm_f64_output("hwma_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_batch_output_into_js(
-    data: &[f64],
-    na_start: f64,
-    na_end: f64,
-    na_step: f64,
-    nb_start: f64,
-    nb_end: f64,
-    nb_step: f64,
-    nc_start: f64,
-    nc_end: f64,
-    nc_step: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = hwma_batch_js(
-        data, na_start, na_end, na_step, nb_start, nb_end, nb_step, nc_start, nc_end, nc_step,
-    )?;
-    crate::write_wasm_f64_output("hwma_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn hwma_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = hwma_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("hwma_batch_unified_output_into_js", &value, out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
@@ -2179,8 +1572,8 @@ mod tests {
 
     fn check_hwma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = HwmaParams {
             na: None,
             nb: None,
@@ -2194,8 +1587,8 @@ mod tests {
 
     fn check_hwma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = HwmaInput::from_candles(&candles, "close", HwmaParams::default());
         let result = hwma_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -2223,8 +1616,8 @@ mod tests {
 
     fn check_hwma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = HwmaInput::with_default_candles(&candles);
         match input.data {
             HwmaData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -2300,8 +1693,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params_1 = HwmaParams::default();
         let input_1 = HwmaInput::from_candles(&candles, "close", params_1);
         let result_1 = hwma_with_kernel(&input_1, kernel)?;
@@ -2322,8 +1715,8 @@ mod tests {
 
     fn check_hwma_nan_check(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = HwmaParams::default();
         let input = HwmaInput::from_candles(&candles, "close", params);
         let result = hwma_with_kernel(&input, kernel)?;
@@ -2338,8 +1731,8 @@ mod tests {
 
     fn check_hwma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = HwmaParams::default();
         let input = HwmaInput::from_candles(&candles, "close", params.clone());
@@ -2669,8 +2062,8 @@ mod tests {
     fn check_hwma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             HwmaParams::default(),
@@ -2868,8 +2261,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = HwmaBatchBuilder::new()
             .kernel(kernel)
@@ -2901,8 +2294,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (0.05, 0.15, 0.05, 0.05, 0.15, 0.05, 0.05, 0.15, 0.05),

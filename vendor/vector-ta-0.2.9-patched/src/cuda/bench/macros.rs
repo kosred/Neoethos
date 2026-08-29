@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 #[macro_export]
 macro_rules! define_ma_period_benches {
@@ -158,15 +158,17 @@ macro_rules! define_ma_period_benches_batch_only {
             }
 
             pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-                vec![CudaBenchScenario::new(
-                    $indicator,
-                    "one_series_many_params",
-                    concat!($group_base, "_cuda_batch_dev"),
-                    "1m_x_250",
-                    prep_one_series_many_params,
-                )
-                .with_sample_size(10)
-                .with_mem_required(bytes_one_series_many_params())]
+                vec![
+                    CudaBenchScenario::new(
+                        $indicator,
+                        "one_series_many_params",
+                        concat!($group_base, "_cuda_batch_dev"),
+                        "1m_x_250",
+                        prep_one_series_many_params,
+                    )
+                    .with_sample_size(10)
+                    .with_mem_required(bytes_one_series_many_params()),
+                ]
             }
         }
     };

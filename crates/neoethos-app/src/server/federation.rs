@@ -139,14 +139,18 @@ pub async fn fed_worker_stop() -> Response {
 /// `running: false` when no mesh sidecar is publishing.
 pub async fn swarm_capacity() -> Response {
     let path = std::env::temp_dir().join("neoethos_mesh_swarm.json");
-    match std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+    match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    {
         Some(mut v) => {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("running".into(), serde_json::json!(true));
             }
             Json(v).into_response()
         }
-        None => Json(serde_json::json!({ "running": false, "nodes": 0, "totalCores": 0 })).into_response(),
+        None => Json(serde_json::json!({ "running": false, "nodes": 0, "totalCores": 0 }))
+            .into_response(),
     }
 }
 

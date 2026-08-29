@@ -44,7 +44,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::session::{BestEver, BlockId, ChampionRow, GcCensus, SessionId, SweepId};
+use crate::session::{
+    BestEver, BlockId, ChampionRow, DatasetReceiptV1, GcCensus, SessionId, SweepId,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Serialisable mirrors of upstream types
@@ -259,6 +261,7 @@ pub enum Record {
         /// an external seed to avoid being deduplicated away (§14.3).
         identity_source: String,
         symbol: String,
+        dataset_receipt: DatasetReceiptV1,
     },
 
     ProposalDrawn {
@@ -332,9 +335,7 @@ pub enum Record {
     /// the record's name is true; the fold applies the same comparison
     /// ([`crate::session::advances_best`]) rather than assigning blind, which
     /// makes the folded pointer monotone whatever order a reader replays in.
-    BestEverAdvanced {
-        best: BestEver,
-    },
+    BestEverAdvanced { best: BestEver },
 
     /// One sweep's champion row — the `pbo_session` input.
     ///
@@ -347,9 +348,7 @@ pub enum Record {
     ///
     /// The row carries its own `sweep`, so there is no second copy of that id to
     /// disagree with it.
-    ChampionRecorded {
-        row: ChampionRow,
-    },
+    ChampionRecorded { row: ChampionRow },
 
     PosteriorUpdated {
         sweep: SweepId,
@@ -436,9 +435,7 @@ pub enum Record {
 
     /// A partial final line found on replay, truncated from the file and
     /// counted here. Never silently absorbed.
-    TruncatedTail {
-        bytes: usize,
-    },
+    TruncatedTail { bytes: usize },
 }
 
 impl Record {
@@ -509,6 +506,15 @@ pub struct JournalLine {
     pub seq: u64,
     pub at_ms: i64,
     pub record: Record,
+}
+
+/// Schema-only view used before the version-specific [`Record`] payload is
+/// deserialized. Serde ignores `record` here, which lets a legacy envelope be
+/// reported as the typed version mismatch it is instead of mislabelling its
+/// now-incomplete payload as corruption.
+#[derive(Deserialize)]
+struct JournalEnvelope {
+    schema: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -586,8 +592,9 @@ impl Journal {
                     .with_context(|| format!("truncating the journal {}", path.display()))?;
                 file.set_len(complete_len as u64)
                     .with_context(|| format!("truncating the journal {}", path.display()))?;
-                file.sync_all()
-                    .with_context(|| format!("fsyncing the truncated journal {}", path.display()))?;
+                file.sync_all().with_context(|| {
+                    format!("fsyncing the truncated journal {}", path.display())
+                })?;
             }
 
             let text = std::str::from_utf8(&bytes[..complete_len]).with_context(|| {
@@ -603,7 +610,7 @@ impl Journal {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let parsed: JournalLine = serde_json::from_str(line).with_context(|| {
+                let envelope: JournalEnvelope = serde_json::from_str(line).with_context(|| {
                     format!(
                         "journal {} line {} is a COMPLETE line that does not parse. That is \
                          corruption in the middle of the history, not a truncated tail — every \
@@ -613,17 +620,29 @@ impl Journal {
                         index + 1
                     )
                 })?;
-                if parsed.schema != crate::JOURNAL_SCHEMA {
+                if envelope.schema != crate::JOURNAL_SCHEMA {
                     bail!(
                         "journal {} line {} carries schema \"{}\", but this build writes \"{}\". \
                          Two journals with different schemas are not one history; start a new \
                          session rather than migrating.",
                         path.display(),
                         index + 1,
-                        parsed.schema,
+                        envelope.schema,
                         crate::JOURNAL_SCHEMA
                     );
                 }
+                let parsed: JournalLine = serde_json::from_str(line).with_context(|| {
+                    format!(
+                        "journal {} line {} is a COMPLETE line in schema {} whose payload does \
+                         not parse. That is corruption in the middle of the history, not a \
+                         truncated tail — every later record's meaning depends on the ones \
+                         before it, so the session cannot be folded past this point. Nothing \
+                         has been modified.",
+                        path.display(),
+                        index + 1,
+                        crate::JOURNAL_SCHEMA
+                    )
+                })?;
                 records.push(parsed.record);
                 replay.lines_read += 1;
             }
@@ -844,7 +863,7 @@ mod tests {
         }
         {
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(b"{\"schema\":\"neoethos.autoresearch.journal.v1\",\"seq\":2,\"at")
+            f.write_all(b"{\"schema\":\"neoethos.autoresearch.journal.v2\",\"seq\":2,\"at")
                 .unwrap();
         }
 
@@ -873,7 +892,8 @@ mod tests {
         }
         {
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(b"{\"this\":\"is not a journal line\"}\n").unwrap();
+            f.write_all(b"{\"this\":\"is not a journal line\"}\n")
+                .unwrap();
         }
         let err = Journal::open(&path).expect_err("a corrupt complete line must not be skipped");
         let rendered = format!("{err:#}");
@@ -975,8 +995,10 @@ mod tests {
         let row = champion(7);
         {
             let mut j = Journal::open(&path).unwrap();
-            j.append(Record::ChampionRecorded { row: row.clone() }).unwrap();
-            j.append(Record::BestEverAdvanced { best: best.clone() }).unwrap();
+            j.append(Record::ChampionRecorded { row: row.clone() })
+                .unwrap();
+            j.append(Record::BestEverAdvanced { best: best.clone() })
+                .unwrap();
         }
         let reopened = Journal::open(&path).unwrap();
         assert_eq!(
@@ -1004,5 +1026,35 @@ mod tests {
         .unwrap();
         let err = Journal::open(&path).expect_err("a foreign schema must be refused");
         assert!(format!("{err:#}").contains("not one history"));
+    }
+
+    #[test]
+    fn a_legacy_v1_header_is_a_typed_schema_mismatch_not_payload_corruption() {
+        let dir = tmp();
+        let path = dir.path().join("journal.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"schema\":\"neoethos.autoresearch.journal.v1\",\"seq\":0,\"at_ms\":0,",
+                "\"record\":{\"type\":\"SessionOpened\",\"session_id\":\"ar-legacy\",",
+                "\"session_seed\":42,\"goal_hash\":\"fnv64:aaaa\",",
+                "\"judge_hash\":\"fnv64:bbbb\",\"cost_hash\":\"fnv64:cccc\",",
+                "\"goals\":[],\"scenarios_source\":\"legacy\",\"judge\":[],\"costs\":[],",
+                "\"oos_window\":{\"start_ms\":900,\"end_ms\":1000},",
+                "\"priors\":\"legacy\",\"budget\":[],\"identity_source\":\"legacy\",",
+                "\"symbol\":\"EURUSD\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let err = Journal::open(&path).expect_err("v1 must not deserialize as a v2 record");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("journal.v1"), "got: {rendered}");
+        assert!(rendered.contains("journal.v2"), "got: {rendered}");
+        assert!(rendered.contains("not one history"), "got: {rendered}");
+        assert!(
+            !rendered.contains("COMPLETE line that does not parse"),
+            "a known legacy envelope is a version mismatch, not corruption: {rendered}"
+        );
     }
 }

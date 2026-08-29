@@ -1,20 +1,25 @@
 use crate::artifact_io::{stable_json_hash, write_json_atomic};
+use crate::data_selection::{
+    CanonicalSearchArtifactEnvelopeV2, CanonicalSearchArtifactScopeV2,
+    CanonicalSearchEvaluatedWindowV1, CanonicalSearchInputReceiptV2, CanonicalSearchRunInputV2,
+    CanonicalSearchWindowRoleV1,
+};
 use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core};
 use crate::genetic::strategy_gene::EvaluationConfig;
 use crate::genetic::{
-    Gene, SmcGateArrays, build_smc_arrays, evolve_search_with_progress_and_limits,
+    Gene, SmcGateArrays, build_smc_arrays, evolve_search_with_progress_and_limits_exact,
     month_day_indices, signals_and_confidence_for_gene_full, signals_for_gene_full,
-    signals_for_gene_full_with_smc, validation_genes_population_gathered,
+    signals_for_gene_full_with_smc,
 };
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
-    CanonicalBacktestArtifactFile, CanonicalBacktestScope, CombinatorialPurgedCV, ForwardTestInput,
-    ForwardTestValidationArtifactFile, ForwardTestValidationScope, PropFirmRiskInput,
-    PropFirmRiskRules, PropFirmRiskValidationArtifactFile, PropFirmRiskValidationScope,
-    WalkforwardSummary, WalkforwardValidationArtifactFile, WalkforwardValidationScope,
-    compute_forward_test_summary, compute_prop_firm_risk_summary,
-    write_canonical_backtest_artifact_atomic, write_forward_test_validation_artifact_atomic,
-    write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
+    CanonicalBacktestArtifactFile, CombinatorialPurgedCV, ForwardTestInput,
+    ForwardTestValidationArtifactFile, PropFirmRiskInput, PropFirmRiskRules,
+    PropFirmRiskValidationArtifactFile, ValidationStrategyIdentityV2, WalkforwardSummary,
+    WalkforwardValidationArtifactFile, compute_forward_test_summary,
+    compute_prop_firm_risk_summary, write_canonical_backtest_artifact_atomic,
+    write_forward_test_validation_artifact_atomic, write_prop_firm_risk_validation_artifact_atomic,
+    write_walkforward_validation_artifact_atomic,
 };
 use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
@@ -24,8 +29,43 @@ use neoethos_core::contracts::{
 use neoethos_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+const PERMUTATION_MONTE_CARLO_P_VALUE_SEMANTICS_V1: &str =
+    "neoethos.permutation-monte-carlo-p-value.v1";
+const PERMUTATION_MONTE_CARLO_P_VALUE_PRIMARY_SOURCE_V1: &str =
+    "https://gksmyth.github.io/pubs/PermPValuesPreprint.pdf";
+
+/// Exact Monte Carlo permutation p-value authority for the robustness gate.
+///
+/// Phipson and Smyth prove that an independently sampled permutation test must
+/// use `(b + 1) / (m + 1)`: `b / m` can report the impossible p-value zero and
+/// biases the finite-resample decision. Invalid counts fail closed rather than
+/// silently manufacturing a gate value.
+fn permutation_monte_carlo_p_value_v1(beats: usize, permutations: usize) -> Result<f64> {
+    if permutations == 0 || beats > permutations {
+        anyhow::bail!(
+            "invalid counts for {} (primary authority {}): beats={beats}, permutations={permutations}",
+            PERMUTATION_MONTE_CARLO_P_VALUE_SEMANTICS_V1,
+            PERMUTATION_MONTE_CARLO_P_VALUE_PRIMARY_SOURCE_V1,
+        );
+    }
+    let numerator = beats.checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "numerator overflow for {}",
+            PERMUTATION_MONTE_CARLO_P_VALUE_SEMANTICS_V1
+        )
+    })?;
+    let denominator = permutations.checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "denominator overflow for {}",
+            PERMUTATION_MONTE_CARLO_P_VALUE_SEMANTICS_V1
+        )
+    })?;
+    Ok(numerator as f64 / denominator as f64)
+}
 
 /// Typed runtime knobs that previously lived only in `NEOETHOS_BOT_*` env vars.
 ///
@@ -269,10 +309,10 @@ fn resolve_and_log_duplicate_knobs(settings: &neoethos_core::Settings) {
     if let Some(shadow_spread) = eval_cost.spread_pips {
         tracing::warn!(
             target: "neoethos_search::config_resolution",
-            winner = "risk.backtest_spread_pips + risk.slippage_pips",
+            winner = "risk.backtest_spread_pips + 2 * risk.slippage_pips_per_fill",
             loser = "models.eval_runtime.spread_pips",
             effective_spread_pips = settings.risk.backtest_spread_pips.max(0.0)
-                + settings.risk.slippage_pips.max(0.0),
+                + 2.0 * settings.risk.slippage_pips.max(0.0),
             ignored_spread_pips = shadow_spread,
             "SPREAD IS SET TWICE. Discovery charges the risk.* number; \
              models.eval_runtime.spread_pips (what the Settings screen calls \
@@ -520,10 +560,9 @@ pub struct DiscoveryConfig {
     /// Both sides now read the same `risk.kill_zones_enabled` (default `true`,
     /// `config.rs:671`), so the shipped behaviour is unchanged and the two sides
     /// can no longer disagree. Turning it OFF re-scores against a different
-    /// simulator, and that is visible rather than silent: the value is part of
-    /// the backtest policy hash (`DiscoveryBacktestPolicy::kill_zones_enabled`)
-    /// and of the run profile, so artifacts produced on either side of the
-    /// switch are distinguishable after the fact.
+    /// simulator, and that is visible rather than silent: the resolved value is
+    /// part of the canonical search-config hash and of the run profile, so
+    /// artifacts produced on either side of the switch remain distinguishable.
     pub kill_zones_enabled: bool,
     pub population: usize,
     /// When `true`, `run_search` raises the GA population to the card's fits
@@ -835,13 +874,36 @@ impl DiscoveryConfig {
         Ok(Self::from_settings(settings))
     }
 
+    /// Resolve the ordinary search knobs from settings while binding every
+    /// financial input to an explicit canonical-trendbar research contract.
+    /// This path never grants live or promotion authority.
+    pub fn try_from_settings_for_canonical_trendbar_research(
+        settings: &neoethos_core::Settings,
+        contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    ) -> anyhow::Result<Self> {
+        contract.validate()?;
+        anyhow::ensure!(
+            settings.system.symbol.trim() == contract.symbol(),
+            "research contract symbol {} does not match settings symbol {}",
+            contract.symbol(),
+            settings.system.symbol
+        );
+        anyhow::ensure!(
+            settings.system.account_currency.trim() == contract.account_currency(),
+            "research contract account currency {} does not match settings account currency {}",
+            contract.account_currency(),
+            settings.system.account_currency
+        );
+        let mut config = Self::from_settings(settings);
+        apply_research_contract_to_discovery_config(&mut config, contract);
+        Ok(config)
+    }
+
     pub(crate) fn from_settings(settings: &neoethos_core::Settings) -> Self {
-        // The cost model converts a pip value into the account currency, which
-        // for a cross pair needs the bridging pair's price. This is the one
-        // place every discovery path passes through holding the full Settings,
-        // so it is where the store gets pointed at. A CLI `--root` / `--data-path`
-        // override reinstalls it later and wins.
-        crate::fx_rates::set_store_root(settings.system.data_dir.clone());
+        // Cross-currency market data cannot be selected from Settings alone:
+        // `data_dir + symbol` does not identify a source/account. The caller
+        // installs `fx_rates::set_store_selection` only after choosing and
+        // verifying the exact CanonicalDatasetIdentity for this run.
         let model_settings = &settings.models;
         let filtering = crate::genetic::FilteringConfig {
             min_trades: model_settings.prop_min_trades.max(1) as f64,
@@ -953,7 +1015,7 @@ impl DiscoveryConfig {
                     target: "neoethos_search::cost_model",
                     symbol = %symbol,
                     flat_spread_pips = settings.risk.backtest_spread_pips.max(0.0)
-                        + settings.risk.slippage_pips.max(0.0),
+                        + 2.0 * settings.risk.slippage_pips.max(0.0),
                     "no session spread curve configured — a FLAT spread is charged at 03:00 \
                      Tokyo and at the London open alike. The per-bar lookup exists on both the \
                      CPU path and the CUDA kernel and is simply unpopulated. Measure your \
@@ -1070,11 +1132,13 @@ impl DiscoveryConfig {
             // Honest-costs fix (2026-07-02): `risk.slippage_pips` existed (and
             // the live order-cost helper charged it) but the DISCOVERY
             // evaluator ignored it — strategies were validated against costs
-            // the live fills never see. Fold slippage into the effective
-            // spread HERE (single resolution point) so the CPU and GPU
-            // kernels charge it identically with zero kernel changes.
+            // the live fills never see. This scalar is a full round-trip
+            // screening envelope: full spread once plus adverse slippage on
+            // BOTH entry and exit fills. The later Bid/Ask replay is separate;
+            // executable-side quote prices already contain spread and must not
+            // charge this scalar again.
             evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0)
-                + settings.risk.slippage_pips.max(0.0),
+                + 2.0 * settings.risk.slippage_pips.max(0.0),
             evaluation_commission_per_trade: resolved_commission,
             session_spread_pips,
             cost_band_pips,
@@ -1470,13 +1534,44 @@ impl DiscoveryConfig {
         // ranking sees was actually searched FOR growth. PropFirm/Strict
         // keep the v4 consistency landscape untouched.
         cfg.growth_objective = matches!(self.mode, DiscoveryMode::Risky);
+        if let Some(contract) =
+            crate::historical_evaluation_authority::active_research_contract_v1()
+        {
+            if self.evaluation_symbol == contract.symbol()
+                && self.evaluation_account_currency == contract.account_currency()
+            {
+                cfg.pip_value = contract.pip_size();
+                cfg.pip_value_per_lot = contract.pip_value_per_lot();
+                cfg.spread_pips = contract.screening_spread_and_slippage_round_trip_pips();
+                cfg.commission_per_trade = contract.round_trip_commission_account_per_lot();
+                cfg.swap_long_pips_per_day = contract.swap_long_pips_per_day();
+                cfg.swap_short_pips_per_day = contract.swap_short_pips_per_day();
+                cfg.pnl_conversion_fee_rate = contract.pnl_conversion_fee_rate();
+            } else {
+                tracing::error!(
+                    target: "neoethos_search::canonical_research",
+                    config_symbol = %self.evaluation_symbol,
+                    contract_symbol = %contract.symbol(),
+                    config_account_currency = %self.evaluation_account_currency,
+                    contract_account_currency = %contract.account_currency(),
+                    "active canonical-trendbar research contract does not match discovery config"
+                );
+                cfg.pip_value = f64::NAN;
+                cfg.pip_value_per_lot = f64::NAN;
+                cfg.spread_pips = f64::NAN;
+                cfg.commission_per_trade = f64::NAN;
+                cfg.swap_long_pips_per_day = f64::NAN;
+                cfg.swap_short_pips_per_day = f64::NAN;
+                cfg.pnl_conversion_fee_rate = f64::NAN;
+            }
+        }
         cfg
     }
 
     pub(crate) fn evaluation_config_with_smc_gate(
         &self,
         price_hint: Option<f64>,
-        effective_smc_gate_threshold: f32,
+        effective_smc_gate_threshold: f64,
     ) -> EvaluationConfig {
         let mut cfg = self.evaluation_config(price_hint);
         cfg.smc_gate_threshold = effective_smc_gate_threshold;
@@ -1484,8 +1579,37 @@ impl DiscoveryConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+pub(crate) fn apply_research_contract_to_discovery_config(
+    config: &mut DiscoveryConfig,
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) {
+    config.evaluation_symbol = contract.symbol().to_owned();
+    config.evaluation_account_currency = contract.account_currency().to_owned();
+    config.evaluation_spread_pips = contract.screening_spread_and_slippage_round_trip_pips();
+    config.evaluation_commission_per_trade = contract.round_trip_commission_account_per_lot();
+    config.sensitivity_commission_per_lot = config
+        .sensitivity_commission_per_lot
+        .max(contract.round_trip_commission_account_per_lot());
+    config.swap_long_pips_per_day = contract.swap_long_pips_per_day();
+    config.swap_short_pips_per_day = contract.swap_short_pips_per_day();
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DiscoveryResult {
+    /// Immutable identity/generation/manifest/Vortex/feature-plan proof for
+    /// every value this run consumed. Persisted outputs must carry this exact
+    /// receipt rather than reconstructing a dataset from symbol/timeframe.
+    pub search_input_receipt: CanonicalSearchInputReceiptV2,
+    /// Exact window evaluated by the selection pipeline. This is
+    /// `DiscoveryInput` for a holdout-free run and `InSample` for a split run.
+    pub selection_scope: CanonicalSearchArtifactScopeV2,
+    /// Exact held-out evidence suffix for a split run. `None` means the caller
+    /// deliberately ran the full `DiscoveryInput` path without an outer tail.
+    pub holdout_scope: Option<CanonicalSearchArtifactScopeV2>,
+    /// Exact resolved search configuration identity shared by the ledger,
+    /// trial-return matrix, and every result artifact. Never recompute this from
+    /// ambient settings after the run.
+    pub search_config_hash: String,
     /// The cost-band verdict for every candidate that SURVIVED the quality
     /// screen, as `(strategy_id, verdict)` — audit #71.
     ///
@@ -1511,7 +1635,7 @@ pub struct DiscoveryResult {
     /// Gene indices refer to columns in this list, not the caller's original names.
     pub effective_feature_names: Vec<String>,
     /// Final annealed SMC gate used by the GA and every post-search replay.
-    pub effective_smc_gate_threshold: f32,
+    pub effective_smc_gate_threshold: f64,
     pub validation_gates: DiscoveryValidationGates,
     pub canonical_backtest_artifacts: Vec<CanonicalBacktestArtifactFile>,
     pub walkforward_validation_artifacts: Vec<WalkforwardValidationArtifactFile>,
@@ -1536,7 +1660,377 @@ pub struct DiscoveryResult {
     pub funnel_profile: Option<crate::funnel_profile::FunnelProfile>,
 }
 
+trait ExactDiscoveryValidationArtifact: Serialize {
+    fn strategy_identity(&self) -> &ValidationStrategyIdentityV2;
+
+    fn validate_exact(
+        &self,
+        scope: &CanonicalSearchArtifactScopeV2,
+        search_config_hash: &str,
+        gene: &Gene,
+    ) -> Result<()>;
+}
+
+impl ExactDiscoveryValidationArtifact for CanonicalBacktestArtifactFile {
+    fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        CanonicalBacktestArtifactFile::strategy_identity(self)
+    }
+
+    fn validate_exact(
+        &self,
+        scope: &CanonicalSearchArtifactScopeV2,
+        search_config_hash: &str,
+        gene: &Gene,
+    ) -> Result<()> {
+        CanonicalBacktestArtifactFile::validate_against(self, scope, search_config_hash, gene)
+    }
+}
+
+impl ExactDiscoveryValidationArtifact for WalkforwardValidationArtifactFile {
+    fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        WalkforwardValidationArtifactFile::strategy_identity(self)
+    }
+
+    fn validate_exact(
+        &self,
+        scope: &CanonicalSearchArtifactScopeV2,
+        search_config_hash: &str,
+        gene: &Gene,
+    ) -> Result<()> {
+        WalkforwardValidationArtifactFile::validate_against(self, scope, search_config_hash, gene)
+    }
+}
+
+impl ExactDiscoveryValidationArtifact for ForwardTestValidationArtifactFile {
+    fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        ForwardTestValidationArtifactFile::strategy_identity(self)
+    }
+
+    fn validate_exact(
+        &self,
+        scope: &CanonicalSearchArtifactScopeV2,
+        search_config_hash: &str,
+        gene: &Gene,
+    ) -> Result<()> {
+        ForwardTestValidationArtifactFile::validate_against(self, scope, search_config_hash, gene)
+    }
+}
+
+impl ExactDiscoveryValidationArtifact for PropFirmRiskValidationArtifactFile {
+    fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        PropFirmRiskValidationArtifactFile::strategy_identity(self)
+    }
+
+    fn validate_exact(
+        &self,
+        scope: &CanonicalSearchArtifactScopeV2,
+        search_config_hash: &str,
+        gene: &Gene,
+    ) -> Result<()> {
+        PropFirmRiskValidationArtifactFile::validate_against(self, scope, search_config_hash, gene)
+    }
+}
+
+fn final_strategy_index<'a>(portfolio: &'a [Gene]) -> Result<HashMap<String, &'a Gene>> {
+    let mut by_hash = HashMap::with_capacity(portfolio.len());
+    let mut strategy_ids = HashSet::with_capacity(portfolio.len());
+    for gene in portfolio {
+        let identity = ValidationStrategyIdentityV2::from_gene(gene)?;
+        anyhow::ensure!(
+            strategy_ids.insert(identity.strategy_id().to_owned()),
+            "final portfolio contains duplicate strategy_id `{}`",
+            identity.strategy_id()
+        );
+        anyhow::ensure!(
+            by_hash
+                .insert(identity.exact_gene_hash().to_owned(), gene)
+                .is_none(),
+            "final portfolio contains a duplicate exact strategy identity `{}`",
+            identity.exact_gene_hash()
+        );
+    }
+    Ok(by_hash)
+}
+
+fn validate_exact_artifact_set<T: ExactDiscoveryValidationArtifact>(
+    kind: &str,
+    artifacts: &[T],
+    portfolio: &[Gene],
+    scope: &CanonicalSearchArtifactScopeV2,
+    search_config_hash: &str,
+    required: bool,
+) -> Result<()> {
+    if artifacts.is_empty() {
+        anyhow::ensure!(
+            !required || portfolio.is_empty(),
+            "{kind} validation evidence is missing for the final portfolio"
+        );
+        return Ok(());
+    }
+
+    let expected = final_strategy_index(portfolio)?;
+    let mut observed = HashSet::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let identity = artifact.strategy_identity();
+        let Some(gene) = expected.get(identity.exact_gene_hash()).copied() else {
+            anyhow::bail!(
+                "{kind} validation evidence contains extra strategy `{}` ({}) outside the final portfolio",
+                identity.strategy_id(),
+                identity.exact_gene_hash()
+            );
+        };
+        anyhow::ensure!(
+            observed.insert(identity.exact_gene_hash().to_owned()),
+            "{kind} validation evidence contains duplicate strategy `{}` ({})",
+            identity.strategy_id(),
+            identity.exact_gene_hash()
+        );
+        artifact
+            .validate_exact(scope, search_config_hash, gene)
+            .with_context(|| {
+                format!(
+                    "validating {kind} evidence for final strategy `{}`",
+                    gene.strategy_id
+                )
+            })?;
+    }
+    if let Some((missing_hash, missing_gene)) = expected
+        .iter()
+        .find(|(hash, _)| !observed.contains(hash.as_str()))
+    {
+        anyhow::bail!(
+            "{kind} validation evidence is missing final strategy `{}` ({missing_hash})",
+            missing_gene.strategy_id
+        );
+    }
+    Ok(())
+}
+
+fn retain_exact_artifacts_for_final_portfolio<T: ExactDiscoveryValidationArtifact>(
+    kind: &str,
+    portfolio: &[Gene],
+    artifacts: &mut Vec<T>,
+) -> Result<()> {
+    let expected = final_strategy_index(portfolio)?;
+    artifacts
+        .retain(|artifact| expected.contains_key(artifact.strategy_identity().exact_gene_hash()));
+
+    let mut observed = HashSet::with_capacity(artifacts.len());
+    for artifact in artifacts.iter() {
+        let identity = artifact.strategy_identity();
+        let gene = expected
+            .get(identity.exact_gene_hash())
+            .copied()
+            .expect("retain removed identities outside the final portfolio");
+        identity.validate_against(gene)?;
+        anyhow::ensure!(
+            observed.insert(identity.exact_gene_hash().to_owned()),
+            "{kind} validation evidence contains duplicate final strategy `{}`",
+            identity.strategy_id()
+        );
+    }
+    if let Some((missing_hash, missing_gene)) = expected
+        .iter()
+        .find(|(hash, _)| !observed.contains(hash.as_str()))
+    {
+        anyhow::bail!(
+            "{kind} validation evidence is missing final strategy `{}` ({missing_hash}) after pruning",
+            missing_gene.strategy_id
+        );
+    }
+    Ok(())
+}
+
+fn retain_selection_validation_artifacts_for_final_portfolio(
+    portfolio: &[Gene],
+    canonical_backtest_artifacts: &mut Vec<CanonicalBacktestArtifactFile>,
+    walkforward_validation_artifacts: &mut Vec<WalkforwardValidationArtifactFile>,
+) -> Result<()> {
+    if canonical_backtest_artifacts.is_empty() && walkforward_validation_artifacts.is_empty() {
+        return Ok(());
+    }
+    retain_exact_artifacts_for_final_portfolio(
+        "canonical_backtest",
+        portfolio,
+        canonical_backtest_artifacts,
+    )?;
+    retain_exact_artifacts_for_final_portfolio(
+        "walkforward",
+        portfolio,
+        walkforward_validation_artifacts,
+    )
+}
+
 impl DiscoveryResult {
+    pub fn search_input_receipt_sha256(&self) -> Result<String> {
+        self.search_input_receipt
+            .identity_sha256()
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Refuse any public-struct literal whose stored scopes do not exactly bind
+    /// to `search_input_receipt` or do not form one supported full/split shape.
+    pub fn validate_evaluated_scopes(&self) -> Result<()> {
+        self.selection_scope
+            .validate_against_receipt(&self.search_input_receipt)
+            .map_err(anyhow::Error::new)?;
+        if let Some(holdout) = &self.holdout_scope {
+            holdout
+                .validate_against_receipt(&self.search_input_receipt)
+                .map_err(anyhow::Error::new)?;
+        }
+
+        let anchor_id = self.search_input_receipt.anchor_dataset_identity();
+        let anchor_bindings = self
+            .search_input_receipt
+            .source_bindings()
+            .iter()
+            .filter(|binding| binding.dataset_identity() == anchor_id)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            anchor_bindings.len() == 1,
+            "discovery result scopes require exactly one receipt anchor binding; found {}",
+            anchor_bindings.len()
+        );
+        let segments = anchor_bindings[0].segments();
+        anyhow::ensure!(
+            !segments.is_empty(),
+            "discovery result receipt anchor has no segments"
+        );
+        anyhow::ensure!(
+            segments
+                .windows(2)
+                .all(|adjacent| adjacent[0].row_end() == adjacent[1].row_start()),
+            "discovery result scopes cannot cover disjoint receipt anchor segments"
+        );
+        let first = segments.first().expect("segments checked non-empty");
+        let last = segments.last().expect("segments checked non-empty");
+        let selected = self.selection_scope.evaluated_window();
+
+        match (selected.role(), self.holdout_scope.as_ref()) {
+            (CanonicalSearchWindowRoleV1::DiscoveryInput, None) => {
+                anyhow::ensure!(
+                    selected.row_start() == first.row_start()
+                        && selected.row_end() == last.row_end()
+                        && selected.timestamp_start_ms() == first.timestamp_start_ms()
+                        && selected.timestamp_end_ms() == last.timestamp_end_ms(),
+                    "holdout-free DiscoveryInput scope must exactly cover the receipt anchor"
+                );
+            }
+            (CanonicalSearchWindowRoleV1::InSample, Some(holdout)) => {
+                let held_out = holdout.evaluated_window();
+                anyhow::ensure!(
+                    held_out.role() == CanonicalSearchWindowRoleV1::Holdout,
+                    "split discovery result evidence scope must have the holdout role"
+                );
+                anyhow::ensure!(
+                    selected.row_start() == first.row_start()
+                        && selected.timestamp_start_ms() == first.timestamp_start_ms(),
+                    "split discovery result selection must start at the receipt anchor"
+                );
+                anyhow::ensure!(
+                    held_out.row_end() == last.row_end()
+                        && held_out.timestamp_end_ms() == last.timestamp_end_ms(),
+                    "split discovery result holdout must end at the receipt anchor"
+                );
+                anyhow::ensure!(
+                    selected.row_end() == held_out.row_start(),
+                    "split discovery result selection/holdout rows must be contiguous"
+                );
+                anyhow::ensure!(
+                    selected.timestamp_end_ms() < held_out.timestamp_start_ms(),
+                    "split discovery result selection/holdout timestamps must be ordered"
+                );
+            }
+            (CanonicalSearchWindowRoleV1::DiscoveryInput, Some(_)) => anyhow::bail!(
+                "holdout-free DiscoveryInput scope cannot carry a holdout evidence scope"
+            ),
+            (CanonicalSearchWindowRoleV1::InSample, None) => anyhow::bail!(
+                "in-sample discovery result scope is missing its holdout evidence scope"
+            ),
+            (role, _) => anyhow::bail!(
+                "unsupported discovery result selection role {role:?}; expected discovery_input or in_sample"
+            ),
+        }
+        Ok(())
+    }
+
+    pub fn selection_scope(&self) -> Result<&CanonicalSearchArtifactScopeV2> {
+        self.validate_evaluated_scopes()?;
+        Ok(&self.selection_scope)
+    }
+
+    pub fn holdout_scope(&self) -> Result<Option<&CanonicalSearchArtifactScopeV2>> {
+        self.validate_evaluated_scopes()?;
+        Ok(self.holdout_scope.as_ref())
+    }
+
+    fn validate_validation_evidence_sets(&self, require_complete: bool) -> Result<()> {
+        self.validate_evaluated_scopes()?;
+        if require_complete {
+            anyhow::ensure!(
+                !self.portfolio.is_empty(),
+                "promotion validation evidence is missing a final strategy portfolio"
+            );
+        }
+        validate_exact_artifact_set(
+            "canonical_backtest",
+            &self.canonical_backtest_artifacts,
+            &self.portfolio,
+            &self.selection_scope,
+            &self.search_config_hash,
+            require_complete,
+        )?;
+        validate_exact_artifact_set(
+            "walkforward",
+            &self.walkforward_validation_artifacts,
+            &self.portfolio,
+            &self.selection_scope,
+            &self.search_config_hash,
+            require_complete,
+        )?;
+
+        match &self.holdout_scope {
+            Some(holdout_scope) => {
+                validate_exact_artifact_set(
+                    "forward_test",
+                    &self.forward_test_validation_artifacts,
+                    &self.portfolio,
+                    holdout_scope,
+                    &self.search_config_hash,
+                    require_complete,
+                )?;
+                validate_exact_artifact_set(
+                    "prop_firm",
+                    &self.prop_firm_validation_artifacts,
+                    &self.portfolio,
+                    holdout_scope,
+                    &self.search_config_hash,
+                    require_complete,
+                )?;
+            }
+            None => {
+                anyhow::ensure!(
+                    self.forward_test_validation_artifacts.is_empty()
+                        && self.prop_firm_validation_artifacts.is_empty(),
+                    "holdout validation evidence cannot exist without an exact stored holdout scope"
+                );
+                anyhow::ensure!(
+                    !require_complete,
+                    "promotion validation evidence is missing the exact holdout scope"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_complete_promotion_evidence(&self) -> Result<()> {
+        self.validate_validation_evidence_sets(true)?;
+        crate::quote_validated_outer_holdout_v1::require_quote_validated_outer_holdout_v1(None)
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
+    }
+
     /// What the cost band said about this strategy — audit #71.
     ///
     /// A strategy with no entry is [`CostBandVerdict::Unmeasured`], never
@@ -1735,9 +2229,16 @@ pub struct DiscoveryRunProfile {
     /// 200,000 bars and the f32 lane is 54% off there, because rounding flips
     /// stop/target comparisons and the run takes 129-430 more trades. Two runs on
     /// different engines therefore ranked different strategies, and nothing in the
-    /// artifact said which had run. Empty means no population evaluation was
-    /// recorded in this process (a profile built from a fixture).
+    /// artifact said which had run. Empty means the full run-scoped receipt
+    /// below is absent; it must never be filled from a process-global
+    /// observation.
     pub population_eval_engines: Vec<crate::engine_identity::PopulationEvalEngine>,
+    /// Full immutable authority behind `population_eval_engines`: exact
+    /// canonical scope, successful population count, ordered engines, and
+    /// domain-separated receipt identity. `None` is fail-closed for profiles
+    /// built from fixtures or legacy results.
+    pub population_execution_run_receipt_v2:
+        Option<crate::population_execution_run_receipt_v2::ExactPopulationExecutionRunReceiptV2>,
     pub determinism_policy: DeterminismPolicy,
     // ── SLICE 5 (2026-08-08): the config fields the profile silently ──────
     // dropped before. `build_discovery_profile` now destructures
@@ -2023,7 +2524,28 @@ fn trim_recent_history(
 ) -> Result<(FeatureFrame, Ohlcv, Option<usize>)> {
     let frame_rows = features.n_samples();
     let ohlcv_rows = ohlcv.close.len();
-    let available_rows = frame_rows.min(ohlcv_rows);
+    let base_timestamps = ohlcv
+        .timestamp
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("base OHLCV has no canonical timestamps"))?;
+    anyhow::ensure!(
+        features.timestamps.as_slice() == base_timestamps,
+        "feature/base timestamp mismatch; refusing row-position trimming"
+    );
+    anyhow::ensure!(
+        features.timestamps.len() == frame_rows
+            && base_timestamps.len() == frame_rows
+            && ohlcv_rows == frame_rows
+            && ohlcv.open.len() == frame_rows
+            && ohlcv.high.len() == frame_rows
+            && ohlcv.low.len() == frame_rows
+            && ohlcv
+                .volume
+                .as_ref()
+                .is_none_or(|volume| volume.len() == frame_rows),
+        "discovery trimming requires exact feature/OHLCV row and column alignment"
+    );
+    let available_rows = frame_rows;
     if available_rows == 0 {
         anyhow::bail!(
             "Cannot run discovery on empty history for {} {} — \
@@ -2052,13 +2574,7 @@ fn trim_recent_history(
         // RAM. This is the hot path: discovery runs with `max_rows = 0`.
         features.clone()
     } else {
-        FeatureFrame {
-            timestamps: features.timestamps[start_idx..available_rows].to_vec(),
-            names: features.names.clone(),
-            data: neoethos_data::FeatureData::InMemory(
-                features.sample_window(start_idx, available_rows),
-            ),
-        }
+        features.row_window(start_idx, available_rows)?
     };
     let trimmed_ohlcv = slice_ohlcv(ohlcv, start_idx, available_rows);
     Ok((trimmed_features, trimmed_ohlcv, row_budget_applied))
@@ -2153,8 +2669,9 @@ fn discovery_backtest_settings(
         pip_value_per_lot: evaluation.pip_value_per_lot,
         // Decision D: charge overnight financing (the engine applies it in both
         // the CPU path and the CUDA kernel; it was silently 0 here before).
-        swap_long_pips_per_day: config.swap_long_pips_per_day,
-        swap_short_pips_per_day: config.swap_short_pips_per_day,
+        swap_long_pips_per_day: evaluation.swap_long_pips_per_day,
+        swap_short_pips_per_day: evaluation.swap_short_pips_per_day,
+        pnl_conversion_fee_rate: evaluation.pnl_conversion_fee_rate,
         // #75/#217 (2026-08-10). This was the literal `true`, between two
         // fields that read `config.`. It is now the one knob both sides read.
         kill_zones_enabled: config.kill_zones_enabled,
@@ -2362,18 +2879,16 @@ pub fn faithful_oos_eval(
     }
     let symbol = artifact.symbol.clone();
     let base_tf = artifact.base_tf.clone();
-    let base_ohlcv = neoethos_data::load_symbol_timeframe(data_dir, &symbol, &base_tf)?;
+    let input = artifact.load_exact_search_input(data_dir)?;
+    crate::fx_rates::set_store_selection(data_dir.to_path_buf(), input.anchor_identity().clone())?;
+    let base_ohlcv = input.base_frame().ohlcv();
     if base_ohlcv.is_empty() {
         anyhow::bail!("no base bars for {symbol} {base_tf}");
     }
     // Rebuild the SAME multi-TF cube discovery used (warm over the FULL series),
     // then project onto the genes' effective feature set (fail-loud on drift).
-    let dataset = neoethos_data::load_symbol_dataset(data_dir, &symbol)?;
-    let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
-    let raw_features =
-        neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs)?;
     let features =
-        crate::project_features_to_effective(&raw_features, &artifact.effective_feature_names)?;
+        crate::project_features_to_effective(input.features(), &artifact.effective_feature_names)?;
     if features.n_samples() != base_ohlcv.len() {
         anyhow::bail!(
             "feature/bar length mismatch {symbol} {base_tf}: {} vs {}",
@@ -2381,6 +2896,10 @@ pub fn faithful_oos_eval(
             base_ohlcv.len()
         );
     }
+    anyhow::ensure!(
+        base_ohlcv.timestamp.as_deref() == Some(features.timestamps.as_slice()),
+        "feature/base timestamp mismatch {symbol} {base_tf}; refusing row-position alignment"
+    );
     let timestamps = features.timestamps.clone();
     let (months, days) = month_day_indices(&timestamps);
     // OOS window = first bar whose timestamp >= the cutoff (warm features behind it).
@@ -2411,7 +2930,7 @@ pub fn faithful_oos_eval(
     for gene in &artifact.genes {
         let settings = oos_resolver.settings_for_gene(gene);
         let (signals, confidences) =
-            signals_and_confidence_for_gene_full(&features, &base_ohlcv, gene, &eval_config);
+            signals_and_confidence_for_gene_full(&features, base_ohlcv, gene, &eval_config)?;
         // Slice everything to the OOS window (features already warm).
         let close = &base_ohlcv.close[oos_start..];
         let high = &base_ohlcv.high[oos_start..];
@@ -2489,25 +3008,31 @@ pub fn faithful_oos_eval(
 /// any signal with non-trivial selectivity). The scale below targets
 /// roughly "~5-10% of bars must trade" on the longer TFs.
 fn min_trades_per_month_scale_for_tf(tf: &str) -> f64 {
-    match tf.to_ascii_uppercase().as_str() {
+    use neoethos_core::CanonicalTimeframe as T;
+
+    let Ok(timeframe) = tf.to_ascii_uppercase().parse::<T>() else {
+        return 1.0;
+    };
+    match timeframe {
         // Intra-day TFs keep operator's value as-is — they have
         // thousands of bars per month, 15-50 trades is a small
         // fraction of total bar count.
-        "M1" | "M3" | "M5" | "M15" => 1.0,
+        T::M1 | T::M2 | T::M3 | T::M4 | T::M5 | T::M10 | T::M15 => 1.0,
         // Half-hour: still plenty of bars (~1000/month), small relax
-        "M30" => 0.67,
+        T::M30 => 0.67,
         // Hourly: ~500 bars/month, 6 trades = ~1.2% of bars
-        "H1" => 0.40,
+        T::H1 => 0.40,
         // 4h: ~126 bars/month, 3 trades = ~2.4% of bars
-        "H4" => 0.20,
+        T::H4 => 0.20,
+        // Preserve the existing H12 fallback exactly until the independent
+        // promotion-gate policy review supplies an evidenced H12 value.
+        T::H12 => 1.0,
         // Daily: ~21 bars/month, 2 trades = ~10% of bars (one swing
         // trade every ~2 weeks is realistic for prop-firm passing)
-        "D1" => 0.13,
+        T::D1 => 0.13,
         // Weekly/monthly: very long-horizon, ANY signal qualifies
-        "W1" => 0.04,
-        "MN1" => 0.02,
-        // Unknown TF: be conservative, keep operator's value
-        _ => 1.0,
+        T::W1 => 0.04,
+        T::MN1 => 0.02,
     }
 }
 
@@ -2912,7 +3437,11 @@ pub fn evaluate_batch_early_reject(genes: &[Gene], profile: &TargetProfile) -> B
         population: genes.len(),
         measured,
         best_expectancy: if measured > 0 { best_expectancy } else { 0.0 },
-        best_profit_factor: if measured > 0 { best_profit_factor } else { 0.0 },
+        best_profit_factor: if measured > 0 {
+            best_profit_factor
+        } else {
+            0.0
+        },
         best_payoff_ratio,
         best_trades,
         floor,
@@ -3031,8 +3560,7 @@ impl BatchRejectionLedger {
 /// A run is a sequence of batches and the tally belongs to the RUN, not to one
 /// cycle — but the cycle is where the predicate fires. So the cycle records
 /// here and the loop (or anything else that wants it) reads one census.
-static BATCH_LEDGER: std::sync::Mutex<Option<BatchRejectionLedger>> =
-    std::sync::Mutex::new(None);
+static BATCH_LEDGER: std::sync::Mutex<Option<BatchRejectionLedger>> = std::sync::Mutex::new(None);
 
 fn with_batch_ledger<T>(f: impl FnOnce(&mut BatchRejectionLedger) -> T) -> T {
     let mut guard = BATCH_LEDGER
@@ -3300,17 +3828,6 @@ fn passes_opportunistic_quality(
 }
 
 #[derive(Debug, Serialize)]
-struct DiscoveryDatasetFingerprint<'a> {
-    row_count: usize,
-    first_timestamp: Option<i64>,
-    last_timestamp: Option<i64>,
-    feature_names: &'a [String],
-    close_rows: usize,
-    first_close: Option<f64>,
-    last_close: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
 struct DiscoveryTemporalPolicy<'a> {
     timeframe_label: &'a str,
     higher_timeframes: &'a [String],
@@ -3345,42 +3862,6 @@ struct DiscoveryLiveReadinessPolicy {
     portfolio_size_target: usize,
     max_regime_loss_pct: f64,
     filtering: crate::genetic::FilteringConfig,
-}
-
-#[derive(Debug, Serialize)]
-struct DiscoveryBacktestPolicy {
-    symbol: String,
-    account_currency: String,
-    timeframe_label: String,
-    sl_pips: f64,
-    tp_pips: f64,
-    max_hold_bars: usize,
-    min_hold_bars: usize,
-    trailing_enabled: bool,
-    trailing_atr_multiplier: f64,
-    trailing_be_trigger_r: f64,
-    /// The FOURTH field of the same exit policy. Added 2026-08-09: it was
-    /// omitted while its three siblings were hashed, so two artifacts produced
-    /// under different min-lock values hashed identically and were
-    /// indistinguishable afterwards — reproducing the exact defect class the
-    /// field was introduced to close (it used to travel by a separate route and
-    /// silently inherit `BacktestSettings::default() = 2.0`). Adding it changes
-    /// the policy hash and therefore invalidates cached artifact identity across
-    /// this change, which is correct: artifacts on either side were produced
-    /// under a policy the hash could not tell apart.
-    trailing_min_lock_pips: f64,
-    pip_value: f64,
-    spread_pips: f64,
-    commission_per_trade: f64,
-    pip_value_per_lot: f64,
-    kill_zones_enabled: bool,
-    /// Stop regime (2026-08-08): an adaptive gene's artifact is produced under
-    /// `sl = adaptive_vol_mult × base[i]`, a DIFFERENT policy from the fixed
-    /// `sl_pips`/`tp_pips` above — the hash must not conflate the two. The
-    /// base series itself is deterministic from the dataset (covered by the
-    /// dataset hash).
-    adaptive_vol_mult: f64,
-    adaptive_rr: f64,
 }
 
 fn discovery_temporal_contract(
@@ -3444,44 +3925,36 @@ fn validation_row_count(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<usize>
     Ok(n)
 }
 
-fn discovery_dataset_hash(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<String> {
-    stable_json_hash(&DiscoveryDatasetFingerprint {
-        row_count: features.n_samples(),
-        first_timestamp: features.timestamps.first().copied(),
-        last_timestamp: features.timestamps.last().copied(),
-        feature_names: &features.names,
-        close_rows: ohlcv.close.len(),
-        first_close: ohlcv.close.first().copied(),
-        last_close: ohlcv.close.last().copied(),
-    })
-}
-
-fn discovery_backtest_policy_hash(
-    config: &DiscoveryConfig,
-    gene: &Gene,
-    settings: &crate::eval::BacktestSettings,
-) -> Result<String> {
-    stable_json_hash(&DiscoveryBacktestPolicy {
-        symbol: config.evaluation_symbol.clone(),
-        account_currency: config.evaluation_account_currency.clone(),
-        timeframe_label: config.timeframe_label.clone(),
-        sl_pips: settings.sl_pips,
-        tp_pips: settings.tp_pips,
-        max_hold_bars: settings.max_hold_bars,
-        min_hold_bars: settings.min_hold_bars,
-        trailing_enabled: settings.trailing_enabled,
-        trailing_atr_multiplier: settings.trailing_atr_multiplier,
-        trailing_be_trigger_r: settings.trailing_be_trigger_r,
-        trailing_min_lock_pips: settings.trailing_min_lock_pips,
-        pip_value: settings.pip_value,
-        spread_pips: settings.spread_pips,
-        commission_per_trade: settings.commission_per_trade,
-        pip_value_per_lot: settings.pip_value_per_lot,
-        kill_zones_enabled: settings.kill_zones_enabled,
-        adaptive_vol_mult: settings.adaptive_vol_mult,
-        adaptive_rr: settings.adaptive_rr,
-    })
-    .with_context(|| format!("hashing backtest policy for {}", gene.strategy_id))
+fn validate_holdout_values_against_scope(
+    holdout_scope: &CanonicalSearchArtifactScopeV2,
+    timestamps: &[i64],
+    row_count: usize,
+) -> Result<()> {
+    holdout_scope.validate().map_err(anyhow::Error::new)?;
+    let window = holdout_scope.evaluated_window();
+    anyhow::ensure!(
+        window.role() == CanonicalSearchWindowRoleV1::Holdout,
+        "held-out validation requires the exact stored holdout scope"
+    );
+    anyhow::ensure!(
+        row_count > 0 && timestamps.len() == row_count,
+        "held-out validation values require aligned non-empty timestamps"
+    );
+    let expected_rows = window
+        .row_end()
+        .checked_sub(window.row_start())
+        .and_then(|rows| usize::try_from(rows).ok())
+        .ok_or_else(|| anyhow::anyhow!("held-out validation scope row range is invalid"))?;
+    anyhow::ensure!(
+        expected_rows == row_count,
+        "held-out validation values contain {row_count} rows but the stored holdout scope contains {expected_rows}"
+    );
+    anyhow::ensure!(
+        timestamps.first().copied() == Some(window.timestamp_start_ms())
+            && timestamps.last().copied() == Some(window.timestamp_end_ms()),
+        "held-out validation timestamps do not exactly match the stored holdout scope boundaries"
+    );
+    Ok(())
 }
 
 fn embargo_bars_from_timestamps(timestamps: &[i64], embargo_minutes: usize) -> usize {
@@ -3540,10 +4013,11 @@ fn evaluate_cpcv_gate(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
-    effective_smc_gate_threshold: f32,
+    effective_smc_gate_threshold: f64,
     months: &[i64],
     days: &[i64],
     pbo_candidates: &[Gene],
+    population_execution_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
 ) -> Result<(bool, usize, f64, Option<f64>, bool)> {
     if portfolio.is_empty() {
         return Ok((false, 0, 0.0, None, true));
@@ -3694,9 +4168,9 @@ fn evaluate_cpcv_gate(
     // Full-series indicators + SMC, computed ONCE and gathered per fold. The SMC
     // arrays carry cross-bar lookback, so they MUST be derived on the full
     // contiguous series and then gathered — never recomputed on a gathered slice.
-    let full_indicators = features.as_indicators_view();
+    let full_indicators = features.to_dense_samples_major()?.values.reversed_axes();
     let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
-        build_smc_arrays(features, ohlcv);
+        build_smc_arrays(features, ohlcv)?;
     let full_n = ohlcv.close.len();
     let mut full_smc: Vec<crate::eval::SmcRow> = Vec::with_capacity(full_n);
     for i in 0..full_n {
@@ -3724,8 +4198,8 @@ fn evaluate_cpcv_gate(
         let metrics_per_gene = {
             #[cfg(feature = "gpu")]
             let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            validation_genes_population_gathered(
-                full_indicators,
+            crate::genetic::search_engine::validation_genes_population_gathered_exact(
+                full_indicators.view(),
                 &full_smc,
                 portfolio,
                 &eval_config,
@@ -3736,6 +4210,7 @@ fn evaluate_cpcv_gate(
                 &low,
                 &fold_months,
                 &fold_days,
+                population_execution_run,
             )?
         };
         if metrics_per_gene.len() != portfolio.len() {
@@ -3787,8 +4262,8 @@ fn evaluate_cpcv_gate(
             let metrics = {
                 #[cfg(feature = "gpu")]
                 let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                validation_genes_population_gathered(
-                    full_indicators,
+                crate::genetic::search_engine::validation_genes_population_gathered_exact(
+                    full_indicators.view(),
                     &full_smc,
                     &cands,
                     &eval_config,
@@ -3799,6 +4274,7 @@ fn evaluate_cpcv_gate(
                     &low,
                     &m,
                     &d,
+                    population_execution_run,
                 )?
             };
             Ok(metrics
@@ -3881,10 +4357,13 @@ fn build_discovery_validation_artifacts(
     portfolio_signals: &[Vec<i8>],
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
+    selection_scope: &CanonicalSearchArtifactScopeV2,
+    search_config_hash: &str,
     config: &DiscoveryConfig,
-    effective_smc_gate_threshold: f32,
+    effective_smc_gate_threshold: f64,
     pbo_candidates: &[Gene],
     trials_tested: usize,
+    population_execution_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
 ) -> Result<(
     DiscoveryValidationGates,
     Vec<CanonicalBacktestArtifactFile>,
@@ -3918,7 +4397,6 @@ fn build_discovery_validation_artifacts(
 
     let temporal_contract = discovery_temporal_contract(config, &features.names)?;
     let temporal_contract_hash = temporal_contract.temporal_contract_hash();
-    let dataset_hash = discovery_dataset_hash(features, ohlcv)?;
     let (months, days) = month_day_indices(&features.timestamps);
     let timestamps = &features.timestamps[..n];
     let embargo_bars = embargo_bars_from_timestamps(timestamps, config.embargo_minutes);
@@ -3947,9 +4425,8 @@ fn build_discovery_validation_artifacts(
     // pack's per-gene SL/TP arrays with the SAME finite-positive-else-20/40
     // fallback `discovery_backtest_settings` applies), so one template built
     // from `portfolio[0]` + the pack reproduces every gene's WF metrics.
-    let wf_settings_template =
-        PopulationTemplateResolver::new(config, ohlcv.close.last().copied())
-            .template(&portfolio[0]);
+    let wf_settings_template = PopulationTemplateResolver::new(config, ohlcv.close.last().copied())
+        .template(&portfolio[0]);
     // ONE resolver over the full series: per-gene settings for the CPU
     // risk-diagnostic half (its SL/TP + adaptive mult drive
     // `simulate_trades_core`'s exits) and for the canonical full-series
@@ -3970,9 +4447,9 @@ fn build_discovery_validation_artifacts(
         .collect();
     let wf_eval_config = config
         .evaluation_config_with_smc_gate(ohlcv.close.last().copied(), effective_smc_gate_threshold);
-    let wf_full_indicators = features.as_indicators_view();
+    let wf_full_indicators = features.to_dense_samples_major()?.values.reversed_axes();
     let (wob, wfvg, wliq, wtrend, wprem, wind, wbos, wchoch, weqh, weql, wdisp) =
-        build_smc_arrays(features, ohlcv);
+        build_smc_arrays(features, ohlcv)?;
     let wf_full_n = ohlcv.close.len();
     let mut wf_full_smc: Vec<crate::eval::SmcRow> = Vec::with_capacity(wf_full_n);
     for i in 0..wf_full_n {
@@ -4019,9 +4496,9 @@ fn build_discovery_validation_artifacts(
             // parallelises across genes.
             #[cfg(feature = "gpu")]
             let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            crate::genetic::validation_genes_population_window(
+            crate::genetic::search_engine::validation_genes_population_window_exact(
                 &wf_gene_pack,
-                wf_full_indicators,
+                wf_full_indicators.view(),
                 &wf_full_smc,
                 &ohlcv.close,
                 &ohlcv.high,
@@ -4031,6 +4508,7 @@ fn build_discovery_validation_artifacts(
                 timestamps,
                 test_start,
                 end,
+                population_execution_run,
             )
             // Metrics only for now: the device writes a trade list but nothing
             // reads it back yet, so the diagnostics still simulate this window
@@ -4053,15 +4531,13 @@ fn build_discovery_validation_artifacts(
         .zip(walkforward_summaries)
     {
         let settings = wf_resolver.settings_for_gene(gene);
-        let strategy_hash = stable_json_hash(gene)?;
-        let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
         // Regenerate per-bar confidence for risk-based, confidence-scaled
         // sizing. We reuse the precomputed `signals` for the signal vector
         // (identity-preserving) and only take the fresh confidence slice —
         // both are produced from the SAME gene + evaluation config, so they
         // are aligned by construction.
         let (_regen_signals, confidences) =
-            signals_and_confidence_for_gene_full(features, ohlcv, gene, &wf_eval_config);
+            signals_and_confidence_for_gene_full(features, ohlcv, gene, &wf_eval_config)?;
         let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
             &ohlcv.close,
             &ohlcv.high,
@@ -4074,27 +4550,21 @@ fn build_discovery_validation_artifacts(
             &settings,
         ));
         canonical_backtest_artifacts.push(CanonicalBacktestArtifactFile::new(
-            CanonicalBacktestScope::new(
-                dataset_hash.clone(),
-                evaluation_config_hash.clone(),
-                strategy_hash.clone(),
-                &temporal_contract,
-            ),
+            selection_scope.clone(),
+            search_config_hash,
+            gene,
             metrics,
-        ));
+        )?);
 
         let gene_wf_passed = walkforward_summary_passed(&walkforward_summary, config.mode);
         walkforward_passed &= gene_wf_passed;
         per_gene_wf.push(gene_wf_passed);
         walkforward_validation_artifacts.push(WalkforwardValidationArtifactFile::new(
-            WalkforwardValidationScope::for_strategy(
-                dataset_hash.clone(),
-                evaluation_config_hash,
-                strategy_hash,
-                &temporal_contract,
-            ),
+            selection_scope.clone(),
+            search_config_hash,
+            gene,
             walkforward_summary,
-        ));
+        )?);
     }
 
     let (cpcv_passed, cpcv_fold_count, cpcv_profitable_fold_ratio, pbo, pbo_passed) =
@@ -4108,6 +4578,7 @@ fn build_discovery_validation_artifacts(
             &months,
             &days,
             pbo_candidates,
+            population_execution_run,
         )?;
 
     let validation_gates = DiscoveryValidationGates {
@@ -4153,6 +4624,8 @@ pub fn compute_discovery_forward_test_artifacts(
     effective_feature_names: &[String],
     tail_features: &FeatureFrame,
     tail_ohlcv: &Ohlcv,
+    holdout_scope: &CanonicalSearchArtifactScopeV2,
+    search_config_hash: &str,
     config: &DiscoveryConfig,
 ) -> Result<Vec<ForwardTestValidationArtifactFile>> {
     let effective_smc_gate_threshold = config
@@ -4163,6 +4636,8 @@ pub fn compute_discovery_forward_test_artifacts(
         effective_feature_names,
         tail_features,
         tail_ohlcv,
+        holdout_scope,
+        search_config_hash,
         config,
         effective_smc_gate_threshold,
     )
@@ -4173,8 +4648,10 @@ pub fn compute_discovery_forward_test_artifacts_with_smc_gate(
     effective_feature_names: &[String],
     tail_features: &FeatureFrame,
     tail_ohlcv: &Ohlcv,
+    holdout_scope: &CanonicalSearchArtifactScopeV2,
+    search_config_hash: &str,
     config: &DiscoveryConfig,
-    effective_smc_gate_threshold: f32,
+    effective_smc_gate_threshold: f64,
 ) -> Result<Vec<ForwardTestValidationArtifactFile>> {
     if portfolio.is_empty() {
         return Ok(Vec::new());
@@ -4202,18 +4679,7 @@ pub fn compute_discovery_forward_test_artifacts_with_smc_gate(
                 })?;
             keep_indices.push(idx);
         }
-        let n_rows = tail_features.n_samples();
-        let mut projected = ndarray::Array2::<f32>::zeros((n_rows, keep_indices.len()));
-        for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
-            projected
-                .column_mut(new_idx)
-                .assign(&tail_features.feature_column(orig_idx));
-        }
-        std::borrow::Cow::Owned(FeatureFrame {
-            timestamps: tail_features.timestamps.clone(),
-            names: effective_feature_names.to_vec(),
-            data: neoethos_data::FeatureData::InMemory(projected),
-        })
+        std::borrow::Cow::Owned(tail_features.select_columns(&keep_indices)?)
     };
     let tail_features = tail_features.as_ref();
 
@@ -4222,10 +4688,9 @@ pub fn compute_discovery_forward_test_artifacts_with_smc_gate(
         anyhow::bail!("forward-test tail must contain at least one bar");
     }
 
-    let temporal_contract = discovery_temporal_contract(config, &tail_features.names)?;
-    let tail_dataset_hash = discovery_dataset_hash(tail_features, tail_ohlcv)?;
     let (months, days) = month_day_indices(&tail_features.timestamps);
     let timestamps = &tail_features.timestamps[..n];
+    validate_holdout_values_against_scope(holdout_scope, timestamps, n)?;
 
     // Each portfolio gene's forward-test replay is fully independent, so run
     // them across the rayon pool instead of one-at-a-time. `par_iter()` on a
@@ -4247,14 +4712,12 @@ pub fn compute_discovery_forward_test_artifacts_with_smc_gate(
         .par_iter()
         .map(|gene| -> Result<ForwardTestValidationArtifactFile> {
             let settings = tail_resolver.settings_for_gene(gene);
-            let strategy_hash = stable_json_hash(gene)?;
-            let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
             let evaluation_config = config.evaluation_config_with_smc_gate(
                 tail_ohlcv.close.last().copied(),
                 effective_smc_gate_threshold,
             );
             let signals =
-                signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
+                signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config)?;
             if signals.len() != n {
                 anyhow::bail!(
                     "forward-test signals length {} does not match validation row count {}",
@@ -4272,15 +4735,12 @@ pub fn compute_discovery_forward_test_artifacts_with_smc_gate(
                 timestamps,
                 settings: &settings,
             })?;
-            Ok(ForwardTestValidationArtifactFile::new(
-                ForwardTestValidationScope::new(
-                    tail_dataset_hash.clone(),
-                    evaluation_config_hash,
-                    strategy_hash,
-                    &temporal_contract,
-                ),
+            ForwardTestValidationArtifactFile::new(
+                holdout_scope.clone(),
+                search_config_hash,
+                gene,
                 summary,
-            ))
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(artifacts)
@@ -4305,6 +4765,8 @@ pub fn compute_discovery_prop_firm_artifacts(
     effective_feature_names: &[String],
     tail_features: &FeatureFrame,
     tail_ohlcv: &Ohlcv,
+    holdout_scope: &CanonicalSearchArtifactScopeV2,
+    search_config_hash: &str,
     config: &DiscoveryConfig,
     rules: PropFirmRiskRules,
 ) -> Result<Vec<PropFirmRiskValidationArtifactFile>> {
@@ -4316,6 +4778,8 @@ pub fn compute_discovery_prop_firm_artifacts(
         effective_feature_names,
         tail_features,
         tail_ohlcv,
+        holdout_scope,
+        search_config_hash,
         config,
         effective_smc_gate_threshold,
         rules,
@@ -4327,8 +4791,10 @@ pub fn compute_discovery_prop_firm_artifacts_with_smc_gate(
     effective_feature_names: &[String],
     tail_features: &FeatureFrame,
     tail_ohlcv: &Ohlcv,
+    holdout_scope: &CanonicalSearchArtifactScopeV2,
+    search_config_hash: &str,
     config: &DiscoveryConfig,
-    effective_smc_gate_threshold: f32,
+    effective_smc_gate_threshold: f64,
     rules: PropFirmRiskRules,
 ) -> Result<Vec<PropFirmRiskValidationArtifactFile>> {
     if portfolio.is_empty() {
@@ -4354,18 +4820,7 @@ pub fn compute_discovery_prop_firm_artifacts_with_smc_gate(
                 })?;
             keep_indices.push(idx);
         }
-        let n_rows = tail_features.n_samples();
-        let mut projected = ndarray::Array2::<f32>::zeros((n_rows, keep_indices.len()));
-        for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
-            projected
-                .column_mut(new_idx)
-                .assign(&tail_features.feature_column(orig_idx));
-        }
-        std::borrow::Cow::Owned(FeatureFrame {
-            timestamps: tail_features.timestamps.clone(),
-            names: effective_feature_names.to_vec(),
-            data: neoethos_data::FeatureData::InMemory(projected),
-        })
+        std::borrow::Cow::Owned(tail_features.select_columns(&keep_indices)?)
     };
     let tail_features = tail_features.as_ref();
 
@@ -4373,9 +4828,8 @@ pub fn compute_discovery_prop_firm_artifacts_with_smc_gate(
     if n == 0 {
         anyhow::bail!("prop-firm tail must contain at least one bar");
     }
-    let temporal_contract = discovery_temporal_contract(config, &tail_features.names)?;
-    let tail_dataset_hash = discovery_dataset_hash(tail_features, tail_ohlcv)?;
     let timestamps = &tail_features.timestamps[..n];
+    validate_holdout_values_against_scope(holdout_scope, timestamps, n)?;
 
     // Same independence as the forward-test tail above: replay each gene on the
     // held-out window in parallel. Order-preserving indexed collect keeps the
@@ -4396,14 +4850,12 @@ pub fn compute_discovery_prop_firm_artifacts_with_smc_gate(
         .par_iter()
         .map(|gene| -> Result<PropFirmRiskValidationArtifactFile> {
             let settings = tail_resolver.settings_for_gene(gene);
-            let strategy_hash = stable_json_hash(gene)?;
-            let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
             let evaluation_config = config.evaluation_config_with_smc_gate(
                 tail_ohlcv.close.last().copied(),
                 effective_smc_gate_threshold,
             );
             let signals =
-                signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
+                signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config)?;
             if signals.len() != n {
                 anyhow::bail!(
                     "prop-firm signals length {} does not match validation row count {}",
@@ -4424,14 +4876,12 @@ pub fn compute_discovery_prop_firm_artifacts_with_smc_gate(
                 initial_balance: config.initial_balance,
                 rules,
             });
-            let scope = PropFirmRiskValidationScope::new(
-                tail_dataset_hash.clone(),
-                evaluation_config_hash,
-                strategy_hash,
-                &rules,
-                &temporal_contract,
-            )?;
-            Ok(PropFirmRiskValidationArtifactFile::new(scope, summary))
+            PropFirmRiskValidationArtifactFile::new(
+                holdout_scope.clone(),
+                search_config_hash,
+                gene,
+                summary,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(artifacts)
@@ -4442,9 +4892,9 @@ struct GeneExport<'a> {
     strategy_id: &'a str,
     indicators: Vec<&'a str>,
     indices: Vec<usize>,
-    weights: Vec<f32>,
-    long_threshold: f32,
-    short_threshold: f32,
+    weights: Vec<f64>,
+    long_threshold: f64,
+    short_threshold: f64,
     fitness: f64,
     sharpe_ratio: f64,
     win_rate: f64,
@@ -4511,19 +4961,23 @@ pub fn approx_bars_per_year(tf: &str) -> usize {
     // FX market is 24/5 but we use 220 days × 24 hours instead of
     // 252 × 24 to leave headroom for holiday gaps. For weekly /
     // monthly timeframes we count calendar weeks / months.
-    match tf.trim().to_ascii_uppercase().as_str() {
-        "M1" => 220 * 24 * 60,
-        "M3" => 220 * 24 * 20,
-        "M5" => 220 * 24 * 12,
-        "M15" => 220 * 24 * 4,
-        "M30" => 220 * 24 * 2,
-        "H1" => 220 * 24,
-        "H4" => 220 * 6,
-        "H12" => 220 * 2,
-        "D1" => 220,
-        "W1" => 52,
-        "MN1" => 12,
-        _ => 0,
+    use neoethos_core::CanonicalTimeframe as T;
+
+    let Ok(timeframe) = tf.trim().to_ascii_uppercase().parse::<T>() else {
+        return 0;
+    };
+    match timeframe {
+        T::D1 => 220,
+        T::W1 => 52,
+        T::MN1 => 12,
+        fixed => {
+            const TRADING_YEAR_MS: i64 = 220 * 24 * 60 * 60 * 1_000;
+            let duration_ms = fixed
+                .fixed_duration_ms()
+                .expect("minute/hour canonical timeframe has a fixed duration");
+            usize::try_from(TRADING_YEAR_MS / duration_ms)
+                .expect("fixed timeframe annual bar count fits usize")
+        }
     }
 }
 
@@ -4775,7 +5229,9 @@ impl CostBandCensus {
 pub fn cost_band_discriminates(band: Option<(f64, f64)>, baseline_cost_pips: f64) -> bool {
     match band {
         Some((_, pessimistic)) => {
-            pessimistic.is_finite() && baseline_cost_pips.is_finite() && pessimistic > baseline_cost_pips
+            pessimistic.is_finite()
+                && baseline_cost_pips.is_finite()
+                && pessimistic > baseline_cost_pips
         }
         None => false,
     }
@@ -4911,11 +5367,10 @@ impl QualityScreenRejects {
 }
 
 pub fn run_discovery_cycle(
-    features: &FeatureFrame,
-    ohlcv: &Ohlcv,
+    input: &CanonicalSearchRunInputV2<'_>,
     config: &DiscoveryConfig,
 ) -> Result<DiscoveryResult> {
-    run_discovery_cycle_with_progress(features, ohlcv, config, |_| {})
+    run_discovery_cycle_with_progress(input, config, |_| {})
 }
 
 /// Fraction of the dataset withheld from discovery as the honest
@@ -4925,6 +5380,303 @@ pub fn run_discovery_cycle(
 /// GA and candidate selection saw every bar, so no window was ever truly
 /// out-of-sample on those paths.
 pub const DEFAULT_OOS_HOLDOUT_FRACTION: f64 = 0.2;
+
+/// Exact rows permitted to fit feature normalization for the canonical 80/20
+/// discovery split. The holdout constructor calls this same function so a
+/// caller cannot fit on one range and evaluate on another.
+pub fn canonical_discovery_normalization_training_rows(
+    row_count: usize,
+) -> Result<std::ops::Range<usize>> {
+    anyhow::ensure!(row_count > 0, "canonical discovery input is empty");
+    let split_at = ((row_count as f64) * (1.0 - DEFAULT_OOS_HOLDOUT_FRACTION)).floor() as usize;
+    anyhow::ensure!(split_at > 0, "in-sample selection window is empty");
+    anyhow::ensure!(
+        split_at < row_count,
+        "holdout suffix is empty or split {split_at} exceeds {row_count} parent rows"
+    );
+    anyhow::ensure!(
+        split_at >= 64,
+        "in-sample selection must contain at least 64 rows; got {split_at}"
+    );
+    Ok(0..split_at)
+}
+
+/// One receipt-bound discovery window. Construction is private so values and
+/// scope can only be derived together from one already-validated parent input.
+#[derive(Debug)]
+struct ScopedDiscoveryInput<'a> {
+    scope: CanonicalSearchArtifactScopeV2,
+    features: Cow<'a, FeatureFrame>,
+    ohlcv: Cow<'a, Ohlcv>,
+}
+
+impl<'a> ScopedDiscoveryInput<'a> {
+    fn entire(input: &'a CanonicalSearchRunInputV2<'_>) -> Result<Self> {
+        let window = Self {
+            scope: CanonicalSearchArtifactScopeV2::from_run_input(
+                CanonicalSearchWindowRoleV1::DiscoveryInput,
+                input,
+            )
+            .map_err(anyhow::Error::new)?,
+            features: Cow::Borrowed(input.features()),
+            ohlcv: Cow::Borrowed(input.ohlcv()),
+        };
+        window.validate_against_parent(input, 0..input.ohlcv().len())?;
+        Ok(window)
+    }
+
+    fn owned_range(
+        input: &'a CanonicalSearchRunInputV2<'_>,
+        role: CanonicalSearchWindowRoleV1,
+        range: std::ops::Range<usize>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            range.start < range.end && range.end <= input.ohlcv().len(),
+            "discovery value window {}..{} is empty or exceeds {} parent rows",
+            range.start,
+            range.end,
+            input.ohlcv().len()
+        );
+        let window = Self {
+            scope: CanonicalSearchArtifactScopeV2::from_run_input_range(role, input, range.clone())
+                .map_err(anyhow::Error::new)?,
+            features: Cow::Owned(input.features().row_window(range.start, range.end)?),
+            ohlcv: Cow::Owned(slice_ohlcv(input.ohlcv(), range.start, range.end)),
+        };
+        window.validate_against_parent(input, range)?;
+        Ok(window)
+    }
+
+    fn validate_against_parent(
+        &self,
+        input: &CanonicalSearchRunInputV2<'_>,
+        range: std::ops::Range<usize>,
+    ) -> Result<()> {
+        self.scope
+            .validate_against_receipt(input.receipt())
+            .map_err(anyhow::Error::new)?;
+        let expected_scope = CanonicalSearchArtifactScopeV2::from_run_input_range(
+            self.scope.evaluated_window().role(),
+            input,
+            range.clone(),
+        )
+        .map_err(anyhow::Error::new)?;
+        anyhow::ensure!(
+            self.scope == expected_scope,
+            "discovery values do not carry the exact parent receipt/role/row/timestamp scope"
+        );
+
+        let expected_timestamps = &input.features().timestamps[range.clone()];
+        anyhow::ensure!(
+            self.features.n_samples() == range.len()
+                && self.ohlcv.len() == range.len()
+                && self.features.timestamps.as_slice() == expected_timestamps
+                && self.ohlcv.timestamp.as_deref() == Some(expected_timestamps),
+            "discovery value window rows/timestamps do not match its exact parent range"
+        );
+        anyhow::ensure!(
+            self.features.names == input.features().names,
+            "discovery value window changed the parent feature schema"
+        );
+        self.features
+            .ensure_same_artifact(input.features())
+            .context("discovery value window changed the parent feature artifact")?;
+
+        let expected_ohlcv = input.ohlcv();
+        anyhow::ensure!(
+            exact_f64_slice(&self.ohlcv.open, &expected_ohlcv.open[range.clone()])
+                && exact_f64_slice(&self.ohlcv.high, &expected_ohlcv.high[range.clone()])
+                && exact_f64_slice(&self.ohlcv.low, &expected_ohlcv.low[range.clone()])
+                && exact_f64_slice(&self.ohlcv.close, &expected_ohlcv.close[range.clone()])
+                && exact_optional_f64_slice(
+                    self.ohlcv.volume.as_deref(),
+                    expected_ohlcv
+                        .volume
+                        .as_deref()
+                        .map(|volume| &volume[range.clone()]),
+                ),
+            "discovery OHLCV values do not exactly match the scoped parent range"
+        );
+        Ok(())
+    }
+
+    fn scope(&self) -> &CanonicalSearchArtifactScopeV2 {
+        &self.scope
+    }
+
+    fn features(&self) -> &FeatureFrame {
+        self.features.as_ref()
+    }
+
+    fn ohlcv(&self) -> &Ohlcv {
+        self.ohlcv.as_ref()
+    }
+}
+
+fn exact_f64_slice(actual: &[f64], expected: &[f64]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+}
+
+fn exact_optional_f64_slice(actual: Option<&[f64]>, expected: Option<&[f64]>) -> bool {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => exact_f64_slice(actual, expected),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Full or holdout-split discovery authority derived from one canonical input.
+/// The selection and evidence windows cannot be supplied independently.
+#[derive(Debug)]
+struct CanonicalDiscoveryRunInputs<'a> {
+    selection: ScopedDiscoveryInput<'a>,
+    holdout: Option<ScopedDiscoveryInput<'a>>,
+}
+
+impl<'a> CanonicalDiscoveryRunInputs<'a> {
+    fn entire(input: &'a CanonicalSearchRunInputV2<'_>) -> Result<Self> {
+        let inputs = Self {
+            selection: ScopedDiscoveryInput::entire(input)?,
+            holdout: None,
+        };
+        validate_discovery_scope_pair(input, inputs.selection.scope(), None)?;
+        Ok(inputs)
+    }
+
+    fn with_holdout(input: &'a CanonicalSearchRunInputV2<'_>) -> Result<Self> {
+        let row_count = input.ohlcv().len();
+        let training_rows = canonical_discovery_normalization_training_rows(row_count)?;
+        Self::with_holdout_at(input, training_rows.end)
+    }
+
+    fn with_holdout_at(input: &'a CanonicalSearchRunInputV2<'_>, split_at: usize) -> Result<Self> {
+        let row_count = input.ohlcv().len();
+        anyhow::ensure!(row_count > 0, "canonical discovery input is empty");
+        anyhow::ensure!(split_at > 0, "in-sample selection window is empty");
+        anyhow::ensure!(
+            split_at < row_count,
+            "holdout suffix is empty or split {split_at} exceeds {row_count} parent rows"
+        );
+        anyhow::ensure!(
+            split_at >= 64,
+            "in-sample selection must contain at least 64 rows; got {split_at}"
+        );
+
+        let inputs = Self {
+            selection: ScopedDiscoveryInput::owned_range(
+                input,
+                CanonicalSearchWindowRoleV1::InSample,
+                0..split_at,
+            )?,
+            holdout: Some(ScopedDiscoveryInput::owned_range(
+                input,
+                CanonicalSearchWindowRoleV1::Holdout,
+                split_at..row_count,
+            )?),
+        };
+        validate_discovery_scope_pair(
+            input,
+            inputs.selection.scope(),
+            inputs.holdout.as_ref().map(ScopedDiscoveryInput::scope),
+        )?;
+        Ok(inputs)
+    }
+
+    fn selection(&self) -> &ScopedDiscoveryInput<'_> {
+        &self.selection
+    }
+
+    fn holdout(&self) -> Option<&ScopedDiscoveryInput<'_>> {
+        self.holdout.as_ref()
+    }
+}
+
+fn validate_discovery_scope_pair(
+    input: &CanonicalSearchRunInputV2<'_>,
+    selection: &CanonicalSearchArtifactScopeV2,
+    holdout: Option<&CanonicalSearchArtifactScopeV2>,
+) -> Result<()> {
+    selection
+        .validate_against_receipt(input.receipt())
+        .map_err(anyhow::Error::new)?;
+    let full_scope = CanonicalSearchArtifactScopeV2::from_run_input(
+        CanonicalSearchWindowRoleV1::DiscoveryInput,
+        input,
+    )
+    .map_err(anyhow::Error::new)?;
+    let full = full_scope.evaluated_window();
+    let selected = selection.evaluated_window();
+
+    let Some(holdout) = holdout else {
+        anyhow::ensure!(
+            selected.role() == CanonicalSearchWindowRoleV1::DiscoveryInput,
+            "holdout-free selection scope has the wrong role"
+        );
+        anyhow::ensure!(
+            selection == &full_scope,
+            "holdout-free selection scope must exactly cover the full canonical input"
+        );
+        return Ok(());
+    };
+
+    holdout
+        .validate_against_receipt(input.receipt())
+        .map_err(anyhow::Error::new)?;
+    let held_out = holdout.evaluated_window();
+    anyhow::ensure!(
+        selected.role() == CanonicalSearchWindowRoleV1::InSample,
+        "holdout split selection scope has the wrong role; expected in_sample"
+    );
+    anyhow::ensure!(
+        held_out.role() == CanonicalSearchWindowRoleV1::Holdout,
+        "holdout split evidence scope has the wrong role; expected holdout"
+    );
+    anyhow::ensure!(
+        selected.row_start() == full.row_start()
+            && selected.timestamp_start_ms() == full.timestamp_start_ms(),
+        "holdout split selection must start at the exact canonical input boundary"
+    );
+    anyhow::ensure!(
+        held_out.row_end() == full.row_end()
+            && held_out.timestamp_end_ms() == full.timestamp_end_ms(),
+        "holdout split evidence must end at the exact canonical input boundary"
+    );
+    anyhow::ensure!(
+        selected.row_end() == held_out.row_start(),
+        "selection and holdout source-row scopes must be contiguous without a gap or overlap"
+    );
+
+    let split_at = selected
+        .row_end()
+        .checked_sub(full.row_start())
+        .and_then(|rows| usize::try_from(rows).ok())
+        .ok_or_else(|| anyhow::anyhow!("holdout split row boundary cannot map into parent rows"))?;
+    anyhow::ensure!(
+        split_at > 0 && split_at < input.ohlcv().len(),
+        "holdout split must contain non-empty selection and evidence windows"
+    );
+    let expected_selection = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::InSample,
+        input,
+        0..split_at,
+    )
+    .map_err(anyhow::Error::new)?;
+    let expected_holdout = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::Holdout,
+        input,
+        split_at..input.ohlcv().len(),
+    )
+    .map_err(anyhow::Error::new)?;
+    anyhow::ensure!(
+        selection == &expected_selection && holdout == &expected_holdout,
+        "selection and holdout scopes do not exactly match the parent rows/timestamps"
+    );
+    Ok(())
+}
 
 /// [`run_discovery_cycle`] behind the outer OOS holdout split — the single
 /// source of truth for "discovery never sees the tail" (audit B02/B03).
@@ -4937,23 +5689,21 @@ pub const DEFAULT_OOS_HOLDOUT_FRACTION: f64 = 0.2;
 /// [`run_discovery_cycle`] directly is only correct for tests or callers
 /// that manage their own holdout.
 pub fn run_discovery_cycle_with_holdout(
-    features: &FeatureFrame,
-    ohlcv: &Ohlcv,
+    input: &CanonicalSearchRunInputV2<'_>,
     config: &DiscoveryConfig,
     prop_firm_rules: PropFirmRiskRules,
 ) -> Result<DiscoveryResult> {
-    run_discovery_cycle_with_holdout_and_progress(features, ohlcv, config, prop_firm_rules, |_| {})
+    run_discovery_cycle_with_holdout_and_progress(input, config, prop_firm_rules, |_| {})
 }
 
 /// See [`run_discovery_cycle_with_holdout`]; this variant forwards discovery
 /// progress events to `progress_fn` (same contract as
 /// [`run_discovery_cycle_with_progress`]).
 pub fn run_discovery_cycle_with_holdout_and_progress<F>(
-    features: &FeatureFrame,
-    ohlcv: &Ohlcv,
+    input: &CanonicalSearchRunInputV2<'_>,
     config: &DiscoveryConfig,
     prop_firm_rules: PropFirmRiskRules,
-    mut progress_fn: F,
+    progress_fn: F,
 ) -> Result<DiscoveryResult>
 where
     F: FnMut(DiscoveryProgress),
@@ -4961,7 +5711,192 @@ where
     neoethos_core::current_broker_financial_truth_capability_v1()
         .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
         .map_err(anyhow::Error::new)?;
+    run_discovery_cycle_with_holdout_and_progress_authorized(
+        input,
+        config,
+        prop_firm_rules,
+        None,
+        None,
+        progress_fn,
+    )
+    .map(|(result, _)| result)
+}
 
+/// CPU half of the prepared V3 entrypoint. The caller already consumed the
+/// one physical-inventory admission and converted its zero-physical-GPU proof
+/// into the exact run-owned Search route, so this path must not probe again.
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn run_discovery_cycle_with_prepared_cpu_admission_v3<F>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    prop_firm_rules: PropFirmRiskRules,
+    strict_device_admission: crate::SealedStrictDiscoveryDeviceAdmissionV1,
+    progress_fn: F,
+) -> Result<DiscoveryResult>
+where
+    F: FnMut(DiscoveryProgress),
+{
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
+    run_discovery_cycle_with_holdout_and_progress_authorized(
+        input,
+        config,
+        prop_firm_rules,
+        None,
+        Some(strict_device_admission),
+        progress_fn,
+    )
+    .map(|(result, _)| result)
+}
+
+/// Discovery result plus the only versioned quote-validation evidence that may
+/// be produced after the final portfolio and outer holdout are locked.
+///
+/// The evidence remains research-only and is not a promotion permit.
+#[derive(Debug)]
+pub struct QuoteValidatedDiscoveryResultV1 {
+    result: DiscoveryResult,
+    quote_validated_outer_holdout: crate::QuoteValidatedOuterHoldoutResearchEvidenceV1,
+}
+
+impl QuoteValidatedDiscoveryResultV1 {
+    pub fn result(&self) -> &DiscoveryResult {
+        &self.result
+    }
+
+    pub fn quote_validated_outer_holdout(
+        &self,
+    ) -> &crate::QuoteValidatedOuterHoldoutResearchEvidenceV1 {
+        &self.quote_validated_outer_holdout
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        DiscoveryResult,
+        crate::QuoteValidatedOuterHoldoutResearchEvidenceV1,
+    ) {
+        (self.result, self.quote_validated_outer_holdout)
+    }
+
+    pub fn validate_complete_promotion_evidence(&self) -> Result<()> {
+        self.result.validate_validation_evidence_sets(true)?;
+        crate::quote_validated_outer_holdout_v1::require_quote_validated_outer_holdout_v1(Some(
+            &self.quote_validated_outer_holdout,
+        ))
+        .map(|_| ())
+        .map_err(anyhow::Error::new)
+    }
+}
+
+type LockedOuterHoldoutReplayProviderV1<'a> = dyn FnMut(
+        &DiscoveryResult,
+        &[Vec<i8>],
+        &CanonicalSearchArtifactScopeV2,
+    ) -> Result<crate::LockedPortfolioOuterHoldoutReplaySetV1>
+    + 'a;
+
+/// Run canonical-trendbar discovery, then ask for sealed quote replay exactly
+/// once after the portfolio is final and all early-return conditions have
+/// passed. The provider cannot influence GA, CPCV, features, or selection.
+pub fn run_discovery_cycle_with_quote_validated_outer_holdout_and_progress<F, P>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    prop_firm_rules: PropFirmRiskRules,
+    mut replay_provider: P,
+    progress_fn: F,
+) -> Result<QuoteValidatedDiscoveryResultV1>
+where
+    F: FnMut(DiscoveryProgress),
+    P: FnMut(
+        &DiscoveryResult,
+        &[Vec<i8>],
+        &CanonicalSearchArtifactScopeV2,
+    ) -> Result<crate::LockedPortfolioOuterHoldoutReplaySetV1>,
+{
+    neoethos_core::current_broker_financial_truth_capability_v1()
+        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+        .map_err(anyhow::Error::new)?;
+    let (result, quote_validated_outer_holdout) =
+        run_discovery_cycle_with_holdout_and_progress_authorized(
+            input,
+            config,
+            prop_firm_rules,
+            Some(&mut replay_provider),
+            None,
+            progress_fn,
+        )?;
+    let quote_validated_outer_holdout =
+        crate::quote_validated_outer_holdout_v1::require_quote_validated_outer_holdout_v1(
+            quote_validated_outer_holdout.as_ref(),
+        )
+        .map_err(anyhow::Error::new)?
+        .clone();
+    Ok(QuoteValidatedDiscoveryResultV1 {
+        result,
+        quote_validated_outer_holdout,
+    })
+}
+
+/// Full receipt-bound CUDA/CPU discovery for canonical-trendbar research.
+/// The returned envelope is structurally research-only and cannot authorize
+/// live execution or promotion.
+pub fn run_canonical_trendbar_research_discovery_with_holdout_and_progress<F>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    prop_firm_rules: PropFirmRiskRules,
+    progress_fn: F,
+) -> Result<crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3>
+where
+    F: FnMut(DiscoveryProgress),
+{
+    contract.validate_against_input(input)?;
+    let mut research_config = config.clone();
+    apply_research_contract_to_discovery_config(&mut research_config, contract);
+    let _research_execution =
+        crate::canonical_trendbar_research::install_canonical_trendbar_research_execution_v3(
+            contract,
+        )?;
+    let result = run_discovery_cycle_with_holdout_and_progress_authorized(
+        input,
+        &research_config,
+        prop_firm_rules,
+        None,
+        None,
+        progress_fn,
+    )?
+    .0;
+    crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3::new(
+        contract.clone(),
+        result,
+    )
+}
+
+fn run_discovery_cycle_with_holdout_and_progress_authorized<F>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    prop_firm_rules: PropFirmRiskRules,
+    mut quote_validated_outer_holdout: Option<&mut LockedOuterHoldoutReplayProviderV1<'_>>,
+    strict_device_admission: Option<crate::SealedStrictDiscoveryDeviceAdmissionV1>,
+    mut progress_fn: F,
+) -> Result<(
+    DiscoveryResult,
+    Option<crate::QuoteValidatedOuterHoldoutResearchEvidenceV1>,
+)>
+where
+    F: FnMut(DiscoveryProgress),
+{
+    #[cfg(feature = "gpu")]
+    let _cubecl_population_residency = crate::cubecl_eval::cubecl_residency_scope();
+    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let selection = inputs.selection();
+    let holdout = inputs
+        .holdout()
+        .expect("with_holdout always constructs a held-out evidence suffix");
+    let n_rows = input.ohlcv().len();
+    let is_end = selection.ohlcv().len();
     crate::gpu_native::capability::gpu_pipeline_preflight(
         crate::backend::current_evaluation_backend(),
         &crate::gpu_native::capability::GpuCapabilityManifest::stage1_baseline(),
@@ -4969,32 +5904,6 @@ where
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
-    // Align both inputs to the same row count before splitting so the
-    // in-sample and tail windows stay index-consistent even when the
-    // caller's OHLCV and feature cube disagree by a few rows.
-    let n_rows = ohlcv.close.len().min(features.n_samples());
-    anyhow::ensure!(
-        n_rows > 0,
-        "run_discovery_cycle_with_holdout: empty dataset (ohlcv rows = {}, feature rows = {})",
-        ohlcv.close.len(),
-        features.n_samples()
-    );
-    let is_end = ((n_rows as f64) * (1.0 - DEFAULT_OOS_HOLDOUT_FRACTION)).floor() as usize;
-    anyhow::ensure!(
-        is_end >= 64,
-        "run_discovery_cycle_with_holdout: dataset too short for an OOS holdout split \
-         ({n_rows} rows total, {is_end} in-sample). Provide more history — discovery \
-         without a held-out tail cannot produce trustworthy out-of-sample evidence."
-    );
-
-    let is_ohlcv = slice_ohlcv(ohlcv, 0, is_end);
-    // Never-OOM fix (2026-07-18): `row_window` is a zero-copy VIEW for
-    // mmap-backed cubes. The old `sample_window` materialized 80% of the
-    // disk cube in RAM before the GA even started — on EURUSD M5 that was a
-    // surprise ~5.8 GB allocation plus a full read of the 7.3 GB store,
-    // which froze the operator's machine mid-discovery. In-memory cubes
-    // still copy (they already fit in RAM by construction).
-    let is_features = features.row_window(0, is_end);
     tracing::info!(
         target: "neoethos_search::discovery",
         total_rows = n_rows,
@@ -5005,16 +5914,24 @@ where
          withheld for forward-test + prop-firm evidence"
     );
 
-    let mut result =
-        run_discovery_cycle_with_progress(&is_features, &is_ohlcv, config, &mut progress_fn)?;
+    let mut result = if let Some(strict_device_admission) = strict_device_admission {
+        run_discovery_cycle_values_with_progress(
+            strict_device_admission,
+            &inputs,
+            config,
+            &mut progress_fn,
+        )?
+    } else {
+        run_discovery_cycle_values_with_real_device_admission(&inputs, config, &mut progress_fn)?
+    };
 
     // Operator Stop mid-search: the cycle returned early with a partial
     // result the caller will discard — don't burn time forward-testing it.
     if crate::genetic::search_engine::search_cancel_requested() {
-        return Ok(result);
+        return Ok((result, None));
     }
-    if result.portfolio.is_empty() || is_end >= n_rows {
-        return Ok(result);
+    if result.portfolio.is_empty() {
+        return Ok((result, None));
     }
 
     progress_fn(DiscoveryProgress::StageAdvanced {
@@ -5027,17 +5944,15 @@ where
         ),
     });
 
-    let tail_ohlcv = slice_ohlcv(ohlcv, is_end, n_rows);
-    // Same never-OOM treatment for the held-out tail: a view, not a copy.
-    // The forward-test projection then copies only the (small) effective
-    // feature columns it actually needs.
-    let tail_features = features.row_window(is_end, n_rows);
-
     match compute_discovery_forward_test_artifacts_with_smc_gate(
         &result.portfolio,
         &result.effective_feature_names,
-        &tail_features,
-        &tail_ohlcv,
+        holdout.features(),
+        holdout.ohlcv(),
+        result
+            .holdout_scope()?
+            .ok_or_else(|| anyhow::anyhow!("split discovery result lost its holdout scope"))?,
+        &result.search_config_hash,
         config,
         result.effective_smc_gate_threshold,
     ) {
@@ -5046,15 +5961,19 @@ where
             target: "neoethos_search::discovery",
             error = %err,
             "forward-test artifact computation on the held-out tail failed \
-             (non-fatal — portfolio export proceeds without forward-test evidence, \
-             and the live-portfolio OOS gate will keep all members)"
+             (the research result remains inspectable, but live/promotion authorities \
+             will fail closed because exact forward-test evidence is missing)"
         ),
     }
     match compute_discovery_prop_firm_artifacts_with_smc_gate(
         &result.portfolio,
         &result.effective_feature_names,
-        &tail_features,
-        &tail_ohlcv,
+        holdout.features(),
+        holdout.ohlcv(),
+        result
+            .holdout_scope()?
+            .ok_or_else(|| anyhow::anyhow!("split discovery result lost its holdout scope"))?,
+        &result.search_config_hash,
         config,
         result.effective_smc_gate_threshold,
         prop_firm_rules,
@@ -5064,24 +5983,103 @@ where
             target: "neoethos_search::discovery",
             error = %err,
             "prop-firm artifact computation on the held-out tail failed \
-             (non-fatal — portfolio export proceeds without prop-firm evidence)"
+             (the research result remains inspectable, but live/promotion authorities \
+             will fail closed because exact prop-firm evidence is missing)"
         ),
     }
-    Ok(result)
+    let quote_validated_outer_holdout = if let Some(replay_provider) =
+        quote_validated_outer_holdout.as_mut()
+    {
+        anyhow::ensure!(
+            !result.portfolio.iter().any(|gene| gene.stop_vol_mult > 0.0),
+            "quote-validated outer-holdout V1 refuses adaptive stops because its ordered fixed-risk binding cannot represent per-bar stop distances"
+        );
+        let holdout_scope = result.holdout_scope()?;
+        let holdout_scope = holdout_scope
+            .ok_or_else(|| anyhow::anyhow!("split discovery result lost its holdout scope"))?
+            .clone();
+        let projected = crate::project_features_to_effective(
+            holdout.features(),
+            &result.effective_feature_names,
+        )?;
+        let evaluation = config.evaluation_config(holdout.ohlcv().close.last().copied());
+        anyhow::ensure!(
+            evaluation.pip_value_per_lot.is_finite() && evaluation.pip_value_per_lot > 0.0,
+            "quote-validated outer-holdout metrics require an exact positive pip value per lot"
+        );
+        let ordered_signals = result
+            .portfolio
+            .iter()
+            .map(|gene| {
+                crate::genetic::search_engine::signals_for_gene_with_config(
+                    &projected,
+                    gene,
+                    &evaluation,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let replay_set: crate::LockedPortfolioOuterHoldoutReplaySetV1 =
+            replay_provider(&result, &ordered_signals, &holdout_scope)?;
+        Some(
+            crate::evaluate_locked_portfolio_outer_holdout_v1(
+                &result.portfolio,
+                &ordered_signals,
+                &result.search_config_hash,
+                &holdout_scope,
+                config.initial_balance,
+                evaluation.pip_value_per_lot,
+                replay_set,
+            )
+            .map_err(anyhow::Error::new)?,
+        )
+    } else {
+        None
+    };
+    Ok((result, quote_validated_outer_holdout))
 }
 
 pub fn run_discovery_cycle_with_progress<F>(
-    features: &FeatureFrame,
-    ohlcv: &Ohlcv,
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    progress_fn: F,
+) -> Result<DiscoveryResult>
+where
+    F: FnMut(DiscoveryProgress),
+{
+    #[cfg(feature = "gpu")]
+    let _cubecl_population_residency = crate::cubecl_eval::cubecl_residency_scope();
+    let inputs = CanonicalDiscoveryRunInputs::entire(input)?;
+    run_discovery_cycle_values_with_real_device_admission(&inputs, config, progress_fn)
+}
+
+fn run_discovery_cycle_values_with_real_device_admission<F>(
+    inputs: &CanonicalDiscoveryRunInputs<'_>,
+    config: &DiscoveryConfig,
+    progress_fn: F,
+) -> Result<DiscoveryResult>
+where
+    F: FnMut(DiscoveryProgress),
+{
+    let strict_device_admission =
+        crate::acquire_strict_discovery_device_admission_v1().map_err(anyhow::Error::new)?;
+    run_discovery_cycle_values_with_progress(strict_device_admission, inputs, config, progress_fn)
+}
+
+fn run_discovery_cycle_values_with_progress<F>(
+    strict_device_admission: crate::SealedStrictDiscoveryDeviceAdmissionV1,
+    inputs: &CanonicalDiscoveryRunInputs<'_>,
     config: &DiscoveryConfig,
     mut progress_fn: F,
 ) -> Result<DiscoveryResult>
 where
     F: FnMut(DiscoveryProgress),
 {
-    neoethos_core::current_broker_financial_truth_capability_v1()
-        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
-        .map_err(anyhow::Error::new)?;
+    let selection = inputs.selection();
+    let features = selection.features();
+    let ohlcv = selection.ohlcv();
+    let selection_scope = selection.scope();
+    let search_input_receipt = selection.scope().receipt();
+    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
 
     // F-304 fix (2026-05-28): pre-flight bail. The cost-model NaN
     // guard at `strategy_gene::infer_market_cost_profile` returns
@@ -5622,7 +6620,7 @@ where
                 config.cpcv_max_rows,
             )),
         };
-        let (filtered_frame, census) = prefilter_features(&features, &ohlcv, &spec);
+        let (filtered_frame, census) = prefilter_features(&features, &ohlcv, &spec)?;
         features = filtered_frame;
 
         let total_labels =
@@ -5718,6 +6716,51 @@ where
     // Capture names after prefilter — gene indices refer to this list.
     let effective_feature_names = features.names.clone();
 
+    // The resident execution parent is the exact post-trim, post-prefilter
+    // dataset consumed by every population lane in this run. The public
+    // selection scope still names the caller's full selected input; derive a
+    // narrower internal scope for the suffix retained by `max_rows` so the
+    // engine receipt never over-claims rows it did not evaluate.
+    let selected_window = selection_scope.evaluated_window();
+    let selected_rows = selected_window
+        .row_end()
+        .checked_sub(selected_window.row_start())
+        .and_then(|rows| usize::try_from(rows).ok());
+    anyhow::ensure!(
+        selected_rows == Some(n_input_rows),
+        "canonical selection scope row count does not match the discovery input"
+    );
+    let trimmed_prefix = n_input_rows
+        .checked_sub(n_after_trim)
+        .ok_or_else(|| anyhow::anyhow!("trimmed discovery row count exceeds its input"))?;
+    let resident_row_start = selected_window
+        .row_start()
+        .checked_add(trimmed_prefix as u64)
+        .ok_or_else(|| anyhow::anyhow!("resident population row-start overflow"))?;
+    let resident_window = CanonicalSearchEvaluatedWindowV1::new(
+        selected_window.role(),
+        resident_row_start,
+        selected_window.row_end(),
+        *features
+            .timestamps
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("resident population input is empty"))?,
+        *features
+            .timestamps
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("resident population input is empty"))?,
+    )?;
+    let resident_scope =
+        CanonicalSearchArtifactScopeV2::new(search_input_receipt.clone(), resident_window)?;
+    let population_execution_run =
+        crate::population_execution_evidence_v1::begin_exact_population_execution_run_v1(
+            strict_device_admission,
+            &resident_scope,
+            &features,
+            &ohlcv,
+        )
+        .map_err(anyhow::Error::new)?;
+
     // Diagnostic (2026-06-08): surface the per-timeframe coverage of the
     // prefiltered cube so a "multi-TF features never reached the GA"
     // regression is visible at a glance instead of hiding behind a flat
@@ -5740,56 +6783,6 @@ where
         );
     }
 
-    // Search-memory + weekly-refresh (2026-06-06): BEFORE the GA starts, seed the
-    // seen-signature memory with the hashes recorded in the prior run's ledger so
-    // the engine SKIPS re-discovering strategies it already found — each weekly
-    // run then ADDS new diverse strategies to a growing library. Config-gated:
-    // when `discovery_ledger_enabled` is false this whole block is skipped and
-    // behaviour is byte-identical to a build without the feature.
-    //
-    // The GA builds its OWN `SeenSignatureMemory::from_env()` (search_engine.rs,
-    // not modified here). We seed into a memory built from the same env/config so
-    // — when an on-disk seen-file is configured via
-    // `models.seen_signature_runtime.file_path` — the seeded hashes are persisted
-    // and the engine's `from_env()` reads them at construction. When no seen-file
-    // is configured (the in-memory default) we still run the seed step but log
-    // that cross-run dedup needs a seen-file path to reach the engine.
-    if config.discovery_ledger_enabled {
-        if let Some(prior) = crate::discovery_ledger::load_prior_ledger(
-            &config.discovery_ledger_cache_dir,
-            &config.evaluation_symbol,
-            &config.timeframe_label,
-        ) {
-            let mut seen = crate::genetic::SeenSignatureMemory::from_env();
-            let seen_has_file = seen.file_path.is_some();
-            let prior_total = prior.portfolio.len() + prior.archive.len();
-            let inserted = crate::discovery_ledger::seed_seen_from_ledger(&prior, &mut seen);
-            seen.flush();
-            if seen_has_file {
-                tracing::info!(
-                    target: "neoethos_search::discovery_ledger",
-                    symbol = %config.evaluation_symbol,
-                    tf = %config.timeframe_label,
-                    prior_total,
-                    seeded = inserted,
-                    "seeded GA seen-set from prior discovery ledger (persisted to seen-file)"
-                );
-            } else {
-                tracing::warn!(
-                    target: "neoethos_search::discovery_ledger",
-                    symbol = %config.evaluation_symbol,
-                    tf = %config.timeframe_label,
-                    prior_total,
-                    seeded = inserted,
-                    "loaded prior discovery ledger but no on-disk seen-file is configured \
-                     (models.seen_signature_runtime.file_path) — the seeded hashes will NOT \
-                     reach the engine's fresh in-memory seen-set. Set a file_path for true \
-                     cross-run dedup."
-                );
-            }
-        }
-    }
-
     // Multi-stage Funnel: Stage 1 (Fast Evaluation)
     let stage1_pct = config.runtime_overrides.resolved_funnel_stage1_pct();
     let stage1_window = config.runtime_overrides.stage1_window;
@@ -5809,13 +6802,7 @@ where
         "stage 1 fast-evaluation slice"
     );
     let ohlcv_stage1 = slice_ohlcv(&ohlcv, stage1_start, stage1_end);
-    let features_stage1 = FeatureFrame {
-        timestamps: features.timestamps[stage1_start..stage1_end].to_vec(),
-        names: features.names.clone(),
-        data: neoethos_data::FeatureData::InMemory(
-            features.sample_window(stage1_start, stage1_end),
-        ),
-    };
+    let features_stage1 = features.row_window(stage1_start, stage1_end)?;
     // ── The search-more knob, resolved here and nowhere else ────────────────
     //
     // Population is NOT a batching parameter: a bigger one creates different
@@ -5877,6 +6864,63 @@ where
     } else {
         config
     };
+
+    // One immutable configuration identity for every persistent search-state
+    // edge. This is resolved only after population auto-sizing, so the prior
+    // ledger, trial-return matrix, and new ledger all name the search that
+    // actually runs rather than the caller's unresolved request.
+    let search_state_config_hash = crate::run_identity::config_hash_for(
+        config,
+        config.evaluation_config(None).pip_value_per_lot,
+        neoethos_data::current_data_runtime_overrides().normalize_features,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!("cannot derive the exact config hash for receipt-bound discovery state")
+    })?;
+
+    // Search-memory + weekly-refresh: seed only from state addressed by this
+    // exact receipt and resolved config. Corruption, a legacy unbound ledger, or
+    // any embedded identity mismatch is fatal rather than treated as absence.
+    if config.discovery_ledger_enabled {
+        if let Some(prior) = crate::discovery_ledger::load_prior_ledger(
+            &config.discovery_ledger_cache_dir,
+            &config.evaluation_symbol,
+            &config.timeframe_label,
+            search_input_receipt,
+            &search_state_config_hash,
+        )? {
+            let mut seen = crate::genetic::SeenSignatureMemory::current();
+            let seen_has_file = seen.file_path.is_some();
+            let prior_total = prior.portfolio.len() + prior.archive.len();
+            let inserted = crate::discovery_ledger::seed_seen_from_ledger(&prior, &mut seen);
+            seen.flush();
+            if seen_has_file {
+                tracing::info!(
+                    target: "neoethos_search::discovery_ledger",
+                    symbol = %config.evaluation_symbol,
+                    tf = %config.timeframe_label,
+                    receipt_sha256 = %prior.search_input_receipt_sha256,
+                    config_hash = %prior.config_hash,
+                    prior_total,
+                    seeded = inserted,
+                    "seeded GA seen-set from exact receipt/config discovery ledger"
+                );
+            } else {
+                tracing::warn!(
+                    target: "neoethos_search::discovery_ledger",
+                    symbol = %config.evaluation_symbol,
+                    tf = %config.timeframe_label,
+                    receipt_sha256 = %prior.search_input_receipt_sha256,
+                    config_hash = %prior.config_hash,
+                    prior_total,
+                    seeded = inserted,
+                    "loaded exact prior discovery ledger but no on-disk seen-file is configured \
+                     (models.seen_signature_runtime.file_path) — the seeded hashes will NOT \
+                     reach the engine's fresh in-memory seen-set"
+                );
+            }
+        }
+    }
     progress_fn(DiscoveryProgress::SearchStarted {
         population: ga_population,
         generations: config.generations,
@@ -5889,7 +6933,7 @@ where
     } else {
         None
     };
-    let search = evolve_search_with_progress_and_limits(
+    let search = evolve_search_with_progress_and_limits_exact(
         &features_stage1,
         &ohlcv_stage1,
         ga_population,
@@ -5897,6 +6941,11 @@ where
         config.max_indicators,
         max_runtime,
         Some(config.evaluation_config(ohlcv_stage1.close.last().copied())),
+        &population_execution_run,
+        crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::ContiguousRange {
+            start: stage1_start,
+            end: stage1_end,
+        },
         |generation, total_generations, best_fitness, stagnant_generations, archived_profitable| {
             progress_fn(DiscoveryProgress::GenerationCompleted {
                 generation,
@@ -5920,16 +6969,39 @@ where
     let profitable_count = search.genes.iter().filter(|g| g.fitness > 0.0).count();
     funnel.record_stage("profitable_archive_size", stage1_count, profitable_count);
 
-    let result = finalize_candidates_with_progress(
+    let mut result = finalize_candidates_with_progress(
         search.genes,
         &features,
         &ohlcv,
+        search_input_receipt,
+        selection_scope,
+        inputs.holdout().map(ScopedDiscoveryInput::scope),
+        &search_state_config_hash,
         config,
         effective_smc_gate_threshold,
         effective_feature_names,
+        &population_execution_run,
         &mut funnel,
         progress_fn,
     )?;
+    let population_execution_run_receipt_v2 = population_execution_run
+        .finish()
+        .map_err(anyhow::Error::new)?;
+    tracing::info!(
+        target: "neoethos_search::engine",
+        receipt_sha256 = %population_execution_run_receipt_v2.identity_sha256(),
+        engines = ?population_execution_run_receipt_v2.engines(),
+        successful_populations = population_execution_run_receipt_v2
+            .engine_receipt_v1()
+            .successful_population_count(),
+        "closed the run-scoped exact population-engine receipt"
+    );
+    result
+        .funnel_profile
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("discovery result lost its run-scoped funnel carrier"))?
+        .attach_population_execution_run_receipt_v2(population_execution_run_receipt_v2)
+        .map_err(anyhow::Error::msg)?;
 
     // Search-memory + weekly-refresh (2026-06-06): AFTER finalize, on the
     // SUCCESS path, write this run's ledger (portfolio + top archive genes, each
@@ -5943,6 +7015,8 @@ where
             &config.discovery_ledger_cache_dir,
             &config.evaluation_symbol,
             &config.timeframe_label,
+            search_input_receipt,
+            &search_state_config_hash,
             &result,
             config,
             timestamp_ms,
@@ -6093,8 +7167,8 @@ const MIN_DECIDED_FIRST_PASSAGE_LABELS: usize = 100;
 /// features by what predicts a decline and calls it a target. Each column is
 /// scored against BOTH and keeps whichever direction it predicts better.
 struct FirstPassageLabels {
-    long: Vec<f32>,
-    short: Vec<f32>,
+    long: Vec<f64>,
+    short: Vec<f64>,
 }
 
 /// Rolling mean true range in f64, for sizing the label's horizontal barriers.
@@ -6109,7 +7183,11 @@ fn rolling_atr_f64(ohlcv: &Ohlcv, period: usize) -> Vec<f64> {
     for i in 0..n {
         let hi = ohlcv.high[i];
         let lo = ohlcv.low[i];
-        let prev_close = if i > 0 { ohlcv.close[i - 1] } else { ohlcv.close[i] };
+        let prev_close = if i > 0 {
+            ohlcv.close[i - 1]
+        } else {
+            ohlcv.close[i]
+        };
         if !hi.is_finite() || !lo.is_finite() || !prev_close.is_finite() {
             tr[i] = f64::NAN;
             continue;
@@ -6171,8 +7249,8 @@ fn first_passage_labels(
     spec: &PrefilterSpec,
 ) -> (FirstPassageLabels, PrefilterCensus) {
     let n = ohlcv.close.len();
-    let mut long_labels = vec![f32::NAN; n];
-    let mut short_labels = vec![f32::NAN; n];
+    let mut long_labels = vec![f64::NAN; n];
+    let mut short_labels = vec![f64::NAN; n];
     let mut census = PrefilterCensus::default();
     if n < 2 {
         census.label_undefined = n;
@@ -6237,8 +7315,8 @@ fn first_passage_labels(
         let short_sl = entry + stop_distance - cost;
         let horizon_end = (i + hold).min(n - 1);
 
-        let mut long_label = 0.0f32;
-        let mut short_label = 0.0f32;
+        let mut long_label = 0.0f64;
+        let mut short_label = 0.0f64;
         let mut long_decided = false;
         let mut short_decided = false;
         for f in (i + 1)..=horizon_end {
@@ -6351,7 +7429,7 @@ fn prefilter_features(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     spec: &PrefilterSpec,
-) -> (FeatureFrame, PrefilterCensus) {
+) -> Result<(FeatureFrame, PrefilterCensus)> {
     let n_rows = features.n_samples();
     let n_cols = features.n_features();
     if n_rows < 2 || n_cols <= spec.top_k {
@@ -6360,7 +7438,7 @@ fn prefilter_features(
             columns_kept: n_cols,
             ..PrefilterCensus::default()
         };
-        return (features.clone(), census);
+        return Ok((features.clone(), census));
     }
 
     // THE TARGET (2026-08-09). Was the 1-bar forward return; is now the
@@ -6399,11 +7477,11 @@ fn prefilter_features(
         );
         census.label_fell_back_to_forward_return = true;
         let n = ohlcv.close.len();
-        let mut returns = vec![f32::NAN; n];
+        let mut returns = vec![f64::NAN; n];
         for i in 0..n.saturating_sub(1) {
             let denom = ohlcv.close[i];
             if denom.abs() > 1e-12 {
-                returns[i] = ((ohlcv.close[i + 1] - denom) / denom) as f32;
+                returns[i] = (ohlcv.close[i + 1] - denom) / denom;
             }
         }
         labels = returns;
@@ -6435,11 +7513,11 @@ fn prefilter_features(
     // `mean_fold_instability` is the residual measure. Removing the rest means
     // re-running the GA per fold: 28× the cost and a pipeline restructure.
     //
-    // Compounding it: with `normalize_features: true` the robust z-score fits
-    // its median/MAD on the leading `NORM_FIT_FRACTION` of rows
-    // (neoethos-data `normalization.rs`), which overlaps most CPCV test groups,
-    // so the values handed to the fold-wise correlation are already scaled using
-    // statistics fitted on those test rows.
+    // The feature builder now requires an explicit caller-owned training range
+    // and persists that fitted normalization state. CPCV must still supply a
+    // fold-causal fit range rather than reusing the outer discovery split: a
+    // shared fit that overlaps a fold's test rows would leak through the values
+    // handed to the fold-wise correlation.
     //
     // The purge does hold: 2% of at most 200k rows is up to 4000 bars against a
     // 35-bar label horizon, so the label's own forward window cannot leak across
@@ -6455,6 +7533,13 @@ fn prefilter_features(
         had_nonfinite: bool,
         rankable: bool,
     }
+
+    // Materialize each projected f64 column exactly once before parallel
+    // scoring. Vortex/read failures propagate instead of being turned into an
+    // empty or zero-valued feature, and Rayon workers only perform arithmetic.
+    let feature_columns = (0..n_cols)
+        .map(|column| features.feature_column(column))
+        .collect::<Result<Vec<_>>>()?;
 
     let scored: Vec<ColumnScore> = (0..n_cols)
         .into_par_iter()
@@ -6475,15 +7560,15 @@ fn prefilter_features(
                     rankable: true,
                 };
             }
-            let col: Vec<f32> = features.feature_column(col_idx).iter().copied().collect();
+            let col = &feature_columns[col_idx];
             let mut worst = f64::INFINITY;
             let mut best = 0.0f64;
             let mut had_nonfinite = false;
             let mut rankable_in_all = true;
             for window in &windows {
-                let mut xs: Vec<f32> = Vec::with_capacity(window.len());
-                let mut ys: Vec<f32> = Vec::with_capacity(window.len());
-                let mut ys_short: Vec<f32> = Vec::with_capacity(window.len());
+                let mut xs: Vec<f64> = Vec::with_capacity(window.len());
+                let mut ys: Vec<f64> = Vec::with_capacity(window.len());
+                let mut ys_short: Vec<f64> = Vec::with_capacity(window.len());
                 for &row in window {
                     // The label series is bar-indexed and the feature cube is
                     // row-indexed; they are the same length in production, but a
@@ -6493,13 +7578,17 @@ fn prefilter_features(
                     if row >= n_rows || row >= labels.len() {
                         continue;
                     }
-                    xs.push(col[row]);
+                    xs.push(if col.validity[row].is_valid() {
+                        col.values[row]
+                    } else {
+                        f64::NAN
+                    });
                     ys.push(labels[row]);
                     if let Some(short) = short_labels.as_ref() {
-                        ys_short.push(short.get(row).copied().unwrap_or(f32::NAN));
+                        ys_short.push(short.get(row).copied().unwrap_or(f64::NAN));
                     }
                 }
-                let outcome = neoethos_data::core::stats_f64::pearson_pairwise_f32(&xs, &ys);
+                let outcome = neoethos_data::core::stats_f64::pearson_pairwise(&xs, &ys);
                 if outcome.skipped > 0 {
                     had_nonfinite = true;
                 }
@@ -6514,7 +7603,7 @@ fn prefilter_features(
                 };
                 if short_labels.is_some() {
                     let short_outcome =
-                        neoethos_data::core::stats_f64::pearson_pairwise_f32(&xs, &ys_short);
+                        neoethos_data::core::stats_f64::pearson_pairwise(&xs, &ys_short);
                     if short_outcome.skipped > 0 {
                         had_nonfinite = true;
                     }
@@ -6682,24 +7771,7 @@ fn prefilter_features(
     let n_keep = keep_indices.len();
     census.columns_kept = n_keep;
 
-    let mut new_names = Vec::with_capacity(n_keep);
-    let mut new_data = ndarray::Array2::zeros((n_rows, n_keep));
-
-    for (new_col_idx, &orig_col_idx) in keep_indices.iter().enumerate() {
-        new_names.push(features.names[orig_col_idx].clone());
-        new_data
-            .column_mut(new_col_idx)
-            .assign(&features.feature_column(orig_col_idx));
-    }
-
-    (
-        FeatureFrame {
-            timestamps: features.timestamps.clone(),
-            names: new_names,
-            data: neoethos_data::FeatureData::InMemory(new_data),
-        },
-        census,
-    )
+    Ok((features.select_columns(&keep_indices)?, census))
 }
 
 /// Genes that must be expected to touch a given column before that column
@@ -6821,15 +7893,18 @@ pub fn resolve_prefilter_top_k(
 ///
 /// BASE TIMEFRAME ONLY, by construction: higher-TF columns carry a `H1_`/`H4_`
 /// prefix (see `timeframe_group`), so `starts_with` matches the base block and
-/// not its ten resamplings. Same as `regime_` has always behaved.
-const PREFILTER_STATE_FAMILIES: [&str; 4] = ["regime_", "smc_", "session_", "fp_"];
+/// not its ten resamplings. Regime-v3 uses truthful identities with both
+/// `regime_` and `neoethos_custom_` heads, so its exact frozen name set is
+/// checked separately rather than widening the custom prefix.
+const PREFILTER_STATE_FAMILIES: [&str; 3] = ["smc_", "session_", "fp_"];
 
 /// Whether this column is force-kept by the prefilter regardless of its
 /// correlation rank.
 fn is_prefilter_state_column(name: &str) -> bool {
-    PREFILTER_STATE_FAMILIES
-        .iter()
-        .any(|family| name.starts_with(family))
+    neoethos_data::REGIME_FEATURE_NAMES_V3.contains(&name)
+        || PREFILTER_STATE_FAMILIES
+            .iter()
+            .any(|family| name.starts_with(family))
 }
 
 /// Identify the higher-timeframe prefix group of a multi-TF feature name.
@@ -6838,7 +7913,7 @@ fn is_prefilter_state_column(name: &str) -> bool {
 /// `"H1_rsi_14"`, `"M15_ema_20"`) by
 /// `prepare_multitimeframe_features_with_options`. Base-TF features are
 /// unprefixed and `regime_*` columns are handled separately, so this returns
-/// `None` for both. A timeframe label is one or two leading uppercase letters
+/// `None` for all base columns. A timeframe label is one or two leading uppercase letters
 /// (`M`, `H`, `D`, `W`, or `MN`) followed by digits, terminated by `_` — which
 /// distinguishes it from lowercase/longer base indicator heads (`rsi`, `macd`,
 /// `ema`, `bb`) without needing the live higher-TF list.
@@ -6871,8 +7946,11 @@ fn validate_regime_robustness(
     let trend_idx = features
         .names
         .iter()
-        .position(|n| n == "regime_trend_strength");
-    let vol_idx = features.names.iter().position(|n| n == "regime_vol_state");
+        .position(|n| n == "regime_wilder_adx_14_v3");
+    let vol_idx = features
+        .names
+        .iter()
+        .position(|n| n == "neoethos_custom_gk_vol_ratio_state_10_50_v3");
 
     // **2026-05-25 unwrap audit**: collapsed the early-return guard +
     // two `.unwrap()` calls into a single `let-else` destructure. Same
@@ -6889,6 +7967,24 @@ fn validate_regime_robustness(
     let mut last_idx = 0;
     let t_len = features.timestamps.len();
 
+    // Project each regime column once. Re-reading a Vortex projection for
+    // every trade dominated this validation stage and mixed storage I/O into
+    // the hot arithmetic loop.
+    let trend_column = match features.feature_column(t_idx) {
+        Ok(column) => column,
+        Err(error) => {
+            tracing::error!(?error, "failed to read trend-regime feature column");
+            return false;
+        }
+    };
+    let volatility_column = match features.feature_column(v_idx) {
+        Ok(column) => column,
+        Err(error) => {
+            tracing::error!(?error, "failed to read volatility-regime feature column");
+            return false;
+        }
+    };
+
     for trade in trades {
         let ts = trade.entry_time;
         while last_idx < t_len && features.timestamps[last_idx] < ts {
@@ -6903,12 +7999,18 @@ fn validate_regime_robustness(
             continue;
         }
 
-        let trend_str = features.feature_at(idx, t_idx);
-        let vol_state = features.feature_at(idx, v_idx);
+        if !trend_column.validity[idx].is_valid() || !volatility_column.validity[idx].is_valid() {
+            // A trade whose regime inputs are undefined cannot prove regime
+            // robustness. Reject the candidate instead of treating undefined
+            // as zero or silently omitting the trade.
+            return false;
+        }
+        let trend_str = trend_column.values[idx];
+        let vol_state = volatility_column.values[idx];
 
-        if trend_str > 0.25 {
+        if trend_str > 25.0 {
             trend_pnl += trade.pnl;
-        } else if trend_str < 0.15 {
+        } else if trend_str < 15.0 {
             range_pnl += trade.pnl;
         }
 
@@ -7224,44 +8326,54 @@ fn screen_candidates_by_signal_count(
     prefiltered: Vec<(usize, Gene)>,
     eval_config: &EvaluationConfig,
     min_trades: usize,
-) -> (Vec<(usize, Gene, Vec<i8>)>, usize) {
+) -> Result<(Vec<(usize, Gene, Vec<i8>)>, usize)> {
     // An empty pool pays nothing. `build_smc_arrays` scans every bar of the
     // series (~90 f64 ops each) before it knows there is no gene to gate, and
     // an empty prefilter is the normal outcome of a run that found nothing —
     // which is most M3 runs today.
     if prefiltered.is_empty() {
-        return (Vec::new(), 0);
+        return Ok((Vec::new(), 0));
     }
-    let smc = SmcGateArrays::build(features, ohlcv);
+    let smc = SmcGateArrays::build(features, ohlcv)?;
     let nonzero_signal_count = std::sync::atomic::AtomicUsize::new(0);
-    let survivors: Vec<(usize, Gene, Vec<i8>)> = prefiltered
+    let survivors = prefiltered
         .into_par_iter()
-        .filter_map(|(candidate_idx, gene)| {
-            let sig = signals_for_gene_full_with_smc(features, &gene, eval_config, &smc);
-            let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
-            if trade_count > 0.0 {
-                nonzero_signal_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            if trade_count >= min_trades as f64 {
-                Some((candidate_idx, gene, sig))
-            } else {
-                None
-            }
-        })
-        .collect();
-    (
+        .map(
+            |(candidate_idx, gene)| -> Result<Option<(usize, Gene, Vec<i8>)>> {
+                let sig = signals_for_gene_full_with_smc(features, &gene, eval_config, &smc)?;
+                let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
+                if trade_count > 0.0 {
+                    nonzero_signal_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if trade_count >= min_trades as f64 {
+                    Ok(Some((candidate_idx, gene, sig)))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok((
         survivors,
         nonzero_signal_count.load(std::sync::atomic::Ordering::Relaxed),
-    )
+    ))
 }
 
 fn finalize_candidates_with_progress<F>(
     candidates: Vec<Gene>,
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
+    search_input_receipt: &CanonicalSearchInputReceiptV2,
+    selection_scope: &CanonicalSearchArtifactScopeV2,
+    holdout_scope: Option<&CanonicalSearchArtifactScopeV2>,
+    search_state_config_hash: &str,
     config: &DiscoveryConfig,
-    effective_smc_gate_threshold: f32,
+    effective_smc_gate_threshold: f64,
     effective_feature_names: Vec<String>,
+    population_execution_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
     funnel: &mut crate::funnel_profile::FunnelProfile,
     mut progress_fn: F,
 ) -> Result<DiscoveryResult>
@@ -7275,24 +8387,27 @@ where
         let total = features.n_values();
         let mut nan = 0usize;
         let mut zero = 0usize;
-        let mut min_v = f32::INFINITY;
-        let mut max_v = f32::NEG_INFINITY;
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
         let mut sum_abs = 0.0_f64;
         let mut finite_count = 0usize;
-        for v in features.iter_values() {
-            if v.is_nan() {
-                nan += 1;
-            } else if v == 0.0 {
-                zero += 1;
-                finite_count += 1;
-            } else if v.is_finite() {
-                finite_count += 1;
-                sum_abs += v.abs() as f64;
-                if v < min_v {
-                    min_v = v;
-                }
-                if v > max_v {
-                    max_v = v;
+        for column_index in 0..features.n_features() {
+            let column = features.feature_column(column_index)?;
+            for (value, validity) in column.values.iter().zip(&column.validity) {
+                if !validity.is_valid() {
+                    nan += 1;
+                } else if *value == 0.0 {
+                    zero += 1;
+                    finite_count += 1;
+                } else {
+                    finite_count += 1;
+                    sum_abs += value.abs();
+                    if *value < min_v {
+                        min_v = *value;
+                    }
+                    if *value > max_v {
+                        max_v = *value;
+                    }
                 }
             }
         }
@@ -7307,8 +8422,8 @@ where
             cols = features.n_features(),
             nan_frac = nan as f64 / total.max(1) as f64,
             zero_frac = zero as f64 / total.max(1) as f64,
-            min_finite = if min_v.is_finite() { min_v as f64 } else { 0.0 },
-            max_finite = if max_v.is_finite() { max_v as f64 } else { 0.0 },
+            min_finite = if min_v.is_finite() { min_v } else { 0.0 },
+            max_finite = if max_v.is_finite() { max_v } else { 0.0 },
             mean_abs_finite = mean_abs,
             "feature frame summary"
         );
@@ -7330,12 +8445,13 @@ where
             let mut named_examples: Vec<String> = Vec::new();
             let start_row = features.n_samples() - trailing;
             for c in 0..n_cols {
-                let mut col_min = f32::INFINITY;
-                let mut col_max = f32::NEG_INFINITY;
+                let mut col_min = f64::INFINITY;
+                let mut col_max = f64::NEG_INFINITY;
                 let mut finite_seen = 0usize;
+                let column = features.feature_column(c)?;
                 for r in start_row..features.n_samples() {
-                    let v = features.feature_at(r, c);
-                    if v.is_finite() {
+                    if column.validity[r].is_valid() {
+                        let v = column.values[r];
                         finite_seen += 1;
                         if v < col_min {
                             col_min = v;
@@ -7508,7 +8624,8 @@ where
     // BIASED TOWARD PASSING, deliberately and irreversibly: see
     // `evaluate_batch_early_reject`. A false reject is invisible and permanent;
     // a false accept only costs time.
-    let batch_verdict = evaluate_batch_early_reject(&ranked_candidate_genes, &config.target_profile);
+    let batch_verdict =
+        evaluate_batch_early_reject(&ranked_candidate_genes, &config.target_profile);
     record_batch_verdict(streaming_sweep_cursor(), &batch_verdict);
     if batch_verdict.is_reject() {
         tracing::warn!(
@@ -7579,33 +8696,33 @@ where
     let prefiltered: Vec<(usize, Gene)> = if batch_verdict.is_reject() {
         Vec::new()
     } else {
-    ranked_candidates
-        .iter()
-        .filter(|(_, g)| {
-            let ok = g.passes_filter(&config.filtering);
-            if !ok {
-                // Cheap heuristic: pick the FIRST violated threshold so the
-                // counts roughly partition the rejections. Not every Gene
-                // populates every metric, so the buckets are a guide rather
-                // than an audit trail.
-                if !g.max_drawdown.is_nan() && g.max_drawdown > config.filtering.max_dd {
-                    reject_dd += 1;
-                } else if !g.win_rate.is_nan() && g.win_rate < config.filtering.min_win_rate {
-                    reject_win_rate += 1;
-                } else if !g.profit_factor.is_nan()
-                    && g.profit_factor < config.filtering.min_profit_factor
-                {
-                    reject_profit_factor += 1;
-                } else if !g.fitness.is_nan() && g.fitness < config.filtering.min_sharpe {
-                    reject_fitness += 1;
-                } else {
-                    reject_other += 1;
+        ranked_candidates
+            .iter()
+            .filter(|(_, g)| {
+                let ok = g.passes_filter(&config.filtering);
+                if !ok {
+                    // Cheap heuristic: pick the FIRST violated threshold so the
+                    // counts roughly partition the rejections. Not every Gene
+                    // populates every metric, so the buckets are a guide rather
+                    // than an audit trail.
+                    if !g.max_drawdown.is_nan() && g.max_drawdown > config.filtering.max_dd {
+                        reject_dd += 1;
+                    } else if !g.win_rate.is_nan() && g.win_rate < config.filtering.min_win_rate {
+                        reject_win_rate += 1;
+                    } else if !g.profit_factor.is_nan()
+                        && g.profit_factor < config.filtering.min_profit_factor
+                    {
+                        reject_profit_factor += 1;
+                    } else if !g.fitness.is_nan() && g.fitness < config.filtering.min_sharpe {
+                        reject_fitness += 1;
+                    } else {
+                        reject_other += 1;
+                    }
                 }
-            }
-            ok
-        })
-        .map(|(idx, g)| (*idx, g.clone()))
-        .collect()
+                ok
+            })
+            .map(|(idx, g)| (*idx, g.clone()))
+            .collect()
     };
     let post_passes_filter = prefiltered.len();
     funnel.record_stage("passed_base_filter", ranked_total, post_passes_filter);
@@ -7686,7 +8803,7 @@ where
         prefiltered,
         &eval_config_for_signals,
         min_trades,
-    );
+    )?;
     let post_min_trades = signals_with_idx.len();
     // 2026-05-26: record "any signal at all" + "passed min-trades" as separate
     // stages so the funnel can tell "SMC gate killed everything" (the common
@@ -8184,14 +9301,14 @@ where
                 ) {
                     Ok(prepared) => {
                         #[cfg(feature = "gpu")]
-                        let _gpu_guard =
-                            GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                        crate::genetic::search_engine::validation_genes_scenarios(
+                        let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                        crate::genetic::search_engine::validation_genes_scenarios_exact(
                             features,
                             ohlcv,
                             &screen_prep,
                             &prepared,
                             &work,
+                            population_execution_run,
                         )
                     }
                     Err(error) => Err(error),
@@ -8312,14 +9429,14 @@ where
                 ) {
                     Ok(prepared) => {
                         #[cfg(feature = "gpu")]
-                        let _gpu_guard =
-                            GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                        crate::genetic::search_engine::validation_genes_scenarios(
+                        let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                        crate::genetic::search_engine::validation_genes_scenarios_exact(
                             features,
                             ohlcv,
                             &screen_prep,
                             &prepared,
                             &base_work,
+                            population_execution_run,
                         )
                     }
                     Err(error) => Err(error),
@@ -8414,11 +9531,12 @@ where
         let cost_band_edges = config.cost_band_pips.filter(|_| band_discriminates);
         let mut cost_band_optimistic: Vec<Option<f64>> = vec![None; candidates];
         let mut cost_band_pessimistic: Vec<Option<f64>> = vec![None; candidates];
-        if let Some((optimistic_pips, pessimistic_pips)) = cost_band_edges.filter(|_| candidates > 0)
+        if let Some((optimistic_pips, pessimistic_pips)) =
+            cost_band_edges.filter(|_| candidates > 0)
         {
             let base_genes: Vec<Gene> = pairs.iter().map(|((_, gene), _)| gene.clone()).collect();
-            let base_work: Vec<neoethos_gpu_contracts::device::ScenarioDescriptor> = (0..candidates
-                as u64)
+            let base_work: Vec<neoethos_gpu_contracts::device::ScenarioDescriptor> = (0
+                ..candidates as u64)
                 .map(|candidate| {
                     crate::gpu_native::scenario::base_scenario(candidate, candidate, bars)
                 })
@@ -8436,14 +9554,14 @@ where
                 ) {
                     Ok(prepared) => {
                         #[cfg(feature = "gpu")]
-                        let _gpu_guard =
-                            GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                        crate::genetic::search_engine::validation_genes_scenarios(
+                        let _gpu_guard = GPU_LAUNCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                        crate::genetic::search_engine::validation_genes_scenarios_exact(
                             features,
                             ohlcv,
                             &screen_prep,
                             &prepared,
                             &base_work,
+                            population_execution_run,
                         )
                     }
                     Err(error) => Err(error),
@@ -8511,11 +9629,6 @@ where
         // the header patched after every flush, so a kill leaves a shorter but
         // valid matrix. Non-fatal either way: a failed write must not lose a
         // discovery result, but it is reported, never swallowed.
-        let trial_config_hash = crate::run_identity::config_hash_for(
-            config,
-            eval_config_for_signals.pip_value_per_lot,
-            neoethos_data::current_data_runtime_overrides().normalize_features,
-        );
         let mut trial_writer = if config.discovery_ledger_enabled && !trial_period_keys.is_empty() {
             match crate::trial_returns::TrialReturnsWriter::open(
                 &config.discovery_ledger_cache_dir,
@@ -8524,7 +9637,8 @@ where
                 trial_period_keys.clone(),
                 initial_balance,
                 candidates,
-                trial_config_hash,
+                search_input_receipt,
+                search_state_config_hash,
             ) {
                 Ok(w) => Some(w),
                 Err(err) => {
@@ -8573,194 +9687,194 @@ where
                 .into_par_iter()
                 .enumerate()
                 .map(|(local_position, ((candidate_idx, gene), sig))| {
-                let position = base + local_position;
-                let trades = crate::eval::simulate_trades_core(
-                    &ohlcv.close,
-                    &ohlcv.high,
-                    &ohlcv.low,
-                    &features.timestamps,
-                    &sig,
-                    &screen_resolver.settings_for_gene(&gene),
-                );
-                let metrics =
-                    analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
+                    let position = base + local_position;
+                    let trades = crate::eval::simulate_trades_core(
+                        &ohlcv.close,
+                        &ohlcv.high,
+                        &ohlcv.low,
+                        &features.timestamps,
+                        &sig,
+                        &screen_resolver.settings_for_gene(&gene),
+                    );
+                    let metrics =
+                        analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
 
-                // Per-session exposure, over EVERY screened candidate. Same
-                // bucket boundaries the cost model charges by construction —
-                // `SessionSpreadProfile::bucket_index` is the one definition.
-                for t in &trades {
-                    if t.entry_time <= 0 {
-                        continue;
+                    // Per-session exposure, over EVERY screened candidate. Same
+                    // bucket boundaries the cost model charges by construction —
+                    // `SessionSpreadProfile::bucket_index` is the one definition.
+                    for t in &trades {
+                        if t.entry_time <= 0 {
+                            continue;
+                        }
+                        let b = crate::eval::SessionSpreadProfile::bucket_index(t.entry_time);
+                        session_trade_counts[b].fetch_add(1, AtomicOrdering::Relaxed);
+                        if t.pnl.is_finite() {
+                            session_pnl_cents[b]
+                                .fetch_add((t.pnl * 100.0).round() as i64, AtomicOrdering::Relaxed);
+                        }
                     }
-                    let b = crate::eval::SessionSpreadProfile::bucket_index(t.entry_time);
-                    session_trade_counts[b].fetch_add(1, AtomicOrdering::Relaxed);
-                    if t.pnl.is_finite() {
-                        session_pnl_cents[b]
-                            .fetch_add((t.pnl * 100.0).round() as i64, AtomicOrdering::Relaxed);
-                    }
-                }
 
-                // EVERY trial's per-period return series, captured BEFORE any
-                // gate — that is the whole point. A matrix built only from
-                // survivors is the selected sample, which is exactly what PBO
-                // exists to detect and therefore cannot be computed from.
-                let (returns, trades_outside_grid) = crate::trial_returns::period_returns(
-                    &trades,
-                    &trial_period_keys,
-                    initial_balance,
-                );
-                let trial_row = crate::trial_returns::TrialReturnRow {
-                    candidate_index: candidate_idx,
-                    strategy_id: gene.strategy_id.clone(),
-                    returns,
-                    trades_outside_grid,
-                };
+                    // EVERY trial's per-period return series, captured BEFORE any
+                    // gate — that is the whole point. A matrix built only from
+                    // survivors is the selected sample, which is exactly what PBO
+                    // exists to detect and therefore cannot be computed from.
+                    let (returns, trades_outside_grid) = crate::trial_returns::period_returns(
+                        &trades,
+                        &trial_period_keys,
+                        initial_balance,
+                    );
+                    let trial_row = crate::trial_returns::TrialReturnRow {
+                        candidate_index: candidate_idx,
+                        strategy_id: gene.strategy_id.clone(),
+                        returns,
+                        trades_outside_grid,
+                    };
 
-                let verdict =
-                    classify_base_quality(&metrics, &config.target_profile, &config.filtering);
-                let opportunistic_quality = match verdict {
-                    Ok(opportunistic) => opportunistic,
-                    Err(reason) => {
-                        rejected_base_quality.fetch_add(1, AtomicOrdering::Relaxed);
-                        // One counter per criterion. The match is exhaustive, so
-                        // a new `BaseQualityReject` variant cannot be added
-                        // without deciding where it is counted.
-                        let counter = match reason {
-                            BaseQualityReject::AccountWiped => &bq_account_wiped,
-                            BaseQualityReject::ProfileNetExpectancy => {
-                                &bq_profile_net_expectancy
-                            }
-                            BaseQualityReject::ProfileExpectancySignificance => {
-                                &bq_profile_expectancy_significance
-                            }
-                            BaseQualityReject::ProfileWinRate => &bq_profile_win_rate,
-                            BaseQualityReject::ProfilePayoffRatio => &bq_profile_payoff_ratio,
-                            BaseQualityReject::ProfileInMarket => &bq_profile_in_market,
-                            BaseQualityReject::OpportunisticLaneClosed => {
-                                &bq_opportunistic_lane_closed
-                            }
-                            BaseQualityReject::PositiveMonths => &bq_positive_months,
-                            BaseQualityReject::TradesPerMonth => &bq_trades_per_month,
-                            BaseQualityReject::MonthlyReturn => &bq_monthly_return,
-                        };
-                        counter.fetch_add(1, AtomicOrdering::Relaxed);
+                    let verdict =
+                        classify_base_quality(&metrics, &config.target_profile, &config.filtering);
+                    let opportunistic_quality = match verdict {
+                        Ok(opportunistic) => opportunistic,
+                        Err(reason) => {
+                            rejected_base_quality.fetch_add(1, AtomicOrdering::Relaxed);
+                            // One counter per criterion. The match is exhaustive, so
+                            // a new `BaseQualityReject` variant cannot be added
+                            // without deciding where it is counted.
+                            let counter = match reason {
+                                BaseQualityReject::AccountWiped => &bq_account_wiped,
+                                BaseQualityReject::ProfileNetExpectancy => {
+                                    &bq_profile_net_expectancy
+                                }
+                                BaseQualityReject::ProfileExpectancySignificance => {
+                                    &bq_profile_expectancy_significance
+                                }
+                                BaseQualityReject::ProfileWinRate => &bq_profile_win_rate,
+                                BaseQualityReject::ProfilePayoffRatio => &bq_profile_payoff_ratio,
+                                BaseQualityReject::ProfileInMarket => &bq_profile_in_market,
+                                BaseQualityReject::OpportunisticLaneClosed => {
+                                    &bq_opportunistic_lane_closed
+                                }
+                                BaseQualityReject::PositiveMonths => &bq_positive_months,
+                                BaseQualityReject::TradesPerMonth => &bq_trades_per_month,
+                                BaseQualityReject::MonthlyReturn => &bq_monthly_return,
+                            };
+                            counter.fetch_add(1, AtomicOrdering::Relaxed);
+                            return (None, trial_row);
+                        }
+                    };
+
+                    // Regime-Aware Validation (Idea #3.2)
+                    let regime_robust = validate_regime_robustness(
+                        &trades,
+                        features,
+                        config.initial_balance,
+                        config.max_regime_loss_pct,
+                    );
+                    if !regime_robust {
+                        rejected_regime.fetch_add(1, AtomicOrdering::Relaxed);
                         return (None, trial_row);
                     }
-                };
 
-                // Regime-Aware Validation (Idea #3.2)
-                let regime_robust = validate_regime_robustness(
-                    &trades,
-                    features,
-                    config.initial_balance,
-                    config.max_regime_loss_pct,
-                );
-                if !regime_robust {
-                    rejected_regime.fetch_add(1, AtomicOrdering::Relaxed);
-                    return (None, trial_row);
-                }
+                    // Monte Carlo Parameter Perturbation Test.
+                    // 2026-05-26 operator directive (dual-mode product): runs +
+                    // min_profitable threshold sourced from typed Settings,
+                    // previously hardcoded 100/70.
+                    //
+                    // AREA 2 / Stage A (2026-06-09): GPU-routed. The serial
+                    // per-run `signals_for_gene_full` + `simulate_trades_core` is
+                    // replaced by ONE batched population launch over `mc_runs`
+                    // perturbed gene clones via `validation_genes_population`
+                    // (GPU-try, CPU-fallback). The perturbations are applied with a
+                    // DETERMINISTIC ChaCha8 RNG seeded per (combo, candidate, run),
+                    // in the EXACT same draw order the serial loop used
+                    // (long_threshold → short_threshold → each weight → sl_pips? →
+                    // tp_pips?), so the batched run reproduces the old serial run
+                    // bit-for-bit and is reproducible CPU↔GPU. The pass test
+                    // `metrics[run][0] > 0.0` (net_profit) is the trade-pnl sum
+                    // (fixed-1-lot, `risk_based_sizing == false`), semantically
+                    // identical to the old `p_trades.iter().map(|t| t.pnl).sum() > 0.0`.
+                    let Some(profitable_runs) = mc_profitable_runs[position] else {
+                        rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
+                        return (None, trial_row);
+                    };
 
-                // Monte Carlo Parameter Perturbation Test.
-                // 2026-05-26 operator directive (dual-mode product): runs +
-                // min_profitable threshold sourced from typed Settings,
-                // previously hardcoded 100/70.
-                //
-                // AREA 2 / Stage A (2026-06-09): GPU-routed. The serial
-                // per-run `signals_for_gene_full` + `simulate_trades_core` is
-                // replaced by ONE batched population launch over `mc_runs`
-                // perturbed gene clones via `validation_genes_population`
-                // (GPU-try, CPU-fallback). The perturbations are applied with a
-                // DETERMINISTIC ChaCha8 RNG seeded per (combo, candidate, run),
-                // in the EXACT same draw order the serial loop used
-                // (long_threshold → short_threshold → each weight → sl_pips? →
-                // tp_pips?), so the batched run reproduces the old serial run
-                // bit-for-bit and is reproducible CPU↔GPU. The pass test
-                // `metrics[run][0] > 0.0` (net_profit) is the trade-pnl sum
-                // (fixed-1-lot, `risk_based_sizing == false`), semantically
-                // identical to the old `p_trades.iter().map(|t| t.pnl).sum() > 0.0`.
-                let Some(profitable_runs) = mc_profitable_runs[position] else {
-                    rejected_mc_error.fetch_add(1, AtomicOrdering::Relaxed);
-                    return (None, trial_row);
-                };
-
-                if (profitable_runs as u32) < config.mc_min_profitable {
-                    rejected_mc_floor.fetch_add(1, AtomicOrdering::Relaxed);
-                    // Within 10 points of the floor: the candidate is robust on
-                    // most perturbations and lost on a minority, which is a very
-                    // different signal from one that collapses outright.
-                    if profitable_runs as u32 + 10 >= config.mc_min_profitable {
-                        mc_near_miss.fetch_add(1, AtomicOrdering::Relaxed);
+                    if (profitable_runs as u32) < config.mc_min_profitable {
+                        rejected_mc_floor.fetch_add(1, AtomicOrdering::Relaxed);
+                        // Within 10 points of the floor: the candidate is robust on
+                        // most perturbations and lost on a minority, which is a very
+                        // different signal from one that collapses outright.
+                        if profitable_runs as u32 + 10 >= config.mc_min_profitable {
+                            mc_near_miss.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        return (None, trial_row);
                     }
-                    return (None, trial_row);
-                }
 
-                // Spread/Slippage Sensitivity Test — wired from Settings
-                // 2026-05-26 (dual-mode product).
-                let Some(sens_pnl) = sensitivity_net_profit[position] else {
-                    // Split from `rejected_mc_error` (2026-08-09): this is the
-                    // SENSITIVITY launch failing, not the Monte-Carlo one.
-                    rejected_sensitivity_error.fetch_add(1, AtomicOrdering::Relaxed);
-                    return (None, trial_row);
-                };
-                if sens_pnl < 0.0 {
-                    rejected_sensitivity.fetch_add(1, AtomicOrdering::Relaxed);
-                    return (None, trial_row);
-                }
+                    // Spread/Slippage Sensitivity Test — wired from Settings
+                    // 2026-05-26 (dual-mode product).
+                    let Some(sens_pnl) = sensitivity_net_profit[position] else {
+                        // Split from `rejected_mc_error` (2026-08-09): this is the
+                        // SENSITIVITY launch failing, not the Monte-Carlo one.
+                        rejected_sensitivity_error.fetch_add(1, AtomicOrdering::Relaxed);
+                        return (None, trial_row);
+                    };
+                    if sens_pnl < 0.0 {
+                        rejected_sensitivity.fetch_add(1, AtomicOrdering::Relaxed);
+                        return (None, trial_row);
+                    }
 
-                // THE COST BAND. Deliberately AFTER every gate: it classifies,
-                // it does not reject. A candidate that only clears the cheap end
-                // of the band is still a survivor of the screen the operator
-                // configured — it is just not a result.
-                //
-                // HOW FAR THE VERDICT TRAVELS, corrected again 2026-08-10 (#71):
-                // it rides on the survivor through this function, is counted
-                // run-level in `CostBandCensus` and on the funnel's
-                // `passed_quality` stage, AND is now carried per strategy out of
-                // the export loop on `DiscoveryResult::cost_band_by_strategy`
-                // and into `live_portfolio.json` as `cost_band`. Until today the
-                // export loop bound it `_cost_band` and dropped it, so a reader
-                // of the one artifact a live run consumes could not tell an
-                // optimistic-edge-only gene from one robust across the band.
-                let cost_band = if config.cost_band_pips.is_some() && !band_discriminates {
-                    CostBandVerdict::NotDiscriminating
-                } else {
-                    CostBandVerdict::from_edges(
-                        cost_band_optimistic[position],
-                        cost_band_pessimistic[position],
+                    // THE COST BAND. Deliberately AFTER every gate: it classifies,
+                    // it does not reject. A candidate that only clears the cheap end
+                    // of the band is still a survivor of the screen the operator
+                    // configured — it is just not a result.
+                    //
+                    // HOW FAR THE VERDICT TRAVELS, corrected again 2026-08-10 (#71):
+                    // it rides on the survivor through this function, is counted
+                    // run-level in `CostBandCensus` and on the funnel's
+                    // `passed_quality` stage, AND is now carried per strategy out of
+                    // the export loop on `DiscoveryResult::cost_band_by_strategy`
+                    // and into `live_portfolio.json` as `cost_band`. Until today the
+                    // export loop bound it `_cost_band` and dropped it, so a reader
+                    // of the one artifact a live run consumes could not tell an
+                    // optimistic-edge-only gene from one robust across the band.
+                    let cost_band = if config.cost_band_pips.is_some() && !band_discriminates {
+                        CostBandVerdict::NotDiscriminating
+                    } else {
+                        CostBandVerdict::from_edges(
+                            cost_band_optimistic[position],
+                            cost_band_pessimistic[position],
+                        )
+                    };
+                    match cost_band {
+                        CostBandVerdict::NotDiscriminating => {
+                            cost_band_not_discriminating.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        CostBandVerdict::OptimisticEdgeOnly => {
+                            cost_band_optimistic_only.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        CostBandVerdict::FailsBand => {
+                            cost_band_failed.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        CostBandVerdict::Unmeasured => {
+                            cost_band_unmeasured.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        CostBandVerdict::SurvivesBand => {
+                            cost_band_survived.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                    }
+
+                    (
+                        Some((
+                            candidate_idx,
+                            gene,
+                            sig,
+                            metrics,
+                            opportunistic_quality,
+                            trades,
+                            cost_band,
+                        )),
+                        trial_row,
                     )
-                };
-                match cost_band {
-                    CostBandVerdict::NotDiscriminating => {
-                        cost_band_not_discriminating.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    CostBandVerdict::OptimisticEdgeOnly => {
-                        cost_band_optimistic_only.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    CostBandVerdict::FailsBand => {
-                        cost_band_failed.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    CostBandVerdict::Unmeasured => {
-                        cost_band_unmeasured.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    CostBandVerdict::SurvivesBand => {
-                        cost_band_survived.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                }
-
-                (
-                    Some((
-                        candidate_idx,
-                        gene,
-                        sig,
-                        metrics,
-                        opportunistic_quality,
-                        trades,
-                        cost_band,
-                    )),
-                    trial_row,
-                )
-            })
-            .collect();
+                })
+                .collect();
 
             // Split the chunk's output: the survivors go on down the funnel, the
             // return series go to disk NOW. Every screened candidate contributed
@@ -9330,13 +10444,16 @@ where
         if portfolio.len() >= config.portfolio_size {
             break;
         }
+        if !portfolio_signal_is_correlation_rankable_v1(&sig) {
+            rejected_by_correlation += 1;
+            continue;
+        }
         let mut ok = true;
         for existing in &portfolio_signals {
-            let pearson = pearson_corr_i8(&sig, existing);
-            // DS-2: also check Spearman to catch non-linear dependencies
-            let spearman = spearman_corr_i8(&sig, existing);
-            // Reject if EITHER correlation exceeds threshold
-            if pearson.abs() >= config.corr_threshold || spearman.abs() >= config.corr_threshold {
+            if !matches!(
+                pairwise_portfolio_correlation_decision_v1(&sig, existing, config.corr_threshold,),
+                PortfolioCorrelationDecisionV1::Accept
+            ) {
                 ok = false;
                 rejected_by_correlation += 1;
                 break;
@@ -9373,7 +10490,7 @@ where
     if rejected_by_correlation > 0 {
         funnel.add_reject_reason(
             "passed_correlation",
-            "pearson_or_spearman_above_threshold",
+            "undefined_or_pearson_or_spearman_above_threshold",
             rejected_by_correlation,
         );
     }
@@ -9416,8 +10533,8 @@ where
     }
     let (
         mut validation_gates,
-        canonical_backtest_artifacts,
-        walkforward_validation_artifacts,
+        mut canonical_backtest_artifacts,
+        mut walkforward_validation_artifacts,
         mut per_gene_wf,
     ) = if portfolio.is_empty() && !best_effort_fallback.is_empty() {
         fallback_mode = true;
@@ -9443,9 +10560,19 @@ where
             if portfolio.len() >= FALLBACK_PORTFOLIO_MAX {
                 break;
             }
+            if !portfolio_signal_is_correlation_rankable_v1(&sig) {
+                continue;
+            }
             let mut ok = true;
             for existing in &portfolio_signals {
-                if pearson_corr_i8(&sig, existing).abs() >= config.corr_threshold {
+                if !matches!(
+                    pairwise_portfolio_correlation_decision_v1(
+                        &sig,
+                        existing,
+                        config.corr_threshold,
+                    ),
+                    PortfolioCorrelationDecisionV1::Accept
+                ) {
                     ok = false;
                     break;
                 }
@@ -9488,10 +10615,13 @@ where
             &portfolio_signals,
             features,
             ohlcv,
+            selection_scope,
+            search_state_config_hash,
             config,
             effective_smc_gate_threshold,
             &pbo_candidates,
             ranked_total,
+            population_execution_run,
         )?
     };
 
@@ -9555,11 +10685,11 @@ where
         let verdicts: Vec<(bool, String)> = portfolio
             .par_iter()
             .enumerate()
-            .map(|(gi, gene)| {
+            .map(|(gi, gene)| -> Result<(bool, String)> {
                 let settings = robust_resolver.settings_for_gene(gene);
                 let sig_full = &portfolio_signals[gi];
                 if sig_full.len() != n_all {
-                    return (true, "skipped (signal length mismatch)".to_string());
+                    return Ok((true, "skipped (signal length mismatch)".to_string()));
                 }
                 let sig_win = &sig_full[w0..];
                 let net_of = |sigs: &[i8]| -> f64 {
@@ -9580,7 +10710,7 @@ where
                 if real_net <= 0.0 || signal_bars < 30 {
                     // Too little recent evidence to test against — pass through;
                     // the OOS/PBO gates already judged the full history.
-                    return (true, "skipped (thin recent window)".to_string());
+                    return Ok((true, "skipped (thin recent window)".to_string()));
                 }
 
                 // #10 permutation p-value — deterministic seed per gene.
@@ -9595,39 +10725,39 @@ where
                         beats += 1;
                     }
                 }
-                let p_value = beats as f64 / N_PERM as f64;
+                let p_value = permutation_monte_carlo_p_value_v1(beats, N_PERM)?;
                 if p_value >= PERM_P_MAX {
-                    return (
+                    return Ok((
                         false,
                         format!(
                             "permutation FAIL (p={p_value:.2}: random timing matches the real net)"
                         ),
-                    );
+                    ));
                 }
 
                 // #11 plateau: ±15% threshold perturbations must keep ≥30% net.
-                for factor in [0.85_f32, 1.15] {
+                for factor in [0.85_f64, 1.15] {
                     let mut variant = gene.clone();
                     variant.long_threshold *= factor;
                     variant.short_threshold *= factor;
-                    let sig_v = signals_for_gene_full(features, ohlcv, &variant, &eval_cfg_rb);
+                    let sig_v = signals_for_gene_full(features, ohlcv, &variant, &eval_cfg_rb)?;
                     if sig_v.len() != n_all {
                         continue;
                     }
                     let net_v = net_of(&sig_v[w0..]);
                     if net_v < PLATEAU_MIN_RATIO * real_net {
-                        return (
+                        return Ok((
                             false,
                             format!(
                                 "plateau FAIL (thresholds ×{factor:.2} → net {net_v:.0} \
                                  vs real {real_net:.0} — cliff, not plateau)"
                             ),
-                        );
+                        ));
                     }
                 }
-                (true, format!("robust (p={p_value:.2}, plateau ok)"))
+                Ok((true, format!("robust (p={p_value:.2}, plateau ok)")))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         for (gi, (kept, why)) in verdicts.iter().enumerate() {
             tracing::info!(
@@ -9803,7 +10933,19 @@ where
     // here, before the result is moved, while config and the trades coexist.
     log_goal_report(config, &portfolio, &quality_metrics, &logged_trades);
 
-    Ok(DiscoveryResult {
+    retain_selection_validation_artifacts_for_final_portfolio(
+        &portfolio,
+        &mut canonical_backtest_artifacts,
+        &mut walkforward_validation_artifacts,
+    )?;
+    validation_gates.canonical_backtest_artifacts = canonical_backtest_artifacts.len();
+    validation_gates.walkforward_validation_artifacts = walkforward_validation_artifacts.len();
+
+    let result = DiscoveryResult {
+        search_input_receipt: search_input_receipt.clone(),
+        selection_scope: selection_scope.clone(),
+        holdout_scope: holdout_scope.cloned(),
+        search_config_hash: search_state_config_hash.to_string(),
         cost_band_by_strategy,
         portfolio,
         candidates: ranked_candidate_genes,
@@ -9818,7 +10960,9 @@ where
         funnel_profile: Some(funnel.clone()),
 
         effective_smc_gate_threshold,
-    })
+    };
+    result.validate_evaluated_scopes()?;
+    Ok(result)
 }
 
 fn candidate_truncation_limit(requested: usize, available: usize) -> usize {
@@ -9847,6 +10991,119 @@ fn min_trades_required(timestamps: &[i64], min_trades_per_day: f64, n_rows: usiz
     }
     let day_count = days.len().max(1) as f64;
     (day_count * min_trades_per_day).ceil() as usize
+}
+
+/// Canonical decision authority `neoethos.portfolio-correlation-authority.v1`.
+///
+/// Pearson formula and undefined/near-constant boundaries:
+/// https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.pearsonr.html
+/// Spearman constant-input boundary:
+/// https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.spearmanr.html
+/// Tie handling (average ranks, then Pearson correlation of the ranks):
+/// https://www.itl.nist.gov/div898/software/dataplot/refman1/auxillar/rankcorr.htm
+///
+/// SciPy warns rather than rejects a near-constant input. V1 deliberately
+/// fails closed at that published numerical-instability boundary because this
+/// correlation is a decision-critical portfolio gate, not a descriptive
+/// statistic.
+const SCIPY_NEAR_CONSTANT_RELATIVE_NORM_V1: f64 = 1.0e-13;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorrelationUndefinedV1 {
+    LengthMismatch,
+    InsufficientPairedObservations,
+    ConstantInput,
+    NearConstantInput,
+    NonFiniteResult,
+    InvalidThreshold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortfolioCorrelationDecisionV1 {
+    Accept,
+    RejectUndefined(CorrelationUndefinedV1),
+    RejectThreshold,
+}
+
+fn validate_paired_correlation_shape_v1(
+    a: &[i8],
+    b: &[i8],
+) -> Result<usize, CorrelationUndefinedV1> {
+    if a.len() != b.len() {
+        return Err(CorrelationUndefinedV1::LengthMismatch);
+    }
+    if a.len() < 2 {
+        return Err(CorrelationUndefinedV1::InsufficientPairedObservations);
+    }
+    Ok(a.len())
+}
+
+fn classify_centered_correlation_input_v1(
+    mean: f64,
+    centered_sum_squares: f64,
+) -> Result<(), CorrelationUndefinedV1> {
+    if !mean.is_finite() || !centered_sum_squares.is_finite() || centered_sum_squares < 0.0 {
+        return Err(CorrelationUndefinedV1::NonFiniteResult);
+    }
+    if centered_sum_squares == 0.0 {
+        return Err(CorrelationUndefinedV1::ConstantInput);
+    }
+    let centered_norm = centered_sum_squares.sqrt();
+    if !centered_norm.is_finite() {
+        return Err(CorrelationUndefinedV1::NonFiniteResult);
+    }
+    if centered_norm < SCIPY_NEAR_CONSTANT_RELATIVE_NORM_V1 * mean.abs() {
+        return Err(CorrelationUndefinedV1::NearConstantInput);
+    }
+    Ok(())
+}
+
+fn finish_correlation_v1(
+    numerator: f64,
+    centered_sum_squares_a: f64,
+    centered_sum_squares_b: f64,
+) -> Result<f64, CorrelationUndefinedV1> {
+    if !numerator.is_finite() {
+        return Err(CorrelationUndefinedV1::NonFiniteResult);
+    }
+    let denominator = centered_sum_squares_a.sqrt() * centered_sum_squares_b.sqrt();
+    if !denominator.is_finite() || denominator <= 0.0 {
+        return Err(CorrelationUndefinedV1::NonFiniteResult);
+    }
+    let correlation = numerator / denominator;
+    if !correlation.is_finite() {
+        return Err(CorrelationUndefinedV1::NonFiniteResult);
+    }
+    Ok(correlation)
+}
+
+fn portfolio_signal_is_correlation_rankable_v1(signal: &[i8]) -> bool {
+    pearson_corr_i8(signal, signal).is_ok() && spearman_corr_i8(signal, signal).is_ok()
+}
+
+fn pairwise_portfolio_correlation_decision_v1(
+    a: &[i8],
+    b: &[i8],
+    threshold: f64,
+) -> PortfolioCorrelationDecisionV1 {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return PortfolioCorrelationDecisionV1::RejectUndefined(
+            CorrelationUndefinedV1::InvalidThreshold,
+        );
+    }
+    let pearson = match pearson_corr_i8(a, b) {
+        Ok(value) => value,
+        Err(reason) => return PortfolioCorrelationDecisionV1::RejectUndefined(reason),
+    };
+    let spearman = match spearman_corr_i8(a, b) {
+        Ok(value) => value,
+        Err(reason) => return PortfolioCorrelationDecisionV1::RejectUndefined(reason),
+    };
+    if pearson.abs() >= threshold || spearman.abs() >= threshold {
+        PortfolioCorrelationDecisionV1::RejectThreshold
+    } else {
+        PortfolioCorrelationDecisionV1::Accept
+    }
 }
 
 /// DS-2: Spearman rank correlation for i8 signals.
@@ -9887,12 +11144,8 @@ fn midrank_of(ranks: &[f64; 256], v: i8) -> f64 {
     ranks[(v as i16 + 128) as usize]
 }
 
-fn spearman_corr_i8(a: &[i8], b: &[i8]) -> f64 {
-    let n = a.len().min(b.len());
-    if n < 2 {
-        return 0.0;
-    }
-    let (a, b) = (&a[..n], &b[..n]);
+fn spearman_corr_i8(a: &[i8], b: &[i8]) -> Result<f64, CorrelationUndefinedV1> {
+    let n = validate_paired_correlation_shape_v1(a, b)?;
     let ranks_a = i8_midranks(a);
     let ranks_b = i8_midranks(b);
     // Means over the SAME element order as before, so the floating-point
@@ -9915,17 +11168,13 @@ fn spearman_corr_i8(a: &[i8], b: &[i8]) -> f64 {
         denom_a += da * da;
         denom_b += db * db;
     }
-    if denom_a <= 1e-12 || denom_b <= 1e-12 {
-        return 0.0;
-    }
-    num / (denom_a.sqrt() * denom_b.sqrt())
+    classify_centered_correlation_input_v1(mean_a, denom_a)?;
+    classify_centered_correlation_input_v1(mean_b, denom_b)?;
+    finish_correlation_v1(num, denom_a, denom_b)
 }
 
-fn pearson_corr_i8(a: &[i8], b: &[i8]) -> f64 {
-    let n = a.len().min(b.len());
-    if n < 2 {
-        return 0.0;
-    }
+fn pearson_corr_i8(a: &[i8], b: &[i8]) -> Result<f64, CorrelationUndefinedV1> {
+    let n = validate_paired_correlation_shape_v1(a, b)?;
     let mut sum_a = 0.0;
     let mut sum_b = 0.0;
     for i in 0..n {
@@ -9944,10 +11193,9 @@ fn pearson_corr_i8(a: &[i8], b: &[i8]) -> f64 {
         denom_a += da * da;
         denom_b += db * db;
     }
-    if denom_a <= 1e-12 || denom_b <= 1e-12 {
-        return 0.0;
-    }
-    num / (denom_a.sqrt() * denom_b.sqrt())
+    classify_centered_correlation_input_v1(mean_a, denom_a)?;
+    classify_centered_correlation_input_v1(mean_b, denom_b)?;
+    finish_correlation_v1(num, denom_a, denom_b)
 }
 
 pub fn ensure_portfolio_export_ready(result: &DiscoveryResult) -> Result<()> {
@@ -9992,9 +11240,17 @@ fn build_portfolio_exports<'a>(
 }
 
 pub fn save_portfolio_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
+    result.validate_evaluated_scopes()?;
     ensure_portfolio_export_ready(result)?;
     let exports = build_portfolio_exports(&result.portfolio, &result.effective_feature_names);
-    write_json_atomic(path, &exports)
+    let envelope = CanonicalSearchArtifactEnvelopeV2::new(
+        "neoethos.search-portfolio.v1",
+        result.selection_scope()?.clone(),
+        result.search_config_hash.clone(),
+        exports,
+    )
+    .map_err(anyhow::Error::new)?;
+    write_json_atomic(path, &envelope)
 }
 
 /// Unicode sparkline of an equity curve (operator 2026-06-06): see the shape
@@ -10305,13 +11561,17 @@ pub fn save_canonical_backtest_artifacts(
     result: &DiscoveryResult,
 ) -> Result<usize> {
     let dir = dir.as_ref();
+    result.validate_validation_evidence_sets(false)?;
     if result.canonical_backtest_artifacts.is_empty() {
         return Ok(0);
     }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create canonical backtest dir {}", dir.display()))?;
     for (idx, artifact) in result.canonical_backtest_artifacts.iter().enumerate() {
-        let file_name = artifact_filename_for_strategy_hash(&artifact.scope.strategy_hash, idx);
+        let file_name = artifact_filename_for_strategy_hash(
+            artifact.strategy_identity().exact_gene_hash(),
+            idx,
+        );
         write_canonical_backtest_artifact_atomic(dir.join(file_name), artifact)?;
     }
     Ok(result.canonical_backtest_artifacts.len())
@@ -10322,18 +11582,17 @@ pub fn save_walkforward_validation_artifacts(
     result: &DiscoveryResult,
 ) -> Result<usize> {
     let dir = dir.as_ref();
+    result.validate_validation_evidence_sets(false)?;
     if result.walkforward_validation_artifacts.is_empty() {
         return Ok(0);
     }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create walk-forward validation dir {}", dir.display()))?;
     for (idx, artifact) in result.walkforward_validation_artifacts.iter().enumerate() {
-        let strategy_hash = artifact
-            .scope
-            .strategy_hash
-            .as_deref()
-            .unwrap_or("portfolio");
-        let file_name = artifact_filename_for_strategy_hash(strategy_hash, idx);
+        let file_name = artifact_filename_for_strategy_hash(
+            artifact.strategy_identity().exact_gene_hash(),
+            idx,
+        );
         write_walkforward_validation_artifact_atomic(dir.join(file_name), artifact)?;
     }
     Ok(result.walkforward_validation_artifacts.len())
@@ -10344,13 +11603,17 @@ pub fn save_forward_test_validation_artifacts(
     result: &DiscoveryResult,
 ) -> Result<usize> {
     let dir = dir.as_ref();
+    result.validate_validation_evidence_sets(false)?;
     if result.forward_test_validation_artifacts.is_empty() {
         return Ok(0);
     }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create forward-test validation dir {}", dir.display()))?;
     for (idx, artifact) in result.forward_test_validation_artifacts.iter().enumerate() {
-        let file_name = artifact_filename_for_strategy_hash(&artifact.scope.strategy_hash, idx);
+        let file_name = artifact_filename_for_strategy_hash(
+            artifact.strategy_identity().exact_gene_hash(),
+            idx,
+        );
         write_forward_test_validation_artifact_atomic(dir.join(file_name), artifact)?;
     }
     Ok(result.forward_test_validation_artifacts.len())
@@ -10362,48 +11625,286 @@ pub fn save_forward_test_validation_artifacts(
 /// already lives on `DiscoveryRunProfile` (Phase 49), but written to
 /// its own file so operators / UI scrapers can poll it without
 /// parsing the full profile JSON.
-pub fn save_promotion_summary_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
-    #[derive(Serialize)]
-    struct PromotionSummary<'a> {
-        validation_evidence_hashes: &'a DiscoveryPerKindEvidenceHashes,
-        validation_evidence_complete: bool,
-        validation_evidence_missing_kinds: Vec<&'static str>,
-        producer_side_complete: bool,
-        check_summary: Vec<(&'static str, &'static str)>,
-        determinism_policy: neoethos_core::contracts::DeterminismPolicy,
-        /// Held-out out-of-sample verdict — the single most decision-relevant
-        /// promotion signal. Surfaced here (per-portfolio) so operators AND the
-        /// model-training corpus can weight each strategy by its honest OOS
-        /// reliability instead of in-sample metrics. `forward_test_passed` /
-        /// `prop_firm_passed` are `None` when no held-out artifact was produced
-        /// (e.g. the CLI full-data path or too short a tail), `Some(false)` when
-        /// the strategy lost money / breached prop rules on the unseen tail.
-        out_of_sample: OutOfSampleVerdict,
+pub const PROMOTION_SUMMARY_ARTIFACT_KIND_V3: &str = "neoethos.search-promotion-summary.v3";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotionStrategyEvidenceV2 {
+    strategy_identity: ValidationStrategyIdentityV2,
+    canonical_backtest_hash: String,
+    walkforward_hash: String,
+    forward_test_hash: String,
+    prop_firm_hash: String,
+}
+
+impl PromotionStrategyEvidenceV2 {
+    pub fn strategy_identity(&self) -> &ValidationStrategyIdentityV2 {
+        &self.strategy_identity
     }
-    #[derive(Serialize)]
-    struct OutOfSampleVerdict {
-        forward_test_passed: Option<bool>,
-        prop_firm_passed: Option<bool>,
-        walkforward_passed: bool,
-        cpcv_passed: bool,
+
+    pub fn canonical_backtest_hash(&self) -> &str {
+        &self.canonical_backtest_hash
     }
+
+    pub fn walkforward_hash(&self) -> &str {
+        &self.walkforward_hash
+    }
+
+    pub fn forward_test_hash(&self) -> &str {
+        &self.forward_test_hash
+    }
+
+    pub fn prop_firm_hash(&self) -> &str {
+        &self.prop_firm_hash
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotionOutOfSampleVerdictV2 {
+    forward_test_passed: bool,
+    prop_firm_passed: bool,
+    walkforward_passed: bool,
+    cpcv_passed: bool,
+}
+
+impl PromotionOutOfSampleVerdictV2 {
+    pub fn forward_test_passed(&self) -> bool {
+        self.forward_test_passed
+    }
+
+    pub fn prop_firm_passed(&self) -> bool {
+        self.prop_firm_passed
+    }
+
+    pub fn walkforward_passed(&self) -> bool {
+        self.walkforward_passed
+    }
+
+    pub fn cpcv_passed(&self) -> bool {
+        self.cpcv_passed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotionSummaryAuthorityPayloadV3 {
+    schema_version: u32,
+    holdout_scope: CanonicalSearchArtifactScopeV2,
+    validation_evidence_hashes: DiscoveryPerKindEvidenceHashes,
+    strategy_evidence: Vec<PromotionStrategyEvidenceV2>,
+    determinism_policy: DeterminismPolicy,
+    out_of_sample: PromotionOutOfSampleVerdictV2,
+}
+
+impl PromotionSummaryAuthorityPayloadV3 {
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn holdout_scope(&self) -> &CanonicalSearchArtifactScopeV2 {
+        &self.holdout_scope
+    }
+
+    pub fn validation_evidence_hashes(&self) -> &DiscoveryPerKindEvidenceHashes {
+        &self.validation_evidence_hashes
+    }
+
+    pub fn strategy_evidence(&self) -> &[PromotionStrategyEvidenceV2] {
+        &self.strategy_evidence
+    }
+
+    pub fn determinism_policy(&self) -> &DeterminismPolicy {
+        &self.determinism_policy
+    }
+
+    pub fn out_of_sample(&self) -> &PromotionOutOfSampleVerdictV2 {
+        &self.out_of_sample
+    }
+
+    pub fn validate_shape(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == 3,
+            "unsupported promotion-summary payload schema version {}; expected 3",
+            self.schema_version
+        );
+        self.holdout_scope.validate().map_err(anyhow::Error::new)?;
+        anyhow::ensure!(
+            self.holdout_scope.evaluated_window().role() == CanonicalSearchWindowRoleV1::Holdout,
+            "promotion summary requires an exact Holdout scope"
+        );
+        anyhow::ensure!(
+            self.validation_evidence_hashes.all_producer_kinds_present(),
+            "promotion summary is missing a producer-side validation hash"
+        );
+        anyhow::ensure!(
+            self.validation_evidence_hashes
+                .live_execution_simulation
+                .is_none(),
+            "promotion summary v3 does not accept an unbound live-simulation hash"
+        );
+        for (label, hash) in [
+            (
+                "canonical backtest aggregate hash",
+                self.validation_evidence_hashes
+                    .canonical_backtest
+                    .as_deref(),
+            ),
+            (
+                "walkforward aggregate hash",
+                self.validation_evidence_hashes.walkforward.as_deref(),
+            ),
+            (
+                "forward-test aggregate hash",
+                self.validation_evidence_hashes.forward_test.as_deref(),
+            ),
+            (
+                "prop-firm aggregate hash",
+                self.validation_evidence_hashes.prop_firm.as_deref(),
+            ),
+        ] {
+            crate::validation::validate_fnv64_hash(
+                label,
+                hash.expect("all producer hashes checked present"),
+            )?;
+        }
+        anyhow::ensure!(
+            !self.strategy_evidence.is_empty(),
+            "promotion summary contains no final strategies"
+        );
+        let mut previous: Option<(&str, &str)> = None;
+        let mut strategy_ids = HashSet::with_capacity(self.strategy_evidence.len());
+        let mut exact_gene_hashes = HashSet::with_capacity(self.strategy_evidence.len());
+        for evidence in &self.strategy_evidence {
+            evidence.strategy_identity.validate()?;
+            if let Some((previous_hash, previous_id)) = previous {
+                anyhow::ensure!(
+                    (previous_hash, previous_id)
+                        < (
+                            evidence.strategy_identity.exact_gene_hash(),
+                            evidence.strategy_identity.strategy_id(),
+                        ),
+                    "promotion summary strategies are not strictly sorted by exact identity"
+                );
+            }
+            previous = Some((
+                evidence.strategy_identity.exact_gene_hash(),
+                evidence.strategy_identity.strategy_id(),
+            ));
+            anyhow::ensure!(
+                strategy_ids.insert(evidence.strategy_identity.strategy_id()),
+                "promotion summary contains duplicate strategy_id `{}`",
+                evidence.strategy_identity.strategy_id()
+            );
+            anyhow::ensure!(
+                exact_gene_hashes.insert(evidence.strategy_identity.exact_gene_hash()),
+                "promotion summary contains duplicate exact gene hash `{}`",
+                evidence.strategy_identity.exact_gene_hash()
+            );
+            for (label, hash) in [
+                (
+                    "canonical backtest strategy hash",
+                    &evidence.canonical_backtest_hash,
+                ),
+                ("walkforward strategy hash", &evidence.walkforward_hash),
+                ("forward-test strategy hash", &evidence.forward_test_hash),
+                ("prop-firm strategy hash", &evidence.prop_firm_hash),
+            ] {
+                crate::validation::validate_fnv64_hash(label, hash)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn build_promotion_summary_envelope(
+    result: &DiscoveryResult,
+) -> Result<CanonicalSearchArtifactEnvelopeV2<PromotionSummaryAuthorityPayloadV3>> {
+    result.validate_complete_promotion_evidence()?;
     let hashes = discovery_per_kind_evidence_hashes(result)?;
-    let evidence = live_validation_evidence_from_discovery(result);
-    let summary = PromotionSummary {
-        producer_side_complete: hashes.all_producer_kinds_present(),
-        check_summary: hashes.check_summary(),
-        validation_evidence_complete: hashes.all_present(),
-        validation_evidence_missing_kinds: hashes.missing_kinds(),
-        validation_evidence_hashes: &hashes,
+    let evidence = live_validation_evidence_from_discovery(result)?;
+    let holdout_scope = result
+        .holdout_scope()?
+        .ok_or_else(|| {
+            anyhow::anyhow!("promotion summary requires the exact stored holdout scope")
+        })?
+        .clone();
+    let mut strategy_evidence = result
+        .portfolio
+        .iter()
+        .map(|gene| -> Result<PromotionStrategyEvidenceV2> {
+            let identity = ValidationStrategyIdentityV2::from_gene(gene)?;
+            let exact_hash = identity.exact_gene_hash();
+            let canonical = result
+                .canonical_backtest_artifacts
+                .iter()
+                .find(|artifact| artifact.strategy_identity().exact_gene_hash() == exact_hash)
+                .expect("complete validation checked canonical strategy coverage");
+            let walkforward = result
+                .walkforward_validation_artifacts
+                .iter()
+                .find(|artifact| artifact.strategy_identity().exact_gene_hash() == exact_hash)
+                .expect("complete validation checked walkforward strategy coverage");
+            let forward_test = result
+                .forward_test_validation_artifacts
+                .iter()
+                .find(|artifact| artifact.strategy_identity().exact_gene_hash() == exact_hash)
+                .expect("complete validation checked forward-test strategy coverage");
+            let prop_firm = result
+                .prop_firm_validation_artifacts
+                .iter()
+                .find(|artifact| artifact.strategy_identity().exact_gene_hash() == exact_hash)
+                .expect("complete validation checked prop-firm strategy coverage");
+            Ok(PromotionStrategyEvidenceV2 {
+                strategy_identity: identity,
+                canonical_backtest_hash: stable_json_hash(canonical)?,
+                walkforward_hash: stable_json_hash(walkforward)?,
+                forward_test_hash: stable_json_hash(forward_test)?,
+                prop_firm_hash: stable_json_hash(prop_firm)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    strategy_evidence.sort_by(|left, right| {
+        left.strategy_identity
+            .exact_gene_hash()
+            .cmp(right.strategy_identity.exact_gene_hash())
+            .then_with(|| {
+                left.strategy_identity
+                    .strategy_id()
+                    .cmp(right.strategy_identity.strategy_id())
+            })
+    });
+    let summary = PromotionSummaryAuthorityPayloadV3 {
+        schema_version: 3,
+        holdout_scope,
+        validation_evidence_hashes: hashes,
+        strategy_evidence,
         determinism_policy: crate::genetic::current_determinism_policy(),
-        out_of_sample: OutOfSampleVerdict {
-            forward_test_passed: evidence.forward_test_passed,
-            prop_firm_passed: evidence.prop_firm_passed,
+        out_of_sample: PromotionOutOfSampleVerdictV2 {
+            forward_test_passed: evidence
+                .forward_test_passed
+                .expect("complete validation requires forward-test evidence"),
+            prop_firm_passed: evidence
+                .prop_firm_passed
+                .expect("complete validation requires prop-firm evidence"),
             walkforward_passed: evidence.walkforward_passed,
             cpcv_passed: evidence.cpcv_passed,
         },
     };
-    write_json_atomic(path, &summary)
+    let envelope = CanonicalSearchArtifactEnvelopeV2::new(
+        PROMOTION_SUMMARY_ARTIFACT_KIND_V3,
+        result.selection_scope()?.clone(),
+        result.search_config_hash.clone(),
+        summary,
+    )
+    .map_err(anyhow::Error::new)?;
+    envelope.payload().validate_shape()?;
+    Ok(envelope)
+}
+
+pub fn save_promotion_summary_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
+    let envelope = build_promotion_summary_envelope(result)?;
+    write_json_atomic(path, &envelope)
 }
 
 pub fn save_prop_firm_validation_artifacts(
@@ -10411,13 +11912,17 @@ pub fn save_prop_firm_validation_artifacts(
     result: &DiscoveryResult,
 ) -> Result<usize> {
     let dir = dir.as_ref();
+    result.validate_validation_evidence_sets(false)?;
     if result.prop_firm_validation_artifacts.is_empty() {
         return Ok(0);
     }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create prop-firm validation dir {}", dir.display()))?;
     for (idx, artifact) in result.prop_firm_validation_artifacts.iter().enumerate() {
-        let file_name = artifact_filename_for_strategy_hash(&artifact.scope.strategy_hash, idx);
+        let file_name = artifact_filename_for_strategy_hash(
+            artifact.strategy_identity().exact_gene_hash(),
+            idx,
+        );
         write_prop_firm_risk_validation_artifact_atomic(dir.join(file_name), artifact)?;
     }
     Ok(result.prop_firm_validation_artifacts.len())
@@ -10445,7 +11950,10 @@ pub fn save_prop_firm_validation_artifacts(
 ///   as missing evidence whenever the gate is required).
 /// - `live_sim_runtime_model_hash` stays `None` until a live-execution
 ///   simulator is wired into the discovery pipeline.
-pub fn live_validation_evidence_from_discovery(result: &DiscoveryResult) -> LiveValidationEvidence {
+pub fn live_validation_evidence_from_discovery(
+    result: &DiscoveryResult,
+) -> Result<LiveValidationEvidence> {
+    result.validate_complete_promotion_evidence()?;
     let forward_test_passed = if result.forward_test_validation_artifacts.is_empty() {
         None
     } else {
@@ -10453,8 +11961,8 @@ pub fn live_validation_evidence_from_discovery(result: &DiscoveryResult) -> Live
             .forward_test_validation_artifacts
             .iter()
             .all(|artifact| {
-                artifact.summary.metrics.trade_count > 0
-                    && artifact.summary.metrics.net_profit > 0.0
+                artifact.summary().metrics.trade_count > 0
+                    && artifact.summary().metrics.net_profit > 0.0
             });
         Some(all_pass)
     };
@@ -10464,16 +11972,16 @@ pub fn live_validation_evidence_from_discovery(result: &DiscoveryResult) -> Live
         let all_pass = result
             .prop_firm_validation_artifacts
             .iter()
-            .all(|artifact| artifact.summary.all_rules_passed);
+            .all(|artifact| artifact.summary().all_rules_passed);
         Some(all_pass)
     };
-    LiveValidationEvidence {
+    Ok(LiveValidationEvidence {
         walkforward_passed: result.validation_gates.walkforward_passed,
         cpcv_passed: result.validation_gates.cpcv_passed,
         forward_test_passed,
         prop_firm_passed,
         live_sim_runtime_model_hash: None,
-    }
+    })
 }
 
 /// Build a [`ValidationEvidenceManifest`] from the persisted discovery
@@ -10492,6 +12000,7 @@ pub fn live_validation_evidence_from_discovery(result: &DiscoveryResult) -> Live
 pub fn discovery_validation_evidence_manifest(
     result: &DiscoveryResult,
 ) -> Result<ValidationEvidenceManifest> {
+    result.validate_validation_evidence_sets(false)?;
     let canonical = hash_validation_artifacts(&result.canonical_backtest_artifacts)?;
     let walkforward = hash_validation_artifacts(&result.walkforward_validation_artifacts)?;
     let forward_test = hash_validation_artifacts(&result.forward_test_validation_artifacts)?;
@@ -10516,6 +12025,7 @@ pub fn discovery_validation_evidence_manifest(
 pub fn discovery_validation_evidence_manifest_excluding_live_sim(
     result: &DiscoveryResult,
 ) -> Result<ValidationEvidenceManifest> {
+    result.validate_validation_evidence_sets(false)?;
     let canonical = hash_validation_artifacts(&result.canonical_backtest_artifacts)?;
     let walkforward = hash_validation_artifacts(&result.walkforward_validation_artifacts)?;
     let forward_test = hash_validation_artifacts(&result.forward_test_validation_artifacts)?;
@@ -10532,6 +12042,7 @@ pub fn discovery_validation_evidence_manifest_excluding_live_sim(
 pub fn discovery_per_kind_evidence_hashes(
     result: &DiscoveryResult,
 ) -> Result<DiscoveryPerKindEvidenceHashes> {
+    result.validate_validation_evidence_sets(false)?;
     Ok(DiscoveryPerKindEvidenceHashes {
         canonical_backtest: optional_hash_validation_artifacts(
             &result.canonical_backtest_artifacts,
@@ -10545,7 +12056,8 @@ pub fn discovery_per_kind_evidence_hashes(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryPerKindEvidenceHashes {
     pub canonical_backtest: Option<String>,
     pub walkforward: Option<String>,
@@ -10621,19 +12133,34 @@ impl DiscoveryPerKindEvidenceHashes {
     }
 }
 
-fn hash_validation_artifacts<T: Serialize>(artifacts: &[T]) -> Result<String> {
+fn hash_validation_artifacts<T: ExactDiscoveryValidationArtifact>(
+    artifacts: &[T],
+) -> Result<String> {
     if artifacts.is_empty() {
         Ok(String::new())
     } else {
-        stable_json_hash(artifacts)
+        let mut ordered = artifacts.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            left.strategy_identity()
+                .exact_gene_hash()
+                .cmp(right.strategy_identity().exact_gene_hash())
+                .then_with(|| {
+                    left.strategy_identity()
+                        .strategy_id()
+                        .cmp(right.strategy_identity().strategy_id())
+                })
+        });
+        stable_json_hash(&ordered)
     }
 }
 
-fn optional_hash_validation_artifacts<T: Serialize>(artifacts: &[T]) -> Result<Option<String>> {
+fn optional_hash_validation_artifacts<T: ExactDiscoveryValidationArtifact>(
+    artifacts: &[T],
+) -> Result<Option<String>> {
     if artifacts.is_empty() {
         Ok(None)
     } else {
-        stable_json_hash(artifacts).map(Some)
+        hash_validation_artifacts(artifacts).map(Some)
     }
 }
 
@@ -10641,6 +12168,13 @@ pub fn build_discovery_profile(
     config: &DiscoveryConfig,
     result: &DiscoveryResult,
 ) -> DiscoveryRunProfile {
+    let population_execution_run_receipt_v2 = result
+        .funnel_profile
+        .as_ref()
+        .and_then(|funnel| funnel.population_execution_run_receipt_v2());
+    let population_eval_engines = population_execution_run_receipt_v2
+        .map(|receipt| receipt.engine_receipt_v1().engines().to_vec())
+        .unwrap_or_default();
     let validation_evidence_hashes =
         discovery_per_kind_evidence_hashes(result).unwrap_or_else(|_| {
             DiscoveryPerKindEvidenceHashes {
@@ -10755,7 +12289,8 @@ pub fn build_discovery_profile(
         min_history_years,
     } = runtime_overrides;
     DiscoveryRunProfile {
-        population_eval_engines: crate::engine_identity::observed_population_engines(),
+        population_eval_engines,
+        population_execution_run_receipt_v2: population_execution_run_receipt_v2.cloned(),
         timeframe_label: timeframe_label.clone(),
         population: *population,
         population_auto: *population_auto,
@@ -10874,6 +12409,7 @@ pub fn save_discovery_profile_json(
     config: &DiscoveryConfig,
     result: &DiscoveryResult,
 ) -> Result<()> {
+    result.validate_validation_evidence_sets(false)?;
     write_json_atomic(path, &build_discovery_profile(config, result))
 }
 
@@ -10961,14 +12497,14 @@ mod monte_carlo_reference_tests {
         // that happens to round the same cannot pass.
         assert_eq!(
             perturbed.long_threshold.to_bits(),
-            0x3F16_D12E,
-            "long_threshold moved: {} (the reference is 0.5891293)",
+            0x3FE0_CF96_9566_5F44,
+            "long_threshold moved: {} (the f64 reference is 0.525340358540213)",
             perturbed.long_threshold
         );
         assert_eq!(
             perturbed.short_threshold.to_bits(),
-            0xBEB3_50F1,
-            "short_threshold moved: {} (the reference is -0.3502269)",
+            0xBFD8_0552_2CA6_FA9A,
+            "short_threshold moved: {} (the f64 reference is -0.37532476769039536)",
             perturbed.short_threshold
         );
         assert_eq!(
@@ -10977,21 +12513,25 @@ mod monte_carlo_reference_tests {
                 .iter()
                 .map(|w| w.to_bits())
                 .collect::<Vec<_>>(),
-            vec![0x3F54_84CF_u32, 0xBEEA_F19D, 0x3E6F_AFC8],
-            "the weight draws moved: {:?} (the reference is \
-             [0.8301515, -0.4588746, 0.23406899])",
+            vec![
+                0x3FF2_A8BD_ADEE_FAFC,
+                0xBFE0_ABE4_4E42_3F21,
+                0x3FD2_E869_E7AE_8290,
+            ],
+            "the weight draws moved: {:?} (the f64 reference is \
+             [1.166196517398645, -0.5209828880778994, 0.2954354059711841])",
             perturbed.weights
         );
         assert_eq!(
             perturbed.sl_pips.to_bits(),
-            0x4032_82A3_D25D_27A8,
-            "sl_pips moved: {} (the reference is 18.510312221281907)",
+            0x4030_BE74_D5AA_A3D4,
+            "sl_pips moved: {} (the f64 reference is 16.743970255050797)",
             perturbed.sl_pips
         );
         assert_eq!(
             perturbed.tp_pips.to_bits(),
-            0x4041_AC00_D7A2_0C94,
-            "tp_pips moved: {} (the reference is 35.34377570545726)",
+            0x4048_A846_152B_D173,
+            "tp_pips moved: {} (the f64 reference is 49.31463875426825)",
             perturbed.tp_pips
         );
     }
@@ -11191,7 +12731,10 @@ mod streaming_and_predicate_tests {
         genes.push(gene_with(0.01, 1.0, 0.51, 400));
         let verdict = evaluate_batch_early_reject(&genes, &shipped_profile());
         assert!(!verdict.is_reject());
-        assert_eq!(verdict.reason(), BatchAcceptReason::CandidateClearsFloor.as_str());
+        assert_eq!(
+            verdict.reason(),
+            BatchAcceptReason::CandidateClearsFloor.as_str()
+        );
     }
 
     /// A thin sample is uncertainty, not evidence. This is the leg that answers
@@ -11219,7 +12762,10 @@ mod streaming_and_predicate_tests {
         let genes: Vec<Gene> = (0..500).map(|_| gene_with(0.0, 0.0, 0.0, 0)).collect();
         let verdict = evaluate_batch_early_reject(&genes, &shipped_profile());
         assert!(!verdict.is_reject());
-        assert_eq!(verdict.reason(), BatchAcceptReason::UncertainNoMetrics.as_str());
+        assert_eq!(
+            verdict.reason(),
+            BatchAcceptReason::UncertainNoMetrics.as_str()
+        );
         assert_eq!(verdict.measured, 0);
     }
 
@@ -11328,7 +12874,10 @@ mod streaming_and_predicate_tests {
     /// by the per-TF quota instead).
     #[test]
     fn only_base_timeframe_state_columns_are_force_kept() {
-        assert!(is_prefilter_state_column("regime_vol_state"));
+        assert!(is_prefilter_state_column(
+            "neoethos_custom_gk_vol_ratio_state_10_50_v3"
+        ));
+        assert!(!is_prefilter_state_column("regime_vol_state"));
         assert!(is_prefilter_state_column("smc_ob"));
         assert!(is_prefilter_state_column("session_london_open"));
         assert!(is_prefilter_state_column("fp_delta"));

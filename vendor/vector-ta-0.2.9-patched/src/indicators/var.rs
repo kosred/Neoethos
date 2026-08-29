@@ -1,24 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -55,10 +40,6 @@ pub struct VarOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VarParams {
     pub period: Option<usize>,
     pub nbdev: Option<f64>,
@@ -258,7 +239,6 @@ pub fn var_with_kernel(input: &VarInput, kernel: Kernel) -> Result<VarOutput, Va
     Ok(VarOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn var_into(input: &VarInput, out: &mut [f64]) -> Result<(), VarError> {
     let data: &[f64] = input.as_ref();
     let len = data.len();
@@ -1159,222 +1139,25 @@ impl VarStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn var_js(data: &[f64], period: usize, nbdev: f64) -> Result<Vec<f64>, JsValue> {
-    let params = VarParams {
-        period: Some(period),
-        nbdev: Some(nbdev),
-    };
-    let input = VarInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    var_into_slice(&mut output, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn var_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn var_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn var_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    nbdev: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = VarParams {
-            period: Some(period),
-            nbdev: Some(nbdev),
-        };
-        let input = VarInput::from_slice(data, params);
-
-        if in_ptr == out_ptr as *const f64 {
-            let mut temp = vec![0.0; len];
-            var_into_slice(&mut temp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            var_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VarBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub nbdev_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VarBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<VarParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = var_batch)]
-pub fn var_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: VarBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = VarBatchRange {
-        period: config.period_range,
-        nbdev: config.nbdev_range,
-    };
-
-    let output = var_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = VarBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn var_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    nbdev_start: f64,
-    nbdev_end: f64,
-    nbdev_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = VarBatchRange {
-            period: (period_start, period_end, period_step),
-            nbdev: (nbdev_start, nbdev_end, nbdev_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        if combos.is_empty() {
-            return Err(JsValue::from_str("No valid parameter combinations"));
-        }
-        let rows = combos.len();
-        let cols = len;
-
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows * cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let first = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
-        for (r, prm) in combos.iter().enumerate() {
-            let warm = (first + prm.period.unwrap() - 1).min(cols);
-            let row = &mut out[r * cols..r * cols + warm];
-            for v in row {
-                *v = f64::NAN;
-            }
-        }
-
-        let _ = var_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn var_output_into_js(
-    data: &[f64],
-    period: usize,
-    nbdev: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = var_js(data, period, nbdev)?;
-    crate::write_wasm_f64_output("var_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn var_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = var_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("var_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
 
     #[test]
     fn test_var_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VarInput::from_candles(&candles, "close", VarParams::default());
 
         let VarOutput { values: expected } = var(&input)?;
 
         let mut out = vec![0.0f64; expected.len()];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             var_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            var_into_slice(&mut out, &input, detect_best_kernel())?;
         }
 
         assert_eq!(out.len(), expected.len());
@@ -1393,8 +1176,8 @@ mod tests {
 
     fn check_var_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = VarParams {
             period: None,
             nbdev: None,
@@ -1407,8 +1190,8 @@ mod tests {
 
     fn check_var_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VarInput::from_candles(&candles, "close", VarParams::default());
         let var_result = var_with_kernel(&input, kernel)?;
         assert_eq!(var_result.values.len(), candles.close.len());
@@ -1437,8 +1220,8 @@ mod tests {
 
     fn check_var_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VarInput::with_default_candles(&candles);
         match input.data {
             VarData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1505,8 +1288,8 @@ mod tests {
 
     fn check_var_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = VarParams {
             period: Some(14),
             nbdev: Some(1.0),
@@ -1525,8 +1308,8 @@ mod tests {
 
     fn check_var_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VarInput::from_candles(
             &candles,
             "close",
@@ -1552,8 +1335,8 @@ mod tests {
 
     fn check_var_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 14;
         let nbdev = 1.0;
         let input = VarInput::from_candles(
@@ -1599,8 +1382,8 @@ mod tests {
     fn check_var_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             VarParams::default(),
@@ -1920,8 +1703,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = VarBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1949,8 +1732,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             ((2, 10, 2), (1.0, 1.0, 0.0)),
@@ -2105,294 +1888,6 @@ mod tests {
             "Should handle period=15 with exactly 15 data points"
         );
     }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "var")]
-#[pyo3(signature = (data, period=14, nbdev=1.0, kernel=None))]
-pub fn var_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    nbdev: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = VarParams {
-        period: Some(period),
-        nbdev: Some(nbdev),
-    };
-    let input = VarInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| var_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VarStream")]
-pub struct VarStreamPy {
-    stream: VarStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VarStreamPy {
-    #[new]
-    fn new(period: usize, nbdev: f64) -> PyResult<Self> {
-        let params = VarParams {
-            period: Some(period),
-            nbdev: Some(nbdev),
-        };
-        let stream =
-            VarStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(VarStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "var_batch")]
-#[pyo3(signature = (data, period_range, nbdev_range=(1.0, 1.0, 0.0), kernel=None))]
-pub fn var_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    nbdev_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let sweep = VarBatchRange {
-        period: period_range,
-        nbdev: nbdev_range,
-    };
-
-    let kern = validate_kernel(kernel, true)?;
-    let kernel = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        k => k,
-    };
-
-    let simd = match kernel {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => unreachable!(),
-    };
-
-    let out = py
-        .allow_threads(|| var_batch_par_slice(slice_in, &sweep, simd))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-
-    let dict = PyDict::new(py);
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow"))?;
-    let values_2d = unsafe { numpy::PyArray2::<f64>::new(py, [rows, cols], false) };
-    let raw_ptr = values_2d.data() as *mut f64;
-    let output_slice = unsafe { std::slice::from_raw_parts_mut(raw_ptr, total) };
-    output_slice.copy_from_slice(&out.values);
-
-    dict.set_item("values", values_2d)?;
-    dict.set_item(
-        "periods",
-        out.combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "nbdevs",
-        out.combos
-            .iter()
-            .map(|p| p.nbdev.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::var_wrapper::CudaVar;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "VarDeviceArrayF32", unsendable)]
-pub struct VarDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl VarDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        mut slf: pyo3::PyRefMut<'py, Self>,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use cust::memory::DeviceBuffer;
-
-        let (expected_type, expected_dev) = slf.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_type, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_type != expected_type || dev_id != expected_dev {
-                    return Err(PyValueError::new_err("dl_device mismatch for VAR buffer"));
-                }
-            }
-        }
-
-        let wants_copy = copy
-            .as_ref()
-            .and_then(|c| c.extract::<bool>(py).ok())
-            .unwrap_or(false);
-        if wants_copy {
-            return Err(PyValueError::new_err(
-                "copy=True not supported for VAR DLPack export",
-            ));
-        }
-
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let rows = slf.inner.rows;
-        let cols = slf.inner.cols;
-        let inner = std::mem::replace(
-            &mut slf.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, inner.buf, rows, cols, expected_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "var_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, nbdev_range=(1.0,1.0,0.0), device_id=0))]
-pub fn var_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    nbdev_range: (f32, f32, f32),
-    device_id: usize,
-) -> PyResult<VarDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = VarBatchRange {
-        period: period_range,
-        nbdev: (
-            nbdev_range.0 as f64,
-            nbdev_range.1 as f64,
-            nbdev_range.2 as f64,
-        ),
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVar::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.var_batch_dev(slice_in, &sweep)
-            .map(|pair| (pair.0, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(VarDeviceArrayF32Py {
-        inner,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "var_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, period, nbdev=1.0, device_id=0))]
-pub fn var_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    nbdev: f64,
-    device_id: usize,
-) -> PyResult<VarDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_tm = data_tm_f32.as_slice()?;
-    let params = VarParams {
-        period: Some(period),
-        nbdev: Some(nbdev),
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVar::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.var_many_series_one_param_time_major_dev(slice_tm, cols, rows, &params)
-            .map(|h| (h, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(VarDeviceArrayF32Py {
-        inner,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
 }
 
 #[inline(always)]

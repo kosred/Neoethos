@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -61,10 +45,6 @@ pub struct VolumeWeightedStochasticRsiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VolumeWeightedStochasticRsiParams {
     pub rsi_length: Option<usize>,
     pub stoch_length: Option<usize>,
@@ -299,16 +279,24 @@ pub enum VolumeWeightedStochasticRsiError {
     DataLengthMismatch,
     #[error("volume_weighted_stochastic_rsi: All source/volume pairs are invalid.")]
     AllValuesNaN,
-    #[error("volume_weighted_stochastic_rsi: Invalid RSI length: rsi_length = {rsi_length}, data length = {data_len}")]
+    #[error(
+        "volume_weighted_stochastic_rsi: Invalid RSI length: rsi_length = {rsi_length}, data length = {data_len}"
+    )]
     InvalidRsiLength { rsi_length: usize, data_len: usize },
-    #[error("volume_weighted_stochastic_rsi: Invalid stochastic length: stoch_length = {stoch_length}, data length = {data_len}")]
+    #[error(
+        "volume_weighted_stochastic_rsi: Invalid stochastic length: stoch_length = {stoch_length}, data length = {data_len}"
+    )]
     InvalidStochLength {
         stoch_length: usize,
         data_len: usize,
     },
-    #[error("volume_weighted_stochastic_rsi: Invalid K length: k_length = {k_length}, data length = {data_len}")]
+    #[error(
+        "volume_weighted_stochastic_rsi: Invalid K length: k_length = {k_length}, data length = {data_len}"
+    )]
     InvalidKLength { k_length: usize, data_len: usize },
-    #[error("volume_weighted_stochastic_rsi: Invalid D length: d_length = {d_length}, data length = {data_len}")]
+    #[error(
+        "volume_weighted_stochastic_rsi: Invalid D length: d_length = {d_length}, data length = {data_len}"
+    )]
     InvalidDLength { d_length: usize, data_len: usize },
     #[error("volume_weighted_stochastic_rsi: Invalid MA type: {ma_type}")]
     InvalidMaType { ma_type: String },
@@ -316,11 +304,11 @@ pub enum VolumeWeightedStochasticRsiError {
         "volume_weighted_stochastic_rsi: Not enough valid data: needed = {needed}, valid = {valid}"
     )]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("volume_weighted_stochastic_rsi: Output length mismatch: expected = {expected}, got = {got}")]
-    OutputLengthMismatch { expected: usize, got: usize },
     #[error(
-        "volume_weighted_stochastic_rsi: Invalid range: start={start}, end={end}, step={step}"
+        "volume_weighted_stochastic_rsi: Output length mismatch: expected = {expected}, got = {got}"
     )]
+    OutputLengthMismatch { expected: usize, got: usize },
+    #[error("volume_weighted_stochastic_rsi: Invalid range: start={start}, end={end}, step={step}")]
     InvalidRange {
         start: usize,
         end: usize,
@@ -437,11 +425,7 @@ fn first_valid_pair(source: &[f64], volume: &[f64]) -> Option<usize> {
 #[inline(always)]
 fn rsi_from_avgs(avg_gain: f64, avg_loss: f64) -> f64 {
     if avg_loss <= 0.0 {
-        if avg_gain <= 0.0 {
-            50.0
-        } else {
-            100.0
-        }
+        if avg_gain <= 0.0 { 50.0 } else { 100.0 }
     } else if avg_gain <= 0.0 {
         0.0
     } else {
@@ -1109,7 +1093,6 @@ pub(crate) fn volume_weighted_stochastic_rsi_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn volume_weighted_stochastic_rsi_into(
     input: &VolumeWeightedStochasticRsiInput,
@@ -1288,16 +1271,6 @@ impl VolumeWeightedStochasticRsiBatchBuilder {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VolumeWeightedStochasticRsiBatchConfig {
-    pub rsi_length_range: Vec<usize>,
-    pub stoch_length_range: Vec<usize>,
-    pub k_length_range: Vec<usize>,
-    pub d_length_range: Vec<usize>,
-    pub ma_type: String,
-}
-
 #[derive(Clone, Debug)]
 pub struct VolumeWeightedStochasticRsiBatchOutput {
     pub k: Vec<f64>,
@@ -1397,7 +1370,7 @@ pub fn volume_weighted_stochastic_rsi_batch_with_kernel(
         other => {
             return Err(VolumeWeightedStochasticRsiError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
     volume_weighted_stochastic_rsi_batch_par_slice(source, volume, sweep, batch.to_non_batch())
@@ -1667,513 +1640,6 @@ fn volume_weighted_stochastic_rsi_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "volume_weighted_stochastic_rsi")]
-#[pyo3(signature = (source, volume, rsi_length=14, stoch_length=14, k_length=3, d_length=3, ma_type="WSMA", kernel=None))]
-pub fn volume_weighted_stochastic_rsi_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    rsi_length: usize,
-    stoch_length: usize,
-    k_length: usize,
-    d_length: usize,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let source = source.as_slice()?;
-    let volume = volume.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = VolumeWeightedStochasticRsiInput::from_slices(
-        source,
-        volume,
-        VolumeWeightedStochasticRsiParams {
-            rsi_length: Some(rsi_length),
-            stoch_length: Some(stoch_length),
-            k_length: Some(k_length),
-            d_length: Some(d_length),
-            ma_type: Some(ma_type.to_string()),
-        },
-    );
-    let output = py
-        .allow_threads(|| volume_weighted_stochastic_rsi_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((output.k.into_pyarray(py), output.d.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VolumeWeightedStochasticRsiStream")]
-pub struct VolumeWeightedStochasticRsiStreamPy {
-    stream: VolumeWeightedStochasticRsiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VolumeWeightedStochasticRsiStreamPy {
-    #[new]
-    #[pyo3(signature = (rsi_length=14, stoch_length=14, k_length=3, d_length=3, ma_type="WSMA"))]
-    fn new(
-        rsi_length: usize,
-        stoch_length: usize,
-        k_length: usize,
-        d_length: usize,
-        ma_type: &str,
-    ) -> PyResult<Self> {
-        let stream =
-            VolumeWeightedStochasticRsiStream::try_new(VolumeWeightedStochasticRsiParams {
-                rsi_length: Some(rsi_length),
-                stoch_length: Some(stoch_length),
-                k_length: Some(k_length),
-                d_length: Some(d_length),
-                ma_type: Some(ma_type.to_string()),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, source: f64, volume: f64) -> Option<(f64, f64)> {
-        self.stream.update(source, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "volume_weighted_stochastic_rsi_batch")]
-#[pyo3(signature = (source, volume, rsi_length_range, stoch_length_range, k_length_range, d_length_range, ma_type="WSMA", kernel=None))]
-pub fn volume_weighted_stochastic_rsi_batch_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    rsi_length_range: (usize, usize, usize),
-    stoch_length_range: (usize, usize, usize),
-    k_length_range: (usize, usize, usize),
-    d_length_range: (usize, usize, usize),
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let source = source.as_slice()?;
-    let volume = volume.as_slice()?;
-    let sweep = VolumeWeightedStochasticRsiBatchRange {
-        rsi_length: rsi_length_range,
-        stoch_length: stoch_length_range,
-        k_length: k_length_range,
-        d_length: d_length_range,
-        ma_type: ma_type.to_string(),
-    };
-    let combos = expand_grid_volume_weighted_stochastic_rsi(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = source.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let k_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let d_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let k_out = unsafe { k_arr.as_slice_mut()? };
-    let d_out = unsafe { d_arr.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        volume_weighted_stochastic_rsi_batch_inner_into(
-            source,
-            volume,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            k_out,
-            d_out,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("k", k_arr.reshape((rows, cols))?)?;
-    dict.set_item("d", d_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "rsi_lengths",
-        combos
-            .iter()
-            .map(|p| p.rsi_length.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "stoch_lengths",
-        combos
-            .iter()
-            .map(|p| p.stoch_length.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "k_lengths",
-        combos
-            .iter()
-            .map(|p| p.k_length.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "d_lengths",
-        combos
-            .iter()
-            .map(|p| p.d_length.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_types",
-        combos
-            .iter()
-            .map(|p| p.ma_type.clone().unwrap_or_else(|| "WSMA".to_string()))
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_volume_weighted_stochastic_rsi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(volume_weighted_stochastic_rsi_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        volume_weighted_stochastic_rsi_batch_py,
-        m
-    )?)?;
-    m.add_class::<VolumeWeightedStochasticRsiStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "volume_weighted_stochastic_rsi_js")]
-pub fn volume_weighted_stochastic_rsi_js(
-    source: &[f64],
-    volume: &[f64],
-    rsi_length: usize,
-    stoch_length: usize,
-    k_length: usize,
-    d_length: usize,
-    ma_type: String,
-) -> Result<JsValue, JsValue> {
-    let input = VolumeWeightedStochasticRsiInput::from_slices(
-        source,
-        volume,
-        VolumeWeightedStochasticRsiParams {
-            rsi_length: Some(rsi_length),
-            stoch_length: Some(stoch_length),
-            k_length: Some(k_length),
-            d_length: Some(d_length),
-            ma_type: Some(ma_type),
-        },
-    );
-    let mut k = vec![0.0; source.len()];
-    let mut d = vec![0.0; source.len()];
-    volume_weighted_stochastic_rsi_into_slice(&mut k, &mut d, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("k"),
-        &serde_wasm_bindgen::to_value(&k).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("d"),
-        &serde_wasm_bindgen::to_value(&d).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "volume_weighted_stochastic_rsi_batch_js")]
-pub fn volume_weighted_stochastic_rsi_batch_js(
-    source: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: VolumeWeightedStochasticRsiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.rsi_length_range.len() != 3
-        || config.stoch_length_range.len() != 3
-        || config.k_length_range.len() != 3
-        || config.d_length_range.len() != 3
-    {
-        return Err(JsValue::from_str(
-            "Invalid config: ranges must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = VolumeWeightedStochasticRsiBatchRange {
-        rsi_length: (
-            config.rsi_length_range[0],
-            config.rsi_length_range[1],
-            config.rsi_length_range[2],
-        ),
-        stoch_length: (
-            config.stoch_length_range[0],
-            config.stoch_length_range[1],
-            config.stoch_length_range[2],
-        ),
-        k_length: (
-            config.k_length_range[0],
-            config.k_length_range[1],
-            config.k_length_range[2],
-        ),
-        d_length: (
-            config.d_length_range[0],
-            config.d_length_range[1],
-            config.d_length_range[2],
-        ),
-        ma_type: config.ma_type,
-    };
-    let combos = expand_grid_volume_weighted_stochastic_rsi(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = source.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let mut k = vec![0.0; total];
-    let mut d = vec![0.0; total];
-    volume_weighted_stochastic_rsi_batch_inner_into(
-        source,
-        volume,
-        &sweep,
-        Kernel::Scalar,
-        false,
-        &mut k,
-        &mut d,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("k"),
-        &serde_wasm_bindgen::to_value(&k).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("d"),
-        &serde_wasm_bindgen::to_value(&d).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_weighted_stochastic_rsi_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(2 * len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_weighted_stochastic_rsi_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_weighted_stochastic_rsi_into(
-    source_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    rsi_length: usize,
-    stoch_length: usize,
-    k_length: usize,
-    d_length: usize,
-    ma_type: String,
-) -> Result<(), JsValue> {
-    if source_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to volume_weighted_stochastic_rsi_into",
-        ));
-    }
-    unsafe {
-        let source = std::slice::from_raw_parts(source_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * len);
-        let (k, d) = out.split_at_mut(len);
-        let input = VolumeWeightedStochasticRsiInput::from_slices(
-            source,
-            volume,
-            VolumeWeightedStochasticRsiParams {
-                rsi_length: Some(rsi_length),
-                stoch_length: Some(stoch_length),
-                k_length: Some(k_length),
-                d_length: Some(d_length),
-                ma_type: Some(ma_type),
-            },
-        );
-        volume_weighted_stochastic_rsi_into_slice(k, d, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "volume_weighted_stochastic_rsi_into_host")]
-pub fn volume_weighted_stochastic_rsi_into_host(
-    source: &[f64],
-    volume: &[f64],
-    out_ptr: *mut f64,
-    rsi_length: usize,
-    stoch_length: usize,
-    k_length: usize,
-    d_length: usize,
-    ma_type: String,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to volume_weighted_stochastic_rsi_into_host",
-        ));
-    }
-    unsafe {
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * source.len());
-        let (k, d) = out.split_at_mut(source.len());
-        let input = VolumeWeightedStochasticRsiInput::from_slices(
-            source,
-            volume,
-            VolumeWeightedStochasticRsiParams {
-                rsi_length: Some(rsi_length),
-                stoch_length: Some(stoch_length),
-                k_length: Some(k_length),
-                d_length: Some(d_length),
-                ma_type: Some(ma_type),
-            },
-        );
-        volume_weighted_stochastic_rsi_into_slice(k, d, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_weighted_stochastic_rsi_batch_into(
-    source_ptr: *const f64,
-    volume_ptr: *const f64,
-    k_ptr: *mut f64,
-    d_ptr: *mut f64,
-    len: usize,
-    rsi_length_start: usize,
-    rsi_length_end: usize,
-    rsi_length_step: usize,
-    stoch_length_start: usize,
-    stoch_length_end: usize,
-    stoch_length_step: usize,
-    k_length_start: usize,
-    k_length_end: usize,
-    k_length_step: usize,
-    d_length_start: usize,
-    d_length_end: usize,
-    d_length_step: usize,
-    ma_type: String,
-) -> Result<usize, JsValue> {
-    if source_ptr.is_null() || volume_ptr.is_null() || k_ptr.is_null() || d_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to volume_weighted_stochastic_rsi_batch_into",
-        ));
-    }
-    unsafe {
-        let source = std::slice::from_raw_parts(source_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let sweep = VolumeWeightedStochasticRsiBatchRange {
-            rsi_length: (rsi_length_start, rsi_length_end, rsi_length_step),
-            stoch_length: (stoch_length_start, stoch_length_end, stoch_length_step),
-            k_length: (k_length_start, k_length_end, k_length_step),
-            d_length: (d_length_start, d_length_end, d_length_step),
-            ma_type,
-        };
-        let combos = expand_grid_volume_weighted_stochastic_rsi(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out_k = std::slice::from_raw_parts_mut(k_ptr, total);
-        let out_d = std::slice::from_raw_parts_mut(d_ptr, total);
-        volume_weighted_stochastic_rsi_batch_inner_into(
-            source,
-            volume,
-            &sweep,
-            Kernel::Scalar,
-            false,
-            out_k,
-            out_d,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_weighted_stochastic_rsi_output_into_js(
-    source: &[f64],
-    volume: &[f64],
-    rsi_length: usize,
-    stoch_length: usize,
-    k_length: usize,
-    d_length: usize,
-    ma_type: String,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = volume_weighted_stochastic_rsi_js(
-        source,
-        volume,
-        rsi_length,
-        stoch_length,
-        k_length,
-        d_length,
-        ma_type,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "volume_weighted_stochastic_rsi_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_weighted_stochastic_rsi_batch_output_into_js(
-    source: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = volume_weighted_stochastic_rsi_batch_js(source, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "volume_weighted_stochastic_rsi_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

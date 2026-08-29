@@ -4,7 +4,8 @@ use neoethos_core::storage::json::{
     DirBackupWriteConfig, JsonBackupWriteConfig, write_dir_with_backup,
     write_json_with_backup as write_json_artifact_with_backup,
 };
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -29,6 +30,7 @@ const BLENDER_DIR_NAME: &str = "blender_model";
 const BLENDER_BACKEND_DIR_NAME: &str = "xgboost_backend";
 const CALIBRATION_BACKEND_DIR_NAME: &str = "calibration_backend";
 const CONFORMAL_BACKEND_DIR_NAME: &str = "conformal_backend";
+const META_F64_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CalibrationMethod {
@@ -39,88 +41,83 @@ pub enum CalibrationMethod {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CalibrationModel {
-    Constant(f32),
-    Platt { a: f32, b: f32 },
-    Temperature { temperature: f32 },
+    Constant(f64),
+    Platt { a: f64, b: f64 },
+    Temperature { temperature: f64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MetaBlenderArtifact {
+    schema_version: u32,
     feature_columns: Vec<String>,
     fitted: bool,
-    #[serde(default)]
     training_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProbabilityCalibratorArtifact {
+    schema_version: u32,
     method: CalibrationMethod,
     fitted: bool,
     models: Vec<CalibrationModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConformalGateArtifact {
-    alpha: f32,
-    qhat: f32,
+    schema_version: u32,
+    alpha: f64,
+    qhat: f64,
     fitted: bool,
     n_calib: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MetaDecisionStackArtifact {
+    schema_version: u32,
     fitted: bool,
     feature_columns: Vec<String>,
-    #[serde(default)]
     training_rows: usize,
-    #[serde(default = "default_calibration_method")]
     method: CalibrationMethod,
-    #[serde(default = "default_conformal_alpha")]
-    alpha: f32,
+    alpha: f64,
     min_prediction_set: usize,
     min_fit_rows: usize,
 }
 
-fn default_calibration_method() -> CalibrationMethod {
-    CalibrationMethod::Platt
-}
-
-fn default_conformal_alpha() -> f32 {
-    0.10
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProbabilityCalibrationExpertArtifact {
+    schema_version: u32,
     fitted: bool,
     feature_columns: Vec<String>,
-    #[serde(default)]
     training_rows: usize,
     method: CalibrationMethod,
     min_fit_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConformalPredictionExpertArtifact {
+    schema_version: u32,
     fitted: bool,
     feature_columns: Vec<String>,
-    #[serde(default)]
     training_rows: usize,
-    alpha: f32,
+    alpha: f64,
     method: CalibrationMethod,
     min_prediction_set: usize,
     min_fit_rows: usize,
 }
 
-fn series_labels(y: &Series) -> Result<Vec<i32>> {
-    let labels = y
-        .cast(&DataType::Int32)
-        .context("cast meta labels to Int32")?;
-    labels
-        .i32()
-        .context("access meta labels as Int32")?
-        .into_iter()
-        .map(|value| value.context("meta labels may not contain nulls"))
-        .collect()
+fn validate_meta_f64_schema(schema_version: u32, artifact: &str) -> Result<()> {
+    if schema_version != META_F64_ARTIFACT_SCHEMA_VERSION {
+        bail!(
+            "{artifact} schema version {schema_version} is unsupported; expected f64 schema version {META_F64_ARTIFACT_SCHEMA_VERSION}"
+        );
+    }
+    Ok(())
 }
 
 fn label_to_class_index(label: i32) -> Result<usize> {
@@ -132,57 +129,72 @@ fn label_to_class_index(label: i32) -> Result<usize> {
     }
 }
 
-fn clamp_probability(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(1e-6, 1.0 - 1e-6)
-    } else {
-        0.5
+fn validate_probability_row(values: &[f64], context: &str) -> Result<()> {
+    if values.is_empty() {
+        bail!("{context} probability row may not be empty");
     }
+    let mut sum = 0.0_f64;
+    for (column, value) in values.iter().copied().enumerate() {
+        if !value.is_finite() {
+            bail!("{context} probability at column {column} must be finite");
+        }
+        if !(0.0..=1.0 + 1e-4).contains(&value) {
+            bail!("{context} probability at column {column} must be between 0 and 1, got {value}");
+        }
+        sum += value;
+    }
+    if !sum.is_finite() || sum <= f64::EPSILON {
+        bail!("{context} probability row must have finite positive mass");
+    }
+    Ok(())
 }
 
-fn set_neutral_probability_row(probabilities: &mut Array2<f32>, row_idx: usize) {
-    for col_idx in 0..probabilities.ncols() {
-        probabilities[(row_idx, col_idx)] = 0.0;
+fn validate_probability_matrix(probabilities: &Array2<f64>, context: &str) -> Result<()> {
+    for row_idx in 0..probabilities.nrows() {
+        let row = probabilities.row(row_idx);
+        validate_probability_row(
+            row.as_slice()
+                .context("probability matrix row must be contiguous")?,
+            &format!("{context} row {row_idx}"),
+        )?;
     }
-    if probabilities.ncols() > 0 {
-        probabilities[(row_idx, 0)] = 1.0;
-    }
+    Ok(())
 }
 
-fn renormalize_rows(probabilities: &Array2<f32>) -> Array2<f32> {
+fn clamp_probability(value: f64) -> Result<f64> {
+    if !value.is_finite() {
+        bail!("scalar probability must be finite");
+    }
+    if !(0.0..=1.0 + 1e-4).contains(&value) {
+        bail!("scalar probability must be between 0 and 1, got {value}");
+    }
+    Ok(value.clamp(1e-6, 1.0 - 1e-6))
+}
+
+fn renormalize_rows(probabilities: &Array2<f64>) -> Result<Array2<f64>> {
+    validate_probability_matrix(probabilities, "normalization input")?;
     let mut normalized = probabilities.clone();
     for row_idx in 0..normalized.nrows() {
-        let mut sum = 0.0_f32;
+        let mut sum = 0.0_f64;
         for col_idx in 0..normalized.ncols() {
             let value = normalized[(row_idx, col_idx)];
-            let clamped = if value.is_finite() {
-                value.max(0.0)
-            } else {
-                0.0
-            };
-            normalized[(row_idx, col_idx)] = clamped;
-            sum += clamped;
-        }
-
-        if sum <= f32::EPSILON {
-            set_neutral_probability_row(&mut normalized, row_idx);
-            continue;
+            sum += value;
         }
 
         for col_idx in 0..normalized.ncols() {
             normalized[(row_idx, col_idx)] /= sum;
         }
     }
-    normalized
+    Ok(normalized)
 }
 
-fn logit(probability: f32) -> f32 {
-    let p = clamp_probability(probability);
-    (p / (1.0 - p)).ln()
+fn logit(probability: f64) -> Result<f64> {
+    let p = clamp_probability(probability)?;
+    Ok((p / (1.0 - p)).ln())
 }
 
-fn sigmoid(value: f32) -> f32 {
-    neoethos_core::utils::stable_sigmoid_f32(value)
+fn sigmoid(value: f64) -> f64 {
+    neoethos_core::utils::stable_sigmoid_f64(value)
 }
 
 fn validate_meta_metadata(
@@ -277,6 +289,7 @@ where
 }
 
 fn validate_calibrator_artifact(artifact: &ProbabilityCalibratorArtifact) -> Result<()> {
+    validate_meta_f64_schema(artifact.schema_version, "probability calibrator")?;
     match artifact.method {
         CalibrationMethod::Identity => {
             if !artifact.models.is_empty() {
@@ -360,6 +373,7 @@ fn validate_probability_calibrator_live_state(state: &ProbabilityCalibrator) -> 
         bail!("probability calibrator is not fitted");
     }
     validate_calibrator_artifact(&ProbabilityCalibratorArtifact {
+        schema_version: META_F64_ARTIFACT_SCHEMA_VERSION,
         method: state.method,
         fitted: state.fitted,
         models: state.models.clone(),
@@ -371,6 +385,7 @@ fn validate_conformal_gate_live_state(state: &ConformalGate) -> Result<()> {
         bail!("conformal gate is not fitted");
     }
     validate_conformal_artifact(&ConformalGateArtifact {
+        schema_version: META_F64_ARTIFACT_SCHEMA_VERSION,
         alpha: state.alpha,
         qhat: state.qhat,
         fitted: state.fitted,
@@ -381,6 +396,7 @@ fn validate_conformal_gate_live_state(state: &ConformalGate) -> Result<()> {
 fn validate_probability_calibration_expert_artifact(
     artifact: &ProbabilityCalibrationExpertArtifact,
 ) -> Result<()> {
+    validate_meta_f64_schema(artifact.schema_version, "probability calibration expert")?;
     if artifact.feature_columns.is_empty() {
         bail!("probability calibration artifact must contain at least one feature column");
     }
@@ -437,6 +453,7 @@ fn validate_probability_calibration_expert_save_state(
 }
 
 fn validate_conformal_artifact(artifact: &ConformalGateArtifact) -> Result<()> {
+    validate_meta_f64_schema(artifact.schema_version, "conformal gate")?;
     if !artifact.alpha.is_finite() || !(0.0..1.0).contains(&artifact.alpha) {
         bail!("conformal gate alpha must be finite and strictly between 0 and 1");
     }
@@ -502,6 +519,7 @@ fn validate_conformal_prediction_expert_save_state(
 fn validate_conformal_prediction_expert_artifact(
     artifact: &ConformalPredictionExpertArtifact,
 ) -> Result<()> {
+    validate_meta_f64_schema(artifact.schema_version, "conformal prediction expert")?;
     if artifact.feature_columns.is_empty() {
         bail!("conformal prediction artifact must contain at least one feature column");
     }
@@ -572,6 +590,7 @@ fn validate_meta_stack_save_state(state: &MetaDecisionStack) -> Result<()> {
 }
 
 fn validate_meta_stack_artifact(artifact: &MetaDecisionStackArtifact) -> Result<()> {
+    validate_meta_f64_schema(artifact.schema_version, "meta decision stack")?;
     if artifact.feature_columns.is_empty() {
         bail!("meta stack artifact must contain at least one feature column");
     }
@@ -599,24 +618,24 @@ fn validate_meta_stack_artifact(artifact: &MetaDecisionStackArtifact) -> Result<
     Ok(())
 }
 
-fn fit_binary_logistic(xs: &[f32], ys: &[f32]) -> CalibrationModel {
+fn fit_binary_logistic(xs: &[f64], ys: &[f64]) -> CalibrationModel {
     if xs.is_empty() || ys.is_empty() || xs.len() != ys.len() {
         return CalibrationModel::Constant(0.5);
     }
 
-    let positive_rate = ys.iter().copied().sum::<f32>() / ys.len() as f32;
+    let positive_rate = ys.iter().copied().sum::<f64>() / ys.len() as f64;
     if !(1e-4..=1.0 - 1e-4).contains(&positive_rate) {
         return CalibrationModel::Constant(positive_rate.clamp(1e-4, 1.0 - 1e-4));
     }
 
-    let mut a = 1.0_f32;
-    let mut b = 0.0_f32;
-    let learning_rate = 0.05_f32;
-    let l2 = 1e-3_f32;
+    let mut a = 1.0_f64;
+    let mut b = 0.0_f64;
+    let learning_rate = 0.05_f64;
+    let l2 = 1e-3_f64;
 
     for _ in 0..300 {
-        let mut grad_a = 0.0_f32;
-        let mut grad_b = 0.0_f32;
+        let mut grad_a = 0.0_f64;
+        let mut grad_b = 0.0_f64;
 
         for (x, y) in xs.iter().copied().zip(ys.iter().copied()) {
             let prediction = sigmoid(a * x + b);
@@ -625,8 +644,8 @@ fn fit_binary_logistic(xs: &[f32], ys: &[f32]) -> CalibrationModel {
             grad_b += error;
         }
 
-        grad_a = grad_a / xs.len() as f32 + l2 * a;
-        grad_b /= xs.len() as f32;
+        grad_a = grad_a / xs.len() as f64 + l2 * a;
+        grad_b /= xs.len() as f64;
 
         a -= learning_rate * grad_a;
         b -= learning_rate * grad_b;
@@ -635,7 +654,7 @@ fn fit_binary_logistic(xs: &[f32], ys: &[f32]) -> CalibrationModel {
     CalibrationModel::Platt { a, b }
 }
 
-fn select_temperature(probabilities: &Array2<f32>, labels: &[i32]) -> Result<f32> {
+fn select_temperature(probabilities: &Array2<f64>, labels: &[i32]) -> Result<f64> {
     if probabilities.nrows() != labels.len() {
         bail!(
             "temperature calibration row mismatch: {} rows vs {} labels",
@@ -643,42 +662,43 @@ fn select_temperature(probabilities: &Array2<f32>, labels: &[i32]) -> Result<f32
             labels.len()
         );
     }
+    validate_probability_matrix(probabilities, "temperature calibration")?;
 
-    let mut best_temperature = 1.0_f32;
-    let mut best_loss = f32::INFINITY;
+    let mut best_temperature = 1.0_f64;
+    let mut best_loss = f64::INFINITY;
 
     for step in 10..=120 {
-        let temperature = step as f32 / 20.0;
-        let mut loss = 0.0_f32;
+        let temperature = step as f64 / 20.0;
+        let mut loss = 0.0_f64;
 
         for (row_idx, label) in labels.iter().copied().enumerate() {
             let class_idx = label_to_class_index(label)?;
             let row = [
-                clamp_probability(probabilities[(row_idx, 0)]),
-                clamp_probability(probabilities[(row_idx, 1)]),
-                clamp_probability(probabilities[(row_idx, 2)]),
+                clamp_probability(probabilities[(row_idx, 0)])?,
+                clamp_probability(probabilities[(row_idx, 1)])?,
+                clamp_probability(probabilities[(row_idx, 2)])?,
             ];
             let logits = [row[0].ln(), row[1].ln(), row[2].ln()];
             let max_logit = logits
                 .iter()
                 .map(|value| *value / temperature)
-                .fold(f32::NEG_INFINITY, f32::max);
+                .fold(f64::NEG_INFINITY, f64::max);
 
-            let mut exp_sum = 0.0_f32;
-            let mut scaled = [0.0_f32; 3];
+            let mut exp_sum = 0.0_f64;
+            let mut scaled = [0.0_f64; 3];
             for idx in 0..3 {
                 let value = ((logits[idx] / temperature) - max_logit).exp();
                 scaled[idx] = value;
                 exp_sum += value;
             }
             for value in &mut scaled {
-                *value /= exp_sum.max(f32::EPSILON);
+                *value /= exp_sum.max(f64::EPSILON);
             }
 
-            loss -= clamp_probability(scaled[class_idx]).ln();
+            loss -= clamp_probability(scaled[class_idx])?.ln();
         }
 
-        loss /= labels.len().max(1) as f32;
+        loss /= labels.len().max(1) as f64;
         if loss < best_loss {
             best_loss = loss;
             best_temperature = temperature;
@@ -691,12 +711,12 @@ fn select_temperature(probabilities: &Array2<f32>, labels: &[i32]) -> Result<f32
 #[cfg(test)]
 fn build_meta_runtime_prediction(
     model_name: &str,
-    row: [f32; 3],
+    row: [f64; 3],
     conformal_gate: &ConformalGate,
     min_prediction_set: usize,
 ) -> Result<RuntimePrediction> {
     let (confidence, shared_abstain) = three_class_runtime_confidence(row)?;
-    let (conformal_abstain, _) = conformal_gate.should_abstain(&row, min_prediction_set);
+    let (conformal_abstain, _) = conformal_gate.should_abstain(&row, min_prediction_set)?;
     let degraded_reason = join_degraded_reasons(
         [
             shared_abstain.then(|| "meta runtime confidence gate recommended abstain".to_string()),
@@ -726,7 +746,7 @@ fn calibration_method_name(method: CalibrationMethod) -> &'static str {
 }
 
 fn build_probability_calibration_runtime_prediction(
-    row: [f32; 3],
+    row: [f64; 3],
     calibration_method: CalibrationMethod,
 ) -> Result<RuntimePrediction> {
     let (confidence, abstain) = three_class_runtime_confidence(row)?;
@@ -751,14 +771,14 @@ fn build_probability_calibration_runtime_prediction(
 }
 
 fn build_conformal_runtime_prediction(
-    row: [f32; 3],
+    row: [f64; 3],
     calibration_method: CalibrationMethod,
     conformal_gate: &ConformalGate,
     min_prediction_set: usize,
 ) -> Result<RuntimePrediction> {
     let (confidence, shared_abstain) = three_class_runtime_confidence(row)?;
     let (conformal_abstain, prediction_set_size) =
-        conformal_gate.should_abstain(&row, min_prediction_set);
+        conformal_gate.should_abstain(&row, min_prediction_set)?;
     let degraded_reason = join_degraded_reasons(
         [
             shared_abstain
@@ -791,14 +811,14 @@ fn build_conformal_runtime_prediction(
 }
 
 fn build_meta_stack_runtime_prediction(
-    row: [f32; 3],
+    row: [f64; 3],
     calibration_method: CalibrationMethod,
     conformal_gate: &ConformalGate,
     min_prediction_set: usize,
 ) -> Result<RuntimePrediction> {
     let (confidence, shared_abstain) = three_class_runtime_confidence(row)?;
     let (conformal_abstain, prediction_set_size) =
-        conformal_gate.should_abstain(&row, min_prediction_set);
+        conformal_gate.should_abstain(&row, min_prediction_set)?;
     let mut degraded_reasons = Vec::new();
     if shared_abstain {
         degraded_reasons.push("shared three-class confidence gate recommended abstain".to_string());
@@ -846,33 +866,30 @@ impl MetaBlender {
         }
     }
 
-    pub fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    pub fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
         let mut model = XGBoostExpert::new(0, None);
-        model.fit(x, y)?;
+        model.fit(x, y, lease)?;
         self.model = Some(model);
-        self.feature_columns = x
-            .get_column_names()
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
-        self.training_rows = x.height();
+        self.feature_columns = x.names.clone();
+        self.training_rows = x.n_samples();
         self.fitted = true;
         Ok(())
     }
 
-    pub fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    pub fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
         if !self.fitted {
             bail!("MetaBlender is not fitted");
         }
         ensure_feature_columns_match(&self.feature_columns, x)?;
         let model = self.model.as_ref().context("MetaBlender not fitted")?;
-        model.predict_proba(x)
+        model.predict_proba(x, lease)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         validate_meta_blender_save_state(self)?;
         let model = self.model.as_ref().context("MetaBlender not fitted")?;
         let artifact = MetaBlenderArtifact {
+            schema_version: META_F64_ARTIFACT_SCHEMA_VERSION,
             feature_columns: self.feature_columns.clone(),
             fitted: self.fitted,
             training_rows: self.training_rows,
@@ -895,6 +912,7 @@ impl MetaBlender {
         let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         validate_meta_metadata(&metadata, "meta_blender")?;
         let artifact: MetaBlenderArtifact = read_json(&path.join(META_BLENDER_FILE_NAME))?;
+        validate_meta_f64_schema(artifact.schema_version, "meta blender")?;
         if artifact.feature_columns.is_empty() {
             bail!("meta blender artifact must contain at least one feature column");
         }
@@ -942,12 +960,12 @@ impl Default for MetaBlender {
 }
 
 impl ExpertModel for MetaBlender {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        MetaBlender::fit(self, x, y)
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        MetaBlender::fit(self, x, y, lease)
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        MetaBlender::predict_proba(self, x)
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        MetaBlender::predict_proba(self, x, lease)
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -975,7 +993,7 @@ impl ProbabilityCalibrator {
         }
     }
 
-    pub fn fit_probabilities(&mut self, probabilities: &Array2<f32>, labels: &[i32]) -> Result<()> {
+    pub fn fit_probabilities(&mut self, probabilities: &Array2<f64>, labels: &[i32]) -> Result<()> {
         if probabilities.nrows() != labels.len() {
             bail!(
                 "calibration row mismatch: {} rows vs {} labels",
@@ -989,6 +1007,7 @@ impl ProbabilityCalibrator {
                 probabilities.ncols()
             );
         }
+        validate_probability_matrix(probabilities, "calibration fit")?;
 
         self.models.clear();
 
@@ -1004,11 +1023,11 @@ impl ProbabilityCalibrator {
                     let mut x_cls = Vec::with_capacity(labels.len());
                     let mut y_cls = Vec::with_capacity(labels.len());
                     for row_idx in 0..labels.len() {
-                        x_cls.push(logit(probabilities[(row_idx, cls)]));
+                        x_cls.push(logit(probabilities[(row_idx, cls)])?);
                         let target = if label_to_class_index(labels[row_idx])? == cls {
-                            1.0_f32
+                            1.0_f64
                         } else {
-                            0.0_f32
+                            0.0_f64
                         };
                         y_cls.push(target);
                     }
@@ -1021,7 +1040,7 @@ impl ProbabilityCalibrator {
         Ok(())
     }
 
-    pub fn predict_proba(&self, probabilities: &Array2<f32>) -> Result<Array2<f32>> {
+    pub fn predict_proba(&self, probabilities: &Array2<f64>) -> Result<Array2<f64>> {
         if probabilities.ncols() != 3 {
             bail!(
                 "probability calibration requires exactly 3 classes, received {}",
@@ -1032,13 +1051,14 @@ impl ProbabilityCalibrator {
         if !self.fitted {
             bail!("probability calibrator is not fitted");
         }
+        validate_probability_matrix(probabilities, "calibration prediction")?;
 
         if matches!(self.method, CalibrationMethod::Identity) {
-            return Ok(renormalize_rows(probabilities));
+            return renormalize_rows(probabilities);
         }
 
         match self.method {
-            CalibrationMethod::Identity => Ok(renormalize_rows(probabilities)),
+            CalibrationMethod::Identity => renormalize_rows(probabilities),
             CalibrationMethod::Temperature => {
                 let CalibrationModel::Temperature { temperature } = self
                     .models
@@ -1049,25 +1069,25 @@ impl ProbabilityCalibrator {
                     bail!("temperature calibrator stored invalid model payload");
                 };
 
-                let mut calibrated = Array2::<f32>::zeros((probabilities.nrows(), 3));
+                let mut calibrated = Array2::<f64>::zeros((probabilities.nrows(), 3));
                 for row_idx in 0..probabilities.nrows() {
                     let logits = [
-                        clamp_probability(probabilities[(row_idx, 0)]).ln(),
-                        clamp_probability(probabilities[(row_idx, 1)]).ln(),
-                        clamp_probability(probabilities[(row_idx, 2)]).ln(),
+                        clamp_probability(probabilities[(row_idx, 0)])?.ln(),
+                        clamp_probability(probabilities[(row_idx, 1)])?.ln(),
+                        clamp_probability(probabilities[(row_idx, 2)])?.ln(),
                     ];
                     let max_logit = logits
                         .iter()
                         .map(|value| *value / temperature)
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let mut exp_sum = 0.0_f32;
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let mut exp_sum = 0.0_f64;
                     for col_idx in 0..3 {
                         let value = ((logits[col_idx] / temperature) - max_logit).exp();
                         calibrated[(row_idx, col_idx)] = value;
                         exp_sum += value;
                     }
                     for col_idx in 0..3 {
-                        calibrated[(row_idx, col_idx)] /= exp_sum.max(f32::EPSILON);
+                        calibrated[(row_idx, col_idx)] /= exp_sum.max(f64::EPSILON);
                     }
                 }
                 Ok(calibrated)
@@ -1080,15 +1100,15 @@ impl ProbabilityCalibrator {
                     );
                 }
 
-                let mut calibrated = Array2::<f32>::zeros((probabilities.nrows(), 3));
+                let mut calibrated = Array2::<f64>::zeros((probabilities.nrows(), 3));
                 for row_idx in 0..probabilities.nrows() {
                     for cls in 0..3 {
                         let value = match self.models.get(cls).context("platt model missing")? {
                             CalibrationModel::Constant(probability) => {
-                                clamp_probability(*probability)
+                                clamp_probability(*probability)?
                             }
                             CalibrationModel::Platt { a, b } => {
-                                sigmoid(a * logit(probabilities[(row_idx, cls)]) + b)
+                                sigmoid(a * logit(probabilities[(row_idx, cls)])? + b)
                             }
                             CalibrationModel::Temperature { .. } => {
                                 bail!("unexpected temperature model inside platt calibrator")
@@ -1097,7 +1117,7 @@ impl ProbabilityCalibrator {
                         calibrated[(row_idx, cls)] = value;
                     }
                 }
-                Ok(renormalize_rows(&calibrated))
+                renormalize_rows(&calibrated)
             }
         }
     }
@@ -1107,6 +1127,7 @@ impl ProbabilityCalibrator {
             bail!("probability calibrator is not fitted");
         }
         let artifact = ProbabilityCalibratorArtifact {
+            schema_version: META_F64_ARTIFACT_SCHEMA_VERSION,
             method: self.method,
             fitted: self.fitted,
             models: self.models.clone(),
@@ -1161,15 +1182,19 @@ impl ProbabilityCalibrationExpert {
         &self.feature_columns
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
         let mut runtime_predictions = Vec::with_capacity(probabilities.nrows());
 
         for row_idx in 0..probabilities.nrows() {
             let row = [
-                clamp_probability(probabilities[(row_idx, 0)]),
-                clamp_probability(probabilities[(row_idx, 1)]),
-                clamp_probability(probabilities[(row_idx, 2)]),
+                clamp_probability(probabilities[(row_idx, 0)])?,
+                clamp_probability(probabilities[(row_idx, 1)])?,
+                clamp_probability(probabilities[(row_idx, 2)])?,
             ];
             runtime_predictions.push(build_probability_calibration_runtime_prediction(
                 row,
@@ -1188,37 +1213,36 @@ impl Default for ProbabilityCalibrationExpert {
 }
 
 impl ExpertModel for ProbabilityCalibrationExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        if x.height() < self.min_fit_rows {
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        if x.n_samples() < self.min_fit_rows {
             bail!(
                 "probability calibration requires at least {} rows, received {}",
                 self.min_fit_rows,
-                x.height()
+                x.n_samples()
             );
         }
-        self.backend.fit(x, y)?;
-        let raw_probabilities = self.backend.predict_proba(x)?;
-        let labels = series_labels(y)?;
-        self.calibrator
-            .fit_probabilities(&raw_probabilities, &labels)?;
+        self.backend.fit(x, y, lease)?;
+        let raw_probabilities = self.backend.predict_proba(x, lease)?;
+        self.calibrator.fit_probabilities(&raw_probabilities, y)?;
         self.feature_columns = self.backend.feature_columns.clone();
-        self.training_rows = x.height();
+        self.training_rows = x.n_samples();
         self.fitted = true;
         Ok(())
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
         if !self.fitted {
             bail!("probability calibration expert is not fitted");
         }
         ensure_feature_columns_match(&self.feature_columns, x)?;
-        let raw_probabilities = self.backend.predict_proba(x)?;
+        let raw_probabilities = self.backend.predict_proba(x, lease)?;
         self.calibrator.predict_proba(&raw_probabilities)
     }
 
     fn save(&self, path: &Path) -> Result<()> {
         validate_probability_calibration_expert_save_state(self)?;
         let artifact = ProbabilityCalibrationExpertArtifact {
+            schema_version: META_F64_ARTIFACT_SCHEMA_VERSION,
             fitted: self.fitted,
             feature_columns: self.feature_columns.clone(),
             training_rows: self.training_rows,
@@ -1292,14 +1316,14 @@ impl ExpertModel for ProbabilityCalibrationExpert {
 
 #[derive(Debug, Clone)]
 pub struct ConformalGate {
-    pub alpha: f32,
-    pub qhat: f32,
+    pub alpha: f64,
+    pub qhat: f64,
     pub fitted: bool,
     pub n_calib: usize,
 }
 
 impl ConformalGate {
-    pub fn new(alpha: f32) -> Self {
+    pub fn new(alpha: f64) -> Self {
         Self {
             alpha: alpha.clamp(1e-6, 0.99),
             qhat: 1.0,
@@ -1308,7 +1332,7 @@ impl ConformalGate {
         }
     }
 
-    pub fn fit_probabilities(&mut self, probabilities: &Array2<f32>, labels: &[i32]) -> Result<()> {
+    pub fn fit_probabilities(&mut self, probabilities: &Array2<f64>, labels: &[i32]) -> Result<()> {
         if probabilities.nrows() != labels.len() {
             bail!(
                 "conformal row mismatch: {} rows vs {} labels",
@@ -1328,36 +1352,37 @@ impl ConformalGate {
                 probabilities.nrows()
             );
         }
+        validate_probability_matrix(probabilities, "conformal calibration")?;
 
         let alpha = self.alpha.clamp(1e-6, 0.99);
         let n = probabilities.nrows();
-        let q_level = ((((n + 1) as f32) * (1.0 - alpha)).ceil() / n as f32).clamp(0.0, 1.0);
+        let q_level = ((((n + 1) as f64) * (1.0 - alpha)).ceil() / n as f64).clamp(0.0, 1.0);
 
         let mut scores = Vec::with_capacity(n);
         for row_idx in 0..n {
             let label_idx = label_to_class_index(labels[row_idx])?;
-            scores.push(1.0 - clamp_probability(probabilities[(row_idx, label_idx)]));
+            scores.push(1.0 - clamp_probability(probabilities[(row_idx, label_idx)])?);
         }
 
         scores.sort_by(|left, right| left.total_cmp(right));
-        let idx = ((q_level * n as f32).ceil() as isize - 1).clamp(0, (n - 1) as isize) as usize;
+        let idx = ((q_level * n as f64).ceil() as isize - 1).clamp(0, (n - 1) as isize) as usize;
         self.qhat = scores[idx].clamp(0.0, 1.0);
         self.fitted = true;
         self.n_calib = n;
         Ok(())
     }
 
-    pub fn prediction_set(&self, row: &[f32; 3]) -> Vec<usize> {
+    pub fn prediction_set(&self, row: &[f64; 3]) -> Result<Vec<usize>> {
+        validate_probability_row(row, "conformal prediction")?;
         let mut keep = row
             .iter()
             .enumerate()
-            .filter_map(|(idx, probability)| {
-                if (1.0 - clamp_probability(*probability)) <= self.qhat {
-                    Some(idx)
-                } else {
-                    None
-                }
+            .map(|(idx, probability)| {
+                Ok(((1.0 - clamp_probability(*probability)?) <= self.qhat).then_some(idx))
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
 
         if keep.is_empty() {
@@ -1371,17 +1396,18 @@ impl ConformalGate {
             keep.push(best_idx);
         }
 
-        keep
+        Ok(keep)
     }
 
-    pub fn should_abstain(&self, row: &[f32; 3], min_set_size: usize) -> (bool, usize) {
+    pub fn should_abstain(&self, row: &[f64; 3], min_set_size: usize) -> Result<(bool, usize)> {
+        validate_probability_row(row, "conformal abstention")?;
         if !self.fitted {
-            return (true, row.len().max(min_set_size.max(1)));
+            return Ok((true, row.len().max(min_set_size.max(1))));
         }
 
-        let keep = self.prediction_set(row);
+        let keep = self.prediction_set(row)?;
         let size = keep.len();
-        (size >= min_set_size.max(1), size)
+        Ok((size >= min_set_size.max(1), size))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -1389,6 +1415,7 @@ impl ConformalGate {
             bail!("conformal gate is not fitted");
         }
         let artifact = ConformalGateArtifact {
+            schema_version: META_F64_ARTIFACT_SCHEMA_VERSION,
             alpha: self.alpha,
             qhat: self.qhat,
             fitted: self.fitted,
@@ -1430,7 +1457,7 @@ pub struct ConformalPredictionExpert {
 }
 
 impl ConformalPredictionExpert {
-    pub fn new(method: CalibrationMethod, alpha: f32) -> Self {
+    pub fn new(method: CalibrationMethod, alpha: f64) -> Self {
         Self {
             backend: MetaBlender::new(),
             calibrator: ProbabilityCalibrator::new(method),
@@ -1449,15 +1476,19 @@ impl ConformalPredictionExpert {
         &self.feature_columns
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
         let mut runtime_predictions = Vec::with_capacity(probabilities.nrows());
 
         for row_idx in 0..probabilities.nrows() {
             let row = [
-                clamp_probability(probabilities[(row_idx, 0)]),
-                clamp_probability(probabilities[(row_idx, 1)]),
-                clamp_probability(probabilities[(row_idx, 2)]),
+                clamp_probability(probabilities[(row_idx, 0)])?,
+                clamp_probability(probabilities[(row_idx, 1)])?,
+                clamp_probability(probabilities[(row_idx, 2)])?,
             ];
             runtime_predictions.push(build_conformal_runtime_prediction(
                 row,
@@ -1478,40 +1509,38 @@ impl Default for ConformalPredictionExpert {
 }
 
 impl ExpertModel for ConformalPredictionExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        if x.height() < self.min_fit_rows {
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        if x.n_samples() < self.min_fit_rows {
             bail!(
                 "conformal gate requires at least {} rows, received {}",
                 self.min_fit_rows,
-                x.height()
+                x.n_samples()
             );
         }
-        self.backend.fit(x, y)?;
-        let raw_probabilities = self.backend.predict_proba(x)?;
-        let labels = series_labels(y)?;
-        self.calibrator
-            .fit_probabilities(&raw_probabilities, &labels)?;
+        self.backend.fit(x, y, lease)?;
+        let raw_probabilities = self.backend.predict_proba(x, lease)?;
+        self.calibrator.fit_probabilities(&raw_probabilities, y)?;
         let calibrated = self.calibrator.predict_proba(&raw_probabilities)?;
-        self.conformal_gate
-            .fit_probabilities(&calibrated, &labels)?;
+        self.conformal_gate.fit_probabilities(&calibrated, y)?;
         self.feature_columns = self.backend.feature_columns.clone();
-        self.training_rows = x.height();
+        self.training_rows = x.n_samples();
         self.fitted = true;
         Ok(())
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
         if !self.fitted {
             bail!("conformal prediction expert is not fitted");
         }
         ensure_feature_columns_match(&self.feature_columns, x)?;
-        let raw_probabilities = self.backend.predict_proba(x)?;
+        let raw_probabilities = self.backend.predict_proba(x, lease)?;
         self.calibrator.predict_proba(&raw_probabilities)
     }
 
     fn save(&self, path: &Path) -> Result<()> {
         validate_conformal_prediction_expert_save_state(self)?;
         let artifact = ConformalPredictionExpertArtifact {
+            schema_version: META_F64_ARTIFACT_SCHEMA_VERSION,
             fitted: self.fitted,
             feature_columns: self.feature_columns.clone(),
             training_rows: self.training_rows,
@@ -1607,7 +1636,7 @@ pub struct MetaDecisionStack {
 }
 
 impl MetaDecisionStack {
-    pub fn new(method: CalibrationMethod, alpha: f32) -> Self {
+    pub fn new(method: CalibrationMethod, alpha: f64) -> Self {
         Self {
             blender: MetaBlender::new(),
             calibrator: ProbabilityCalibrator::new(method),
@@ -1626,15 +1655,19 @@ impl MetaDecisionStack {
         &self.feature_columns
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
         let mut runtime_predictions = Vec::with_capacity(probabilities.nrows());
 
         for row_idx in 0..probabilities.nrows() {
             let row = [
-                clamp_probability(probabilities[(row_idx, 0)]),
-                clamp_probability(probabilities[(row_idx, 1)]),
-                clamp_probability(probabilities[(row_idx, 2)]),
+                clamp_probability(probabilities[(row_idx, 0)])?,
+                clamp_probability(probabilities[(row_idx, 1)])?,
+                clamp_probability(probabilities[(row_idx, 2)])?,
             ];
             runtime_predictions.push(build_meta_stack_runtime_prediction(
                 row,
@@ -1655,42 +1688,40 @@ impl Default for MetaDecisionStack {
 }
 
 impl ExpertModel for MetaDecisionStack {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        if x.height() < self.min_fit_rows {
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        if x.n_samples() < self.min_fit_rows {
             bail!(
                 "meta stack requires at least {} rows, received {}",
                 self.min_fit_rows,
-                x.height()
+                x.n_samples()
             );
         }
-        self.blender.fit(x, y)?;
-        let raw_probabilities = self.blender.predict_proba(x)?;
-        let labels = series_labels(y)?;
+        self.blender.fit(x, y, lease)?;
+        let raw_probabilities = self.blender.predict_proba(x, lease)?;
 
-        self.calibrator
-            .fit_probabilities(&raw_probabilities, &labels)?;
+        self.calibrator.fit_probabilities(&raw_probabilities, y)?;
         let calibrated = self.calibrator.predict_proba(&raw_probabilities)?;
-        self.conformal_gate
-            .fit_probabilities(&calibrated, &labels)?;
+        self.conformal_gate.fit_probabilities(&calibrated, y)?;
 
         self.feature_columns = self.blender.feature_columns.clone();
-        self.training_rows = x.height();
+        self.training_rows = x.n_samples();
         self.fitted = true;
         Ok(())
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
         if !self.fitted {
             bail!("meta decision stack is not fitted");
         }
         ensure_feature_columns_match(&self.feature_columns, x)?;
-        let raw_probabilities = self.blender.predict_proba(x)?;
+        let raw_probabilities = self.blender.predict_proba(x, lease)?;
         self.calibrator.predict_proba(&raw_probabilities)
     }
 
     fn save(&self, path: &Path) -> Result<()> {
         validate_meta_stack_save_state(self)?;
         let artifact = MetaDecisionStackArtifact {
+            schema_version: META_F64_ARTIFACT_SCHEMA_VERSION,
             fitted: self.fitted,
             feature_columns: self.feature_columns.clone(),
             training_rows: self.training_rows,

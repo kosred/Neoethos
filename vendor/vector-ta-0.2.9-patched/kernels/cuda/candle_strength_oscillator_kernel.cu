@@ -41,9 +41,12 @@ struct AtrState {
             return false;
         }
 
-        const double tr = isnan(prev_close)
-            ? (high - low)
-            : (fmax(high, prev_close) - fmin(low, prev_close));
+        double tr = high - low;
+        if (!isnan(prev_close)) {
+            const double up = high > prev_close ? high : prev_close;
+            const double dn = low < prev_close ? low : prev_close;
+            tr = up - dn;
+        }
         prev_close = close;
 
         if (!seeded) {
@@ -58,7 +61,7 @@ struct AtrState {
             return false;
         }
 
-        rma = alpha * (tr - rma) + rma;
+        rma = fma(alpha, tr - rma, rma);
         *out = rma;
         return true;
     }
@@ -169,7 +172,7 @@ struct BollingerState {
             buffer[pos] = value;
             len += 1;
             sum += value;
-            sum_sq += value * value;
+            sum_sq = fma(value, value, sum_sq);
             if (len < period) {
                 return false;
             }
@@ -178,10 +181,10 @@ struct BollingerState {
             buffer[head] = value;
             head = (head + 1) % cap;
             sum += value - old;
-            sum_sq += value * value - old * old;
+            sum_sq = fma(value, value, sum_sq - old * old);
         }
         const double mean = sum * inv_n;
-        const double var = fmax(sum_sq * inv_n - mean * mean, 0.0);
+        const double var = sum_sq * inv_n - mean * mean;
         const double stddev = var > 0.0 ? sqrt(var) : 0.0;
         *highs = mean + BOLLINGER_STD_MULTIPLIER * stddev;
         *lows = mean - BOLLINGER_STD_MULTIPLIER * stddev;
@@ -237,8 +240,12 @@ struct DonchianState {
         double lo = INFINITY;
         for (int i = 0; i < period; ++i) {
             const double sample = buffer[(head + i) % cap];
-            hi = fmax(hi, sample);
-            lo = fmin(lo, sample);
+            if (sample > hi) {
+                hi = sample;
+            }
+            if (sample < lo) {
+                lo = sample;
+            }
         }
         *highs = hi;
         *lows = lo;
@@ -246,6 +253,182 @@ struct DonchianState {
         return true;
     }
 };
+
+__device__ inline void candle_strength_oscillator_row_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int len,
+    int period,
+    int atr_length,
+    int atr_enabled,
+    int mode,
+    double* __restrict__ full_buffer,
+    int full_cap,
+    double* __restrict__ half_buffer,
+    int half_cap,
+    double* __restrict__ sqrt_buffer,
+    int sqrt_cap,
+    double* __restrict__ level_buffer,
+    int level_cap,
+    double* __restrict__ row_strength,
+    double* __restrict__ row_highs,
+    double* __restrict__ row_lows,
+    double* __restrict__ row_mid,
+    double* __restrict__ row_long_signal,
+    double* __restrict__ row_short_signal
+) {
+    const bool emit_levels = row_highs != nullptr && row_lows != nullptr && row_mid != nullptr &&
+        row_long_signal != nullptr && row_short_signal != nullptr;
+    for (int i = 0; i < len; ++i) {
+        row_strength[i] = NAN;
+        if (emit_levels) {
+            row_highs[i] = NAN;
+            row_lows[i] = NAN;
+            row_mid[i] = NAN;
+            row_long_signal[i] = 0.0;
+            row_short_signal[i] = 0.0;
+        }
+    }
+
+    if (period <= 0 || (atr_enabled != 0 && atr_length <= 0)) {
+        return;
+    }
+    if (mode != MODE_BOLLINGER && mode != MODE_DONCHIAN) {
+        return;
+    }
+
+    const int half_period = period / 2 > 0 ? period / 2 : 1;
+    const int sqrt_period_raw = static_cast<int>(floor(sqrt(static_cast<double>(period))));
+    const int sqrt_period = sqrt_period_raw > 0 ? sqrt_period_raw : 1;
+    if (full_buffer == nullptr || half_buffer == nullptr || sqrt_buffer == nullptr ||
+        full_cap < period || half_cap < half_period || sqrt_cap < sqrt_period ||
+        (emit_levels && (level_buffer == nullptr || level_cap < period))) {
+        return;
+    }
+
+    RingWmaState full_state;
+    RingWmaState half_state;
+    RingWmaState sqrt_state;
+    full_state.init(full_buffer, full_cap, period);
+    half_state.init(half_buffer, half_cap, half_period);
+    sqrt_state.init(sqrt_buffer, sqrt_cap, sqrt_period);
+
+    BollingerState bollinger_state;
+    DonchianState donchian_state;
+    if (emit_levels) {
+        if (mode == MODE_BOLLINGER) {
+            bollinger_state.init(level_buffer, level_cap, period);
+        } else {
+            donchian_state.init(level_buffer, level_cap, period);
+        }
+    }
+
+    AtrState atr_state;
+    atr_state.init(atr_length);
+
+    double prev_strength = NAN;
+    double prev_mid = NAN;
+    bool has_prev_levels = false;
+
+    for (int i = 0; i < len; ++i) {
+        const double o = open[i];
+        const double h = high[i];
+        const double l = low[i];
+        const double c = close[i];
+
+        if (!finite_quad(o, h, l, c)) {
+            atr_state.reset();
+            full_state.reset();
+            half_state.reset();
+            sqrt_state.reset();
+            if (emit_levels) {
+                if (mode == MODE_BOLLINGER) {
+                    bollinger_state.reset();
+                } else {
+                    donchian_state.reset();
+                }
+            }
+            prev_strength = NAN;
+            prev_mid = NAN;
+            has_prev_levels = false;
+            continue;
+        }
+
+        double atr_factor = 1.0;
+        if (atr_enabled != 0 && !atr_state.update(h, l, c, &atr_factor)) {
+            continue;
+        }
+
+        const double range = h - l;
+        if (!isfinite(range) || fabs(range) <= DBL_EPSILON) {
+            atr_state.reset();
+            full_state.reset();
+            half_state.reset();
+            sqrt_state.reset();
+            if (emit_levels) {
+                if (mode == MODE_BOLLINGER) {
+                    bollinger_state.reset();
+                } else {
+                    donchian_state.reset();
+                }
+            }
+            prev_strength = NAN;
+            prev_mid = NAN;
+            has_prev_levels = false;
+            continue;
+        }
+
+        const double body = fabs(c - o);
+        const double body_ratio = body / range;
+        const double signed_body_ratio = c > o ? body_ratio : -body_ratio;
+        const double signed_score = signed_body_ratio * atr_factor * 100.0;
+
+        double full_value = NAN;
+        double half_value = NAN;
+        double strength = NAN;
+        const bool full_ready = full_state.update(signed_score, &full_value);
+        const bool half_ready = half_state.update(signed_score, &half_value);
+        if (!(full_ready && half_ready)) {
+            continue;
+        }
+        const double derived = fma(2.0, half_value, -full_value);
+        if (!sqrt_state.update(derived, &strength)) {
+            continue;
+        }
+
+        row_strength[i] = strength;
+        if (!emit_levels) {
+            continue;
+        }
+
+        double highs = NAN;
+        double lows = NAN;
+        double mid = NAN;
+        const bool levels_ready = mode == MODE_BOLLINGER
+            ? bollinger_state.update(strength, &highs, &lows, &mid)
+            : donchian_state.update(strength, &highs, &lows, &mid);
+        if (!levels_ready) {
+            continue;
+        }
+
+        row_highs[i] = highs;
+        row_lows[i] = lows;
+        row_mid[i] = mid;
+        if (has_prev_levels) {
+            if (prev_strength <= prev_mid && strength > mid) {
+                row_long_signal[i] = 1.0;
+            }
+            if (prev_strength >= prev_mid && strength < mid) {
+                row_short_signal[i] = 1.0;
+            }
+        }
+        prev_strength = strength;
+        prev_mid = mid;
+        has_prev_levels = true;
+    }
+}
 
 }
 
@@ -282,179 +465,40 @@ extern "C" __global__ void candle_strength_oscillator_batch_f64(
 
     const int period = periods[row];
     const int atr_length = atr_lengths[row];
-
-    double* row_strength = out_strength + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_highs = out_highs + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_lows = out_lows + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_mid = out_mid + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_long_signal =
-        out_long_signal + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_short_signal =
-        out_short_signal + static_cast<size_t>(row) * static_cast<size_t>(len);
-
-    for (int i = 0; i < len; ++i) {
-        row_strength[i] = NAN;
-        row_highs[i] = NAN;
-        row_lows[i] = NAN;
-        row_mid[i] = NAN;
-        row_long_signal[i] = 0.0;
-        row_short_signal[i] = 0.0;
-    }
-
-    if (period <= 0 || (atr_enabled != 0 && atr_length <= 0)) {
-        return;
-    }
-    if (mode != MODE_BOLLINGER && mode != MODE_DONCHIAN) {
-        return;
-    }
-
-    const int half_period = period / 2 > 0 ? period / 2 : 1;
-    const int sqrt_period = static_cast<int>(floor(sqrt(static_cast<double>(period)))) > 0
-        ? static_cast<int>(floor(sqrt(static_cast<double>(period))))
-        : 1;
-
-    RingWmaState full_state;
-    RingWmaState half_state;
-    RingWmaState sqrt_state;
-    full_state.init(
+    const size_t output_offset = static_cast<size_t>(row) * static_cast<size_t>(len);
+    candle_strength_oscillator_row_f64(
+        open,
+        high,
+        low,
+        close,
+        len,
+        period,
+        atr_length,
+        atr_enabled,
+        mode,
         full_scratch + static_cast<size_t>(row) * static_cast<size_t>(full_cap),
         full_cap,
-        period
-    );
-    half_state.init(
         half_scratch + static_cast<size_t>(row) * static_cast<size_t>(half_cap),
         half_cap,
-        half_period
-    );
-    sqrt_state.init(
         sqrt_scratch + static_cast<size_t>(row) * static_cast<size_t>(sqrt_cap),
         sqrt_cap,
-        sqrt_period
+        level_scratch + static_cast<size_t>(row) * static_cast<size_t>(level_cap),
+        level_cap,
+        out_strength + output_offset,
+        out_highs + output_offset,
+        out_lows + output_offset,
+        out_mid + output_offset,
+        out_long_signal + output_offset,
+        out_short_signal + output_offset
     );
-
-    BollingerState bollinger_state;
-    DonchianState donchian_state;
-    if (mode == MODE_BOLLINGER) {
-        bollinger_state.init(
-            level_scratch + static_cast<size_t>(row) * static_cast<size_t>(level_cap),
-            level_cap,
-            period
-        );
-    } else {
-        donchian_state.init(
-            level_scratch + static_cast<size_t>(row) * static_cast<size_t>(level_cap),
-            level_cap,
-            period
-        );
-    }
-
-    AtrState atr_state;
-    atr_state.init(atr_length);
-
-    double prev_strength = NAN;
-    double prev_mid = NAN;
-    bool has_prev_levels = false;
-
-    for (int i = 0; i < len; ++i) {
-        const double o = open[i];
-        const double h = high[i];
-        const double l = low[i];
-        const double c = close[i];
-
-        if (!finite_quad(o, h, l, c)) {
-            atr_state.reset();
-            full_state.reset();
-            half_state.reset();
-            sqrt_state.reset();
-            if (mode == MODE_BOLLINGER) {
-                bollinger_state.reset();
-            } else {
-                donchian_state.reset();
-            }
-            prev_strength = NAN;
-            prev_mid = NAN;
-            has_prev_levels = false;
-            continue;
-        }
-
-        double atr_factor = 1.0;
-        if (atr_enabled != 0) {
-            if (!atr_state.update(h, l, c, &atr_factor)) {
-                continue;
-            }
-        }
-
-        const double range = h - l;
-        if (!isfinite(range) || fabs(range) <= DBL_EPSILON) {
-            atr_state.reset();
-            full_state.reset();
-            half_state.reset();
-            sqrt_state.reset();
-            if (mode == MODE_BOLLINGER) {
-                bollinger_state.reset();
-            } else {
-                donchian_state.reset();
-            }
-            prev_strength = NAN;
-            prev_mid = NAN;
-            has_prev_levels = false;
-            continue;
-        }
-
-        const double body = fabs(c - o);
-        const double sign = c > o ? 1.0 : -1.0;
-        const double signed_score = sign * body / range * atr_factor * 100.0;
-
-        double full_value = NAN;
-        double half_value = NAN;
-        double strength = NAN;
-        const bool full_ready = full_state.update(signed_score, &full_value);
-        const bool half_ready = half_state.update(signed_score, &half_value);
-        if (!(full_ready && half_ready)) {
-            continue;
-        }
-        if (!sqrt_state.update(2.0 * half_value - full_value, &strength)) {
-            continue;
-        }
-
-        row_strength[i] = strength;
-
-        double highs = NAN;
-        double lows = NAN;
-        double mid = NAN;
-        const bool levels_ready = mode == MODE_BOLLINGER
-            ? bollinger_state.update(strength, &highs, &lows, &mid)
-            : donchian_state.update(strength, &highs, &lows, &mid);
-        if (!levels_ready) {
-            continue;
-        }
-
-        row_highs[i] = highs;
-        row_lows[i] = lows;
-        row_mid[i] = mid;
-
-        if (has_prev_levels) {
-            if (prev_strength <= prev_mid && strength > mid) {
-                row_long_signal[i] = 1.0;
-            }
-            if (prev_strength >= prev_mid && strength < mid) {
-                row_short_signal[i] = 1.0;
-            }
-        }
-
-        prev_strength = strength;
-        prev_mid = mid;
-        has_prev_levels = true;
-    }
 }
 
 // ---------------------------------------------------------------------------
 // NEOETHOS f64 LANE  --  closer 3
 //
 // CPU reference: src/indicators/candle_strength_oscillator.rs:951
-// (candle_strength_oscillator_with_kernel). The column this emits is strength,
-// which is what output_id == "value" resolves to
-// (dispatch/cpu_batch.rs:7490-7491).
+// (candle_strength_oscillator_with_kernel). The canonical primary column this
+// emits is `strength`.
 //
 // SHAPE: one thread per combo, bars ascending. FORCED sequential -- three
 // nested Hull-style weighted moving averages, each maintained INCREMENTALLY
@@ -467,11 +511,10 @@ extern "C" __global__ void candle_strength_oscillator_batch_f64(
 // binds to it. atr_enabled false, atr_length 50 and mode "bollinger"
 // (:7516-7519) are not swept and are pinned at their CPU defaults.
 //
-// WHAT IS DELIBERATELY ABSENT: the Bollinger / Donchian level state and the
-// crossover signals. They consume strength, they do not produce it, so a
-// kernel emitting strength does not carry them. The ATR state IS kept, because
-// atr_enabled is a parameter and the reset it performs is part of the state
-// machine even when the factor is 1.0.
+// The primary ABI materializes only strength, while the shared row authority
+// also serves the canonical six-output production entry above. The ATR state
+// is kept because its reset is part of the exact state machine even when the
+// canonical default disables its multiplier.
 //
 // THE THREE RING BUFFERS ARE PER-THREAD, so their depth is a property of THIS
 // COMPILED KERNEL and an oversized period is refused BY NAME by the host
@@ -484,10 +527,11 @@ extern "C" __global__ void candle_strength_oscillator_batch_f64(
 // a non-finite or zero-range bar, so there is no warmup index. The lane row
 // declares F64FirstValidRule::Ignored.
 //
-// f64 END TO END: double literals, double fmax/fmin/fabs/sqrt/floor, no
-// f32-suffixed math function, no fast-math intrinsic. The degenerate-range
-// test uses DBL_EPSILON -- the DOUBLE machine epsilon, which is the CPU's own
-// f64::EPSILON and NOT an f32 epsilon carried across (rule 2).
+// f64 END TO END: double literals, explicit fma where the CPU uses mul_add,
+// double fabs/sqrt/floor, no f32-suffixed math function, no fast-math
+// intrinsic. The degenerate-range test uses DBL_EPSILON -- the DOUBLE machine
+// epsilon, which is the CPU's own f64::EPSILON and NOT an f32 epsilon carried
+// across (rule 2).
 // ---------------------------------------------------------------------------
 
 #define NEO_CSO_ATR_ENABLED 0
@@ -513,86 +557,36 @@ extern "C" __global__ void candle_strength_oscillator_neo_batch_f64(
     }
     (void)first_valid;
 
-    double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
-    for (int i = 0; i < n; ++i) {
-        row[i] = NAN;
-    }
-
     const int period = periods[row_idx];
     const int atr_enabled = NEO_CSO_ATR_ENABLED;
     const int atr_length = NEO_CSO_ATR_LENGTH;
 
-    if (period <= 0 || period > NEO_CSO_MAX_PERIOD || (atr_enabled != 0 && atr_length <= 0)) {
-        return;
-    }
-
-    const int half_period = period / 2 > 0 ? period / 2 : 1;
-    const int sqrt_period_raw = static_cast<int>(floor(sqrt(static_cast<double>(period))));
-    const int sqrt_period = sqrt_period_raw > 0 ? sqrt_period_raw : 1;
-    if (half_period > NEO_CSO_MAX_HALF_PERIOD || sqrt_period > NEO_CSO_MAX_SQRT_PERIOD) {
-        return;
-    }
-
     double full_buf[NEO_CSO_MAX_PERIOD];
     double half_buf[NEO_CSO_MAX_HALF_PERIOD];
     double sqrt_buf[NEO_CSO_MAX_SQRT_PERIOD];
-
-    RingWmaState full_state;
-    RingWmaState half_state;
-    RingWmaState sqrt_state;
-    full_state.init(full_buf, NEO_CSO_MAX_PERIOD, period);
-    half_state.init(half_buf, NEO_CSO_MAX_HALF_PERIOD, half_period);
-    sqrt_state.init(sqrt_buf, NEO_CSO_MAX_SQRT_PERIOD, sqrt_period);
-
-    AtrState atr_state;
-    atr_state.init(atr_length);
-
-    for (int i = 0; i < n; ++i) {
-        const double o = open[i];
-        const double h = high[i];
-        const double l = low[i];
-        const double c = close[i];
-
-        if (!finite_quad(o, h, l, c)) {
-            atr_state.reset();
-            full_state.reset();
-            half_state.reset();
-            sqrt_state.reset();
-            continue;
-        }
-
-        double atr_factor = 1.0;
-        if (atr_enabled != 0) {
-            if (!atr_state.update(h, l, c, &atr_factor)) {
-                continue;
-            }
-        }
-
-        const double range = h - l;
-        if (!isfinite(range) || fabs(range) <= DBL_EPSILON) {
-            atr_state.reset();
-            full_state.reset();
-            half_state.reset();
-            sqrt_state.reset();
-            continue;
-        }
-
-        const double body = fabs(c - o);
-        const double sign = c > o ? 1.0 : -1.0;
-        const double signed_score = sign * body / range * atr_factor * 100.0;
-
-        double full_value = NAN;
-        double half_value = NAN;
-        double strength = NAN;
-        const bool full_ready = full_state.update(signed_score, &full_value);
-        const bool half_ready = half_state.update(signed_score, &half_value);
-        if (!(full_ready && half_ready)) {
-            continue;
-        }
-        if (!sqrt_state.update(2.0 * half_value - full_value, &strength)) {
-            continue;
-        }
-
-        row[i] = strength;
-    }
+    candle_strength_oscillator_row_f64(
+        open,
+        high,
+        low,
+        close,
+        n,
+        period,
+        atr_length,
+        atr_enabled,
+        MODE_BOLLINGER,
+        full_buf,
+        NEO_CSO_MAX_PERIOD,
+        half_buf,
+        NEO_CSO_MAX_HALF_PERIOD,
+        sqrt_buf,
+        NEO_CSO_MAX_SQRT_PERIOD,
+        nullptr,
+        0,
+        out + static_cast<size_t>(row_idx) * static_cast<size_t>(n),
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr
+    );
 }

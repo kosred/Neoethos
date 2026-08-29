@@ -1,24 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -72,10 +57,6 @@ pub struct LinearRegSlopeOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct LinearRegSlopeParams {
     pub period: Option<usize>,
 }
@@ -1097,224 +1078,6 @@ fn expand_grid_stream(_r: &LinearRegSlopeBatchRange) -> Vec<LinearRegSlopeParams
     vec![LinearRegSlopeParams::default()]
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "linearreg_slope")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn linearreg_slope_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = LinearRegSlopeParams {
-        period: Some(period),
-    };
-    let linearreg_slope_in = LinearRegSlopeInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| linearreg_slope_with_kernel(&linearreg_slope_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "linearreg_slope_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn linearreg_slope_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-    use std::mem::MaybeUninit;
-
-    let slice_in = data.as_slice()?;
-    let sweep = LinearRegSlopeBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    if rows == 0 {
-        return Err(PyValueError::new_err(
-            "linearreg_slope: invalid period range (empty expansion)",
-        ));
-    }
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("linearreg_slope: rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let first = slice_in
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| PyValueError::new_err("All values are NaN"))?;
-    let warm: Vec<usize> = combos
-        .iter()
-        .map(|c| first + c.period.unwrap() - 1)
-        .collect();
-    unsafe {
-        let out_mu: &mut [MaybeUninit<f64>] = core::slice::from_raw_parts_mut(
-            slice_out.as_mut_ptr() as *mut MaybeUninit<f64>,
-            slice_out.len(),
-        );
-        init_matrix_prefixes(out_mu, cols, &warm);
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let k = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        let simd = match k {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => unreachable!(),
-        };
-        linearreg_slope_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaLinearregSlope;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "linearreg_slope_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn linearreg_slope_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    use numpy::IntoPyArray;
-    use pyo3::types::PyDict;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = LinearRegSlopeBatchRange {
-        period: period_range,
-    };
-
-    let (inner, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaLinearregSlope::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        cuda.linearreg_slope_batch_dev(slice_in, &sweep)
-            .map(|(inner, combos)| (inner, combos, ctx, dev))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = PyDict::new(py);
-    let periods: Vec<u64> = combos.iter().map(|c| c.period.unwrap() as u64).collect();
-    dict.set_item("periods", periods.into_pyarray(py))?;
-
-    Ok((
-        DeviceArrayF32Py {
-            inner,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-        dict,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "linearreg_slope_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn linearreg_slope_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = LinearRegSlopeParams {
-        period: Some(period),
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaLinearregSlope::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        cuda.linearreg_slope_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map(|inner| (inner, ctx, dev))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "LinearRegSlopeStream")]
-pub struct LinearRegSlopeStreamPy {
-    stream: LinearRegSlopeStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl LinearRegSlopeStreamPy {
-    #[new]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let params = LinearRegSlopeParams {
-            period: Some(period),
-        };
-        let stream = LinearRegSlopeStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
 pub fn linearreg_slope_into_slice(
     dst: &mut [f64],
     input: &LinearRegSlopeInput,
@@ -1377,22 +1140,6 @@ pub fn linearreg_slope_into_slice(
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_slope_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = LinearRegSlopeParams {
-        period: Some(period),
-    };
-    let input = LinearRegSlopeInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    linearreg_slope_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn linearreg_slope_into(
     input: &LinearRegSlopeInput,
@@ -1401,190 +1148,19 @@ pub fn linearreg_slope_into(
     linearreg_slope_into_slice(out, input, Kernel::Auto)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_slope_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = LinearRegSlopeParams {
-            period: Some(period),
-        };
-        let input = LinearRegSlopeInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            linearreg_slope_into_slice(&mut temp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            linearreg_slope_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_slope_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_slope_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LinearRegSlopeBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LinearRegSlopeBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<LinearRegSlopeParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = linearreg_slope_batch)]
-pub fn linearreg_slope_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: LinearRegSlopeBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = LinearRegSlopeBatchRange {
-        period: config.period_range,
-    };
-
-    let output = linearreg_slope_batch_inner(data, &sweep, Kernel::Scalar, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = LinearRegSlopeBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_slope_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to linearreg_slope_batch_into",
-        ));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(in_ptr, len);
-        let sweep = LinearRegSlopeBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        if rows == 0 {
-            return Err(JsValue::from_str(
-                "linearreg_slope: invalid period range (empty expansion)",
-            ));
-        }
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("linearreg_slope: rows*cols overflow"))?;
-
-        let out = core::slice::from_raw_parts_mut(out_ptr, total);
-
-        let first = data
-            .iter()
-            .position(|x| !x.is_nan())
-            .ok_or_else(|| JsValue::from_str("All values are NaN"))?;
-        let warm: Vec<usize> = combos
-            .iter()
-            .map(|c| first + c.period.unwrap() - 1)
-            .collect();
-        let out_mu =
-            core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut MaybeUninit<f64>, out.len());
-        init_matrix_prefixes(out_mu, cols, &warm);
-
-        linearreg_slope_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_slope_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = linearreg_slope_js(data, period)?;
-    crate::write_wasm_f64_output("linearreg_slope_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linearreg_slope_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = linearreg_slope_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "linearreg_slope_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_linearreg_slope_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = LinearRegSlopeParams { period: None };
         let input = LinearRegSlopeInput::from_candles(&candles, "close", default_params);
@@ -1712,8 +1288,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = LinearRegSlopeInput::from_candles(
             &candles,
             "close",
@@ -1741,8 +1317,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             LinearRegSlopeParams::default(),
@@ -1858,7 +1434,6 @@ mod tests {
         check_linearreg_slope_no_poison
     );
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_linearreg_slope_into_matches_api() -> Result<(), Box<dyn Error>> {
         let n = 512usize;
@@ -1896,8 +1471,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = LinearRegSlopeBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1911,8 +1486,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),

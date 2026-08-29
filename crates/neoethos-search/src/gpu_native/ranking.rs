@@ -92,7 +92,7 @@ pub fn canonical_gene_bytes(gene: &Gene) -> Result<Vec<u8>, RankKeyError> {
         .copied()
         .zip(gene.weights.iter().copied())
     {
-        terms.push((index as u64, canonical_f32("weight", weight)?));
+        terms.push((index as u64, canonical_f64("weight", weight)?));
     }
     terms.sort_unstable_by_key(|(index, weight_bits)| (*index, *weight_bits));
 
@@ -100,16 +100,16 @@ pub fn canonical_gene_bytes(gene: &Gene) -> Result<Vec<u8>, RankKeyError> {
     push_u32(&mut out, terms.len() as u32);
     for (index, weight_bits) in terms {
         push_u64(&mut out, index);
-        push_u32(&mut out, weight_bits);
+        push_u64(&mut out, weight_bits);
     }
 
-    push_u32(
+    push_u64(
         &mut out,
-        canonical_f32("long_threshold", gene.long_threshold)?,
+        canonical_f64("long_threshold", gene.long_threshold)?,
     );
-    push_u32(
+    push_u64(
         &mut out,
-        canonical_f32("short_threshold", gene.short_threshold)?,
+        canonical_f64("short_threshold", gene.short_threshold)?,
     );
 
     let flags = [
@@ -145,13 +145,6 @@ fn quantize_f64(field: &'static str, value: f64, scale: i64) -> Result<i64, Rank
         return Err(RankKeyError::OutOfRange { field });
     }
     Ok(scaled.round() as i64)
-}
-
-fn canonical_f32(field: &'static str, value: f32) -> Result<u32, RankKeyError> {
-    if !value.is_finite() {
-        return Err(RankKeyError::NonFinite { field });
-    }
-    Ok(if value == 0.0 { 0.0_f32 } else { value }.to_bits())
 }
 
 fn canonical_f64(field: &'static str, value: f64) -> Result<u64, RankKeyError> {
@@ -233,7 +226,7 @@ mod tests {
     #[test]
     fn non_finite_semantic_values_are_rejected() {
         let mut candidate = gene();
-        candidate.long_threshold = f32::NAN;
+        candidate.long_threshold = f64::NAN;
         assert!(matches!(
             canonical_gene_bytes(&candidate),
             Err(RankKeyError::NonFinite {

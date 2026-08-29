@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::natr::{NatrBatchRange, NatrParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -109,11 +109,6 @@ impl CudaNatr {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/natr_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("natr_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -228,17 +223,20 @@ impl CudaNatr {
         let first = Self::first_valid_hlc(high, low, close)
             .ok_or_else(|| CudaNatrError::InvalidInput("all values are NaN".into()))?;
         let mut tr = vec![0f32; len];
-        if first < len {
-            tr[first] = high[first] - low[first];
-            for i in (first + 1)..len {
-                let h = high[i];
-                let l = low[i];
-                let pc = close[i - 1];
-                let hl = h - l;
-                let hc = (h - pc).abs();
-                let lc = (l - pc).abs();
-                tr[i] = hl.max(hc.max(lc));
+        for i in (first + 1)..len {
+            let h = f64::from(high[i]);
+            let l = f64::from(low[i]);
+            let pc = f64::from(close[i - 1]);
+            let mut greatest = h - l;
+            let high_distance = (pc - h).abs();
+            if high_distance > greatest {
+                greatest = high_distance;
             }
+            let low_distance = (pc - l).abs();
+            if low_distance > greatest {
+                greatest = low_distance;
+            }
+            tr[i] = greatest as f32;
         }
         Ok((tr, first))
     }
@@ -270,7 +268,7 @@ impl CudaNatr {
                     None => {
                         return Err(CudaNatrError::InvalidInput(
                             "index overflow in first_valids_time_major".into(),
-                        ))
+                        ));
                     }
                 };
                 if high_tm[idx].is_finite() && low_tm[idx].is_finite() && close_tm[idx].is_finite()
@@ -499,10 +497,10 @@ impl CudaNatr {
         let (tr, first_valid) = Self::build_tr_one_series(high, low, close)?;
 
         let max_p = *periods_v.iter().max().unwrap();
-        if len - first_valid < max_p {
+        if len - first_valid <= max_p {
             return Err(CudaNatrError::InvalidInput(format!(
                 "not enough valid data (needed >= {}, valid = {})",
-                max_p,
+                max_p + 1,
                 len - first_valid
             )));
         }
@@ -510,7 +508,7 @@ impl CudaNatr {
         let rows = periods_v.len();
 
         let min_period = *periods_v.iter().min().unwrap();
-        let warm_needed = first_valid + min_period - 1;
+        let warm_needed = first_valid + min_period;
         let active_len = if len > warm_needed {
             len - warm_needed
         } else {
@@ -641,10 +639,10 @@ impl CudaNatr {
 
         let periods_v = Self::axis_usize(sweep.period)?;
         let max_p = *periods_v.iter().max().unwrap();
-        if len - first_valid < max_p {
+        if len - first_valid <= max_p {
             return Err(CudaNatrError::InvalidInput(format!(
                 "not enough valid data (needed >= {}, valid = {})",
-                max_p,
+                max_p + 1,
                 len - first_valid
             )));
         }
@@ -652,7 +650,7 @@ impl CudaNatr {
         let rows = periods_v.len();
 
         let min_period = *periods_v.iter().min().unwrap();
-        let warm_needed = first_valid + min_period - 1;
+        let warm_needed = first_valid + min_period;
         let active_len = if len > warm_needed {
             len - warm_needed
         } else {
@@ -977,14 +975,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "natr",
-            "one_series_many_params",
-            "natr_cuda_batch",
-            "1m",
-            prep_one_series,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series(20))]
+        vec![
+            CudaBenchScenario::new(
+                "natr",
+                "one_series_many_params",
+                "natr_cuda_batch",
+                "1m",
+                prep_one_series,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series(20)),
+        ]
     }
 }

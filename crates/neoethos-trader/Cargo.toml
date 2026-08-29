@@ -22,6 +22,7 @@ license.workspace = true
 # the offline dry-run that backs the CLI `trader-replay` command and the app
 # `/autonomous/replay` endpoint (same helper → identical EngineStats = parity).
 neoethos-data = { path = "../neoethos-data" }
+neoethos-broker-truth = { workspace = true }
 # Phase 4: the discovered `Gene` + the EXACT signal/feature-projection code the GA
 # uses (`signals_for_gene_full`, `project_features_to_effective`) + the
 # `LivePortfolioArtifact` loader — reused, never re-implemented, so live signals

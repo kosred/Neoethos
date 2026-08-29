@@ -1,24 +1,24 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32 as SharedDeviceArrayF32;
 use crate::indicators::moving_averages::vwap::{
-    expand_grid_vwap, first_valid_vwap_index, parse_anchor, VwapBatchRange, VwapParams,
+    VwapBatchRange, VwapParams, expand_grid_vwap, first_valid_vwap_index, parse_anchor,
 };
 use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::convert::TryFrom;
 use std::env;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -139,12 +139,6 @@ impl CudaVwap {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/vwap_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("vwap_kernel")?;
 
         if let Ok(mut f) = module.get_function("vwap_batch_f32") {
@@ -311,7 +305,7 @@ impl CudaVwap {
                     return Err(CudaVwapError::InvalidInput(format!(
                         "unsupported anchor unit '{}'",
                         other
-                    )))
+                    )));
                 }
             };
 
@@ -1796,15 +1790,17 @@ pub mod benches {
             }
         }
 
-        let mut out = vec![CudaBenchScenario::new(
-            "vwap",
-            "one_series_many_params",
-            "vwap_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())];
+        let mut out = vec![
+            CudaBenchScenario::new(
+                "vwap",
+                "one_series_many_params",
+                "vwap_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ];
 
         fn synth_many_series(rows: usize, cols: usize) -> (Vec<i64>, Vec<f32>, Vec<f32>) {
             let mut ts = vec![0i64; rows];

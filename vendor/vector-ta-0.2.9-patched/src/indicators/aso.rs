@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -60,10 +44,6 @@ pub enum AsoOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AsoParams {
     pub period: Option<usize>,
     pub mode: Option<usize>,
@@ -276,7 +256,6 @@ pub fn aso_with_kernel(input: &AsoInput, kernel: Kernel) -> Result<AsoOutput, As
     Ok(AsoOutput { bulls, bears })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn aso_into(
     input: &AsoInput,
@@ -1652,11 +1631,7 @@ impl AsoStream {
 
     #[inline(always)]
     fn inv_or_one(x: f64) -> f64 {
-        if x != 0.0 {
-            x.recip()
-        } else {
-            1.0
-        }
+        if x != 0.0 { x.recip() } else { 1.0 }
     }
 
     #[inline]
@@ -1809,647 +1784,11 @@ impl AsoStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "aso")]
-#[pyo3(signature = (open, high, low, close, period=None, mode=None, kernel=None))]
-pub fn aso_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: Option<usize>,
-    mode: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let o = open.as_slice()?;
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    if h.len() != o.len() || l.len() != o.len() || c.len() != o.len() {
-        return Err(PyValueError::new_err(
-            "All OHLC arrays must have the same length",
-        ));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = AsoParams { period, mode };
-    let input = AsoInput::from_slices(o, h, l, c, params);
-
-    let (bulls, bears) = py
-        .allow_threads(|| aso_with_kernel(&input, kern).map(|o| (o.bulls, o.bears)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((bulls.into_pyarray(py), bears.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "aso_batch")]
-#[pyo3(signature = (open, high, low, close, period_range, mode_range, kernel=None))]
-pub fn aso_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    mode_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArray1;
-    let (o, h, l, c) = (
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-    );
-    let sweep = AsoBatchRange {
-        period: period_range,
-        mode: mode_range,
-    };
-    let combos = expand_grid_aso(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = c.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("size overflow"))?;
-
-    let bulls_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bears_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let b = unsafe { bulls_arr.as_slice_mut()? };
-    let e = unsafe { bears_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let simd = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        aso_batch_inner_into(o, h, l, c, &sweep, simd, true, b, e)
-    })
-    .map_err(|er| PyValueError::new_err(er.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("bulls", bulls_arr.reshape((rows, cols))?)?;
-    d.set_item("bears", bears_arr.reshape((rows, cols))?)?;
-    d.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "modes",
-        combos
-            .iter()
-            .map(|p| p.mode.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaAso;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context as CudaContext;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct AsoDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<CudaContext>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl AsoDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = if self.rows == 0 || self.cols == 0 {
-            0usize
-        } else {
-            self.buf
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-                .as_device_ptr()
-                .as_raw() as usize
-        };
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "__dlpack__(copy=True) not implemented for ASO device handle",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for ASO tensor"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "aso_cuda_batch_dev")]
-#[pyo3(signature = (open, high, low, close, period_range, mode_range, device_id=0))]
-pub fn aso_cuda_batch_dev_py(
-    py: Python<'_>,
-    open: PyReadonlyArray1<'_, f32>,
-    high: PyReadonlyArray1<'_, f32>,
-    low: PyReadonlyArray1<'_, f32>,
-    close: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    mode_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(AsoDeviceArrayF32Py, AsoDeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let o = open.as_slice()?;
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    if o.len() == 0 || h.len() != o.len() || l.len() != o.len() || c.len() != o.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-    let sweep = AsoBatchRange {
-        period: period_range,
-        mode: mode_range,
-    };
-    let (bulls, bears, ctx_guard, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAso::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .aso_batch_dev(o, h, l, c, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out.0, out.1, cuda.context_arc(), cuda.device_id()))
-    })?;
-    Ok((
-        AsoDeviceArrayF32Py {
-            buf: Some(bulls.buf),
-            rows: bulls.rows,
-            cols: bulls.cols,
-            _ctx: ctx_guard.clone(),
-            device_id: dev_id,
-        },
-        AsoDeviceArrayF32Py {
-            buf: Some(bears.buf),
-            rows: bears.rows,
-            cols: bears.cols,
-            _ctx: ctx_guard,
-            device_id: dev_id,
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "aso_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (open_tm, high_tm, low_tm, close_tm, cols, rows, period, mode, device_id=0))]
-pub fn aso_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    open_tm: PyReadonlyArray1<'_, f32>,
-    high_tm: PyReadonlyArray1<'_, f32>,
-    low_tm: PyReadonlyArray1<'_, f32>,
-    close_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    mode: usize,
-    device_id: usize,
-) -> PyResult<(AsoDeviceArrayF32Py, AsoDeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let o = open_tm.as_slice()?;
-    let h = high_tm.as_slice()?;
-    let l = low_tm.as_slice()?;
-    let c = close_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("size overflow"))?;
-    if expected != o.len() || h.len() != o.len() || l.len() != o.len() || c.len() != o.len() {
-        return Err(PyValueError::new_err("mismatched input sizes"));
-    }
-    if mode > 2 {
-        return Err(PyValueError::new_err("invalid mode"));
-    }
-    let (bulls, bears, ctx_guard, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAso::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .aso_many_series_one_param_time_major_dev(o, h, l, c, cols, rows, period, mode)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out.0, out.1, cuda.context_arc(), cuda.device_id()))
-    })?;
-    Ok((
-        AsoDeviceArrayF32Py {
-            buf: Some(bulls.buf),
-            rows: bulls.rows,
-            cols: bulls.cols,
-            _ctx: ctx_guard.clone(),
-            device_id: dev_id,
-        },
-        AsoDeviceArrayF32Py {
-            buf: Some(bears.buf),
-            rows: bears.rows,
-            cols: bears.cols,
-            _ctx: ctx_guard,
-            device_id: dev_id,
-        },
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AsoStream")]
-pub struct AsoStreamPy {
-    stream: AsoStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AsoStreamPy {
-    #[new]
-    fn new(period: Option<usize>, mode: Option<usize>) -> PyResult<Self> {
-        let params = AsoParams { period, mode };
-        let stream =
-            AsoStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AsoStreamPy { stream })
-    }
-
-    fn update(&mut self, open: f64, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.stream.update(open, high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AsoResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "aso")]
-pub fn aso_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: Option<usize>,
-    mode: Option<usize>,
-) -> Result<JsValue, JsValue> {
-    let len = close.len();
-    if open.len() != len || high.len() != len || low.len() != len {
-        return Err(JsValue::from_str(
-            "All OHLC arrays must have the same length",
-        ));
-    }
-    let p = period.unwrap_or(10);
-    let m = mode.unwrap_or(0);
-    if m > 2 {
-        return Err(JsValue::from_str("Invalid mode"));
-    }
-
-    let first = close
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| JsValue::from_str("All values NaN"))?;
-    if p == 0 || p > len {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-    if len - first < p {
-        return Err(JsValue::from_str("Not enough valid data"));
-    }
-
-    let mut mu = make_uninit_matrix(2, len);
-    let warm = first + p - 1;
-    init_matrix_prefixes(&mut mu, len, &[warm, warm]);
-
-    let mut guard = core::mem::ManuallyDrop::new(mu);
-    let dst: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
-    let (bulls_dst, bears_dst) = dst.split_at_mut(len);
-
-    let chosen = detect_best_kernel();
-    unsafe {
-        aso_compute_into(
-            open, high, low, close, p, m, first, chosen, bulls_dst, bears_dst,
-        );
-    }
-
-    let values = unsafe {
-        Vec::from_raw_parts(
-            guard.as_mut_ptr() as *mut f64,
-            guard.len(),
-            guard.capacity(),
-        )
-    };
-    let out = AsoResult {
-        values,
-        rows: 2,
-        cols: len,
-    };
-    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aso_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    bulls_ptr: *mut f64,
-    bears_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    mode: usize,
-) -> Result<(), JsValue> {
-    if [open_ptr, high_ptr, low_ptr, close_ptr]
-        .iter()
-        .any(|p| p.is_null())
-        || [bulls_ptr, bears_ptr].iter().any(|p| p.is_null())
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    unsafe {
-        let o = std::slice::from_raw_parts(open_ptr, len);
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let bulls = std::slice::from_raw_parts_mut(bulls_ptr, len);
-        let bears = std::slice::from_raw_parts_mut(bears_ptr, len);
-
-        let input = AsoInput::from_slices(
-            o,
-            h,
-            l,
-            c,
-            AsoParams {
-                period: Some(period),
-                mode: Some(mode),
-            },
-        );
-
-        aso_into_slices(bulls, bears, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aso_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    mode_start: usize,
-    mode_end: usize,
-    mode_step: usize,
-    bulls_out: *mut f64,
-    bears_out: *mut f64,
-) -> Result<usize, JsValue> {
-    if [open_ptr, high_ptr, low_ptr, close_ptr, bulls_out, bears_out]
-        .iter()
-        .any(|p| p.is_null())
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let o = std::slice::from_raw_parts(open_ptr, len);
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = AsoBatchRange {
-            period: (period_start, period_end, period_step),
-            mode: (mode_start, mode_end, mode_step),
-        };
-
-        let combos = expand_grid_aso(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("size overflow"))?;
-
-        let b = std::slice::from_raw_parts_mut(bulls_out, total);
-        let e = std::slice::from_raw_parts_mut(bears_out, total);
-
-        aso_batch_inner_into(o, h, l, c, &sweep, detect_best_batch_kernel(), false, b, e)
-            .map_err(|er| JsValue::from_str(&er.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AsoBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub mode_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AsoBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AsoParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "aso_batch")]
-pub fn aso_batch_unified_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: AsoBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AsoBatchRange {
-        period: cfg.period_range,
-        mode: cfg.mode_range,
-    };
-    let combos = expand_grid_aso(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    if cols == 0 {
-        return Err(JsValue::from_str("Empty input"));
-    }
-    if open.len() != cols || high.len() != cols || low.len() != cols {
-        return Err(JsValue::from_str("OHLC length mismatch"));
-    }
-
-    let mut mu = make_uninit_matrix(rows * 2, cols);
-    let first = close
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| JsValue::from_str("All values NaN"))?;
-    let warms: Vec<usize> = combos
-        .iter()
-        .flat_map(|c| {
-            let w = first + c.period.unwrap() - 1;
-            [w, w]
-        })
-        .collect();
-    init_matrix_prefixes(&mut mu, cols, &warms);
-
-    let mut guard = core::mem::ManuallyDrop::new(mu);
-    let dst: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("size overflow"))?;
-    let (bulls_dst, bears_dst) = dst.split_at_mut(total);
-
-    let kern = detect_best_batch_kernel();
-    aso_batch_inner_into(
-        open, high, low, close, &sweep, kern, false, bulls_dst, bears_dst,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let values = unsafe {
-        Vec::from_raw_parts(
-            guard.as_mut_ptr() as *mut f64,
-            guard.len(),
-            guard.capacity(),
-        )
-    };
-
-    let out = AsoBatchJsOutput {
-        values,
-        combos: combos.clone(),
-        rows: rows * 2,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aso_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aso_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aso_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: Option<usize>,
-    mode: Option<usize>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = aso_js(open, high, low, close, period, mode)?;
-    crate::write_wasm_object_f64_outputs("aso_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aso_batch_unified_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = aso_batch_unified_js(open, high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("aso_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
@@ -2457,8 +1796,8 @@ mod tests {
     fn check_aso_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AsoInput::from_candles(&candles, "close", AsoParams::default());
         let result = aso_with_kernel(&input, kernel)?;
@@ -2514,8 +1853,8 @@ mod tests {
     fn check_aso_slice_input(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AsoInput::from_slices(
             &candles.open,
@@ -2535,8 +1874,8 @@ mod tests {
     fn check_aso_into_slices(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let mut bulls = vec![0.0; candles.close.len()];
         let mut bears = vec![0.0; candles.close.len()];
@@ -2582,8 +1921,8 @@ mod tests {
     fn check_aso_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = AsoParams {
             period: None,
@@ -2600,8 +1939,8 @@ mod tests {
     fn check_aso_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AsoInput::with_default_candles(&candles);
         let output = aso_with_kernel(&input, kernel)?;
@@ -2661,8 +2000,8 @@ mod tests {
     fn check_aso_invalid_mode(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = AsoParams {
             period: Some(10),
@@ -2733,8 +2072,8 @@ mod tests {
 
     fn check_aso_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = AsoParams {
             period: Some(10),
@@ -2769,8 +2108,8 @@ mod tests {
 
     fn check_aso_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AsoInput::from_candles(
             &candles,
@@ -2810,8 +2149,8 @@ mod tests {
     fn check_aso_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 10;
         let mode = 0;
@@ -2911,8 +2250,8 @@ mod tests {
     fn check_aso_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             AsoParams::default(),
@@ -3178,8 +2517,8 @@ mod tests {
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = AsoBatchBuilder::new()
             .kernel(kernel)
@@ -3242,8 +2581,8 @@ mod tests {
     fn check_batch_sweep(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = AsoBatchBuilder::new()
             .kernel(kernel)
@@ -3282,8 +2621,8 @@ mod tests {
     fn check_batch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_configs = vec![
             (2, 10, 2, 0, 2, 1),
@@ -3326,8 +2665,15 @@ mod tests {
                             panic!(
                                 "[{}] Config {}: Found alloc_with_nan_prefix poison {} (0x{:016X}) in {} \
                                 at row {} col {} (period={}, mode={})",
-                                test_name, cfg_idx, val, bits, name, row_idx, col_idx,
-                                combo.period.unwrap_or(10), combo.mode.unwrap_or(0)
+                                test_name,
+                                cfg_idx,
+                                val,
+                                bits,
+                                name,
+                                row_idx,
+                                col_idx,
+                                combo.period.unwrap_or(10),
+                                combo.mode.unwrap_or(0)
                             );
                         }
 
@@ -3335,8 +2681,15 @@ mod tests {
                             panic!(
                                 "[{}] Config {}: Found init_matrix_prefixes poison {} (0x{:016X}) in {} \
                                 at row {} col {} (period={}, mode={})",
-                                test_name, cfg_idx, val, bits, name, row_idx, col_idx,
-                                combo.period.unwrap_or(10), combo.mode.unwrap_or(0)
+                                test_name,
+                                cfg_idx,
+                                val,
+                                bits,
+                                name,
+                                row_idx,
+                                col_idx,
+                                combo.period.unwrap_or(10),
+                                combo.mode.unwrap_or(0)
                             );
                         }
 
@@ -3344,8 +2697,15 @@ mod tests {
                             panic!(
                                 "[{}] Config {}: Found make_uninit_matrix poison {} (0x{:016X}) in {} \
                                 at row {} col {} (period={}, mode={})",
-                                test_name, cfg_idx, val, bits, name, row_idx, col_idx,
-                                combo.period.unwrap_or(10), combo.mode.unwrap_or(0)
+                                test_name,
+                                cfg_idx,
+                                val,
+                                bits,
+                                name,
+                                row_idx,
+                                col_idx,
+                                combo.period.unwrap_or(10),
+                                combo.mode.unwrap_or(0)
                             );
                         }
                     }
@@ -3439,11 +2799,10 @@ mod tests {
     gen_batch_tests!(check_batch_sweep);
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_aso_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AsoInput::from_candles(&candles, "close", AsoParams::default());
 
@@ -3482,8 +2841,8 @@ mod tests {
 
     #[test]
     fn test_new_api_features() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AsoInput::from_candles(&candles, "close", AsoParams::default());
         let _data_ref: &[f64] = input.as_ref();

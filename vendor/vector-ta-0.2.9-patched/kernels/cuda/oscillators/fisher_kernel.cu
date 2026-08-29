@@ -219,102 +219,445 @@ extern "C" __global__ void fisher_many_series_one_param_f32(
 }
 
 // =============================================================================
-// NeoEthos f64 lane — added in place, f64 end to end.
+// NeoEthos f64 lane
+// Fisher v2: deterministic, bounded-faithful CPU/CUDA authority.
 //
-// CPU reference: src/indicators/fisher.rs
-//   * fisher_with_kernel (:237) — first_valid is the first index at which HIGH
-//     and LOW are both non-NaN (close is never scanned), warmup prefix is
-//     first + period - 1 (:258).
-//   * fisher_scalar_into (:300) — the general path reproduced below.
-//   * fisher_scalar_period9_into (:352) — the period == 9 path is the SAME
-//     expression fully unrolled in the same order, so one implementation is
-//     bit-identical to both and the branch is not reproduced.
+// The creator coefficient/order semantics and VectorTA's established 0.001
+// range floor are preserved. Sun fdlibm/OpenLibm e_log is mirrored below with
+// explicit RN arithmetic; no platform-native transcendental participates.
+// Immutable authority receipt:
+// commit=82e90aef0657289192efe77be89791c07dea0775
+// source=https://raw.githubusercontent.com/JuliaMath/openlibm/82e90aef0657289192efe77be89791c07dea0775/src/e_log.c
+// license=https://raw.githubusercontent.com/JuliaMath/openlibm/82e90aef0657289192efe77be89791c07dea0775/LICENSE.md
+// sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD
+// Every finite H/L/midpoint segment is a fresh recurrence. A non-finite bar or
+// arithmetic-domain failure emits canonical qNaN, clears extrema/state, and
+// requires `period` consecutive finite bars before the next output. The first
+// signal in every segment is exact +0.
 //
-// DEFAULT OUTPUT is the FISHER line: cpu_batch.rs:14777 maps output_id "value"
-// to out.fisher. neoethos_fisher_signal_f64 ships beside it for the signal
-// line, which is simply the PREVIOUS bar's fisher value.
+// Bounded-faithful audit receipts, not a universal RN or ULP guarantee:
+// FISHER_F64_V2_FIXTURE_MAX_ULP=2
+// FISHER_F64_V2_FIXTURE_MAX_ABS=8.881784197001252e-16
+// FISHER_F64_V2_ADVERSARIAL_MAX_ABS=1.7763568394002505e-15
+// The fixture bound is against a correctly-rounded transform while retaining
+// the established binary64 coefficient/floor schedule: 24,195 primary cells,
+// 1,327 nonzero differences, 28 above one ULP. Exact-real normalization is a
+// separate authority question and is deliberately not claimed by this v2.
 //
-// NaN SEMANTICS. `(max_val - min_val).max(0.001)` is f64::max, which returns
-// the NON-NaN operand. fmax() has exactly that semantics; an if-chain does not,
-// because a comparison against NaN is false and the NaN would survive into the
-// division and then into the recurrence. This is the adx-class bug and it is
-// avoided here by construction.
-//
-// The min/max window scan, by contrast, IS a raw comparison chain on the CPU
-// (fisher_update_min_max, :348), where a NaN midpoint updates neither bound.
-// Reproduced as raw comparisons for that reason — matching the CPU, not
-// applying fmax/fmin blindly.
-//
-// SEEDS. f64::MAX = 1.7976931348623157e308 and f64::MIN = -1.7976931348623157e308
-// (Rust's f64::MIN is the most NEGATIVE finite double, NOT the smallest
-// positive one — the C analogue of f64::MIN is -DBL_MAX, not DBL_MIN). Getting
-// this wrong is exactly the f32-epsilon class of bug the brief names.
-//
-// ROUNDING COUNT. Two fused steps on the CPU:
-//     val1 = 0.67f64.mul_add(val1, 0.66 * (...))   -> fma(0.67, val1, 0.66 * (...))
-//     new  = 0.5f64.mul_add(ln(...), 0.5*prev)     -> fma(0.5, log(...), 0.5*prev)
-// log() is the correctly-rounded double natural log; logf would be the f32 one.
-//
-// Sequential: val1 and prev_fish carry across bars. One thread per column.
+// One CUDA block owns one period tuple. Thread zero walks the sequential
+// recurrence; the block cooperatively initializes outputs. Strict f64 periods
+// through 1024 use O(N) monotone deques in dynamic shared memory. Any invalid
+// or larger period remains canonical qNaN; the shared wrapper must reject it
+// before allocation/upload/module lookup/launch. ABI symbols and argument order
+// remain unchanged; the wrapper must launch grid.x=n_combos, one warp per block,
+// and 2*(max_period+1) shared int slots. That hunk is handed off separately.
+// The release gate is an RTX 1M-row x 250-period receipt: all periods <=1024
+// must stay on this O(N) deque body, report zero local-array spill, and show no
+// regression versus the frozen native strict-f64 production launch.
 // =============================================================================
 
-__device__ __forceinline__ double nef_qnan_fisher() {
+#define NEO_FISHER_F64_MAX_PERIOD 1024
+
+__device__ __forceinline__ double fisher_qnan_f64_v2() {
     return __longlong_as_double(0x7ff8000000000000LL);
 }
 
-// Shared body. `want_signal` selects which of the two CPU outputs is written.
-__device__ __forceinline__ void nef_fisher_body(const double* __restrict__ high,
-                                                const double* __restrict__ low,
-                                                int n,
-                                                int period,
-                                                int first_valid,
-                                                bool want_signal,
-                                                double* __restrict__ row)
-{
-    const double QNAN = nef_qnan_fisher();
+__device__ __forceinline__ double fisher_add_rn_f64_v2(double left, double right) {
+    return __dadd_rn(left, right);
+}
 
-    if (period <= 0 || first_valid < 0 || first_valid >= n) {
-        for (int i = 0; i < n; ++i) row[i] = QNAN;
-        return;
+__device__ __forceinline__ double fisher_sub_rn_f64_v2(double left, double right) {
+    return __dsub_rn(left, right);
+}
+
+__device__ __forceinline__ double fisher_mul_rn_f64_v2(double left, double right) {
+    return __dmul_rn(left, right);
+}
+
+__device__ __forceinline__ double fisher_div_rn_f64_v2(double left, double right) {
+    return __ddiv_rn(left, right);
+}
+
+__device__ __forceinline__ double fisher_fma_rn_f64_v2(double left,
+                                                        double right,
+                                                        double addend) {
+    return __fma_rn(left, right, addend);
+}
+
+__device__ __forceinline__ double fisher_with_high_word_f64_v2(double value,
+                                                                unsigned int high) {
+    unsigned long long bits = (unsigned long long)__double_as_longlong(value);
+    bits = (bits & 0x00000000ffffffffULL) | ((unsigned long long)high << 32);
+    return __longlong_as_double((long long)bits);
+}
+
+// Literal Sun fdlibm/OpenLibm e_log schedule. Every arithmetic edge is an
+// explicit round-to-nearest-even operation so host and CUDA share one graph.
+__device__ __forceinline__ bool fisher_log_f64_v2(double value, double* output) {
+    const double TWO54 = 1.80143985094819840000e+16;
+    const double LN2_HI = 6.93147180369123816490e-01;
+    const double LN2_LO = 1.90821492927058770002e-10;
+    const double LG1 = 6.666666666666735130e-01;
+    const double LG2 = 3.999999999940941908e-01;
+    const double LG3 = 2.857142874366239149e-01;
+    const double LG4 = 2.222219843214978396e-01;
+    const double LG5 = 1.818357216161805012e-01;
+    const double LG6 = 1.531383769920937332e-01;
+    const double LG7 = 1.479819860511658591e-01;
+
+    if (!isfinite(value) || !(value > 0.0)) return false;
+    unsigned long long raw = (unsigned long long)__double_as_longlong(value);
+    int high = (int)(raw >> 32);
+    const unsigned int low = (unsigned int)raw;
+    int exponent = 0;
+    if (high < 0x00100000) {
+        if ((((unsigned int)high & 0x7fffffffU) | low) == 0U) return false;
+        exponent -= 54;
+        value = fisher_mul_rn_f64_v2(value, TWO54);
+        raw = (unsigned long long)__double_as_longlong(value);
+        high = (int)(raw >> 32);
+    }
+    if (high >= 0x7ff00000) return false;
+
+    exponent += (high >> 20) - 1023;
+    high &= 0x000fffff;
+    const int normalize = (high + 0x00095f64) & 0x00100000;
+    value = fisher_with_high_word_f64_v2(
+        value, (unsigned int)(high | (normalize ^ 0x3ff00000)));
+    exponent += normalize >> 20;
+
+    const double fraction = fisher_sub_rn_f64_v2(value, 1.0);
+    if ((0x000fffff & (2 + high)) < 3) {
+        if (fraction == 0.0) {
+            if (exponent == 0) {
+                *output = 0.0;
+                return true;
+            }
+            const double exponent_f64 = (double)exponent;
+            *output = fisher_add_rn_f64_v2(
+                fisher_mul_rn_f64_v2(exponent_f64, LN2_HI),
+                fisher_mul_rn_f64_v2(exponent_f64, LN2_LO));
+            return isfinite(*output);
+        }
+        const double square = fisher_mul_rn_f64_v2(fraction, fraction);
+        const double inner = fisher_sub_rn_f64_v2(
+            0.5, fisher_mul_rn_f64_v2(0.33333333333333333, fraction));
+        const double remainder = fisher_mul_rn_f64_v2(square, inner);
+        if (exponent == 0) {
+            *output = fisher_sub_rn_f64_v2(fraction, remainder);
+            return isfinite(*output);
+        }
+        const double exponent_f64 = (double)exponent;
+        const double correction = fisher_sub_rn_f64_v2(
+            fisher_sub_rn_f64_v2(
+                remainder, fisher_mul_rn_f64_v2(exponent_f64, LN2_LO)),
+            fraction);
+        *output = fisher_sub_rn_f64_v2(
+            fisher_mul_rn_f64_v2(exponent_f64, LN2_HI), correction);
+        return isfinite(*output);
     }
 
-    const long long w = (long long)first_valid + (long long)period - 1;
-    const int warm = w > (long long)n ? n : (int)w;
-    for (int i = 0; i < n; ++i) row[i] = QNAN;
-    if (warm >= n) return;
+    const double scaled = fisher_div_rn_f64_v2(
+        fraction, fisher_add_rn_f64_v2(2.0, fraction));
+    const double exponent_f64 = (double)exponent;
+    const double square = fisher_mul_rn_f64_v2(scaled, scaled);
+    const int selector = (high - 0x0006147a) | (0x0006b851 - high);
+    const double fourth = fisher_mul_rn_f64_v2(square, square);
+    const double even_inner = fisher_add_rn_f64_v2(
+        LG4, fisher_mul_rn_f64_v2(fourth, LG6));
+    const double even = fisher_mul_rn_f64_v2(
+        fourth,
+        fisher_add_rn_f64_v2(LG2, fisher_mul_rn_f64_v2(fourth, even_inner)));
+    const double odd_inner = fisher_add_rn_f64_v2(
+        LG5, fisher_mul_rn_f64_v2(fourth, LG7));
+    const double odd_middle = fisher_add_rn_f64_v2(
+        LG3, fisher_mul_rn_f64_v2(fourth, odd_inner));
+    const double odd = fisher_mul_rn_f64_v2(
+        square,
+        fisher_add_rn_f64_v2(LG1, fisher_mul_rn_f64_v2(fourth, odd_middle)));
+    const double remainder = fisher_add_rn_f64_v2(odd, even);
 
-    // Rust f64::MAX / f64::MIN — the largest and the most NEGATIVE finite f64.
-    const double F64_MAX =  1.7976931348623157e308;
-    const double F64_MIN = -1.7976931348623157e308;
-
-    double prev_fish = 0.0;
-    double val1 = 0.0;
-
-    for (int i = warm; i < n; ++i) {
-        const int start = i + 1 - period;
-
-        double min_val = F64_MAX;
-        double max_val = F64_MIN;
-        for (int j = start; j <= i; ++j) {
-            const double midpoint = 0.5 * (high[j] + low[j]);
-            if (midpoint > max_val) max_val = midpoint;
-            if (midpoint < min_val) min_val = midpoint;
+    if (selector > 0) {
+        const double half_square = fisher_mul_rn_f64_v2(
+            fisher_mul_rn_f64_v2(0.5, fraction), fraction);
+        const double scaled_sum = fisher_mul_rn_f64_v2(
+            scaled, fisher_add_rn_f64_v2(half_square, remainder));
+        if (exponent == 0) {
+            *output = fisher_sub_rn_f64_v2(
+                fraction, fisher_sub_rn_f64_v2(half_square, scaled_sum));
+            return isfinite(*output);
         }
-
-        // f64::max semantics: returns the non-NaN operand.
-        const double range = fmax(max_val - min_val, 0.001);
-        const double hl = 0.5 * (high[i] + low[i]);
-        val1 = fma(0.67, val1, 0.66 * ((hl - min_val) / range - 0.5));
-        if (val1 > 0.99) {
-            val1 = 0.999;
-        } else if (val1 < -0.99) {
-            val1 = -0.999;
-        }
-        const double signal_here = prev_fish;
-        const double new_fish = fma(0.5, log((1.0 + val1) / (1.0 - val1)), 0.5 * prev_fish);
-        row[i] = want_signal ? signal_here : new_fish;
-        prev_fish = new_fish;
+        const double low_term = fisher_mul_rn_f64_v2(exponent_f64, LN2_LO);
+        const double correction = fisher_sub_rn_f64_v2(
+            fisher_sub_rn_f64_v2(
+                half_square, fisher_add_rn_f64_v2(scaled_sum, low_term)),
+            fraction);
+        *output = fisher_sub_rn_f64_v2(
+            fisher_mul_rn_f64_v2(exponent_f64, LN2_HI), correction);
+        return isfinite(*output);
     }
+
+    const double scaled_remainder = fisher_mul_rn_f64_v2(
+        scaled, fisher_sub_rn_f64_v2(fraction, remainder));
+    if (exponent == 0) {
+        *output = fisher_sub_rn_f64_v2(fraction, scaled_remainder);
+        return isfinite(*output);
+    }
+    const double correction = fisher_sub_rn_f64_v2(
+        fisher_sub_rn_f64_v2(
+            scaled_remainder, fisher_mul_rn_f64_v2(exponent_f64, LN2_LO)),
+        fraction);
+    *output = fisher_sub_rn_f64_v2(
+        fisher_mul_rn_f64_v2(exponent_f64, LN2_HI), correction);
+    return isfinite(*output);
+}
+
+__device__ __forceinline__ bool fisher_midpoint_f64_v2(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int index,
+    double* midpoint) {
+    const double high_value = high[index];
+    const double low_value = low[index];
+    if (!isfinite(high_value) || !isfinite(low_value)) return false;
+    *midpoint = fisher_mul_rn_f64_v2(
+        0.5, fisher_add_rn_f64_v2(high_value, low_value));
+    return isfinite(*midpoint);
+}
+
+__device__ __forceinline__ bool fisher_transition_f64_v2(double midpoint,
+                                                          double minimum,
+                                                          double maximum,
+                                                          double* value1,
+                                                          double* previous_fisher,
+                                                          double* fisher,
+                                                          double* signal) {
+    const double range_delta = fisher_sub_rn_f64_v2(maximum, minimum);
+    if (!isfinite(range_delta)) return false;
+    const double range = range_delta > 0.001 ? range_delta : 0.001;
+    const double normalized = fisher_sub_rn_f64_v2(
+        fisher_div_rn_f64_v2(
+            fisher_sub_rn_f64_v2(midpoint, minimum), range),
+        0.5);
+    const double weighted = fisher_mul_rn_f64_v2(0.66, normalized);
+    if (!isfinite(normalized) || !isfinite(weighted)) return false;
+
+    double next_value1 = fisher_fma_rn_f64_v2(0.67, *value1, weighted);
+    if (!isfinite(next_value1)) return false;
+    if (next_value1 > 0.99) {
+        next_value1 = 0.999;
+    } else if (next_value1 < -0.99) {
+        next_value1 = -0.999;
+    }
+
+    const double numerator = fisher_add_rn_f64_v2(1.0, next_value1);
+    const double denominator = fisher_sub_rn_f64_v2(1.0, next_value1);
+    const double ratio = fisher_div_rn_f64_v2(numerator, denominator);
+    double logarithm = 0.0;
+    if (!fisher_log_f64_v2(ratio, &logarithm)) return false;
+    const double next_signal = *previous_fisher;
+    const double next_fisher = fisher_fma_rn_f64_v2(
+        0.5, logarithm, fisher_mul_rn_f64_v2(0.5, next_signal));
+    if (!isfinite(next_fisher)) return false;
+
+    *value1 = next_value1;
+    *previous_fisher = next_fisher;
+    *fisher = next_fisher;
+    *signal = next_signal;
+    return true;
+}
+
+struct NeoFisherDequeF64V2 {
+    int* indices;
+    int head;
+    int length;
+    int capacity;
+};
+
+__device__ __forceinline__ void fisher_deque_init_f64_v2(
+    NeoFisherDequeF64V2* deque, int* indices, int capacity) {
+    deque->indices = indices;
+    deque->head = 0;
+    deque->length = 0;
+    deque->capacity = capacity;
+}
+
+__device__ __forceinline__ void fisher_deque_clear_f64_v2(
+    NeoFisherDequeF64V2* deque) {
+    deque->head = 0;
+    deque->length = 0;
+}
+
+__device__ __forceinline__ int fisher_deque_front_f64_v2(
+    const NeoFisherDequeF64V2* deque) {
+    return deque->indices[deque->head];
+}
+
+__device__ __forceinline__ int fisher_deque_back_f64_v2(
+    const NeoFisherDequeF64V2* deque) {
+    const int slot = (deque->head + deque->length - 1) % deque->capacity;
+    return deque->indices[slot];
+}
+
+__device__ __forceinline__ void fisher_deque_pop_front_f64_v2(
+    NeoFisherDequeF64V2* deque) {
+    deque->head = (deque->head + 1) % deque->capacity;
+    --deque->length;
+}
+
+__device__ __forceinline__ void fisher_deque_pop_back_f64_v2(
+    NeoFisherDequeF64V2* deque) {
+    --deque->length;
+}
+
+__device__ __forceinline__ void fisher_deque_push_back_f64_v2(
+    NeoFisherDequeF64V2* deque, int index) {
+    const int slot = (deque->head + deque->length) % deque->capacity;
+    deque->indices[slot] = index;
+    ++deque->length;
+}
+
+__device__ __forceinline__ bool fisher_admit_midpoint_f64_v2(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int index,
+    int period,
+    double midpoint,
+    NeoFisherDequeF64V2* minimum,
+    NeoFisherDequeF64V2* maximum) {
+    while (minimum->length > 0) {
+        double last = 0.0;
+        if (!fisher_midpoint_f64_v2(
+                high, low, fisher_deque_back_f64_v2(minimum), &last)) return false;
+        if (!(last >= midpoint)) break;
+        fisher_deque_pop_back_f64_v2(minimum);
+    }
+    fisher_deque_push_back_f64_v2(minimum, index);
+
+    while (maximum->length > 0) {
+        double last = 0.0;
+        if (!fisher_midpoint_f64_v2(
+                high, low, fisher_deque_back_f64_v2(maximum), &last)) return false;
+        if (!(last <= midpoint)) break;
+        fisher_deque_pop_back_f64_v2(maximum);
+    }
+    fisher_deque_push_back_f64_v2(maximum, index);
+
+    const int start = index + 1 - period;
+    while (minimum->length > 0 && fisher_deque_front_f64_v2(minimum) < start) {
+        fisher_deque_pop_front_f64_v2(minimum);
+    }
+    while (maximum->length > 0 && fisher_deque_front_f64_v2(maximum) < start) {
+        fisher_deque_pop_front_f64_v2(maximum);
+    }
+    return true;
+}
+
+__device__ __forceinline__ void fisher_reset_deques_f64_v2(
+    NeoFisherDequeF64V2* minimum,
+    NeoFisherDequeF64V2* maximum,
+    int* finite_bars,
+    double* value1,
+    double* previous_fisher) {
+    fisher_deque_clear_f64_v2(minimum);
+    fisher_deque_clear_f64_v2(maximum);
+    *finite_bars = 0;
+    *value1 = 0.0;
+    *previous_fisher = 0.0;
+}
+
+__device__ __forceinline__ void fisher_row_deque_f64_v2(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int n,
+    int period,
+    int first_valid,
+    double* __restrict__ fisher_out,
+    double* __restrict__ signal_out,
+    int* __restrict__ storage) {
+    const int capacity = period + 1;
+    NeoFisherDequeF64V2 minimum;
+    NeoFisherDequeF64V2 maximum;
+    fisher_deque_init_f64_v2(&minimum, storage, capacity);
+    fisher_deque_init_f64_v2(&maximum, storage + capacity, capacity);
+    int finite_bars = 0;
+    double previous_fisher = 0.0;
+    double value1 = 0.0;
+
+    for (int index = first_valid; index < n; ++index) {
+        double midpoint = 0.0;
+        if (!fisher_midpoint_f64_v2(high, low, index, &midpoint)) {
+            fisher_reset_deques_f64_v2(
+                &minimum, &maximum, &finite_bars, &value1, &previous_fisher);
+            continue;
+        }
+        if (!fisher_admit_midpoint_f64_v2(
+                high, low, index, period, midpoint, &minimum, &maximum)) {
+            fisher_reset_deques_f64_v2(
+                &minimum, &maximum, &finite_bars, &value1, &previous_fisher);
+            continue;
+        }
+        if (finite_bars < period) ++finite_bars;
+        if (finite_bars < period) continue;
+
+        double minimum_value = 0.0;
+        double maximum_value = 0.0;
+        if (!fisher_midpoint_f64_v2(
+                high, low, fisher_deque_front_f64_v2(&minimum), &minimum_value)
+            || !fisher_midpoint_f64_v2(
+                high, low, fisher_deque_front_f64_v2(&maximum), &maximum_value)) {
+            fisher_reset_deques_f64_v2(
+                &minimum, &maximum, &finite_bars, &value1, &previous_fisher);
+            continue;
+        }
+        double fisher = 0.0;
+        double signal = 0.0;
+        if (!fisher_transition_f64_v2(
+                midpoint,
+                minimum_value,
+                maximum_value,
+                &value1,
+                &previous_fisher,
+                &fisher,
+                &signal)) {
+            fisher_reset_deques_f64_v2(
+                &minimum, &maximum, &finite_bars, &value1, &previous_fisher);
+            continue;
+        }
+        if (fisher_out != nullptr) fisher_out[index] = fisher;
+        if (signal_out != nullptr) signal_out[index] = signal;
+    }
+}
+
+// All threads enter so the qNaN initialization and barrier are block-uniform.
+// Thread zero then owns the recurrence for the block's single period tuple.
+__device__ __forceinline__ void fisher_row_f64_v2(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    int n,
+    int period,
+    int first_valid,
+    double* __restrict__ fisher_out,
+    double* __restrict__ signal_out,
+    int* __restrict__ deque_storage) {
+    const double qnan = fisher_qnan_f64_v2();
+    for (int index = (int)threadIdx.x; index < n; index += (int)blockDim.x) {
+        if (fisher_out != nullptr) fisher_out[index] = qnan;
+        if (signal_out != nullptr) signal_out[index] = qnan;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    if (period <= 0 || period > NEO_FISHER_F64_MAX_PERIOD) return;
+    if (first_valid < 0 || first_valid >= n) return;
+    fisher_row_deque_f64_v2(
+        high,
+        low,
+        n,
+        period,
+        first_valid,
+        fisher_out,
+        signal_out,
+        deque_storage);
 }
 
 extern "C" __global__
@@ -326,10 +669,18 @@ void neoethos_fisher_f64(const double* __restrict__ high,
                          int first_valid,
                          double* __restrict__ out)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= n_combos || n <= 0) return;
-    nef_fisher_body(high, low, n, periods[r], first_valid, false,
-                    out + (size_t)r * (size_t)n);
+    const int combo = (int)blockIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    extern __shared__ int fisher_deque_storage[];
+    fisher_row_f64_v2(
+        high,
+        low,
+        n,
+        periods[combo],
+        first_valid,
+        out + (size_t)combo * (size_t)n,
+        nullptr,
+        fisher_deque_storage);
 }
 
 extern "C" __global__
@@ -341,76 +692,50 @@ void neoethos_fisher_signal_f64(const double* __restrict__ high,
                                 int first_valid,
                                 double* __restrict__ out)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= n_combos || n <= 0) return;
-    nef_fisher_body(high, low, n, periods[r], first_valid, true,
-                    out + (size_t)r * (size_t)n);
+    const int combo = (int)blockIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    extern __shared__ int fisher_deque_storage[];
+    fisher_row_f64_v2(
+        high,
+        low,
+        n,
+        periods[combo],
+        first_valid,
+        nullptr,
+        out + (size_t)combo * (size_t)n,
+        fisher_deque_storage);
+}
+
+// Production full-pair ABI. One block owns one period tuple and writes both
+// matrices from the same recurrence; no second launch replays the state.
+extern "C" __global__
+void fisher_outputs_f64(const double* __restrict__ high,
+                        const double* __restrict__ low,
+                        const int* __restrict__ periods,
+                        int n,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ fisher_out,
+                        double* __restrict__ signal_out)
+{
+    const int combo = (int)blockIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    extern __shared__ int fisher_deque_storage[];
+    fisher_row_f64_v2(
+        high,
+        low,
+        n,
+        periods[combo],
+        first_valid,
+        fisher_out + (size_t)combo * (size_t)n,
+        signal_out + (size_t)combo * (size_t)n,
+        fisher_deque_storage);
 }
 
 
-// ===========================================================================
-// S1 f64 LANE  --  fisher
-// ===========================================================================
-// Written by shard S1 of the f64 conversion, INTO THE FILE THIS INDICATOR
-// ALREADY SHIPS IN, beside the f32 entry points that this crate's own f32
-// wrappers still call. Listing this file in `F64_LANE_SOURCES` (build.rs) opts
-// the WHOLE translation unit out of `--use_fast_math`, which is the only way
-// the opt-out can be correct: the f32 and f64 entry points share one
-// translation unit and nvcc has no per-entry flag.
-//
-// CPU reference: src/indicators/fisher.rs -- `fisher_scalar_into` (:300), `fisher_scalar_period9_into` (:361), `fisher_with_kernel` (:215)
-//
-// INPUT SHAPE: high and low ONLY. `compute_fisher_batch`
-// (cpu_batch.rs:14760) calls `extract_high_low_input`, and
-// `fisher_with_kernel` scans high and low for first_valid (fisher.rs:239-243).
-// Close is never read, so this declares `HighLow` -- handing it an Ohlc ref
-// would adopt close's first-valid and shift the whole series.
-//
-// PERIOD-BASED: `period` (default 9) is the swept parameter.
-//
-// ONE BODY SERVES BOTH CPU PATHS. `fisher_scalar_into` branches at period == 9
-// to `fisher_scalar_period9_into`, which is the SAME loop with the nine
-// midpoint updates written out. The order of the min/max updates is identical
-// (ascending j, `>` for max and `<` for min, so ties keep the EARLIER value),
-// and min/max are exact operations anyway -- there is no reassociation and
-// therefore no second body here. Checked, not assumed, because period 9 is the
-// default and would be the only branch this lane ever took.
-//
-// ARITHMETIC ORDER, and the two `mul_add`s that must stay `fma`:
-//   `val1 = 0.67f64.mul_add(val1, 0.66 * ((hl - min)/range - 0.5))` -- ONE
-//   rounding on the fused part. Writing `0.67*val1 + ...` would be two.
-//   `new_fish = 0.5f64.mul_add(ln((1+val1)/(1-val1)), 0.5 * prev_fish)` -- same.
-// Both are reproduced with `fma`, and the file is compiled with `-fmad=false`
-// so the compiler contracts nothing else by accident.
-//
-// SENTINELS AND CONSTANTS, RE-DERIVED FOR f64:
-//   `f64::MAX` = 1.7976931348623157e308 and `f64::MIN` = -1.7976931348623157e308
-//   (the most NEGATIVE finite double, not the smallest positive one -- the f32
-//   habit of writing `FLT_MIN` for a min-sentinel is exactly the bug this rule
-//   exists to catch). Spelled as DBL_MAX / -DBL_MAX here.
-//   `range.max(0.001)` -- 0.001 is a floor on the price range from the
-//   published Fisher Transform, not a machine epsilon, so it does NOT scale
-//   with precision and is carried over unchanged. It is `fmax`, matching
-//   `f64::max`'s non-NaN-preferring semantics, not an if-chain.
-//   The clamps 0.99 -> 0.999 are the published saturation and likewise fixed.
-//
-// PRIMARY OUTPUT: `fisher`. `compute_fisher_batch` maps output_id "value" to
-// `out.fisher` (cpu_batch.rs:14777); `signal` is a second series and this lane
-// carries one matrix per launch, so `signal` is not emitted.
-//
-// WARMUP: `alloc_with_nan_prefix(len, first + period - 1)`.
-// ===========================================================================
-
-#ifndef NEO_S1_QNAN_DEFINED
-#define NEO_S1_QNAN_DEFINED
-// The f32 kernels in this crate spell NaN `__int_as_float(0x7fc00000)`. That is
-// a 32-bit pattern; widening it is a value change, not a cast. This is the f64
-// quiet-NaN pattern, stated once per translation unit.
-__device__ __forceinline__ double neo_s1_qnan() {
-    return __longlong_as_double(0x7ff8000000000000LL);
-}
-__device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
-#endif
+// Compatibility ABI for callers that request only the primary matrix. It is
+// deliberately routed through the same v2 body as the full-pair production
+// ABI, including finite-segment reset, canonical qNaN, and deterministic log.
 
 extern "C" __global__ void neoethos_fisher_batch_f64(
     const double* __restrict__ high,
@@ -421,51 +746,16 @@ extern "C" __global__ void neoethos_fisher_batch_f64(
     int first_valid,
     double* __restrict__ out)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= n_combos) return;
-    double* __restrict__ row = out + (size_t)r * (size_t)n;
-    const int period = periods[r];
-
-    const bool declined =
-        (n <= 0) ||
-        (first_valid < 0) || (first_valid >= n) ||
-        (period == 0) || (period > n) ||
-        ((n - first_valid) < period);
-    if (declined) {
-        for (int i = 0; i < n; ++i) row[i] = neo_s1_qnan();
-        return;
-    }
-
-    const int warm = first_valid + period - 1;
-    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s1_qnan();
-    if (warm >= n) return;
-
-    double prev_fish = 0.0;
-    double val1 = 0.0;
-
-    for (int i = warm; i < n; ++i) {
-        const int start = i + 1 - period;
-
-        double min_val =  1.7976931348623157e308;   // f64::MAX
-        double max_val = -1.7976931348623157e308;   // f64::MIN
-        for (int j = start; j <= i; ++j) {
-            const double midpoint = 0.5 * (high[j] + low[j]);
-            if (midpoint > max_val) max_val = midpoint;
-            if (midpoint < min_val) min_val = midpoint;
-        }
-
-        const double range = fmax(max_val - min_val, 0.001);
-        const double hl = 0.5 * (high[i] + low[i]);
-        val1 = fma(0.67, val1, 0.66 * ((hl - min_val) / range - 0.5));
-        if (val1 > 0.99) {
-            val1 = 0.999;
-        } else if (val1 < -0.99) {
-            val1 = -0.999;
-        }
-        // `signal_out[i] = prev_fish` happens here in the CPU; the signal
-        // series is not the emitted output, so only the state is carried.
-        const double new_fish = fma(0.5, log((1.0 + val1) / (1.0 - val1)), 0.5 * prev_fish);
-        row[i] = new_fish;
-        prev_fish = new_fish;
-    }
+    const int combo = (int)blockIdx.x;
+    if (combo >= n_combos || n <= 0) return;
+    extern __shared__ int fisher_deque_storage[];
+    fisher_row_f64_v2(
+        high,
+        low,
+        n,
+        periods[combo],
+        first_valid,
+        out + (size_t)combo * (size_t)n,
+        nullptr,
+        fisher_deque_storage);
 }

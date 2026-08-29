@@ -8,7 +8,8 @@ use irithyll::serde_support::{load_model, save_model_with};
 #[cfg(feature = "adaptive-models")]
 use irithyll::{DynSGBT, LossType, SGBT, SGBTConfig, Sample};
 use ndarray::{Array1, Array2};
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use crate::runtime::capabilities::{
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
-    feature_matrix_from_dataframe, read_json, remap_three_class_labels, softmax_rows, write_json,
+    feature_matrix_from_frame, read_json, remap_three_class_labels, softmax_rows, write_json,
 };
 #[cfg(feature = "adaptive-models")]
 use tracing::warn;
@@ -92,14 +93,14 @@ fn ensure_label_count(model_name: &str, rows: usize, labels: usize) -> Result<()
     Ok(())
 }
 
-fn expand_hoeffding_fallback_features(values: &[f32], basis: HoeffdingFallbackBasis) -> Vec<f32> {
+fn expand_hoeffding_fallback_features(values: &[f64], basis: HoeffdingFallbackBasis) -> Vec<f64> {
     match basis {
         HoeffdingFallbackBasis::Linear => values.to_vec(),
         HoeffdingFallbackBasis::Quadratic => {
             let mut expanded = Vec::with_capacity(values.len().saturating_mul(2));
             expanded.extend_from_slice(values);
             expanded.extend(values.iter().map(|value| {
-                let clamped = value.clamp(-1.0e9_f32, 1.0e9_f32);
+                let clamped = value.clamp(-1.0e9_f64, 1.0e9_f64);
                 clamped * clamped
             }));
             expanded
@@ -108,9 +109,9 @@ fn expand_hoeffding_fallback_features(values: &[f32], basis: HoeffdingFallbackBa
 }
 
 fn expand_hoeffding_fallback_matrix(
-    features: &Array2<f32>,
+    features: &Array2<f64>,
     basis: HoeffdingFallbackBasis,
-) -> Result<Array2<f32>> {
+) -> Result<Array2<f64>> {
     match basis {
         HoeffdingFallbackBasis::Linear => Ok(features.clone()),
         HoeffdingFallbackBasis::Quadratic => {
@@ -457,7 +458,7 @@ fn validate_hoeffding_artifact(artifact: &HoeffdingArtifact) -> Result<()> {
     }
 
     let fallback_blend_weight = hoeffding_fallback_blend_weight(&artifact.params)?;
-    if artifact.committee_json.is_empty() && fallback_blend_weight <= f32::EPSILON && !has_fallback
+    if artifact.committee_json.is_empty() && fallback_blend_weight <= f64::EPSILON && !has_fallback
     {
         bail!("online_hoeffding artifact cannot be empty and blend-less at the same time");
     }
@@ -490,18 +491,10 @@ fn float_param(params: &HashMap<String, String>, key: &str, default: f64) -> f64
         .unwrap_or(default)
 }
 
-fn float_param_f32(params: &HashMap<String, String>, key: &str, default: f32) -> f32 {
-    params
-        .get(key)
-        .and_then(|value| value.trim().parse::<f32>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(default)
-}
-
-fn hoeffding_fallback_blend_weight(params: &HashMap<String, String>) -> Result<f32> {
+fn hoeffding_fallback_blend_weight(params: &HashMap<String, String>) -> Result<f64> {
     match params.get("fallback_blend_weight") {
         Some(raw_value) => {
-            let value = raw_value.trim().parse::<f32>().with_context(|| {
+            let value = raw_value.trim().parse::<f64>().with_context(|| {
                 format!(
                     "online_hoeffding fallback_blend_weight `{}` is not a valid number",
                     raw_value
@@ -519,6 +512,7 @@ fn hoeffding_fallback_blend_weight(params: &HashMap<String, String>) -> Result<f
     }
 }
 
+#[cfg(feature = "adaptive-models")]
 fn labels_to_binary_targets(labels: &[usize], positive_class: usize) -> Vec<f64> {
     labels
         .iter()
@@ -526,7 +520,7 @@ fn labels_to_binary_targets(labels: &[usize], positive_class: usize) -> Vec<f64>
         .collect()
 }
 
-fn balanced_class_weights(labels: &[usize], classes: usize) -> Vec<f32> {
+fn balanced_class_weights(labels: &[usize], classes: usize) -> Vec<f64> {
     let mut counts = vec![0usize; classes.max(1)];
     for &label in labels {
         if let Some(slot) = counts.get_mut(label) {
@@ -534,27 +528,27 @@ fn balanced_class_weights(labels: &[usize], classes: usize) -> Vec<f32> {
         }
     }
 
-    let total = labels.len().max(1) as f32;
+    let total = labels.len().max(1) as f64;
     counts
         .into_iter()
         .map(|count| {
-            let count = count.max(1) as f32;
-            (total / (classes.max(1) as f32 * count)).clamp(0.5, 4.0)
+            let count = count.max(1) as f64;
+            (total / (classes.max(1) as f64 * count)).clamp(0.5, 4.0)
         })
         .collect()
 }
 
-fn array2_from_logits(rows: usize, cols: usize, logits: Vec<f32>) -> Result<Array2<f32>> {
+fn array2_from_logits(rows: usize, cols: usize, logits: Vec<f64>) -> Result<Array2<f64>> {
     Array2::from_shape_vec((rows, cols), logits).context("build adaptive model logits")
 }
 
 fn fallback_logits(
-    features: &Array2<f32>,
+    features: &Array2<f64>,
     scaler: &FeatureScaler,
-    weights: &Array2<f32>,
-    bias: &Array1<f32>,
+    weights: &Array2<f64>,
+    bias: &Array1<f64>,
     basis: HoeffdingFallbackBasis,
-) -> Result<Array2<f32>> {
+) -> Result<Array2<f64>> {
     let features = scaler.transform(features)?;
     let features = expand_hoeffding_fallback_matrix(&features, basis)?;
     let mut logits = Vec::with_capacity(features.nrows() * 3);
@@ -566,7 +560,7 @@ fn fallback_logits(
                     .iter()
                     .zip(features.row(row).iter())
                     .map(|(weight, value)| weight * value)
-                    .sum::<f32>()
+                    .sum::<f64>()
                     + bias[class_idx],
             );
         }
@@ -576,12 +570,12 @@ fn fallback_logits(
 }
 
 #[cfg(feature = "adaptive-models")]
-fn committee_output_to_logit(output: f64) -> Result<f32> {
+fn committee_output_to_logit(output: f64) -> Result<f64> {
     if !output.is_finite() {
         bail!("online_hoeffding committee produced a non-finite probability");
     }
     let probability = output.clamp(1e-6, 1.0 - 1e-6);
-    Ok((probability / (1.0 - probability)).ln() as f32)
+    Ok((probability / (1.0 - probability)).ln())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -590,27 +584,28 @@ struct PassiveAggressiveArtifact {
     feature_columns: Vec<String>,
     dataset_rows: usize,
     scaler: FeatureScaler,
-    weights: Array2<f32>,
-    bias: Array1<f32>,
-    aggressiveness: f32,
+    weights: Array2<f64>,
+    bias: Array1<f64>,
+    aggressiveness: f64,
     epochs: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct OnlinePassiveAggressiveExpert {
-    pub aggressiveness: f32,
+    pub aggressiveness: f64,
     pub epochs: usize,
     pub feature_columns: Vec<String>,
     pub dataset_rows: usize,
     pub scaler: Option<FeatureScaler>,
-    pub weights: Option<Array2<f32>>,
-    pub bias: Option<Array1<f32>>,
+    pub weights: Option<Array2<f64>>,
+    pub bias: Option<Array1<f64>>,
 }
 
 impl OnlinePassiveAggressiveExpert {
-    pub fn new(aggressiveness: f32, epochs: usize) -> Self {
+    pub fn new(aggressiveness: impl Into<f64>, epochs: usize) -> Self {
+        let aggressiveness = aggressiveness.into();
         Self {
-            aggressiveness: aggressiveness.clamp(1e-4_f32, 100.0_f32),
+            aggressiveness: aggressiveness.clamp(1e-4_f64, 100.0_f64),
             epochs: epochs.max(1),
             feature_columns: Vec::new(),
             dataset_rows: 0,
@@ -623,7 +618,7 @@ impl OnlinePassiveAggressiveExpert {
     pub fn from_params(params: Option<HashMap<String, String>>) -> Self {
         let params = params.unwrap_or_default();
         Self::new(
-            float_param_f32(&params, "c", 1.0),
+            float_param(&params, "c", 1.0),
             usize_param(&params, "epochs", 4),
         )
     }
@@ -651,113 +646,113 @@ impl Default for OnlinePassiveAggressiveExpert {
 }
 
 impl ExpertModel for OnlinePassiveAggressiveExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
-        let labels = remap_three_class_labels(y)?;
-        ensure_label_count("online_pa", features.nrows(), labels.len())?;
-        let scaler = FeatureScaler::fit(&features)?;
-        let features = scaler.transform(&features)?;
-        let sample_weights = balanced_class_weights(&labels, 3);
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| {
+            let (features, feature_columns) = feature_matrix_from_frame(x)?;
+            let labels = remap_three_class_labels(y)?;
+            ensure_label_count("online_pa", features.nrows(), labels.len())?;
+            let scaler = FeatureScaler::fit(&features)?;
+            let features = scaler.transform(&features)?;
+            let sample_weights = balanced_class_weights(&labels, 3);
 
-        let n_rows = features.nrows();
-        let n_cols = features.ncols();
-        let mut weights = Array2::<f32>::zeros((3, n_cols));
-        let mut bias = Array1::<f32>::zeros(3);
+            let n_rows = features.nrows();
+            let n_cols = features.ncols();
+            let mut weights = Array2::<f64>::zeros((3, n_cols));
+            let mut bias = Array1::<f64>::zeros(3);
 
-        for _ in 0..self.epochs {
-            for (row, target_class) in labels.iter().enumerate().take(n_rows) {
-                let x_row = features.row(row);
-                let norm_sq = x_row.iter().map(|value| value * value).sum::<f32>() + 1e-6;
+            for _ in 0..self.epochs {
+                for (row, target_class) in labels.iter().enumerate().take(n_rows) {
+                    let x_row = features.row(row);
+                    let norm_sq = x_row.iter().map(|value| value * value).sum::<f64>() + 1e-6;
 
-                let mut scores = [0.0_f32; 3];
-                for class_idx in 0..3 {
-                    scores[class_idx] = weights
-                        .row(class_idx)
+                    let mut scores = [0.0_f64; 3];
+                    for class_idx in 0..3 {
+                        scores[class_idx] = weights
+                            .row(class_idx)
+                            .iter()
+                            .zip(x_row.iter())
+                            .map(|(weight, value)| weight * value)
+                            .sum::<f64>()
+                            + bias[class_idx];
+                    }
+
+                    if scores.iter().any(|s| !s.is_finite()) {
+                        tracing::warn!(
+                            target: "online_learner",
+                            "non-finite scores in argmax; skipping update"
+                        );
+                        continue;
+                    }
+                    let predicted_class = scores
                         .iter()
-                        .zip(x_row.iter())
-                        .map(|(weight, value)| weight * value)
-                        .sum::<f32>()
-                        + bias[class_idx];
-                }
+                        .enumerate()
+                        .max_by(|left, right| left.1.total_cmp(right.1))
+                        .map(|(class_idx, _)| class_idx)
+                        .unwrap_or(*target_class);
+                    if predicted_class == *target_class {
+                        continue;
+                    }
 
-                if scores.iter().any(|s| !s.is_finite()) {
-                    tracing::warn!(
-                        target: "online_learner",
-                        "non-finite scores in argmax; skipping update"
-                    );
-                    continue;
-                }
-                let predicted_class = scores
-                    .iter()
-                    .enumerate()
-                    .max_by(|left, right| left.1.total_cmp(right.1))
-                    .map(|(class_idx, _)| class_idx)
-                    .unwrap_or(*target_class);
-                if predicted_class == *target_class {
-                    continue;
-                }
+                    let margin = scores[predicted_class] - scores[*target_class] + 1.0;
+                    if margin <= 0.0 {
+                        continue;
+                    }
 
-                let margin = scores[predicted_class] - scores[*target_class] + 1.0;
-                if margin <= 0.0 {
-                    continue;
+                    let tau = (margin * sample_weights[*target_class] / (2.0 * norm_sq))
+                        .min(self.aggressiveness);
+                    if !tau.is_finite() || tau < 0.0 {
+                        tracing::warn!(
+                            target: "online_learner",
+                            "OPA tau non-finite or negative ({tau}); skipping update"
+                        );
+                        continue;
+                    }
+                    for col in 0..n_cols {
+                        weights[(*target_class, col)] += tau * x_row[col];
+                        weights[(predicted_class, col)] -= tau * x_row[col];
+                    }
+                    bias[*target_class] += tau;
+                    bias[predicted_class] -= tau;
                 }
-
-                let tau = (margin * sample_weights[*target_class] / (2.0 * norm_sq))
-                    .min(self.aggressiveness);
-                if !tau.is_finite() || tau < 0.0 {
-                    tracing::warn!(
-                        target: "online_learner",
-                        "OPA tau non-finite or negative ({tau}); skipping update"
-                    );
-                    continue;
-                }
-                for col in 0..n_cols {
-                    weights[(*target_class, col)] += tau * x_row[col];
-                    weights[(predicted_class, col)] -= tau * x_row[col];
-                }
-                bias[*target_class] += tau;
-                bias[predicted_class] -= tau;
             }
-        }
 
-        self.feature_columns = feature_columns;
-        self.dataset_rows = n_rows;
-        self.scaler = Some(scaler);
-        self.weights = Some(weights);
-        self.bias = Some(bias);
-        Ok(())
+            self.feature_columns = feature_columns;
+            self.dataset_rows = n_rows;
+            self.scaler = Some(scaler);
+            self.weights = Some(weights);
+            self.bias = Some(bias);
+            Ok(())
+        })
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        ensure_feature_columns_match(&self.feature_columns, x)?;
-        let weights = self
-            .weights
-            .as_ref()
-            .context("online_pa model not fitted")?;
-        let bias = self.bias.as_ref().context("online_pa model not fitted")?;
-        let scaler = self.scaler.as_ref().context("online_pa scaler missing")?;
-        let (features, _) = feature_matrix_from_dataframe(x)?;
-        let features = scaler.transform(&features)?;
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| {
+            ensure_feature_columns_match(&self.feature_columns, x)?;
+            let weights = self
+                .weights
+                .as_ref()
+                .context("online_pa model not fitted")?;
+            let bias = self.bias.as_ref().context("online_pa model not fitted")?;
+            let scaler = self.scaler.as_ref().context("online_pa scaler missing")?;
+            let (features, _) = feature_matrix_from_frame(x)?;
+            let features = scaler.transform(&features)?;
 
-        let mut logits = Vec::with_capacity(features.nrows() * 3);
-        for row in 0..features.nrows() {
-            for class_idx in 0..3 {
-                let score = weights
-                    .row(class_idx)
-                    .iter()
-                    .zip(features.row(row).iter())
-                    .map(|(weight, value)| weight * value)
-                    .sum::<f32>()
-                    + bias[class_idx];
-                logits.push(score);
+            let mut logits = Vec::with_capacity(features.nrows() * 3);
+            for row in 0..features.nrows() {
+                for class_idx in 0..3 {
+                    let score = weights
+                        .row(class_idx)
+                        .iter()
+                        .zip(features.row(row).iter())
+                        .map(|(weight, value)| weight * value)
+                        .sum::<f64>()
+                        + bias[class_idx];
+                    logits.push(score);
+                }
             }
-        }
 
-        Ok(softmax_rows(&array2_from_logits(
-            features.nrows(),
-            3,
-            logits,
-        )?))
+            softmax_rows(&array2_from_logits(features.nrows(), 3, logits)?)
+        })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -869,8 +864,12 @@ impl OnlinePassiveAggressiveExpert {
         (Some("online_pa_cpu".to_string()), gpu_cpu_fallback)
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
         let (execution_backend, degraded_reason) = self.runtime_details();
         let mut predictions = Vec::with_capacity(probabilities.nrows());
         for row in probabilities.outer_iter() {
@@ -901,16 +900,16 @@ struct HoeffdingArtifact {
     #[serde(default)]
     fallback_scaler: Option<FeatureScaler>,
     #[serde(default)]
-    fallback_weights: Option<Array2<f32>>,
+    fallback_weights: Option<Array2<f64>>,
     #[serde(default)]
-    fallback_bias: Option<Array1<f32>>,
+    fallback_bias: Option<Array1<f64>>,
 }
 
 fn fit_fallback_online_committee(
-    features: &Array2<f32>,
+    features: &Array2<f64>,
     labels: &[usize],
     params: &HashMap<String, String>,
-) -> Result<(FeatureScaler, Array2<f32>, Array1<f32>)> {
+) -> Result<(FeatureScaler, Array2<f64>, Array1<f64>)> {
     ensure_label_count("online_hoeffding fallback", features.nrows(), labels.len())?;
     validate_hoeffding_fallback_basis_param(params)?;
     let scaler = FeatureScaler::fit(features)?;
@@ -923,27 +922,27 @@ fn fit_fallback_online_committee(
         bail!("online_hoeffding fallback requires a non-empty feature matrix");
     }
 
-    let lr = float_param_f32(params, "learning_rate", 0.03).max(1e-4);
+    let lr = float_param(params, "learning_rate", 0.03).max(1e-4);
     let epochs = usize_param(params, "epochs", 4).max(1);
-    let l2 = float_param_f32(params, "l2", 1e-4).max(0.0);
+    let l2 = float_param(params, "l2", 1e-4).max(0.0);
     let sample_weights = balanced_class_weights(labels, 3);
-    let mut weights = Array2::<f32>::zeros((3, cols));
-    let mut bias = Array1::<f32>::zeros(3);
+    let mut weights = Array2::<f64>::zeros((3, cols));
+    let mut bias = Array1::<f64>::zeros(3);
 
     for _ in 0..epochs {
         for row in 0..rows {
             let x_row = features.row(row);
-            let mut logits = Array2::<f32>::zeros((1, 3));
+            let mut logits = Array2::<f64>::zeros((1, 3));
             for class_idx in 0..3 {
                 logits[(0, class_idx)] = weights
                     .row(class_idx)
                     .iter()
                     .zip(x_row.iter())
                     .map(|(weight, value)| weight * value)
-                    .sum::<f32>()
+                    .sum::<f64>()
                     + bias[class_idx];
             }
-            let probabilities = softmax_rows(&logits);
+            let probabilities = softmax_rows(&logits)?;
             let sample_weight = sample_weights[labels[row]];
             for class_idx in 0..3 {
                 let target = if labels[row] == class_idx { 1.0 } else { 0.0 };
@@ -975,8 +974,8 @@ pub struct OnlineHoeffdingExpert {
     committee_runtime_ready: bool,
     load_degraded_reason: Option<String>,
     fallback_scaler: Option<FeatureScaler>,
-    fallback_weights: Option<Array2<f32>>,
-    fallback_bias: Option<Array1<f32>>,
+    fallback_weights: Option<Array2<f64>>,
+    fallback_bias: Option<Array1<f64>>,
     #[cfg(feature = "adaptive-models")]
     committees: Vec<DynSGBT>,
 }
@@ -1126,111 +1125,108 @@ impl Default for OnlineHoeffdingExpert {
 }
 
 impl ExpertModel for OnlineHoeffdingExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        #[cfg(not(feature = "adaptive-models"))]
-        {
-            let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
-            let labels = remap_three_class_labels(y)?;
-            ensure_label_count("online_hoeffding", features.nrows(), labels.len())?;
-            // Establish the fallback basis/blend/classes params BEFORE fitting so
-            // the fitted weight matrix matches the basis the runtime validator
-            // recomputes from these params (otherwise it is built linear (3×F)
-            // but validated against the quadratic expansion (3×2F) → mismatch).
-            self.params
-                .entry("fallback_blend_weight".to_string())
-                .or_insert_with(|| "0.3".to_string());
-            self.params
-                .entry("fallback_basis".to_string())
-                .or_insert_with(|| "quadratic".to_string());
-            self.params
-                .entry("classes".to_string())
-                .or_insert_with(|| "3".to_string());
-            let (scaler, weights, bias) =
-                fit_fallback_online_committee(&features, &labels, &self.params)?;
-            self.params
-                .insert("artifact_mode".to_string(), "fallback_only".to_string());
-            self.feature_columns = feature_columns;
-            self.dataset_rows = features.nrows();
-            self.committee_json.clear();
-            self.committee_runtime_ready = false;
-            self.fallback_scaler = Some(scaler);
-            self.fallback_weights = Some(weights);
-            self.fallback_bias = Some(bias);
-            Ok(())
-        }
-
-        #[cfg(feature = "adaptive-models")]
-        {
-            let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
-            let labels = remap_three_class_labels(y)?;
-            ensure_label_count("online_hoeffding", features.nrows(), labels.len())?;
-            validate_hoeffding_fallback_basis_param(&self.params)?;
-            let config = self.config()?;
-            let rows = (0..features.nrows())
-                .map(|row_idx| {
-                    features
-                        .row(row_idx)
-                        .iter()
-                        .map(|value| *value as f64)
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-
-            let mut committee_json = Vec::with_capacity(3);
-            let mut committees = Vec::with_capacity(3);
-
-            for class_idx in 0..3 {
-                let binary_targets = labels_to_binary_targets(&labels, class_idx);
-                let mut committee = SGBT::with_loss(config.clone(), LogisticLoss);
-                for (features, target) in rows.iter().zip(binary_targets.iter()) {
-                    committee.train_one(&Sample::new(features.clone(), *target));
-                }
-
-                let payload = save_model_with(&committee, LossType::Logistic)
-                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-                let runtime =
-                    load_model(&payload).map_err(|err| anyhow::anyhow!(err.to_string()))?;
-                committee_json.push(payload);
-                committees.push(runtime);
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| {
+            #[cfg(not(feature = "adaptive-models"))]
+            {
+                let (features, feature_columns) = feature_matrix_from_frame(x)?;
+                let labels = remap_three_class_labels(y)?;
+                ensure_label_count("online_hoeffding", features.nrows(), labels.len())?;
+                // Establish the fallback basis/blend/classes params BEFORE fitting so
+                // the fitted weight matrix matches the basis the runtime validator
+                // recomputes from these params (otherwise it is built linear (3×F)
+                // but validated against the quadratic expansion (3×2F) → mismatch).
+                self.params
+                    .entry("fallback_blend_weight".to_string())
+                    .or_insert_with(|| "0.3".to_string());
+                self.params
+                    .entry("fallback_basis".to_string())
+                    .or_insert_with(|| "quadratic".to_string());
+                self.params
+                    .entry("classes".to_string())
+                    .or_insert_with(|| "3".to_string());
+                let (scaler, weights, bias) =
+                    fit_fallback_online_committee(&features, &labels, &self.params)?;
+                self.params
+                    .insert("artifact_mode".to_string(), "fallback_only".to_string());
+                self.feature_columns = feature_columns;
+                self.dataset_rows = features.nrows();
+                self.committee_json.clear();
+                self.committee_runtime_ready = false;
+                self.fallback_scaler = Some(scaler);
+                self.fallback_weights = Some(weights);
+                self.fallback_bias = Some(bias);
+                Ok(())
             }
 
-            // Establish the fallback basis/blend/classes params BEFORE fitting so
-            // the fitted weight matrix matches the basis the runtime validator
-            // recomputes from these params (otherwise it is built linear (3×F)
-            // but validated against the quadratic expansion (3×2F) → mismatch).
-            self.params
-                .entry("fallback_blend_weight".to_string())
-                .or_insert_with(|| "0.3".to_string());
-            self.params
-                .entry("fallback_basis".to_string())
-                .or_insert_with(|| "quadratic".to_string());
-            self.params
-                .entry("classes".to_string())
-                .or_insert_with(|| "3".to_string());
+            #[cfg(feature = "adaptive-models")]
+            {
+                let (features, feature_columns) = feature_matrix_from_frame(x)?;
+                let labels = remap_three_class_labels(y)?;
+                ensure_label_count("online_hoeffding", features.nrows(), labels.len())?;
+                validate_hoeffding_fallback_basis_param(&self.params)?;
+                let config = self.config()?;
+                let rows = (0..features.nrows())
+                    .map(|row_idx| features.row(row_idx).iter().copied().collect::<Vec<_>>())
+                    .collect::<Vec<_>>();
 
-            let (fallback_scaler, fallback_weights, fallback_bias) =
-                fit_fallback_online_committee(&features, &labels, &self.params)?;
+                let mut committee_json = Vec::with_capacity(3);
+                let mut committees = Vec::with_capacity(3);
 
-            self.params
-                .insert("artifact_mode".to_string(), "committee_hybrid".to_string());
-            self.feature_columns = feature_columns;
-            self.dataset_rows = features.nrows();
-            self.committee_json = committee_json;
-            self.committee_runtime_ready = true;
-            self.fallback_scaler = Some(fallback_scaler);
-            self.fallback_weights = Some(fallback_weights);
-            self.fallback_bias = Some(fallback_bias);
-            self.committees = committees;
-            Ok(())
-        }
+                for class_idx in 0..3 {
+                    let binary_targets = labels_to_binary_targets(&labels, class_idx);
+                    let mut committee = SGBT::with_loss(config.clone(), LogisticLoss);
+                    for (features, target) in rows.iter().zip(binary_targets.iter()) {
+                        committee.train_one(&Sample::new(features.clone(), *target));
+                    }
+
+                    let payload = save_model_with(&committee, LossType::Logistic)
+                        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                    let runtime =
+                        load_model(&payload).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                    committee_json.push(payload);
+                    committees.push(runtime);
+                }
+
+                // Establish the fallback basis/blend/classes params BEFORE fitting so
+                // the fitted weight matrix matches the basis the runtime validator
+                // recomputes from these params (otherwise it is built linear (3×F)
+                // but validated against the quadratic expansion (3×2F) → mismatch).
+                self.params
+                    .entry("fallback_blend_weight".to_string())
+                    .or_insert_with(|| "0.3".to_string());
+                self.params
+                    .entry("fallback_basis".to_string())
+                    .or_insert_with(|| "quadratic".to_string());
+                self.params
+                    .entry("classes".to_string())
+                    .or_insert_with(|| "3".to_string());
+
+                let (fallback_scaler, fallback_weights, fallback_bias) =
+                    fit_fallback_online_committee(&features, &labels, &self.params)?;
+
+                self.params
+                    .insert("artifact_mode".to_string(), "committee_hybrid".to_string());
+                self.feature_columns = feature_columns;
+                self.dataset_rows = features.nrows();
+                self.committee_json = committee_json;
+                self.committee_runtime_ready = true;
+                self.fallback_scaler = Some(fallback_scaler);
+                self.fallback_weights = Some(fallback_weights);
+                self.fallback_bias = Some(fallback_bias);
+                self.committees = committees;
+                Ok(())
+            }
+        })
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| {
         #[cfg(not(feature = "adaptive-models"))]
         {
             let fallback_basis = hoeffding_fallback_basis(&self.params);
             ensure_feature_columns_match(&self.feature_columns, x)?;
-            let (features, _) = feature_matrix_from_dataframe(x)?;
+            let (features, _) = feature_matrix_from_frame(x)?;
             let scaler = self
                 .fallback_scaler
                 .as_ref()
@@ -1243,13 +1239,13 @@ impl ExpertModel for OnlineHoeffdingExpert {
                 .fallback_bias
                 .as_ref()
                 .context("online_hoeffding fallback bias missing")?;
-            Ok(softmax_rows(&fallback_logits(
+            softmax_rows(&fallback_logits(
                 &features,
                 scaler,
                 weights,
                 bias,
                 fallback_basis,
-            )?))
+            )?)
         }
 
         #[cfg(feature = "adaptive-models")]
@@ -1257,13 +1253,13 @@ impl ExpertModel for OnlineHoeffdingExpert {
             let fallback_basis = hoeffding_fallback_basis(&self.params);
             ensure_feature_columns_match(&self.feature_columns, x)?;
             let fallback_blend_weight = hoeffding_fallback_blend_weight(&self.params)?;
-            let (features, _) = feature_matrix_from_dataframe(x)?;
+            let (features, _) = feature_matrix_from_frame(x)?;
             let rows = (0..features.nrows())
                 .map(|row_idx| {
                     features
                         .row(row_idx)
                         .iter()
-                        .map(|value| *value as f64)
+                        .copied()
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
@@ -1279,7 +1275,7 @@ impl ExpertModel for OnlineHoeffdingExpert {
                 .transpose()?;
 
             if self.committees.len() == 3 {
-                let mut committee_logits = Array2::<f32>::zeros((rows.len(), 3));
+                let mut committee_logits = Array2::<f64>::zeros((rows.len(), 3));
                 let mut committee_failed = None;
                 for (row_idx, features) in rows.iter().enumerate() {
                     for (class_idx, committee) in self.committees.iter().enumerate() {
@@ -1301,18 +1297,18 @@ impl ExpertModel for OnlineHoeffdingExpert {
                             "online_hoeffding committee inference degraded to fallback model: {}",
                             err
                         );
-                        return Ok(softmax_rows(&fallback));
+                        return softmax_rows(&fallback);
                     }
                     return Err(err);
                 }
                 if let Some(fallback) = fallback {
-                    if fallback_blend_weight <= f32::EPSILON {
-                        Ok(softmax_rows(&committee_logits))
-                    } else if fallback_blend_weight >= 1.0 - f32::EPSILON {
+                    if fallback_blend_weight <= f64::EPSILON {
+                        softmax_rows(&committee_logits)
+                    } else if fallback_blend_weight >= 1.0 - f64::EPSILON {
                         warn!(
                             "online_hoeffding fallback_blend_weight is 1.0; using fallback logits only"
                         );
-                        Ok(softmax_rows(&fallback))
+                        softmax_rows(&fallback)
                     } else {
                         let committee_weight = 1.0 - fallback_blend_weight;
                         let mut blended = committee_logits;
@@ -1323,16 +1319,17 @@ impl ExpertModel for OnlineHoeffdingExpert {
                                     + fallback_blend_weight * fallback[(row, class_idx)];
                             }
                         }
-                        Ok(softmax_rows(&blended))
+                        softmax_rows(&blended)
                     }
                 } else {
-                    Ok(softmax_rows(&committee_logits))
+                    softmax_rows(&committee_logits)
                 }
             } else {
                 let fallback = fallback.context("online_hoeffding fallback model missing")?;
-                Ok(softmax_rows(&fallback))
+                softmax_rows(&fallback)
             }
         }
+        })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -1474,14 +1471,14 @@ impl OnlineHoeffdingExpert {
             None
         };
         match (has_runtime_committees, has_fallback) {
-            (true, true) if fallback_blend_weight >= 1.0 - f32::EPSILON => (
+            (true, true) if fallback_blend_weight >= 1.0 - f64::EPSILON => (
                 Some("online_hoeffding_fallback".to_string()),
                 append_runtime_degraded_reason(
                     Some("committee_blend_disabled_by_weight".to_string()),
                     gpu_cpu_fallback.clone(),
                 ),
             ),
-            (true, true) if fallback_blend_weight <= f32::EPSILON => (
+            (true, true) if fallback_blend_weight <= f64::EPSILON => (
                 Some("online_hoeffding_committee".to_string()),
                 gpu_cpu_fallback.clone(),
             ),
@@ -1496,7 +1493,7 @@ impl OnlineHoeffdingExpert {
                 Some("online_hoeffding_committee".to_string()),
                 gpu_cpu_fallback.clone(),
             ),
-            (false, true) if fallback_blend_weight >= 1.0 - f32::EPSILON => (
+            (false, true) if fallback_blend_weight >= 1.0 - f64::EPSILON => (
                 Some("online_hoeffding_fallback".to_string()),
                 append_runtime_degraded_reason(
                     Some("committee_blend_disabled_by_weight".to_string()),
@@ -1524,8 +1521,12 @@ impl OnlineHoeffdingExpert {
         }
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
         let (execution_backend, degraded_reason) = self.runtime_details();
         let mut predictions = Vec::with_capacity(probabilities.nrows());
         for row in probabilities.outer_iter() {
@@ -1707,7 +1708,7 @@ impl Default for AdaptiveGradientBooster {
     }
 }
 
-// TODO(real-data): every Series / DataFrame / committee weight vector
+// TODO(real-data): every typed feature frame / committee weight vector
 // in this test module is synthetic (zero means, unit stds, hand-picked
 // f64 sequences like vec![1.0, -1.0]). Replace each fixture with a
 // cTrader historical sample (e.g. EURUSD M15 z-scored features) and
@@ -1717,9 +1718,31 @@ impl Default for AdaptiveGradientBooster {
 mod tests {
     use super::*;
     use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
-    use polars::prelude::{DataFrame, Series};
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+    use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn typed_frame(columns: Vec<(&str, Vec<f64>)>) -> Result<FeatureFrame> {
+        let rows = columns.first().map_or(0, |(_, values)| values.len());
+        let columns = columns
+            .into_iter()
+            .map(|(name, values)| {
+                FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+    }
+
+    fn one_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker is valid");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("isolated adaptive-model test lease")
+    }
 
     fn temp_model_dir(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
@@ -1775,16 +1798,13 @@ mod tests {
             "degraded load should preserve committee provenance"
         );
 
-        let frame = DataFrame::new(vec![
-            Series::new("f1".into(), vec![1.0_f64, -1.0]).into(),
-            Series::new("f2".into(), vec![0.5_f64, 0.25]).into(),
-        ])?;
-        let probabilities = expert.predict_proba(&frame)?;
+        let frame = typed_frame(vec![("f1", vec![1.0, -1.0]), ("f2", vec![0.5, 0.25])])?;
+        let probabilities = expert.predict_proba(&frame, &one_worker_lease())?;
 
         assert_eq!(probabilities.nrows(), 2);
         assert_eq!(probabilities.ncols(), 3);
         for row in 0..probabilities.nrows() {
-            let sum = probabilities.row(row).iter().sum::<f32>();
+            let sum = probabilities.row(row).iter().sum::<f64>();
             assert!((sum - 1.0).abs() < 1e-5);
         }
 

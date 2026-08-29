@@ -1,31 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::volume_adjusted_ma_wrapper::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaVolumeAdjustedMa;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
 
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use std::arch::is_x86_feature_detected;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -103,10 +81,6 @@ pub struct VolumeAdjustedMaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VolumeAdjustedMaParams {
     pub length: Option<usize>,
     pub vi_factor: Option<f64>,
@@ -320,9 +294,7 @@ pub enum VolumeAdjustedMaError {
     #[error("volume_adjusted_ma: Invalid vi_factor: {vi_factor}. Must be positive.")]
     InvalidViFactor { vi_factor: f64 },
 
-    #[error(
-        "volume_adjusted_ma: Data length mismatch: price = {price_len}, volume = {volume_len}"
-    )]
+    #[error("volume_adjusted_ma: Data length mismatch: price = {price_len}, volume = {volume_len}")]
     DataLengthMismatch { price_len: usize, volume_len: usize },
 
     #[error("volume_adjusted_ma: output length mismatch: expected = {expected}, got = {got}")]
@@ -1019,7 +991,6 @@ pub fn VolumeAdjustedMa_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn volume_adjusted_ma_into(
     input: &VolumeAdjustedMaInput,
@@ -1676,558 +1647,11 @@ impl VolumeAdjustedMaStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "VolumeAdjustedMa")]
-#[pyo3(signature = (data, volume, length=13, vi_factor=0.67, strict=true, sample_period=0, kernel=None))]
-pub fn volume_adjusted_ma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    vi_factor: f64,
-    strict: bool,
-    sample_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in: &[f64];
-    let volume_in: &[f64];
-    let owned_price;
-    let owned_vol;
-    let try_price = data.as_slice();
-    let try_vol = volume.as_slice();
-    match (try_price, try_vol) {
-        (Ok(p), Ok(v)) => {
-            slice_in = p;
-            volume_in = v;
-        }
-        _ => {
-            owned_price = data.to_owned_array();
-            owned_vol = volume.to_owned_array();
-            slice_in = owned_price.as_slice().unwrap();
-            volume_in = owned_vol.as_slice().unwrap();
-        }
-    }
-    let kern = validate_kernel(kernel, false)?;
-    let params = VolumeAdjustedMaParams {
-        length: Some(length),
-        vi_factor: Some(vi_factor),
-        strict: Some(strict),
-        sample_period: Some(sample_period),
-    };
-    let input = VolumeAdjustedMaInput::from_slices(slice_in, volume_in, params);
-
-    let result = py
-        .allow_threads(|| VolumeAdjustedMa_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "VolumeAdjustedMa_batch")]
-#[pyo3(signature = (data, volume, length_range, vi_factor_range, sample_period_range, strict=None, kernel=None))]
-pub fn volume_adjusted_ma_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    vi_factor_range: (f64, f64, f64),
-    sample_period_range: (usize, usize, usize),
-    strict: Option<bool>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    eprintln!("[VolumeAdjustedMa_batch_py] using Vec->ndarray path (no PyArray1 prealloc)");
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let d: &[f64];
-    let v: &[f64];
-    let owned_d;
-    let owned_v;
-    match (data.as_slice(), volume.as_slice()) {
-        (Ok(dp), Ok(vp)) => {
-            d = dp;
-            v = vp;
-        }
-        _ => {
-            owned_d = data.to_owned_array();
-            owned_v = volume.to_owned_array();
-            d = owned_d.as_slice().unwrap();
-            v = owned_v.as_slice().unwrap();
-        }
-    }
-    if d.len() != v.len() {
-        return Err(PyValueError::new_err("price and volume length mismatch"));
-    }
-
-    let sweep = VolumeAdjustedMaBatchRange {
-        length: length_range,
-        vi_factor: vi_factor_range,
-        sample_period: sample_period_range,
-        strict,
-    };
-
-    let combos = expand_grid_VolumeAdjustedMa(&sweep);
-    let rows = combos.len();
-    let cols = d.len();
-    if rows == 0 || cols == 0 {
-        return Err(PyValueError::new_err("empty grid or data"));
-    }
-
-    let first = d
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| PyValueError::new_err("all data values are NaN"))?;
-    let mut buf = vec![f64::NAN; rows * cols];
-
-    let kern = validate_kernel(kernel, true)?;
-    let batch = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        other => other,
-    };
-    let simd = match batch {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => unreachable!(),
-    };
-
-    py.allow_threads(|| VolumeAdjustedMa_batch_inner_into(d, v, &combos, first, simd, &mut buf))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    use numpy::PyArray2;
-
-    let arr2 = ndarray::Array2::from_shape_vec((rows, cols), buf)
-        .map_err(|_| PyValueError::new_err("failed to build output array"))?;
-    let out_arr2 = arr2.into_pyarray(py);
-    dict.set_item("values", out_arr2)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "vi_factors",
-        combos
-            .iter()
-            .map(|p| p.vi_factor.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "sample_periods",
-        combos
-            .iter()
-            .map(|p| p.sample_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "stricts",
-        combos
-            .iter()
-            .map(|p| p.strict.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "volume_adjusted_ma_cuda_batch_dev")]
-#[pyo3(signature = (price_f32, volume_f32, length_range, vi_factor_range, sample_period_range, strict=None, device_id=0))]
-pub fn volume_adjusted_ma_cuda_batch_dev_py(
-    py: Python<'_>,
-    price_f32: numpy::PyReadonlyArray1<'_, f32>,
-    volume_f32: numpy::PyReadonlyArray1<'_, f32>,
-    length_range: (usize, usize, usize),
-    vi_factor_range: (f64, f64, f64),
-    sample_period_range: (usize, usize, usize),
-    strict: Option<bool>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let prices = price_f32.as_slice()?;
-    let volumes = volume_f32.as_slice()?;
-    if prices.len() != volumes.len() {
-        return Err(PyValueError::new_err("price and volume length mismatch"));
-    }
-
-    let sweep = VolumeAdjustedMaBatchRange {
-        length: length_range,
-        vi_factor: vi_factor_range,
-        sample_period: sample_period_range,
-        strict,
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVolumeAdjustedMa::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .volume_adjusted_ma_batch_dev(prices, volumes, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "volume_adjusted_ma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (price_tm_f32, volume_tm_f32, length, vi_factor, strict=true, sample_period=0, device_id=0))]
-pub fn volume_adjusted_ma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    price_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    volume_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    length: usize,
-    vi_factor: f64,
-    strict: bool,
-    sample_period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let price_slice = price_tm_f32.as_slice()?;
-    let volume_slice = volume_tm_f32.as_slice()?;
-
-    let shape = price_tm_f32.shape();
-    if shape != volume_tm_f32.shape() {
-        return Err(PyValueError::new_err(
-            "price and volume tensors must share the same shape",
-        ));
-    }
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D arrays (time, series)"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-
-    let params = VolumeAdjustedMaParams {
-        length: Some(length),
-        vi_factor: Some(vi_factor),
-        strict: Some(strict),
-        sample_period: Some(sample_period),
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVolumeAdjustedMa::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .volume_adjusted_ma_many_series_one_param_time_major_dev(
-                price_slice,
-                volume_slice,
-                cols,
-                rows,
-                &params,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VolumeAdjustedMaStream")]
-pub struct VolumeAdjustedMaStreamPy {
-    stream: VolumeAdjustedMaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VolumeAdjustedMaStreamPy {
-    #[new]
-    fn new(length: usize, vi_factor: f64, strict: bool, sample_period: usize) -> PyResult<Self> {
-        let s = VolumeAdjustedMaStream::try_new(VolumeAdjustedMaParams {
-            length: Some(length),
-            vi_factor: Some(vi_factor),
-            strict: Some(strict),
-            sample_period: Some(sample_period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream: s })
-    }
-    fn update(&mut self, price: f64, volume: f64) -> Option<f64> {
-        self.stream.update(price, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_VolumeAdjustedMa_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(volume_adjusted_ma_py, m)?)?;
-    m.add_function(wrap_pyfunction!(volume_adjusted_ma_batch_py, m)?)?;
-    m.add_class::<VolumeAdjustedMaStreamPy>()?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(volume_adjusted_ma_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(
-            volume_adjusted_ma_cuda_many_series_one_param_dev_py,
-            m
-        )?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VolumeAdjustedMaJsResult {
-    pub values: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_js(
-    data: &[f64],
-    volume: &[f64],
-    length: usize,
-    vi_factor: f64,
-    strict: bool,
-    sample_period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = VolumeAdjustedMaParams {
-        length: Some(length),
-        vi_factor: Some(vi_factor),
-        strict: Some(strict),
-        sample_period: Some(sample_period),
-    };
-    let input = VolumeAdjustedMaInput::from_slices(data, volume, params);
-
-    VolumeAdjustedMa(&input)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_unified_js(
-    data: &[f64],
-    volume: &[f64],
-    length: Option<usize>,
-    vi_factor: Option<f64>,
-    strict: Option<bool>,
-    sample_period: Option<usize>,
-) -> Result<JsValue, JsValue> {
-    let params = VolumeAdjustedMaParams {
-        length,
-        vi_factor,
-        strict,
-        sample_period,
-    };
-    let input = VolumeAdjustedMaInput::from_slices(data, volume, params);
-
-    VolumeAdjustedMa(&input)
-        .map(|output| {
-            serde_wasm_bindgen::to_value(&VolumeAdjustedMaJsResult {
-                values: output.values,
-            })
-            .unwrap()
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_into(
-    price_ptr: *const f64,
-    vol_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    vi_factor: f64,
-    strict: bool,
-    sample_period: usize,
-) -> Result<(), JsValue> {
-    if price_ptr.is_null() || vol_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(price_ptr, len);
-        let vol = std::slice::from_raw_parts(vol_ptr, len);
-        let params = VolumeAdjustedMaParams {
-            length: Some(length),
-            vi_factor: Some(vi_factor),
-            strict: Some(strict),
-            sample_period: Some(sample_period),
-        };
-        let input = VolumeAdjustedMaInput::from_slices(data, vol, params);
-
-        let aliased = out_ptr as *const f64 == price_ptr || out_ptr as *const f64 == vol_ptr;
-        if aliased {
-            let mut tmp = vec![0.0; len];
-            VolumeAdjustedMa_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            VolumeAdjustedMa_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VolumeAdjustedMaBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub vi_factor_range: (f64, f64, f64),
-    pub sample_period_range: (usize, usize, usize),
-    pub strict: Option<bool>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VolumeAdjustedMaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<VolumeAdjustedMaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_batch(
-    data: &[f64],
-    volume: &[f64],
-    cfg: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: VolumeAdjustedMaBatchConfig = serde_wasm_bindgen::from_value(cfg)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = VolumeAdjustedMaBatchRange {
-        length: cfg.length_range,
-        vi_factor: cfg.vi_factor_range,
-        sample_period: cfg.sample_period_range,
-        strict: cfg.strict,
-    };
-    let out = VolumeAdjustedMa_batch_with_kernel(data, volume, &sweep, detect_best_batch_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&VolumeAdjustedMaBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_batch_into(
-    price_ptr: *const f64,
-    vol_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    vf_start: f64,
-    vf_end: f64,
-    vf_step: f64,
-    sp_start: usize,
-    sp_end: usize,
-    sp_step: usize,
-    strict: Option<bool>,
-) -> Result<usize, JsValue> {
-    if price_ptr.is_null() || vol_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to VolumeAdjustedMa_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(price_ptr, len);
-        let vol = std::slice::from_raw_parts(vol_ptr, len);
-        let sweep = VolumeAdjustedMaBatchRange {
-            length: (length_start, length_end, length_step),
-            vi_factor: (vf_start, vf_end, vf_step),
-            sample_period: (sp_start, sp_end, sp_step),
-            strict,
-        };
-        let combos = expand_grid_VolumeAdjustedMa(&sweep);
-        let rows = combos.len();
-        let cols = len;
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-        let simd = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-        let first = data
-            .iter()
-            .position(|x| !x.is_nan())
-            .ok_or_else(|| JsValue::from_str("all data values are NaN"))?;
-        VolumeAdjustedMa_batch_inner_into(data, vol, &combos, first, simd, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_output_into_js(
-    data: &[f64],
-    volume: &[f64],
-    length: usize,
-    vi_factor: f64,
-    strict: bool,
-    sample_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = volume_adjusted_ma_js(data, volume, length, vi_factor, strict, sample_period)?;
-    crate::write_wasm_f64_output("volume_adjusted_ma_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_adjusted_ma_unified_output_into_js(
-    data: &[f64],
-    volume: &[f64],
-    length: Option<usize>,
-    vi_factor: Option<f64>,
-    strict: Option<bool>,
-    sample_period: Option<usize>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value =
-        volume_adjusted_ma_unified_js(data, volume, length, vi_factor, strict, sample_period)?;
-    crate::write_wasm_object_f64_outputs("volume_adjusted_ma_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     #[cfg(feature = "proptest")]
@@ -2238,8 +1662,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = VolumeAdjustedMaInput::from_candles(
             &candles,
@@ -2275,8 +1699,8 @@ mod tests {
 
     fn check_VolumeAdjustedMa_slow(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = VolumeAdjustedMaParams {
             length: Some(55),
@@ -2317,8 +1741,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = VolumeAdjustedMaInput::with_default_candles(&c);
         let out = VolumeAdjustedMa_with_kernel(&input, kernel)?;
         assert_eq!(out.values.len(), c.close.len());
@@ -2331,8 +1755,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = VolumeAdjustedMaInput::with_default_candles(&c);
         let out = VolumeAdjustedMa_with_kernel(&input, kernel)?;
         for (i, &v) in out.values.iter().enumerate() {
@@ -2364,8 +1788,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let p = VolumeAdjustedMaParams::default();
         let batch = VolumeAdjustedMa_with_kernel(
             &VolumeAdjustedMaInput::from_candles(&c, "close", p.clone()),
@@ -2483,8 +1907,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = VolumeAdjustedMaParams {
             length: Some(20),
@@ -2517,13 +1941,8 @@ mod tests {
         let expected = VolumeAdjustedMa(&input)?.values;
 
         let mut out = vec![0.0f64; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             volume_adjusted_ma_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            VolumeAdjustedMa_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(out.len(), expected.len());
@@ -2648,8 +2067,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let data = &candles.close[..100];
         let volume = &candles.volume[..100];
 
@@ -2678,8 +2097,8 @@ mod tests {
 
     fn check_batch_sweep(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let data = &candles.close[..50];
         let volume = &candles.volume[..50];
 
@@ -2709,8 +2128,8 @@ mod tests {
 
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let data = &candles.close[..100];
         let volume = &candles.volume[..100];
 
@@ -2884,8 +2303,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let out = VolumeAdjustedMaBatchBuilder::new()
             .kernel(kernel)
@@ -2921,8 +2340,8 @@ mod tests {
 
     fn check_builder_apply_default(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = VolumeAdjustedMaBuilder::new().kernel(kernel).apply(&c)?;
         assert_eq!(out.values.len(), c.close.len());
         Ok(())
@@ -2930,8 +2349,8 @@ mod tests {
 
     fn check_batch_slice_vs_par(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let data = &c.close[..64];
         let vol = &c.volume[..64];
         let sweep = VolumeAdjustedMaBatchRange::default();

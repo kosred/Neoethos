@@ -1,10 +1,10 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
+use crate::cuda::moving_averages::CudaEmaError;
 use crate::cuda::moving_averages::ema_wrapper::{
     BatchKernelPolicy as EmaBatchKernelPolicy, CudaEmaPolicy as EmaCudaPolicy,
     ManySeriesKernelPolicy as EmaManySeriesKernelPolicy,
 };
-use crate::cuda::moving_averages::CudaEmaError;
 use crate::cuda::moving_averages::{CudaEma, CudaSma};
 use crate::indicators::moving_averages::ema::EmaParams;
 
@@ -16,8 +16,8 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -132,10 +132,8 @@ impl CudaPpo {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/ppo_kernel.ptx"));
         let module = crate::load_cuda_embedded_module!("ppo_kernel")?;
 
-        let ema_ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/ema_kernel.ptx"));
         let ema_module = crate::load_cuda_embedded_module!("ema_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;

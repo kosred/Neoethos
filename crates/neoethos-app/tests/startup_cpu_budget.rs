@@ -18,6 +18,9 @@ fn headless_app_installs_budget_before_building_tokio_runtime() {
     let load = source
         .find("Settings::from_yaml")
         .expect("startup loads the operator config synchronously");
+    let source_seal = source
+        .find("initialize_source_seal_before_runtime")
+        .expect("startup installs SourceSeal signal ownership synchronously");
     let install = source
         .find("install_process_budget")
         .expect("startup installs the one process CPU budget");
@@ -30,7 +33,13 @@ fn headless_app_installs_budget_before_building_tokio_runtime() {
     let run = source
         .find("block_on")
         .expect("the synchronous entrypoint enters the managed runtime");
-    assert!(load < install && install < logging && logging < runtime && runtime < run);
+    assert!(
+        source_seal < load
+            && load < install
+            && install < logging
+            && logging < runtime
+            && runtime < run
+    );
 }
 
 #[test]
@@ -69,7 +78,8 @@ fn headless_app_runtime_uses_the_resolved_parent_cap() {
     assert!(stderr.contains(&format!("effective_worker_limit={expected}")));
     assert!(stderr.contains(&format!("runtime_worker_threads={expected}")));
     assert!(stderr.contains(
-        "events=configuration_loaded,parent_cpu_cap_parsed,cpu_budget_resolved,\
+        "events=import_signal_preflight_completed,configuration_loaded,\
+         parent_cpu_cap_parsed,cpu_budget_resolved,\
          cpu_budget_installed,runtime_settings_installed,tokio_runtime_built"
     ));
 }

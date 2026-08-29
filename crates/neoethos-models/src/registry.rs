@@ -20,6 +20,30 @@
 
 use crate::runtime::capabilities::{ModelCapability, ModelFamily, model_capability};
 
+/// Every named production surface reachable through the normal `gpu-cuda`
+/// build whose training implementation can execute NVIDIA CUDA work.
+///
+/// This is a census, not a promise that every model prefers CUDA under the
+/// current runtime settings. LightGBM has a separate operator opt-in and the
+/// statistical models ship with an explicit CPU policy.
+pub const CUDA_CAPABLE_MODEL_NAMES: &[&str] = &[
+    "catboost",
+    "catboost_alt",
+    "conformal_gate",
+    "dqn",
+    "elasticnet",
+    "lightgbm",
+    "logistic",
+    "meta_blender",
+    "meta_stack",
+    "neat",
+    "neuro_evo",
+    "probability_calibrator",
+    "xgboost",
+    "xgboost_dart",
+    "xgboost_rf",
+];
+
 /// Resolve the capability record for a known model name.
 ///
 /// LIVE: `runtime::dispatch::build_dispatch_plan` calls this for every model
@@ -30,43 +54,88 @@ pub fn get_model_capability(name: &str) -> Option<ModelCapability> {
 
 /// Whether this build contains a GPU code path that `name` can actually use.
 ///
-/// NOT WIRED YET — held deliberately. This is a correct per-model capability
-/// table (it reads the real Cargo features, so it cannot drift from what was
-/// compiled), and task #35's per-model "device self-report" on the training
-/// summary is exactly the consumer it lacks. Until that lands, the operator
-/// has no way to see that e.g. the DQN's CUDA path is compiled but the Deep
-/// models' is not. Deleting the table would delete the answer as well as the
-/// missing question.
+/// The full-NVIDIA training preflight consumes this table before launching any
+/// model. It reads the real Cargo features, so a build cannot advertise a CUDA
+/// implementation that was not compiled. Runtime artifacts and training
+/// summaries then record the requested/effective device selected by each
+/// model's own strict execution boundary.
 ///
 /// Do not add an `#[allow(dead_code)]` here if a caller disappears — either
 /// wire it or delete it.
 pub fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
     match name {
         "lightgbm" => cfg!(feature = "lightgbm-gpu"),
-        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
+        "xgboost"
+        | "xgboost_rf"
+        | "xgboost_dart"
+        | "meta_blender"
+        | "probability_calibrator"
+        | "conformal_gate"
+        | "meta_stack" => cfg!(feature = "xgboost"),
         "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
         "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
-        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
-        "sac" => cfg!(feature = "burn-wgpu-backend"),
+        "neat" | "neuro_evo" => cfg!(feature = "neuro-evolution-gpu"),
+        "logistic" | "elasticnet" => cfg!(feature = "statistical-gpu"),
+        // SAC runs on the selected Burn GPU backend (like Deep/Exit), not the
+        // rlkit/Candle DQN path.
+        "sac" => cfg!(any(
+            feature = "burn-wgpu-backend",
+            feature = "burn-cuda-backend"
+        )),
         _ => match family {
-            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
+            ModelFamily::Deep | ModelFamily::Exit => cfg!(any(
+                feature = "burn-wgpu-backend",
+                feature = "burn-cuda-backend"
+            )),
             _ => false,
         },
     }
 }
 
 /// Whether the GPU path is the one this model SHOULD take when a card is
-/// present. Same hold as [`supports_gpu_for_model`] — see its note.
+/// present under the installed runtime policy.
 pub fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
     match name {
-        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
-        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
+        "lightgbm" => {
+            cfg!(feature = "lightgbm-gpu")
+                && crate::tree_models::config::lightgbm_gpu_allowed()
+                && !matches!(
+                    crate::common::parse_cuda_device_policy(
+                        &crate::tree_models::config::current_tree_runtime().device
+                    ),
+                    Ok(crate::common::CudaDevicePolicy::Cpu) | Err(_)
+                )
+        }
+        "xgboost"
+        | "xgboost_rf"
+        | "xgboost_dart"
+        | "meta_blender"
+        | "probability_calibrator"
+        | "conformal_gate"
+        | "meta_stack" => cfg!(feature = "xgboost"),
         "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
         "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
-        // SAC runs on the Burn backend (like Deep/Exit), not rlkit/CUDA.
-        "sac" => cfg!(feature = "burn-wgpu-backend"),
+        "neat" | "neuro_evo" => cfg!(feature = "neuro-evolution-gpu"),
+        "logistic" | "elasticnet" => {
+            cfg!(feature = "statistical-gpu")
+                && !matches!(
+                    crate::common::parse_cuda_device_policy(
+                        crate::statistical::common::configured_statistical_device()
+                    ),
+                    Ok(crate::common::CudaDevicePolicy::Cpu) | Err(_)
+                )
+        }
+        // SAC runs on the selected Burn GPU backend (like Deep/Exit), not the
+        // rlkit/Candle DQN path.
+        "sac" => cfg!(any(
+            feature = "burn-wgpu-backend",
+            feature = "burn-cuda-backend"
+        )),
         _ => match family {
-            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
+            ModelFamily::Deep | ModelFamily::Exit => cfg!(any(
+                feature = "burn-wgpu-backend",
+                feature = "burn-cuda-backend"
+            )),
             _ => false,
         },
     }
@@ -199,10 +268,9 @@ mod tests {
             };
             let supports = supports_gpu_for_model(&capability.name, capability.family);
             let prefers = prefers_gpu_for_model(&capability.name, capability.family);
-            assert_eq!(
-                supports, prefers,
-                "{name}: supports/prefers diverged — a model that can use the card but \
-                 should not, or vice versa, needs its own documented reason"
+            assert!(
+                !prefers || supports,
+                "{name}: a model cannot prefer a GPU path absent from this build"
             );
         }
 
@@ -214,15 +282,59 @@ mod tests {
             supports_gpu_for_model("dqn", ModelFamily::Rl),
             cfg!(feature = "reinforcement-learning-cuda")
         );
+        for (name, family) in [
+            ("mlp", ModelFamily::Deep),
+            ("exit_agent", ModelFamily::Exit),
+            ("sac", ModelFamily::Rl),
+        ] {
+            let burn_gpu_compiled = cfg!(any(
+                feature = "burn-wgpu-backend",
+                feature = "burn-cuda-backend"
+            ));
+            assert_eq!(
+                supports_gpu_for_model(name, family),
+                burn_gpu_compiled,
+                "{name} must report every compiled Burn GPU backend"
+            );
+            assert_eq!(
+                prefers_gpu_for_model(name, family),
+                burn_gpu_compiled,
+                "{name} must prefer the explicitly compiled Burn GPU backend"
+            );
+        }
         assert_eq!(
-            supports_gpu_for_model("mlp", ModelFamily::Deep),
-            cfg!(feature = "burn-wgpu-backend")
+            supports_gpu_for_model("logistic", ModelFamily::Meta),
+            cfg!(feature = "statistical-gpu")
         );
-        // Meta / Adaptive / Anomaly families have no GPU lane in any build.
-        assert!(!supports_gpu_for_model("logistic", ModelFamily::Meta));
+        assert!(
+            !prefers_gpu_for_model("logistic", ModelFamily::Meta),
+            "the shipped statistical_device=cpu policy must remain an explicit opt-out"
+        );
+        assert!(
+            !prefers_gpu_for_model("lightgbm", ModelFamily::Tree),
+            "the shipped lightgbm_gpu=false gate must remain an explicit opt-out"
+        );
+        // Adaptive / Anomaly families have no GPU lane in any build.
         assert!(!supports_gpu_for_model(
             "isolation_forest",
             ModelFamily::Anomaly
         ));
+
+        for name in CUDA_CAPABLE_MODEL_NAMES {
+            let capability = get_model_capability(name)
+                .unwrap_or_else(|| panic!("CUDA census name `{name}` lacks a capability"));
+            assert_eq!(
+                supports_gpu_for_model(name, capability.family),
+                match *name {
+                    "lightgbm" => cfg!(feature = "lightgbm-gpu"),
+                    "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
+                    "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
+                    "neat" | "neuro_evo" => cfg!(feature = "neuro-evolution-gpu"),
+                    "logistic" | "elasticnet" => cfg!(feature = "statistical-gpu"),
+                    _ => cfg!(feature = "xgboost"),
+                },
+                "CUDA census feature mapping drifted for {name}"
+            );
+        }
     }
 }

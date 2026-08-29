@@ -1,58 +1,11 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn polynomial_regression_extrapolation_output_into_js(
-    data: &[f64],
-    length: usize,
-    extrapolate: usize,
-    degree: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = polynomial_regression_extrapolation_js(data, length, extrapolate, degree)?;
-    crate::write_wasm_f64_output(
-        "polynomial_regression_extrapolation_output_into_js",
-        &values,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn polynomial_regression_extrapolation_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = polynomial_regression_extrapolation_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "polynomial_regression_extrapolation_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
 
 #[cfg(test)]
 use std::error::Error as StdError;
@@ -89,10 +42,6 @@ pub struct PolynomialRegressionExtrapolationOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct PolynomialRegressionExtrapolationParams {
     pub length: Option<usize>,
     pub extrapolate: Option<usize>,
@@ -603,7 +552,6 @@ pub fn polynomial_regression_extrapolation_with_kernel(
     Ok(PolynomialRegressionExtrapolationOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn polynomial_regression_extrapolation_into(
     input: &PolynomialRegressionExtrapolationInput,
@@ -1115,311 +1063,10 @@ fn polynomial_regression_extrapolation_batch_inner_into(
     Ok(specs.into_iter().map(|spec| spec.params).collect())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "polynomial_regression_extrapolation")]
-#[pyo3(signature = (data, length=DEFAULT_LENGTH, extrapolate=DEFAULT_EXTRAPOLATE, degree=DEFAULT_DEGREE, kernel=None))]
-pub fn polynomial_regression_extrapolation_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    extrapolate: usize,
-    degree: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = PolynomialRegressionExtrapolationInput::from_slice(
-        slice_in,
-        PolynomialRegressionExtrapolationParams {
-            length: Some(length),
-            extrapolate: Some(extrapolate),
-            degree: Some(degree),
-        },
-    );
-    let values = py
-        .allow_threads(|| {
-            polynomial_regression_extrapolation_with_kernel(&input, kern)
-                .map(|output| output.values)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "polynomial_regression_extrapolation_batch")]
-#[pyo3(signature = (data, length_range=(DEFAULT_LENGTH, DEFAULT_LENGTH, 0), extrapolate_range=(DEFAULT_EXTRAPOLATE, DEFAULT_EXTRAPOLATE, 0), degree_range=(DEFAULT_DEGREE, DEFAULT_DEGREE, 0), kernel=None))]
-pub fn polynomial_regression_extrapolation_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    extrapolate_range: (usize, usize, usize),
-    degree_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = PolynomialRegressionExtrapolationBatchRange {
-        length: length_range,
-        extrapolate: extrapolate_range,
-        degree: degree_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-    let combos = py
-        .allow_threads(|| {
-            let batch_kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            let simd = match batch_kernel {
-                Kernel::ScalarBatch | Kernel::Avx2Batch | Kernel::Avx512Batch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            polynomial_regression_extrapolation_batch_inner_into(
-                slice_in, &sweep, simd, true, slice_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|params| params.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "extrapolates",
-        combos
-            .iter()
-            .map(|params| params.extrapolate.unwrap_or(DEFAULT_EXTRAPOLATE) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "degrees",
-        combos
-            .iter()
-            .map(|params| params.degree.unwrap_or(DEFAULT_DEGREE) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "PolynomialRegressionExtrapolationStream")]
-pub struct PolynomialRegressionExtrapolationStreamPy {
-    inner: PolynomialRegressionExtrapolationStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PolynomialRegressionExtrapolationStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, extrapolate=DEFAULT_EXTRAPOLATE, degree=DEFAULT_DEGREE))]
-    pub fn new(length: usize, extrapolate: usize, degree: usize) -> PyResult<Self> {
-        let inner = PolynomialRegressionExtrapolationStream::try_new(
-            PolynomialRegressionExtrapolationParams {
-                length: Some(length),
-                extrapolate: Some(extrapolate),
-                degree: Some(degree),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PolynomialRegressionExtrapolationBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub extrapolate_range: (usize, usize, usize),
-    pub degree_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PolynomialRegressionExtrapolationBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<PolynomialRegressionExtrapolationParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn polynomial_regression_extrapolation_js(
-    data: &[f64],
-    length: usize,
-    extrapolate: usize,
-    degree: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let input = PolynomialRegressionExtrapolationInput::from_slice(
-        data,
-        PolynomialRegressionExtrapolationParams {
-            length: Some(length),
-            extrapolate: Some(extrapolate),
-            degree: Some(degree),
-        },
-    );
-    let mut out = vec![0.0; data.len()];
-    polynomial_regression_extrapolation_into_slice(&mut out, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn polynomial_regression_extrapolation_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn polynomial_regression_extrapolation_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn polynomial_regression_extrapolation_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    extrapolate: usize,
-    degree: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = PolynomialRegressionExtrapolationInput::from_slice(
-            data,
-            PolynomialRegressionExtrapolationParams {
-                length: Some(length),
-                extrapolate: Some(extrapolate),
-                degree: Some(degree),
-            },
-        );
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            polynomial_regression_extrapolation_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            polynomial_regression_extrapolation_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = polynomial_regression_extrapolation_batch)]
-pub fn polynomial_regression_extrapolation_batch_unified_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: PolynomialRegressionExtrapolationBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = PolynomialRegressionExtrapolationBatchRange {
-        length: config.length_range,
-        extrapolate: config.extrapolate_range,
-        degree: config.degree_range,
-    };
-    let output = polynomial_regression_extrapolation_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js_output = PolynomialRegressionExtrapolationBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn polynomial_regression_extrapolation_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    extrapolate_start: usize,
-    extrapolate_end: usize,
-    extrapolate_step: usize,
-    degree_start: usize,
-    degree_end: usize,
-    degree_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = PolynomialRegressionExtrapolationBatchRange {
-        length: (length_start, length_end, length_step),
-        extrapolate: (extrapolate_start, extrapolate_end, extrapolate_step),
-        degree: (degree_start, degree_end, degree_step),
-    };
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*len overflow"))?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        polynomial_regression_extrapolation_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Scalar,
-            false,
-            out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
 
     fn assert_series_close(actual: &[f64], expected: &[f64], tol: f64) {
@@ -1715,7 +1362,7 @@ mod tests {
     #[test]
     fn polynomial_regression_extrapolation_default_candles_smoke() -> Result<(), Box<dyn StdError>>
     {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let input = PolynomialRegressionExtrapolationInput::with_default_candles(&candles);
         let output = polynomial_regression_extrapolation(&input)?;
         assert_eq!(output.values.len(), candles.close.len());

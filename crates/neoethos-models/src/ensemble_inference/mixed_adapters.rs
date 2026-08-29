@@ -45,10 +45,11 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use polars::prelude::DataFrame;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 
 use super::tree_adapters::classification3_per_row;
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, project_expert_frame};
 use crate::anomaly::IsolationForestExpert;
 use crate::base::ExpertModel as BaseExpertModel;
 use crate::runtime::capabilities::ModelFamily;
@@ -85,10 +86,11 @@ impl ExpertModel for OnlinePaAdapter {
     fn feature_columns(&self) -> &[String] {
         &self.inner.feature_columns
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "online_pa predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -144,10 +146,11 @@ impl ExpertModel for OnlineHoeffdingAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "online_hoeffding predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -214,10 +217,11 @@ impl ExpertModel for IsolationForestAdapter {
     fn feature_columns(&self) -> &[String] {
         &self.inner.feature_columns
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .with_context(|| "isolation_forest predict_proba failed")?;
         classification3_per_row(&probs)
     }

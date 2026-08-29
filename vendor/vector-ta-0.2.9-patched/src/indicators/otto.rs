@@ -1,43 +1,25 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
-use crate::indicators::cmo::{cmo, CmoData, CmoInput, CmoParams};
-use crate::indicators::moving_averages::dema::{dema, DemaData, DemaInput, DemaParams};
-use crate::indicators::moving_averages::ema::{ema, EmaData, EmaInput, EmaParams};
-use crate::indicators::moving_averages::hma::{hma, HmaData, HmaInput, HmaParams};
-use crate::indicators::moving_averages::linreg::{linreg, LinRegData, LinRegInput, LinRegParams};
-use crate::indicators::moving_averages::sma::{sma, SmaData, SmaInput, SmaParams};
-use crate::indicators::moving_averages::trima::{trima, TrimaData, TrimaInput, TrimaParams};
-use crate::indicators::moving_averages::wma::{wma, WmaData, WmaInput, WmaParams};
-use crate::indicators::moving_averages::zlema::{zlema, ZlemaData, ZlemaInput, ZlemaParams};
-use crate::indicators::tsf::{tsf, TsfData, TsfInput, TsfParams};
+use crate::indicators::cmo::{CmoData, CmoInput, CmoParams, cmo};
+use crate::indicators::moving_averages::dema::{DemaData, DemaInput, DemaParams, dema};
+use crate::indicators::moving_averages::ema::{EmaData, EmaInput, EmaParams, ema};
+use crate::indicators::moving_averages::hma::{HmaData, HmaInput, HmaParams, hma};
+use crate::indicators::moving_averages::linreg::{LinRegData, LinRegInput, LinRegParams, linreg};
+use crate::indicators::moving_averages::sma::{SmaData, SmaInput, SmaParams, sma};
+use crate::indicators::moving_averages::trima::{TrimaData, TrimaInput, TrimaParams, trima};
+use crate::indicators::moving_averages::wma::{WmaData, WmaInput, WmaParams, wma};
+use crate::indicators::moving_averages::zlema::{ZlemaData, ZlemaInput, ZlemaParams, zlema};
+use crate::indicators::tsf::{TsfData, TsfInput, TsfParams, tsf};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
@@ -72,10 +54,6 @@ pub struct OttoOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct OttoParams {
     pub ott_period: Option<usize>,
     pub ott_percent: Option<f64>,
@@ -1615,7 +1593,6 @@ pub fn otto(input: &OttoInput) -> Result<OttoOutput, OttoError> {
     otto_with_kernel(input, Kernel::Scalar)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn otto_into(
     input: &OttoInput,
@@ -2025,480 +2002,11 @@ pub fn otto_batch_with_kernel(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "otto")]
-#[pyo3(signature = (data, ott_period, ott_percent, fast_vidya_length, slow_vidya_length, correcting_constant, ma_type, kernel=None))]
-pub fn otto_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    ott_period: usize,
-    ott_percent: f64,
-    fast_vidya_length: usize,
-    slow_vidya_length: usize,
-    correcting_constant: f64,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArray1};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = OttoParams {
-        ott_period: Some(ott_period),
-        ott_percent: Some(ott_percent),
-        fast_vidya_length: Some(fast_vidya_length),
-        slow_vidya_length: Some(slow_vidya_length),
-        correcting_constant: Some(correcting_constant),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = OttoInput::from_slice(slice_in, params);
-
-    let out = py
-        .allow_threads(|| otto_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((out.hott.into_pyarray(py), out.lott.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "otto_batch")]
-#[pyo3(signature = (data, ott_period_range, ott_percent_range, fast_vidya_range, slow_vidya_range, correcting_constant_range, ma_types, kernel=None))]
-pub fn otto_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    ott_period_range: (usize, usize, usize),
-    ott_percent_range: (f64, f64, f64),
-    fast_vidya_range: (usize, usize, usize),
-    slow_vidya_range: (usize, usize, usize),
-    correcting_constant_range: (f64, f64, f64),
-    ma_types: Vec<String>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = OttoBatchRange {
-        ott_period: ott_period_range,
-        ott_percent: ott_percent_range,
-        fast_vidya: fast_vidya_range,
-        slow_vidya: slow_vidya_range,
-        correcting_constant: correcting_constant_range,
-        ma_types,
-    };
-    let out = py
-        .allow_threads(|| otto_batch_with_kernel(slice_in, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    let hott = out.hott.into_pyarray(py).reshape([out.rows, out.cols])?;
-    let lott = out.lott.into_pyarray(py).reshape([out.rows, out.cols])?;
-    dict.set_item("hott", hott)?;
-    dict.set_item("lott", lott)?;
-    dict.set_item(
-        "ott_periods",
-        out.combos
-            .iter()
-            .map(|p| p.ott_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ott_percents",
-        out.combos
-            .iter()
-            .map(|p| p.ott_percent.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "fast_vidya",
-        out.combos
-            .iter()
-            .map(|p| p.fast_vidya_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_vidya",
-        out.combos
-            .iter()
-            .map(|p| p.slow_vidya_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    let py_list = PyList::new(py, out.combos.iter().map(|p| p.ma_type.clone().unwrap()))?;
-    dict.set_item("ma_types", py_list)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass]
-pub struct OttoStreamPy {
-    ott_period: usize,
-    ott_percent: f64,
-    fast_vidya_length: usize,
-    slow_vidya_length: usize,
-    correcting_constant: f64,
-    ma_type: String,
-    buffer: Vec<f64>,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl OttoStreamPy {
-    #[new]
-    #[pyo3(signature = (ott_period=None, ott_percent=None, fast_vidya_length=None, slow_vidya_length=None, correcting_constant=None, ma_type=None))]
-    pub fn new(
-        ott_period: Option<usize>,
-        ott_percent: Option<f64>,
-        fast_vidya_length: Option<usize>,
-        slow_vidya_length: Option<usize>,
-        correcting_constant: Option<f64>,
-        ma_type: Option<String>,
-    ) -> Self {
-        Self {
-            ott_period: ott_period.unwrap_or(2),
-            ott_percent: ott_percent.unwrap_or(0.6),
-            fast_vidya_length: fast_vidya_length.unwrap_or(10),
-            slow_vidya_length: slow_vidya_length.unwrap_or(25),
-            correcting_constant: correcting_constant.unwrap_or(100000.0),
-            ma_type: ma_type.unwrap_or_else(|| "VAR".to_string()),
-            buffer: Vec::new(),
-        }
-    }
-
-    pub fn update(&mut self, value: f64) -> PyResult<(Option<f64>, Option<f64>)> {
-        self.buffer.push(value);
-
-        let required_len = self.slow_vidya_length * self.fast_vidya_length + 10;
-        if self.buffer.len() < required_len {
-            return Ok((None, None));
-        }
-
-        let params = OttoParams {
-            ott_period: Some(self.ott_period),
-            ott_percent: Some(self.ott_percent),
-            fast_vidya_length: Some(self.fast_vidya_length),
-            slow_vidya_length: Some(self.slow_vidya_length),
-            correcting_constant: Some(self.correcting_constant),
-            ma_type: Some(self.ma_type.clone()),
-        };
-
-        let input = OttoInput::from_slice(&self.buffer, params);
-
-        match otto(&input) {
-            Ok(output) => {
-                let last_idx = output.hott.len() - 1;
-                Ok((Some(output.hott[last_idx]), Some(output.lott[last_idx])))
-            }
-            Err(e) => Err(PyValueError::new_err(e.to_string())),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.buffer.clear();
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct OttoResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn otto_js(
-    data: &[f64],
-    ott_period: usize,
-    ott_percent: f64,
-    fast_vidya_length: usize,
-    slow_vidya_length: usize,
-    correcting_constant: f64,
-    ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    let params = OttoParams {
-        ott_period: Some(ott_period),
-        ott_percent: Some(ott_percent),
-        fast_vidya_length: Some(fast_vidya_length),
-        slow_vidya_length: Some(slow_vidya_length),
-        correcting_constant: Some(correcting_constant),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = OttoInput::from_slice(data, params);
-
-    let out = otto_with_kernel(&input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(data.len() * 2);
-    values.extend_from_slice(&out.hott);
-    values.extend_from_slice(&out.lott);
-
-    let js = OttoResult {
-        values,
-        rows: 2,
-        cols: data.len(),
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct OttoBatchConfig {
-    pub ott_period: (usize, usize, usize),
-    pub ott_percent: (f64, f64, f64),
-    pub fast_vidya: (usize, usize, usize),
-    pub slow_vidya: (usize, usize, usize),
-    pub correcting_constant: (f64, f64, f64),
-    pub ma_types: Vec<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct OttoBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<OttoParams>,
-    pub rows: usize,
-    pub cols: usize,
-    pub rows_per_combo: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = otto_batch)]
-pub fn otto_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: OttoBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = OttoBatchRange {
-        ott_period: cfg.ott_period,
-        ott_percent: cfg.ott_percent,
-        fast_vidya: cfg.fast_vidya,
-        slow_vidya: cfg.slow_vidya,
-        correcting_constant: cfg.correcting_constant,
-        ma_types: cfg.ma_types,
-    };
-
-    let out = otto_batch_with_kernel(data, &sweep, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(out.rows * out.cols * 2);
-    for r in 0..out.rows {
-        let base = r * out.cols;
-        values.extend_from_slice(&out.hott[base..base + out.cols]);
-        values.extend_from_slice(&out.lott[base..base + out.cols]);
-    }
-
-    let js = OttoBatchJsOutput {
-        values,
-        combos: out.combos,
-        rows: out.rows * 2,
-        cols: out.cols,
-        rows_per_combo: 2,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn otto_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn otto_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn otto_into(
-    in_ptr: *const f64,
-    hott_ptr: *mut f64,
-    lott_ptr: *mut f64,
-    len: usize,
-    ott_period: usize,
-    ott_percent: f64,
-    fast_vidya_length: usize,
-    slow_vidya_length: usize,
-    correcting_constant: f64,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || hott_ptr.is_null() || lott_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to otto_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let mut hott_tmp;
-        let mut lott_tmp;
-
-        let alias_h = in_ptr == hott_ptr || hott_ptr == lott_ptr;
-        let alias_l = in_ptr == lott_ptr || hott_ptr == lott_ptr;
-
-        let (h_dst, l_dst): (&mut [f64], &mut [f64]) = if alias_h || alias_l {
-            hott_tmp = vec![f64::NAN; len];
-            lott_tmp = vec![f64::NAN; len];
-            (&mut hott_tmp, &mut lott_tmp)
-        } else {
-            (
-                std::slice::from_raw_parts_mut(hott_ptr, len),
-                std::slice::from_raw_parts_mut(lott_ptr, len),
-            )
-        };
-
-        let params = OttoParams {
-            ott_period: Some(ott_period),
-            ott_percent: Some(ott_percent),
-            fast_vidya_length: Some(fast_vidya_length),
-            slow_vidya_length: Some(slow_vidya_length),
-            correcting_constant: Some(correcting_constant),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let input = OttoInput::from_slice(data, params);
-
-        otto_into_slices(h_dst, l_dst, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        if alias_h || alias_l {
-            std::slice::from_raw_parts_mut(hott_ptr, len).copy_from_slice(h_dst);
-            std::slice::from_raw_parts_mut(lott_ptr, len).copy_from_slice(l_dst);
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "otto_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, ott_period_range, ott_percent_range=(0.6,0.6,0.0), fast_vidya_range=(10,10,0), slow_vidya_range=(25,25,0), correcting_constant_range=(100000.0,100000.0,0.0), ma_types=vec!["VAR".to_string()], device_id=0))]
-pub fn otto_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    ott_period_range: (usize, usize, usize),
-    ott_percent_range: (f64, f64, f64),
-    fast_vidya_range: (usize, usize, usize),
-    slow_vidya_range: (usize, usize, usize),
-    correcting_constant_range: (f64, f64, f64),
-    ma_types: Vec<String>,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_f32.as_slice()?;
-    let sweep = OttoBatchRange {
-        ott_period: ott_period_range,
-        ott_percent: ott_percent_range,
-        fast_vidya: fast_vidya_range,
-        slow_vidya: slow_vidya_range,
-        correcting_constant: correcting_constant_range,
-        ma_types,
-    };
-    let (hott, lott) = py.allow_threads(|| {
-        let cuda = crate::cuda::moving_averages::CudaOtto::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.otto_batch_dev(slice, &sweep)
-            .map(|(h, l, _)| (h, l))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let hott_dev = make_device_array_py(device_id, hott)?;
-    let lott_dev = make_device_array_py(device_id, lott)?;
-    Ok((hott_dev, lott_dev))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "otto_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, cols, rows, ott_period=2, ott_percent=0.6, fast_vidya_length=10, slow_vidya_length=25, correcting_constant=100000.0, _ma_type="VAR", device_id=0))]
-pub fn otto_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    ott_period: usize,
-    ott_percent: f64,
-    fast_vidya_length: usize,
-    slow_vidya_length: usize,
-    correcting_constant: f64,
-    _ma_type: &str,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let prices = prices_tm_f32.as_slice()?;
-    let params = OttoParams {
-        ott_period: Some(ott_period),
-        ott_percent: Some(ott_percent),
-        fast_vidya_length: Some(fast_vidya_length),
-        slow_vidya_length: Some(slow_vidya_length),
-        correcting_constant: Some(correcting_constant),
-        ma_type: Some("VAR".to_string()),
-    };
-    let (hott, lott) = py.allow_threads(|| {
-        let cuda = crate::cuda::moving_averages::CudaOtto::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.otto_many_series_one_param_time_major_dev(prices, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let hott_dev = make_device_array_py(device_id, hott)?;
-    let lott_dev = make_device_array_py(device_id, lott)?;
-    Ok((hott_dev, lott_dev))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn otto_output_into_js(
-    data: &[f64],
-    ott_period: usize,
-    ott_percent: f64,
-    fast_vidya_length: usize,
-    slow_vidya_length: usize,
-    correcting_constant: f64,
-    ma_type: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = otto_js(
-        data,
-        ott_period,
-        ott_percent,
-        fast_vidya_length,
-        slow_vidya_length,
-        correcting_constant,
-        ma_type,
-    )?;
-    crate::write_wasm_object_f64_outputs("otto_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn otto_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = otto_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("otto_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn generate_otto_test_data(n: usize) -> Vec<f64> {
         let mut data = Vec::with_capacity(n);
@@ -2511,8 +2019,8 @@ mod tests {
     fn check_otto_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = OttoParams {
             ott_period: None,
@@ -2535,8 +2043,8 @@ mod tests {
     fn check_otto_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = OttoParams::default();
         let input = OttoInput::from_candles(&candles, "close", params);
@@ -2592,8 +2100,8 @@ mod tests {
     fn check_otto_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = OttoInput::with_default_candles(&candles);
         let output = otto_with_kernel(&input, kernel)?;
@@ -2607,8 +2115,8 @@ mod tests {
     fn check_otto_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = OttoParams {
             ott_period: Some(0),
@@ -2633,8 +2141,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let small_data = &candles.close[0..3];
 
@@ -2661,8 +2169,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let small_data = &candles.close[0..15];
 
@@ -2709,8 +2217,8 @@ mod tests {
     fn check_otto_invalid_ma_type(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = OttoParams {
             ma_type: Some("INVALID_MA".to_string()),
@@ -2732,8 +2240,8 @@ mod tests {
     fn check_otto_all_ma_types(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let ma_types = [
             "SMA", "EMA", "WMA", "DEMA", "TMA", "VAR", "ZLEMA", "TSF", "HULL",
@@ -2763,8 +2271,8 @@ mod tests {
     fn check_otto_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = OttoParams::default();
         let input = OttoInput::from_candles(&candles, "close", params);
@@ -2797,8 +2305,8 @@ mod tests {
     fn check_otto_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let mut data = candles.close.clone();
 
@@ -2831,8 +2339,8 @@ mod tests {
     fn check_otto_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = OttoParams::default();
 
@@ -2879,8 +2387,8 @@ mod tests {
     fn check_otto_builder(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = OttoBuilder::new()
             .ott_period(3)
@@ -2948,8 +2456,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = OttoBatchBuilder::new()
             .kernel(kernel)
@@ -2994,8 +2502,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = OttoBatchBuilder::new()
             .kernel(kernel)
@@ -3023,10 +2531,10 @@ mod tests {
 
     #[cfg(debug_assertions)]
     fn check_no_poison_single(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        use crate::utilities::data_loader::read_candles_from_csv;
+        use crate::utilities::data_loader::read_candles_from_vortex;
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = OttoBuilder::new().kernel(kernel).apply(&c)?;
         for &v in out.hott.iter().chain(out.lott.iter()) {
             if v.is_nan() {
@@ -3109,7 +2617,6 @@ mod tests {
     #[cfg(debug_assertions)]
     generate_all_otto_tests!(check_no_poison_single);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_otto_into_matches_api() -> Result<(), Box<dyn Error>> {
         let n = 512usize;

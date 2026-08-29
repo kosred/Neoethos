@@ -1,13 +1,13 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
-use crate::indicators::srsi::{expand_grid_srsi, SrsiBatchRange, SrsiParams};
+use crate::indicators::srsi::{SrsiBatchRange, SrsiParams, expand_grid_srsi};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::collections::BTreeMap;
@@ -72,11 +72,6 @@ impl CudaSrsi {
         cust::init(CudaFlags::empty())?;
         let dev = Device::get_device(device_id as u32)?;
         let ctx = Arc::new(Context::new(dev)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/srsi_kernel.ptx"));
-        let jit = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("srsi_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -607,7 +602,7 @@ pub mod benches {
     use super::*;
     use crate::cuda::bench::helpers::gen_series;
     use crate::cuda::bench::{CudaBenchScenario, CudaBenchState};
-    use crate::indicators::rsi::{rsi, RsiInput, RsiParams};
+    use crate::indicators::rsi::{RsiInput, RsiParams, rsi};
 
     const ONE_SERIES_LEN: usize = 1_000_000;
     const MANY_COLS: usize = 1024;

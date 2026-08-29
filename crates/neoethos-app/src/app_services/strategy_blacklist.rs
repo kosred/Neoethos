@@ -146,8 +146,12 @@ pub fn fingerprint_file(path: impl AsRef<Path>) -> Option<String> {
 
 /// Load all retired entries; empty on any failure (best-effort).
 pub fn load() -> Vec<BlacklistEntry> {
-    let Some(path) = blacklist_path() else { return Vec::new() };
-    let Ok(raw) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Some(path) = blacklist_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
@@ -319,7 +323,10 @@ mod tests {
         );
         let a = gene_fingerprint_bytes(first.as_bytes()).expect("a live-portfolio artifact");
         let b = gene_fingerprint_bytes(second.as_bytes()).expect("a live-portfolio artifact");
-        assert_eq!(a, b, "the same rule must keep the same identity across runs");
+        assert_eq!(
+            a, b,
+            "the same rule must keep the same identity across runs"
+        );
         assert!(a.starts_with(GENE_FINGERPRINT_PREFIX));
     }
 
@@ -391,10 +398,8 @@ mod tests {
     #[test]
     fn an_out_of_range_index_is_kept_verbatim() {
         let names = ["rsi_14"];
-        let resolved = neoethos_core::strategy_identity::resolve_indices(
-            &serde_json::json!([0, 7]),
-            &names,
-        );
+        let resolved =
+            neoethos_core::strategy_identity::resolve_indices(&serde_json::json!([0, 7]), &names);
         assert_eq!(resolved, serde_json::json!(["rsi_14", 7]));
     }
 

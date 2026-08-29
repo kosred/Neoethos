@@ -1,44 +1,14 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaUma;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use js_sys;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::deviation::{deviation, DeviationInput, DeviationParams};
-use crate::indicators::mfi::{mfi, MfiInput, MfiParams};
-use crate::indicators::moving_averages::sma::{sma, SmaInput, SmaParams};
-use crate::indicators::moving_averages::wma::{wma, WmaInput, WmaParams};
-use crate::indicators::rsi::{rsi, RsiInput, RsiParams};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::deviation::{DeviationInput, DeviationParams, deviation};
+use crate::indicators::mfi::{MfiInput, MfiParams, mfi};
+use crate::indicators::moving_averages::sma::{SmaInput, SmaParams, sma};
+use crate::indicators::moving_averages::wma::{WmaInput, WmaParams, wma};
+use crate::indicators::rsi::{RsiInput, RsiParams, rsi};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -71,10 +41,6 @@ pub struct UmaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct UmaParams {
     pub accelerator: Option<f64>,
     pub min_length: Option<usize>,
@@ -1253,7 +1219,6 @@ pub fn uma_into_slice(dst: &mut [f64], input: &UmaInput, kern: Kernel) -> Result
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn uma_into(input: &UmaInput, out: &mut [f64]) -> Result<(), UmaError> {
     uma_into_slice(out, input, Kernel::Auto)
@@ -1737,755 +1702,18 @@ fn uma_batch_inner(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "uma")]
-#[pyo3(signature = (data, accelerator, min_length, max_length, smooth_length, volume=None, kernel=None))]
-pub fn uma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    accelerator: f64,
-    min_length: usize,
-    max_length: usize,
-    smooth_length: usize,
-    volume: Option<PyReadonlyArray1<'py, f64>>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::PyArrayMethods;
-    let kern = validate_kernel(kernel, false)?;
-    let slice_in = data.as_slice()?;
-    let vol_slice = volume.as_ref().map(|v| v.as_slice()).transpose()?;
-
-    let params = UmaParams {
-        accelerator: Some(accelerator),
-        min_length: Some(min_length),
-        max_length: Some(max_length),
-        smooth_length: Some(smooth_length),
-    };
-    let input = UmaInput::from_slice(slice_in, vol_slice, params);
-
-    let out: Vec<f64> = py
-        .allow_threads(|| uma_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "UmaStream")]
-pub struct UmaStreamPy {
-    stream: UmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl UmaStreamPy {
-    #[new]
-    pub fn new(
-        accelerator: f64,
-        min_length: usize,
-        max_length: usize,
-        smooth_length: usize,
-    ) -> PyResult<Self> {
-        let params = UmaParams {
-            accelerator: Some(accelerator),
-            min_length: Some(min_length),
-            max_length: Some(max_length),
-            smooth_length: Some(smooth_length),
-        };
-        let stream =
-            UmaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-
-    #[pyo3(name = "update_with_volume")]
-    pub fn update_with_volume_py(&mut self, value: f64, volume: Option<f64>) -> Option<f64> {
-        self.stream.update_with_volume(value, volume)
-    }
-
-    pub fn reset(&mut self) {
-        self.stream.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "uma_batch")]
-#[pyo3(signature = (data, accelerator_range, min_length_range, max_length_range, smooth_length_range, volume=None, kernel=None))]
-pub fn uma_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    accelerator_range: (f64, f64, f64),
-    min_length_range: (usize, usize, usize),
-    max_length_range: (usize, usize, usize),
-    smooth_length_range: (usize, usize, usize),
-    volume: Option<numpy::PyReadonlyArray1<'py, f64>>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let vol_slice = volume.as_ref().map(|v| v.as_slice()).transpose()?;
-    let sweep = UmaBatchRange {
-        accelerator: accelerator_range,
-        min_length: min_length_range,
-        max_length: max_length_range,
-        smooth_length: smooth_length_range,
-    };
-    let combos = expand_grid_uma(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| uma_batch_inner_into(slice_in, vol_slice, &sweep, kern, false, out_slice))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item(
-        "accelerators",
-        combos
-            .iter()
-            .map(|c| c.accelerator.unwrap_or(1.0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "min_lengths",
-        combos
-            .iter()
-            .map(|c| c.min_length.unwrap_or(5) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "max_lengths",
-        combos
-            .iter()
-            .map(|c| c.max_length.unwrap_or(50) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_lengths",
-        combos
-            .iter()
-            .map(|c| c.smooth_length.unwrap_or(4) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    let combo_list: Vec<Bound<'py, PyDict>> = combos
-        .iter()
-        .map(|c| {
-            let d = PyDict::new(py);
-            d.set_item("accelerator", c.accelerator.unwrap_or(1.0))
-                .unwrap();
-            d.set_item("min_length", c.min_length.unwrap_or(5)).unwrap();
-            d.set_item("max_length", c.max_length.unwrap_or(50))
-                .unwrap();
-            d.set_item("smooth_length", c.smooth_length.unwrap_or(4))
-                .unwrap();
-            d.into()
-        })
-        .collect();
-    dict.set_item("combos", combo_list)?;
-
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct UmaDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl UmaDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "__dlpack__(copy=True) not implemented for UMA device handle",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for UMA tensor"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "uma_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, accelerator_range, min_length_range, max_length_range, smooth_length_range, volume_f32=None, device_id=0))]
-pub fn uma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    accelerator_range: (f64, f64, f64),
-    min_length_range: (usize, usize, usize),
-    max_length_range: (usize, usize, usize),
-    smooth_length_range: (usize, usize, usize),
-    volume_f32: Option<numpy::PyReadonlyArray1<'_, f32>>,
-    device_id: usize,
-) -> PyResult<UmaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let volume_slice = volume_f32.as_ref().map(|v| v.as_slice()).transpose()?;
-    let sweep = UmaBatchRange {
-        accelerator: accelerator_range,
-        min_length: min_length_range,
-        max_length: max_length_range,
-        smooth_length: smooth_length_range,
-    };
-
-    let (inner, ctx, dev_id) = py
-        .allow_threads(
-            || -> Result<_, crate::cuda::moving_averages::uma_wrapper::CudaUmaError> {
-                let cuda = CudaUma::new(device_id)?;
-                let out = cuda.uma_batch_dev(slice_in, volume_slice, &sweep)?;
-                Ok((out, cuda.context_arc(), cuda.device_id()))
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let crate::cuda::DeviceArrayF32 { buf, rows, cols } = inner;
-    Ok(UmaDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "uma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, accelerator, min_length, max_length, smooth_length, volume_tm_f32=None, device_id=0))]
-pub fn uma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: PyReadonlyArray2<'_, f32>,
-    accelerator: f64,
-    min_length: usize,
-    max_length: usize,
-    smooth_length: usize,
-    volume_tm_f32: Option<PyReadonlyArray2<'_, f32>>,
-    device_id: usize,
-) -> PyResult<UmaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    use numpy::PyUntypedArrayMethods;
-
-    let rows = prices_tm_f32.shape()[0];
-    let cols = prices_tm_f32.shape()[1];
-    if let Some(vol) = &volume_tm_f32 {
-        let vshape = vol.shape();
-        if vshape != prices_tm_f32.shape() {
-            return Err(PyValueError::new_err(
-                "price and volume matrices must share shape",
-            ));
-        }
-    }
-
-    let prices_flat = prices_tm_f32.as_slice()?;
-    let volume_flat = volume_tm_f32
-        .as_ref()
-        .map(|arr| arr.as_slice())
-        .transpose()?;
-
-    let params = UmaParams {
-        accelerator: Some(accelerator),
-        min_length: Some(min_length),
-        max_length: Some(max_length),
-        smooth_length: Some(smooth_length),
-    };
-
-    let (inner, ctx, dev_id) = py
-        .allow_threads(
-            || -> Result<_, crate::cuda::moving_averages::uma_wrapper::CudaUmaError> {
-                let cuda = CudaUma::new(device_id)?;
-                let out = cuda.uma_many_series_one_param_time_major_dev(
-                    prices_flat,
-                    volume_flat,
-                    cols,
-                    rows,
-                    &params,
-                )?;
-                Ok((out, cuda.context_arc(), cuda.device_id()))
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let crate::cuda::DeviceArrayF32 { buf, rows, cols } = inner;
-    Ok(UmaDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_js(
-    data: &[f64],
-    accelerator: f64,
-    min_length: usize,
-    max_length: usize,
-    smooth_length: usize,
-    volume: Option<Vec<f64>>,
-) -> Result<JsValue, JsValue> {
-    let params = UmaParams {
-        accelerator: Some(accelerator),
-        min_length: Some(min_length),
-        max_length: Some(max_length),
-        smooth_length: Some(smooth_length),
-    };
-    let vol_slice = volume.as_deref();
-    let input = UmaInput::from_slice(data, vol_slice, params);
-
-    match uma_with_kernel(&input, Kernel::Auto) {
-        Ok(output) => {
-            let obj = js_sys::Object::new();
-            let values_array = js_sys::Array::new();
-            for val in output.values {
-                values_array.push(&JsValue::from_f64(val));
-            }
-            js_sys::Reflect::set(&obj, &JsValue::from_str("values"), &values_array)?;
-            Ok(obj.into())
-        }
-        Err(e) => Err(JsValue::from_str(&e.to_string())),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct UmaBatchConfig {
-    pub accelerator_range: (f64, f64, f64),
-    pub min_length_range: (usize, usize, usize),
-    pub max_length_range: (usize, usize, usize),
-    pub smooth_length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct UmaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<UmaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "uma_batch")]
-pub fn uma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: UmaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = UmaBatchRange {
-        accelerator: cfg.accelerator_range,
-        min_length: cfg.min_length_range,
-        max_length: cfg.max_length_range,
-        smooth_length: cfg.smooth_length_range,
-    };
-    let out = uma_batch_inner(data, None, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = UmaBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    accelerator: f64,
-    min_length: usize,
-    max_length: usize,
-    smooth_length: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = UmaParams {
-            accelerator: Some(accelerator),
-            min_length: Some(min_length),
-            max_length: Some(max_length),
-            smooth_length: Some(smooth_length),
-        };
-        let input = UmaInput::from_slice(data, None, params);
-
-        if core::ptr::eq(in_ptr as *const u8, out_ptr as *const u8) {
-            let mut tmp = vec![0.0; len];
-            uma_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            uma_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_stream_new(
-    accelerator: f64,
-    min_length: usize,
-    max_length: usize,
-    smooth_length: usize,
-) -> *mut UmaStream {
-    let params = UmaParams {
-        accelerator: Some(accelerator),
-        min_length: Some(min_length),
-        max_length: Some(max_length),
-        smooth_length: Some(smooth_length),
-    };
-
-    match UmaStream::try_new(params) {
-        Ok(stream) => Box::into_raw(Box::new(stream)),
-        Err(_) => std::ptr::null_mut(),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_stream_update(stream: *mut UmaStream, value: f64) -> Option<f64> {
-    if stream.is_null() {
-        return None;
-    }
-    unsafe { (*stream).update_with_volume(value, None) }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_stream_update_with_volume(
-    stream: *mut UmaStream,
-    value: f64,
-    volume: f64,
-) -> Option<f64> {
-    if stream.is_null() {
-        return None;
-    }
-    unsafe { (*stream).update_with_volume(value, Some(volume)) }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_stream_reset(stream: *mut UmaStream) {
-    if !stream.is_null() {
-        unsafe {
-            (*stream).reset();
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_stream_free(stream: *mut UmaStream) {
-    if !stream.is_null() {
-        unsafe {
-            let _ = Box::from_raw(stream);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_get_view(ptr: *mut f64, len: usize) -> js_sys::Float64Array {
-    unsafe { js_sys::Float64Array::view(std::slice::from_raw_parts(ptr, len)) }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_update(
-    ptr: *mut f64,
-    len: usize,
-    accelerator: f64,
-    min_length: usize,
-    max_length: usize,
-    smooth_length: usize,
-) -> Result<(), JsValue> {
-    if ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(ptr, len);
-        let params = UmaParams {
-            accelerator: Some(accelerator),
-            min_length: Some(min_length),
-            max_length: Some(max_length),
-            smooth_length: Some(smooth_length),
-        };
-        let input = UmaInput::from_slice(data, None, params);
-
-        let mut tmp = vec![0.0; len];
-        uma_into_slice(&mut tmp, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let out = std::slice::from_raw_parts_mut(ptr, len);
-        out.copy_from_slice(&tmp);
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_batch_js(
-    data: &[f64],
-    accelerator_range: Vec<f64>,
-    min_length_range: Vec<usize>,
-    max_length_range: Vec<usize>,
-    smooth_length_range: Vec<usize>,
-    volume: Option<Vec<f64>>,
-) -> Result<JsValue, JsValue> {
-    if accelerator_range.len() != 3
-        || min_length_range.len() != 3
-        || max_length_range.len() != 3
-        || smooth_length_range.len() != 3
-    {
-        return Err(JsValue::from_str(
-            "All range arrays must have exactly 3 elements: [start, end, step]",
-        ));
-    }
-
-    let sweep = UmaBatchRange {
-        accelerator: (
-            accelerator_range[0],
-            accelerator_range[1],
-            accelerator_range[2],
-        ),
-        min_length: (
-            min_length_range[0],
-            min_length_range[1],
-            min_length_range[2],
-        ),
-        max_length: (
-            max_length_range[0],
-            max_length_range[1],
-            max_length_range[2],
-        ),
-        smooth_length: (
-            smooth_length_range[0],
-            smooth_length_range[1],
-            smooth_length_range[2],
-        ),
-    };
-
-    let vol_slice = volume.as_deref();
-    let kernel = detect_best_batch_kernel();
-
-    let result = uma_batch_inner(data, vol_slice, &sweep, kernel, true)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-
-    let values_array = js_sys::Array::new();
-    for val in result.values {
-        values_array.push(&JsValue::from_f64(val));
-    }
-    js_sys::Reflect::set(&obj, &JsValue::from_str("values"), &values_array)?;
-
-    let accelerators = js_sys::Array::new();
-    let min_lengths = js_sys::Array::new();
-    let max_lengths = js_sys::Array::new();
-    let smooth_lengths = js_sys::Array::new();
-
-    for combo in &result.combos {
-        accelerators.push(&JsValue::from_f64(combo.accelerator.unwrap_or(1.0)));
-        min_lengths.push(&JsValue::from_f64(combo.min_length.unwrap_or(5) as f64));
-        max_lengths.push(&JsValue::from_f64(combo.max_length.unwrap_or(50) as f64));
-        smooth_lengths.push(&JsValue::from_f64(combo.smooth_length.unwrap_or(4) as f64));
-    }
-
-    js_sys::Reflect::set(&obj, &JsValue::from_str("accelerators"), &accelerators)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("min_lengths"), &min_lengths)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("max_lengths"), &max_lengths)?;
-    js_sys::Reflect::set(&obj, &JsValue::from_str("smooth_lengths"), &smooth_lengths)?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(result.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(result.cols as f64),
-    )?;
-
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_output_into_js(
-    data: &[f64],
-    accelerator: f64,
-    min_length: usize,
-    max_length: usize,
-    smooth_length: usize,
-    volume: Option<Vec<f64>>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = uma_js(
-        data,
-        accelerator,
-        min_length,
-        max_length,
-        smooth_length,
-        volume,
-    )?;
-    crate::write_wasm_object_f64_outputs("uma_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = uma_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("uma_batch_unified_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn uma_batch_output_into_js(
-    data: &[f64],
-    accelerator_range: Vec<f64>,
-    min_length_range: Vec<usize>,
-    max_length_range: Vec<usize>,
-    smooth_length_range: Vec<usize>,
-    volume: Option<Vec<f64>>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = uma_batch_js(
-        data,
-        accelerator_range,
-        min_length_range,
-        max_length_range,
-        smooth_length_range,
-        volume,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs("uma_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_uma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = UmaParams {
             accelerator: None,
@@ -2502,8 +1730,8 @@ mod tests {
 
     fn check_uma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = UmaInput::from_candles(&candles, "close", UmaParams::default());
         let result = uma_with_kernel(&input, kernel)?;
@@ -2540,8 +1768,8 @@ mod tests {
 
     fn check_uma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = UmaInput::with_default_candles(&candles);
         match input.data {
@@ -2644,8 +1872,8 @@ mod tests {
 
     fn check_uma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = UmaParams::default();
         let first_input = UmaInput::from_candles(&candles, "close", first_params);
@@ -2694,8 +1922,8 @@ mod tests {
     fn check_uma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = UmaParams::default();
         let input = UmaInput::from_candles(&candles, "close", params.clone());
@@ -2757,8 +1985,8 @@ mod tests {
     fn check_uma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             UmaParams::default(),
@@ -2938,8 +2166,9 @@ mod tests {
 
     #[test]
     fn uma_into_slice_matches_with_kernel() {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let c = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv").unwrap();
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let c =
+            read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex").unwrap();
         let params = UmaParams::default();
         let input = UmaInput::from_candles(&c, "close", params.clone());
 
@@ -2987,10 +2216,7 @@ mod tests {
         let baseline = uma(&input).unwrap().values;
         let mut via_into = vec![0.0; baseline.len()];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         uma_into(&input, &mut via_into).unwrap();
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        uma_into_slice(&mut via_into, &input, Kernel::Auto).unwrap();
 
         assert_eq!(baseline.len(), via_into.len());
         for (a, b) in baseline.iter().zip(via_into.iter()) {
@@ -3004,34 +2230,11 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "python")]
-    #[test]
-    fn uma_batch_py_no_copy_shape() {
-        pyo3::Python::with_gil(|py| {
-            use numpy::{PyArray1, PyArrayMethods};
-            let data = PyArray1::from_vec(py, (0..256).map(|i| i as f64).collect());
-            let d = crate::indicators::moving_averages::uma::uma_batch_py(
-                py,
-                data.readonly(),
-                (1.0, 1.0, 0.0),
-                (5, 5, 0),
-                (50, 50, 0),
-                (4, 4, 0),
-                None,
-                Some("scalar_batch"),
-            )
-            .unwrap();
-            let v = d.get_item("values").unwrap().expect("values missing");
-
-            assert!(v.downcast::<numpy::PyArray2<f64>>().is_ok());
-        });
-    }
-
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = UmaBatchBuilder::new()
             .kernel(kernel)
@@ -3077,8 +2280,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (1.0, 1.5, 0.5, 5, 10, 5, 20, 30, 10, 3, 5, 2),

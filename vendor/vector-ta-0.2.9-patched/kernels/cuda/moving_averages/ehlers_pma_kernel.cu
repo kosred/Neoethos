@@ -799,7 +799,47 @@ static __device__ __forceinline__ double trigger4_from_ff_ring_f64(const ff_f64 
     kahan_add_prod_f64(4., p3.lo, s, c);
     return __dmul_rn(s, 0.1);
 }
-static __device__ __forceinline__ void ehlers_pma_batch_core_f64(
+static __device__ __forceinline__ double ehlers_pma_wma1_at_f64(
+    const double* __restrict__ prices,
+    int i)
+{
+    const double inv28 = 1.0 / 28.0;
+    return (7.0 * prices[i - 1]
+          + 6.0 * prices[i - 2]
+          + 5.0 * prices[i - 3]
+          + 4.0 * prices[i - 4]
+          + 3.0 * prices[i - 5]
+          + 2.0 * prices[i - 6]
+          + 1.0 * prices[i - 7]) * inv28;
+}
+
+static __device__ __forceinline__ double ehlers_pma_predict_at_f64(
+    const double* __restrict__ prices,
+    int i)
+{
+    const double inv28 = 1.0 / 28.0;
+    const double w0 = ehlers_pma_wma1_at_f64(prices, i);
+    const double w1 = ehlers_pma_wma1_at_f64(prices, i - 1);
+    const double w2 = ehlers_pma_wma1_at_f64(prices, i - 2);
+    const double w3 = ehlers_pma_wma1_at_f64(prices, i - 3);
+    const double w4 = ehlers_pma_wma1_at_f64(prices, i - 4);
+    const double w5 = ehlers_pma_wma1_at_f64(prices, i - 5);
+    const double w6 = ehlers_pma_wma1_at_f64(prices, i - 6);
+    const double second = (7.0 * w0
+                         + 6.0 * w1
+                         + 5.0 * w2
+                         + 4.0 * w3
+                         + 3.0 * w4
+                         + 2.0 * w5
+                         + 1.0 * w6) * inv28;
+    return 2.0 * w0 - second;
+}
+
+// Parameter-free PMA has one real row. Parallelism therefore comes from bars,
+// not manufactured duplicate parameter rows: one CUDA thread owns one
+// (row, bar) output cell and recomputes the bounded FIR dependency window.
+// There is no inter-kernel synchronization, host staging, or CPU recurrence.
+extern "C" __global__ void ehlers_pma_bars_parallel_f64(
     const double* __restrict__ prices,
     int series_len,
     int n_combos,
@@ -807,99 +847,32 @@ static __device__ __forceinline__ void ehlers_pma_batch_core_f64(
     double* __restrict__ out_predict,
     double* __restrict__ out_trigger)
 {
-    const int combo = blockIdx.x;
-    if (combo >= n_combos) return;
-    if (threadIdx.x != 0) return;
+    if (series_len <= 0 || n_combos <= 0) return;
+    const size_t flat = (size_t)blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const size_t total = (size_t)series_len * (size_t)n_combos;
+    if (flat >= total) return;
 
-    const double nan_f = nan32_f64();
-    if (series_len <= 0) return;
+    const int combo = (int)(flat / (size_t)series_len);
+    const int i = (int)(flat - (size_t)combo * (size_t)series_len);
+    double* predict_row = out_predict + (size_t)combo * (size_t)series_len;
+    double* trigger_row = out_trigger + (size_t)combo * (size_t)series_len;
+    predict_row[i] = nan32_f64();
+    trigger_row[i] = nan32_f64();
+
     if (first_valid < 0) first_valid = 0;
     if (first_valid >= series_len) return;
+    const int warm_predict = first_valid + 13;
+    const int warm_trigger = warm_predict + 3;
+    if (i < warm_predict) return;
 
-
-    const int warm_wma1    = first_valid + 7;
-    const int warm_wma2    = first_valid + 13;
-    const int warm_trigger = warm_wma2 + 3;
-
-    double* predict_row = out_predict + combo * series_len;
-    double* trigger_row = out_trigger + combo * series_len;
-
-
-    {
-        int stop = (series_len < warm_wma2) ? series_len : warm_wma2;
-        for (int i = 0; i < stop; ++i) { predict_row[i] = nan_f; }
+    const double predict = ehlers_pma_predict_at_f64(prices, i);
+    predict_row[i] = predict;
+    if (i >= warm_trigger) {
+        const double p1 = ehlers_pma_predict_at_f64(prices, i - 1);
+        const double p2 = ehlers_pma_predict_at_f64(prices, i - 2);
+        const double p3 = ehlers_pma_predict_at_f64(prices, i - 3);
+        trigger_row[i] = (4.0 * predict + 3.0 * p1 + 2.0 * p2 + 1.0 * p3) * (1.0 / 10.0);
     }
-    {
-        int stop = (series_len < warm_trigger) ? series_len : warm_trigger;
-        for (int i = 0; i < stop; ++i) { trigger_row[i] = nan_f; }
-    }
-
-
-    if (warm_wma1 >= series_len) return;
-
-
-    lwma7_f64 price_w7;  price_w7.init_f64();
-    lwma7_f64 wma1_w7;   wma1_w7.init_f64();
-    lwma4_ff_f64  trig_w4;   trig_w4.init_f64();
-
-
-    for (int idx = first_valid; idx < series_len; ++idx) {
-
-
-        double wma1_val = nan_f;
-        if (price_w7.full_f64()) {
-            wma1_val = price_w7.value_f64();
-        }
-
-
-        if (idx >= warm_wma1) {
-            wma1_w7.push_f64(wma1_val);
-
-            if (wma1_w7.full_f64()) {
-                const double wma2_val = wma1_w7.value_f64();
-                const double current_wma1 = wma1_w7.newest_f64();
-                const double two_m = __dadd_rn(current_wma1, current_wma1);
-                const ff_f64     pred  = two_sum_f64(two_m, -wma2_val);
-                predict_row[idx]   = __dadd_rn(pred.hi, pred.lo);
-
-
-                trig_w4.push_f64(pred);
-                if (trig_w4.full_f64() && idx >= warm_trigger) {
-                    trigger_row[idx] = trig_w4.value_f64();
-                }
-            }
-        }
-
-
-        const double p_new = prices[idx];
-        price_w7.push_f64(p_new);
-    }
-}
-extern "C" __global__ void ehlers_pma_batch_f64(const double* __restrict__ prices,
-                                                 int series_len,
-                                                 int n_combos,
-                                                 int first_valid,
-                                                 double* __restrict__ out_predict,
-                                                 double* __restrict__ out_trigger) {
-    ehlers_pma_batch_core_f64(prices, series_len, n_combos, first_valid, out_predict, out_trigger);
-}
-extern "C" __global__ void ehlers_pma_batch_tiled_f64_tile128(
-    const double* __restrict__ prices,
-    int series_len,
-    int n_combos,
-    int first_valid,
-    double* __restrict__ out_predict,
-    double* __restrict__ out_trigger) {
-    ehlers_pma_batch_core_f64(prices, series_len, n_combos, first_valid, out_predict, out_trigger);
-}
-extern "C" __global__ void ehlers_pma_batch_tiled_f64_tile256(
-    const double* __restrict__ prices,
-    int series_len,
-    int n_combos,
-    int first_valid,
-    double* __restrict__ out_predict,
-    double* __restrict__ out_trigger) {
-    ehlers_pma_batch_core_f64(prices, series_len, n_combos, first_valid, out_predict, out_trigger);
 }
 extern "C" __global__ void ehlers_pma_many_series_one_param_f64(
     const double* __restrict__ prices_tm,

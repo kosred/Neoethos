@@ -70,11 +70,7 @@ pub fn lambertw_approx_f64(x: f64) -> f64 {
         x
     } else {
         let g = ln_approx_f64(x).max(0.0);
-        if g < 0.5 {
-            0.5
-        } else {
-            g
-        }
+        if g < 0.5 { 0.5 } else { g }
     };
 
     for _ in 0..2 {

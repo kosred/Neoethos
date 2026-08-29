@@ -1,127 +1,10 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::dvdiqqe_wrapper::CudaDvdiqqe;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context as CudaContext;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceDvdiqqePlanePy {
-    pub(crate) inner: crate::cuda::moving_averages::DeviceArrayF32,
-    pub(crate) _ctx: std::sync::Arc<CudaContext>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceDvdiqqePlanePy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        Ok((2, self.device_id as i32))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyNotImplementedError::new_err(
-                            "__dlpack__ copy path is not implemented for dvdiqqe CUDA buffers",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err(
-                            "dl_device mismatch and copy not requested",
-                        ));
-                    }
-                }
-            }
-        }
-
-        if let Some(obj) = stream.as_ref() {
-            if !obj.is_none(py) {
-                if let Ok(i) = obj.extract::<i64>(py) {
-                    if i == 0 {
-                        return Err(PyValueError::new_err(
-                            "__dlpack__: stream 0 is disallowed for CUDA",
-                        ));
-                    }
-                }
-            }
-        }
-
-        let inner = std::mem::replace(
-            &mut self.inner,
-            crate::cuda::moving_averages::DeviceArrayF32 {
-                buf: cust::memory::DeviceBuffer::from_slice(&[])
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-use crate::indicators::moving_averages::ema::{ema_with_kernel, EmaInput, EmaParams};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::moving_averages::ema::{EmaInput, EmaParams, ema_with_kernel};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -166,10 +49,6 @@ pub enum DvdiqqeOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DvdiqqeParams {
     pub period: Option<usize>,
     pub smoothing_period: Option<usize>,
@@ -497,11 +376,7 @@ fn dvdiqqe_compute_into(
             tick_vol
         } else if let Some(vs) = volume_opt {
             let vv = vs[i];
-            if vv.is_finite() {
-                vv
-            } else {
-                tick_vol
-            }
+            if vv.is_finite() { vv } else { tick_vol }
         } else {
             tick_vol
         };
@@ -680,11 +555,7 @@ fn dvdiqqe_build_raw_dvdi(
             tick_vol
         } else if let Some(vs) = volume_opt {
             let vv = vs[i];
-            if vv.is_finite() {
-                vv
-            } else {
-                tick_vol
-            }
+            if vv.is_finite() { vv } else { tick_vol }
         } else {
             tick_vol
         };
@@ -1200,7 +1071,6 @@ pub fn dvdiqqe_into_slices(
     )
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn dvdiqqe_into(
     input: &DvdiqqeInput,
     dvdi_out: &mut [f64],
@@ -2501,846 +2371,11 @@ pub struct DvdiqqeStreamOutput {
     pub center_line: f64,
 }
 
-#[cfg(feature = "python")]
-#[pyclass]
-pub struct DvdiqqeStreamPy {
-    stream: DvdiqqeStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DvdiqqeStreamPy {
-    #[new]
-    fn new(
-        period: Option<i32>,
-        smoothing_period: Option<i32>,
-        fast_multiplier: Option<f64>,
-        slow_multiplier: Option<f64>,
-        volume_type: Option<String>,
-        center_type: Option<String>,
-        tick_size: Option<f64>,
-    ) -> PyResult<Self> {
-        let period_validated = if let Some(p) = period {
-            if p <= 0 {
-                return Err(PyValueError::new_err(format!(
-                    "Invalid period: Period must be positive (got {})",
-                    p
-                )));
-            }
-            Some(p as usize)
-        } else {
-            None
-        };
-
-        let smoothing_validated = if let Some(s) = smoothing_period {
-            if s <= 0 {
-                return Err(PyValueError::new_err(format!(
-                    "Invalid smoothing period: Smoothing period must be positive (got {})",
-                    s
-                )));
-            }
-            Some(s as usize)
-        } else {
-            None
-        };
-
-        let params = DvdiqqeParams {
-            period: period_validated,
-            smoothing_period: smoothing_validated,
-            fast_multiplier,
-            slow_multiplier,
-            volume_type,
-            center_type,
-            tick_size,
-        };
-
-        let stream =
-            DvdiqqeStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        Ok(DvdiqqeStreamPy { stream })
-    }
-
-    fn update(
-        &mut self,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: f64,
-    ) -> Option<(f64, f64, f64, f64)> {
-        self.stream
-            .update(open, high, low, close, volume)
-            .map(|output| {
-                (
-                    output.dvdi,
-                    output.fast_tl,
-                    output.slow_tl,
-                    output.center_line,
-                )
-            })
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction]
-#[pyo3(name = "dvdiqqe", signature = (
-    open,
-    high,
-    low,
-    close,
-    volume=None,
-    period=None,
-    smoothing_period=None,
-    fast_multiplier=None,
-    slow_multiplier=None,
-    volume_type=None,
-    center_type=None,
-    tick_size=None,
-    kernel=None
-))]
-pub fn dvdiqqe_py<'py>(
-    py: Python<'py>,
-    open: Option<PyReadonlyArray1<'py, f64>>,
-    high: Option<PyReadonlyArray1<'py, f64>>,
-    low: Option<PyReadonlyArray1<'py, f64>>,
-    close: Option<PyReadonlyArray1<'py, f64>>,
-    volume: Option<PyReadonlyArray1<'py, f64>>,
-    period: Option<i32>,
-    smoothing_period: Option<i32>,
-    fast_multiplier: Option<f64>,
-    slow_multiplier: Option<f64>,
-    volume_type: Option<String>,
-    center_type: Option<String>,
-    tick_size: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    if open.is_none() || high.is_none() || low.is_none() || close.is_none() {
-        return Err(PyValueError::new_err(
-            "OHLC data (open, high, low, close) is required",
-        ));
-    }
-
-    let open_arr = open.unwrap();
-    let high_arr = high.unwrap();
-    let low_arr = low.unwrap();
-    let close_arr = close.unwrap();
-
-    let o = open_arr.as_slice()?;
-    let h = high_arr.as_slice()?;
-    let l = low_arr.as_slice()?;
-    let c = close_arr.as_slice()?;
-    let v = volume.as_ref().map(|v| v.as_slice()).transpose()?;
-    let len = c.len();
-
-    let mut dvdi = unsafe { numpy::PyArray1::<f64>::new(py, [len], false) };
-    let mut fast = unsafe { numpy::PyArray1::<f64>::new(py, [len], false) };
-    let mut slow = unsafe { numpy::PyArray1::<f64>::new(py, [len], false) };
-    let mut cent = unsafe { numpy::PyArray1::<f64>::new(py, [len], false) };
-    let dvdi_s = unsafe { dvdi.as_slice_mut()? };
-    let fast_s = unsafe { fast.as_slice_mut()? };
-    let slow_s = unsafe { slow.as_slice_mut()? };
-    let cent_s = unsafe { cent.as_slice_mut()? };
-
-    let period_validated = if let Some(p) = period {
-        if p <= 0 {
-            return Err(PyValueError::new_err(format!(
-                "Invalid period: Period must be positive (got {})",
-                p
-            )));
-        }
-        Some(p as usize)
-    } else {
-        None
-    };
-
-    let smoothing_validated = if let Some(s) = smoothing_period {
-        if s <= 0 {
-            return Err(PyValueError::new_err(format!(
-                "Invalid smoothing period: Smoothing period must be positive (got {})",
-                s
-            )));
-        }
-        Some(s as usize)
-    } else {
-        None
-    };
-
-    let params = DvdiqqeParams {
-        period: period_validated,
-        smoothing_period: smoothing_validated,
-        fast_multiplier,
-        slow_multiplier,
-        volume_type,
-        center_type,
-        tick_size,
-    };
-    let input = DvdiqqeInput::from_slices(o, h, l, c, v, params);
-    let kern = validate_kernel(kernel, false).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    py.allow_threads(|| dvdiqqe_into_slices(dvdi_s, fast_s, slow_s, cent_s, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((dvdi.into(), fast.into(), slow.into(), cent.into()))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dvdiqqe_batch")]
-#[pyo3(signature = (
-    open,
-    high,
-    low,
-    close,
-    period_range,
-    smoothing_period_range,
-    fast_mult_range,
-    slow_mult_range,
-    kernel=None
-))]
-pub fn dvdiqqe_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    smoothing_period_range: (usize, usize, usize),
-    fast_mult_range: (f64, f64, f64),
-    slow_mult_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let o = open.as_slice()?;
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let sweep = DvdiqqeBatchRange {
-        period: period_range,
-        smoothing_period: smoothing_period_range,
-        fast_multiplier: fast_mult_range,
-        slow_multiplier: slow_mult_range,
-    };
-    let kern = validate_kernel(kernel, true).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let out = py
-        .allow_threads(|| {
-            dvdiqqe_batch_with_kernel_flat(
-                o, h, l, c, None, &sweep, kern, "default", "dynamic", 0.01,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-    let series = out.series;
-    let plane = rows * cols;
-
-    use numpy::PyArray2;
-    let dvdi = unsafe { PyArray2::new(py, [rows, cols], false) };
-    let fast = unsafe { PyArray2::new(py, [rows, cols], false) };
-    let slow = unsafe { PyArray2::new(py, [rows, cols], false) };
-    let center = unsafe { PyArray2::new(py, [rows, cols], false) };
-
-    unsafe {
-        dvdi.as_slice_mut()?
-            .copy_from_slice(&out.values[0 * plane..1 * plane]);
-        fast.as_slice_mut()?
-            .copy_from_slice(&out.values[1 * plane..2 * plane]);
-        slow.as_slice_mut()?
-            .copy_from_slice(&out.values[2 * plane..3 * plane]);
-        center
-            .as_slice_mut()?
-            .copy_from_slice(&out.values[3 * plane..4 * plane]);
-    }
-
-    let d = PyDict::new(py);
-    d.set_item("dvdi", dvdi)?;
-    d.set_item("fast", fast)?;
-    d.set_item("slow", slow)?;
-    d.set_item("center", center)?;
-    d.set_item(
-        "periods",
-        out.combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "smoothing_periods",
-        out.combos
-            .iter()
-            .map(|p| p.smoothing_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "fast_multipliers",
-        out.combos
-            .iter()
-            .map(|p| p.fast_multiplier.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "slow_multipliers",
-        out.combos
-            .iter()
-            .map(|p| p.slow_multiplier.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item("rows", rows)?;
-    d.set_item("cols", cols)?;
-    d.set_item("series", series)?;
-    Ok(d.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dvdiqqe_cuda_batch_dev")]
-#[pyo3(signature = (open_f32, close_f32, volume_f32, period_range, smoothing_period_range, fast_mult_range, slow_mult_range, volume_type="default", center_type="dynamic", tick_size=0.01, device_id=0))]
-pub fn dvdiqqe_cuda_batch_dev_py(
-    py: Python<'_>,
-    open_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    volume_f32: Option<PyReadonlyArray1<'_, f32>>,
-    period_range: (usize, usize, usize),
-    smoothing_period_range: (usize, usize, usize),
-    fast_mult_range: (f64, f64, f64),
-    slow_mult_range: (f64, f64, f64),
-    volume_type: &str,
-    center_type: &str,
-    tick_size: f32,
-    device_id: usize,
-) -> PyResult<(
-    DeviceDvdiqqePlanePy,
-    DeviceDvdiqqePlanePy,
-    DeviceDvdiqqePlanePy,
-    DeviceDvdiqqePlanePy,
-)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let o = open_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let v_opt: Option<&[f32]> = match volume_f32.as_ref() {
-        Some(v) => Some(v.as_slice()?),
-        None => None,
-    };
-    if o.len() != c.len() {
-        return Err(PyValueError::new_err("open/close length mismatch"));
-    }
-    if let Some(v) = v_opt {
-        if v.len() != c.len() {
-            return Err(PyValueError::new_err("volume length mismatch"));
-        }
-    }
-
-    let sweep = DvdiqqeBatchRange {
-        period: period_range,
-        smoothing_period: smoothing_period_range,
-        fast_multiplier: fast_mult_range,
-        slow_multiplier: slow_mult_range,
-    };
-
-    let (dvdi, fast, slow, center) = py.allow_threads(|| {
-        let cuda = CudaDvdiqqe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        let quad = cuda
-            .dvdiqqe_batch_dev(o, c, v_opt, &sweep, volume_type, center_type, tick_size)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((
-            DeviceDvdiqqePlanePy {
-                inner: quad.dvdi,
-                _ctx: ctx.clone(),
-                device_id: dev,
-            },
-            DeviceDvdiqqePlanePy {
-                inner: quad.fast,
-                _ctx: ctx.clone(),
-                device_id: dev,
-            },
-            DeviceDvdiqqePlanePy {
-                inner: quad.slow,
-                _ctx: ctx.clone(),
-                device_id: dev,
-            },
-            DeviceDvdiqqePlanePy {
-                inner: quad.center,
-                _ctx: ctx,
-                device_id: dev,
-            },
-        ))
-    })?;
-
-    Ok((dvdi, fast, slow, center))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dvdiqqe_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (open_tm_f32, close_tm_f32, cols, rows, period, smoothing, fast_mult, slow_mult, volume_tm_f32, volume_type="default", center_type="dynamic", tick_size=0.01, device_id=0))]
-pub fn dvdiqqe_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    open_tm_f32: PyReadonlyArray1<'_, f32>,
-    close_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    smoothing: usize,
-    fast_mult: f32,
-    slow_mult: f32,
-    volume_tm_f32: Option<PyReadonlyArray1<'_, f32>>,
-    volume_type: &str,
-    center_type: &str,
-    tick_size: f32,
-    device_id: usize,
-) -> PyResult<(
-    DeviceDvdiqqePlanePy,
-    DeviceDvdiqqePlanePy,
-    DeviceDvdiqqePlanePy,
-    DeviceDvdiqqePlanePy,
-)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let o_tm = open_tm_f32.as_slice()?;
-    let c_tm = close_tm_f32.as_slice()?;
-    let v_tm: Option<&[f32]> = match volume_tm_f32.as_ref() {
-        Some(v) => Some(v.as_slice()?),
-        None => None,
-    };
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if o_tm.len() != expected || c_tm.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    if let Some(v) = v_tm {
-        if v.len() != expected {
-            return Err(PyValueError::new_err("time-major volume mismatch"));
-        }
-    }
-
-    let (dvdi, fast, slow, center) = py.allow_threads(|| {
-        let cuda = CudaDvdiqqe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        let quad = cuda
-            .dvdiqqe_many_series_one_param_time_major_dev(
-                o_tm,
-                c_tm,
-                v_tm,
-                cols,
-                rows,
-                period,
-                smoothing,
-                fast_mult,
-                slow_mult,
-                volume_type,
-                center_type,
-                tick_size,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((
-            DeviceDvdiqqePlanePy {
-                inner: quad.dvdi,
-                _ctx: ctx.clone(),
-                device_id: dev,
-            },
-            DeviceDvdiqqePlanePy {
-                inner: quad.fast,
-                _ctx: ctx.clone(),
-                device_id: dev,
-            },
-            DeviceDvdiqqePlanePy {
-                inner: quad.slow,
-                _ctx: ctx.clone(),
-                device_id: dev,
-            },
-            DeviceDvdiqqePlanePy {
-                inner: quad.center,
-                _ctx: ctx,
-                device_id: dev,
-            },
-        ))
-    })?;
-
-    Ok((dvdi, fast, slow, center))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DvdiqqeJsFlat {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dvdiqqe)]
-pub fn dvdiqqe_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: Option<Vec<f64>>,
-    period: Option<usize>,
-    smoothing_period: Option<usize>,
-    fast_multiplier: Option<f64>,
-    slow_multiplier: Option<f64>,
-    volume_type: Option<String>,
-    center_type: Option<String>,
-    tick_size: Option<f64>,
-) -> Result<JsValue, JsValue> {
-    let params = DvdiqqeParams {
-        period: period.or(Some(13)),
-        smoothing_period: smoothing_period.or(Some(6)),
-        fast_multiplier: fast_multiplier.or(Some(2.618)),
-        slow_multiplier: slow_multiplier.or(Some(4.236)),
-        volume_type: volume_type.or_else(|| Some("default".to_string())),
-        center_type: center_type.or_else(|| Some("dynamic".to_string())),
-        tick_size: tick_size.or(Some(0.01)),
-    };
-    let input = DvdiqqeInput::from_slices(open, high, low, close, volume.as_deref(), params);
-    let out = dvdiqqe_with_kernel(&input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let cols = close.len();
-    let mut values = Vec::with_capacity(4 * cols);
-    values.extend_from_slice(&out.dvdi);
-    values.extend_from_slice(&out.fast_tl);
-    values.extend_from_slice(&out.slow_tl);
-    values.extend_from_slice(&out.center_line);
-
-    serde_wasm_bindgen::to_value(&DvdiqqeJsFlat {
-        values,
-        rows: 4,
-        cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dvdiqqe_alloc(len: usize) -> *mut f64 {
-    let mut v: Vec<f64> = Vec::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dvdiqqe_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dvdiqqe_into)]
-pub fn dvdiqqe_into(
-    open: *const f64,
-    high: *const f64,
-    low: *const f64,
-    close: *const f64,
-    vol: *const f64,
-    len: usize,
-    period: usize,
-    smoothing_period: usize,
-    fast_multiplier: f64,
-    slow_multiplier: f64,
-    volume_type: String,
-    center_type: String,
-    tick_size: f64,
-
-    out_ptr: *mut f64,
-) -> Result<(), JsValue> {
-    if open.is_null() || high.is_null() || low.is_null() || close.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let o = std::slice::from_raw_parts(open, len);
-        let h = std::slice::from_raw_parts(high, len);
-        let l = std::slice::from_raw_parts(low, len);
-        let c = std::slice::from_raw_parts(close, len);
-        let v = if vol.is_null() {
-            None
-        } else {
-            Some(std::slice::from_raw_parts(vol, len))
-        };
-
-        let mut out = std::slice::from_raw_parts_mut(out_ptr, 4 * len);
-        let (dvdi_dst, rest) = out.split_at_mut(len);
-        let (fast_dst, rest) = rest.split_at_mut(len);
-        let (slow_dst, cent_dst) = rest.split_at_mut(len);
-
-        let params = DvdiqqeParams {
-            period: Some(period),
-            smoothing_period: Some(smoothing_period),
-            fast_multiplier: Some(fast_multiplier),
-            slow_multiplier: Some(slow_multiplier),
-            volume_type: Some(volume_type),
-            center_type: Some(center_type),
-            tick_size: Some(tick_size),
-        };
-        let input = DvdiqqeInput::from_slices(o, h, l, c, v, params);
-        dvdiqqe_into_slices(
-            dvdi_dst,
-            fast_dst,
-            slow_dst,
-            cent_dst,
-            &input,
-            detect_best_kernel(),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DvdiqqeBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub smoothing_period_range: (usize, usize, usize),
-    pub fast_mult_range: (f64, f64, f64),
-    pub slow_mult_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DvdiqqeParamsJs {
-    pub period: usize,
-    pub smoothing_period: usize,
-    pub fast_multiplier: f64,
-    pub slow_multiplier: f64,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DvdiqqeBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub combos: Vec<DvdiqqeParamsJs>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dvdiqqe_batch_unified)]
-pub fn dvdiqqe_batch_unified_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: Option<Vec<f64>>,
-    config: JsValue,
-    volume_type: String,
-    center_type: String,
-    tick_size: f64,
-) -> Result<JsValue, JsValue> {
-    let cfg: DvdiqqeBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let sweep = DvdiqqeBatchRange {
-        period: cfg.period_range,
-        smoothing_period: cfg.smoothing_period_range,
-        fast_multiplier: cfg.fast_mult_range,
-        slow_multiplier: cfg.slow_mult_range,
-    };
-
-    let result = dvdiqqe_batch_with_kernel(
-        open,
-        high,
-        low,
-        close,
-        volume.as_deref(),
-        &sweep,
-        detect_best_kernel(),
-        &volume_type,
-        &center_type,
-        tick_size,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let cols = close.len();
-    let rows = result.rows;
-    let mut values = Vec::with_capacity(4 * rows * cols);
-
-    values.extend_from_slice(&result.dvdi_values);
-    values.extend_from_slice(&result.fast_tl_values);
-    values.extend_from_slice(&result.slow_tl_values);
-    values.extend_from_slice(&result.center_values);
-
-    let combos: Vec<DvdiqqeParamsJs> = result
-        .combos
-        .iter()
-        .map(|p| DvdiqqeParamsJs {
-            period: p.period.unwrap_or(13),
-            smoothing_period: p.smoothing_period.unwrap_or(6),
-            fast_multiplier: p.fast_multiplier.unwrap_or(2.618),
-            slow_multiplier: p.slow_multiplier.unwrap_or(4.236),
-        })
-        .collect();
-
-    let output = DvdiqqeBatchJsOutput {
-        values,
-        rows: rows * 4,
-        cols,
-        combos,
-    };
-
-    serde_wasm_bindgen::to_value(&output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dvdiqqe_batch_into)]
-pub fn dvdiqqe_batch_into(
-    open: *const f64,
-    high: *const f64,
-    low: *const f64,
-    close: *const f64,
-    vol: *const f64,
-    len: usize,
-
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    smoothing_start: usize,
-    smoothing_end: usize,
-    smoothing_step: usize,
-    fast_start: f64,
-    fast_end: f64,
-    fast_step: f64,
-    slow_start: f64,
-    slow_end: f64,
-    slow_step: f64,
-
-    volume_type: String,
-    center_type: String,
-    tick_size: f64,
-
-    out_ptr: *mut f64,
-) -> Result<(), JsValue> {
-    if open.is_null() || high.is_null() || low.is_null() || close.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open, len);
-        let high = std::slice::from_raw_parts(high, len);
-        let low = std::slice::from_raw_parts(low, len);
-        let close = std::slice::from_raw_parts(close, len);
-        let volume = if vol.is_null() {
-            None
-        } else {
-            Some(std::slice::from_raw_parts(vol, len))
-        };
-
-        let sweep = DvdiqqeBatchRange {
-            period: (period_start, period_end, period_step),
-            smoothing_period: (smoothing_start, smoothing_end, smoothing_step),
-            fast_multiplier: (fast_start, fast_end, fast_step),
-            slow_multiplier: (slow_start, slow_end, slow_step),
-        };
-
-        let result = dvdiqqe_batch_with_kernel_flat(
-            open,
-            high,
-            low,
-            close,
-            volume,
-            &sweep,
-            detect_best_kernel(),
-            &volume_type,
-            &center_type,
-            tick_size,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let out_slice = std::slice::from_raw_parts_mut(out_ptr, result.values.len());
-        out_slice.copy_from_slice(&result.values);
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dvdiqqe_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: Option<Vec<f64>>,
-    period: Option<usize>,
-    smoothing_period: Option<usize>,
-    fast_multiplier: Option<f64>,
-    slow_multiplier: Option<f64>,
-    volume_type: Option<String>,
-    center_type: Option<String>,
-    tick_size: Option<f64>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dvdiqqe_js(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        period,
-        smoothing_period,
-        fast_multiplier,
-        slow_multiplier,
-        volume_type,
-        center_type,
-        tick_size,
-    )?;
-    crate::write_wasm_object_f64_outputs("dvdiqqe_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dvdiqqe_batch_unified_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: Option<Vec<f64>>,
-    config: JsValue,
-    volume_type: String,
-    center_type: String,
-    tick_size: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dvdiqqe_batch_unified_js(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        config,
-        volume_type,
-        center_type,
-        tick_size,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "dvdiqqe_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::{read_candles_from_csv, Candles};
+    use crate::utilities::data_loader::{Candles, read_candles_from_vortex};
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
@@ -3369,8 +2404,8 @@ mod tests {
 
     #[test]
     fn test_dvdiqqe_with_csv_data() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = DvdiqqeParams::default();
         let input = DvdiqqeInput::from_candles(&candles, params);
@@ -3403,8 +2438,8 @@ mod tests {
 
     #[test]
     fn test_dvdiqqe_into_matches_api_v2() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DvdiqqeInput::with_default_candles(&candles);
         let baseline = dvdiqqe(&input)?;
@@ -3415,7 +2450,6 @@ mod tests {
         let mut slow = vec![0.0; len];
         let mut center = vec![0.0; len];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             dvdiqqe_into(&input, &mut dvdi, &mut fast, &mut slow, &mut center)?;
         }
@@ -3511,7 +2545,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_dvdiqqe_into_matches_api() -> Result<(), Box<dyn Error>> {
         let len = 256usize;
@@ -3594,8 +2627,8 @@ mod tests {
 
     fn check_dvdiqqe_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = DvdiqqeParams::default();
         let input = DvdiqqeInput::from_candles(&candles, params);
@@ -3682,8 +2715,8 @@ mod tests {
 
     fn check_dvdiqqe_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = DvdiqqeParams {
             period: None,
@@ -3707,8 +2740,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DvdiqqeInput::with_default_candles(&candles);
         let output = dvdiqqe_with_kernel(&input, kernel)?;
@@ -3882,8 +2915,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = DvdiqqeParams {
             volume_type: Some("tick".to_string()),
@@ -3971,8 +3004,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = DvdiqqeBatchBuilder::new().kernel(k).apply_candles(&c)?;
         assert_eq!(out.dvdi_values.len(), out.rows * out.cols);
         assert_eq!(out.fast_tl_values.len(), out.rows * out.cols);
@@ -3983,8 +3016,8 @@ mod tests {
 
     fn check_batch_sweep(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = DvdiqqeBatchBuilder::new()
             .kernel(k)
             .period_range(13, 16, 1)
@@ -4007,8 +3040,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let batch_output = DvdiqqeBatchBuilder::new()
             .kernel(kernel)
@@ -4209,8 +3242,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let out = DvdiqqeBatchBuilder::new()
             .kernel(kernel)
@@ -4229,8 +3262,8 @@ mod tests {
 
     fn check_dvdiqqe_reinput(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out1 = dvdiqqe_with_kernel(&DvdiqqeInput::with_default_candles(&c), k)?;
 
         let i2 = DvdiqqeInput::from_slices(
@@ -4267,8 +3300,8 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn dvdiqqe_no_poison_in_outputs() -> Result<(), Box<dyn Error>> {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let c = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let c = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
 
         let out = dvdiqqe_with_kernel(&DvdiqqeInput::with_default_candles(&c), Kernel::Scalar)?;
 

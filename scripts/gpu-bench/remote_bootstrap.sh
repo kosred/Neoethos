@@ -4,13 +4,13 @@
 # Runs ON the rented machine. The ordering is deliberate and is about money:
 # the question that justifies renting at all — "is the warp-cooperative
 # Prototype B kernel correct?" — is answered in stage 1, which needs only
-# rustc, a C++ compiler and nvcc. The heavy CubeCL/libtorch stack is provisioned
-# only in stage 3, and only if stage 1 and 2 passed. If the budget dies early,
+# rustc, a C++ compiler and nvcc. The CubeCL search/data stack is exercised only
+# in stage 3, and only if stage 1 and 2 passed. If the budget dies early,
 # you still leave with the answer you paid for.
 #
-# Nothing here fabricates a result. `NEOETHOS_REQUIRE_GPU=1` turns a
-# "no adapter, skipping" outcome into a hard failure, so a green run cannot mean
-# the tests quietly did nothing on a box you are being billed for.
+# Nothing here fabricates a result. Every filtered test binary has an exact
+# expected count and rejects skip/fallback/substitution output. CubeCL search
+# tests also set their explicit real-device switch.
 #
 # Usage:
 #   scripts/gpu-bench/remote_bootstrap.sh [stage1|stage2|stage3|all]
@@ -18,13 +18,14 @@
 set -euo pipefail
 
 STAGE="${1:-all}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# The repo pins mold on Linux for link speed. mold 1.0.3 splits `.init_array`
-# and leaves nvcc's fatbin-registration constructors outside the dynamic tag,
-# so CUDA kernels build, link, and then fail at launch with "invalid device
-# function". Every CUDA build here uses the default linker instead. RUSTFLAGS
-# replaces .cargo/config.toml's list, so target-cpu is restated.
-export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=bfd}"
+# mold 1.0.3 splits `.init_array` and leaves nvcc's fatbin-registration
+# constructors outside the dynamic tag, so CUDA kernels build, link, and then
+# fail at launch with "invalid device function". Every CUDA build here uses the
+# default linker instead. Test harnesses remain on the portable CPU baseline;
+# they are not private payloads behind the x86-64 v3 launcher.
+export RUSTFLAGS="${RUSTFLAGS:--C link-arg=-fuse-ld=bfd}"
 RESULTS="${NEOETHOS_RESULTS_DIR:-cache/gpu-bench/remote}"
 mkdir -p "$RESULTS"
 
@@ -45,7 +46,7 @@ log "stage 0: environment"
 {
   date -u +'utc=%Y-%m-%dT%H:%M:%SZ'
   command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi \
-    --query-gpu=name,uuid,driver_version,memory.total,clocks.max.sm \
+    --query-gpu=name,uuid,driver_version,memory.total,compute_cap,clocks.max.sm \
     --format=csv,noheader || echo "nvidia-smi: MISSING"
   command -v nvcc >/dev/null 2>&1 && nvcc --version | tail -n2 || echo "nvcc: MISSING"
   command -v cargo >/dev/null 2>&1 && cargo --version || echo "cargo: MISSING"
@@ -56,9 +57,12 @@ log "stage 0: environment"
 } | record > "$RESULTS/environment.txt" 2>&1 || true
 cat "$RESULTS/environment.txt"
 
-for tool in nvidia-smi nvcc g++; do
-  command -v "$tool" >/dev/null 2>&1 || fail "stage 0: $tool is missing; this box cannot prove Prototype B"
+for tool in nvidia-smi nvcc g++ compute-sanitizer; do
+  command -v "$tool" >/dev/null 2>&1 \
+    || fail "stage 0: $tool is missing; this box cannot complete the paid CUDA proof"
 done
+bash "$SCRIPT_DIR/check_cuda_hardware.sh" \
+  || fail "stage 0: unsupported NVIDIA hardware"
 if ! command -v cargo >/dev/null 2>&1; then
   log "stage 0: installing rustup"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -86,22 +90,12 @@ run_stage1() {
   cargo test -p neoethos-gpu-contracts 2>&1 | record \
     || fail "stage 1: gpu-contracts"
 
-  log "stage 1: Rust -> C ABI -> CUDA smoke"
-  NEOETHOS_RUN_CUDA_SMOKE=1 cargo test -p neoethos-gpu-cuda --features cuda -- --nocapture 2>&1 \
-    | tee "$RESULTS/stage1-cuda-smoke.log" | record \
-    || fail "stage 1: CUDA smoke"
-  grep -qi "skipped" "$RESULTS/stage1-cuda-smoke.log" \
-    && fail "stage 1: CUDA smoke reported a skip on a rented GPU"
+  log "stage 1: f64 native ABI plus all three native-B parity tests"
+  NEOETHOS_GPU_VALIDATION_LOG_DIR="$RESULTS/stage1-validation" \
+    bash "$SCRIPT_DIR/run_cuda_validation.sh" native 2>&1 | record \
+    || fail "stage 1: strict native CUDA validation"
 
-  log "stage 1: Prototype B population parity against the canonical oracle"
-  NEOETHOS_REQUIRE_GPU=1 cargo test -p neoethos-search --features gpu-b-native \
-    prototype_b -- --nocapture --test-threads=1 2>&1 \
-    | tee "$RESULTS/stage1-prototype-b.log" | record \
-    || fail "stage 1: Prototype B parity"
-  grep -qi "skipped" "$RESULTS/stage1-prototype-b.log" \
-    && fail "stage 1: Prototype B parity reported a skip while a GPU was required"
-
-  log "stage 1: PASSED — the B kernel is correct on real CUDA"
+  log "stage 1: PASSED — native ABI 1/1 and native-B parity 3/3"
 }
 
 # ---------------------------------------------------------------------------
@@ -109,41 +103,36 @@ run_stage1() {
 # ---------------------------------------------------------------------------
 
 run_stage2() {
-  command -v compute-sanitizer >/dev/null 2>&1 \
-    || fail "stage 2: compute-sanitizer is missing"
-  log "stage 2: Compute Sanitizer memcheck over the B population path"
-  NEOETHOS_REQUIRE_GPU=1 compute-sanitizer \
-    --tool memcheck --target-processes all --require-cuda-init no --error-exitcode 86 \
-    --log-file "$RESULTS/stage2-memcheck.log" \
-    cargo test -p neoethos-search --features gpu-b-native prototype_b -- --test-threads=1 2>&1 \
-    | record || fail "stage 2: memcheck"
-  log "stage 2: PASSED — no invalid access in the B population path"
+  log "stage 2: Compute Sanitizer over native ABI 1/1 and native-B parity 3/3"
+  NEOETHOS_GPU_SANITIZER_LOG_DIR="$RESULTS/stage2-native-memcheck" \
+  NEOETHOS_GPU_TELEMETRY_LOG="$RESULTS/stage2-native-telemetry.csv" \
+    bash "$SCRIPT_DIR/run_cuda_memcheck_validation.sh" native 2>&1 | record \
+    || fail "stage 2: native ABI/native-B memcheck or leak check"
+  log "stage 2: PASSED — zero memcheck errors and zero leaked bytes"
 }
 
 # ---------------------------------------------------------------------------
-# Stage 3 — full stack: CubeCL CUDA plus the attributed A/B/C matrix
+# Stage 3 — CubeCL search engines and the complete current data CUDA suites
 # ---------------------------------------------------------------------------
 
 run_stage3() {
-  log "stage 3: full GPU stack build (CubeCL CUDA + libtorch)"
-  cargo build --release -p neoethos-cli --features gpu-nvidia 2>&1 | record \
-    || fail "stage 3: full-stack build (see docs/ for the libtorch recipe)"
+  log "stage 3: CubeCL f64 population/trailing/fused, direct A, and C 7/7"
+  NEOETHOS_GPU_VALIDATION_LOG_DIR="$RESULTS/stage3-cubecl-validation" \
+    bash "$SCRIPT_DIR/run_cuda_validation.sh" cubecl 2>&1 | record \
+    || fail "stage 3: strict CubeCL/A/C validation"
 
-  log "stage 3: Prototype C on CUDA"
-  NEOETHOS_REQUIRE_GPU=1 cargo test -p neoethos-search --features gpu-cuda \
-    gpu_native:: -- --nocapture --test-threads=1 2>&1 \
-    | tee "$RESULTS/stage3-gpu-native.log" | record \
-    || fail "stage 3: gpu_native suite on CUDA"
+  log "stage 3: Compute Sanitizer over CubeCL 7/7, direct A 1/1, and resident C 7/7"
+  NEOETHOS_GPU_SANITIZER_LOG_DIR="$RESULTS/stage3-search-memcheck" \
+  NEOETHOS_GPU_TELEMETRY_LOG="$RESULTS/stage3-search-telemetry.csv" \
+    bash "$SCRIPT_DIR/run_cuda_memcheck_validation.sh" cubecl 2>&1 | record \
+    || fail "stage 3: CubeCL/A/C memcheck or leak check"
 
-  log "stage 3: attributed matrix"
-  local sha
-  sha="$(git rev-parse HEAD)"
-  ./target/release/neoethos-cli bench-matrix \
-    --candidate-sha "$sha" \
-    --runs-root "$RESULTS/runs" \
-    --out "$RESULTS/matrix.json" 2>&1 | record \
-    || fail "stage 3: matrix generation"
-  log "stage 3: matrix written; execute the printed commands, then bench-collate"
+  log "stage 3: complete current resident-f64 data suite and HPC sweep parity"
+  NEOETHOS_GPU_VALIDATION_LOG_DIR="$RESULTS/stage3-data-validation" \
+    bash "$SCRIPT_DIR/run_cuda_validation.sh" data 2>&1 | record \
+    || fail "stage 3: strict data CUDA validation"
+
+  log "stage 3: PASSED — direct engine tests, not the misattributed CLI A benchmark"
 }
 
 case "$STAGE" in

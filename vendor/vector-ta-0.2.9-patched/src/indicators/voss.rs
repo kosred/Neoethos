@@ -1,24 +1,4 @@
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -26,16 +6,10 @@ use crate::utilities::helpers::{
 };
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
 use std::error::Error;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 use thiserror::Error;
 
 impl<'a> AsRef<[f64]> for VossInput<'a> {
@@ -70,10 +44,6 @@ pub enum VossOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VossParams {
     pub period: Option<usize>,
     pub predict: Option<usize>,
@@ -416,7 +386,6 @@ pub fn voss_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn voss_into(
     input: &VossInput,
@@ -1558,273 +1527,11 @@ pub fn expand_grid_voss(r: &VossBatchRange) -> Result<Vec<VossParams>, VossError
     expand_grid(r)
 }
 
-#[cfg(feature = "python")]
-pub fn register_voss_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(voss_py, m)?)?;
-    m.add_function(wrap_pyfunction!(voss_batch_py, m)?)?;
-    m.add_class::<VossStreamPy>()?;
-    #[cfg(all(feature = "python", feature = "cuda"))]
-    {
-        m.add_class::<VossDeviceArrayF32Py>()?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct VossDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl VossDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (exp_dev_ty, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != exp_dev_ty || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "voss_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period=(20,20,0), predict=(3,3,0), bandwidth=(0.25,0.25,0.0), device_id=0))]
-pub fn voss_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period: (usize, usize, usize),
-    predict: (usize, usize, usize),
-    bandwidth: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = VossBatchRange {
-        period,
-        predict,
-        bandwidth,
-    };
-    let (voss_dev, filt_dev, combos, ctx, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda = crate::cuda::CudaVoss::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (voss_dev, filt_dev, combos) = cuda
-            .voss_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((
-            voss_dev,
-            filt_dev,
-            combos,
-            cuda.context_arc(),
-            cuda.device_id(),
-        ))
-    })?;
-    let dict = PyDict::new(py);
-    let crate::cuda::moving_averages::DeviceArrayF32 { buf, rows, cols } = voss_dev;
-    dict.set_item(
-        "voss",
-        Py::new(
-            py,
-            VossDeviceArrayF32Py {
-                buf: Some(buf),
-                rows,
-                cols,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    let crate::cuda::moving_averages::DeviceArrayF32 { buf, rows, cols } = filt_dev;
-    dict.set_item(
-        "filt",
-        Py::new(
-            py,
-            VossDeviceArrayF32Py {
-                buf: Some(buf),
-                rows,
-                cols,
-                _ctx: ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", slice_in.len())?;
-    use numpy::IntoPyArray;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|c| c.period.unwrap_or(20) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "predicts",
-        combos
-            .iter()
-            .map(|c| c.predict.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "bandwidths",
-        combos
-            .iter()
-            .map(|c| c.bandwidth.unwrap_or(0.25))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "voss_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period=20, predict=3, bandwidth=0.25, device_id=0))]
-pub fn voss_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    period: usize,
-    predict: usize,
-    bandwidth: f64,
-    device_id: usize,
-) -> PyResult<(VossDeviceArrayF32Py, VossDeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = VossParams {
-        period: Some(period),
-        predict: Some(predict),
-        bandwidth: Some(bandwidth),
-    };
-    let (voss_dev, filt_dev, ctx, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda = crate::cuda::CudaVoss::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (voss_dev, filt_dev) = cuda
-            .voss_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok((voss_dev, filt_dev, cuda.context_arc(), cuda.device_id()))
-    })?;
-    let crate::cuda::moving_averages::DeviceArrayF32 { buf, rows, cols } = voss_dev;
-    let voss_py = VossDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx.clone(),
-        device_id: dev_id,
-    };
-    let crate::cuda::moving_averages::DeviceArrayF32 { buf, rows, cols } = filt_dev;
-    let filt_py = VossDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    };
-    Ok((voss_py, filt_py))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn voss_output_into_js(
-    data: &[f64],
-    period: usize,
-    predict: usize,
-    bandwidth: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = voss_js(data, period, predict, bandwidth)?;
-    crate::write_wasm_object_f64_outputs("voss_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn voss_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = voss_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("voss_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[inline]
     fn eq_or_both_nan(a: f64, b: f64) -> bool {
@@ -1833,8 +1540,8 @@ mod tests {
 
     #[test]
     fn test_voss_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VossInput::with_default_candles(&candles);
 
         let base = voss(&input)?;
@@ -1842,13 +1549,8 @@ mod tests {
         let len = candles.close.len();
         let mut out_voss = vec![0.0f64; len];
         let mut out_filt = vec![0.0f64; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             voss_into(&input, &mut out_voss, &mut out_filt)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            voss_into_slice(&mut out_voss, &mut out_filt, &input, Kernel::Auto)?;
         }
 
         assert_eq!(base.voss.len(), out_voss.len());
@@ -1876,8 +1578,8 @@ mod tests {
 
     fn check_voss_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = VossParams {
             period: None,
@@ -1893,8 +1595,8 @@ mod tests {
 
     fn check_voss_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = VossParams {
             period: Some(20),
@@ -1947,8 +1649,8 @@ mod tests {
 
     fn check_voss_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = VossInput::with_default_candles(&candles);
         match input.data {
@@ -2022,8 +1724,8 @@ mod tests {
 
     fn check_voss_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = VossParams {
             period: Some(10),
@@ -2049,8 +1751,8 @@ mod tests {
     fn check_voss_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             VossParams::default(),
@@ -2398,8 +2100,8 @@ mod tests {
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = VossBatchBuilder::new()
             .kernel(kernel)
@@ -2424,8 +2126,8 @@ mod tests {
     fn check_batch_param_grid(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let builder = VossBatchBuilder::new()
             .kernel(kernel)
@@ -2491,8 +2193,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 1, 3, 1, 0.1, 0.3, 0.1),
@@ -2523,35 +2225,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in voss output with params: period={}, predict={}, bandwidth={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(20),
-						combo.predict.unwrap_or(3),
-						combo.bandwidth.unwrap_or(0.25)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(20),
+                        combo.predict.unwrap_or(3),
+                        combo.bandwidth.unwrap_or(0.25)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in voss output with params: period={}, predict={}, bandwidth={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(20),
-						combo.predict.unwrap_or(3),
-						combo.bandwidth.unwrap_or(0.25)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(20),
+                        combo.predict.unwrap_or(3),
+                        combo.bandwidth.unwrap_or(0.25)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in voss output with params: period={}, predict={}, bandwidth={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(20),
-						combo.predict.unwrap_or(3),
-						combo.bandwidth.unwrap_or(0.25)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(20),
+                        combo.predict.unwrap_or(3),
+                        combo.bandwidth.unwrap_or(0.25)
+                    );
                 }
             }
 
@@ -2567,35 +2287,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in filt output with params: period={}, predict={}, bandwidth={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(20),
-						combo.predict.unwrap_or(3),
-						combo.bandwidth.unwrap_or(0.25)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(20),
+                        combo.predict.unwrap_or(3),
+                        combo.bandwidth.unwrap_or(0.25)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in filt output with params: period={}, predict={}, bandwidth={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(20),
-						combo.predict.unwrap_or(3),
-						combo.bandwidth.unwrap_or(0.25)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(20),
+                        combo.predict.unwrap_or(3),
+                        combo.bandwidth.unwrap_or(0.25)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in filt output with params: period={}, predict={}, bandwidth={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(20),
-						combo.predict.unwrap_or(3),
-						combo.bandwidth.unwrap_or(0.25)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(20),
+                        combo.predict.unwrap_or(3),
+                        combo.bandwidth.unwrap_or(0.25)
+                    );
                 }
             }
         }
@@ -2634,360 +2372,4 @@ mod tests {
     gen_batch_tests!(check_batch_nan_propagation);
     gen_batch_tests!(check_batch_invalid_range);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "voss")]
-#[pyo3(signature = (data, period=20, predict=3, bandwidth=0.25, kernel=None))]
-pub fn voss_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    predict: usize,
-    bandwidth: f64,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = VossParams {
-        period: Some(period),
-        predict: Some(predict),
-        bandwidth: Some(bandwidth),
-    };
-    let input = VossInput::from_slice(slice_in, params);
-
-    let (voss_vec, filt_vec) = py
-        .allow_threads(|| voss_with_kernel(&input, kern).map(|o| (o.voss, o.filt)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((voss_vec.into_pyarray(py), filt_vec.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VossStream")]
-pub struct VossStreamPy {
-    stream: VossStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VossStreamPy {
-    #[new]
-    #[pyo3(signature = (period=20, predict=3, bandwidth=0.25))]
-    fn new(period: usize, predict: usize, bandwidth: f64) -> PyResult<Self> {
-        let params = VossParams {
-            period: Some(period),
-            predict: Some(predict),
-            bandwidth: Some(bandwidth),
-        };
-        let stream =
-            VossStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(VossStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "voss_batch")]
-#[pyo3(signature = (data, period_range=(20, 100, 1), predict_range=(3, 3, 0), bandwidth_range=(0.25, 0.25, 0.0), kernel=None))]
-pub fn voss_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    predict_range: (usize, usize, usize),
-    bandwidth_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArray1;
-    let slice_in = data.as_slice()?;
-
-    let sweep = VossBatchRange {
-        period: period_range,
-        predict: predict_range,
-        bandwidth: bandwidth_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in voss_batch_py"))?;
-
-    let voss_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let filt_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let voss_slice = unsafe { voss_arr.as_slice_mut()? };
-    let filt_slice = unsafe { filt_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match k {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => k,
-            };
-            voss_batch_inner_into(slice_in, &sweep, simd, true, voss_slice, filt_slice)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("voss", voss_arr.reshape((rows, cols))?)?;
-    dict.set_item("filt", filt_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap_or(20) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "predicts",
-        combos
-            .iter()
-            .map(|p| p.predict.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "bandwidths",
-        combos
-            .iter()
-            .map(|p| p.bandwidth.unwrap_or(0.25))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn voss_js(
-    data: &[f64],
-    period: usize,
-    predict: usize,
-    bandwidth: f64,
-) -> Result<JsValue, JsValue> {
-    let params = VossParams {
-        period: Some(period),
-        predict: Some(predict),
-        bandwidth: Some(bandwidth),
-    };
-    let input = VossInput::from_slice(data, params);
-    let out = voss_with_kernel(&input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    #[derive(Serialize)]
-    struct Out {
-        voss: Vec<f64>,
-        filt: Vec<f64>,
-    }
-
-    serde_wasm_bindgen::to_value(&Out {
-        voss: out.voss,
-        filt: out.filt,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn voss_into(
-    in_ptr: *const f64,
-    voss_ptr: *mut f64,
-    filt_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    predict: usize,
-    bandwidth: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || voss_ptr.is_null() || filt_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = VossParams {
-            period: Some(period),
-            predict: Some(predict),
-            bandwidth: Some(bandwidth),
-        };
-        let input = VossInput::from_slice(data, params);
-
-        let in_aliased = in_ptr == voss_ptr as *const f64 || in_ptr == filt_ptr as *const f64;
-        let out_aliased = voss_ptr == filt_ptr;
-
-        if in_aliased || out_aliased {
-            let mut temp_voss = vec![0.0; len];
-            let mut temp_filt = vec![0.0; len];
-            voss_into_slice(&mut temp_voss, &mut temp_filt, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let voss_out = std::slice::from_raw_parts_mut(voss_ptr, len);
-            let filt_out = std::slice::from_raw_parts_mut(filt_ptr, len);
-            voss_out.copy_from_slice(&temp_voss);
-            filt_out.copy_from_slice(&temp_filt);
-        } else {
-            let voss_out = std::slice::from_raw_parts_mut(voss_ptr, len);
-            let filt_out = std::slice::from_raw_parts_mut(filt_ptr, len);
-            voss_into_slice(voss_out, filt_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn voss_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn voss_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VossBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub predict_range: (usize, usize, usize),
-    pub bandwidth_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VossBatchJsOutput {
-    pub voss: Vec<f64>,
-    pub filt: Vec<f64>,
-    pub combos: Vec<VossParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "voss_batch")]
-pub fn voss_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: VossBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = VossBatchRange {
-        period: cfg.period_range,
-        predict: cfg.predict_range,
-        bandwidth: cfg.bandwidth_range,
-    };
-
-    let out = voss_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = VossBatchJsOutput {
-        voss: out.voss,
-        filt: out.filt,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn voss_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    predict_start: usize,
-    predict_end: usize,
-    predict_step: usize,
-    bandwidth_start: f64,
-    bandwidth_end: f64,
-    bandwidth_step: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = VossBatchRange {
-        period: (period_start, period_end, period_step),
-        predict: (predict_start, predict_end, predict_step),
-        bandwidth: (bandwidth_start, bandwidth_end, bandwidth_step),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let cap = combos.len().checked_mul(3).unwrap_or(0);
-    let mut metadata = Vec::with_capacity(cap);
-
-    for combo in combos {
-        metadata.push(combo.period.unwrap_or(20) as f64);
-        metadata.push(combo.predict.unwrap_or(3) as f64);
-        metadata.push(combo.bandwidth.unwrap_or(0.25));
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn voss_batch_into(
-    in_ptr: *const f64,
-    voss_ptr: *mut f64,
-    filt_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    predict_start: usize,
-    predict_end: usize,
-    predict_step: usize,
-    bandwidth_start: f64,
-    bandwidth_end: f64,
-    bandwidth_step: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || voss_ptr.is_null() || filt_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = VossBatchRange {
-            period: (period_start, period_end, period_step),
-            predict: (predict_start, predict_end, predict_step),
-            bandwidth: (bandwidth_start, bandwidth_end, bandwidth_step),
-        };
-
-        let output = voss_batch_par_slice(data, &sweep, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let total_size = output
-            .rows
-            .checked_mul(output.cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in voss_batch_into"))?;
-        if total_size > 0 {
-            let voss_out = std::slice::from_raw_parts_mut(voss_ptr, total_size);
-            let filt_out = std::slice::from_raw_parts_mut(filt_ptr, total_size);
-            voss_out.copy_from_slice(&output.voss);
-            filt_out.copy_from_slice(&output.filt);
-        }
-
-        Ok(())
-    }
 }

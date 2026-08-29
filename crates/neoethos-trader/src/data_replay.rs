@@ -19,6 +19,8 @@
 
 use std::path::Path;
 
+use anyhow::Context;
+
 use crate::contracts::{LiveBar, PortfolioEntry, StrategySource, TradeMode};
 use crate::decision::{DecisionConfig, DecisionEngine};
 use crate::engine::{AutonomousEngine, DEFAULT_REPLAY_STARTING_BALANCE, EngineConfig, EngineStats};
@@ -26,8 +28,8 @@ use crate::execution::MockExecutionAdapter;
 use crate::portfolio::PortfolioRegistry;
 use crate::risk::PermissiveRiskGate;
 
-fn require_broker_real_historical_replay(
-) -> anyhow::Result<neoethos_core::BrokerFinancialTruthPermitV1> {
+fn require_broker_real_historical_replay()
+-> anyhow::Result<neoethos_core::BrokerFinancialTruthPermitV1> {
     neoethos_core::current_broker_financial_truth_capability_v1()
         .require(neoethos_core::BrokerFinancialOperationV1::HistoricalReplay)
         .map_err(anyhow::Error::new)
@@ -41,7 +43,12 @@ use crate::signal::MomentumStubSignal;
 /// this list is empty, the numbers below it may not be compared with live
 /// results, and the operator should be able to see that without reading the
 /// source.
-fn disclose(mut stats: EngineStats, path: &str, symbol: &str, warnings: Vec<String>) -> EngineStats {
+fn disclose(
+    mut stats: EngineStats,
+    path: &str,
+    symbol: &str,
+    warnings: Vec<String>,
+) -> EngineStats {
     if warnings.is_empty() {
         tracing::info!(
             target: "neoethos_trader::replay",
@@ -252,20 +259,18 @@ pub fn replay_portfolio_from_dir(
     let symbol = artifact.symbol.clone();
     let base_tf = artifact.base_tf.clone();
 
-    // Base-TF OHLCV: drives the engine loop AND the SMC gates.
-    let base_ohlcv = neoethos_data::load_symbol_timeframe(data_dir, &symbol, &base_tf)?;
+    // Reopen the immutable generations from the v2 artifact itself. A current
+    // symbol/timeframe publication is not an acceptable substitute.
+    let exact_input = artifact.load_exact_search_input(data_dir)?;
+    let base_ohlcv = exact_input.base_frame().ohlcv();
     if base_ohlcv.is_empty() {
         anyhow::bail!("no base bars for {symbol} {base_tf}");
     }
 
     // Rebuild the SAME multi-TF feature cube discovery used, then project onto the
     // genes' effective feature set (parity by reusing discovery's exact code).
-    let dataset = neoethos_data::load_symbol_dataset(data_dir, &symbol)?;
-    let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
-    let raw_features =
-        neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs)?;
     let aligned = neoethos_search::project_features_to_effective(
-        &raw_features,
+        exact_input.features(),
         &artifact.effective_feature_names,
     )?;
 
@@ -288,15 +293,16 @@ pub fn replay_portfolio_from_dir(
     let (directions, sl_pips, tp_pips) = crate::gene_signal::combine_gene_signals_with_brackets(
         &artifact.genes,
         &aligned,
-        &base_ohlcv,
+        base_ohlcv,
         pip_size,
-    );
+    )
+    .with_context(|| format!("failed to synthesize portfolio signals for {symbol} {base_tf}"))?;
     let bracketless_bars = directions
         .iter()
         .zip(sl_pips.iter())
         .filter(|(d, sl)| **d != crate::contracts::Direction::Flat && **sl <= 0.0)
         .count();
-    let bars = ohlcv_to_livebars(&base_ohlcv, &symbol, &base_tf);
+    let bars = ohlcv_to_livebars(base_ohlcv, &symbol, &base_tf);
 
     let registry = PortfolioRegistry::from_entries(vec![PortfolioEntry {
         symbol: symbol.clone(),
@@ -342,7 +348,12 @@ pub fn replay_portfolio_from_dir(
         cfg,
     );
     let stats = crate::replay::replay(&mut engine, &bars);
-    Ok(disclose(stats, "replay_portfolio_from_dir", &symbol, warnings))
+    Ok(disclose(
+        stats,
+        "replay_portfolio_from_dir",
+        &symbol,
+        warnings,
+    ))
 }
 
 /// v0.5 ML-integration Stage 3 — offline dry-run of a discovered portfolio with
@@ -387,17 +398,14 @@ pub fn replay_blend_from_dir(
     let symbol = artifact.symbol.clone();
     let base_tf = artifact.base_tf.clone();
 
-    let base_ohlcv = neoethos_data::load_symbol_timeframe(data_dir, &symbol, &base_tf)?;
+    let exact_input = artifact.load_exact_search_input(data_dir)?;
+    let base_ohlcv = exact_input.base_frame().ohlcv();
     if base_ohlcv.is_empty() {
         anyhow::bail!("no base bars for {symbol} {base_tf}");
     }
 
-    let dataset = neoethos_data::load_symbol_dataset(data_dir, &symbol)?;
-    let higher_refs: Vec<&str> = artifact.higher_tfs.iter().map(|s| s.as_str()).collect();
-    let raw_features =
-        neoethos_data::prepare_multitimeframe_features(&dataset, &base_tf, &higher_refs)?;
     let aligned = neoethos_search::project_features_to_effective(
-        &raw_features,
+        exact_input.features(),
         &artifact.effective_feature_names,
     )?;
     if aligned.n_samples() != base_ohlcv.len() {
@@ -416,15 +424,16 @@ pub fn replay_blend_from_dir(
     let (directions, sl_pips, tp_pips) = crate::gene_signal::combine_gene_signals_with_brackets(
         &artifact.genes,
         &aligned,
-        &base_ohlcv,
+        base_ohlcv,
         pip_size,
-    );
+    )
+    .with_context(|| format!("failed to synthesize blend signals for {symbol} {base_tf}"))?;
     let bracketless_bars = directions
         .iter()
         .zip(sl_pips.iter())
         .filter(|(d, sl)| **d != crate::contracts::Direction::Flat && **sl <= 0.0)
         .count();
-    let bars = ohlcv_to_livebars(&base_ohlcv, &symbol, &base_tf);
+    let bars = ohlcv_to_livebars(base_ohlcv, &symbol, &base_tf);
 
     // Build the ML decisions (skipped entirely in GenesOnly). On ANY error or
     // row mismatch, fall back to the gene-only engine — never trade on
@@ -432,11 +441,19 @@ pub fn replay_blend_from_dir(
     let signal_engine = if matches!(blend.mode, BlendMode::GenesOnly) {
         BlendedSignalEngine::genes_only(&symbol, directions)
     } else {
+        let installed = neoethos_core::execution_budget::installed_process_budget()
+            .context("blend replay unavailable before the process CPU budget is installed")?;
+        let inference_lease = installed.broker().acquire(
+            neoethos_core::execution_budget::CpuPermitRequest::local(
+                installed.resolved().effective_worker_limit,
+            ),
+        )?;
         match neoethos_models::ensemble_inference::bootstrap::role_decisions_from_feature_frame(
             models_root.as_ref(),
             &symbol,
             &base_tf,
-            &raw_features,
+            exact_input.features(),
+            &inference_lease,
         ) {
             Ok(decs) if decs.len() == base_ohlcv.len() => {
                 let ml: Vec<MlDecision> = decs

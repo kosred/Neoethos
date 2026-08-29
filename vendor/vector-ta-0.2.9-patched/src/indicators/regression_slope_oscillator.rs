@@ -1,30 +1,12 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::indicators::dispatch::{
-    compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-    ParamValue,
+    IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+    compute_cpu_batch,
 };
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -51,10 +33,6 @@ pub struct RegressionSlopeOscillatorOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RegressionSlopeOscillatorParams {
     pub min_range: Option<usize>,
     pub max_range: Option<usize>,
@@ -220,7 +198,9 @@ pub enum RegressionSlopeOscillatorError {
     InvalidStep { step: usize },
     #[error("regression_slope_oscillator: Invalid signal_line: {signal_line}")]
     InvalidSignalLine { signal_line: usize },
-    #[error("regression_slope_oscillator: Invalid range config: min_range={min_range}, max_range={max_range}, step={step}")]
+    #[error(
+        "regression_slope_oscillator: Invalid range config: min_range={min_range}, max_range={max_range}, step={step}"
+    )]
     InvalidRangeConfig {
         min_range: usize,
         max_range: usize,
@@ -593,7 +573,6 @@ pub fn regression_slope_oscillator_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[allow(clippy::too_many_arguments)]
 pub fn regression_slope_oscillator_into(
     out_value: &mut [f64],
@@ -803,10 +782,6 @@ impl RegressionSlopeOscillatorStream {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RegressionSlopeOscillatorBatchRange {
     pub min_range: (usize, usize, usize),
     pub max_range: (usize, usize, usize),
@@ -978,7 +953,7 @@ pub fn regression_slope_oscillator_batch_with_kernel(
         _ => {
             return Err(RegressionSlopeOscillatorError::InvalidKernelForBatch(
                 kernel,
-            ))
+            ));
         }
     };
     regression_slope_oscillator_batch_par_slice(data, sweep, batch_kernel.to_non_batch())
@@ -1184,478 +1159,6 @@ fn regression_slope_oscillator_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "regression_slope_oscillator")]
-#[pyo3(signature = (
-    data,
-    min_range=10,
-    max_range=100,
-    step=5,
-    signal_line=7,
-    kernel=None
-))]
-pub fn regression_slope_oscillator_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    min_range: usize,
-    max_range: usize,
-    step: usize,
-    signal_line: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let input = RegressionSlopeOscillatorInput::from_slice(
-        data,
-        RegressionSlopeOscillatorParams {
-            min_range: Some(min_range),
-            max_range: Some(max_range),
-            step: Some(step),
-            signal_line: Some(signal_line),
-        },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| regression_slope_oscillator_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("value", out.value.into_pyarray(py))?;
-    dict.set_item("signal", out.signal.into_pyarray(py))?;
-    dict.set_item("bullish_reversal", out.bullish_reversal.into_pyarray(py))?;
-    dict.set_item("bearish_reversal", out.bearish_reversal.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RegressionSlopeOscillatorStream")]
-pub struct RegressionSlopeOscillatorStreamPy {
-    stream: RegressionSlopeOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RegressionSlopeOscillatorStreamPy {
-    #[new]
-    #[pyo3(signature = (min_range=10, max_range=100, step=5, signal_line=7))]
-    fn new(min_range: usize, max_range: usize, step: usize, signal_line: usize) -> PyResult<Self> {
-        let stream = RegressionSlopeOscillatorStream::try_new(RegressionSlopeOscillatorParams {
-            min_range: Some(min_range),
-            max_range: Some(max_range),
-            step: Some(step),
-            signal_line: Some(signal_line),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> (f64, f64, f64, f64) {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "regression_slope_oscillator_batch")]
-#[pyo3(signature = (
-    data,
-    min_range_range=(10,10,0),
-    max_range_range=(100,100,0),
-    step_range=(5,5,0),
-    signal_line_range=(7,7,0),
-    kernel=None
-))]
-pub fn regression_slope_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    min_range_range: (usize, usize, usize),
-    max_range_range: (usize, usize, usize),
-    step_range: (usize, usize, usize),
-    signal_line_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let sweep = RegressionSlopeOscillatorBatchRange {
-        min_range: min_range_range,
-        max_range: max_range_range,
-        step: step_range,
-        signal_line: signal_line_range,
-    };
-    let combos = regression_slope_oscillator_expand_grid(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_value = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_signal = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_bullish = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_bearish = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let value_slice = unsafe { out_value.as_slice_mut()? };
-    let signal_slice = unsafe { out_signal.as_slice_mut()? };
-    let bullish_slice = unsafe { out_bullish.as_slice_mut()? };
-    let bearish_slice = unsafe { out_bearish.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        regression_slope_oscillator_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel.is_batch(),
-            value_slice,
-            signal_slice,
-            bullish_slice,
-            bearish_slice,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("value", out_value.reshape((rows, cols))?)?;
-    dict.set_item("signal", out_signal.reshape((rows, cols))?)?;
-    dict.set_item("bullish_reversal", out_bullish.reshape((rows, cols))?)?;
-    dict.set_item("bearish_reversal", out_bearish.reshape((rows, cols))?)?;
-    dict.set_item(
-        "min_ranges",
-        combos
-            .iter()
-            .map(|combo| combo.min_range.unwrap_or(DEFAULT_MIN_RANGE))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "max_ranges",
-        combos
-            .iter()
-            .map(|combo| combo.max_range.unwrap_or(DEFAULT_MAX_RANGE))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "steps",
-        combos
-            .iter()
-            .map(|combo| combo.step.unwrap_or(DEFAULT_STEP))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signal_lines",
-        combos
-            .iter()
-            .map(|combo| combo.signal_line.unwrap_or(DEFAULT_SIGNAL_LINE))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_regression_slope_oscillator_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(regression_slope_oscillator_py, m)?)?;
-    m.add_function(wrap_pyfunction!(regression_slope_oscillator_batch_py, m)?)?;
-    m.add_class::<RegressionSlopeOscillatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RegressionSlopeOscillatorJsOutput {
-    pub value: Vec<f64>,
-    pub signal: Vec<f64>,
-    pub bullish_reversal: Vec<f64>,
-    pub bearish_reversal: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "regression_slope_oscillator_js")]
-pub fn regression_slope_oscillator_js(
-    data: &[f64],
-    min_range: usize,
-    max_range: usize,
-    step: usize,
-    signal_line: usize,
-) -> Result<JsValue, JsValue> {
-    let input = RegressionSlopeOscillatorInput::from_slice(
-        data,
-        RegressionSlopeOscillatorParams {
-            min_range: Some(min_range),
-            max_range: Some(max_range),
-            step: Some(step),
-            signal_line: Some(signal_line),
-        },
-    );
-    let out = regression_slope_oscillator_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&RegressionSlopeOscillatorJsOutput {
-        value: out.value,
-        signal: out.signal,
-        bullish_reversal: out.bullish_reversal,
-        bearish_reversal: out.bearish_reversal,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RegressionSlopeOscillatorBatchConfig {
-    pub min_range_range: Vec<f64>,
-    pub max_range_range: Vec<f64>,
-    pub step_range: Vec<f64>,
-    pub signal_line_range: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RegressionSlopeOscillatorBatchJsOutput {
-    pub value: Vec<f64>,
-    pub signal: Vec<f64>,
-    pub bullish_reversal: Vec<f64>,
-    pub bearish_reversal: Vec<f64>,
-    pub min_ranges: Vec<usize>,
-    pub max_ranges: Vec<usize>,
-    pub steps: Vec<usize>,
-    pub signal_lines: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_usize(name: &str, values: &[f64]) -> Result<(usize, usize, usize), JsValue> {
-    if values.len() != 3 {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 elements [start, end, step]"
-        )));
-    }
-    let mut out = [0usize; 3];
-    for (idx, value) in values.iter().enumerate() {
-        if !value.is_finite() || *value < 0.0 || value.fract() != 0.0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid config: {name} values must be non-negative integers"
-            )));
-        }
-        out[idx] = *value as usize;
-    }
-    Ok((out[0], out[1], out[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "regression_slope_oscillator_batch_js")]
-pub fn regression_slope_oscillator_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: RegressionSlopeOscillatorBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = RegressionSlopeOscillatorBatchRange {
-        min_range: js_vec3_to_usize("min_range_range", &config.min_range_range)?,
-        max_range: js_vec3_to_usize("max_range_range", &config.max_range_range)?,
-        step: js_vec3_to_usize("step_range", &config.step_range)?,
-        signal_line: js_vec3_to_usize("signal_line_range", &config.signal_line_range)?,
-    };
-    let out = regression_slope_oscillator_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&RegressionSlopeOscillatorBatchJsOutput {
-        value: out.value,
-        signal: out.signal,
-        bullish_reversal: out.bullish_reversal,
-        bearish_reversal: out.bearish_reversal,
-        min_ranges: out
-            .combos
-            .iter()
-            .map(|combo| combo.min_range.unwrap_or(DEFAULT_MIN_RANGE))
-            .collect(),
-        max_ranges: out
-            .combos
-            .iter()
-            .map(|combo| combo.max_range.unwrap_or(DEFAULT_MAX_RANGE))
-            .collect(),
-        steps: out
-            .combos
-            .iter()
-            .map(|combo| combo.step.unwrap_or(DEFAULT_STEP))
-            .collect(),
-        signal_lines: out
-            .combos
-            .iter()
-            .map(|combo| combo.signal_line.unwrap_or(DEFAULT_SIGNAL_LINE))
-            .collect(),
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn regression_slope_oscillator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn regression_slope_oscillator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn regression_slope_oscillator_into(
-    in_ptr: *const f64,
-    out_value_ptr: *mut f64,
-    out_signal_ptr: *mut f64,
-    out_bullish_reversal_ptr: *mut f64,
-    out_bearish_reversal_ptr: *mut f64,
-    len: usize,
-    min_range: usize,
-    max_range: usize,
-    step: usize,
-    signal_line: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null()
-        || out_value_ptr.is_null()
-        || out_signal_ptr.is_null()
-        || out_bullish_reversal_ptr.is_null()
-        || out_bearish_reversal_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to regression_slope_oscillator_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out_value = std::slice::from_raw_parts_mut(out_value_ptr, len);
-        let out_signal = std::slice::from_raw_parts_mut(out_signal_ptr, len);
-        let out_bullish = std::slice::from_raw_parts_mut(out_bullish_reversal_ptr, len);
-        let out_bearish = std::slice::from_raw_parts_mut(out_bearish_reversal_ptr, len);
-        let input = RegressionSlopeOscillatorInput::from_slice(
-            data,
-            RegressionSlopeOscillatorParams {
-                min_range: Some(min_range),
-                max_range: Some(max_range),
-                step: Some(step),
-                signal_line: Some(signal_line),
-            },
-        );
-        regression_slope_oscillator_into_slice(
-            out_value,
-            out_signal,
-            out_bullish,
-            out_bearish,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn regression_slope_oscillator_batch_into(
-    in_ptr: *const f64,
-    out_value_ptr: *mut f64,
-    out_signal_ptr: *mut f64,
-    out_bullish_reversal_ptr: *mut f64,
-    out_bearish_reversal_ptr: *mut f64,
-    len: usize,
-    min_range_start: usize,
-    min_range_end: usize,
-    min_range_step: usize,
-    max_range_start: usize,
-    max_range_end: usize,
-    max_range_step: usize,
-    step_start: usize,
-    step_end: usize,
-    step_step: usize,
-    signal_line_start: usize,
-    signal_line_end: usize,
-    signal_line_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null()
-        || out_value_ptr.is_null()
-        || out_signal_ptr.is_null()
-        || out_bullish_reversal_ptr.is_null()
-        || out_bearish_reversal_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to regression_slope_oscillator_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = RegressionSlopeOscillatorBatchRange {
-            min_range: (min_range_start, min_range_end, min_range_step),
-            max_range: (max_range_start, max_range_end, max_range_step),
-            step: (step_start, step_end, step_step),
-            signal_line: (signal_line_start, signal_line_end, signal_line_step),
-        };
-        let combos = regression_slope_oscillator_expand_grid(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows.checked_mul(len).ok_or_else(|| {
-            JsValue::from_str("rows*cols overflow in regression_slope_oscillator_batch_into")
-        })?;
-        let out_value = std::slice::from_raw_parts_mut(out_value_ptr, total);
-        let out_signal = std::slice::from_raw_parts_mut(out_signal_ptr, total);
-        let out_bullish = std::slice::from_raw_parts_mut(out_bullish_reversal_ptr, total);
-        let out_bearish = std::slice::from_raw_parts_mut(out_bearish_reversal_ptr, total);
-        regression_slope_oscillator_batch_into_slice(
-            out_value,
-            out_signal,
-            out_bullish,
-            out_bearish,
-            data,
-            &sweep,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn regression_slope_oscillator_output_into_js(
-    data: &[f64],
-    min_range: usize,
-    max_range: usize,
-    step: usize,
-    signal_line: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = regression_slope_oscillator_js(data, min_range, max_range, step, signal_line)?;
-    crate::write_wasm_object_f64_outputs("regression_slope_oscillator_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn regression_slope_oscillator_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = regression_slope_oscillator_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "regression_slope_oscillator_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

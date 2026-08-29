@@ -60,7 +60,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          # Pinned repo nightly: .cargo/config.toml passes -Zthreads (nightly-only),
+          # Pinned repo nightly: use the exact project toolchain in rust-toolchain.toml,
           # and dtolnay's action overrides rust-toolchain.toml.
           toolchain: nightly-2026-04-07
           components: clippy, rustfmt
@@ -123,7 +123,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          # Pinned repo nightly: .cargo/config.toml passes -Zthreads (nightly-only),
+          # Pinned repo nightly: use the exact project toolchain in rust-toolchain.toml,
           # and dtolnay's action overrides rust-toolchain.toml.
           toolchain: nightly-2026-04-07
           components: clippy, rustfmt
@@ -147,15 +147,18 @@ jobs:
         env:
           CUDA_PATH: /usr/local/cuda
 
-      # THE POINT of this job: the CPU==GPU parity suite. NEOETHOS_REQUIRE_GPU=1
-      # turns "no GPU detected" into a hard FAILURE instead of a silent skip,
-      # so a mislabeled runner can't fake a pass. This is the gate the
-      # deferred backtest-core fixes (final-position, gap fills) must hold.
-      - name: GPU parity tests (CPU == GPU)
-        run: cargo test -p neoethos-search --release --features gpu-cuda gpu_ -- --nocapture
+      # One shared inventory pins every expected passing/ignored count and
+      # rejects skip/fallback/substitution diagnostics. CubeCL tests need their
+      # explicit real-device switch in addition to the generic strict policy.
+      - name: Strict NVIDIA real-device validation
+        run: |
+          bash scripts/gpu-bench/check_cuda_hardware.sh
+          bash scripts/gpu-bench/run_cuda_validation.sh all
+          bash scripts/gpu-bench/run_cuda_memcheck_validation.sh all
         env:
           CUDA_PATH: /usr/local/cuda
           NEOETHOS_REQUIRE_GPU: "1"
+          NEOETHOS_RUN_CUDA_SEARCH_TESTS: "1"
 
   # GPU-accelerated Linux job with AMD ROCm support
   workspace-linux-gpu-amd:
@@ -184,7 +187,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          # Pinned repo nightly: .cargo/config.toml passes -Zthreads (nightly-only),
+          # Pinned repo nightly: use the exact project toolchain in rust-toolchain.toml,
           # and dtolnay's action overrides rust-toolchain.toml.
           toolchain: nightly-2026-04-07
           components: clippy, rustfmt

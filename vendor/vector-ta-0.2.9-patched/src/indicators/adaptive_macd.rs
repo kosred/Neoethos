@@ -1,57 +1,11 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_macd_output_into_js(
-    data: &[f64],
-    length: usize,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adaptive_macd_js(data, length, fast_period, slow_period, signal_period)?;
-    crate::write_wasm_object_f64_outputs("adaptive_macd_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_macd_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adaptive_macd_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "adaptive_macd_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
 
 #[cfg(test)]
 use std::error::Error as StdError;
@@ -85,10 +39,6 @@ pub enum AdaptiveMacdData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdaptiveMacdOutput {
     pub macd: Vec<f64>,
     pub signal: Vec<f64>,
@@ -103,10 +53,6 @@ pub enum AdaptiveMacdOutputField {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdaptiveMacdParams {
     pub length: Option<usize>,
     pub fast_period: Option<usize>,
@@ -283,9 +229,7 @@ pub enum AdaptiveMacdError {
     NotEnoughValidData { needed: usize, valid: usize },
     #[error("adaptive_macd: output length mismatch: expected = {expected}, got = {got}")]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error(
-        "adaptive_macd: invalid range for {axis}: start = {start}, end = {end}, step = {step}"
-    )]
+    #[error("adaptive_macd: invalid range for {axis}: start = {start}, end = {end}, step = {step}")]
     InvalidRange {
         axis: &'static str,
         start: usize,
@@ -840,7 +784,6 @@ pub fn adaptive_macd_with_kernel(
     Ok(AdaptiveMacdOutput { macd, signal, hist })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn adaptive_macd_into(
     input: &AdaptiveMacdInput,
     macd_out: &mut [f64],
@@ -1165,369 +1108,10 @@ fn adaptive_macd_batch_impl(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "adaptive_macd")]
-#[pyo3(signature = (data, length=DEFAULT_LENGTH, fast_period=DEFAULT_FAST_PERIOD, slow_period=DEFAULT_SLOW_PERIOD, signal_period=DEFAULT_SIGNAL_PERIOD, kernel=None))]
-pub fn adaptive_macd_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = AdaptiveMacdInput::from_slice(
-        slice_in,
-        AdaptiveMacdParams {
-            length: Some(length),
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            signal_period: Some(signal_period),
-        },
-    );
-    let result = py
-        .allow_threads(|| adaptive_macd_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        result.macd.into_pyarray(py),
-        result.signal.into_pyarray(py),
-        result.hist.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adaptive_macd_batch")]
-#[pyo3(signature = (data, length_range=(DEFAULT_LENGTH, DEFAULT_LENGTH, 0), fast_period_range=(DEFAULT_FAST_PERIOD, DEFAULT_FAST_PERIOD, 0), slow_period_range=(DEFAULT_SLOW_PERIOD, DEFAULT_SLOW_PERIOD, 0), signal_period_range=(DEFAULT_SIGNAL_PERIOD, DEFAULT_SIGNAL_PERIOD, 0), kernel=None))]
-pub fn adaptive_macd_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    signal_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let _ = validate_kernel(kernel, true)?;
-    let sweep = AdaptiveMacdBatchRange {
-        length: length_range,
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        signal_period: signal_period_range,
-    };
-    let rows = expand_grid(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?
-        .len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let macd_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let hist_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let macd_slice = unsafe { macd_arr.as_slice_mut()? };
-    let signal_slice = unsafe { signal_arr.as_slice_mut()? };
-    let hist_slice = unsafe { hist_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            adaptive_macd_batch_inner_into(
-                slice_in,
-                &sweep,
-                true,
-                macd_slice,
-                signal_slice,
-                hist_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("macd", macd_arr.reshape((rows, cols))?)?;
-    dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    dict.set_item("hist", hist_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|params| params.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|params| params.fast_period.unwrap_or(DEFAULT_FAST_PERIOD) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|params| params.slow_period.unwrap_or(DEFAULT_SLOW_PERIOD) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signal_periods",
-        combos
-            .iter()
-            .map(|params| params.signal_period.unwrap_or(DEFAULT_SIGNAL_PERIOD) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdaptiveMacdStream")]
-pub struct AdaptiveMacdStreamPy {
-    inner: AdaptiveMacdStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdaptiveMacdStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, fast_period=DEFAULT_FAST_PERIOD, slow_period=DEFAULT_SLOW_PERIOD, signal_period=DEFAULT_SIGNAL_PERIOD))]
-    pub fn new(
-        length: usize,
-        fast_period: usize,
-        slow_period: usize,
-        signal_period: usize,
-    ) -> PyResult<Self> {
-        let inner = AdaptiveMacdStream::try_new(AdaptiveMacdParams {
-            length: Some(length),
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            signal_period: Some(signal_period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<(f64, f64, f64)> {
-        self.inner.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_adaptive_macd_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(adaptive_macd_py, m)?)?;
-    m.add_function(wrap_pyfunction!(adaptive_macd_batch_py, m)?)?;
-    m.add_class::<AdaptiveMacdStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveMacdBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub fast_period_range: (usize, usize, usize),
-    pub slow_period_range: (usize, usize, usize),
-    pub signal_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdaptiveMacdBatchJsOutput {
-    pub macd: Vec<f64>,
-    pub signal: Vec<f64>,
-    pub hist: Vec<f64>,
-    pub combos: Vec<AdaptiveMacdParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_macd_js(
-    data: &[f64],
-    length: usize,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-) -> Result<JsValue, JsValue> {
-    let input = AdaptiveMacdInput::from_slice(
-        data,
-        AdaptiveMacdParams {
-            length: Some(length),
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            signal_period: Some(signal_period),
-        },
-    );
-    let output = adaptive_macd_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_macd_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_macd_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_macd_into(
-    in_ptr: *const f64,
-    macd_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    hist_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || macd_ptr.is_null() || signal_ptr.is_null() || hist_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = AdaptiveMacdInput::from_slice(
-            data,
-            AdaptiveMacdParams {
-                length: Some(length),
-                fast_period: Some(fast_period),
-                slow_period: Some(slow_period),
-                signal_period: Some(signal_period),
-            },
-        );
-
-        let aliased = in_ptr == macd_ptr
-            || in_ptr == signal_ptr
-            || in_ptr == hist_ptr
-            || macd_ptr == signal_ptr
-            || macd_ptr == hist_ptr
-            || signal_ptr == hist_ptr;
-
-        if aliased {
-            let out = adaptive_macd_with_kernel(&input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(macd_ptr, len).copy_from_slice(&out.macd);
-            std::slice::from_raw_parts_mut(signal_ptr, len).copy_from_slice(&out.signal);
-            std::slice::from_raw_parts_mut(hist_ptr, len).copy_from_slice(&out.hist);
-        } else {
-            let macd_out = std::slice::from_raw_parts_mut(macd_ptr, len);
-            let signal_out = std::slice::from_raw_parts_mut(signal_ptr, len);
-            let hist_out = std::slice::from_raw_parts_mut(hist_ptr, len);
-            adaptive_macd_into_slice(macd_out, signal_out, hist_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adaptive_macd_batch)]
-pub fn adaptive_macd_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: AdaptiveMacdBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = AdaptiveMacdBatchRange {
-        length: config.length_range,
-        fast_period: config.fast_period_range,
-        slow_period: config.slow_period_range,
-        signal_period: config.signal_period_range,
-    };
-    let output = adaptive_macd_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js_output = AdaptiveMacdBatchJsOutput {
-        macd: output.macd,
-        signal: output.signal,
-        hist: output.hist,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adaptive_macd_batch_into(
-    in_ptr: *const f64,
-    macd_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    hist_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    fast_period_start: usize,
-    fast_period_end: usize,
-    fast_period_step: usize,
-    slow_period_start: usize,
-    slow_period_end: usize,
-    slow_period_step: usize,
-    signal_period_start: usize,
-    signal_period_end: usize,
-    signal_period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || macd_ptr.is_null() || signal_ptr.is_null() || hist_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = AdaptiveMacdBatchRange {
-        length: (length_start, length_end, length_step),
-        fast_period: (fast_period_start, fast_period_end, fast_period_step),
-        slow_period: (slow_period_start, slow_period_end, slow_period_step),
-        signal_period: (signal_period_start, signal_period_end, signal_period_step),
-    };
-    let rows = expand_grid(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*len overflow"))?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let macd_out = std::slice::from_raw_parts_mut(macd_ptr, total);
-        let signal_out = std::slice::from_raw_parts_mut(signal_ptr, total);
-        let hist_out = std::slice::from_raw_parts_mut(hist_ptr, total);
-        adaptive_macd_batch_inner_into(data, &sweep, false, macd_out, signal_out, hist_out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn linear_data(size: usize) -> Vec<f64> {
         (0..size).map(|i| i as f64).collect()
@@ -1786,7 +1370,7 @@ mod tests {
 
     #[test]
     fn adaptive_macd_default_candles_smoke() -> Result<(), Box<dyn StdError>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let input = AdaptiveMacdInput::with_default_candles(&candles);
         let output = adaptive_macd(&input)?;
         assert_eq!(output.macd.len(), candles.close.len());

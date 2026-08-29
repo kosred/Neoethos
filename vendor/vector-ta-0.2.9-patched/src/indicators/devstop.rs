@@ -1,13 +1,11 @@
-use crate::indicators::deviation::{deviation, DevInput, DevParams};
-use crate::indicators::moving_averages::ma::{ma, MaData};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::deviation::{DevInput, DevParams, deviation};
+use crate::indicators::moving_averages::ma::{MaData, ma};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
     init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,22 +28,6 @@ fn devstop_source_type<'a>(candles: &'a Candles, source: &str) -> &'a [f64] {
     }
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaDevStop;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::{exceptions::PyValueError, prelude::*};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 #[derive(Debug, Clone)]
 pub enum DevStopData<'a> {
     Candles {
@@ -62,10 +44,6 @@ pub struct DevStopOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DevStopParams {
     pub period: Option<usize>,
     pub mult: Option<f64>,
@@ -274,7 +252,6 @@ pub fn devstop(input: &DevStopInput) -> Result<DevStopOutput, DevStopError> {
     devstop_with_kernel(input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn devstop_into(input: &DevStopInput, out: &mut [f64]) -> Result<(), DevStopError> {
     devstop_into_slice(out, input, Kernel::Auto)
@@ -1602,430 +1579,6 @@ fn fast_mad_ratio() -> f64 {
     1.0 / 1.482_602_218_505_602_f64
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "devstop")]
-#[pyo3(signature = (high, low, period, mult, devtype, direction, ma_type, kernel=None))]
-pub fn devstop_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    mult: f64,
-    devtype: usize,
-    direction: &str,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err("high/low length mismatch"));
-    }
-
-    if h.iter().all(|&x| x.is_nan()) && l.iter().all(|&x| x.is_nan()) {
-        return Err(PyValueError::new_err("All values are NaN"));
-    }
-
-    if period == 0 {
-        return Err(PyValueError::new_err("Invalid period"));
-    }
-
-    let len = h.len();
-    if period > len {
-        return Err(PyValueError::new_err("Invalid period"));
-    }
-
-    let fh = h.iter().position(|x| !x.is_nan());
-    let fl = l.iter().position(|x| !x.is_nan());
-    let first = match (fh, fl) {
-        (Some(h), Some(l)) => h.min(l),
-        _ => return Err(PyValueError::new_err("All values are NaN")),
-    };
-
-    if len - first < period {
-        return Err(PyValueError::new_err("Not enough valid data"));
-    }
-
-    let params = DevStopParams {
-        period: Some(period),
-        mult: Some(mult),
-        devtype: Some(devtype),
-        direction: Some(direction.to_string()),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = DevStopInput::from_slices(h, l, params);
-
-    let kern = validate_kernel(kernel, false)?;
-    let warm = devstop_warmup(first, period);
-
-    let out = unsafe { PyArray1::<f64>::new(py, [h.len()], false) };
-    let slice_out = unsafe { out.as_slice_mut()? };
-
-    let slice_len = slice_out.len();
-    for v in &mut slice_out[..warm.min(slice_len)] {
-        *v = f64::NAN;
-    }
-
-    py.allow_threads(|| devstop_into_slice(slice_out, &input, kern))
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("InvalidPeriod") {
-                PyValueError::new_err("Invalid period")
-            } else if msg.contains("NotEnoughValidData") {
-                PyValueError::new_err("Not enough valid data")
-            } else if msg.contains("AllValuesNaN") {
-                PyValueError::new_err("All values are NaN")
-            } else {
-                PyValueError::new_err(msg)
-            }
-        })?;
-
-    Ok(out)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "devstop_batch")]
-#[pyo3(signature = (high, low, period_range, mult_range, devtype_range, kernel=None))]
-pub fn devstop_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    devtype_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use pyo3::types::PyDict;
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err("high/low length mismatch"));
-    }
-
-    let sweep = DevStopBatchRange {
-        period: period_range,
-        mult: mult_range,
-        devtype: devtype_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let out = py
-        .allow_threads(|| devstop_batch_with_kernel(h, l, &sweep, kern))
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("InvalidPeriod") || msg.contains("Invalid period") {
-                PyValueError::new_err("Invalid period")
-            } else if msg.contains("NotEnoughValidData") || msg.contains("Not enough valid data") {
-                PyValueError::new_err("Not enough valid data")
-            } else if msg.contains("AllValuesNaN") || msg.contains("All values are NaN") {
-                PyValueError::new_err("All values are NaN")
-            } else {
-                PyValueError::new_err(msg)
-            }
-        })?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-
-    let values_arr = out.values.into_pyarray(py);
-    let values_2d = values_arr
-        .reshape((rows, cols))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("values", values_2d)?;
-    d.set_item(
-        "periods",
-        out.combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "mults",
-        out.combos
-            .iter()
-            .map(|p| p.mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "devtypes",
-        out.combos
-            .iter()
-            .map(|p| p.devtype.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = devstop)]
-pub fn devstop_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    mult: f64,
-    devtype: usize,
-    direction: &str,
-    ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str("length mismatch"));
-    }
-
-    if high.iter().all(|&x| x.is_nan()) && low.iter().all(|&x| x.is_nan()) {
-        return Err(JsValue::from_str("All values are NaN"));
-    }
-
-    if period == 0 {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-
-    let len = high.len();
-    if period > len {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-
-    let fh = high.iter().position(|x| !x.is_nan());
-    let fl = low.iter().position(|x| !x.is_nan());
-    let first = match (fh, fl) {
-        (Some(h), Some(l)) => h.min(l),
-        _ => return Err(JsValue::from_str("All values are NaN")),
-    };
-
-    if len - first < period {
-        return Err(JsValue::from_str("Not enough valid data"));
-    }
-
-    let params = DevStopParams {
-        period: Some(period),
-        mult: Some(mult),
-        devtype: Some(devtype),
-        direction: Some(direction.to_string()),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = DevStopInput::from_slices(high, low, params);
-    let mut out = vec![0.0; high.len()];
-
-    let kernel = if cfg!(target_arch = "wasm32") {
-        Kernel::Scalar
-    } else {
-        detect_best_kernel()
-    };
-    devstop_into_slice(&mut out, &input, kernel).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("InvalidPeriod") {
-            JsValue::from_str("Invalid period")
-        } else if msg.contains("NotEnoughValidData") {
-            JsValue::from_str("Not enough valid data")
-        } else if msg.contains("AllValuesNaN") {
-            JsValue::from_str("All values are NaN")
-        } else {
-            JsValue::from_str(&msg)
-        }
-    })?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn devstop_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn devstop_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = devstop_into)]
-pub fn devstop_into_js(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    mult: f64,
-    devtype: usize,
-    direction: &str,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        let params = DevStopParams {
-            period: Some(period),
-            mult: Some(mult),
-            devtype: Some(devtype),
-            direction: Some(direction.to_string()),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let input = DevStopInput::from_slices(h, l, params);
-
-        let kernel = if cfg!(target_arch = "wasm32") {
-            Kernel::Scalar
-        } else {
-            detect_best_kernel()
-        };
-        devstop_into_slice(out, &input, kernel).map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DevStopBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub mult_range: (f64, f64, f64),
-    pub devtype_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DevStopBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<DevStopParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = devstop_batch)]
-pub fn devstop_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str("length mismatch"));
-    }
-    let cfg: DevStopBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = DevStopBatchRange {
-        period: cfg.period_range,
-        mult: cfg.mult_range,
-        devtype: cfg.devtype_range,
-    };
-
-    let kernel = if cfg!(target_arch = "wasm32") {
-        Kernel::ScalarBatch
-    } else {
-        detect_best_batch_kernel()
-    };
-    let out = devstop_batch_inner(high, low, &sweep, kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = DevStopBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "devstop_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, period_range, mult_range, devtype_range, direction="long", device_id=0))]
-pub fn devstop_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    devtype_range: (usize, usize, usize),
-    direction: &str,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, pyo3::types::PyDict>)> {
-    use crate::cuda::cuda_available;
-    use numpy::IntoPyArray;
-    use pyo3::types::PyDict;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err("length mismatch"));
-    }
-    let sweep = DevStopBatchRange {
-        period: period_range,
-        mult: mult_range,
-        devtype: devtype_range,
-    };
-    let is_long = direction.eq_ignore_ascii_case("long");
-    let (inner, meta) = py.allow_threads(|| {
-        let cuda = CudaDevStop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.devstop_batch_dev(h, l, &sweep, is_long)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = PyDict::new(py);
-    let periods: Vec<u64> = meta.iter().map(|(p, _)| *p as u64).collect();
-    let mults: Vec<f32> = meta.iter().map(|(_, m)| *m).collect();
-    dict.set_item("periods", periods.into_pyarray(py))?;
-    dict.set_item("mults", mults.into_pyarray(py))?;
-
-    let handle = make_device_array_py(device_id, inner)?;
-
-    Ok((handle, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "devstop_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, period, mult, direction="long", device_id=0))]
-pub fn devstop_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    mult: f64,
-    direction: &str,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if high_tm_f32.shape() != low_tm_f32.shape() {
-        return Err(PyValueError::new_err("shape mismatch"));
-    }
-    let flat_h = high_tm_f32.as_slice()?;
-    let flat_l = low_tm_f32.as_slice()?;
-    let rows = high_tm_f32.shape()[0];
-    let cols = high_tm_f32.shape()[1];
-    let is_long = direction.eq_ignore_ascii_case("long");
-    let inner = py.allow_threads(|| {
-        let cuda = CudaDevStop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.devstop_many_series_one_param_time_major_dev(
-            flat_h,
-            flat_l,
-            cols,
-            rows,
-            period,
-            mult as f32,
-            is_long,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    make_device_array_py(device_id, inner)
-}
-
 #[inline]
 unsafe fn devstop_scalar_classic_fused<const EMA: bool>(
     high: &[f64],
@@ -2066,11 +1619,7 @@ unsafe fn devstop_scalar_classic_fused<const EMA: bool>(
     }
     #[inline(always)]
     fn max0(x: f64) -> f64 {
-        if x < 0.0 {
-            0.0
-        } else {
-            x
-        }
+        if x < 0.0 { 0.0 } else { x }
     }
 
     let mut r_ring = vec![f64::NAN; period];
@@ -2292,43 +1841,11 @@ pub unsafe fn devstop_scalar_classic_ema(
     devstop_scalar_classic_fused::<true>(high, low, period, mult, is_long, first, dst)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn devstop_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    mult: f64,
-    devtype: usize,
-    direction: &str,
-    ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = devstop_js(high, low, period, mult, devtype, direction, ma_type)?;
-    crate::write_wasm_f64_output("devstop_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn devstop_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = devstop_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "devstop_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     #[test]
@@ -2350,13 +1867,8 @@ mod tests {
         let DevStopOutput { values: expected } = devstop(&input)?;
 
         let mut got = vec![0.0; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             devstop_into(&input, &mut got)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            return Ok(());
         }
 
         assert_eq!(expected.len(), got.len());
@@ -2381,8 +1893,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = DevStopParams {
             period: None,
@@ -2413,8 +1925,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let high = &candles.high;
         let low = &candles.low;
 
@@ -2442,8 +1954,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DevStopInput::with_default_candles(&candles);
         match input.data {
@@ -2527,8 +2039,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = DevStopParams {
             period: Some(20),
@@ -2561,8 +2073,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let high = &candles.high;
         let low = &candles.low;
 
@@ -2616,8 +2128,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DevStopParams::default(),
@@ -3076,8 +2588,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let high = &c.high;
         let low = &c.low;
 
@@ -3115,8 +2627,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let high = &c.high;
         let low = &c.low;
 
@@ -3139,8 +2651,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let high = &c.high;
         let low = &c.low;
 

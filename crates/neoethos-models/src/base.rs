@@ -9,7 +9,8 @@
 
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::*;
@@ -24,66 +25,6 @@ use crate::runtime::prediction::{PredictionMetadata, RuntimePrediction, RuntimeP
 type ModelSaveFn = Box<dyn FnOnce(&Path) -> Result<()>>;
 
 // ============================================================================
-// EARLY STOPPING
-// ============================================================================
-
-/// Universal Early Stopping utility.
-/// Stops training when validation metric stops improving.
-///
-/// Early-stopping helper for supervised training loops.
-pub struct EarlyStopper {
-    patience: usize,
-    min_delta: f64,
-    counter: usize,
-    best_loss: Option<f64>,
-    pub early_stop: bool,
-}
-
-impl EarlyStopper {
-    pub fn new(patience: usize, min_delta: f64) -> Self {
-        Self {
-            patience,
-            min_delta,
-            counter: 0,
-            best_loss: None,
-            early_stop: false,
-        }
-    }
-
-    /// Call with validation loss. Returns true if should stop.
-    /// Derived from legacy __call__ method (lines 38-48)
-    pub fn check(&mut self, val_loss: f64) -> bool {
-        if self.best_loss.is_none() {
-            self.best_loss = Some(val_loss);
-        } else if let Some(best) = self.best_loss {
-            if val_loss > best - self.min_delta {
-                self.counter += 1;
-                if self.counter >= self.patience {
-                    self.early_stop = true;
-                }
-            } else {
-                self.best_loss = Some(val_loss);
-                self.counter = 0;
-            }
-        }
-        self.early_stop
-    }
-}
-
-/// Return (patience, min_delta) with optional config overrides (was the
-/// `NEOETHOS_BOT_EARLY_STOP_*` env vars; now config-driven via
-/// `tree_models::config::current_tree_runtime`).
-pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) -> (usize, f64) {
-    let rt = crate::tree_models::config::current_tree_runtime();
-    let patience = rt
-        .early_stop_patience
-        .filter(|p| *p > 0)
-        .unwrap_or(default_patience);
-    let min_delta = rt.early_stop_min_delta.unwrap_or(default_min_delta);
-    (patience, min_delta)
-}
-
-// ============================================================================
 // EXPERT MODEL TRAIT
 // ============================================================================
 
@@ -92,7 +33,7 @@ pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) ->
 pub trait ExpertModel {
     /// Train the model.
     /// Derived from legacy fit method (lines 74-77)
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()>;
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()>;
 
     /// Train the model using an explicit validation frame for early stopping
     /// or `eval_set`-style monitoring (M5/M6/M7 audit fixes). The default
@@ -104,22 +45,23 @@ pub trait ExpertModel {
     /// stop relying on tail-of-train internal splits.
     fn fit_with_validation(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        _val_x: Option<&DataFrame>,
-        _val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        _val_x: Option<&FeatureFrame>,
+        _val_y: Option<&[i32]>,
+        lease: &CpuLease,
     ) -> Result<()> {
-        self.fit(x, y)
+        self.fit(x, y, lease)
     }
 
     /// Predict probabilities for classes [-1, 0, 1].
     ///
     /// Returns:
-    ///     Array2<f32>: Shape (N, 3) where columns map to [neutral, buy, sell]
+    ///     Array2<f64>: Shape (N, 3) where columns map to [neutral, buy, sell]
     ///                  Convention: col 0 -> neutral, col 1 -> buy, col 2 -> sell
     ///
     /// Derived from legacy predict_proba method (lines 79-89)
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>>;
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>>;
 
     /// Save model artifacts to directory.
     /// Derived from legacy save method (lines 91-94)
@@ -169,89 +111,80 @@ pub trait ExpertModel {
 }
 
 // ============================================================================
-// DATA CONVERSION UTILITIES
+// TYPED MODEL INPUT UTILITIES
 // ============================================================================
 
-/// Convert a DataFrame to a float32 ndarray suitable for models.
-///
-/// Derived from legacy dataframe_to_float32_numpy (lines 129-139)
-pub fn dataframe_to_float32_array(df: &DataFrame) -> Result<Array2<f32>> {
-    let n_rows = df.height();
-    let n_cols = df.width();
-
-    let mut array_data = vec![0.0_f32; n_rows * n_cols];
-    for (col_idx, col) in df.get_columns().iter().enumerate() {
-        let series_f64 = col
-            .cast(&DataType::Float64)
-            .with_context(|| format!("Failed to cast column {} to f64", col.name()))?;
-
-        let ca = series_f64
-            .f64()
-            .with_context(|| format!("Failed to get f64 chunked array for {}", col.name()))?;
-
-        for (row_idx, val) in ca.into_iter().enumerate() {
-            let value = val.with_context(|| {
-                format!(
-                    "Column {} contains null at row {}; model features must be fully materialized",
-                    col.name(),
-                    row_idx
-                )
-            })?;
-            if !value.is_finite() {
-                return Err(anyhow::anyhow!(
-                    "Column {} contains non-finite value {} at row {}",
-                    col.name(),
-                    value,
-                    row_idx
-                ));
+/// Materialize the exact shared f64 values for a model that requires a dense
+/// matrix. Invalid cells are structural input errors here: callers that want
+/// to exclude rows must construct and record the eligible row set before
+/// calling a model, never silently drop or zero-fill them in this function.
+pub fn feature_frame_to_f64_array(frame: &FeatureFrame) -> Result<Array2<f64>> {
+    let dense = frame
+        .to_dense_samples_major()
+        .context("materialize typed f64 model frame")?;
+    for row in 0..dense.values.nrows() {
+        for column in 0..dense.values.ncols() {
+            let validity = dense.validity[(row, column)];
+            if !validity.is_valid() {
+                bail!(
+                    "model feature `{}` row {} is ineligible: {}",
+                    frame.names[column],
+                    row,
+                    validity.as_str()
+                );
             }
-
-            array_data[row_idx * n_cols + col_idx] = value as f32;
+            let value = dense.values[(row, column)];
+            if !value.is_finite() {
+                bail!(
+                    "model feature `{}` row {} is marked valid with non-finite value {}",
+                    frame.names[column],
+                    row,
+                    value
+                );
+            }
         }
     }
-
-    Array2::from_shape_vec((n_rows, n_cols), array_data)
-        .context("Failed to create Array2 from DataFrame")
+    Ok(dense.values)
 }
 
-/// Extract a numeric column as strict finite Float64 values.
-/// Nulls or non-finite values are treated as structural data errors.
-pub fn strict_numeric_column_values(df: &DataFrame, column_name: &str) -> Result<Vec<f64>> {
-    let series = df
-        .column(column_name)
-        .with_context(|| format!("Missing required numeric column {column_name}"))?
-        .cast(&DataType::Float64)
-        .with_context(|| format!("Failed to cast column {column_name} to Float64"))?;
-
-    series
-        .f64()
-        .with_context(|| format!("Failed to access column {column_name} as Float64"))?
-        .into_iter()
-        .enumerate()
-        .map(|(idx, value)| {
-            let value = value.with_context(|| {
-                format!(
-                    "Column {column_name} contains null at row {idx}; downstream models require strict numeric input"
-                )
-            })?;
-            if !value.is_finite() {
-                return Err(anyhow::anyhow!(
-                    "Column {column_name} contains non-finite value {} at row {}",
-                    value,
-                    idx
-                ));
-            }
-            Ok(value)
-        })
-        .collect()
-}
-
-/// Extract ordered feature column names from a dataframe.
-pub fn feature_columns_from_dataframe(df: &DataFrame) -> Vec<String> {
-    df.get_column_names()
+/// Extract one named f64 feature column without losing validity information.
+pub fn strict_feature_column_values(frame: &FeatureFrame, column_name: &str) -> Result<Vec<f64>> {
+    let index = frame
+        .names
         .iter()
-        .map(|name| name.to_string())
-        .collect()
+        .position(|name| name == column_name)
+        .with_context(|| format!("missing required feature column `{column_name}`"))?;
+    let column = frame.feature_column(index)?;
+    for (row, validity) in column.validity.iter().copied().enumerate() {
+        if !validity.is_valid() {
+            bail!(
+                "model feature `{column_name}` row {row} is ineligible: {}",
+                validity.as_str()
+            );
+        }
+    }
+    Ok(column.values.clone())
+}
+
+/// Extract ordered feature names from the typed shared frame.
+pub fn feature_columns_from_frame(frame: &FeatureFrame) -> Vec<String> {
+    frame.names.clone()
+}
+
+/// Validate the typed label boundary before any model-specific conversion.
+pub fn validate_model_labels(labels: &[i32], expected_rows: usize) -> Result<()> {
+    if labels.len() != expected_rows {
+        bail!(
+            "model label count mismatch: {} labels for {expected_rows} feature rows",
+            labels.len()
+        );
+    }
+    for (row, &label) in labels.iter().enumerate() {
+        if !matches!(label, -1 | 0 | 1) {
+            bail!("model label row {row} has unsupported class {label}; expected -1, 0, or 1");
+        }
+    }
+    Ok(())
 }
 
 /// Return the canonical three-class label mapping used by the runtime contract.
@@ -369,8 +302,8 @@ pub fn build_runtime_prediction(
     model_name: impl Into<String>,
     family: ModelFamily,
     state: CapabilityState,
-    class_probabilities: [f32; 3],
-    confidence: Option<f32>,
+    class_probabilities: [f64; 3],
+    confidence: Option<f64>,
     abstain_recommended: Option<bool>,
 ) -> Result<RuntimePrediction, RuntimePredictionError> {
     RuntimePrediction::try_new(
@@ -386,8 +319,8 @@ pub fn build_runtime_prediction_with_details(
     model_name: impl Into<String>,
     family: ModelFamily,
     state: CapabilityState,
-    class_probabilities: [f32; 3],
-    confidence: Option<f32>,
+    class_probabilities: [f64; 3],
+    confidence: Option<f64>,
     abstain_recommended: Option<bool>,
     execution_backend: Option<String>,
     degraded_reason: Option<String>,
@@ -401,9 +334,9 @@ pub fn build_runtime_prediction_with_details(
     )
 }
 
-pub fn three_class_runtime_confidence(row_values: [f32; 3]) -> Result<(f32, bool)> {
+pub fn three_class_runtime_confidence(row_values: [f64; 3]) -> Result<(f64, bool)> {
     let mut normalized = row_values;
-    let mut sum = 0.0_f32;
+    let mut sum = 0.0_f64;
     for value in &normalized {
         if !value.is_finite() || *value < 0.0 {
             bail!("runtime predictions require finite non-negative probabilities");
@@ -413,7 +346,7 @@ pub fn three_class_runtime_confidence(row_values: [f32; 3]) -> Result<(f32, bool
         }
         sum += *value;
     }
-    if !sum.is_finite() || sum <= f32::EPSILON {
+    if !sum.is_finite() || sum <= f64::EPSILON {
         bail!("runtime predictions require probability rows with positive mass");
     }
     for value in &mut normalized {
@@ -430,166 +363,11 @@ pub fn three_class_runtime_confidence(row_values: [f32; 3]) -> Result<(f32, bool
         .copied()
         .filter(|value| *value > 1e-8)
         .map(|value| -value * value.ln())
-        .sum::<f32>()
-        / (3.0_f32.ln());
+        .sum::<f64>()
+        / (3.0_f64.ln());
     let sharpness = (1.0 - entropy).clamp(0.0, 1.0);
     let confidence = (0.6 * top + 0.25 * margin + 0.15 * sharpness).clamp(0.0, 1.0);
     Ok((confidence, top < 0.5 || confidence < 0.56))
-}
-
-// ============================================================================
-// TIME-SERIES VALIDATION
-// ============================================================================
-
-/// Validate that DataFrame index is monotonically increasing (time-ordered).
-///
-/// This is critical for time-series models to prevent look-ahead bias.
-///
-/// Derived from legacy validate_time_ordering (lines 142-184)
-pub fn validate_time_ordering(df: &DataFrame, context: &str) -> Result<bool> {
-    if df.height() == 0 {
-        return Ok(true);
-    }
-
-    let time_cols = ["timestamp", "time", "date", "datetime"];
-    for col_name in time_cols {
-        if let Ok(series) = df.column(col_name)
-            && let Ok(ca) = series.cast(&polars::datatypes::DataType::Int64)
-            && let Ok(ca_i64) = ca.i64()
-        {
-            let mut prev = i64::MIN;
-            for val in ca_i64.into_iter().flatten() {
-                if val < prev {
-                    return Err(anyhow::anyhow!(
-                        "{}: Datetime column '{}' is NOT monotonically increasing. Look-ahead bias structural risk!",
-                        context,
-                        col_name
-                    ));
-                }
-                prev = val;
-            }
-            return Ok(true);
-        }
-    }
-
-    warn!(
-        "{}: No explicit time column found (timestamp/time/date). Assuming data is pre-sorted.",
-        context
-    );
-    Ok(true)
-}
-
-/// Splits data for time-series training with an embargo gap.
-///
-/// Derived from legacy time_series_train_val_split (lines 187-212)
-pub fn time_series_train_val_split(
-    x: &DataFrame,
-    y: &Series,
-    val_ratio: f64,
-    min_train_samples: usize,
-    embargo_samples: usize, // HPC FIX: Guaranteed memory flush
-) -> Result<(DataFrame, DataFrame, Series, Series)> {
-    let n = x.height();
-    let val_size = (n as f64 * val_ratio) as usize;
-    let mut train_end = n.saturating_sub(val_size).saturating_sub(embargo_samples);
-
-    if train_end < min_train_samples {
-        // If dataset too small, reduce embargo but maintain at least 100 bars
-        let reduced_embargo = embargo_samples.min(100.max(n / 10));
-        train_end = n.saturating_sub(val_size).saturating_sub(reduced_embargo);
-    }
-
-    let x_train = x.slice(0, train_end);
-    let y_train = y.slice(0, train_end);
-
-    let val_start = train_end + embargo_samples;
-    let val_len = n.saturating_sub(val_start);
-    let x_val = x.slice(val_start as i64, val_len);
-    let y_val = y.slice(val_start as i64, val_len);
-
-    Ok((x_train, x_val, y_train, y_val))
-}
-
-// ============================================================================
-// SAMPLING UTILITIES
-// ============================================================================
-
-/// Downsample data while preserving class distribution.
-///
-/// Used to limit memory/compute for large datasets while maintaining
-/// representative class balance.
-///
-/// Derived from legacy stratified_downsample (lines 215-289)
-pub fn stratified_downsample(
-    x: &DataFrame,
-    y: &Series,
-    max_samples: usize,
-    random_state: u64,
-) -> Result<(DataFrame, Series)> {
-    let n = x.height();
-
-    if max_samples == 0 || n <= max_samples {
-        return Ok((x.clone(), y.clone()));
-    }
-
-    use rand::SeedableRng;
-    use rand::prelude::*;
-    let mut rng = StdRng::seed_from_u64(random_state);
-
-    // Group by class
-    let y_i64 = y.cast(&DataType::Int64)?;
-    let y_ca = y_i64.i64()?;
-
-    let mut class_indices: HashMap<i64, Vec<usize>> = HashMap::new();
-    for (idx, label) in y_ca.into_iter().enumerate() {
-        if let Some(lbl) = label {
-            class_indices.entry(lbl).or_default().push(idx);
-        }
-    }
-
-    // Calculate samples per class (proportional)
-    let total = n;
-    let mut sampled_indices = Vec::new();
-
-    for (_label, indices) in class_indices.iter() {
-        // Proportion of this class in original data
-        let class_ratio = indices.len() as f64 / total as f64;
-        // Target samples for this class
-        let target_count = ((max_samples as f64 * class_ratio) as usize).max(1);
-        // Actual samples to take
-        let take_count = indices.len().min(target_count);
-
-        if take_count > 0 {
-            let mut indices_clone = indices.clone();
-            indices_clone.shuffle(&mut rng);
-            sampled_indices.extend_from_slice(&indices_clone[..take_count]);
-        }
-    }
-
-    // Trim to max if over
-    if sampled_indices.len() > max_samples {
-        sampled_indices.shuffle(&mut rng);
-        sampled_indices.truncate(max_samples);
-    }
-
-    // Sort to maintain temporal order
-    sampled_indices.sort_unstable();
-
-    // Create downsampled DataFrame and Series
-    // Polars 0.47: take() expects ChunkedArray<UInt32Type>
-    let indices: Vec<u32> = sampled_indices.iter().map(|&i| i as u32).collect();
-    let indices_ca = Series::new("indices".into(), indices).u32()?.clone();
-    let x_out = x.take(&indices_ca)?;
-    let y_out = y.take(&indices_ca)?;
-
-    info!(
-        "Downsampled from {} to {} samples ({:.1}%)",
-        n,
-        x_out.height(),
-        (x_out.height() as f64 / n as f64) * 100.0
-    );
-
-    Ok((x_out, y_out))
 }
 
 // ============================================================================
@@ -601,17 +379,18 @@ pub fn stratified_downsample(
 /// Uses inverse frequency weighting: rare classes get higher weights.
 ///
 /// Derived from legacy compute_class_weights (lines 292-319)
-pub fn compute_class_weights(y: &Series) -> Result<HashMap<i64, f64>> {
-    let y_i64 = y.cast(&DataType::Int64)?;
-    let y_ca = y_i64.i64()?;
-
-    let mut class_counts: HashMap<i64, usize> = HashMap::new();
-    let mut n_samples = 0;
-
-    for label in y_ca.into_iter().flatten() {
-        *class_counts.entry(label).or_insert(0) += 1;
-        n_samples += 1;
+pub fn compute_class_weights(labels: &[i32]) -> Result<HashMap<i32, f64>> {
+    validate_model_labels(labels, labels.len())?;
+    if labels.is_empty() {
+        bail!("class weighting requires at least one model label");
     }
+
+    let mut class_counts: HashMap<i32, usize> = HashMap::new();
+    for &label in labels {
+        *class_counts.entry(label).or_insert(0) += 1;
+    }
+
+    let n_samples = labels.len();
 
     let n_classes = class_counts.len();
     let mut weights = HashMap::new();
@@ -629,512 +408,69 @@ pub fn compute_class_weights(y: &Series) -> Result<HashMap<i64, f64>> {
 /// Compute per-sample weights based on class frequency.
 ///
 /// Derived from legacy compute_sample_weights (lines 322-343)
-pub fn compute_sample_weights(y: &Series) -> Result<Vec<f32>> {
-    let class_weights = compute_class_weights(y)?;
-    let y_i64 = y.cast(&DataType::Int64)?;
-    let y_ca = y_i64.i64()?;
-
-    let mut sample_weights = Vec::with_capacity(y.len());
-
-    for label in y_ca.into_iter() {
-        if let Some(lbl) = label {
-            let weight = class_weights.get(&lbl).copied().unwrap_or(1.0);
-            sample_weights.push(weight as f32);
-        } else {
-            sample_weights.push(1.0);
-        }
-    }
-
-    Ok(sample_weights)
-}
-
-// ============================================================================
-// FEATURE DRIFT DETECTION
-// ============================================================================
-
-/// Detect feature drift between training and validation data.
-///
-/// Uses Population Stability Index (PSI) or simple mean/std comparison
-/// to identify features that have shifted significantly.
-///
-/// Derived from legacy detect_feature_drift (lines 346-477)
-///
-/// # `threshold` — 2026-08-10: the parameter is now the parameter
-///
-/// This function took a `_threshold` argument, **discarded it**, and read
-/// `NEOETHOS_BOT_DRIFT_THRESHOLD` (default `0.20`) instead. A caller passing
-/// `risk.feature_drift_threshold` would have been overruled by an environment
-/// variable that appears in no config file and no artifact. The argument is now
-/// honoured and the env var is deleted (reported at startup if still set).
-///
-/// Pass `settings.risk.feature_drift_threshold`. It is scaled by realised
-/// volatility below, exactly as the env value was.
-///
-/// ⚠ **NO CALLER as of 2026-08-10.** A workspace grep over `crates/`,
-/// `desktop/` and `mcp/` finds this function's definition and nothing else, so
-/// no run's behaviour changes today — including the fact that the shipped
-/// `risk.feature_drift_threshold` (0.30) is looser than the literal 0.20 the
-/// env default supplied. Whoever wires the first caller owns that comparison
-/// and must state it, because a looser base threshold means drift is flagged
-/// LESS often.
-pub fn detect_feature_drift(
-    train_df: &DataFrame,
-    val_df: &DataFrame,
-    threshold: f64,
-    method: &str,
-) -> Result<FeatureDriftReport> {
-    if !threshold.is_finite() || threshold <= 0.0 {
-        anyhow::bail!(
-            "detect_feature_drift needs a positive base threshold; received {threshold}. \
-             Pass risk.feature_drift_threshold — a non-positive value would report every \
-             feature as drifted, or none, depending on the comparison, and neither is a \
-             usable answer."
-        );
-    }
-    if train_df.height() == 0 || val_df.height() == 0 {
-        return Ok(FeatureDriftReport {
-            drifted_features: vec![],
-            drift_scores: HashMap::new(),
-            summary: "Insufficient data for drift detection".to_string(),
-            critical: false,
-        });
-    }
-
-    // Find common numeric columns
-    let train_cols: std::collections::HashSet<_> =
-        train_df.get_column_names().iter().copied().collect();
-    let val_cols: std::collections::HashSet<_> =
-        val_df.get_column_names().iter().copied().collect();
-    let common_cols: Vec<_> = train_cols.intersection(&val_cols).copied().collect();
-
-    let numeric_cols: Vec<String> = common_cols
+pub fn compute_sample_weights(labels: &[i32]) -> Result<Vec<f64>> {
+    let class_weights = compute_class_weights(labels)?;
+    labels
         .iter()
-        .filter(|&col_name| {
-            if let (Ok(train_col), Ok(val_col)) =
-                (train_df.column(col_name), val_df.column(col_name))
-            {
-                matches!(
-                    train_col.dtype(),
-                    DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64
-                ) && matches!(
-                    val_col.dtype(),
-                    DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64
-                )
-            } else {
-                false
-            }
-        })
-        .map(|s| s.to_string())
-        .collect();
-
-    if numeric_cols.is_empty() {
-        return Ok(FeatureDriftReport {
-            drifted_features: vec![],
-            drift_scores: HashMap::new(),
-            summary: "No numeric features to check".to_string(),
-            critical: false,
-        });
-    }
-
-    // HPC FIX: Regime-Aware Drift Thresholding (lines 405-417)
-    let base_threshold = threshold;
-
-    let mut vol_scale = 1.0;
-    if let Ok(vol_col) = val_df.column("realized_volatility")
-        && let Ok(series) = vol_col.cast(&DataType::Float64)
-        && let Ok(ca) = series.f64()
-    {
-        let vol_sum: f64 = ca.into_iter().flatten().sum();
-        let count = ca.into_iter().flatten().count();
-        if count > 0 && vol_sum > 0.0 {
-            vol_scale = ((vol_sum / count as f64) * 1000.0).clamp(0.2, 5.0);
-        }
-    }
-    let threshold = base_threshold * vol_scale;
-
-    let mut drift_scores = HashMap::new();
-    let mut drifted_features = Vec::new();
-
-    // HPC: Use parallel processing for drift detection (lines 436-437)
-    use rayon::prelude::*;
-
-    let results: Vec<_> = numeric_cols
-        .par_iter()
-        .filter_map(|col| {
-            let train_col = train_df.column(col).ok()?;
-            let val_col = val_df.column(col).ok()?;
-
-            // Polars 0.47: Convert Column to Series
-            let train_series = train_col.as_materialized_series().clone();
-            let val_series = val_col.as_materialized_series().clone();
-
-            let train_vals = extract_numeric_values(&train_series).ok()?;
-            let val_vals = extract_numeric_values(&val_series).ok()?;
-
-            if train_vals.len() < 10 || val_vals.len() < 10 {
-                return None;
-            }
-
-            let score = if method == "psi" {
-                compute_psi(&train_vals, &val_vals, 10)
-            } else {
-                compute_stats_drift(&train_vals, &val_vals)
-            };
-
-            Some((col.clone(), score))
-        })
-        .collect();
-
-    for (col, score) in results {
-        drift_scores.insert(col.clone(), score);
-        if score >= threshold {
-            drifted_features.push(col);
-        }
-    }
-
-    // Calculate overall drift severity (lines 448-460)
-    let critical_threshold = 0.25;
-    let critical_count = drift_scores
-        .values()
-        .filter(|&&s| s >= critical_threshold)
-        .count();
-    let total_features = drift_scores.len();
-
-    let (critical, summary) = if critical_count > total_features * 3 / 10 {
-        (
-            true,
-            format!(
-                "CRITICAL: {}/{} features have significant drift",
-                critical_count, total_features
-            ),
-        )
-    } else if drifted_features.len() > total_features * 2 / 10 {
-        (
-            false,
-            format!(
-                "WARNING: {}/{} features show drift",
-                drifted_features.len(),
-                total_features
-            ),
-        )
-    } else {
-        (
-            false,
-            format!(
-                "OK: {}/{} features with minor drift",
-                drifted_features.len(),
-                total_features
-            ),
-        )
-    };
-
-    if !drifted_features.is_empty() {
-        let mut sorted_drifted = drifted_features.clone();
-        sorted_drifted.sort_by(|a, b| {
-            let score_a = drift_scores.get(a).copied().unwrap_or(f64::NEG_INFINITY);
-            let score_b = drift_scores.get(b).copied().unwrap_or(f64::NEG_INFINITY);
-            score_b.total_cmp(&score_a).then_with(|| a.cmp(b))
-        });
-
-        let top_5: Vec<_> = sorted_drifted.iter().take(5).map(|s| s.as_str()).collect();
-        let msg = format!(
-            "Feature drift detected: {}. Top drifted: {:?}",
-            summary, top_5
-        );
-
-        if critical || summary.starts_with("WARNING:") {
-            warn!("{}", msg);
-        } else {
-            info!("{}", msg);
-        }
-    }
-
-    Ok(FeatureDriftReport {
-        drifted_features,
-        drift_scores,
-        summary,
-        critical,
-    })
-}
-
-pub struct FeatureDriftReport {
-    pub drifted_features: Vec<String>,
-    pub drift_scores: HashMap<String, f64>,
-    pub summary: String,
-    pub critical: bool,
-}
-
-/// Extract numeric values from a Polars series
-fn extract_numeric_values(series: &Series) -> Result<Vec<f64>> {
-    let series_f64 = series.cast(&DataType::Float64)?;
-    let ca = series_f64.f64()?;
-    let values: Vec<f64> = ca
-        .into_iter()
-        .flatten()
-        .filter(|value| value.is_finite())
-        .collect();
-    Ok(values)
-}
-
-/// Compute Population Stability Index (PSI) between two distributions.
-///
-/// PSI = sum((actual_pct - expected_pct) * ln(actual_pct / expected_pct))
-///
-/// Interpretation:
-/// - PSI < 0.1: No significant change
-/// - 0.1 <= PSI < 0.25: Moderate change
-/// - PSI >= 0.25: Significant change
-///
-/// Derived from legacy _compute_psi (lines 480-535)
-pub fn compute_psi(expected: &[f64], actual: &[f64], n_bins: usize) -> f64 {
-    let eps = 1e-6;
-    let n_bins = n_bins.max(3);
-
-    // Create bins from expected distribution
-    let mut breakpoints = compute_percentiles(expected, n_bins + 1);
-    // NaN-safe sort: NaNs sort to the end. We then drop them before dedup
-    // so the histogram never sees a NaN bin edge — `partial_cmp(.).unwrap()`
-    // would have panicked here on the first NaN sample from upstream.
-    breakpoints.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
-    breakpoints.retain(|x| x.is_finite());
-    breakpoints.dedup();
-
-    if breakpoints.len() < 2 {
-        return 0.0;
-    }
-
-    let expected_counts = histogram(expected, &breakpoints);
-    let actual_counts = histogram(actual, &breakpoints);
-
-    // If bins are too sparse, retry with coarser bins
-    if expected_counts.iter().any(|&c| c < 3) || actual_counts.iter().any(|&c| c < 3) {
-        let coarse_bins = (3_usize).max((breakpoints.len() - 1).min(5));
-        let coarse_breaks = compute_percentiles(expected, coarse_bins + 1);
-        if coarse_breaks.len() >= 2 && coarse_breaks.len() < breakpoints.len() {
-            let expected_counts = histogram(expected, &coarse_breaks);
-            let actual_counts = histogram(actual, &coarse_breaks);
-            return compute_psi_from_counts(
-                &expected_counts,
-                &actual_counts,
-                expected.len(),
-                actual.len(),
-                eps,
-            );
-        }
-    }
-
-    compute_psi_from_counts(
-        &expected_counts,
-        &actual_counts,
-        expected.len(),
-        actual.len(),
-        eps,
-    )
-}
-
-fn compute_psi_from_counts(
-    expected_counts: &[usize],
-    actual_counts: &[usize],
-    expected_len: usize,
-    actual_len: usize,
-    eps: f64,
-) -> f64 {
-    let expected_pct: Vec<f64> = expected_counts
-        .iter()
-        .map(|&c| (c as f64 / (expected_len as f64 + eps)).clamp(eps, 1.0))
-        .collect();
-    let actual_pct: Vec<f64> = actual_counts
-        .iter()
-        .map(|&c| (c as f64 / (actual_len as f64 + eps)).clamp(eps, 1.0))
-        .collect();
-
-    let psi: f64 = expected_pct
-        .iter()
-        .zip(actual_pct.iter())
-        .map(|(&exp, &act)| {
-            let diff = act - exp;
-            let ratio = (act / exp).ln();
-            diff * ratio
-        })
-        .sum();
-
-    psi
-}
-
-fn compute_percentiles(data: &[f64], n: usize) -> Vec<f64> {
-    let mut sorted: Vec<f64> = data
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    if sorted.is_empty() || n == 0 {
-        return Vec::new();
-    }
-    sorted.sort_by(|a, b| a.total_cmp(b));
-
-    (0..=n)
-        .map(|i| {
-            let pct = i as f64 / n as f64;
-            let idx = ((sorted.len() - 1) as f64 * pct) as usize;
-            sorted[idx.min(sorted.len() - 1)]
+        .map(|label| {
+            class_weights
+                .get(label)
+                .copied()
+                .with_context(|| format!("missing class weight for model label {label}"))
         })
         .collect()
-}
-
-fn histogram(data: &[f64], breakpoints: &[f64]) -> Vec<usize> {
-    let mut counts = vec![0; breakpoints.len().saturating_sub(1)];
-
-    for &val in data {
-        for i in 0..breakpoints.len() - 1 {
-            if val >= breakpoints[i] && (i == breakpoints.len() - 2 || val < breakpoints[i + 1]) {
-                counts[i] += 1;
-                break;
-            }
-        }
-    }
-
-    counts
-}
-
-/// Fallback drift metric based on mean/std shift.
-///
-/// Derived from legacy _compute_stats_drift (lines 538-554)
-pub fn compute_stats_drift(train_vals: &[f64], val_vals: &[f64]) -> f64 {
-    let train_mean = train_vals.iter().sum::<f64>() / train_vals.len() as f64;
-    let val_mean = val_vals.iter().sum::<f64>() / val_vals.len() as f64;
-
-    let train_std = {
-        let variance = train_vals
-            .iter()
-            .map(|&x| (x - train_mean).powi(2))
-            .sum::<f64>()
-            / train_vals.len() as f64;
-        variance.sqrt()
-    };
-    let val_std = {
-        let variance = val_vals
-            .iter()
-            .map(|&x| (x - val_mean).powi(2))
-            .sum::<f64>()
-            / val_vals.len() as f64;
-        variance.sqrt()
-    };
-
-    let eps = f64::EPSILON;
-
-    if train_std > eps {
-        let mean_shift = (val_mean - train_mean).abs() / train_std.max(eps);
-        let std_ratio = val_std / train_std.max(eps);
-        mean_shift + (1.0 - std_ratio).abs()
-    } else {
-        0.0
-    }
-}
-
-// ============================================================================
-// ROBUST SCALING (HPC ADVANCEMENT)
-// ============================================================================
-
-/// Robust Scaler that handles NaN and Infinite values efficiently.
-/// Derived from legacy advancements in normalization.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RobustScaler {
-    pub mean: Option<Array2<f32>>,
-    pub scale: Option<Array2<f32>>,
-}
-
-impl Default for RobustScaler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RobustScaler {
-    pub fn new() -> Self {
-        Self {
-            mean: None,
-            scale: None,
-        }
-    }
-
-    /// Fit the scaler to data, ignoring NaN/Inf.
-    pub fn fit(&mut self, data: &Array2<f32>) -> Result<()> {
-        let n_features = data.ncols();
-        let mut means = Array2::zeros((1, n_features));
-        let mut scales = Array2::zeros((1, n_features));
-
-        for j in 0..n_features {
-            let col = data.column(j);
-            let valid_values: Vec<f32> = col.iter().filter(|&&x| x.is_finite()).copied().collect();
-
-            if valid_values.is_empty() {
-                means[[0, j]] = 0.0;
-                scales[[0, j]] = 1.0;
-                continue;
-            }
-
-            let sum: f32 = valid_values.iter().sum();
-            let count = valid_values.len() as f32;
-            let mean = sum / count;
-
-            let variance: f32 = valid_values
-                .iter()
-                .map(|&x| (x - mean).powi(2))
-                .sum::<f32>()
-                / count;
-
-            let std = variance.sqrt().max(1e-3);
-
-            means[[0, j]] = mean;
-            scales[[0, j]] = std;
-        }
-
-        self.mean = Some(means);
-        self.scale = Some(scales);
-        Ok(())
-    }
-
-    /// Transform data using fitted parameters.
-    pub fn transform(&self, data: &Array2<f32>) -> Result<Array2<f32>> {
-        let mean = self.mean.as_ref().context("Scaler not fitted")?;
-        let scale = self.scale.as_ref().context("Scaler not fitted")?;
-
-        let mut transformed = data.clone();
-        for i in 0..data.nrows() {
-            for j in 0..data.ncols() {
-                let val = transformed[[i, j]];
-                if val.is_finite() {
-                    transformed[[i, j]] = (val - mean[[0, j]]) / scale[[0, j]];
-                } else {
-                    // Replace NaN/Inf with 0.0 after normalization (mean)
-                    transformed[[i, j]] = 0.0;
-                }
-            }
-        }
-
-        Ok(transformed)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+
+    fn sample_frame() -> FeatureFrame {
+        let columns = [
+            ("open", vec![1.0, 2.0]),
+            ("high", vec![1.5, 2.5]),
+            ("close", vec![1.25, 2.25]),
+        ]
+        .into_iter()
+        .map(|(name, values)| {
+            FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; 2])
+                .expect("valid typed feature column")
+        })
+        .collect();
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(2),
+            columns,
+        )
+        .expect("typed feature frame")
+    }
 
     #[test]
-    fn feature_columns_from_dataframe_preserves_column_order() -> Result<()> {
-        let df = DataFrame::new(vec![
-            Series::new("open".into(), vec![1.0_f64, 2.0]).into(),
-            Series::new("high".into(), vec![1.5_f64, 2.5]).into(),
-            Series::new("close".into(), vec![1.25_f64, 2.25]).into(),
-        ])?;
+    fn sample_weights_use_typed_labels_and_preserve_f64() -> Result<()> {
+        let labels = [-1, 0, 0, 1, 1, 1];
+        let weights: Vec<f64> = compute_sample_weights(&labels)?;
 
-        let columns = feature_columns_from_dataframe(&df);
+        assert_eq!(weights.len(), labels.len());
+        assert_eq!(weights[0], 2.0);
+        assert_eq!(weights[1], 1.0);
+        assert_eq!(weights[3], 2.0 / 3.0);
+        Ok(())
+    }
+
+    #[test]
+    fn sample_weights_reject_unknown_model_labels() {
+        let error = compute_sample_weights(&[-1, 0, 2])
+            .expect_err("the shared model label contract must reject class 2");
+        assert!(error.to_string().contains("unsupported class 2"));
+    }
+
+    #[test]
+    fn feature_columns_from_frame_preserves_column_order() {
+        let columns = feature_columns_from_frame(&sample_frame());
         assert_eq!(
             columns,
             vec!["open".to_string(), "high".to_string(), "close".to_string()]
         );
-        Ok(())
     }
 
     #[test]
@@ -1363,38 +699,21 @@ mod tests {
     }
 
     #[test]
-    fn dataframe_to_float32_array_still_builds_row_major_contract() -> Result<()> {
-        let df = DataFrame::new(vec![
-            Series::new("a".into(), vec![1.0_f64, 2.0]).into(),
-            Series::new("b".into(), vec![3.0_f64, 4.0]).into(),
-        ])?;
+    fn strict_feature_column_values_rejects_invalid_cells() -> Result<()> {
+        let mut columns = vec![FeatureColumnF64::new(
+            "close",
+            vec![1.0, 2.0],
+            vec![FeatureCellValidity::Valid; 2],
+        )?];
+        columns[0].invalidate(1, FeatureCellValidity::Gap)?;
+        let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(2),
+            columns,
+        )?;
 
-        let array = dataframe_to_float32_array(&df)?;
-        assert_eq!(array, array![[1.0_f32, 3.0_f32], [2.0_f32, 4.0_f32]]);
-        Ok(())
-    }
-
-    #[test]
-    fn dataframe_to_float32_array_rejects_nulls() -> Result<()> {
-        let df = DataFrame::new(vec![
-            Series::new("a".into(), vec![Some(1.0_f64), None]).into(),
-            Series::new("b".into(), vec![Some(3.0_f64), Some(4.0)]).into(),
-        ])?;
-
-        let err = dataframe_to_float32_array(&df).expect_err("null feature row should fail");
-        assert!(err.to_string().contains("contains null"));
-        Ok(())
-    }
-
-    #[test]
-    fn strict_numeric_column_values_rejects_non_finite_values() -> Result<()> {
-        let df = DataFrame::new(vec![
-            Series::new("close".into(), vec![1.0_f64, f64::NAN]).into(),
-        ])?;
-
-        let err = strict_numeric_column_values(&df, "close")
-            .expect_err("non-finite numeric values should fail");
-        assert!(err.to_string().contains("non-finite"));
+        let err = strict_feature_column_values(&frame, "close")
+            .expect_err("invalid typed feature cells must fail closed");
+        assert!(err.to_string().contains("row 1") && err.to_string().contains("gap"));
         Ok(())
     }
 }

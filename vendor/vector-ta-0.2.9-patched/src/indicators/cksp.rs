@@ -11,28 +11,6 @@ use std::error::Error;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use thiserror::Error;
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaCksp};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 #[derive(Debug, Clone)]
 pub enum CkspData<'a> {
     Candles {
@@ -46,10 +24,6 @@ pub enum CkspData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct CkspParams {
     pub p: Option<usize>,
     pub x: Option<f64>,
@@ -242,7 +216,6 @@ pub fn cksp(input: &CkspInput) -> Result<CkspOutput, CkspError> {
     cksp_with_kernel(input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn cksp_into(
     input: &CkspInput,
@@ -448,20 +421,12 @@ unsafe fn cksp_compute_into_fixed<const CAP: usize>(
 
     #[inline(always)]
     fn rb_dec<const CAP: usize>(idx: usize) -> usize {
-        if idx == 0 {
-            CAP - 1
-        } else {
-            idx - 1
-        }
+        if idx == 0 { CAP - 1 } else { idx - 1 }
     }
     #[inline(always)]
     fn rb_inc<const CAP: usize>(idx: usize) -> usize {
         let next = idx + 1;
-        if next == CAP {
-            0
-        } else {
-            next
-        }
+        if next == CAP { 0 } else { next }
     }
 
     for i in first_valid_idx..size {
@@ -475,11 +440,7 @@ unsafe fn cksp_compute_into_fixed<const CAP: usize>(
             let hc = (hi - cprev).abs();
             let lc = (lo - cprev).abs();
             if hl >= hc {
-                if hl >= lc {
-                    hl
-                } else {
-                    lc
-                }
+                if hl >= lc { hl } else { lc }
             } else if hc >= lc {
                 hc
             } else {
@@ -677,11 +638,7 @@ pub unsafe fn cksp_scalar(
 
     #[inline(always)]
     unsafe fn rb_dec(idx: usize, cap: usize) -> usize {
-        if idx == 0 {
-            cap - 1
-        } else {
-            idx - 1
-        }
+        if idx == 0 { cap - 1 } else { idx - 1 }
     }
     #[inline(always)]
     unsafe fn rb_inc(idx: usize, cap: usize) -> usize {
@@ -707,17 +664,9 @@ pub unsafe fn cksp_scalar(
             let hc = (hi - cprev).abs();
             let lc = (lo - cprev).abs();
             if hl >= hc {
-                if hl >= lc {
-                    hl
-                } else {
-                    lc
-                }
+                if hl >= lc { hl } else { lc }
             } else {
-                if hc >= lc {
-                    hc
-                } else {
-                    lc
-                }
+                if hc >= lc { hc } else { lc }
             }
         };
 
@@ -968,11 +917,7 @@ pub unsafe fn cksp_compute_into(
 
     #[inline(always)]
     unsafe fn rb_dec(idx: usize, cap: usize) -> usize {
-        if idx == 0 {
-            cap - 1
-        } else {
-            idx - 1
-        }
+        if idx == 0 { cap - 1 } else { idx - 1 }
     }
     #[inline(always)]
     unsafe fn rb_inc(idx: usize, cap: usize) -> usize {
@@ -998,17 +943,9 @@ pub unsafe fn cksp_compute_into(
             let hc = (hi - cprev).abs();
             let lc = (lo - cprev).abs();
             if hl >= hc {
-                if hl >= lc {
-                    hl
-                } else {
-                    lc
-                }
+                if hl >= lc { hl } else { lc }
             } else {
-                if hc >= lc {
-                    hc
-                } else {
-                    lc
-                }
+                if hc >= lc { hc } else { lc }
             }
         };
 
@@ -1900,11 +1837,7 @@ fn cksp_batch_inner(
         let mut tail = 0usize;
         #[inline(always)]
         fn dec(i: usize, c: usize) -> usize {
-            if i == 0 {
-                c - 1
-            } else {
-                i - 1
-            }
+            if i == 0 { c - 1 } else { i - 1 }
         }
         #[inline(always)]
         fn inc(i: usize, c: usize) -> usize {
@@ -1961,11 +1894,7 @@ fn cksp_batch_inner(
         let mut tail = 0usize;
         #[inline(always)]
         fn dec(i: usize, c: usize) -> usize {
-            if i == 0 {
-                c - 1
-            } else {
-                i - 1
-            }
+            if i == 0 { c - 1 } else { i - 1 }
         }
         #[inline(always)]
         fn inc(i: usize, c: usize) -> usize {
@@ -2052,11 +1981,7 @@ fn cksp_batch_inner(
         let mut ss_tail = 0usize;
         #[inline(always)]
         fn dec(i: usize, c: usize) -> usize {
-            if i == 0 {
-                c - 1
-            } else {
-                i - 1
-            }
+            if i == 0 { c - 1 } else { i - 1 }
         }
         #[inline(always)]
         fn inc(i: usize, c: usize) -> usize {
@@ -2184,47 +2109,19 @@ fn cksp_batch_inner(
     })
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cksp_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    p: usize,
-    x: f64,
-    q: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = cksp_js(high, low, close, p, x, q)?;
-    crate::write_wasm_f64_output("cksp_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cksp_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = cksp_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("cksp_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_cksp_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = CkspParams {
             p: None,
@@ -2240,8 +2137,8 @@ mod tests {
 
     fn check_cksp_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = CkspParams {
             p: Some(10),
@@ -2297,8 +2194,8 @@ mod tests {
 
     fn check_cksp_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = CkspInput::with_default_candles(&candles);
         match input.data {
@@ -2379,8 +2276,8 @@ mod tests {
 
     fn check_cksp_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = CkspParams {
             p: Some(10),
@@ -2405,8 +2302,8 @@ mod tests {
 
     fn check_cksp_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = CkspInput::from_candles(
             &candles,
@@ -2441,8 +2338,8 @@ mod tests {
     fn check_cksp_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let p = 10;
         let x = 1.0;
@@ -2518,8 +2415,8 @@ mod tests {
     fn check_cksp_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = CkspInput::from_candles(&candles, CkspParams::default());
         let output = cksp_with_kernel(&input, kernel)?;
@@ -2533,23 +2430,23 @@ mod tests {
 
             if bits == 0x11111111_11111111 {
                 panic!(
-					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in long_values",
-					test_name, val, bits, i
-				);
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in long_values",
+                    test_name, val, bits, i
+                );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
-					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in long_values",
-					test_name, val, bits, i
-				);
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in long_values",
+                    test_name, val, bits, i
+                );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
-					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in long_values",
-					test_name, val, bits, i
-				);
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in long_values",
+                    test_name, val, bits, i
+                );
             }
         }
 
@@ -2562,23 +2459,23 @@ mod tests {
 
             if bits == 0x11111111_11111111 {
                 panic!(
-					"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in short_values",
-					test_name, val, bits, i
-				);
+                    "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in short_values",
+                    test_name, val, bits, i
+                );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
-					"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in short_values",
-					test_name, val, bits, i
-				);
+                    "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in short_values",
+                    test_name, val, bits, i
+                );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
-					"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in short_values",
-					test_name, val, bits, i
-				);
+                    "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in short_values",
+                    test_name, val, bits, i
+                );
             }
         }
 
@@ -2616,7 +2513,13 @@ mod tests {
                 {
                     panic!(
                         "[{}] Found poison value {} (0x{:016X}) at index {} in long_values with params p={}, x={}, q={}",
-                        test_name, val, bits, i, params.p.unwrap(), params.x.unwrap(), params.q.unwrap()
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.p.unwrap(),
+                        params.x.unwrap(),
+                        params.q.unwrap()
                     );
                 }
             }
@@ -2633,7 +2536,13 @@ mod tests {
                 {
                     panic!(
                         "[{}] Found poison value {} (0x{:016X}) at index {} in short_values with params p={}, x={}, q={}",
-                        test_name, val, bits, i, params.p.unwrap(), params.x.unwrap(), params.q.unwrap()
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.p.unwrap(),
+                        params.x.unwrap(),
+                        params.q.unwrap()
                     );
                 }
             }
@@ -3137,8 +3046,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = CkspBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -3183,8 +3092,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = CkspBatchBuilder::new()
             .kernel(kernel)
@@ -3288,8 +3197,8 @@ mod tests {
 
     #[test]
     fn test_cksp_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = CkspInput::from_candles(&candles, CkspParams::default());
 
@@ -3299,14 +3208,8 @@ mod tests {
         let mut out_long = vec![0.0; n];
         let mut out_short = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             cksp_into(&input, &mut out_long, &mut out_short)?;
-        }
-
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            cksp_into_slices(&mut out_long, &mut out_short, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.long_values.len(), out_long.len());
@@ -3334,129 +3237,6 @@ mod tests {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-#[inline(always)]
-fn cksp_prepare(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    p: usize,
-    x: f64,
-    q: usize,
-    kernel: Kernel,
-) -> Result<(usize, Kernel), CkspError> {
-    if p == 0 || q == 0 {
-        return Err(CkspError::InvalidParam { param: "p/q" });
-    }
-    if !x.is_finite() {
-        return Err(CkspError::InvalidMultiplier { x });
-    }
-
-    let size = close.len();
-    if size == 0 {
-        return Err(CkspError::EmptyInputData);
-    }
-    if high.len() != low.len() || low.len() != close.len() {
-        return Err(CkspError::InconsistentLengths);
-    }
-    let first_valid_idx = match close.iter().position(|&v| !v.is_nan()) {
-        Some(idx) => idx,
-        None => return Err(CkspError::AllValuesNaN),
-    };
-    let valid = size - first_valid_idx;
-    let warmup = p
-        .checked_add(q)
-        .and_then(|v| v.checked_sub(1))
-        .ok_or_else(|| CkspError::InvalidInput("warmup overflow (p+q too large)".into()))?;
-    if valid <= warmup {
-        let needed = warmup
-            .checked_add(1)
-            .ok_or_else(|| CkspError::InvalidInput("warmup+1 overflow".into()))?;
-        return Err(CkspError::NotEnoughValidData { needed, valid });
-    }
-
-    let chosen = match kernel {
-        Kernel::Auto => Kernel::Scalar,
-        other => other,
-    };
-
-    Ok((first_valid_idx, chosen))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "cksp")]
-#[pyo3(signature = (high, low, close, p=10, x=1.0, q=9, kernel=None))]
-pub fn cksp_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    p: usize,
-    x: f64,
-    q: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let (first_valid_idx, chosen) = cksp_prepare(high_slice, low_slice, close_slice, p, x, q, kern)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let result = py
-        .allow_threads(|| unsafe {
-            match chosen {
-                Kernel::Scalar | Kernel::ScalarBatch => {
-                    cksp_scalar(high_slice, low_slice, close_slice, p, x, q, first_valid_idx)
-                }
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx2 | Kernel::Avx2Batch => {
-                    cksp_avx2(high_slice, low_slice, close_slice, p, x, q, first_valid_idx)
-                }
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx512 | Kernel::Avx512Batch => {
-                    cksp_avx512(high_slice, low_slice, close_slice, p, x, q, first_valid_idx)
-                }
-                _ => unreachable!(),
-            }
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        result.long_values.into_pyarray(py),
-        result.short_values.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "CkspStream")]
-pub struct CkspStreamPy {
-    inner: CkspStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl CkspStreamPy {
-    #[new]
-    pub fn new(p: usize, x: f64, q: usize) -> PyResult<Self> {
-        let params = CkspParams {
-            p: Some(p),
-            x: Some(x),
-            q: Some(q),
-        };
-        let inner =
-            CkspStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(CkspStreamPy { inner })
-    }
-
-    pub fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.inner.update(high, low, close)
     }
 }
 
@@ -3587,219 +3367,6 @@ fn cksp_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "cksp_batch")]
-#[pyo3(signature = (high, low, close, p_range=(10, 10, 0), x_range=(1.0, 1.0, 0.0), q_range=(9, 9, 0), kernel=None))]
-pub fn cksp_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    p_range: (usize, usize, usize),
-    x_range: (f64, f64, f64),
-    q_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = CkspBatchRange {
-        p: p_range,
-        x: x_range,
-        q: q_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close_slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let long_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let short_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let long_slice = unsafe { long_arr.as_slice_mut()? };
-    let short_slice = unsafe { short_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            cksp_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &sweep,
-                simd,
-                true,
-                long_slice,
-                short_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("long_values", long_arr.reshape((rows, cols))?)?;
-    dict.set_item("short_values", short_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "p",
-        combos
-            .iter()
-            .map(|p| p.p.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "x",
-        combos
-            .iter()
-            .map(|p| p.x.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "q",
-        combos
-            .iter()
-            .map(|p| p.q.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "cksp_cuda_batch_dev")]
-#[pyo3(signature = (high, low, close, p_range=(10,10,0), x_range=(1.0,1.0,0.0), q_range=(9,9,0), device_id=0))]
-pub fn cksp_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f32>,
-    low: PyReadonlyArray1<'py, f32>,
-    close: PyReadonlyArray1<'py, f32>,
-    p_range: (usize, usize, usize),
-    x_range: (f32, f32, f32),
-    q_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-    let cs = close.as_slice()?;
-    let sweep = CkspBatchRange {
-        p: p_range,
-        x: (x_range.0 as f64, x_range.1 as f64, x_range.2 as f64),
-        q: q_range,
-    };
-    let (pair, combos) = py.allow_threads(|| {
-        let cuda = CudaCksp::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.cksp_batch_dev(hs, ls, cs, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    let long_dev = make_device_array_py(device_id, pair.long)?;
-    let short_dev = make_device_array_py(device_id, pair.short)?;
-    dict.set_item("long_values", Py::new(py, long_dev)?)?;
-    dict.set_item("short_values", Py::new(py, short_dev)?)?;
-    use numpy::IntoPyArray;
-    dict.set_item(
-        "p",
-        combos
-            .iter()
-            .map(|c| c.p.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "x",
-        combos
-            .iter()
-            .map(|c| c.x.unwrap() as f64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "q",
-        combos
-            .iter()
-            .map(|c| c.q.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", cs.len())?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "cksp_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, close_tm, p=10, x=1.0, q=9, device_id=0))]
-pub fn cksp_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm: numpy::PyReadonlyArray2<'py, f32>,
-    low_tm: numpy::PyReadonlyArray2<'py, f32>,
-    close_tm: numpy::PyReadonlyArray2<'py, f32>,
-    p: usize,
-    x: f64,
-    q: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sh = high_tm.shape();
-    let sl = low_tm.shape();
-    let sc = close_tm.shape();
-    if sh.len() != 2 || sl.len() != 2 || sc.len() != 2 || sh != sl || sh != sc {
-        return Err(PyValueError::new_err(
-            "expected 2D arrays with identical shape",
-        ));
-    }
-    let rows = sh[0];
-    let cols = sh[1];
-    let hflat = high_tm.as_slice()?;
-    let lflat = low_tm.as_slice()?;
-    let cflat = close_tm.as_slice()?;
-    let params = CkspParams {
-        p: Some(p),
-        x: Some(x),
-        q: Some(q),
-    };
-    let pair = py.allow_threads(|| {
-        let cuda = CudaCksp::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.cksp_many_series_one_param_time_major_dev(hflat, lflat, cflat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    let long_dev = make_device_array_py(device_id, pair.long)?;
-    let short_dev = make_device_array_py(device_id, pair.short)?;
-    dict.set_item("long_values", Py::new(py, long_dev)?)?;
-    dict.set_item("short_values", Py::new(py, short_dev)?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("p", p)?;
-    dict.set_item("x", x)?;
-    dict.set_item("q", q)?;
-    Ok(dict)
-}
-
 #[inline]
 pub fn cksp_into_slice(
     long_dst: &mut [f64],
@@ -3873,268 +3440,4 @@ pub fn cksp_into_slice(
     }
 
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cksp_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    p: usize,
-    x: f64,
-    q: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let input = CkspInput::from_slices(
-        high,
-        low,
-        close,
-        CkspParams {
-            p: Some(p),
-            x: Some(x),
-            q: Some(q),
-        },
-    );
-    let out =
-        cksp_with_kernel(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let cols = close.len();
-    let mut values = Vec::with_capacity(2 * cols);
-    values.extend_from_slice(&out.long_values);
-    values.extend_from_slice(&out.short_values);
-    Ok(values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cksp_into(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    long_ptr: *mut f64,
-    short_ptr: *mut f64,
-    len: usize,
-    p: usize,
-    x: f64,
-    q: usize,
-) -> Result<(), JsValue> {
-    if long_ptr.is_null() || short_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    if high.len() != len || low.len() != len || close.len() != len {
-        return Err(JsValue::from_str("Input length mismatch"));
-    }
-
-    unsafe {
-        let high_ptr = high.as_ptr();
-        let low_ptr = low.as_ptr();
-        let close_ptr = close.as_ptr();
-
-        let has_aliasing = (high_ptr as *const f64 == long_ptr as *const f64)
-            || (high_ptr as *const f64 == short_ptr as *const f64)
-            || (low_ptr as *const f64 == long_ptr as *const f64)
-            || (low_ptr as *const f64 == short_ptr as *const f64)
-            || (close_ptr as *const f64 == long_ptr as *const f64)
-            || (close_ptr as *const f64 == short_ptr as *const f64)
-            || (long_ptr == short_ptr);
-
-        if has_aliasing {
-            let mut temp_long = vec![0.0; len];
-            let mut temp_short = vec![0.0; len];
-
-            cksp_into_slice(
-                &mut temp_long,
-                &mut temp_short,
-                high,
-                low,
-                close,
-                p,
-                x,
-                q,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let long_out = std::slice::from_raw_parts_mut(long_ptr, len);
-            let short_out = std::slice::from_raw_parts_mut(short_ptr, len);
-            long_out.copy_from_slice(&temp_long);
-            short_out.copy_from_slice(&temp_short);
-        } else {
-            let long_out = std::slice::from_raw_parts_mut(long_ptr, len);
-            let short_out = std::slice::from_raw_parts_mut(short_ptr, len);
-
-            cksp_into_slice(long_out, short_out, high, low, close, p, x, q, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cksp_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cksp_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CkspJsResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CkspBatchConfig {
-    pub p_range: (usize, usize, usize),
-    pub x_range: (f64, f64, f64),
-    pub q_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CkspBatchJsOutput {
-    pub long_values: Vec<f64>,
-    pub short_values: Vec<f64>,
-    pub combos: Vec<CkspParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = cksp_batch)]
-pub fn cksp_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: CkspBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = CkspBatchRange {
-        p: config.p_range,
-        x: config.x_range,
-        q: config.q_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-    let mut long_values = vec![0.0; total];
-    let mut short_values = vec![0.0; total];
-
-    let kernel = detect_best_batch_kernel();
-    let simd = match kernel {
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx512Batch => Kernel::Avx512,
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch | _ => Kernel::Scalar,
-    };
-    cksp_batch_inner_into(
-        high,
-        low,
-        close,
-        &sweep,
-        simd,
-        false,
-        &mut long_values,
-        &mut short_values,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = CkspBatchJsOutput {
-        long_values,
-        short_values,
-        combos,
-        rows,
-        cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn cksp_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    long_ptr: *mut f64,
-    short_ptr: *mut f64,
-    len: usize,
-    p_start: usize,
-    p_end: usize,
-    p_step: usize,
-    x_start: f64,
-    x_end: f64,
-    x_step: f64,
-    q_start: usize,
-    q_end: usize,
-    q_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || long_ptr.is_null()
-        || short_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = CkspBatchRange {
-            p: (p_start, p_end, p_step),
-            x: (x_start, x_end, x_step),
-            q: (q_start, q_end, q_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-        let long_out = std::slice::from_raw_parts_mut(long_ptr, total);
-        let short_out = std::slice::from_raw_parts_mut(short_ptr, total);
-
-        let kernel = detect_best_batch_kernel();
-        let simd = match kernel {
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512Batch => Kernel::Avx512,
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch | _ => Kernel::Scalar,
-        };
-        cksp_batch_inner_into(high, low, close, &sweep, simd, false, long_out, short_out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

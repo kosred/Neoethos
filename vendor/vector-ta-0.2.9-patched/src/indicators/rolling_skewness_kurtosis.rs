@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -57,10 +41,6 @@ pub struct RollingSkewnessKurtosisOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RollingSkewnessKurtosisParams {
     pub length: Option<usize>,
     pub smooth_length: Option<usize>,
@@ -228,9 +208,7 @@ pub enum RollingSkewnessKurtosisError {
     InvalidLength { length: usize, data_len: usize },
     #[error("rolling_skewness_kurtosis: Invalid smooth_length: {smooth_length}")]
     InvalidSmoothLength { smooth_length: usize },
-    #[error(
-        "rolling_skewness_kurtosis: Not enough valid data: needed = {needed}, valid = {valid}"
-    )]
+    #[error("rolling_skewness_kurtosis: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
     #[error(
         "rolling_skewness_kurtosis: Output length mismatch: expected = {expected}, got = {got}"
@@ -496,11 +474,7 @@ fn update_sma3(
         }
         *count += 1;
         *sum += value;
-        if *count < 3 {
-            None
-        } else {
-            Some(*sum / 3.0)
-        }
+        if *count < 3 { None } else { Some(*sum / 3.0) }
     } else {
         let old = buf[*head];
         buf[*head] = value;
@@ -711,7 +685,6 @@ pub fn rolling_skewness_kurtosis_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn rolling_skewness_kurtosis_into(
     input: &RollingSkewnessKurtosisInput,
     out_skewness: &mut [f64],
@@ -1110,358 +1083,11 @@ fn rolling_skewness_kurtosis_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "rolling_skewness_kurtosis")]
-#[pyo3(signature = (data, length=50, smooth_length=3, kernel=None))]
-pub fn rolling_skewness_kurtosis_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    smooth_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let input = RollingSkewnessKurtosisInput::from_slice(
-        data,
-        RollingSkewnessKurtosisParams {
-            length: Some(length),
-            smooth_length: Some(smooth_length),
-        },
-    );
-    let out = py
-        .allow_threads(|| rolling_skewness_kurtosis_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((out.skewness.into_pyarray(py), out.kurtosis.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RollingSkewnessKurtosisStream")]
-pub struct RollingSkewnessKurtosisStreamPy {
-    stream: RollingSkewnessKurtosisStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RollingSkewnessKurtosisStreamPy {
-    #[new]
-    #[pyo3(signature = (length=50, smooth_length=3))]
-    fn new(length: usize, smooth_length: usize) -> PyResult<Self> {
-        let stream = RollingSkewnessKurtosisStream::try_new(RollingSkewnessKurtosisParams {
-            length: Some(length),
-            smooth_length: Some(smooth_length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "rolling_skewness_kurtosis_batch")]
-#[pyo3(signature = (data, length_range=(50,50,0), smooth_length_range=(3,3,0), kernel=None))]
-pub fn rolling_skewness_kurtosis_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    smooth_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            rolling_skewness_kurtosis_batch_with_kernel(
-                data,
-                &RollingSkewnessKurtosisBatchRange {
-                    length: length_range,
-                    smooth_length: smooth_length_range,
-                },
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "skewness",
-        output
-            .skewness
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "kurtosis",
-        output
-            .kurtosis
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.length.unwrap_or(50) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.smooth_length.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_rolling_skewness_kurtosis_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(rolling_skewness_kurtosis_py, m)?)?;
-    m.add_function(wrap_pyfunction!(rolling_skewness_kurtosis_batch_py, m)?)?;
-    m.add_class::<RollingSkewnessKurtosisStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RollingSkewnessKurtosisBatchConfig {
-    pub length_range: Vec<usize>,
-    pub smooth_length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = rolling_skewness_kurtosis_js)]
-pub fn rolling_skewness_kurtosis_js(
-    data: &[f64],
-    length: usize,
-    smooth_length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = RollingSkewnessKurtosisInput::from_slice(
-        data,
-        RollingSkewnessKurtosisParams {
-            length: Some(length),
-            smooth_length: Some(smooth_length),
-        },
-    );
-    let out = rolling_skewness_kurtosis_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("skewness"),
-        &serde_wasm_bindgen::to_value(&out.skewness).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("kurtosis"),
-        &serde_wasm_bindgen::to_value(&out.kurtosis).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = rolling_skewness_kurtosis_batch_js)]
-pub fn rolling_skewness_kurtosis_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: RollingSkewnessKurtosisBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 || config.smooth_length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: every range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let out = rolling_skewness_kurtosis_batch_with_kernel(
-        data,
-        &RollingSkewnessKurtosisBatchRange {
-            length: (
-                config.length_range[0],
-                config.length_range[1],
-                config.length_range[2],
-            ),
-            smooth_length: (
-                config.smooth_length_range[0],
-                config.smooth_length_range[1],
-                config.smooth_length_range[2],
-            ),
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("skewness"),
-        &serde_wasm_bindgen::to_value(&out.skewness).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("kurtosis"),
-        &serde_wasm_bindgen::to_value(&out.kurtosis).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rolling_skewness_kurtosis_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(2 * len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rolling_skewness_kurtosis_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rolling_skewness_kurtosis_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    smooth_length: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to rolling_skewness_kurtosis_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * len);
-        let (dst_skewness, dst_kurtosis) = out.split_at_mut(len);
-        let input = RollingSkewnessKurtosisInput::from_slice(
-            data,
-            RollingSkewnessKurtosisParams {
-                length: Some(length),
-                smooth_length: Some(smooth_length),
-            },
-        );
-        rolling_skewness_kurtosis_into_slice(dst_skewness, dst_kurtosis, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rolling_skewness_kurtosis_batch_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    smooth_length_start: usize,
-    smooth_length_end: usize,
-    smooth_length_step: usize,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to rolling_skewness_kurtosis_batch_into",
-        ));
-    }
-    let sweep = RollingSkewnessKurtosisBatchRange {
-        length: (length_start, length_end, length_step),
-        smooth_length: (smooth_length_start, smooth_length_end, smooth_length_step),
-    };
-    let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .and_then(|v| v.checked_mul(2))
-        .ok_or_else(|| {
-            JsValue::from_str("rows*cols overflow in rolling_skewness_kurtosis_batch_into")
-        })?;
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let split = rows * len;
-        let (dst_skewness, dst_kurtosis) = out.split_at_mut(split);
-        rolling_skewness_kurtosis_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Auto,
-            false,
-            dst_skewness,
-            dst_kurtosis,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rolling_skewness_kurtosis_output_into_js(
-    data: &[f64],
-    length: usize,
-    smooth_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = rolling_skewness_kurtosis_js(data, length, smooth_length)?;
-    crate::write_wasm_object_f64_outputs("rolling_skewness_kurtosis_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn rolling_skewness_kurtosis_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = rolling_skewness_kurtosis_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "rolling_skewness_kurtosis_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu, IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue,
+        IndicatorComputeRequest, IndicatorDataRef, ParamKV, ParamValue, compute_cpu,
     };
 
     fn sample_data(len: usize) -> Vec<f64> {

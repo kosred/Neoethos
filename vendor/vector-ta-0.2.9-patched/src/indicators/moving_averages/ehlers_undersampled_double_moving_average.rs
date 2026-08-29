@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -66,10 +48,6 @@ pub struct EhlersUndersampledDoubleMovingAverageOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersUndersampledDoubleMovingAverageParams {
     pub fast_length: Option<usize>,
     pub slow_length: Option<usize>,
@@ -252,27 +230,41 @@ pub enum EhlersUndersampledDoubleMovingAverageError {
     EmptyInputData,
     #[error("ehlers_undersampled_double_moving_average: all values are NaN.")]
     AllValuesNaN,
-    #[error("ehlers_undersampled_double_moving_average: invalid fast_length: {fast_length}. Expected 1..={MAX_LENGTH}.")]
+    #[error(
+        "ehlers_undersampled_double_moving_average: invalid fast_length: {fast_length}. Expected 1..={MAX_LENGTH}."
+    )]
     InvalidFastLength { fast_length: usize },
-    #[error("ehlers_undersampled_double_moving_average: invalid slow_length: {slow_length}. Expected 1..={MAX_LENGTH}.")]
+    #[error(
+        "ehlers_undersampled_double_moving_average: invalid slow_length: {slow_length}. Expected 1..={MAX_LENGTH}."
+    )]
     InvalidSlowLength { slow_length: usize },
-    #[error("ehlers_undersampled_double_moving_average: invalid sample_length: {sample_length}. Expected 1..={MAX_LENGTH}.")]
+    #[error(
+        "ehlers_undersampled_double_moving_average: invalid sample_length: {sample_length}. Expected 1..={MAX_LENGTH}."
+    )]
     InvalidSampleLength { sample_length: usize },
-    #[error("ehlers_undersampled_double_moving_average: output length mismatch: expected = {expected}, got = {got}")]
+    #[error(
+        "ehlers_undersampled_double_moving_average: output length mismatch: expected = {expected}, got = {got}"
+    )]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error("ehlers_undersampled_double_moving_average: invalid fast_length range: start={start}, end={end}, step={step}")]
+    #[error(
+        "ehlers_undersampled_double_moving_average: invalid fast_length range: start={start}, end={end}, step={step}"
+    )]
     InvalidFastLengthRange {
         start: usize,
         end: usize,
         step: usize,
     },
-    #[error("ehlers_undersampled_double_moving_average: invalid slow_length range: start={start}, end={end}, step={step}")]
+    #[error(
+        "ehlers_undersampled_double_moving_average: invalid slow_length range: start={start}, end={end}, step={step}"
+    )]
     InvalidSlowLengthRange {
         start: usize,
         end: usize,
         step: usize,
     },
-    #[error("ehlers_undersampled_double_moving_average: invalid sample_length range: start={start}, end={end}, step={step}")]
+    #[error(
+        "ehlers_undersampled_double_moving_average: invalid sample_length range: start={start}, end={end}, step={step}"
+    )]
     InvalidSampleLengthRange {
         start: usize,
         end: usize,
@@ -356,11 +348,7 @@ impl HannFilterState {
             for offset in 0..len {
                 let value = if offset < self.count {
                     let current = self.ring[idx];
-                    if current.is_finite() {
-                        current
-                    } else {
-                        0.0
-                    }
+                    if current.is_finite() { current } else { 0.0 }
                 } else {
                     0.0
                 };
@@ -375,6 +363,35 @@ impl HannFilterState {
             acc / self.norm
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EhlersUndersampledDoubleMovingAverageExactHannPayload {
+    pub fast_weights: Vec<f64>,
+    pub slow_weights: Vec<f64>,
+    pub fast_norm: f64,
+    pub slow_norm: f64,
+}
+
+/// Build the immutable Hann coefficients from the same scalar CPU constructor
+/// used by [`EudmaCore`]. The production CUDA route uploads only this bounded
+/// parameter payload; price inputs and result matrices remain device-resident.
+pub(crate) fn ehlers_undersampled_double_moving_average_exact_hann_payload(
+    fast_length: usize,
+    slow_length: usize,
+) -> Result<
+    EhlersUndersampledDoubleMovingAverageExactHannPayload,
+    EhlersUndersampledDoubleMovingAverageError,
+> {
+    validate_params(fast_length, slow_length, 1)?;
+    let fast = HannFilterState::new(fast_length);
+    let slow = HannFilterState::new(slow_length);
+    Ok(EhlersUndersampledDoubleMovingAverageExactHannPayload {
+        fast_weights: fast.weights,
+        slow_weights: slow.weights,
+        fast_norm: fast.norm,
+        slow_norm: slow.norm,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -631,7 +648,6 @@ pub fn ehlers_undersampled_double_moving_average_into_slices(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ehlers_undersampled_double_moving_average_into(
     input: &EhlersUndersampledDoubleMovingAverageInput,
@@ -910,7 +926,7 @@ pub fn ehlers_undersampled_double_moving_average_batch_with_kernel(
         Kernel::Auto => detect_best_batch_kernel(),
         other if other.is_batch() => other,
         other => {
-            return Err(EhlersUndersampledDoubleMovingAverageError::InvalidKernelForBatch(other))
+            return Err(EhlersUndersampledDoubleMovingAverageError::InvalidKernelForBatch(other));
         }
     };
     ehlers_undersampled_double_moving_average_batch_inner(
@@ -1179,448 +1195,14 @@ pub fn ehlers_undersampled_double_moving_average_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_undersampled_double_moving_average")]
-#[pyo3(signature = (data, fast_length=6, slow_length=12, sample_length=5, kernel=None))]
-pub fn ehlers_undersampled_double_moving_average_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    fast_length: usize,
-    slow_length: usize,
-    sample_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = EhlersUndersampledDoubleMovingAverageInput::from_slice(
-        slice,
-        EhlersUndersampledDoubleMovingAverageParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-            sample_length: Some(sample_length),
-        },
-    );
-    let out = py
-        .allow_threads(|| ehlers_undersampled_double_moving_average_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((out.fast.into_pyarray(py), out.slow.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_undersampled_double_moving_average_batch")]
-#[pyo3(signature = (data, fast_length_range=(6,6,0), slow_length_range=(12,12,0), sample_length_range=(5,5,0), kernel=None))]
-pub fn ehlers_undersampled_double_moving_average_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    fast_length_range: (usize, usize, usize),
-    slow_length_range: (usize, usize, usize),
-    sample_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = EhlersUndersampledDoubleMovingAverageBatchRange {
-        fast_length: fast_length_range,
-        slow_length: slow_length_range,
-        sample_length: sample_length_range,
-    };
-
-    let combos = expand_grid_ehlers_undersampled_double_moving_average(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let fast_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slow_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let fast_slice = unsafe { fast_arr.as_slice_mut()? };
-    let slow_slice = unsafe { slow_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch_kernel = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            ehlers_undersampled_double_moving_average_batch_inner_into(
-                slice,
-                &sweep,
-                batch_kernel,
-                !matches!(batch_kernel, Kernel::ScalarBatch),
-                fast_slice,
-                slow_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("fast_values", fast_arr.reshape((rows, cols))?)?;
-    dict.set_item("slow_values", slow_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fast_lengths",
-        combos
-            .iter()
-            .map(|combo| combo.fast_length.unwrap_or(DEFAULT_FAST_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_lengths",
-        combos
-            .iter()
-            .map(|combo| combo.slow_length.unwrap_or(DEFAULT_SLOW_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "sample_lengths",
-        combos
-            .iter()
-            .map(|combo| combo.sample_length.unwrap_or(DEFAULT_SAMPLE_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersUndersampledDoubleMovingAverageStream")]
-pub struct EhlersUndersampledDoubleMovingAverageStreamPy {
-    inner: EhlersUndersampledDoubleMovingAverageStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersUndersampledDoubleMovingAverageStreamPy {
-    #[new]
-    pub fn new(fast_length: usize, slow_length: usize, sample_length: usize) -> PyResult<Self> {
-        let inner = EhlersUndersampledDoubleMovingAverageStream::try_new(
-            EhlersUndersampledDoubleMovingAverageParams {
-                fast_length: Some(fast_length),
-                slow_length: Some(slow_length),
-                sample_length: Some(sample_length),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.inner.update(value)
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_ehlers_undersampled_double_moving_average_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(
-        ehlers_undersampled_double_moving_average_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        ehlers_undersampled_double_moving_average_batch_py,
-        m
-    )?)?;
-    m.add_class::<EhlersUndersampledDoubleMovingAverageStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersUndersampledDoubleMovingAverageJsOutput {
-    pub fast: Vec<f64>,
-    pub slow: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersUndersampledDoubleMovingAverageBatchConfig {
-    pub fast_length_range: (usize, usize, usize),
-    pub slow_length_range: (usize, usize, usize),
-    pub sample_length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersUndersampledDoubleMovingAverageBatchJsOutput {
-    pub fast_values: Vec<f64>,
-    pub slow_values: Vec<f64>,
-    pub combos: Vec<EhlersUndersampledDoubleMovingAverageParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersUndersampledDoubleMovingAverageStreamValue {
-    pub fast: f64,
-    pub slow: f64,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_undersampled_double_moving_average)]
-pub fn ehlers_undersampled_double_moving_average_js(
-    data: &[f64],
-    fast_length: usize,
-    slow_length: usize,
-    sample_length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = EhlersUndersampledDoubleMovingAverageInput::from_slice(
-        data,
-        EhlersUndersampledDoubleMovingAverageParams {
-            fast_length: Some(fast_length),
-            slow_length: Some(slow_length),
-            sample_length: Some(sample_length),
-        },
-    );
-    let out = ehlers_undersampled_double_moving_average(&input)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&EhlersUndersampledDoubleMovingAverageJsOutput {
-        fast: out.fast,
-        slow: out.slow,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_undersampled_double_moving_average_batch)]
-pub fn ehlers_undersampled_double_moving_average_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: EhlersUndersampledDoubleMovingAverageBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = EhlersUndersampledDoubleMovingAverageBatchRange {
-        fast_length: config.fast_length_range,
-        slow_length: config.slow_length_range,
-        sample_length: config.sample_length_range,
-    };
-    let out =
-        ehlers_undersampled_double_moving_average_batch_with_kernel(data, &sweep, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&EhlersUndersampledDoubleMovingAverageBatchJsOutput {
-        fast_values: out.fast_values,
-        slow_values: out.slow_values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_undersampled_double_moving_average_alloc(len: usize) -> *mut f64 {
-    let mut values = Vec::<f64>::with_capacity(len);
-    let ptr = values.as_mut_ptr();
-    std::mem::forget(values);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_undersampled_double_moving_average_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_undersampled_double_moving_average_into)]
-pub fn ehlers_undersampled_double_moving_average_into_js(
-    in_ptr: *const f64,
-    fast_out_ptr: *mut f64,
-    slow_out_ptr: *mut f64,
-    len: usize,
-    fast_length: usize,
-    slow_length: usize,
-    sample_length: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || fast_out_ptr.is_null() || slow_out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_undersampled_double_moving_average_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = EhlersUndersampledDoubleMovingAverageInput::from_slice(
-            data,
-            EhlersUndersampledDoubleMovingAverageParams {
-                fast_length: Some(fast_length),
-                slow_length: Some(slow_length),
-                sample_length: Some(sample_length),
-            },
-        );
-        let fast_out = std::slice::from_raw_parts_mut(fast_out_ptr, len);
-        let slow_out = std::slice::from_raw_parts_mut(slow_out_ptr, len);
-        ehlers_undersampled_double_moving_average_into_slices(
-            fast_out,
-            slow_out,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_undersampled_double_moving_average_batch_into)]
-pub fn ehlers_undersampled_double_moving_average_batch_into_js(
-    in_ptr: *const f64,
-    fast_out_ptr: *mut f64,
-    slow_out_ptr: *mut f64,
-    len: usize,
-    fast_length_start: usize,
-    fast_length_end: usize,
-    fast_length_step: usize,
-    slow_length_start: usize,
-    slow_length_end: usize,
-    slow_length_step: usize,
-    sample_length_start: usize,
-    sample_length_end: usize,
-    sample_length_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || fast_out_ptr.is_null() || slow_out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ehlers_undersampled_double_moving_average_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = EhlersUndersampledDoubleMovingAverageBatchRange {
-            fast_length: (fast_length_start, fast_length_end, fast_length_step),
-            slow_length: (slow_length_start, slow_length_end, slow_length_step),
-            sample_length: (sample_length_start, sample_length_end, sample_length_step),
-        };
-        let combos = expand_grid_ehlers_undersampled_double_moving_average(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let fast_out = std::slice::from_raw_parts_mut(fast_out_ptr, total);
-        let slow_out = std::slice::from_raw_parts_mut(slow_out_ptr, total);
-        let batch_kernel = detect_best_batch_kernel();
-        ehlers_undersampled_double_moving_average_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel,
-            !matches!(batch_kernel, Kernel::ScalarBatch),
-            fast_out,
-            slow_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct EhlersUndersampledDoubleMovingAverageStreamWasm {
-    inner: EhlersUndersampledDoubleMovingAverageStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl EhlersUndersampledDoubleMovingAverageStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        fast_length: usize,
-        slow_length: usize,
-        sample_length: usize,
-    ) -> Result<EhlersUndersampledDoubleMovingAverageStreamWasm, JsValue> {
-        Ok(Self {
-            inner: EhlersUndersampledDoubleMovingAverageStream::try_new(
-                EhlersUndersampledDoubleMovingAverageParams {
-                    fast_length: Some(fast_length),
-                    slow_length: Some(slow_length),
-                    sample_length: Some(sample_length),
-                },
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?,
-        })
-    }
-
-    pub fn update(&mut self, value: f64) -> Result<JsValue, JsValue> {
-        match self.inner.update(value) {
-            Some((fast, slow)) => {
-                serde_wasm_bindgen::to_value(&EhlersUndersampledDoubleMovingAverageStreamValue {
-                    fast,
-                    slow,
-                })
-                .map_err(|e| JsValue::from_str(&e.to_string()))
-            }
-            None => Ok(JsValue::NULL),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_undersampled_double_moving_average_output_into_js(
-    data: &[f64],
-    fast_length: usize,
-    slow_length: usize,
-    sample_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_undersampled_double_moving_average_js(
-        data,
-        fast_length,
-        slow_length,
-        sample_length,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "ehlers_undersampled_double_moving_average_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_undersampled_double_moving_average_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ehlers_undersampled_double_moving_average_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ehlers_undersampled_double_moving_average_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::moving_averages::ma::MaData;
     use crate::indicators::moving_averages::ma_batch::{
-        ma_batch_with_kernel_and_typed_params, MaBatchParamKV, MaBatchParamValue,
+        MaBatchParamKV, MaBatchParamValue, ma_batch_with_kernel_and_typed_params,
     };
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn naive_series(
         data: &[f64],
@@ -1827,8 +1409,8 @@ mod tests {
     }
 
     #[test]
-    fn eudma_ma_batch_typed_output_selection_matches_direct(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn eudma_ma_batch_typed_output_selection_matches_direct()
+    -> Result<(), Box<dyn std::error::Error>> {
         let data = sample_data();
         let params = [
             MaBatchParamKV {
@@ -1871,7 +1453,7 @@ mod tests {
 
     #[test]
     fn eudma_fixture_has_values() -> Result<(), Box<dyn std::error::Error>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let out = ehlers_undersampled_double_moving_average(
             &EhlersUndersampledDoubleMovingAverageInput::with_default_candles(&candles),
         )?;

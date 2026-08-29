@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -57,10 +41,6 @@ pub struct RangeOscillatorOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RangeOscillatorParams {
     pub length: Option<usize>,
     pub mult: Option<f64>,
@@ -1574,338 +1554,6 @@ unsafe fn vec_f64_from_mu_guard(buf: ManuallyDrop<Vec<MaybeUninit<f64>>>) -> Vec
     Vec::from_raw_parts(buf.as_mut_ptr() as *mut f64, buf.len(), buf.capacity())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "range_oscillator")]
-#[pyo3(signature = (high, low, close, length=DEFAULT_LENGTH, mult=DEFAULT_MULT, kernel=None))]
-pub fn range_oscillator_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    mult: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = RangeOscillatorInput::from_slices(
-        high,
-        low,
-        close,
-        RangeOscillatorParams {
-            length: Some(length),
-            mult: Some(mult),
-        },
-    );
-    let output = py
-        .allow_threads(|| range_oscillator_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("oscillator", output.oscillator.into_pyarray(py))?;
-    dict.set_item("ma", output.ma.into_pyarray(py))?;
-    dict.set_item("upper_band", output.upper_band.into_pyarray(py))?;
-    dict.set_item("lower_band", output.lower_band.into_pyarray(py))?;
-    dict.set_item("range_width", output.range_width.into_pyarray(py))?;
-    dict.set_item("in_range", output.in_range.into_pyarray(py))?;
-    dict.set_item("trend", output.trend.into_pyarray(py))?;
-    dict.set_item("break_up", output.break_up.into_pyarray(py))?;
-    dict.set_item("break_down", output.break_down.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "range_oscillator_batch")]
-#[pyo3(signature = (high, low, close, length_range, mult_range, kernel=None))]
-pub fn range_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            range_oscillator_batch_with_kernel(
-                high,
-                low,
-                close,
-                &RangeOscillatorBatchRange {
-                    length: length_range,
-                    mult: mult_range,
-                },
-                kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let total = output.rows * output.cols;
-    let arrays = [
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-        unsafe { PyArray1::<f64>::new(py, [total], false) },
-    ];
-    unsafe { arrays[0].as_slice_mut()? }.copy_from_slice(&output.oscillator);
-    unsafe { arrays[1].as_slice_mut()? }.copy_from_slice(&output.ma);
-    unsafe { arrays[2].as_slice_mut()? }.copy_from_slice(&output.upper_band);
-    unsafe { arrays[3].as_slice_mut()? }.copy_from_slice(&output.lower_band);
-    unsafe { arrays[4].as_slice_mut()? }.copy_from_slice(&output.range_width);
-    unsafe { arrays[5].as_slice_mut()? }.copy_from_slice(&output.in_range);
-    unsafe { arrays[6].as_slice_mut()? }.copy_from_slice(&output.trend);
-    unsafe { arrays[7].as_slice_mut()? }.copy_from_slice(&output.break_up);
-    unsafe { arrays[8].as_slice_mut()? }.copy_from_slice(&output.break_down);
-
-    let dict = PyDict::new(py);
-    dict.set_item("oscillator", arrays[0].reshape((output.rows, output.cols))?)?;
-    dict.set_item("ma", arrays[1].reshape((output.rows, output.cols))?)?;
-    dict.set_item("upper_band", arrays[2].reshape((output.rows, output.cols))?)?;
-    dict.set_item("lower_band", arrays[3].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "range_width",
-        arrays[4].reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item("in_range", arrays[5].reshape((output.rows, output.cols))?)?;
-    dict.set_item("trend", arrays[6].reshape((output.rows, output.cols))?)?;
-    dict.set_item("break_up", arrays[7].reshape((output.rows, output.cols))?)?;
-    dict.set_item("break_down", arrays[8].reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "mults",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.mult.unwrap_or(DEFAULT_MULT))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RangeOscillatorStream")]
-pub struct RangeOscillatorStreamPy {
-    stream: RangeOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RangeOscillatorStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, mult=DEFAULT_MULT))]
-    fn new(length: usize, mult: f64) -> PyResult<Self> {
-        let stream = RangeOscillatorStream::try_new(RangeOscillatorParams {
-            length: Some(length),
-            mult: Some(mult),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(
-        &mut self,
-        high: f64,
-        low: f64,
-        close: f64,
-    ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
-        self.stream.update(high, low, close).map(|output| {
-            (
-                output.oscillator,
-                output.ma,
-                output.upper_band,
-                output.lower_band,
-                output.range_width,
-                output.in_range,
-                output.trend,
-                output.break_up,
-                output.break_down,
-            )
-        })
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_range_oscillator_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(range_oscillator_py, m)?)?;
-    m.add_function(wrap_pyfunction!(range_oscillator_batch_py, m)?)?;
-    m.add_class::<RangeOscillatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeOscillatorJsOutput {
-    pub oscillator: Vec<f64>,
-    pub ma: Vec<f64>,
-    pub upper_band: Vec<f64>,
-    pub lower_band: Vec<f64>,
-    pub range_width: Vec<f64>,
-    pub in_range: Vec<f64>,
-    pub trend: Vec<f64>,
-    pub break_up: Vec<f64>,
-    pub break_down: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_oscillator_js)]
-pub fn range_oscillator_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    mult: f64,
-) -> Result<JsValue, JsValue> {
-    let input = RangeOscillatorInput::from_slices(
-        high,
-        low,
-        close,
-        RangeOscillatorParams {
-            length: Some(length),
-            mult: Some(mult),
-        },
-    );
-    let output = range_oscillator_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&RangeOscillatorJsOutput {
-        oscillator: output.oscillator,
-        ma: output.ma,
-        upper_band: output.upper_band,
-        lower_band: output.lower_band,
-        range_width: output.range_width,
-        in_range: output.in_range,
-        trend: output.trend,
-        break_up: output.break_up,
-        break_down: output.break_down,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeOscillatorBatchConfig {
-    pub length_range: (usize, usize, usize),
-    pub mult_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RangeOscillatorBatchJsOutput {
-    pub oscillator: Vec<f64>,
-    pub ma: Vec<f64>,
-    pub upper_band: Vec<f64>,
-    pub lower_band: Vec<f64>,
-    pub range_width: Vec<f64>,
-    pub in_range: Vec<f64>,
-    pub trend: Vec<f64>,
-    pub break_up: Vec<f64>,
-    pub break_down: Vec<f64>,
-    pub lengths: Vec<usize>,
-    pub mults: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = range_oscillator_batch)]
-pub fn range_oscillator_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: RangeOscillatorBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let output = range_oscillator_batch_with_kernel(
-        high,
-        low,
-        close,
-        &RangeOscillatorBatchRange {
-            length: cfg.length_range,
-            mult: cfg.mult_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&RangeOscillatorBatchJsOutput {
-        oscillator: output.oscillator,
-        ma: output.ma,
-        upper_band: output.upper_band,
-        lower_band: output.lower_band,
-        range_width: output.range_width,
-        in_range: output.in_range,
-        trend: output.trend,
-        break_up: output.break_up,
-        break_down: output.break_down,
-        lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH))
-            .collect(),
-        mults: output
-            .combos
-            .iter()
-            .map(|combo| combo.mult.unwrap_or(DEFAULT_MULT))
-            .collect(),
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_oscillator_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    mult: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_oscillator_js(high, low, close, length, mult)?;
-    crate::write_wasm_object_f64_outputs("range_oscillator_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn range_oscillator_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = range_oscillator_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "range_oscillator_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1924,6 +1572,124 @@ mod tests {
             close.push(c);
         }
         (high, low, close)
+    }
+
+    #[test]
+    fn range_oscillator_matches_hand_derived_structural_atr_formula() {
+        // Published definition:
+        //   weight[i] = abs(close[i] - close[i+1]) / close[i+1]
+        //   ma        = sum(close[i] * weight[i]) / sum(weight[i])
+        //   oscillator = 100 * (close - ma) / (Wilder ATR * mult)
+        // Keep high-low fixed at 20 and every close inside [90, 110], so each
+        // true range is exactly 20 and the seeded 200-bar Wilder ATR is exactly
+        // 20.  The last three closes are 100, 102, 101 with length=2:
+        //   ma = (101*(1/102) + 102*(2/100)) / ((1/102) + (2/100))
+        //      = 7727/76.
+        let len = 205;
+        let high = vec![110.0; len];
+        let low = vec![90.0; len];
+        let mut close = vec![100.0; len];
+        close[len - 2] = 102.0;
+        close[len - 1] = 101.0;
+
+        let output = range_oscillator_with_kernel(
+            &RangeOscillatorInput::from_slices(
+                &high,
+                &low,
+                &close,
+                RangeOscillatorParams {
+                    length: Some(2),
+                    mult: Some(2.0),
+                },
+            ),
+            Kernel::Scalar,
+        )
+        .expect("the hand-derived fixture is a valid structural-ATR series");
+
+        let index = len - 1;
+        let expected_ma = 7727.0 / 76.0;
+        let expected_width = 40.0;
+        let expected_oscillator = 100.0 * (101.0 - expected_ma) / expected_width;
+        let close_enough = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() <= 1e-13 * expected.abs().max(1.0),
+                "actual={actual:?} expected={expected:?}"
+            );
+        };
+
+        close_enough(output.ma[index], expected_ma);
+        close_enough(output.range_width[index], expected_width);
+        close_enough(output.upper_band[index], expected_ma + expected_width);
+        close_enough(output.lower_band[index], expected_ma - expected_width);
+        close_enough(output.oscillator[index], expected_oscillator);
+        assert_eq!(output.in_range[index], 1.0);
+        assert_eq!(output.trend[index], -1.0);
+        assert_eq!(output.break_up[index], 0.0);
+        assert_eq!(output.break_down[index], 0.0);
+    }
+
+    #[test]
+    fn range_oscillator_restarts_every_state_after_an_invalid_bar() {
+        let len = 425;
+        let mut high = vec![110.0; len];
+        let mut low = vec![90.0; len];
+        let mut close = (0..len)
+            .map(|index| 100.0 + [0.0, 1.0, 2.0, 1.0][index % 4])
+            .collect::<Vec<_>>();
+        let gap = 220;
+        high[gap] = f64::NAN;
+        low[gap] = f64::NAN;
+        close[gap] = f64::NAN;
+
+        let output = range_oscillator_with_kernel(
+            &RangeOscillatorInput::from_slices(
+                &high,
+                &low,
+                &close,
+                RangeOscillatorParams {
+                    length: Some(3),
+                    mult: Some(1.5),
+                },
+            ),
+            Kernel::Scalar,
+        )
+        .expect("the two finite runs contain enough total data");
+
+        assert!(
+            output.oscillator[gap - 1].is_finite(),
+            "the first segment must become valid before the injected gap"
+        );
+        // The post-gap run starts at 221. A fresh ATR(200) first becomes valid
+        // at 420. No rolling close, ATR, trend, or breakout state may bridge
+        // the invalid bar.
+        for index in gap..420 {
+            for (name, value) in [
+                ("oscillator", output.oscillator[index]),
+                ("ma", output.ma[index]),
+                ("upper_band", output.upper_band[index]),
+                ("lower_band", output.lower_band[index]),
+                ("range_width", output.range_width[index]),
+                ("in_range", output.in_range[index]),
+                ("trend", output.trend[index]),
+                ("break_up", output.break_up[index]),
+                ("break_down", output.break_down[index]),
+            ] {
+                assert!(value.is_nan(), "{name}[{index}] bridged the gap: {value:?}");
+            }
+        }
+        for (name, value) in [
+            ("oscillator", output.oscillator[420]),
+            ("ma", output.ma[420]),
+            ("upper_band", output.upper_band[420]),
+            ("lower_band", output.lower_band[420]),
+            ("range_width", output.range_width[420]),
+            ("in_range", output.in_range[420]),
+            ("trend", output.trend[420]),
+            ("break_up", output.break_up[420]),
+            ("break_down", output.break_down[420]),
+        ] {
+            assert!(value.is_finite(), "{name}[420] did not restart: {value:?}");
+        }
     }
 
     #[test]

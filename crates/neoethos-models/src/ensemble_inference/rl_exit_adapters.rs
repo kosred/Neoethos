@@ -46,10 +46,11 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use polars::prelude::DataFrame;
+use anyhow::{Context, Result, bail};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, project_expert_frame};
 use crate::exit_agent::ExitAgent;
 use crate::rl::TradingReinforcementLearner;
 use crate::runtime::capabilities::ModelFamily;
@@ -100,67 +101,82 @@ impl ExpertModel for DqnAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
-        let n_rows = df.height();
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
+        let dense = projected.to_dense_samples_major()?;
+        let n_rows = projected.n_samples();
         if n_rows == 0 {
             return Ok(Vec::new());
         }
-        // Build a row-major (n_rows × n_cols) view by collecting
-        // each numeric column into f32. polars columns expose
-        // `f64()` for cast-to-f64; we down-cast to f32 at the
-        // boundary (matches the DQN trainer's input contract).
-        let n_cols = df.width();
-        let columns = df.get_columns();
-        // Per-row state vector — collected once per row to keep
-        // the Q-network's input shape `(state_dim,)`.
-        let mut out = Vec::with_capacity(n_rows);
-        for row_idx in 0..n_rows {
-            let mut state: Vec<f32> = Vec::with_capacity(n_cols);
-            for col in columns {
-                // Try f64() then i64() then f32() — the feature
-                // builder typically emits f32 / f64; integer
-                // columns (timestamps etc.) get coerced.
-                let value = if let Ok(series) = col.f64() {
-                    series.get(row_idx).unwrap_or(0.0) as f32
-                } else if let Ok(series) = col.i64() {
-                    series.get(row_idx).unwrap_or(0) as f32
-                } else if let Ok(series) = col.f32() {
-                    series.get(row_idx).unwrap_or(0.0)
-                } else {
-                    // Unknown dtype — substitute 0.0 so the
-                    // predict_q_values call doesn't panic on
-                    // length mismatch.
-                    0.0
-                };
-                state.push(if value.is_finite() { value } else { 0.0 });
+        lease.scope(|| {
+            let mut out = Vec::with_capacity(n_rows);
+            for row_idx in 0..n_rows {
+                if let Some(reason) = dense
+                    .validity
+                    .row(row_idx)
+                    .iter()
+                    .copied()
+                    .find(|reason| !reason.is_valid())
+                {
+                    out.push(ExpertPrediction::invalid(
+                        ExpertOutputKind::Classification3,
+                        reason,
+                    )?);
+                    continue;
+                }
+                let state = dense
+                    .values
+                    .row(row_idx)
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(column, value)| {
+                        if !value.is_finite() || value < f32::MIN as f64 || value > f32::MAX as f64
+                        {
+                            bail!(
+                                "dqn f64-to-f32 adapter rejected row {row_idx} column {column}: {value}"
+                            );
+                        }
+                        let narrowed = value as f32;
+                        if !narrowed.is_finite() {
+                            bail!(
+                                "dqn f64-to-f32 adapter produced non-finite row {row_idx} column {column}"
+                            );
+                        }
+                        Ok(narrowed)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let q_values = self
+                    .inner
+                    .predict_q_values(&state)
+                    .with_context(|| format!("dqn predict_q_values failed at row {row_idx}"))?;
+                if q_values.len() != 3 || q_values.iter().any(|value| !value.is_finite()) {
+                    bail!(
+                        "dqn predict_q_values returned an invalid {:?}; expected three finite values in [hold, buy, sell] order",
+                        q_values
+                    );
+                }
+                let max_q = q_values
+                    .iter()
+                    .copied()
+                    .map(f64::from)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let exp_q = q_values
+                    .iter()
+                    .copied()
+                    .map(|q| (f64::from(q) - max_q).exp())
+                    .collect::<Vec<_>>();
+                let sum = exp_q.iter().sum::<f64>();
+                if !sum.is_finite() || sum <= 0.0 {
+                    bail!("dqn softmax has invalid mass at row {row_idx}: {sum}");
+                }
+                out.push(ExpertPrediction::valid(
+                    ExpertOutputKind::Classification3,
+                    exp_q.into_iter().map(|value| value / sum).collect(),
+                )?);
             }
-            let q_values = self
-                .inner
-                .predict_q_values(&state)
-                .with_context(|| format!("dqn predict_q_values failed at row {row_idx}"))?;
-            if q_values.len() != 3 {
-                anyhow::bail!(
-                    "dqn predict_q_values returned {} values, expected 3 (sell/hold/buy)",
-                    q_values.len()
-                );
-            }
-            // Softmax → 3-class probability distribution.
-            let max_q = q_values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let exp_q: Vec<f32> = q_values.iter().map(|q| (q - max_q).exp()).collect();
-            let sum: f32 = exp_q.iter().sum();
-            let probs: Vec<f32> = if sum > 0.0 {
-                exp_q.iter().map(|e| e / sum).collect()
-            } else {
-                vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
-            };
-            let pred = ExpertPrediction {
-                kind: ExpertOutputKind::Classification3,
-                values: probs,
-            };
-            pred.validate()?;
-            out.push(pred);
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 }
 
@@ -223,21 +239,19 @@ impl ExpertModel for ExitAgentAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let runtime_preds = self
             .inner
-            .predict_runtime(df)
+            .predict_runtime(&projected, lease)
             .with_context(|| "exit_agent predict_runtime failed")?;
         let mut out = Vec::with_capacity(runtime_preds.len());
         for rp in runtime_preds {
             let probs = rp.class_probabilities();
-            let values: Vec<f32> = probs.to_vec();
-            let pred = ExpertPrediction {
-                kind: ExpertOutputKind::ExitDecision3,
-                values,
-            };
-            pred.validate()?;
-            out.push(pred);
+            out.push(ExpertPrediction::valid(
+                ExpertOutputKind::ExitDecision3,
+                probs.to_vec(),
+            )?);
         }
         Ok(out)
     }
@@ -301,19 +315,18 @@ impl ExpertModel for SacAgentAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let runtime_preds = self
             .inner
-            .predict_runtime(df)
+            .predict_runtime(&projected, lease)
             .with_context(|| "sac predict_runtime failed")?;
         let mut out = Vec::with_capacity(runtime_preds.len());
         for rp in runtime_preds {
-            let pred = ExpertPrediction {
-                kind: ExpertOutputKind::Classification3,
-                values: rp.class_probabilities().to_vec(),
-            };
-            pred.validate()?;
-            out.push(pred);
+            out.push(ExpertPrediction::valid(
+                ExpertOutputKind::Classification3,
+                rp.class_probabilities().to_vec(),
+            )?);
         }
         Ok(out)
     }
@@ -475,7 +488,13 @@ mod tests {
         // `evolution_adapters` / `swarm_adapter` and ARE part of
         // `build_default_registry` since 2026-07-11 (F-319 revision +
         // D1.2.8). `genetic`/`exit_agent` stay out everywhere.
-        for absent in ["genetic", "neuro_evo", "neat", "exit_agent", "swarm_forecaster"] {
+        for absent in [
+            "genetic",
+            "neuro_evo",
+            "neat",
+            "exit_agent",
+            "swarm_forecaster",
+        ] {
             assert!(
                 !reg.has_loader(absent),
                 "partial registry unexpectedly has loader for '{absent}'"

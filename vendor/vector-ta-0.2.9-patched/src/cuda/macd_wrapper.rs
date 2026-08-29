@@ -1,14 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::macd::{
-    expand_grid as expand_grid_host, MacdBatchRange, MacdError, MacdParams,
+    MacdBatchRange, MacdError, MacdParams, expand_grid as expand_grid_host,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -19,7 +19,9 @@ use thiserror::Error;
 pub enum CudaMacdError {
     #[error("CUDA error: {0}")]
     Cuda(#[from] CudaError),
-    #[error("Out of memory on device: required={required} bytes, free={free} bytes, headroom={headroom} bytes")]
+    #[error(
+        "Out of memory on device: required={required} bytes, free={free} bytes, headroom={headroom} bytes"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -100,11 +102,6 @@ impl CudaMacd {
         let context = Arc::new(Context::new(device)?);
         let sm_count = device.get_attribute(DeviceAttribute::MultiprocessorCount)? as u32;
         let max_grid_x = device.get_attribute(DeviceAttribute::MaxGridDimX)? as u32;
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/macd_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("macd_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {

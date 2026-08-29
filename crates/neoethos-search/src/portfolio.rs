@@ -455,7 +455,10 @@ mod tests {
             assert!(*w <= cap + 1e-9, "weight {w} exceeds cap {cap}");
         }
         // Mass conserved: the two under-cap assets absorb the excess.
-        assert!(out[0] <= cap + 1e-9 && out[0] >= cap - 1e-9, "biggest hits cap");
+        assert!(
+            out[0] <= cap + 1e-9 && out[0] >= cap - 1e-9,
+            "biggest hits cap"
+        );
     }
 
     #[test]
@@ -481,7 +484,10 @@ mod tests {
         let sum: f64 = out.iter().sum();
         assert!((sum - 1.0).abs() < 1e-9);
         for w in &out {
-            assert!((*w - 1.0 / 3.0).abs() < 1e-9, "expected equal weights, got {w}");
+            assert!(
+                (*w - 1.0 / 3.0).abs() < 1e-9,
+                "expected equal weights, got {w}"
+            );
         }
     }
 }

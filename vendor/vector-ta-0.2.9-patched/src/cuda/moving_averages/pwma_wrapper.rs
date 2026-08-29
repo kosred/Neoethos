@@ -1,19 +1,19 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::cwma_wrapper::{BatchKernelPolicy, BatchThreadsPerOutput, ManySeriesKernelPolicy};
-use crate::indicators::moving_averages::pwma::{expand_grid, PwmaBatchRange, PwmaParams};
+use crate::indicators::moving_averages::pwma::{PwmaBatchRange, PwmaParams, expand_grid};
 use cust::context::Context;
 use cust::context::{CacheConfig, SharedMemoryConfig};
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 const PWMA_MAX_PERIOD_CONST: usize = 4096;
@@ -95,11 +95,6 @@ impl CudaPwma {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/pwma_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("pwma_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -1185,7 +1180,7 @@ impl CudaPwma {
         let _ = func.set_cache_config(CacheConfig::PreferShared);
         let _ = func.set_shared_memory_config(SharedMemoryConfig::FourByteBankSize);
         unsafe {
-            use cust::sys::{cuFuncSetAttribute, CUfunction_attribute_enum as Attr};
+            use cust::sys::{CUfunction_attribute_enum as Attr, cuFuncSetAttribute};
             let raw = func.to_raw();
             let _ = cuFuncSetAttribute(
                 raw,

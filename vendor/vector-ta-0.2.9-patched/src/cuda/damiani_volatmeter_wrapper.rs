@@ -1,10 +1,10 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
 use cust::memory::{AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -112,11 +112,6 @@ impl CudaDamianiVolatmeter {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let ctx = Arc::new(Context::new(device)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/damiani_volatmeter_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("damiani_volatmeter_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {

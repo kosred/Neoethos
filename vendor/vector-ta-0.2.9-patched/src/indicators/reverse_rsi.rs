@@ -1,32 +1,10 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaReverseRsi;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::DeviceArrayF32Py;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::moving_averages::ema::{ema, ema_into_slice, EmaInput, EmaParams};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::moving_averages::ema::{EmaInput, EmaParams, ema, ema_into_slice};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -64,10 +42,6 @@ pub struct ReverseRsiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct ReverseRsiParams {
     pub rsi_length: Option<usize>,
     pub rsi_level: Option<f64>,
@@ -857,7 +831,6 @@ pub fn reverse_rsi_with_kernel(
     Ok(ReverseRsiOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn reverse_rsi_into(input: &ReverseRsiInput, out: &mut [f64]) -> Result<(), ReverseRsiError> {
     let (data, first, rsi_len, rsi_lvl, ema_len) = reverse_rsi_prepare(input, Kernel::Auto)?;
@@ -1043,11 +1016,7 @@ impl ReverseRsiStream {
         let m = (x0 >= 0.0) as i32 as f64;
         let scale0 = self.neg_scale + m * (1.0 - self.neg_scale);
         let v0 = base + x0 * scale0;
-        if v0.is_finite() || x0 >= 0.0 {
-            v0
-        } else {
-            0.0
-        }
+        if v0.is_finite() || x0 >= 0.0 { v0 } else { 0.0 }
     }
 
     #[inline(always)]
@@ -1058,11 +1027,7 @@ impl ReverseRsiStream {
         let m = (x >= 0.0) as i32 as f64;
         let scale = self.neg_scale + m * (1.0 - self.neg_scale);
         let v = cur + x * scale;
-        if v.is_finite() || x >= 0.0 {
-            v
-        } else {
-            0.0
-        }
+        if v.is_finite() || x >= 0.0 { v } else { 0.0 }
     }
 }
 
@@ -1501,423 +1466,19 @@ pub fn reverse_rsi_batch(
     Ok(results)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "reverse_rsi")]
-#[pyo3(signature = (data, rsi_length, rsi_level, kernel=None))]
-pub fn reverse_rsi_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    rsi_length: usize,
-    rsi_level: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = ReverseRsiParams {
-        rsi_length: Some(rsi_length),
-        rsi_level: Some(rsi_level),
-    };
-    let inp = ReverseRsiInput::from_slice(slice_in, params);
-    let out: Vec<f64> = py
-        .allow_threads(|| reverse_rsi_with_kernel(&inp, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(out.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "reverse_rsi_batch")]
-#[pyo3(signature = (data, rsi_length_range, rsi_level_range, kernel=None))]
-pub fn reverse_rsi_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    rsi_length_range: (usize, usize, usize),
-    rsi_level_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let sweep = ReverseRsiBatchRange {
-        rsi_length_range,
-        rsi_level_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in reverse_rsi_batch_py"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        reverse_rsi_batch_inner_into(
-            slice_in,
-            &combos,
-            {
-                match kern {
-                    Kernel::Auto => detect_best_batch_kernel(),
-                    k => k,
-                }
-            },
-            true,
-            slice_out,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "rsi_lengths",
-        combos
-            .iter()
-            .map(|p| p.rsi_length.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "rsi_levels",
-        combos
-            .iter()
-            .map(|p| p.rsi_level.unwrap_or(50.0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "reverse_rsi_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, rsi_length_range, rsi_level_range, device_id=0))]
-pub fn reverse_rsi_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: PyReadonlyArray1<'py, f32>,
-    rsi_length_range: (usize, usize, usize),
-    rsi_level_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, Bound<'py, PyDict>)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = ReverseRsiBatchRange {
-        rsi_length_range,
-        rsi_level_range,
-    };
-    let (inner, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaReverseRsi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.reverse_rsi_batch_dev(slice_in, &sweep)
-            .map(|(inner, combos)| (inner, combos, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = PyDict::new(py);
-    let lens: Vec<u64> = combos
-        .iter()
-        .map(|c| c.rsi_length.unwrap_or(14) as u64)
-        .collect();
-    let lvls: Vec<f64> = combos
-        .iter()
-        .map(|c| c.rsi_level.unwrap_or(50.0) as f64)
-        .collect();
-    dict.set_item("rsi_lengths", lens.into_pyarray(py))?;
-    dict.set_item("rsi_levels", lvls.into_pyarray(py))?;
-    Ok((
-        DeviceArrayF32Py {
-            inner,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-        dict,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "reverse_rsi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, cols, rows, rsi_length, rsi_level, device_id=0))]
-pub fn reverse_rsi_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    rsi_length: usize,
-    rsi_level: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_tm_f32.as_slice()?;
-    let params = ReverseRsiParams {
-        rsi_length: Some(rsi_length),
-        rsi_level: Some(rsi_level),
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaReverseRsi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.reverse_rsi_many_series_one_param_time_major_dev(slice_in, cols, rows, &params)
-            .map(|inner| (inner, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ReverseRsiStream")]
-pub struct ReverseRsiStreamPy {
-    inner: ReverseRsiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ReverseRsiStreamPy {
-    #[new]
-    fn new(rsi_length: usize, rsi_level: f64) -> PyResult<Self> {
-        let params = ReverseRsiParams {
-            rsi_length: Some(rsi_length),
-            rsi_level: Some(rsi_level),
-        };
-        let stream =
-            ReverseRsiStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner: stream })
-    }
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-    #[deprecated(note = "use update()")]
-    fn next(&mut self, value: f64) -> f64 {
-        self.inner.next(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ReverseRsiBatchConfig {
-    pub rsi_length_range: (usize, usize, usize),
-    pub rsi_level_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ReverseRsiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<ReverseRsiParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = reverse_rsi_batch)]
-pub fn reverse_rsi_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: ReverseRsiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = ReverseRsiBatchRange {
-        rsi_length_range: cfg.rsi_length_range,
-        rsi_level_range: cfg.rsi_level_range,
-    };
-    let out = reverse_rsi_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = ReverseRsiBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn reverse_rsi_js(
-    data: &[f64],
-    rsi_length: usize,
-    rsi_level: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let params = ReverseRsiParams {
-        rsi_length: Some(rsi_length),
-        rsi_level: Some(rsi_level),
-    };
-
-    let input = ReverseRsiInput::from_slice(data, params);
-    let output = reverse_rsi(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output.values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn reverse_rsi_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn reverse_rsi_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn reverse_rsi_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    rsi_length: usize,
-    rsi_level: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to reverse_rsi_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = ReverseRsiParams {
-            rsi_length: Some(rsi_length),
-            rsi_level: Some(rsi_level),
-        };
-        let input = ReverseRsiInput::from_slice(data, params);
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            reverse_rsi_into_slice(&mut temp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            reverse_rsi_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn reverse_rsi_batch_columnar_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    rows: usize,
-    cols: usize,
-    rsi_length: usize,
-    rsi_level: f64,
-) -> i32 {
-    let total_len = match rows.checked_mul(cols) {
-        Some(v) => v,
-        None => return -1,
-    };
-    let data = unsafe { std::slice::from_raw_parts(in_ptr, total_len) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, total_len) };
-
-    let params = vec![ReverseRsiParams {
-        rsi_length: Some(rsi_length),
-        rsi_level: Some(rsi_level),
-    }];
-
-    match reverse_rsi_batch(data, rows, cols, &params) {
-        Ok(results) => {
-            for (col, result) in results.iter().enumerate() {
-                for (row, &value) in result.iter().enumerate() {
-                    out[row * cols + col] = value;
-                }
-            }
-            0
-        }
-        Err(_) => -1,
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn reverse_rsi_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    rsi_len_start: usize,
-    rsi_len_end: usize,
-    rsi_len_step: usize,
-    rsi_lvl_start: f64,
-    rsi_lvl_end: f64,
-    rsi_lvl_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to reverse_rsi_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = ReverseRsiBatchRange {
-            rsi_length_range: (rsi_len_start, rsi_len_end, rsi_len_step),
-            rsi_level_range: (rsi_lvl_start, rsi_lvl_end, rsi_lvl_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in reverse_rsi_batch_into"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        reverse_rsi_batch_inner_into(data, &combos, detect_best_batch_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn reverse_rsi_output_into_js(
-    data: &[f64],
-    rsi_length: usize,
-    rsi_level: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = reverse_rsi_js(data, rsi_length, rsi_level)?;
-    crate::write_wasm_f64_output("reverse_rsi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn reverse_rsi_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = reverse_rsi_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "reverse_rsi_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_reverse_rsi_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = ReverseRsiParams {
             rsi_length: None,
@@ -1932,8 +1493,8 @@ mod tests {
 
     fn check_reverse_rsi_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ReverseRsiParams {
             rsi_length: Some(14),
@@ -1976,8 +1537,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = ReverseRsiInput::with_default_candles(&candles);
         match input.data {
@@ -2140,8 +1701,8 @@ mod tests {
 
     fn check_reverse_rsi_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = ReverseRsiParams {
             rsi_length: Some(14),
@@ -2167,8 +1728,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = ReverseRsiInput::from_candles(
             &candles,
@@ -2187,8 +1748,8 @@ mod tests {
     fn check_reverse_rsi_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let rsi_length = 14;
         let rsi_level = 50.0;
@@ -2243,8 +1804,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ReverseRsiParams {
             rsi_length: Some(14),
@@ -2271,8 +1832,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_reverse_rsi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             ReverseRsiParams::default(),
@@ -2404,8 +1965,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = ReverseRsiBatchBuilder::new()
             .kernel(kernel)
@@ -2429,8 +1990,8 @@ mod tests {
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = ReverseRsiBatchBuilder::new()
             .kernel(kernel)
@@ -2450,8 +2011,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (7, 21, 7, 20.0, 80.0, 20.0),
@@ -2590,8 +2151,8 @@ mod tests {
 
     #[test]
     fn test_reverse_rsi_into_matches_api() {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path).expect("read candles");
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path).expect("read candles");
 
         let params = ReverseRsiParams::default();
         let input = ReverseRsiInput::from_candles(&candles, "close", params);
@@ -2599,13 +2160,8 @@ mod tests {
         let baseline = reverse_rsi(&input).expect("baseline").values;
 
         let mut out = vec![0.0; candles.close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             reverse_rsi_into(&input, &mut out).expect("reverse_rsi_into");
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            reverse_rsi_into_slice(&mut out, &input, Kernel::Auto).expect("reverse_rsi_into_slice");
         }
 
         assert_eq!(baseline.len(), out.len());

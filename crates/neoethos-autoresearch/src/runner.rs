@@ -54,14 +54,13 @@ use neoethos_core::config::Settings;
 use neoethos_search::deflated::TrialStatisticsReport;
 use neoethos_search::discovery::DiscoveryConfig;
 
+use crate::QuoteValidatedOosTouchEvidenceV1;
 use crate::contracts::{self, ResolvedInputs};
 use crate::goals::GoalSet;
-use crate::journal::{
-    CostBandCounts, NamedValues, OosWindow, Record, SearchRecord, SweepKind,
-};
+use crate::journal::{CostBandCounts, NamedValues, OosWindow, Record, SearchRecord, SweepKind};
 use crate::session::{
-    BestEver, ChampionRow, SessionHeader, SessionId, SessionStore, SessionWriter, SweepEvidence,
-    SweepId,
+    BestEver, ChampionRow, DatasetReceiptV1, SessionHeader, SessionId, SessionStore, SessionWriter,
+    SweepEvidence, SweepId,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +74,7 @@ use crate::session::{
 /// command line, which is the same defect wearing a different hat.
 #[derive(Debug, Clone)]
 pub struct RunArgs {
-    pub symbol: String,
+    pub dataset_identity: neoethos_data::CanonicalDatasetIdentity,
     pub max_sweeps: usize,
     pub max_hours: f64,
     /// Resume an existing session. Without it, a new session id.
@@ -87,9 +86,9 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
-    pub fn new(symbol: impl Into<String>) -> Self {
+    pub fn new(dataset_identity: neoethos_data::CanonicalDatasetIdentity) -> Self {
         Self {
-            symbol: symbol.into(),
+            dataset_identity,
             max_sweeps: crate::DEFAULT_MAX_SWEEPS,
             max_hours: f64::INFINITY,
             session: None,
@@ -106,6 +105,11 @@ impl RunArgs {
 /// What one search is asked to do.
 #[derive(Debug, Clone)]
 pub struct SearchRequest<'a> {
+    /// Exact durable session whose scratch and evidence this search may write.
+    pub session_id: &'a SessionId,
+    /// Full immutable-generation/window receipt. A digest of it keys the
+    /// scratch path, but manifests exact-compare this value.
+    pub dataset_receipt: &'a DatasetReceiptV1,
     pub sweep: SweepId,
     /// The slot that NAMES this proposal — [`crate::proposal::Proposal::slot`],
     /// not a position in any vector. The executor keys its per-slot ledger
@@ -122,10 +126,10 @@ pub struct SearchRequest<'a> {
     /// stamp that says which configuration selected them.
     ///
     /// It is a path in the SESSION STORE and not in the executor's scratch
-    /// directory, and that is the whole point: the scratch root is keyed by
-    /// SYMBOL and is reused by every session, while the promotion candidate may
-    /// be a sweep that ran days earlier and is resumed into. Evidence that lives
-    /// anywhere else is evidence the single out-of-sample touch cannot rely on.
+    /// directory, and that is the whole point: scratch is disposable even
+    /// though its path and manifest are keyed by receipt + session. A promotion
+    /// candidate may be resumed days later, so its durable evidence belongs to
+    /// the session store.
     pub promotion_evidence_path: std::path::PathBuf,
     /// `Some` for a shuffle control: the permutation to apply to the feature
     /// block before the search sees it. Prices, labels, costs, exit geometry,
@@ -251,7 +255,40 @@ impl SearchOutcome {
 }
 
 /// The schema of the per-slot promotion-evidence artifact.
-pub const PROMOTION_EVIDENCE_SCHEMA: &str = "neoethos.autoresearch.promotion_evidence.v1";
+pub const PROMOTION_EVIDENCE_SCHEMA: &str = "neoethos.autoresearch.promotion_evidence.v5";
+
+/// One selected gene, inseparably tagged with the batch binding that owns its
+/// local feature indices.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaggedPromotionGeneV4 {
+    pub batch_ordinal: usize,
+    pub source_cursor: usize,
+    pub gene: neoethos_search::genetic::Gene,
+}
+
+/// Exact durable evidence for one streaming batch that selected genes.
+///
+/// `search_input_receipt` proves the exact feature bits, validity, execution
+/// lane, feature plan, and source provenance;
+/// `receipt_sha256` prevents a changed receipt from inheriting an old identity;
+/// `evaluated_window` proves which exact source rows were searched; and
+/// `search_config_hash` is the effective discovery/ledger configuration, not
+/// the top-level proposal stamp.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotionBatchBindingV5 {
+    pub ordinal: usize,
+    pub cursor: usize,
+    pub search_input_receipt: neoethos_search::CanonicalSearchInputReceiptV2,
+    pub receipt_sha256: String,
+    pub evaluated_window: neoethos_search::CanonicalSearchEvaluatedWindowV1,
+    pub search_config_hash: String,
+    /// Batch-local post-prefilter names. Every tagged gene's indices address
+    /// this list and no other list.
+    pub feature_names: Vec<String>,
+    pub genes: Vec<TaggedPromotionGeneV4>,
+}
 
 /// What a search selected IN SAMPLE, persisted at S5 so the one out-of-sample
 /// touch has something to evaluate.
@@ -266,36 +303,39 @@ pub const PROMOTION_EVIDENCE_SCHEMA: &str = "neoethos.autoresearch.promotion_evi
 ///    that it describes the right configuration — the session store is keyed by
 ///    session, but a resumed session, a re-run sweep or a hand-copied directory
 ///    all put bytes at that path.
-/// 2. **It carries the names its gene indices address.** A `Gene`'s `indices`
-///    are positions into the feature list that search actually used — after
-///    discovery's prefilter, and after the streaming loop's canonical remap.
-///    They are NOT positions into whatever `prepare_multitimeframe_features`
-///    happens to build later. Carrying the names is what lets the out-of-sample
-///    evaluation project by NAME and refuse loudly when a name is absent,
-///    instead of silently reading a different column and calling the answer out
-///    of sample.
+/// 2. **Every batch is self-contained.** Its receipt, receipt SHA-256, exact
+///    evaluated window, effective discovery configuration, local feature names,
+///    and cursor-tagged genes travel together. A gene can never be flattened
+///    away from the batch whose feature plan gives its indices meaning.
 /// 3. **It is honest about being empty.** A search that selected nothing writes
 ///    no artifact, so "no evidence" and "evidence saying nothing survived" are
 ///    the same observable, and the promotion path refuses instead of evaluating
 ///    an empty portfolio and reporting its zero trades as a result.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PromotionPortfolio {
     pub schema: String,
+    /// Exact durable session that selected these genes. A copied artifact from
+    /// another session is foreign even when sweep, slot, config and dataset all
+    /// happen to match.
+    pub session_id: SessionId,
     pub sweep: SweepId,
     /// The SLOT that names the proposal — never a position in a vector.
     pub slot: usize,
     /// The stamp of the configuration that selected these genes.
     pub config_hash: String,
-    /// The feature names the genes' `indices` address, in that exact order.
-    pub feature_names: Vec<String>,
-    /// The portfolio, exactly as the search selected it.
-    pub genes: Vec<neoethos_search::genetic::Gene>,
+    /// Exact immutable generations and IS/OOS split under which these genes
+    /// were selected. Promotion refuses a byte-for-byte different receipt.
+    pub dataset_receipt: DatasetReceiptV1,
     /// Did this search stream? Recorded because a streamed run's feature names
     /// can include working-set columns that a plain whole-vocabulary build does
     /// not contain, which is the one way the projection below can fail.
     pub streamed: bool,
-    /// How many batches contributed genes.
-    pub batches: usize,
+    pub batch_count: usize,
+    pub gene_count: usize,
+    /// Ordered batch bindings. There is deliberately no parallel flat gene or
+    /// feature-name list in v5.
+    pub batch_bindings: Vec<PromotionBatchBindingV5>,
 }
 
 impl PromotionPortfolio {
@@ -305,11 +345,14 @@ impl PromotionPortfolio {
     /// Every check here is a refusal and none is a repair: the whole purpose of
     /// the stamp is that the answer to "is this the right evidence?" is either
     /// YES or a stop, never a guess.
-    pub fn assert_names(
+    pub fn assert_bindings(
         &self,
+        expected_session_id: &SessionId,
         sweep: SweepId,
         slot: usize,
         config_hash: &str,
+        expected_effective_search_config_hash: &dyn Fn(&PromotionBatchBindingV5) -> Result<String>,
+        expected_dataset_receipt: &DatasetReceiptV1,
         path: &std::path::Path,
     ) -> Result<()> {
         if self.schema != PROMOTION_EVIDENCE_SCHEMA {
@@ -319,6 +362,16 @@ impl PromotionPortfolio {
                  does not know it agrees with.",
                 path.display(),
                 self.schema
+            );
+        }
+        if &self.session_id != expected_session_id {
+            bail!(
+                "{} belongs to session {} but the promotion is running in session {}. Refusing \
+                 cross-session evidence before the single out-of-sample touch; the window is \
+                 NOT spent.",
+                path.display(),
+                self.session_id,
+                expected_session_id
             );
         }
         if self.sweep != sweep || self.slot != slot {
@@ -340,37 +393,208 @@ impl PromotionPortfolio {
                 self.config_hash
             );
         }
-        if self.genes.is_empty() {
+        if &self.dataset_receipt != expected_dataset_receipt {
             bail!(
-                "{} records no genes, so there is nothing to evaluate out of sample. A search that \
-                 selected nothing is not a promotion candidate, and this path will NOT re-search \
-                 to find one.",
+                "{} carries dataset receipt {} but this session is frozen to {}. Refusing to spend the single out-of-sample touch on genes selected from different generations or a different IS/OOS window.",
+                path.display(),
+                self.dataset_receipt.identity(),
+                expected_dataset_receipt.identity()
+            );
+        }
+        if self.batch_count != self.batch_bindings.len() {
+            bail!(
+                "{} declares batch_count={} but carries {} ordered batch bindings. A missing batch \
+                 binding would detach its genes from their receipt/config/window authority; \
+                 refusing before OOS.",
+                path.display(),
+                self.batch_count,
+                self.batch_bindings.len()
+            );
+        }
+        if self.batch_bindings.is_empty() {
+            bail!(
+                "{} records no batch bindings, so there is nothing to evaluate out of sample. A \
+                 search that selected nothing is not a promotion candidate, and this path will \
+                 NOT re-search to find one.",
                 path.display()
             );
         }
-        if self.feature_names.is_empty() {
-            bail!(
-                "{} records {} genes but no feature names, so nothing can say WHICH columns their \
-                 indices address. An index without a name is a number that reads whatever happens \
-                 to be in that position.",
-                path.display(),
-                self.genes.len()
-            );
-        }
-        for (position, gene) in self.genes.iter().enumerate() {
-            if let Some(out_of_range) = gene
-                .indices
-                .iter()
-                .find(|index| **index >= self.feature_names.len())
-            {
+        let mut observed_gene_count = 0usize;
+        let mut previous_cursor = None;
+        let mut receipt_digests = HashSet::new();
+        for (ordinal, binding) in self.batch_bindings.iter().enumerate() {
+            if binding.ordinal != ordinal {
                 bail!(
-                    "{}: gene {position} addresses feature index {out_of_range} but only {} names \
-                     were recorded. The artifact is internally inconsistent, so no projection of \
-                     it can be trusted.",
+                    "{}: ordered batch position {ordinal} claims ordinal {}. Batch order is part \
+                     of the evidence; a missing or swapped binding is refused before OOS.",
                     path.display(),
-                    self.feature_names.len()
+                    binding.ordinal
                 );
             }
+            if previous_cursor.is_some_and(|cursor| binding.cursor <= cursor) {
+                bail!(
+                    "{}: batch ordinal {ordinal} carries cursor {} after cursor {:?}. Streaming \
+                     batch cursors must be strictly increasing, so a duplicate or swapped binding \
+                     cannot be adopted.",
+                    path.display(),
+                    binding.cursor,
+                    previous_cursor
+                );
+            }
+            previous_cursor = Some(binding.cursor);
+
+            let expected_hash = binding
+                .search_input_receipt
+                .identity_sha256()
+                .map_err(anyhow::Error::new)
+                .with_context(|| {
+                    format!(
+                        "validating {} batch ordinal {ordinal}'s canonical receipt",
+                        path.display()
+                    )
+                })?;
+            if binding.receipt_sha256 != expected_hash {
+                bail!(
+                    "{}: batch ordinal {ordinal} carries receipt SHA-256 {} but its embedded \
+                     receipt recomputes to {expected_hash}. Changed feature bits, validity, math \
+                     lane, plan, or provenance cannot inherit an old digest.",
+                    path.display(),
+                    binding.receipt_sha256
+                );
+            }
+            if !receipt_digests.insert(binding.receipt_sha256.clone()) {
+                bail!(
+                    "{}: batch ordinal {ordinal} repeats receipt SHA-256 {}. Distinct streamed \
+                     batches must not duplicate one binding under two cursors.",
+                    path.display(),
+                    binding.receipt_sha256
+                );
+            }
+
+            let stored_scope = neoethos_search::CanonicalSearchArtifactScopeV2::new(
+                binding.search_input_receipt.clone(),
+                binding.evaluated_window.clone(),
+            )
+            .map_err(anyhow::Error::new)
+            .with_context(|| {
+                format!(
+                    "validating {} batch ordinal {ordinal}'s exact stored selection scope",
+                    path.display()
+                )
+            })?;
+            if stored_scope.receipt() != &binding.search_input_receipt
+                || stored_scope.receipt_sha256() != binding.receipt_sha256
+                || stored_scope.evaluated_window() != &binding.evaluated_window
+            {
+                bail!(
+                    "{}: batch ordinal {ordinal}'s receipt SHA-256 or evaluated window does not \
+                     equal its exact stored selection scope. A changed role, row range, or timestamp \
+                     window is refused before OOS.",
+                    path.display()
+                );
+            }
+            if stored_scope.evaluated_window().role()
+                != neoethos_search::CanonicalSearchWindowRoleV1::InSample
+            {
+                bail!(
+                    "{}: batch ordinal {ordinal}'s evaluated window has role {:?}, but streaming \
+                     discovery records the exact in-sample selection scope. Refusing relabelled or \
+                     holdout evidence before OOS.",
+                    path.display(),
+                    stored_scope.evaluated_window().role()
+                );
+            }
+            streaming::validate_search_receipt_against_dataset_receipt(
+                expected_dataset_receipt,
+                &binding.search_input_receipt,
+            )
+            .with_context(|| {
+                format!(
+                    "revalidating {} batch ordinal {ordinal} against the frozen dataset receipt",
+                    path.display()
+                )
+            })?;
+
+            let expected_effective =
+                expected_effective_search_config_hash(binding).with_context(|| {
+                    format!(
+                        "deriving {} batch ordinal {ordinal}'s exact effective search config",
+                        path.display()
+                    )
+                })?;
+            if binding.search_config_hash != expected_effective {
+                bail!(
+                    "{}: batch ordinal {ordinal} is stamped with effective search config {} but \
+                     the exact request/ledger configuration is {expected_effective}. Refusing a \
+                     different search's genes before OOS.",
+                    path.display(),
+                    binding.search_config_hash
+                );
+            }
+            if binding.feature_names.is_empty() {
+                bail!(
+                    "{}: batch ordinal {ordinal} records genes but no local feature names, so \
+                     their indices have no meaning.",
+                    path.display()
+                );
+            }
+            let mut names = HashSet::new();
+            if binding
+                .feature_names
+                .iter()
+                .any(|name| name.is_empty() || !names.insert(name.as_str()))
+            {
+                bail!(
+                    "{}: batch ordinal {ordinal} carries an empty or duplicate local feature name; \
+                     name projection would be ambiguous.",
+                    path.display()
+                );
+            }
+            if binding.genes.is_empty() {
+                bail!(
+                    "{}: batch ordinal {ordinal} carries no tagged genes and is not promotion \
+                     evidence.",
+                    path.display()
+                );
+            }
+            for (position, tagged) in binding.genes.iter().enumerate() {
+                if tagged.batch_ordinal != ordinal || tagged.source_cursor != binding.cursor {
+                    bail!(
+                        "{}: batch ordinal {ordinal} gene {position} is tagged as ordinal {} cursor \
+                         {}, not its enclosing cursor {}. A flattened, missing, or swapped gene \
+                         binding is refused.",
+                        path.display(),
+                        tagged.batch_ordinal,
+                        tagged.source_cursor,
+                        binding.cursor
+                    );
+                }
+                if let Some(out_of_range) = tagged
+                    .gene
+                    .indices
+                    .iter()
+                    .find(|index| **index >= binding.feature_names.len())
+                {
+                    bail!(
+                        "{}: batch ordinal {ordinal} gene {position} addresses feature index \
+                         {out_of_range} but only {} local names were recorded. The binding is \
+                         internally inconsistent.",
+                        path.display(),
+                        binding.feature_names.len()
+                    );
+                }
+            }
+            observed_gene_count = observed_gene_count
+                .checked_add(binding.genes.len())
+                .context("promotion evidence gene-count overflow")?;
+        }
+        if self.gene_count != observed_gene_count {
+            bail!(
+                "{} declares gene_count={} but its ordered batch bindings carry {observed_gene_count} \
+                 tagged genes. Missing or flattened genes are refused before OOS.",
+                path.display(),
+                self.gene_count
+            );
         }
         Ok(())
     }
@@ -396,9 +620,12 @@ fn promotion_evidence_path(
 /// journalled as spent.
 fn load_promotion_portfolio(
     path: &std::path::Path,
+    expected_session_id: &SessionId,
     sweep: SweepId,
     slot: usize,
     config_hash: &str,
+    expected_effective_search_config_hash: &dyn Fn(&PromotionBatchBindingV5) -> Result<String>,
+    expected_dataset_receipt: &DatasetReceiptV1,
 ) -> Result<PromotionPortfolio> {
     let bytes = std::fs::read(path).with_context(|| {
         format!(
@@ -410,9 +637,17 @@ fn load_promotion_portfolio(
             path.display()
         )
     })?;
-    let portfolio: PromotionPortfolio = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    portfolio.assert_names(sweep, slot, config_hash, path)?;
+    let portfolio: PromotionPortfolio =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    portfolio.assert_bindings(
+        expected_session_id,
+        sweep,
+        slot,
+        config_hash,
+        expected_effective_search_config_hash,
+        expected_dataset_receipt,
+        path,
+    )?;
     Ok(portfolio)
 }
 
@@ -462,6 +697,22 @@ pub trait SweepExecutor {
     /// verdict is supposed to test it against.
     fn windows(&self) -> Result<((i64, i64), OosWindow, usize, f64)>;
 
+    /// Exact immutable dataset generations and IS/OOS split this executor has
+    /// resolved. There is deliberately no default: an executor without a
+    /// receipt cannot contribute to a resumable research session.
+    fn dataset_receipt(&self) -> &DatasetReceiptV1;
+
+    /// Reconstruct the exact effective discovery/ledger config identity for one
+    /// recorded batch. This is deliberately separate from the proposal stamp:
+    /// runtime population resolution can make them different identities.
+    fn expected_effective_search_config_hash(
+        &self,
+        _config: &DiscoveryConfig,
+        _binding: &PromotionBatchBindingV5,
+    ) -> Result<String> {
+        bail!("this executor cannot reconstruct a batch's effective discovery/ledger config hash")
+    }
+
     /// Run one search.
     ///
     /// Returning `Err` fails the SWEEP; returning an `Ok` outcome whose `error`
@@ -504,7 +755,7 @@ pub trait SweepExecutor {
         slot: usize,
         config: &DiscoveryConfig,
         portfolio: &PromotionPortfolio,
-    ) -> Result<OosEvidence>;
+    ) -> Result<QuoteValidatedOosTouchEvidenceV1>;
 }
 
 /// An executor that refuses to run anything.
@@ -517,12 +768,20 @@ pub trait SweepExecutor {
 /// indistinguishable from a sweep that found nothing.
 pub struct RefusingExecutor {
     windows: ((i64, i64), OosWindow, usize, f64),
+    dataset_receipt: DatasetReceiptV1,
 }
 
 impl RefusingExecutor {
-    pub fn new(search_span: (i64, i64), oos: OosWindow, oos_bars: usize, bars_per_trade: f64) -> Self {
+    pub fn new(
+        search_span: (i64, i64),
+        oos: OosWindow,
+        oos_bars: usize,
+        bars_per_trade: f64,
+        dataset_receipt: DatasetReceiptV1,
+    ) -> Self {
         Self {
             windows: (search_span, oos, oos_bars, bars_per_trade),
+            dataset_receipt,
         }
     }
 }
@@ -538,6 +797,10 @@ impl SweepExecutor for RefusingExecutor {
 
     fn windows(&self) -> Result<((i64, i64), OosWindow, usize, f64)> {
         Ok(self.windows)
+    }
+
+    fn dataset_receipt(&self) -> &DatasetReceiptV1 {
+        &self.dataset_receipt
     }
 
     fn execute(&mut self, request: &SearchRequest<'_>) -> Result<SearchOutcome> {
@@ -565,7 +828,7 @@ impl SweepExecutor for RefusingExecutor {
         _slot: usize,
         _config: &DiscoveryConfig,
         _portfolio: &PromotionPortfolio,
-    ) -> Result<OosEvidence> {
+    ) -> Result<QuoteValidatedOosTouchEvidenceV1> {
         bail!("the refusing executor never touches the out-of-sample window")
     }
 }
@@ -587,6 +850,7 @@ struct LoopContext {
     max_sweeps: usize,
     max_hours: f64,
     symbol: String,
+    dataset_receipt: DatasetReceiptV1,
 }
 
 /// The frozen cost model and validation geometry, as `(field path, value)`.
@@ -622,7 +886,10 @@ fn frozen_cost_fields(config: &DiscoveryConfig, pip_value_per_lot: f64) -> Named
             "session_spread_pips".into(),
             format!("{:?}", config.session_spread_pips),
         ),
-        ("cost_band_pips".into(), format!("{:?}", config.cost_band_pips)),
+        (
+            "cost_band_pips".into(),
+            format!("{:?}", config.cost_band_pips),
+        ),
         ("pip_value_per_lot".into(), format!("{pip_value_per_lot}")),
         ("enable_cpcv".into(), format!("{}", config.enable_cpcv)),
         ("cpcv_n_splits".into(), format!("{}", config.cpcv_n_splits)),
@@ -634,7 +901,10 @@ fn frozen_cost_fields(config: &DiscoveryConfig, pip_value_per_lot: f64) -> Named
             "cpcv_embargo_pct".into(),
             format!("{}", config.cpcv_embargo_pct),
         ),
-        ("cpcv_purge_pct".into(), format!("{}", config.cpcv_purge_pct)),
+        (
+            "cpcv_purge_pct".into(),
+            format!("{}", config.cpcv_purge_pct),
+        ),
         ("cpcv_max_rows".into(), format!("{}", config.cpcv_max_rows)),
     ])
 }
@@ -658,17 +928,15 @@ fn hash_named(values: &NamedValues) -> String {
 /// This is the ONE function the CLI calls (§14.2). It resolves the real
 /// executor and hands off to [`run_with_executor`].
 pub fn run(args: RunArgs, settings: &Settings) -> Result<crate::verdict::SessionVerdict> {
-    let base_config = DiscoveryConfig {
-        evaluation_symbol: args.symbol.clone(),
-        ..DiscoveryConfig::try_from_settings(settings)?
-    }
-    .apply_mode_overrides();
+    let base_config = DiscoveryConfig::try_from_settings(settings)?.apply_mode_overrides();
+    assert_identity_matches_config(&args.dataset_identity, &base_config)?;
 
     // A `--dry-run` resolves the REAL executor too: the dataset load, the
     // window derivation and the whole startup self-check are most of what a dry
     // run is for. It simply stops after S3 STAMP without executing anything.
-    let mut executor = streaming::StreamingSweepExecutor::resolve(settings, &base_config)
-        .context("resolving the search executor for the autoresearch loop")?;
+    let mut executor =
+        streaming::StreamingSweepExecutor::resolve(settings, &base_config, &args.dataset_identity)
+            .context("resolving the search executor for the autoresearch loop")?;
     run_with_executor(args, settings, base_config, &mut executor)
 }
 
@@ -679,6 +947,8 @@ pub fn run_with_executor(
     base_config: DiscoveryConfig,
     executor: &mut dyn SweepExecutor,
 ) -> Result<crate::verdict::SessionVerdict> {
+    assert_identity_matches_config(&args.dataset_identity, &base_config)?;
+
     // `run()` already reaches this refusal through
     // `DiscoveryConfig::try_from_settings`, but this function is public so
     // test harnesses and alternate callers can supply a config directly.
@@ -687,11 +957,13 @@ pub fn run_with_executor(
     neoethos_core::current_broker_financial_truth_capability_v1()
         .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
         .map_err(anyhow::Error::new)?;
+    assert_executor_receipt(&args.dataset_identity, executor)?;
 
     let started = Instant::now();
 
     // ── S0 OPEN / RESUME ────────────────────────────────────────────────────
-    let (mut ctx, mut writer, mut proposer) = open_or_resume(&args, settings, base_config, executor)?;
+    let (mut ctx, mut writer, mut proposer) =
+        open_or_resume(&args, settings, base_config, executor)?;
 
     // A session that already reached a verdict is not resumed into more sweeps.
     // The OOS window is spent, and a second promotion would need a second one.
@@ -835,13 +1107,7 @@ pub fn run_with_executor(
         // The judge returns POSITIONS; every record below is keyed by the SLOT
         // that names a proposal. This is the one place the two are related, and
         // it refuses rather than guessing.
-        let aligned = match align_screen(
-            sweep,
-            &drawn.proposals,
-            evidence,
-            &screen,
-            &run.not_run,
-        ) {
+        let aligned = match align_screen(sweep, &drawn.proposals, evidence, &screen, &run.not_run) {
             Ok(aligned) => aligned,
             Err(err) => {
                 return stop(
@@ -863,8 +1129,7 @@ pub fn run_with_executor(
                 failing_conjunct: result.failing_conjunct_label(),
             })?;
         }
-        let credits =
-            proposer.credits_for(&aligned.credit_proposals, &aligned.credit_screens);
+        let credits = proposer.credits_for(&aligned.credit_proposals, &aligned.credit_screens);
         writer.append(Record::PosteriorUpdated { sweep, credits })?;
 
         // The champion ROW and the BEST-EVER record are two different things and
@@ -976,6 +1241,48 @@ pub fn run_with_executor(
     }
 }
 
+fn assert_identity_matches_config(
+    dataset_identity: &neoethos_data::CanonicalDatasetIdentity,
+    base_config: &DiscoveryConfig,
+) -> Result<(String, String)> {
+    let symbol = dataset_identity.symbol_name().to_owned();
+    let base_timeframe = dataset_identity.timeframe().as_str().to_owned();
+    anyhow::ensure!(
+        base_config.evaluation_symbol.eq_ignore_ascii_case(&symbol),
+        "autoresearch config symbol {} disagrees with selected canonical dataset identity symbol {symbol}",
+        base_config.evaluation_symbol
+    );
+    anyhow::ensure!(
+        base_config.timeframe_label == base_timeframe,
+        "autoresearch config timeframe {} disagrees with selected canonical dataset identity timeframe {base_timeframe}",
+        base_config.timeframe_label
+    );
+    Ok((symbol, base_timeframe))
+}
+
+fn assert_executor_receipt(
+    dataset_identity: &neoethos_data::CanonicalDatasetIdentity,
+    executor: &dyn SweepExecutor,
+) -> Result<()> {
+    let receipt = executor.dataset_receipt();
+    anyhow::ensure!(
+        &receipt.anchor_identity == dataset_identity,
+        "autoresearch executor receipt anchor {} disagrees with selected canonical dataset identity {}",
+        receipt.anchor_identity.to_path_component(),
+        dataset_identity.to_path_component()
+    );
+    let (search_span, oos_window, _, _) = executor.windows()?;
+    anyhow::ensure!(
+        receipt.in_sample_window.start_ms == search_span.0
+            && search_span.1 < receipt.in_sample_window.end_exclusive_ms
+            && receipt.in_sample_window.end_exclusive_ms == oos_window.start_ms
+            && receipt.oos_window == oos_window,
+        "autoresearch executor windows disagree with dataset receipt {}",
+        receipt.identity()
+    );
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // S0
 // ─────────────────────────────────────────────────────────────────────────────
@@ -986,28 +1293,30 @@ fn open_or_resume(
     base_config: DiscoveryConfig,
     executor: &dyn SweepExecutor,
 ) -> Result<(LoopContext, SessionWriter, crate::proposer::Proposer)> {
+    let (symbol, _base_timeframe) =
+        assert_identity_matches_config(&args.dataset_identity, &base_config)?;
+    let dataset_receipt = executor.dataset_receipt().clone();
     // The goals abort here (G1–G6) if any of them is not a goal.
     let goals = GoalSet::load(settings).map_err(contracts::MissingCapability::Goals)?;
     let scenario = match &args.scenario {
-        Some(label) => goals
-            .scenario_by_label(label)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no scenario is labelled {label:?}. Available: {:?}. The loop will NOT fall \
+        Some(label) => goals.scenario_by_label(label).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no scenario is labelled {label:?}. Available: {:?}. The loop will NOT fall \
                      back to the primary scenario — silently optimising toward a different goal \
                      than the one you typed is the failure this crate exists to prevent. \
                      (scenarios source: {})",
-                    goals.scenarios().iter().map(|s| s.label()).collect::<Vec<_>>(),
-                    goals.scenarios_source()
-                )
-            })?,
+                goals
+                    .scenarios()
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>(),
+                goals.scenarios_source()
+            )
+        })?,
         None => goals.primary().clone(),
     };
 
-    let pip_value_per_lot = base_config
-        .try_evaluation_config(None)?
-        .pip_value_per_lot;
+    let pip_value_per_lot = base_config.try_evaluation_config(None)?.pip_value_per_lot;
     let costs = frozen_cost_fields(&base_config, pip_value_per_lot);
     let cost_hash = hash_named(&costs);
 
@@ -1021,11 +1330,17 @@ fn open_or_resume(
     let judge_hash = thresholds.judge_hash();
 
     let root = SessionStore::root()?;
-    let created_utc = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let created_utc = chrono::Utc::now().format("%Y%m%dT%H%M%S%9fZ").to_string();
     let session_id = match &args.session {
         Some(raw) => SessionId::parse(raw)?,
         None => {
-            let base = SessionId::new(&created_utc, goals.goal_hash(), &judge_hash, &cost_hash);
+            let base = SessionId::new(
+                &created_utc,
+                goals.goal_hash(),
+                &judge_hash,
+                &cost_hash,
+                &dataset_receipt.identity(),
+            );
             if args.dry_run {
                 // A dry run must never contaminate a real session's
                 // config_hash set: proposals drawn but never run would be
@@ -1039,8 +1354,8 @@ fn open_or_resume(
     let store = SessionStore::open_under(&root, session_id.clone())?;
 
     let reproduction = format!(
-        "neoethos autoresearch --symbol {} --max-sweeps {} --max-hours {} --session {}{}",
-        args.symbol,
+        "neoethos autoresearch --dataset-identity {} --max-sweeps {} --max-hours {} --session {}{}",
+        args.dataset_identity.to_path_component(),
         args.max_sweeps,
         args.max_hours,
         session_id,
@@ -1051,7 +1366,8 @@ fn open_or_resume(
         schema: crate::SESSION_SCHEMA.to_string(),
         session_id: session_id.clone(),
         session_seed: session_seed_for(&session_id),
-        symbol: args.symbol.clone(),
+        symbol: symbol.clone(),
+        dataset_receipt: dataset_receipt.clone(),
         created_utc: created_utc.clone(),
         goal_hash: goals.goal_hash().to_string(),
         judge_hash: judge_hash.clone(),
@@ -1070,7 +1386,8 @@ fn open_or_resume(
             goals.goal_hash(),
             &judge_hash,
             &cost_hash,
-            &args.symbol,
+            &symbol,
+            &dataset_receipt,
         )?;
     } else {
         store.write_header_once(&header)?;
@@ -1106,7 +1423,8 @@ fn open_or_resume(
                 ("sweep_searches".into(), crate::SWEEP_SEARCHES.to_string()),
             ]),
             identity_source: identity_source(),
-            symbol: args.symbol.clone(),
+            symbol: symbol.clone(),
+            dataset_receipt: dataset_receipt.clone(),
         })?;
     }
 
@@ -1164,7 +1482,8 @@ fn open_or_resume(
     tracing::info!(
         target: "neoethos_autoresearch::runner",
         session = %session_id,
-        symbol = %args.symbol,
+        symbol = %symbol,
+        dataset_receipt = %dataset_receipt.identity(),
         resuming,
         sweeps_run = writer.session().sweeps_run(),
         n_session = writer.session().n_session(),
@@ -1177,11 +1496,8 @@ fn open_or_resume(
         "autoresearch session open"
     );
 
-    let proposer = crate::proposer::Proposer::restore(
-        writer.session(),
-        header.session_seed,
-        &base_config,
-    )?;
+    let proposer =
+        crate::proposer::Proposer::restore(writer.session(), header.session_seed, &base_config)?;
 
     let ctx = LoopContext {
         goals,
@@ -1194,7 +1510,8 @@ fn open_or_resume(
         oos_window,
         max_sweeps: args.max_sweeps,
         max_hours: args.max_hours,
-        symbol: args.symbol.clone(),
+        symbol,
+        dataset_receipt,
     };
     Ok((ctx, writer, proposer))
 }
@@ -1349,16 +1666,13 @@ fn proposal_named_by<'a>(
     slot: usize,
     expected_hash: Option<&str>,
 ) -> Result<&'a crate::proposal::Proposal> {
-    let proposal = proposals
-        .iter()
-        .find(|p| p.slot == slot)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{sweep} has no proposal naming slot {slot}. A slot names its proposal; it is \
+    let proposal = proposals.iter().find(|p| p.slot == slot).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{sweep} has no proposal naming slot {slot}. A slot names its proposal; it is \
                  never a position in a vector. Slots present: {:?}",
-                proposals.iter().map(|p| p.slot).collect::<Vec<_>>()
-            )
-        })?;
+            proposals.iter().map(|p| p.slot).collect::<Vec<_>>()
+        )
+    })?;
     if let Some(expected) = expected_hash
         && !expected.is_empty()
         && !proposal.config_hash.is_empty()
@@ -1549,6 +1863,8 @@ fn run_sweep(
             }
         };
         let request = SearchRequest {
+            session_id: ctx.store.session_id(),
+            dataset_receipt: &ctx.dataset_receipt,
             sweep,
             slot,
             config: &config,
@@ -1559,8 +1875,9 @@ fn run_sweep(
         };
 
         let executed = match executor.execute(&request) {
-            Ok(outcome) => assert_outcome_names_its_request(sweep, slot, outcome.slot)
-                .map(|()| outcome),
+            Ok(outcome) => {
+                assert_outcome_names_its_request(sweep, slot, outcome.slot).map(|()| outcome)
+            }
             Err(err) => Err(err),
         };
 
@@ -1980,11 +2297,17 @@ fn promote(
     // and carries the slot's `config_hash` so that a file at the right path
     // still has to prove it describes the right configuration.
     let evidence_path = promotion_evidence_path(&ctx.store, candidate.sweep, candidate.slot);
+    let expected_effective_search_config_hash = |binding: &PromotionBatchBindingV5| {
+        executor.expected_effective_search_config_hash(&config, binding)
+    };
     let portfolio = match load_promotion_portfolio(
         &evidence_path,
+        ctx.store.session_id(),
         candidate.sweep,
         candidate.slot,
         &proposal.config_hash,
+        &expected_effective_search_config_hash,
+        &ctx.dataset_receipt,
     ) {
         Ok(portfolio) => portfolio,
         Err(err) => {
@@ -2030,7 +2353,7 @@ fn promote(
         candidate: proposal.config_hash.clone(),
     })?;
 
-    let oos = match executor.evaluate_oos(
+    let oos: QuoteValidatedOosTouchEvidenceV1 = match executor.evaluate_oos(
         candidate.sweep,
         candidate.slot,
         &config,
@@ -2103,7 +2426,7 @@ fn promote(
             "goal_bar": outcome.goal_bar,
             "frontier": outcome.frontier,
             "oos_window": ctx.oos_window,
-            "oos_trades": oos.per_trade_net_pips.len(),
+            "oos_trades": oos.per_trade_net_pips().len(),
             "proposal": proposal,
             // WHICH genes were evaluated, and where they are. The counts are
             // here so a reader can tell a portfolio from a single strategy
@@ -2113,15 +2436,21 @@ fn promote(
             "promotion_evidence": {
                 "path": evidence_path.display().to_string(),
                 "config_hash": portfolio.config_hash,
-                "genes": portfolio.genes.len(),
-                "feature_names": portfolio.feature_names.len(),
+                "genes": portfolio.gene_count,
+                "feature_names": portfolio.batch_bindings.iter()
+                    .map(|binding| binding.feature_names.len())
+                    .sum::<usize>(),
                 "streamed": portfolio.streamed,
-                "batches": portfolio.batches,
+                "batches": portfolio.batch_count,
             },
             "NOT_A_PROMOTION": "This file is a PROPOSAL. Nothing in the trading path reads it. \
                                 Promoting it is the operator's act.",
         }))?;
-        stop(ctx, writer, crate::verdict::StopReason::GoalReached(candidate))
+        stop(
+            ctx,
+            writer,
+            crate::verdict::StopReason::GoalReached(candidate),
+        )
     } else {
         let conjunct = outcome
             .failing_conjunct
@@ -2180,6 +2509,7 @@ fn stop(
         crate::verdict::VerdictContext {
             session_id: ctx.store.session_id().as_str().to_string(),
             symbol: ctx.symbol.clone(),
+            dataset_receipt: ctx.dataset_receipt.clone(),
             cost_hash: ctx.cost_hash.clone(),
             judge_hash: ctx.judge_hash.clone(),
             oos_window: ctx.oos_window,
@@ -2252,8 +2582,7 @@ fn dry_run(
     let sweep = writer.session().next_sweep();
     let drawn = proposer.draw_sweep(sweep, writer.session())?;
     journal_draw(writer, sweep, &drawn)?;
-    ctx.store
-        .prepare_sweep(sweep)?;
+    ctx.store.prepare_sweep(sweep)?;
     ctx.store
         .write_sweep_artifact(sweep, "proposals.json", &drawn.proposals)?;
     tracing::info!(

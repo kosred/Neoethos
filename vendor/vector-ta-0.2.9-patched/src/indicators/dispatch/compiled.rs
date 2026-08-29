@@ -1,17 +1,17 @@
 use super::{
-    compute_cpu_batch, IndicatorBatchOutput, IndicatorBatchRequest, IndicatorDataRef,
-    IndicatorDispatchError, IndicatorParamSet, ParamKV, ParamValue,
+    IndicatorBatchOutput, IndicatorBatchRequest, IndicatorDataRef, IndicatorDispatchError,
+    IndicatorParamSet, ParamKV, ParamValue, compute_cpu_batch,
 };
-use crate::indicators::dx::{dx_batch_with_kernel, DxBatchRange};
-use crate::indicators::mfi::{mfi_batch_with_kernel, MfiBatchRange};
-use crate::indicators::moving_averages::sma::{sma_batch_with_kernel, SmaBatchRange};
+use crate::indicators::dx::{DxBatchRange, dx_batch_with_kernel};
+use crate::indicators::mfi::{MfiBatchRange, mfi_batch_with_kernel};
+use crate::indicators::moving_averages::sma::{SmaBatchRange, sma_batch_with_kernel};
 use crate::indicators::registry::get_indicator;
 use crate::utilities::data_loader::source_type;
 use crate::utilities::enums::Kernel;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 use super::{
-    compute_cuda, CudaOutputTarget, IndicatorCudaDataRef, IndicatorCudaOutput, IndicatorCudaRequest,
+    CudaOutputTarget, IndicatorCudaDataRef, IndicatorCudaOutput, IndicatorCudaRequest, compute_cuda,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -475,7 +475,7 @@ fn f64_output(output_id: &str, rows: usize, cols: usize, values: Vec<f64>) -> In
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 pub fn run_compiled_cuda(
     call: &CompiledIndicatorCall,
     data: IndicatorCudaDataRef<'_>,
@@ -496,7 +496,7 @@ pub fn run_compiled_cuda(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indicators::dispatch::{compute_cpu_batch, IndicatorBatchRequest};
+    use crate::indicators::dispatch::{IndicatorBatchRequest, compute_cpu_batch};
 
     fn sample_series() -> Vec<f64> {
         (1..=128).map(|v| v as f64).collect()
@@ -699,7 +699,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-build-native")]
     #[test]
     fn compile_prefer_cuda_rejects_non_cuda_indicator() {
         let err = compile_call("historical_volatility", Some("value"), &[], true).unwrap_err();

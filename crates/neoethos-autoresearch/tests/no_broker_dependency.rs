@@ -17,8 +17,7 @@ const FORBIDDEN: &[&str] = &["neoethos-app", "neoethos-trader"];
 
 fn manifest() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {}: {err}", path.display()))
 }
 
 #[test]
@@ -142,7 +141,9 @@ fn the_path_guard_still_catches_a_real_path() {
     ];
     for line in offending {
         let lowered = line.to_ascii_lowercase();
-        let at = lowered.find(TRADING_ARTIFACT).expect("the fixture names it");
+        let at = lowered
+            .find(TRADING_ARTIFACT)
+            .expect("the fixture names it");
         let preceded_by = lowered[..at].chars().next_back();
         let as_path_component =
             matches!(preceded_by, Some('"') | Some('/') | Some('\\') | Some('}'));

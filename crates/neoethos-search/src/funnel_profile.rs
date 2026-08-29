@@ -115,6 +115,12 @@ pub struct FunnelProfile {
     pub bottleneck_rejected: usize,
     /// Final outcome state per P10.
     pub outcome: String,
+    /// In-memory authority for the arithmetic engines that completed this exact
+    /// discovery run. It is attached once from the closed canonical-scope-bound
+    /// receipt and is never reconstructed from funnel JSON or process state.
+    #[serde(skip)]
+    population_execution_run_receipt_v2:
+        Option<crate::population_execution_run_receipt_v2::ExactPopulationExecutionRunReceiptV2>,
     /// When the previous stage finished, so each stage can report its own cost.
     /// Not persisted — it only has meaning during the run that set it.
     #[serde(skip)]
@@ -133,8 +139,27 @@ impl FunnelProfile {
             bottleneck_stage: String::new(),
             bottleneck_rejected: 0,
             outcome: "pending".to_string(),
+            population_execution_run_receipt_v2: None,
             last_mark: Some(std::time::Instant::now()),
         }
+    }
+
+    pub(crate) fn attach_population_execution_run_receipt_v2(
+        &mut self,
+        receipt: crate::population_execution_run_receipt_v2::ExactPopulationExecutionRunReceiptV2,
+    ) -> Result<(), &'static str> {
+        if self.population_execution_run_receipt_v2.is_some() {
+            return Err("population execution run receipt v2 is already attached");
+        }
+        self.population_execution_run_receipt_v2 = Some(receipt);
+        Ok(())
+    }
+
+    pub(crate) const fn population_execution_run_receipt_v2(
+        &self,
+    ) -> Option<&crate::population_execution_run_receipt_v2::ExactPopulationExecutionRunReceiptV2>
+    {
+        self.population_execution_run_receipt_v2.as_ref()
     }
 
     /// 2026-05-26 operator directive (dual-mode product): record which trading

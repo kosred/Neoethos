@@ -25,8 +25,9 @@
 //! [`SessionWriter::append`] in debug builds and by
 //! `fold_matches_incremental_apply` in the tests.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -114,13 +115,25 @@ impl std::fmt::Display for SessionId {
 /// `--session ../../etc` would otherwise let a command-line argument address a
 /// path outside the store.
 impl SessionId {
-    /// `ar-<yyyymmddThhmmssZ>-<hash8>`, where the hash covers the goal, judge
-    /// and cost hashes. Two sessions judged by two different judges therefore
-    /// cannot collide, and cannot share a history.
-    pub fn new(now_utc: &str, goal_hash: &str, judge_hash: &str, cost_hash: &str) -> Self {
+    /// `ar-<utc>-<receipt-sha256>-<hash8>`. The full receipt identity makes the
+    /// directory specific to the exact immutable generations and IS/OOS split;
+    /// the final hash still separates different goal/judge/cost frames.
+    pub fn new(
+        now_utc: &str,
+        goal_hash: &str,
+        judge_hash: &str,
+        cost_hash: &str,
+        dataset_receipt_id: &DatasetReceiptId,
+    ) -> Self {
         let fingerprint = crate::fnv64(&format!("{goal_hash}|{judge_hash}|{cost_hash}"));
-        let short = fingerprint.trim_start_matches("fnv64:").get(..8).unwrap_or("00000000");
-        Self(format!("ar-{now_utc}-{short}"))
+        let short = fingerprint
+            .trim_start_matches("fnv64:")
+            .get(..8)
+            .unwrap_or("00000000");
+        Self(format!(
+            "ar-{now_utc}-{}-{short}",
+            dataset_receipt_id.as_str()
+        ))
     }
 
     /// Parse an operator-supplied `--session` value.
@@ -148,6 +161,269 @@ impl SessionId {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Exact dataset receipt
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const DATASET_RECEIPT_SCHEMA: &str = "neoethos.autoresearch.dataset-receipt.v1";
+const DATASET_RECEIPT_ID_DOMAIN: &[u8] = b"neoethos.autoresearch.dataset-receipt.identity\0";
+const DATASET_RECEIPT_ID_VERSION: u16 = 1;
+
+/// Collision-resistant path key for one exact [`DatasetReceiptV1`]. The full
+/// receipt is always persisted and exact-compared; this digest is only a safe,
+/// bounded directory component.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DatasetReceiptId(String);
+
+impl DatasetReceiptId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DatasetReceiptId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Exact immutable artifact selected for one direct timeframe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTimeframeReceiptV1 {
+    #[serde(with = "canonical_dataset_identity_serde")]
+    pub dataset_identity: neoethos_data::CanonicalDatasetIdentity,
+    pub manifest_schema_id: String,
+    pub manifest_sha256: [u8; 32],
+    pub generation_id: String,
+    pub vortex_sha256: [u8; 32],
+    pub row_count: u64,
+    pub timestamp_start_ms: i64,
+    pub timestamp_end_ms: i64,
+}
+
+impl DirectTimeframeReceiptV1 {
+    pub fn from_artifact(artifact: &neoethos_data::CanonicalDatasetArtifactV1) -> Result<Self> {
+        let binding = artifact.source_binding("dataset-receipt")?;
+        Ok(Self {
+            dataset_identity: artifact.identity().clone(),
+            manifest_schema_id: binding.manifest_schema_id().to_owned(),
+            manifest_sha256: *binding.manifest_hash(),
+            generation_id: artifact.generation_id().to_owned(),
+            vortex_sha256: *binding.vortex_hash(),
+            row_count: artifact.row_count(),
+            timestamp_start_ms: artifact.timestamp_start_ms(),
+            timestamp_end_ms: artifact.timestamp_end_ms(),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.manifest_schema_id.trim().is_empty(),
+            "direct timeframe receipt has an empty manifest schema id"
+        );
+        ensure!(
+            !self.generation_id.trim().is_empty(),
+            "direct timeframe receipt has an empty generation id"
+        );
+        ensure!(
+            self.row_count > 0,
+            "direct timeframe receipt {} has no rows",
+            self.dataset_identity.to_path_component()
+        );
+        ensure!(
+            self.timestamp_start_ms <= self.timestamp_end_ms,
+            "direct timeframe receipt {} has inverted timestamp bounds",
+            self.dataset_identity.to_path_component()
+        );
+        Ok(())
+    }
+}
+
+/// Exact half-open in-sample interval. Every direct timeframe consumes only
+/// rows whose canonical timestamp is in this interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InSampleWindowV1 {
+    pub start_ms: i64,
+    pub end_exclusive_ms: i64,
+}
+
+/// Frozen identity of all data one autoresearch session is allowed to use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetReceiptV1 {
+    pub schema: String,
+    #[serde(with = "canonical_dataset_identity_serde")]
+    pub anchor_identity: neoethos_data::CanonicalDatasetIdentity,
+    pub direct_timeframes: Vec<DirectTimeframeReceiptV1>,
+    pub in_sample_window: InSampleWindowV1,
+    pub oos_window: OosWindow,
+}
+
+impl DatasetReceiptV1 {
+    pub fn new(
+        anchor_identity: neoethos_data::CanonicalDatasetIdentity,
+        mut direct_timeframes: Vec<DirectTimeframeReceiptV1>,
+        in_sample_window: InSampleWindowV1,
+        oos_window: OosWindow,
+    ) -> Result<Self> {
+        direct_timeframes.sort_by(|left, right| {
+            left.dataset_identity
+                .to_path_component()
+                .cmp(&right.dataset_identity.to_path_component())
+        });
+        let receipt = Self {
+            schema: DATASET_RECEIPT_SCHEMA.to_owned(),
+            anchor_identity,
+            direct_timeframes,
+            in_sample_window,
+            oos_window,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn identity(&self) -> DatasetReceiptId {
+        let digest = Sha256::digest(self.canonical_identity_bytes());
+        DatasetReceiptId(format!("dr1-{}", encode_hex(&digest)))
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema == DATASET_RECEIPT_SCHEMA,
+            "dataset receipt schema {:?} is not {DATASET_RECEIPT_SCHEMA}",
+            self.schema
+        );
+        ensure!(
+            self.in_sample_window.start_ms < self.in_sample_window.end_exclusive_ms,
+            "dataset receipt in-sample window must be non-empty and half-open"
+        );
+        ensure!(
+            self.in_sample_window.end_exclusive_ms == self.oos_window.start_ms,
+            "dataset receipt IS cutoff {} does not equal OOS start {}",
+            self.in_sample_window.end_exclusive_ms,
+            self.oos_window.start_ms
+        );
+        ensure!(
+            self.oos_window.start_ms <= self.oos_window.end_ms,
+            "dataset receipt OOS window is inverted"
+        );
+        ensure!(
+            !self.direct_timeframes.is_empty(),
+            "dataset receipt has no direct timeframe artifacts"
+        );
+
+        let mut seen_timeframes = std::collections::BTreeSet::new();
+        let mut anchor_artifact = None;
+        let mut previous_identity = None::<String>;
+        for direct in &self.direct_timeframes {
+            direct.validate()?;
+            ensure!(
+                direct.dataset_identity.scope() == self.anchor_identity.scope()
+                    && direct.dataset_identity.symbol_name() == self.anchor_identity.symbol_name()
+                    && direct.dataset_identity.bar_timestamp_convention()
+                        == self.anchor_identity.bar_timestamp_convention(),
+                "direct timeframe {} is outside anchor series {}",
+                direct.dataset_identity.to_path_component(),
+                self.anchor_identity.to_path_component()
+            );
+            ensure!(
+                seen_timeframes.insert(direct.dataset_identity.timeframe()),
+                "dataset receipt repeats direct timeframe {}",
+                direct.dataset_identity.timeframe()
+            );
+            let encoded = direct.dataset_identity.to_path_component();
+            if let Some(previous) = &previous_identity {
+                ensure!(
+                    previous < &encoded,
+                    "dataset receipt direct timeframes are not in canonical order"
+                );
+            }
+            previous_identity = Some(encoded);
+            if direct.dataset_identity == self.anchor_identity {
+                anchor_artifact = Some(direct);
+            }
+        }
+        let anchor_artifact = anchor_artifact.context(
+            "dataset receipt does not contain the selected anchor identity as a direct artifact",
+        )?;
+        ensure!(
+            self.in_sample_window.start_ms >= anchor_artifact.timestamp_start_ms
+                && self.oos_window.end_ms <= anchor_artifact.timestamp_end_ms,
+            "dataset receipt windows are outside the selected anchor generation"
+        );
+        Ok(())
+    }
+
+    fn canonical_identity_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(512 + self.direct_timeframes.len() * 256);
+        bytes.extend_from_slice(DATASET_RECEIPT_ID_DOMAIN);
+        bytes.extend_from_slice(&DATASET_RECEIPT_ID_VERSION.to_be_bytes());
+        push_receipt_bytes(&mut bytes, self.schema.as_bytes());
+        push_receipt_bytes(
+            &mut bytes,
+            self.anchor_identity.to_path_component().as_bytes(),
+        );
+        bytes.extend_from_slice(&(self.direct_timeframes.len() as u64).to_be_bytes());
+        for direct in &self.direct_timeframes {
+            push_receipt_bytes(
+                &mut bytes,
+                direct.dataset_identity.to_path_component().as_bytes(),
+            );
+            push_receipt_bytes(&mut bytes, direct.manifest_schema_id.as_bytes());
+            bytes.extend_from_slice(&direct.manifest_sha256);
+            push_receipt_bytes(&mut bytes, direct.generation_id.as_bytes());
+            bytes.extend_from_slice(&direct.vortex_sha256);
+            bytes.extend_from_slice(&direct.row_count.to_be_bytes());
+            bytes.extend_from_slice(&direct.timestamp_start_ms.to_be_bytes());
+            bytes.extend_from_slice(&direct.timestamp_end_ms.to_be_bytes());
+        }
+        bytes.extend_from_slice(&self.in_sample_window.start_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.in_sample_window.end_exclusive_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.oos_window.start_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.oos_window.end_ms.to_be_bytes());
+        bytes
+    }
+}
+
+fn push_receipt_bytes(target: &mut Vec<u8>, value: &[u8]) {
+    target.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    target.extend_from_slice(value);
+}
+
+fn encode_hex(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+mod canonical_dataset_identity_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        identity: &neoethos_data::CanonicalDatasetIdentity,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&identity.to_path_component())
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<neoethos_data::CanonicalDatasetIdentity, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        neoethos_data::CanonicalDatasetIdentity::from_path_component(&encoded)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The immutable header
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -164,6 +440,7 @@ pub struct SessionHeader {
     pub session_id: SessionId,
     pub session_seed: u64,
     pub symbol: String,
+    pub dataset_receipt: DatasetReceiptV1,
     pub created_utc: String,
     pub goal_hash: String,
     pub judge_hash: String,
@@ -176,6 +453,23 @@ pub struct SessionHeader {
     pub reproduction: String,
 }
 
+impl SessionHeader {
+    fn validate(&self) -> Result<()> {
+        self.dataset_receipt.validate()?;
+        ensure!(
+            self.dataset_receipt.anchor_identity.symbol_name() == self.symbol,
+            "session header symbol {} disagrees with dataset receipt anchor symbol {}",
+            self.symbol,
+            self.dataset_receipt.anchor_identity.symbol_name()
+        );
+        ensure!(
+            self.dataset_receipt.oos_window == self.oos_window,
+            "session header OOS window disagrees with its exact dataset receipt"
+        );
+        Ok(())
+    }
+}
+
 /// Why a resume was refused. Each variant names the hash that moved, because
 /// *"the config changed"* is not actionable and *"the judge's PBO ceiling moved
 /// from 0.50 to 0.60"* is.
@@ -185,6 +479,7 @@ pub enum ResumeRefusal {
     JudgeChanged { stored: String, current: String },
     CostModelChanged { stored: String, current: String },
     SymbolChanged { stored: String, current: String },
+    DatasetReceiptChanged { stored: String, current: String },
     SchemaChanged { stored: String, current: String },
 }
 
@@ -216,6 +511,12 @@ impl fmt::Display for ResumeRefusal {
             Self::SymbolChanged { stored, current } => (
                 "symbol",
                 "this session was opened on a different instrument",
+                stored,
+                current,
+            ),
+            Self::DatasetReceiptChanged { stored, current } => (
+                "dataset_receipt",
+                "the selected immutable generation set or the exact IS/OOS window moved. Results from two data receipts cannot share one history or one out-of-sample touch",
                 stored,
                 current,
             ),
@@ -564,7 +865,11 @@ impl AbandonCensus {
             "  searches errored                {}",
             self.searches_errored
         );
-        let _ = writeln!(s, "  sweeps failed                   {}", self.sweeps_failed);
+        let _ = writeln!(
+            s,
+            "  sweeps failed                   {}",
+            self.sweeps_failed
+        );
         let _ = writeln!(
             s,
             "  sweeps abandoned (crash)        {}",
@@ -572,11 +877,7 @@ impl AbandonCensus {
         );
         let _ = writeln!(s, "  screen failures by conjunct:");
         for (i, label) in crate::judge::ScreenConjunct::ALL_LABELS.iter().enumerate() {
-            let _ = writeln!(
-                s,
-                "    {label:<16} {}",
-                self.screen_failed_by_conjunct[i]
-            );
+            let _ = writeln!(s, "    {label:<16} {}", self.screen_failed_by_conjunct[i]);
         }
         let _ = writeln!(
             s,
@@ -749,6 +1050,7 @@ pub struct OpenedHeader {
     pub session_id: SessionId,
     pub session_seed: u64,
     pub symbol: String,
+    pub dataset_receipt: DatasetReceiptV1,
     pub goal_hash: String,
     pub judge_hash: String,
     pub cost_hash: String,
@@ -785,6 +1087,7 @@ impl Session {
                 oos_window,
                 scenarios_source,
                 identity_source,
+                dataset_receipt,
                 ..
             } => {
                 if self.opened.is_some() {
@@ -794,10 +1097,20 @@ impl Session {
                          would mean two experiments folded into one N and one verdict."
                     );
                 }
+                dataset_receipt.validate()?;
+                ensure!(
+                    dataset_receipt.anchor_identity.symbol_name() == symbol,
+                    "SessionOpened symbol disagrees with its dataset receipt anchor"
+                );
+                ensure!(
+                    dataset_receipt.oos_window == *oos_window,
+                    "SessionOpened OOS window disagrees with its dataset receipt"
+                );
                 self.opened = Some(OpenedHeader {
                     session_id: session_id.clone(),
                     session_seed: *session_seed,
                     symbol: symbol.clone(),
+                    dataset_receipt: dataset_receipt.clone(),
                     goal_hash: goal_hash.clone(),
                     judge_hash: judge_hash.clone(),
                     cost_hash: cost_hash.clone(),
@@ -1282,6 +1595,50 @@ impl Session {
 // The writer — journal and session, in lockstep, always
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Operating-system lease for the sole process allowed to append one session.
+///
+/// The lock file is deliberately kept after release. Unlinking a locked file
+/// would let another process create and lock a new inode while the old owner
+/// still held the original one. Closing this handle (including process death)
+/// releases the OS lock; acquisition is non-blocking, so this never waits while
+/// holding a CPU-admission permit or an in-process mutex.
+struct SessionWriterLease {
+    _file: std::fs::File,
+}
+
+impl SessionWriterLease {
+    fn acquire(journal_path: &Path) -> Result<Self> {
+        if let Some(parent) = journal_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating the session writer lease directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let lock_path = journal_path.with_extension("writer.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "opening the active session writer lease {}",
+                    lock_path.display()
+                )
+            })?;
+        file.try_lock().with_context(|| {
+            format!(
+                "acquiring the exclusive active session writer lease {}. Another process may \
+                 still own this session; acquisition is deliberately non-blocking",
+                lock_path.display()
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// Owns the journal and the folded session together, so nothing can append to
 /// one without updating the other.
 ///
@@ -1293,6 +1650,9 @@ impl Session {
 pub struct SessionWriter {
     journal: Journal,
     session: Session,
+    // Declared last so the journal handle is dropped before its ownership
+    // lease. The lease itself is held for this writer's complete lifetime.
+    _lease: SessionWriterLease,
 }
 
 impl SessionWriter {
@@ -1302,11 +1662,17 @@ impl SessionWriter {
     /// appended immediately, so the fact survives into the verdict's census
     /// rather than living only in a log line nobody kept.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let lease = SessionWriterLease::acquire(path)?;
         let journal = Journal::open(path)?;
         let session = Session::fold(journal.records())
             .context("folding the journal into a session on resume")?;
         let truncated = journal.replay_report().truncated_tail_bytes;
-        let mut writer = Self { journal, session };
+        let mut writer = Self {
+            journal,
+            session,
+            _lease: lease,
+        };
         if truncated > 0 {
             writer.append(Record::TruncatedTail { bytes: truncated })?;
         }
@@ -1428,9 +1794,8 @@ impl SessionStore {
     pub fn open_under(root: impl AsRef<Path>, session_id: SessionId) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let dir = root.join(session_id.as_str());
-        std::fs::create_dir_all(dir.join("sweeps")).with_context(|| {
-            format!("creating the session directory {}", dir.display())
-        })?;
+        std::fs::create_dir_all(dir.join("sweeps"))
+            .with_context(|| format!("creating the session directory {}", dir.display()))?;
         Ok(Self {
             root,
             dir,
@@ -1513,6 +1878,7 @@ impl SessionStore {
     /// an error; with the same header it is a no-op, so a crash between
     /// `create_dir_all` and the first journal append does not wedge the store.
     pub fn write_header_once(&self, header: &SessionHeader) -> Result<()> {
+        header.validate()?;
         let path = self.header_path();
         if path.exists() {
             let existing = self.read_header()?;
@@ -1533,8 +1899,10 @@ impl SessionStore {
         let path = self.header_path();
         let bytes = std::fs::read(&path)
             .with_context(|| format!("reading the session header {}", path.display()))?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing the session header {}", path.display()))
+        let header: SessionHeader = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing the session header {}", path.display()))?;
+        header.validate()?;
+        Ok(header)
     }
 
     /// Refuse a resume whose frame has moved. §11.4.
@@ -1545,6 +1913,7 @@ impl SessionStore {
         judge_hash: &str,
         cost_hash: &str,
         symbol: &str,
+        dataset_receipt: &DatasetReceiptV1,
     ) -> Result<(), ResumeRefusal> {
         if stored.schema != crate::SESSION_SCHEMA {
             return Err(ResumeRefusal::SchemaChanged {
@@ -1576,6 +1945,12 @@ impl SessionStore {
                 current: symbol.to_string(),
             });
         }
+        if &stored.dataset_receipt != dataset_receipt {
+            return Err(ResumeRefusal::DatasetReceiptChanged {
+                stored: stored.dataset_receipt.identity().to_string(),
+                current: dataset_receipt.identity().to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -1596,8 +1971,11 @@ impl SessionStore {
             .append(true)
             .open(&path)
             .with_context(|| format!("opening the partial ledger {}", path.display()))?;
-        writeln!(file, "{{\"slot\":{slot},\"trials_offered\":{trials_offered}}}")
-            .with_context(|| format!("appending to the partial ledger {}", path.display()))?;
+        writeln!(
+            file,
+            "{{\"slot\":{slot},\"trials_offered\":{trials_offered}}}"
+        )
+        .with_context(|| format!("appending to the partial ledger {}", path.display()))?;
         file.flush()?;
         file.sync_data()
             .with_context(|| format!("fsyncing the partial ledger {}", path.display()))?;
@@ -1714,8 +2092,7 @@ impl SessionStore {
                 }
             }
         }
-        census.free_bytes_after =
-            neoethos_search::trial_returns::available_bytes_for(&self.dir);
+        census.free_bytes_after = neoethos_search::trial_returns::available_bytes_for(&self.dir);
         Ok(census)
     }
 }
@@ -1735,8 +2112,8 @@ fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .with_context(|| format!("serialising {}", path.display()))?;
     {
-        let mut file = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(&bytes)
             .with_context(|| format!("writing {}", tmp.display()))?;
         file.flush()?;
@@ -1764,6 +2141,46 @@ mod tests {
     use super::*;
     use crate::journal::CostBandCounts;
 
+    fn direct_receipt(
+        timeframe: neoethos_data::CanonicalTimeframe,
+        generation_id: &str,
+        hash_byte: u8,
+    ) -> DirectTimeframeReceiptV1 {
+        DirectTimeframeReceiptV1 {
+            dataset_identity: neoethos_data::CanonicalDatasetIdentity::external(
+                "autoresearch-session-test",
+                "EURUSD",
+                timeframe,
+                neoethos_data::BarTimestampConvention::BarOpen,
+            )
+            .expect("test dataset identity"),
+            manifest_schema_id: "neoethos.dataset-manifest.v1".to_owned(),
+            manifest_sha256: [hash_byte; 32],
+            generation_id: generation_id.to_owned(),
+            vortex_sha256: [hash_byte.wrapping_add(1); 32],
+            row_count: 101,
+            timestamp_start_ms: 0,
+            timestamp_end_ms: 1_000,
+        }
+    }
+
+    fn dataset_receipt(generation_id: &str) -> DatasetReceiptV1 {
+        let base = direct_receipt(neoethos_data::CanonicalTimeframe::M5, generation_id, 3);
+        DatasetReceiptV1::new(
+            base.dataset_identity.clone(),
+            vec![base],
+            InSampleWindowV1 {
+                start_ms: 0,
+                end_exclusive_ms: 900,
+            },
+            OosWindow {
+                start_ms: 900,
+                end_ms: 1_000,
+            },
+        )
+        .expect("test dataset receipt")
+    }
+
     fn header_record(id: &str) -> Record {
         Record::SessionOpened {
             session_id: SessionId(id.to_string()),
@@ -1786,6 +2203,7 @@ mod tests {
             budget: crate::journal::NamedValues(vec![("max_sweeps".into(), "200".into())]),
             identity_source: "config_hash".into(),
             symbol: "EURUSD".into(),
+            dataset_receipt: dataset_receipt("generation-a"),
         }
     }
 
@@ -1857,7 +2275,9 @@ mod tests {
             config_hash: format!("fnv64:{sweep:016x}"),
             strategy_id: format!("g{sweep}"),
             period_keys: champion_months(),
-            monthly_returns: (0..36).map(|m| 0.01 * ((i + m) % 7) as f64 - 0.02).collect(),
+            monthly_returns: (0..36)
+                .map(|m| 0.01 * ((i + m) % 7) as f64 - 0.02)
+                .collect(),
             e_screen_pess: 0.4,
         }
     }
@@ -1901,7 +2321,8 @@ mod tests {
             incremental.apply(record).unwrap();
             let folded = Session::fold(&records[..=index]).unwrap();
             assert_eq!(
-                folded, incremental,
+                folded,
+                incremental,
                 "the fold diverged from the incremental state after record {index} ({})",
                 record.tag()
             );
@@ -1913,7 +2334,10 @@ mod tests {
         assert_eq!(incremental.champions.len(), 1);
         assert_eq!(incremental.champions[0].sweep, SweepId(1));
         let best_ever = incremental.best_ever.as_ref().expect("a best-ever pointer");
-        assert_eq!(best_ever.slot, 0, "the lower offer must not displace the best");
+        assert_eq!(
+            best_ever.slot, 0,
+            "the lower offer must not displace the best"
+        );
         assert!((best_ever.e_screen_pess - 0.40).abs() < 1e-12);
     }
 
@@ -1932,7 +2356,10 @@ mod tests {
             },
         ];
         let err = Session::fold(&records).expect_err("two rows from one sweep must not fold");
-        assert!(format!("{err:#}").contains("ONE ROW PER SWEEP"), "got: {err:#}");
+        assert!(
+            format!("{err:#}").contains("ONE ROW PER SWEEP"),
+            "got: {err:#}"
+        );
     }
 
     #[test]
@@ -1944,7 +2371,10 @@ mod tests {
         assert!(!advances_best(None, &best(1, 0, f64::NAN)));
         assert!(advances_best(Some(&best(1, 0, 0.10)), &best(2, 0, 0.11)));
         assert!(!advances_best(Some(&best(1, 0, 0.10)), &best(2, 0, 0.10)));
-        assert!(!advances_best(Some(&best(1, 0, 0.10)), &best(2, 0, f64::NAN)));
+        assert!(!advances_best(
+            Some(&best(1, 0, 0.10)),
+            &best(2, 0, f64::NAN)
+        ));
 
         let records = vec![
             header_record("ar-test"),
@@ -1981,7 +2411,12 @@ mod tests {
     fn a_crash_loses_one_sweep_not_the_session() {
         // Two-phase journalling: the intent for sweep 2 is on disk, the outcome
         // never arrived.
-        let records = vec![header_record("ar-test"), started(1), completed(1, 100), started(2)];
+        let records = vec![
+            header_record("ar-test"),
+            started(1),
+            completed(1, 100),
+            started(2),
+        ];
         let session = Session::fold(&records).unwrap();
 
         // Sweep 1 survived intact.
@@ -2004,8 +2439,88 @@ mod tests {
             reason: "process died".into(),
         });
         let session = Session::fold(&records).unwrap();
-        assert_eq!(session.n_session(), 62, "a trial that ran is a trial that ran");
+        assert_eq!(
+            session.n_session(),
+            62,
+            "a trial that ran is a trial that ran"
+        );
         assert_eq!(session.census.sweeps_abandoned, 1);
+    }
+
+    #[test]
+    fn a_second_writer_cannot_open_the_same_active_session_until_the_first_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+
+        let first = SessionWriter::open(&path).expect("the first writer owns the session");
+        let error = match SessionWriter::open(&path) {
+            Ok(_) => panic!("two live writers must never own one session journal"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("active session writer"),
+            "the refusal must name the exclusive writer lease: {error:#}"
+        );
+
+        drop(first);
+        SessionWriter::open(&path)
+            .expect("dropping the owner must release the operating-system writer lease");
+    }
+
+    #[test]
+    fn session_writer_lease_child_process() {
+        let Ok(journal_path) = std::env::var("NEOETHOS_TEST_SESSION_WRITER_JOURNAL") else {
+            return;
+        };
+        let ready_path = std::env::var("NEOETHOS_TEST_SESSION_WRITER_READY")
+            .expect("the lease-child ready path accompanies its journal path");
+        let _writer = SessionWriter::open(&journal_path).expect("child owns the writer lease");
+        std::fs::write(&ready_path, b"ready").expect("child announces lease ownership");
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn another_process_is_refused_and_process_death_releases_the_writer_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.jsonl");
+        let ready_path = dir.path().join("child-ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("session::tests::session_writer_lease_child_process")
+            .arg("--nocapture")
+            .env("NEOETHOS_TEST_SESSION_WRITER_JOURNAL", &journal_path)
+            .env("NEOETHOS_TEST_SESSION_WRITER_READY", &ready_path)
+            .spawn()
+            .expect("spawn writer-lease child process");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready_path.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("writer-lease child exited before acquiring the lock: {status}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("writer-lease child did not acquire the lock within 10 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let error = match SessionWriter::open(&journal_path) {
+            Ok(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("a second process opened a journal whose child writer was active")
+            }
+            Err(error) => error,
+        };
+        child.kill().expect("terminate the lease-owning child");
+        child.wait().expect("reap the lease-owning child");
+        SessionWriter::open(&journal_path)
+            .expect("operating-system process death must release the writer lease");
+        assert!(format!("{error:#}").contains("active session writer"));
     }
 
     /// **The adversary's test.** Kill the loop after sweeps that produced
@@ -2042,7 +2557,10 @@ mod tests {
                 let advanced = writer
                     .offer_best_ever(best(sweep, 0, 0.10 + 0.01 * sweep as f64))
                     .unwrap();
-                assert!(advanced, "sweep {sweep} strictly improved on its predecessor");
+                assert!(
+                    advanced,
+                    "sweep {sweep} strictly improved on its predecessor"
+                );
             }
             // A non-advancing offer costs no journal line and changes nothing.
             assert!(!writer.offer_best_ever(best(12, 9, -5.0)).unwrap());
@@ -2105,7 +2623,11 @@ mod tests {
             "U2 fell into the no-best arm after a resume, which can never be satisfied: {}",
             u2.detail
         );
-        assert!(u2.satisfied, "U2 must remain SATISFIABLE after a resume: {}", u2.detail);
+        assert!(
+            u2.satisfied,
+            "U2 must remain SATISFIABLE after a resume: {}",
+            u2.detail
+        );
 
         // CAPABILITY 2 — promotion is still possible. `pbo_session` is computed
         // over the champion matrix; with an empty matrix it refuses, and a
@@ -2187,7 +2709,10 @@ mod tests {
         ];
         let session = Session::fold(&records).unwrap();
         assert_eq!(session.posterior.evidence("population", "4096"), (0, 1));
-        assert_eq!(session.posterior.evidence("axis_b", "B3_CostElastic"), (0, 1));
+        assert_eq!(
+            session.posterior.evidence("axis_b", "B3_CostElastic"),
+            (0, 1)
+        );
     }
 
     #[test]
@@ -2275,7 +2800,10 @@ mod tests {
         let session = Session::fold(&records).unwrap();
         assert!(session.null_observations.is_empty());
         assert_eq!(session.null_refusals, 1);
-        assert_eq!(crate::shuffle::ShuffleNull::from_session(&session).refused(), 1);
+        assert_eq!(
+            crate::shuffle::ShuffleNull::from_session(&session).refused(),
+            1
+        );
         assert_eq!(
             crate::shuffle::ShuffleSummary::from_session(&session).null_refusals,
             1,
@@ -2343,7 +2871,10 @@ mod tests {
 
     #[test]
     fn the_truncated_tail_reaches_the_census() {
-        let records = vec![header_record("ar-test"), Record::TruncatedTail { bytes: 57 }];
+        let records = vec![
+            header_record("ar-test"),
+            Record::TruncatedTail { bytes: 57 },
+        ];
         let session = Session::fold(&records).unwrap();
         assert_eq!(session.journal_truncated_bytes, 57);
         assert!(
@@ -2377,14 +2908,20 @@ mod tests {
     #[test]
     fn the_store_refuses_a_resume_whose_judge_moved() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0000").unwrap())
-                .unwrap();
+        let store = SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0000").unwrap())
+            .unwrap();
+        let frozen_dataset_receipt = dataset_receipt("generation-a");
+        let reproduction = format!(
+            "neoethos autoresearch --dataset-identity {} --session {}",
+            frozen_dataset_receipt.anchor_identity.to_path_component(),
+            store.session_id()
+        );
         let header = SessionHeader {
             schema: crate::SESSION_SCHEMA.to_string(),
             session_id: store.session_id().clone(),
             session_seed: 7,
             symbol: "EURUSD".into(),
+            dataset_receipt: frozen_dataset_receipt,
             created_utc: "2026-08-10T00:00:00Z".into(),
             goal_hash: "fnv64:g".into(),
             judge_hash: "fnv64:j".into(),
@@ -2395,7 +2932,7 @@ mod tests {
                 start_ms: 900,
                 end_ms: 1000,
             },
-            reproduction: "neoethos autoresearch --symbol EURUSD".into(),
+            reproduction,
         };
         store.write_header_once(&header).unwrap();
         // Idempotent for the same header.
@@ -2404,22 +2941,122 @@ mod tests {
         let stored = store.read_header().unwrap();
         assert!(
             store
-                .assert_resumable(&stored, "fnv64:g", "fnv64:j", "fnv64:c", "EURUSD")
+                .assert_resumable(
+                    &stored,
+                    "fnv64:g",
+                    "fnv64:j",
+                    "fnv64:c",
+                    "EURUSD",
+                    &dataset_receipt("generation-a"),
+                )
                 .is_ok()
         );
         let err = store
-            .assert_resumable(&stored, "fnv64:g", "fnv64:MOVED", "fnv64:c", "EURUSD")
+            .assert_resumable(
+                &stored,
+                "fnv64:g",
+                "fnv64:MOVED",
+                "fnv64:c",
+                "EURUSD",
+                &dataset_receipt("generation-a"),
+            )
             .expect_err("a moved judge must refuse the resume");
         assert!(matches!(err, ResumeRefusal::JudgeChanged { .. }));
         assert!(err.to_string().contains("judge_hash"));
     }
 
     #[test]
-    fn a_partial_ledger_recovers_the_trials_a_crashed_sweep_had_run() {
+    fn dataset_receipt_identity_is_stable_ordered_and_sensitive_to_generation_and_window() {
+        let base = direct_receipt(neoethos_data::CanonicalTimeframe::M5, "generation-base", 3);
+        let higher = direct_receipt(
+            neoethos_data::CanonicalTimeframe::H1,
+            "generation-higher",
+            5,
+        );
+        let make = |direct_timeframes: Vec<DirectTimeframeReceiptV1>, cutoff| {
+            DatasetReceiptV1::new(
+                base.dataset_identity.clone(),
+                direct_timeframes,
+                InSampleWindowV1 {
+                    start_ms: 0,
+                    end_exclusive_ms: cutoff,
+                },
+                OosWindow {
+                    start_ms: cutoff,
+                    end_ms: 1_000,
+                },
+            )
+            .expect("dataset receipt")
+        };
+        let forward = make(vec![base.clone(), higher.clone()], 900);
+        let reversed = make(vec![higher.clone(), base.clone()], 900);
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.identity(), reversed.identity());
+
+        let mut changed_higher = higher;
+        changed_higher.generation_id = "generation-higher-replaced".to_owned();
+        let changed_generation = make(vec![base.clone(), changed_higher], 900);
+        assert_ne!(forward.identity(), changed_generation.identity());
+
+        let changed_window = make(
+            vec![
+                base.clone(),
+                direct_receipt(
+                    neoethos_data::CanonicalTimeframe::H1,
+                    "generation-higher",
+                    5,
+                ),
+            ],
+            800,
+        );
+        assert_ne!(forward.identity(), changed_window.identity());
+    }
+
+    #[test]
+    fn resume_refuses_a_different_exact_dataset_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let store =
-            SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0001").unwrap())
+            SessionStore::open_under(dir.path(), SessionId::parse("ar-test-receipt").unwrap())
                 .unwrap();
+        let mut header = SessionHeader {
+            schema: crate::SESSION_SCHEMA.to_string(),
+            session_id: store.session_id().clone(),
+            session_seed: 7,
+            symbol: "EURUSD".into(),
+            dataset_receipt: dataset_receipt("generation-a"),
+            created_utc: "2026-08-17T00:00:00Z".into(),
+            goal_hash: "fnv64:g".into(),
+            judge_hash: "fnv64:j".into(),
+            cost_hash: "fnv64:c".into(),
+            scenarios_source: "test".into(),
+            identity_source: "config_hash".into(),
+            oos_window: OosWindow {
+                start_ms: 900,
+                end_ms: 1_000,
+            },
+            reproduction: "test".into(),
+        };
+        store.write_header_once(&header).unwrap();
+        let stored = store.read_header().unwrap();
+        header.dataset_receipt = dataset_receipt("generation-b");
+        let err = store
+            .assert_resumable(
+                &stored,
+                &header.goal_hash,
+                &header.judge_hash,
+                &header.cost_hash,
+                &header.symbol,
+                &header.dataset_receipt,
+            )
+            .expect_err("changed generation must refuse resume");
+        assert!(matches!(err, ResumeRefusal::DatasetReceiptChanged { .. }));
+    }
+
+    #[test]
+    fn a_partial_ledger_recovers_the_trials_a_crashed_sweep_had_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0001").unwrap())
+            .unwrap();
         store.prepare_sweep(SweepId(4)).unwrap();
         store.record_partial(SweepId(4), 0, 40).unwrap();
         store.record_partial(SweepId(4), 1, 37).unwrap();
@@ -2447,9 +3084,8 @@ mod tests {
     #[test]
     fn the_sweep_directory_name_is_the_name_the_gc_parses_back() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0003").unwrap())
-                .unwrap();
+        let store = SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0003").unwrap())
+            .unwrap();
         for id in [SweepId(1), SweepId(42)] {
             let name = store
                 .sweep_dir(id)
@@ -2460,7 +3096,8 @@ mod tests {
                 .to_string();
             assert_eq!(name, format!("sweep-{}", id.0));
             assert_eq!(
-                name.strip_prefix("sweep-").and_then(|n| n.parse::<u64>().ok()),
+                name.strip_prefix("sweep-")
+                    .and_then(|n| n.parse::<u64>().ok()),
                 Some(id.0),
                 "the GC must be able to recover the SweepId from the directory name"
             );
@@ -2470,9 +3107,8 @@ mod tests {
     #[test]
     fn gc_names_its_rule_and_counts_its_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0002").unwrap())
-                .unwrap();
+        let store = SessionStore::open_under(dir.path(), SessionId::parse("ar-test-0002").unwrap())
+            .unwrap();
         for sweep in [SweepId(1), SweepId(2)] {
             store.prepare_sweep(sweep).unwrap();
             std::fs::write(store.trial_returns_path(sweep, 0), vec![0u8; 1024]).unwrap();
@@ -2525,7 +3161,12 @@ mod tests {
         assert_eq!(session.census.gc_deleted_matrices, 197);
         assert_eq!(session.census.gc_bytes_reclaimed, 12_288);
         // And the counters are visible in the two places every report reads.
-        assert!(session.census.render().contains("197 (12288 bytes reclaimed)"));
+        assert!(
+            session
+                .census
+                .render()
+                .contains("197 (12288 bytes reclaimed)")
+        );
         assert!(session.census_line().contains("gc_deleted=197"));
 
         // The RULE is named ONCE — on the first pass that actually reclaimed

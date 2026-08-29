@@ -802,41 +802,17 @@ void cwma_precompute_weights_oldest_first_f32(const int* __restrict__ periods,
 /* ===========================================================================
  * S4 f64 LANE — cwma (cubic weighted moving average)
  * ---------------------------------------------------------------------------
- * CPU oracle: src/indicators/moving_averages/cwma.rs
- *   `cwma_prepare` (:218)  — first_valid, guards, weights, inv_norm, warm
- *   `cwma_scalar`  (:350)  — the dot product and its EXACT summation tree
- *   `cube`         (:39)   — w = x*x*x
+ * Creator authority (immutable origin commit):
+ * https://raw.githubusercontent.com/jesse-ai/jesse/2f24de176d62e10d38f435e74590bad451815d6d/jesse/indicators/cwma.py
  *
- * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ * For each output bar Jesse scans offsets 0..period-2 (newest to oldest),
+ * rounds one value*weight multiplication and one sum+term addition per
+ * offset, then performs one final sum/weightSum division. The explicit CUDA
+ * round-to-nearest intrinsics below prohibit FMA contraction, reciprocal
+ * multiplication, and horizontal/tree reassociation.
  *
- *  1. PRECISION AND THE WEIGHTS. The weights are (period-i)^3. At period 200
- *     that is 8e6, and the running dot product mixes 8e6-scaled terms with
- *     1-scaled ones; in f32 the small terms vanish below the accumulator's
- *     ulp long before the window closes. In f64 they do not.
- *  2. THE SUMMATION TREE IS NOT ASSOCIATIVE AND IS NOT A PLAIN LOOP. The CPU
- *     keeps EIGHT independent accumulators, folds them as
- *     `(s0+s1)+(s2+s3)+(s4+s5)+(s6+s7)`, and only then folds the <8 tail into
- *     that combined sum. Reproduced literally below. A straight `for k` loop
- *     is a different number in the last places at every bar.
- *  3. `__fmaf_rn` x11, `__fmul_rn` x10, `__fadd_rn` x4, `__frcp_rn` x2 and
- *     `__fsub_rn` x2 in the f32 kernels. `__frcp_rn` in particular is a
- *     RECIPROCAL, not a divide: the CPU computes `inv_norm = 1.0 / norm` in
- *     full precision and multiplies. Here `1.0 / norm` is a real IEEE divide.
- *  4. `fmaxf` x2. Not carried over; there is no max in the CPU reference, the
- *     f32 kernels used it to clamp an index.
- *
- * WEIGHTS ARE NOT STORED. `weights[i] = cube((period - i) as f64)` is an
- * integer cubed, exact in f64 for every period this crate accepts, so it is
- * recomputed per term instead of held in a per-thread array. `norm` IS
- * accumulated in the CPU's ascending order rather than closed-form, because
- * "the closed form is also exact" is an argument and the accumulation is a
- * guarantee.
- *
- * WARMUP: `alloc_with_nan_prefix(len, first + period - 1)` (cwma.rs:266,337)
- * and the emit loop starts at `first_val + wlen` with `wlen == period - 1`
- * (cwma.rs:360) — the same index. One thread per column.
- *
- * period == 1 is an ERROR on the CPU (cwma.rs:244), not a degenerate window.
+ * NeoEthos retains its versioned NaN warmup boundary at first+period-1; this
+ * changes only unavailable-prefix representation, never an admitted value.
  * =========================================================================== */
 
 #ifndef NEO_F64_NAN
@@ -858,8 +834,6 @@ void cwma_neo_batch_f64(const double* __restrict__ data,
     double* __restrict__ o = out + (size_t)combo * (size_t)len;
     const int period = periods[combo];
 
-    // Every branch of `cwma_prepare` that returns Err -> the CPU produces no
-    // series at all, which this lane represents as an all-NaN row.
     if (len <= 0 || period <= 1 || period > len ||
         first_valid < 0 || first_valid >= len ||
         (len - first_valid) < period) {
@@ -868,47 +842,27 @@ void cwma_neo_batch_f64(const double* __restrict__ data,
     }
 
     const int wlen = period - 1;
-
-    // `norm += w` ascending, w = cube(period - i).
     double norm = 0.0;
-    for (int i = 0; i < wlen; ++i) {
-        const double w = (double)(period - i);
-        norm += w * w * w;
+    for (int offset = 0; offset < wlen; ++offset) {
+        const double base = (double)(period - offset);
+        const double square = __dmul_rn(base, base);
+        const double weight = __dmul_rn(square, base);
+        norm = __dadd_rn(norm, weight);
     }
-    const double inv_norm = 1.0 / norm;
 
     const int warm = first_valid + period - 1;
     for (int i = 0; i < len && i < warm; ++i) o[i] = NEO_F64_NAN;
     if (warm >= len) return;
 
     for (int i = warm; i < len; ++i) {
-        double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-        double s4 = 0.0, s5 = 0.0, s6 = 0.0, s7 = 0.0;
-
-        int k = 0;
-        while (k + 7 < wlen) {
-            double w;
-            w = (double)(period - (k + 0)); s0 = fma(data[i - (k + 0)], w * w * w, s0);
-            w = (double)(period - (k + 1)); s1 = fma(data[i - (k + 1)], w * w * w, s1);
-            w = (double)(period - (k + 2)); s2 = fma(data[i - (k + 2)], w * w * w, s2);
-            w = (double)(period - (k + 3)); s3 = fma(data[i - (k + 3)], w * w * w, s3);
-            w = (double)(period - (k + 4)); s4 = fma(data[i - (k + 4)], w * w * w, s4);
-            w = (double)(period - (k + 5)); s5 = fma(data[i - (k + 5)], w * w * w, s5);
-            w = (double)(period - (k + 6)); s6 = fma(data[i - (k + 6)], w * w * w, s6);
-            w = (double)(period - (k + 7)); s7 = fma(data[i - (k + 7)], w * w * w, s7);
-            k += 8;
+        double sum = 0.0;
+        for (int offset = 0; offset < wlen; ++offset) {
+            const double base = (double)(period - offset);
+            const double square = __dmul_rn(base, base);
+            const double weight = __dmul_rn(square, base);
+            const double term = __dmul_rn(data[i - offset], weight);
+            sum = __dadd_rn(sum, term);
         }
-
-        // cwma.rs:395 — this exact parenthesisation, not a left fold.
-        double sum = (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
-
-        // cwma.rs:397-462: the `match wlen - k` arms are one unrolled loop of
-        // at most seven `mul_add`s, ascending, folded into `sum`.
-        for (int m = k; m < wlen; ++m) {
-            const double w = (double)(period - m);
-            sum = fma(data[i - m], w * w * w, sum);
-        }
-
-        o[i] = sum * inv_norm;
+        o[i] = __ddiv_rn(sum, norm);
     }
 }

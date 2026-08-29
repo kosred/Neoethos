@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -71,18 +71,29 @@ use crate::{
     TransformerExpert,
 };
 use neoethos_core::system::HardwareProbe;
-use neoethos_core::{HardwareExecutionPlan, WorkloadKind};
+use neoethos_core::{AcceleratorBackend, HardwareExecutionPlan, Settings, WorkloadKind};
 use neoethos_data::{
-    FeatureBuildOptions, Ohlcv, load_symbol_dataset, prepare_multitimeframe_features_with_options,
+    CanonicalDatasetSeriesReceiptV1, CanonicalTimeframe, FeatureBuildOptions, FeatureFrame, Ohlcv,
+    SymbolDataset, load_exact_dataset_series_receipt, load_symbol_dataset,
+    prepare_multitimeframe_features_with_options,
 };
+use neoethos_execution_budget::CpuLease;
 use neoethos_search::genetic::{ParentSelectionPolicy, SurvivorSelectionPolicy};
-use polars::prelude::{BooleanChunked, DataFrame, NamedFrom, NewChunkedArray, Series};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingRunSummary {
     pub planned_models: Vec<String>,
     pub completed_models: Vec<String>,
     pub failed_models: Vec<ModelTrainingFailure>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrainingLabelEconomics {
+    BrokerFinancialTruth,
+    CanonicalTrendbarScreeningV2 {
+        pip_size: f64,
+        round_trip_cost_pips: f64,
+    },
 }
 
 pub struct TrainingOrchestrator {
@@ -111,110 +122,182 @@ pub struct TrainingOrchestrator {
     pub data_root_override: Option<PathBuf>,
 }
 
+const LEGACY_RLLIB_MIGRATION_ERROR_V1: &str = "legacy RLlib migration boundary v1: `use_rllib_agent`, `auto_enable_rllib`, and non-zero `rllib_num_workers` are unsupported because this build has no Ray runtime; set the flags to false, set `rllib_num_workers: 0`, and use `use_rl_agent: true` for the native rlkit DQN backend";
+
+/// Keep legacy configuration keys readable, but never reinterpret a request
+/// for Ray/RLlib as permission to run a different implementation. This guard
+/// runs before dispatch materialization, so neither model selection nor any
+/// backend/tool probing can occur for an unsupported request.
+fn reject_legacy_rllib_request_v1(settings: &Settings) -> Result<()> {
+    if settings.models.use_rllib_agent
+        || settings.models.auto_enable_rllib
+        || settings.models.rllib_num_workers != 0
+    {
+        anyhow::bail!(LEGACY_RLLIB_MIGRATION_ERROR_V1);
+    }
+    Ok(())
+}
+
+fn reject_legacy_rllib_model_params_v1(
+    model_name: &str,
+    params: &HashMap<String, String>,
+) -> Result<()> {
+    if canonical_model_name(model_name) != "dqn" {
+        return Ok(());
+    }
+
+    let backend_requests_rllib = params
+        .get("backend")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("rllib"));
+    let workers_request_rllib = params
+        .get("rllib_num_workers")
+        .is_some_and(|value| value.trim() != "0");
+    let legacy_substitution_marker =
+        params.contains_key("__rllib_requested") || params.contains_key("auto_rllib");
+    if backend_requests_rllib || workers_request_rllib || legacy_substitution_marker {
+        anyhow::bail!(LEGACY_RLLIB_MIGRATION_ERROR_V1);
+    }
+    Ok(())
+}
+
 fn is_supported_orchestrator_burn_device_policy(policy: &str) -> bool {
     matches!(policy, "auto" | "cpu" | "gpu") || policy.starts_with("gpu:")
 }
 
-/// Drop rows where any feature column is non-finite (NaN/Inf). Returns
-/// (cleaned_features, cleaned_labels, dropped_count). Labels are sliced
-/// in lock-step with the feature rows so order is preserved. The
-/// downstream `dataframe_to_float32_array` strict-rejects any non-finite
-/// value, so this is the canonical place to handle indicator warmup.
-/// Defensive variant — operates on a polars DataFrame after row
-/// filtering / column selection has already happened. Builds a row mask
-/// by scanning every column for non-finite values, then `frame.filter()`s
-/// once. Labels are sliced in lock-step. Returns `(clean_frame, clean_labels, dropped)`.
-fn drop_nonfinite_rows_dataframe(
-    frame: DataFrame,
-    labels: Vec<i32>,
-) -> Result<(DataFrame, Vec<i32>, usize)> {
-    use polars::prelude::DataType;
+fn model_requires_cuda_in_full_nvidia_run(name: &str, family: ModelFamily) -> bool {
+    let canonical = canonical_model_name(name);
+    crate::registry::CUDA_CAPABLE_MODEL_NAMES.contains(&canonical)
+        || matches!(family, ModelFamily::Deep | ModelFamily::Exit)
+        || canonical == "sac"
+}
 
-    let n_rows = frame.height();
-    if n_rows == 0 || labels.len() != n_rows {
-        return Ok((frame, labels, 0));
+fn pin_cpu_only_model_device(
+    name: &str,
+    family: ModelFamily,
+    params: &mut HashMap<String, String>,
+) {
+    if model_requires_cuda_in_full_nvidia_run(name, family) {
+        return;
     }
-    let mut keep = vec![true; n_rows];
-    for col in frame.get_columns() {
-        let series_f64 = col
-            .cast(&DataType::Float64)
-            .with_context(|| format!("cast column {} to f64 for NaN scan", col.name()))?;
-        let ca = series_f64
-            .f64()
-            .with_context(|| format!("get f64 chunked array for {}", col.name()))?;
-        for (row_idx, val) in ca.into_iter().enumerate() {
-            match val {
-                None => keep[row_idx] = false,
-                Some(v) if !v.is_finite() => keep[row_idx] = false,
-                _ => {}
-            }
-        }
+    params.insert("device".to_string(), "cpu".to_string());
+    params.insert("__planned_backend".to_string(), "cpu".to_string());
+    params.insert("__planned_device".to_string(), "cpu".to_string());
+}
+
+const DENSE_TRAINING_MIN_ROWS: usize = 500;
+const DENSE_TRAINING_REQUIRED_COLUMNS: [&str; 2] = ["quant_log_return", "quant_log_volatility"];
+
+#[derive(Debug)]
+struct DenseTrainingProjection {
+    frame: FeatureFrame,
+    row_start: usize,
+    dropped_columns: usize,
+}
+
+fn trailing_valid_run(validity: &[neoethos_data::FeatureCellValidity]) -> usize {
+    validity
+        .iter()
+        .rev()
+        .take_while(|cell| cell.is_valid())
+        .count()
+}
+
+/// Select the largest deterministic dense suffix available to strict model
+/// adapters. The score maximizes retained valid cells, then retained rows,
+/// while the two versioned HMM inputs and at least 500 rows are mandatory.
+/// This is a typed column/row projection over the purged in-sample frame: it
+/// never changes a cell value or validity reason and never reads OOS rows.
+fn project_dense_training_suffix(frame: &FeatureFrame) -> Result<DenseTrainingProjection> {
+    anyhow::ensure!(
+        frame.n_samples() >= DENSE_TRAINING_MIN_ROWS,
+        "training feature frame has {} rows; dense model training requires at least {}",
+        frame.n_samples(),
+        DENSE_TRAINING_MIN_ROWS
+    );
+
+    let mut trailing_runs = Vec::with_capacity(frame.n_features());
+    for feature in 0..frame.n_features() {
+        let column = frame
+            .feature_column(feature)
+            .with_context(|| format!("inspect validity for feature `{}`", frame.names[feature]))?;
+        trailing_runs.push(trailing_valid_run(&column.validity));
     }
-    let dropped = keep.iter().filter(|k| !**k).count();
-    if dropped == 0 {
-        return Ok((frame, labels, 0));
-    }
-    let mask = BooleanChunked::from_slice("nan_drop_mask".into(), &keep);
-    let clean_frame = frame.filter(&mask).context("apply nan-drop mask")?;
-    let clean_labels = labels
+
+    let required_run_cap = DENSE_TRAINING_REQUIRED_COLUMNS
+        .iter()
+        .map(|required| {
+            let feature = frame
+                .names
+                .iter()
+                .position(|name| name == required)
+                .with_context(|| format!("dense training is missing required feature `{required}`"))?;
+            let run = trailing_runs[feature];
+            anyhow::ensure!(
+                run >= DENSE_TRAINING_MIN_ROWS,
+                "dense training required feature `{required}` has only {run} trailing valid rows; need at least {DENSE_TRAINING_MIN_ROWS}"
+            );
+            Ok(run)
+        })
+        .collect::<Result<Vec<_>>>()?
         .into_iter()
-        .zip(keep.iter())
-        .filter_map(|(l, k)| if *k { Some(l) } else { None })
+        .min()
+        .context("dense training required-column set is empty")?;
+
+    let mut candidate_rows = trailing_runs
+        .iter()
+        .copied()
+        .filter(|run| *run >= DENSE_TRAINING_MIN_ROWS && *run <= required_run_cap)
         .collect::<Vec<_>>();
-    Ok((clean_frame, clean_labels, dropped))
-}
+    candidate_rows.sort_unstable();
+    candidate_rows.dedup();
 
-/// Prune feature COLUMNS that are entirely non-finite (NaN/Inf in every row).
-/// Such a column carries zero information, and — left in — would make the
-/// row-wise [`drop_nonfinite_rows`] discard EVERY row. Mutates `features` +
-/// `names` in lock-step and returns the number of columns removed. A column
-/// that has at least one finite value is kept (its warmup NaNs are handled by
-/// the row drop). See `train_symbol_with_progress`.
-fn prune_all_nonfinite_columns(
-    features: &mut ndarray::Array2<f32>,
-    names: &mut Vec<String>,
-) -> usize {
-    let ncols = features.ncols();
-    if ncols == 0 || features.nrows() == 0 {
-        return 0;
-    }
-    let keep: Vec<usize> = (0..ncols)
-        .filter(|&c| features.column(c).iter().any(|v| v.is_finite()))
-        .collect();
-    let pruned = ncols - keep.len();
-    if pruned > 0 {
-        *features = features.select(ndarray::Axis(1), &keep);
-        if names.len() == ncols {
-            *names = keep.iter().map(|&c| names[c].clone()).collect();
+    let mut best: Option<(usize, usize, usize)> = None;
+    for rows in candidate_rows {
+        let columns = trailing_runs.iter().filter(|run| **run >= rows).count();
+        let cells = rows.checked_mul(columns).ok_or_else(|| {
+            anyhow::anyhow!("dense training suffix score overflow: {rows} rows x {columns} columns")
+        })?;
+        if best.is_none_or(|current| (cells, rows, columns) > current) {
+            best = Some((cells, rows, columns));
         }
     }
-    pruned
-}
+    let (_, retained_rows, _) = best.context("training frame has no dense valid suffix")?;
+    let kept_columns = trailing_runs
+        .iter()
+        .enumerate()
+        .filter_map(|(feature, run)| (*run >= retained_rows).then_some(feature))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !kept_columns.is_empty(),
+        "dense training suffix retained no feature columns"
+    );
+    for required in DENSE_TRAINING_REQUIRED_COLUMNS {
+        anyhow::ensure!(
+            kept_columns
+                .iter()
+                .any(|feature| frame.names[*feature] == required),
+            "dense training suffix dropped required feature `{required}`"
+        );
+    }
 
-fn drop_nonfinite_rows(
-    features: ndarray::Array2<f32>,
-    labels: Vec<i32>,
-) -> (ndarray::Array2<f32>, Vec<i32>, usize) {
-    let n_rows = features.nrows();
-    debug_assert_eq!(n_rows, labels.len(), "row/label length mismatch");
-    let mut keep_idx: Vec<usize> = Vec::with_capacity(n_rows);
-    for (row_idx, row) in features.rows().into_iter().enumerate() {
-        if row.iter().all(|v| v.is_finite()) {
-            keep_idx.push(row_idx);
-        }
+    let dropped_columns = frame.n_features().saturating_sub(kept_columns.len());
+    let row_start = frame.n_samples() - retained_rows;
+    let projected_columns = frame.select_columns(&kept_columns)?;
+    let projected = projected_columns.row_window(row_start, frame.n_samples())?;
+    for feature in 0..projected.n_features() {
+        let column = projected.feature_column(feature)?;
+        anyhow::ensure!(
+            column.validity.iter().all(|cell| cell.is_valid()),
+            "dense training projection retained an invalid cell in feature `{}`",
+            column.name
+        );
     }
-    let dropped = n_rows - keep_idx.len();
-    if dropped == 0 {
-        return (features, labels, 0);
-    }
-    let n_cols = features.ncols();
-    let mut clean = ndarray::Array2::<f32>::zeros((keep_idx.len(), n_cols));
-    let mut clean_labels = Vec::with_capacity(keep_idx.len());
-    for (new_idx, &old_idx) in keep_idx.iter().enumerate() {
-        clean.row_mut(new_idx).assign(&features.row(old_idx));
-        clean_labels.push(labels[old_idx]);
-    }
-    (clean, clean_labels, dropped)
+
+    Ok(DenseTrainingProjection {
+        frame: projected,
+        row_start,
+        dropped_columns,
+    })
 }
 
 /// Write a hardware-plan value into a model's params, RECORDING the fact when
@@ -322,8 +405,221 @@ impl TrainingOrchestrator {
         }
     }
 
-    pub fn train_symbol(&self, symbol: &str, base_tf: &str) -> Result<()> {
-        let summary = self.train_symbol_with_progress(symbol, base_tf, |_| {})?;
+    fn full_nvidia_device_policy_for_config(&self, config: &ModelConfig) -> Result<String> {
+        let canonical = canonical_model_name(&config.name);
+        match canonical {
+            "meta_blender" | "probability_calibrator" | "conformal_gate" | "meta_stack" => {
+                Ok(self.settings.models.tree_runtime.device.clone())
+            }
+            "elasticnet" | "logistic" => Ok(config
+                .params
+                .get("device")
+                .cloned()
+                .unwrap_or_else(|| self.settings.models.statistical_device.clone())),
+            _ => config.params.get("device").cloned().with_context(|| {
+                format!(
+                    "full NVIDIA training model `{}` has no explicit device policy",
+                    config.name
+                )
+            }),
+        }
+    }
+
+    /// Validate the complete configured model expansion and its exact CUDA/CPU
+    /// routing before a canonical full run spends time building features or
+    /// searching. This is deliberately stricter than ordinary CPU-capable
+    /// training: every compiled CUDA surface must target ordinal zero, while
+    /// every model without a CUDA implementation is explicitly pinned to CPU.
+    pub fn preflight_full_nvidia_cuda_training(&self) -> Result<Vec<String>> {
+        let dispatch_plan = self.create_dispatch_plan()?;
+        self.validate_dispatch_plan(&dispatch_plan)?;
+        let hardware_plan = self.hardware_execution_plan();
+        anyhow::ensure!(
+            hardware_plan.gpu_enabled
+                && hardware_plan.primary_backend == AcceleratorBackend::Cuda
+                && hardware_plan
+                    .profile
+                    .accelerator_devices
+                    .iter()
+                    .any(|device| { device.id == 0 && device.backend == AcceleratorBackend::Cuda }),
+            "full NVIDIA training requires a detected CUDA device at ordinal 0"
+        );
+        for workload_kind in [
+            WorkloadKind::StrategySearch,
+            WorkloadKind::TreeTraining,
+            WorkloadKind::DeepTraining,
+            WorkloadKind::RlTraining,
+        ] {
+            let workload = hardware_plan.workload(workload_kind).with_context(|| {
+                format!("full NVIDIA training lacks the {workload_kind:?} hardware plan")
+            })?;
+            anyhow::ensure!(
+                workload.backend == AcceleratorBackend::Cuda && workload.device_ids.contains(&0),
+                "full NVIDIA training workload {workload_kind:?} is not pinned to CUDA ordinal 0: backend={:?}, device={}, ordinals={:?}",
+                workload.backend,
+                workload.device,
+                workload.device_ids
+            );
+        }
+
+        let configs =
+            self.build_training_configs_with_hardware_plan(&dispatch_plan, &hardware_plan)?;
+        let required_voters = crate::ensemble_inference::DEFAULT_BOOTSTRAP_EXPERT_NAMES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let planned_canonical = configs
+            .iter()
+            .map(|config| canonical_model_name(&config.name))
+            .collect::<BTreeSet<_>>();
+        let missing_voters = required_voters
+            .difference(&planned_canonical)
+            .copied()
+            .collect::<Vec<_>>();
+        let unconsumed_models = planned_canonical
+            .difference(&required_voters)
+            .copied()
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            missing_voters.is_empty(),
+            "full NVIDIA training dispatch is missing production ensemble voters: {}",
+            missing_voters.join(", ")
+        );
+        anyhow::ensure!(
+            unconsumed_models.is_empty(),
+            "full NVIDIA training dispatch contains models with no production ensemble consumer: {}",
+            unconsumed_models.join(", ")
+        );
+        let mut planned_models = Vec::with_capacity(configs.len());
+        for config in configs {
+            let requires_cuda =
+                model_requires_cuda_in_full_nvidia_run(&config.name, config.capability_family);
+            if requires_cuda {
+                anyhow::ensure!(
+                    crate::registry::supports_gpu_for_model(
+                        canonical_model_name(&config.name),
+                        config.capability_family,
+                    ),
+                    "full NVIDIA build lacks the CUDA implementation required by model `{}`",
+                    config.name
+                );
+                let policy = self.full_nvidia_device_policy_for_config(&config)?;
+                let parsed =
+                    crate::common::parse_cuda_device_policy(&policy).with_context(|| {
+                        format!(
+                            "full NVIDIA model `{}` has invalid device policy `{policy}`",
+                            config.name
+                        )
+                    })?;
+                anyhow::ensure!(
+                    policy.trim().contains(':')
+                        && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
+                    "full NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
+                    config.name
+                );
+            } else {
+                let policy = config.params.get("device").with_context(|| {
+                    format!(
+                        "CPU-only model `{}` lacks an explicit CPU device policy",
+                        config.name
+                    )
+                })?;
+                anyhow::ensure!(
+                    matches!(
+                        crate::common::parse_cuda_device_policy(policy)?,
+                        crate::common::CudaDevicePolicy::Cpu
+                    ),
+                    "CPU-only model `{}` was planned on non-CPU device `{policy}`",
+                    config.name
+                );
+            }
+            planned_models.push(config.name);
+        }
+        Ok(planned_models)
+    }
+
+    /// Validate only the exact model set enabled for one explicitly scoped
+    /// NVIDIA training run. Unlike the full-ensemble preflight, this does not
+    /// invent missing voters that are outside the configured plan; every model
+    /// that is present still has to resolve to its real CUDA implementation on
+    /// ordinal zero or to an explicit CPU-only policy.
+    pub fn preflight_configured_nvidia_training(&self) -> Result<Vec<String>> {
+        let dispatch_plan = self.create_dispatch_plan()?;
+        self.validate_dispatch_plan(&dispatch_plan)?;
+        let hardware_plan = self.hardware_execution_plan();
+        anyhow::ensure!(
+            hardware_plan.gpu_enabled
+                && hardware_plan.primary_backend == AcceleratorBackend::Cuda
+                && hardware_plan
+                    .profile
+                    .accelerator_devices
+                    .iter()
+                    .any(|device| { device.id == 0 && device.backend == AcceleratorBackend::Cuda }),
+            "configured NVIDIA training requires a detected CUDA device at ordinal 0"
+        );
+        let configs =
+            self.build_training_configs_with_hardware_plan(&dispatch_plan, &hardware_plan)?;
+        anyhow::ensure!(
+            !configs.is_empty(),
+            "configured NVIDIA training resolved an empty model plan"
+        );
+
+        let mut configured_cuda_models = 0_usize;
+        let mut planned_models = Vec::with_capacity(configs.len());
+        for config in configs {
+            let requires_cuda =
+                model_requires_cuda_in_full_nvidia_run(&config.name, config.capability_family);
+            if requires_cuda {
+                configured_cuda_models += 1;
+                anyhow::ensure!(
+                    crate::registry::supports_gpu_for_model(
+                        canonical_model_name(&config.name),
+                        config.capability_family,
+                    ),
+                    "configured NVIDIA build lacks the CUDA implementation required by model `{}`",
+                    config.name
+                );
+                let policy = self.full_nvidia_device_policy_for_config(&config)?;
+                let parsed =
+                    crate::common::parse_cuda_device_policy(&policy).with_context(|| {
+                        format!(
+                            "configured NVIDIA model `{}` has invalid device policy `{policy}`",
+                            config.name
+                        )
+                    })?;
+                anyhow::ensure!(
+                    policy.trim().contains(':')
+                        && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
+                    "configured NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
+                    config.name
+                );
+            } else {
+                let policy = config.params.get("device").with_context(|| {
+                    format!(
+                        "CPU-only model `{}` lacks an explicit CPU device policy",
+                        config.name
+                    )
+                })?;
+                anyhow::ensure!(
+                    matches!(
+                        crate::common::parse_cuda_device_policy(policy)?,
+                        crate::common::CudaDevicePolicy::Cpu
+                    ),
+                    "CPU-only model `{}` was planned on non-CPU device `{policy}`",
+                    config.name
+                );
+            }
+            planned_models.push(config.name);
+        }
+        anyhow::ensure!(
+            configured_cuda_models > 0,
+            "configured NVIDIA training plan contains no CUDA-backed model"
+        );
+        Ok(planned_models)
+    }
+
+    pub fn train_symbol(&self, symbol: &str, base_tf: &str, lease: &CpuLease) -> Result<()> {
+        let summary = self.train_symbol_with_progress(symbol, base_tf, lease, |_| {})?;
         if !summary.failed_models.is_empty() {
             anyhow::bail!(
                 "Training failed for [{}]; successful models: [{}]",
@@ -344,6 +640,176 @@ impl TrainingOrchestrator {
         &self,
         symbol: &str,
         base_tf: &str,
+        lease: &CpuLease,
+        progress_fn: R,
+    ) -> Result<TrainingRunSummary>
+    where
+        R: Fn(ModelTrainingProgress) + Send + Sync + Clone + 'static,
+    {
+        let data_root = self.data_root();
+        let dataset = load_symbol_dataset(&data_root, symbol)?;
+        self.train_dataset_with_progress(
+            symbol,
+            base_tf,
+            dataset,
+            TrainingLabelEconomics::BrokerFinancialTruth,
+            lease,
+            progress_fn,
+        )
+    }
+
+    /// Train the complete configured model surface from one explicitly
+    /// selected immutable canonical series. Every direct timeframe is reopened
+    /// by generation id + manifest-binding hash before feature computation.
+    pub fn train_canonical_series_with_progress<R>(
+        &self,
+        series: &CanonicalDatasetSeriesReceiptV1,
+        base_tf: CanonicalTimeframe,
+        search_input: neoethos_search::data_selection::CanonicalSearchInput,
+        screening_contract: &neoethos_search::CanonicalTrendbarResearchExecutionContractV3,
+        lease: &CpuLease,
+        progress_fn: R,
+    ) -> Result<TrainingRunSummary>
+    where
+        R: Fn(ModelTrainingProgress) + Send + Sync + Clone + 'static,
+    {
+        series.validate()?;
+        let (pip_size, round_trip_cost_pips) = {
+            let search_input = search_input.as_run_input()?;
+            screening_contract.validate_against_input(&search_input)?;
+            (
+                screening_contract.pip_size(),
+                screening_contract.screening_round_trip_cost_pips(),
+            )
+        };
+        drop(search_input);
+        let symbol = series.anchor().identity().symbol_name();
+        let required_timeframes = self.selected_feature_timeframes(base_tf.as_str())?;
+        let selected_timeframes = series
+            .direct_timeframes()
+            .iter()
+            .map(|selected| selected.identity().timeframe())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            selected_timeframes.contains(&base_tf),
+            "canonical training series for {symbol} does not contain base timeframe {base_tf}"
+        );
+        for required in &required_timeframes {
+            let required = required.parse::<CanonicalTimeframe>().with_context(|| {
+                format!("training requested non-canonical feature timeframe {required}")
+            })?;
+            anyhow::ensure!(
+                selected_timeframes.contains(&required),
+                "canonical training series for {symbol} does not contain required direct timeframe {required}"
+            );
+        }
+        let dataset = load_exact_dataset_series_receipt(self.data_root(), series)?;
+        self.train_dataset_with_progress(
+            symbol,
+            base_tf.as_str(),
+            dataset,
+            TrainingLabelEconomics::CanonicalTrendbarScreeningV2 {
+                pip_size,
+                round_trip_cost_pips,
+            },
+            lease,
+            progress_fn,
+        )
+    }
+
+    /// Train from an immutable canonical series and an independently persisted
+    /// canonical-search input receipt. This is the exact two-phase hand-off for
+    /// a completed historical search whose feature frame has already been
+    /// released; it preserves receipt-bound screening economics without
+    /// requiring live broker financial truth or replaying Discovery.
+    pub fn train_canonical_series_receipt_with_progress<R>(
+        &self,
+        series: &CanonicalDatasetSeriesReceiptV1,
+        base_tf: CanonicalTimeframe,
+        input_receipt: &neoethos_search::CanonicalSearchInputReceiptV2,
+        screening_contract: &neoethos_search::CanonicalTrendbarResearchExecutionContractV3,
+        lease: &CpuLease,
+        progress_fn: R,
+    ) -> Result<TrainingRunSummary>
+    where
+        R: Fn(ModelTrainingProgress) + Send + Sync + Clone + 'static,
+    {
+        series.validate()?;
+        screening_contract.validate_against_receipt(input_receipt)?;
+        let pip_size = screening_contract.pip_size();
+        let round_trip_cost_pips = screening_contract.screening_round_trip_cost_pips();
+        let symbol = series.anchor().identity().symbol_name();
+        let required_timeframes = self.selected_feature_timeframes(base_tf.as_str())?;
+        let selected_timeframes = series
+            .direct_timeframes()
+            .iter()
+            .map(|selected| selected.identity().timeframe())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            selected_timeframes.contains(&base_tf),
+            "canonical training series for {symbol} does not contain base timeframe {base_tf}"
+        );
+        for required in &required_timeframes {
+            let required = required.parse::<CanonicalTimeframe>().with_context(|| {
+                format!("training requested non-canonical feature timeframe {required}")
+            })?;
+            anyhow::ensure!(
+                selected_timeframes.contains(&required),
+                "canonical training series for {symbol} does not contain required direct timeframe {required}"
+            );
+        }
+        let dataset = load_exact_dataset_series_receipt(self.data_root(), series)?;
+        self.train_dataset_with_progress(
+            symbol,
+            base_tf.as_str(),
+            dataset,
+            TrainingLabelEconomics::CanonicalTrendbarScreeningV2 {
+                pip_size,
+                round_trip_cost_pips,
+            },
+            lease,
+            progress_fn,
+        )
+    }
+
+    pub fn train_canonical_series(
+        &self,
+        series: &CanonicalDatasetSeriesReceiptV1,
+        base_tf: CanonicalTimeframe,
+        search_input: neoethos_search::data_selection::CanonicalSearchInput,
+        screening_contract: &neoethos_search::CanonicalTrendbarResearchExecutionContractV3,
+        lease: &CpuLease,
+    ) -> Result<()> {
+        let summary = self.train_canonical_series_with_progress(
+            series,
+            base_tf,
+            search_input,
+            screening_contract,
+            lease,
+            |_| {},
+        )?;
+        if !summary.failed_models.is_empty() {
+            anyhow::bail!(
+                "Training failed for [{}]; successful models: [{}]",
+                summary
+                    .failed_models
+                    .iter()
+                    .map(|failure| failure.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                summary.completed_models.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    fn train_dataset_with_progress<R>(
+        &self,
+        symbol: &str,
+        base_tf: &str,
+        dataset: SymbolDataset,
+        label_economics: TrainingLabelEconomics,
+        lease: &CpuLease,
         progress_fn: R,
     ) -> Result<TrainingRunSummary>
     where
@@ -357,80 +823,17 @@ impl TrainingOrchestrator {
         let planned_models: Vec<String> =
             configs.iter().map(|config| config.name.clone()).collect();
 
-        let data_root = self.data_root();
-        let dataset = load_symbol_dataset(&data_root, symbol)?;
-
-        let opts = FeatureBuildOptions {
-            higher_tfs: self.selected_feature_timeframes(base_tf),
-            prefix_base_features: self.settings.system.multi_resolution_prefix_base,
-            ..FeatureBuildOptions::default()
-        };
-        let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts)?;
+        let higher_tfs = self.selected_feature_timeframes(base_tf)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
-        let labels = self.derive_labels(base_ohlcv, symbol)?;
-
-        // hmm_regime trains UNSUPERVISED on a `(log_return, log_volatility)`
-        // matrix derived from the RAW base OHLCV — not on the feature frame
-        // the other experts consume — so build its observations here where
-        // the OHLCV is in scope (the dispatch closure only sees the payload).
-        // Honour the same leak-free OOS lock as the supervised experts: only
-        // bars STRICTLY before the cutoff. Build errors are reported when the
-        // model actually trains (fail loud there, with the reason), not
-        // swallowed here.
-        let hmm_bar_count = match self.oos_lock_from_ms {
-            Some(cutoff) => base_ohlcv
-                .timestamp
-                .as_ref()
-                .map(|ts| ts.iter().take_while(|&&t| t < cutoff).count())
-                .unwrap_or(base_ohlcv.close.len()),
-            None => base_ohlcv.close.len(),
-        };
-        let hmm_observations: std::sync::Arc<std::result::Result<ndarray::Array2<f64>, String>> =
-            std::sync::Arc::new(
-                RegimeHmmExpert::ohlcv_to_features(
-                    &base_ohlcv.close[..hmm_bar_count],
-                    &base_ohlcv.high[..hmm_bar_count],
-                &base_ohlcv.low[..hmm_bar_count],
-            )
-            .map_err(|e| e.to_string()),
-        );
-
-        // Stage 4 leak-free OOS lock: truncate to rows STRICTLY before the cutoff,
-        // minus a triple-barrier purge, BEFORE the warmup drop + split. The frame
-        // rows are 1:1 with `base_ohlcv` (and `labels`) here, so we slice the dense
-        // matrix + labels to the leading in-sample block.
-        let mut dense = frame.to_dense_samples_major();
-        let mut feature_names = frame.names.clone();
-        // Prune feature columns that are PERMANENTLY non-finite (e.g. a
-        // long-lookback indicator on a sparse higher TF — MN1 ~156 bars — that
-        // never warms up). Such a column carries zero information yet, left in,
-        // makes the row-wise NaN drop below discard EVERY row ("kept 0 rows").
-        // Discovery dodges this by projecting to the genes' effective features;
-        // training keeps all columns, so we prune the dead ones here instead.
-        let pruned_cols = prune_all_nonfinite_columns(&mut dense, &mut feature_names);
-        if pruned_cols > 0 {
-            info!(
-                "Pruned {} all-NaN feature column(s) before training ({} columns remain)",
-                pruned_cols,
-                feature_names.len()
-            );
-        }
-        let mut labels = labels;
-        if let Some(cutoff) = self.oos_lock_from_ms {
+        let oos_training_boundary = if let Some(cutoff) = self.oos_lock_from_ms {
             let timestamps = base_ohlcv
                 .timestamp
                 .as_ref()
                 .context("OOS-lock requires base-tf timestamps")?;
-            if timestamps.len() != dense.nrows() {
-                anyhow::bail!(
-                    "OOS-lock: timestamp/feature row mismatch ({} ts vs {} rows)",
-                    timestamps.len(),
-                    dense.nrows()
-                );
-            }
             let in_sample = timestamps.iter().take_while(|&&t| t < cutoff).count();
             // Purge the last `label_horizon_bars` IS rows whose triple-barrier
-            // label looks forward across the cutoff.
+            // label looks forward across the cutoff. Normalization is fitted
+            // to this same purged prefix, never to the OOS suffix or purge rows.
             let purge = self.settings.models.label_horizon_bars;
             let keep = in_sample.saturating_sub(purge);
             if keep < 256 {
@@ -439,89 +842,115 @@ impl TrainingOrchestrator {
                      purge) for {symbol}/{base_tf} — too few to train leak-free; pick a later cutoff"
                 );
             }
+            Some((cutoff, in_sample, purge, keep))
+        } else {
+            None
+        };
+        let opts = FeatureBuildOptions {
+            higher_tfs: higher_tfs.clone(),
+            prefix_base_features: self.settings.system.multi_resolution_prefix_base,
+            normalization_training_rows: oos_training_boundary.map(|(_, _, _, keep)| 0..keep),
+            drop_columns_without_normalization_training_support: true,
+            ..FeatureBuildOptions::default()
+        };
+        let mut frame = lease
+            .scope(|| prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts))?;
+        let mut labels = match label_economics {
+            TrainingLabelEconomics::BrokerFinancialTruth => {
+                self.derive_labels(base_ohlcv, symbol)?
+            }
+            TrainingLabelEconomics::CanonicalTrendbarScreeningV2 {
+                pip_size,
+                round_trip_cost_pips,
+            } => self.derive_labels_with_screening_costs(
+                base_ohlcv,
+                symbol,
+                pip_size,
+                round_trip_cost_pips,
+            )?,
+        };
+        if frame.n_samples() != labels.len() {
+            anyhow::bail!(
+                "training frame/label mismatch for {symbol}/{base_tf}: {} rows vs {} labels",
+                frame.n_samples(),
+                labels.len()
+            );
+        }
+        let mut source_row_indices = (0..frame.n_samples()).collect::<Vec<_>>();
+
+        // Stage 4 leak-free OOS lock: truncate to rows STRICTLY before the cutoff,
+        // minus a triple-barrier purge, BEFORE the warmup drop + split. The frame
+        // rows are 1:1 with `base_ohlcv` (and `labels`) here, so truncate the typed
+        // frame, labels, and canonical source-row receipts in lock-step.
+        if let Some((cutoff, in_sample, purge, keep)) = oos_training_boundary {
+            let timestamps = base_ohlcv
+                .timestamp
+                .as_ref()
+                .context("OOS-lock requires base-tf timestamps")?;
+            if timestamps.as_slice() != frame.timestamps.as_slice() {
+                anyhow::bail!(
+                    "OOS-lock: base timestamp/feature receipt mismatch ({} ts vs {} rows)",
+                    timestamps.len(),
+                    frame.n_samples()
+                );
+            }
             info!(
                 "OOS-lock: {symbol}/{base_tf} truncated to {keep} in-sample rows (< {cutoff}, \
                  purged {purge} look-ahead rows of {in_sample}); experts will not see >= cutoff"
             );
-            dense = dense.slice(ndarray::s![0..keep, ..]).to_owned();
+            frame = frame.row_window(0, keep)?;
             labels.truncate(keep);
+            source_row_indices.truncate(keep);
         }
 
-        // Drop any rows whose features are non-finite (NaN/Inf). This is
-        // the warmup period for indicators like rsi_7 — the first N rows
-        // will have NaN until the lookback window fills. The downstream
-        // `dataframe_to_float32_array` strict-rejects any non-finite, so
-        // we sanitise here. Labels are sliced in lock-step.
-        let (clean_data, clean_labels, dropped) = drop_nonfinite_rows(dense, labels);
-        if dropped > 0 {
-            info!(
-                "Dropped {} warmup/non-finite feature rows before training (kept {} rows)",
-                dropped,
-                clean_data.nrows()
-            );
-        }
-        // Fail loud with an actionable message instead of the downstream
-        // "expert requires a non-empty feature matrix": after pruning all-NaN
-        // columns, an empty cube means every REMAINING row had a non-finite
-        // value (e.g. the entire series is shorter than the indicator warmup).
-        if clean_data.nrows() == 0 {
-            anyhow::bail!(
-                "training feature cube for {symbol}/{base_tf} is EMPTY after pruning {pruned_cols} \
-                 all-NaN column(s) and dropping {dropped} non-finite rows ({} columns remained). \
-                 The remaining features never produce a finite row — likely the series is too short \
-                 for the indicator warmup, or the higher-TF selection ({:?}) cannot align to base \
-                 {base_tf}. Check system.higher_timeframes / multi_resolution_timeframes.",
-                feature_names.len(),
-                self.selected_feature_timeframes(base_tf)
-            );
-        }
-        let raw_payload =
-            TrainingPayload::from_named_dense(clean_data, clean_labels, feature_names)?;
-        let filtered_payload = if self.settings.models.filter_to_base_signal {
-            let (filtered_frame, filtered_labels) = self.apply_base_signal_filter(
-                raw_payload.frame.as_ref(),
-                raw_payload.labels.as_ref(),
-            )?;
-            if filtered_frame.height() == raw_payload.frame.height() {
-                raw_payload
+        // Dense model adapters intentionally fail on typed invalid cells. A
+        // raw intersection across thousands of partially-supported features is
+        // empty even on a long frame, so select one exact in-sample suffix and
+        // the columns that are valid throughout it. No values are rewritten.
+        let rows_before_dense_projection = frame.n_samples();
+        let dense_projection = project_dense_training_suffix(&frame)?;
+        let dense_row_start = dense_projection.row_start;
+        let dense_dropped_columns = dense_projection.dropped_columns;
+        frame = dense_projection.frame;
+        labels = labels[dense_row_start..].to_vec();
+        source_row_indices = source_row_indices[dense_row_start..].to_vec();
+        info!(
+            "Projected strict dense training suffix: kept {} / {} rows and {} columns; dropped {} partially-supported columns without changing cell values",
+            frame.n_samples(),
+            rows_before_dense_projection,
+            frame.n_features(),
+            dense_dropped_columns
+        );
+
+        let (filtered_frame, filtered_labels, filtered_source_rows) =
+            if self.settings.models.filter_to_base_signal {
+                self.apply_base_signal_filter(&frame, &labels, &source_row_indices)?
             } else {
-                // Belt-and-suspenders: scrub any NaN that survived the
-                // upstream Array2 drop. polars sometimes lifts NaN from
-                // a hidden f32→f64 cast and our downstream
-                // dataframe_to_float32_array strict-rejects them. This
-                // call is a no-op when there are none.
-                let (clean_frame, clean_labels, dropped) =
-                    drop_nonfinite_rows_dataframe(filtered_frame, filtered_labels)?;
-                if dropped > 0 {
-                    info!(
-                        "Dropped {} additional NaN-bearing rows after base-signal filter ({} rows remain)",
-                        dropped,
-                        clean_frame.height()
-                    );
-                }
-                TrainingPayload::from_frame(clean_frame, clean_labels)?
-            }
-        } else {
-            raw_payload
-        };
-        let (budgeted_frame, budgeted_labels, row_budget_applied) = self
-            .apply_training_row_budget(
-                filtered_payload.frame.as_ref(),
-                filtered_payload.labels.as_ref(),
-            )?;
-        let selected_frame =
-            self.apply_feature_selection(&budgeted_frame, &budgeted_labels, base_ohlcv)?;
-        let payload = if selected_frame.width() == budgeted_frame.width() {
-            Arc::new(TrainingPayload::from_frame(
-                budgeted_frame,
-                budgeted_labels.clone(),
-            )?)
-        } else {
-            Arc::new(TrainingPayload::from_frame(
-                selected_frame,
-                budgeted_labels.clone(),
-            )?)
-        };
+                (frame, labels, source_row_indices)
+            };
+        let (budgeted_frame, budgeted_labels, budgeted_source_rows, row_budget_applied) = self
+            .apply_training_row_budget(&filtered_frame, &filtered_labels, &filtered_source_rows)?;
+        // HMM training consumes the exact versioned feature-plan values after
+        // the same OOS, validity, signal-filter and row-budget boundaries as
+        // every other model. It never reconstructs observations from bare
+        // OHLCV or from a feature-selected frame that may omit its columns.
+        let hmm_observations: std::sync::Arc<std::result::Result<ndarray::Array2<f64>, String>> =
+            std::sync::Arc::new(
+                RegimeHmmExpert::training_observations_from_feature_frame(&budgeted_frame, lease)
+                    .map_err(|error| error.to_string()),
+            );
+        let selected_frame = self.apply_feature_selection(
+            &budgeted_frame,
+            &budgeted_labels,
+            &budgeted_source_rows,
+            base_ohlcv,
+            lease,
+        )?;
+        let payload = Arc::new(TrainingPayload::from_frame_with_source_rows(
+            selected_frame,
+            budgeted_labels,
+            budgeted_source_rows,
+        )?);
         let models_dir = self.models_dir.clone();
         let settings = self.settings.clone();
         let symbol = symbol.to_string();
@@ -529,8 +958,9 @@ impl TrainingOrchestrator {
         let trained = train_models_parallel_with_progress(
             configs,
             payload,
+            lease,
             progress_fn,
-            move |config, payload| {
+            move |config, payload, model_lease| {
                 info!(
                     "Training model instance: {} ({:?})",
                     config.name, config.model_type
@@ -543,6 +973,7 @@ impl TrainingOrchestrator {
                     row_budget_applied,
                     config,
                     payload,
+                    model_lease,
                     &hmm_observations,
                 )
             },
@@ -560,6 +991,7 @@ impl TrainingOrchestrator {
     }
 
     fn create_dispatch_plan(&self) -> Result<DispatchPlan> {
+        reject_legacy_rllib_request_v1(&self.settings)?;
         let mut requested_models = self.settings.models.ml_models.clone();
         requested_models.extend(self.settings.models.phase5_core_models.clone());
 
@@ -587,41 +1019,24 @@ impl TrainingOrchestrator {
             // `crate::soft_actor_critic`), which participates in the
             // soft-voting ensemble like the DQN entry voter. It used to
             // silently alias to the DQN-backed `exit_agent`; that alias
-            // is gone.
+            // is gone. The exit-side agent is not auto-requested here:
+            // it has no production consumer (F-318). Operators can still
+            // request `exit_agent` explicitly through `models.ml_models`
+            // when developing a future exit-side pipeline.
             requested_models.push("sac".to_string());
-            // The exit-side `exit_agent` was previously the ONLY model
-            // this flag produced. To avoid silently dropping its
-            // training, keep it auto-requested under the same flag so
-            // existing configs still train both the SAC entry policy and
-            // the exit-decision agent.
-            //
-            // ⚠ AUDIT #173/#175 — CORRECTING THIS COMMENT. It used to end
-            // "…but the artifact stays available for the exit-side pipeline",
-            // which reads as though a consumer exists. NONE DOES. `exit_agent`
-            // is absent from `DEFAULT_BOOTSTRAP_EXPERT_NAMES`
-            // (`ensemble_inference/bootstrap.rs:102-149`) and explicitly
-            // whitelisted as a non-voter at `ensemble_inference/mod.rs:907`, so
-            // its `ExitDecision3` output is read by nothing in production. It
-            // trains every run for nobody. Whether to ship the exit-side
-            // decision loop or stop training it is the OPERATOR'S call; this
-            // code does not decide it, it only refuses to hide the cost.
-            requested_models.push("exit_agent".to_string());
-            warn!(
-                "exit_agent queued for training and NOTHING CONSUMES IT — its ExitDecision3 \
-                 output has no production reader (audit #173/#175, decision pending: ship the \
-                 exit-side loop or stop training it). This costs training time on every run."
-            );
         }
-        if self.settings.models.use_rl_agent || self.settings.models.use_rllib_agent {
+        if self.settings.models.use_rl_agent {
             requested_models.push("dqn".to_string());
         }
         if self.settings.models.use_neuroevolution {
             requested_models.push("neuro_evo".to_string());
             requested_models.push("neat".to_string());
         }
-        if self.settings.models.prop_search_enabled {
-            requested_models.push("genetic".to_string());
-        }
+        // `prop_search_*` configures the real discovery/search cycle. Do not
+        // also train the separate `GeneticStrategyExpert` implicitly: its
+        // artifact has no production loader and discovery already performs
+        // the strategy search. The expert remains available when explicitly
+        // listed in `models.ml_models` for direct development work.
         // hmm_regime — the soft regime gate the ensemble's role-aware
         // combiner expects. Loader + adapter shipped 2026-05-25 but the
         // training request was never added, so every install reported it
@@ -721,6 +1136,14 @@ impl TrainingOrchestrator {
 
     fn build_training_configs(&self, dispatch_plan: &DispatchPlan) -> Result<Vec<ModelConfig>> {
         let hardware_plan = self.hardware_execution_plan();
+        self.build_training_configs_with_hardware_plan(dispatch_plan, &hardware_plan)
+    }
+
+    fn build_training_configs_with_hardware_plan(
+        &self,
+        dispatch_plan: &DispatchPlan,
+        hardware_plan: &HardwareExecutionPlan,
+    ) -> Result<Vec<ModelConfig>> {
         dispatch_plan
             .entries
             .iter()
@@ -728,15 +1151,17 @@ impl TrainingOrchestrator {
                 let mut params = self.default_model_params(&entry.name);
                 self.inject_runtime_model_params(&entry.name, &mut params);
                 self.apply_model_param_overrides(&entry.name, &mut params);
+                reject_legacy_rllib_model_params_v1(&entry.name, &params)?;
                 // Resource limits and accelerator provenance are authoritative.
                 // Apply them last so stale settings or per-model overrides cannot
                 // oversubscribe the detected machine or route work to another device.
                 self.apply_hardware_plan_params(
                     &entry.name,
                     entry.family,
-                    &hardware_plan,
+                    hardware_plan,
                     &mut params,
                 );
+                pin_cpu_only_model_device(&entry.name, entry.family, &mut params);
                 Ok(ModelConfig {
                     name: entry.name.clone(),
                     model_type: self.map_model_type(&entry.name)?,
@@ -1069,72 +1494,90 @@ impl TrainingOrchestrator {
 
     fn apply_training_row_budget(
         &self,
-        frame: &DataFrame,
+        frame: &FeatureFrame,
         labels: &[i32],
-    ) -> Result<(DataFrame, Vec<i32>, Option<usize>)> {
-        if frame.height() != labels.len() {
+        source_row_indices: &[usize],
+    ) -> Result<(FeatureFrame, Vec<i32>, Vec<usize>, Option<usize>)> {
+        if frame.n_samples() != labels.len() {
             anyhow::bail!(
                 "training row-budget mismatch: {} rows vs {} labels",
-                frame.height(),
+                frame.n_samples(),
                 labels.len()
+            );
+        }
+        if source_row_indices.len() != labels.len() {
+            anyhow::bail!(
+                "training row-budget source receipt mismatch: {} rows vs {} receipts",
+                labels.len(),
+                source_row_indices.len()
             );
         }
 
         let Some(cap) = self.effective_training_row_budget() else {
-            return Ok((frame.clone(), labels.to_vec(), None));
+            return Ok((
+                frame.clone(),
+                labels.to_vec(),
+                source_row_indices.to_vec(),
+                None,
+            ));
         };
 
-        if frame.height() <= cap {
-            return Ok((frame.clone(), labels.to_vec(), None));
+        if frame.n_samples() <= cap {
+            return Ok((
+                frame.clone(),
+                labels.to_vec(),
+                source_row_indices.to_vec(),
+                None,
+            ));
         }
 
-        let start = frame.height().saturating_sub(cap);
-        let budgeted_frame = frame.slice(start as i64, cap);
-        let budgeted_labels = labels
-            .iter()
-            .skip(start)
-            .take(cap)
-            .copied()
-            .collect::<Vec<_>>();
+        let start = frame.n_samples().saturating_sub(cap);
+        let budgeted_frame = frame.row_window(start, frame.n_samples())?;
+        let budgeted_labels = labels[start..].to_vec();
+        let budgeted_source_rows = source_row_indices[start..].to_vec();
 
         info!(
             "Applied training row budget: kept {} / {} rows",
-            budgeted_frame.height(),
-            frame.height()
+            budgeted_frame.n_samples(),
+            frame.n_samples()
         );
-        Ok((budgeted_frame, budgeted_labels, Some(cap)))
+        Ok((
+            budgeted_frame,
+            budgeted_labels,
+            budgeted_source_rows,
+            Some(cap),
+        ))
     }
 
-    fn selected_feature_timeframes(&self, base_tf: &str) -> Vec<String> {
-        let source = if self.settings.system.multi_resolution_enabled
-            && !self.settings.system.multi_resolution_timeframes.is_empty()
-        {
-            &self.settings.system.multi_resolution_timeframes
-        } else {
-            &self.settings.system.higher_timeframes
-        };
+    fn selected_feature_timeframes(&self, base_tf: &str) -> Result<Vec<String>> {
+        let base = base_tf
+            .parse::<CanonicalTimeframe>()
+            .with_context(|| format!("training base timeframe {base_tf} is not canonical"))?;
+        let source = self.settings.system.resolve_higher_timeframes(base_tf);
 
-        // Mirror discovery's selection (the flat config list minus the base) for
-        // UI/CLI↔discovery parity — discovery trains genes on these same TFs and
-        // works. Any feature column that ends up permanently non-finite (e.g. a
-        // long-lookback indicator on a sparse higher TF that never warms up) is
-        // PRUNED in `train_symbol_with_progress` before the row-wise NaN drop, so
-        // a single dead column no longer nukes the whole dataset.
+        // Use the same shared config resolver as discovery/CLI. With
+        // multi-resolution disabled it excludes lower/equal timeframes; with it
+        // enabled it preserves the explicit direct-timeframe list minus the base.
         let mut selected = Vec::new();
-        for timeframe in source {
-            if timeframe.eq_ignore_ascii_case(base_tf) {
+        for timeframe in &source {
+            let canonical = timeframe.parse::<CanonicalTimeframe>().with_context(|| {
+                format!(
+                    "training feature timeframe {timeframe} is not a direct canonical timeframe"
+                )
+            })?;
+            if canonical == base {
                 continue;
             }
             if selected
                 .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(timeframe))
+                .any(|existing: &String| existing == canonical.as_str())
             {
                 continue;
             }
-            selected.push(timeframe.clone());
+            selected.push(canonical.as_str().to_owned());
         }
 
-        selected
+        Ok(selected)
     }
 
     fn conformal_alpha(&self) -> f32 {
@@ -1147,14 +1590,15 @@ impl TrainingOrchestrator {
 
     fn fit_l1_ranked_features(
         &self,
-        frame: &DataFrame,
+        frame: &FeatureFrame,
         labels: &[i32],
-    ) -> Result<Vec<(String, f32)>> {
+        lease: &CpuLease,
+    ) -> Result<Vec<(String, f64)>> {
         let alpha = 1.0 / self.settings.models.l1_feature_selection_c.max(1e-3);
         let mut selector = ElasticNetExpert::new(alpha, 1.0);
         selector.learning_rate = 0.03;
         selector.epochs = 400;
-        selector.fit(frame, &labels_to_series(labels))?;
+        selector.fit(frame, labels, lease)?;
         selector.ranked_feature_importance()
     }
 
@@ -1162,66 +1606,61 @@ impl TrainingOrchestrator {
     /// Uses the most-recent rows within the provided frame up to the configured limit.
     fn recent_sample_from(
         &self,
-        frame: &DataFrame,
+        frame: &FeatureFrame,
         labels: &[i32],
-    ) -> Result<(DataFrame, Vec<i32>, usize)> {
+    ) -> Result<(FeatureFrame, Vec<i32>, usize)> {
         let sample_limit = self.settings.models.l1_feature_selection_sample_limit.max(
             self.settings
                 .models
                 .l1_feature_selection_max_features
                 .max(1),
         );
-        let total_rows = frame.height();
+        let total_rows = frame.n_samples();
         let sample_rows = total_rows.min(sample_limit.max(1));
         let start = total_rows.saturating_sub(sample_rows);
-        let sampled = frame.slice(start as i64, sample_rows);
-        let sampled_labels = labels
-            .iter()
-            .skip(start)
-            .take(sample_rows)
-            .copied()
-            .collect::<Vec<_>>();
+        let sampled = frame.row_window(start, total_rows)?;
+        let sampled_labels = labels[start..].to_vec();
         Ok((sampled, sampled_labels, start))
     }
 
     fn take_row_subset(
         &self,
-        frame: &DataFrame,
+        frame: &FeatureFrame,
         labels: &[i32],
         indices: &[usize],
-    ) -> Result<(DataFrame, Vec<i32>)> {
+    ) -> Result<(FeatureFrame, Vec<i32>)> {
         if indices.is_empty() {
             anyhow::bail!("row subset indices must not be empty");
         }
-
-        let mut mask = vec![false; frame.height()];
-        let mut subset_labels = Vec::with_capacity(indices.len());
-        for idx in indices.iter().copied().filter(|idx| *idx < frame.height()) {
-            mask[idx] = true;
-            subset_labels.push(labels[idx]);
+        if frame.n_samples() != labels.len() {
+            anyhow::bail!(
+                "row subset frame/label mismatch: {} rows vs {} labels",
+                frame.n_samples(),
+                labels.len()
+            );
         }
-
-        if subset_labels.is_empty() {
-            anyhow::bail!("row subset produced no labels");
+        for &row in indices {
+            anyhow::ensure!(
+                row < frame.n_samples(),
+                "row subset index {row} is outside 0..{}",
+                frame.n_samples()
+            );
         }
-
-        let mask = BooleanChunked::from_slice("l1_selection_mask".into(), &mask);
-        let subset = frame.filter(&mask)?;
+        let subset = frame.select_rows(indices)?;
+        let subset_labels = indices.iter().map(|&row| labels[row]).collect();
         Ok((subset, subset_labels))
     }
 
     fn derive_regime_buckets(
         &self,
         base_ohlcv: &Ohlcv,
-        sample_start: usize,
-        sample_len: usize,
+        source_row_indices: &[usize],
     ) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
         let mut trend = Vec::new();
         let mut range = Vec::new();
         let mut neutral = Vec::new();
 
-        for local_idx in 0..sample_len {
-            let global_idx = sample_start + local_idx;
+        for (local_idx, &global_idx) in source_row_indices.iter().enumerate() {
             if global_idx >= base_ohlcv.close.len()
                 || global_idx >= base_ohlcv.open.len()
                 || global_idx >= base_ohlcv.high.len()
@@ -1255,12 +1694,22 @@ impl TrainingOrchestrator {
 
     fn apply_feature_selection(
         &self,
-        frame: &DataFrame,
+        frame: &FeatureFrame,
         labels: &[i32],
+        source_row_indices: &[usize],
         base_ohlcv: &Ohlcv,
-    ) -> Result<DataFrame> {
+        lease: &CpuLease,
+    ) -> Result<FeatureFrame> {
         if !self.settings.models.l1_feature_selection_enabled {
             return Ok(frame.clone());
+        }
+        if frame.n_samples() != labels.len() || labels.len() != source_row_indices.len() {
+            anyhow::bail!(
+                "feature selection receipt mismatch: {} rows, {} labels, {} source rows",
+                frame.n_samples(),
+                labels.len(),
+                source_row_indices.len()
+            );
         }
 
         let min_features = self
@@ -1273,51 +1722,34 @@ impl TrainingOrchestrator {
             .models
             .l1_feature_selection_max_features
             .max(min_features);
-        if frame.width() <= min_features {
+        if frame.n_features() <= min_features {
             return Ok(frame.clone());
         }
 
         // TR-1 fix: feature selection must run only on train-split (first 80%) to
         // prevent the L1 selector from seeing validation/test rows and overfitting.
-        let total_rows = frame.height();
+        let total_rows = frame.n_samples();
         let train_end = (total_rows * 4 / 5).max(1);
-        let train_frame = frame.slice(0, train_end);
+        let train_frame = frame.row_window(0, train_end)?;
         let train_labels: Vec<i32> = labels[..train_end.min(labels.len())].to_vec();
 
         // Sample up to the configured limit from within the train portion only
         let (sampled_frame, sampled_labels, sample_start) =
             self.recent_sample_from(&train_frame, &train_labels)?;
-        let mut score_map = HashMap::<String, f32>::new();
+        let sampled_source_rows = &source_row_indices
+            [sample_start..sample_start.saturating_add(sampled_frame.n_samples())];
+        let mut score_map = HashMap::<String, f64>::new();
 
-        for (name, score) in self.fit_l1_ranked_features(&sampled_frame, &sampled_labels)? {
+        for (name, score) in self.fit_l1_ranked_features(&sampled_frame, &sampled_labels, lease)? {
             *score_map.entry(name).or_insert(0.0) += score.max(0.0);
         }
 
-        // Audit B08 (2026-07-13): `derive_regime_buckets` maps each sampled
-        // frame row to `base_ohlcv[sample_start + local_idx]` by POSITION.
-        // That is only correct when the feature frame is 1:1 aligned with the
-        // raw OHLCV — but `apply_base_signal_filter` + `drop_nonfinite_rows`
-        // upstream DROP rows (filter_to_base_signal defaults on), so the frame
-        // is usually shorter and the positional map points at the WRONG bar,
-        // silently mislabeling every regime bucket. Until row identity is
-        // carried through the filters (follow-up), only run the per-regime
-        // selection when the frame is provably 1:1 with the OHLCV; otherwise
-        // fall back to the (correct) global L1 selection with a warning rather
-        // than bucket on misaligned regimes.
-        let frame_aligned_with_ohlcv = frame.height() == base_ohlcv.close.len();
-        if self.settings.models.l1_feature_selection_per_regime && !frame_aligned_with_ohlcv {
-            tracing::warn!(
-                target: "neoethos_models::training_orchestrator",
-                frame_rows = frame.height(),
-                ohlcv_rows = base_ohlcv.close.len(),
-                "per-regime L1 feature selection skipped: feature frame is not 1:1 with \
-                 the OHLCV (rows were dropped upstream), so positional regime labels would \
-                 be misaligned. Using global L1 selection instead (audit B08)."
-            );
-        }
-        if self.settings.models.l1_feature_selection_per_regime && frame_aligned_with_ohlcv {
+        // Source-row receipts survive every warmup/filter/budget operation, so
+        // regime buckets are mapped to the exact originating OHLCV bars rather
+        // than guessed from the filtered frame's local position.
+        if self.settings.models.l1_feature_selection_per_regime {
             let (trend_rows, range_rows, neutral_rows) =
-                self.derive_regime_buckets(base_ohlcv, sample_start, sampled_frame.height());
+                self.derive_regime_buckets(base_ohlcv, sampled_source_rows);
 
             for rows in [trend_rows, range_rows, neutral_rows] {
                 if rows.len() < min_features.max(32) {
@@ -1325,7 +1757,9 @@ impl TrainingOrchestrator {
                 }
                 let (subset_frame, subset_labels) =
                     self.take_row_subset(&sampled_frame, &sampled_labels, &rows)?;
-                for (name, score) in self.fit_l1_ranked_features(&subset_frame, &subset_labels)? {
+                for (name, score) in
+                    self.fit_l1_ranked_features(&subset_frame, &subset_labels, lease)?
+                {
                     *score_map.entry(name).or_insert(0.0) += score.max(0.0) * 0.75;
                 }
             }
@@ -1340,7 +1774,7 @@ impl TrainingOrchestrator {
             .count()
             .max(min_features)
             .min(max_features)
-            .min(frame.width());
+            .min(frame.n_features());
 
         let selected_names = ranked
             .into_iter()
@@ -1348,7 +1782,7 @@ impl TrainingOrchestrator {
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
 
-        if selected_names.is_empty() || selected_names.len() >= frame.width() {
+        if selected_names.is_empty() || selected_names.len() >= frame.n_features() {
             return Ok(frame.clone());
         }
 
@@ -1356,63 +1790,76 @@ impl TrainingOrchestrator {
             .iter()
             .map(|name| {
                 frame
-                    .column(name)
-                    .with_context(|| format!("selected feature column `{name}` missing from frame"))
-                    .cloned()
+                    .names
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .with_context(|| format!("selected feature `{name}` missing from frame"))
             })
             .collect::<Result<Vec<_>>>()?;
 
         info!(
             "Applied L1 feature selection: kept {} / {} features",
             selected_columns.len(),
-            frame.width()
+            frame.n_features()
         );
-        DataFrame::new(selected_columns).context("rebuild feature-selected dataframe")
+        frame.select_columns(&selected_columns)
     }
 
     fn apply_base_signal_filter(
         &self,
-        frame: &DataFrame,
+        frame: &FeatureFrame,
         labels: &[i32],
-    ) -> Result<(DataFrame, Vec<i32>)> {
-        if frame.height() != labels.len() {
+        source_row_indices: &[usize],
+    ) -> Result<(FeatureFrame, Vec<i32>, Vec<usize>)> {
+        if frame.n_samples() != labels.len() {
             anyhow::bail!(
                 "base-signal filter row/label mismatch: {} rows vs {} labels",
-                frame.height(),
+                frame.n_samples(),
                 labels.len()
+            );
+        }
+        if source_row_indices.len() != labels.len() {
+            anyhow::bail!(
+                "base-signal filter source receipt mismatch: {} rows vs {} receipts",
+                labels.len(),
+                source_row_indices.len()
             );
         }
 
         let active_rows = labels.iter().filter(|label| **label != 0).count();
         if active_rows < 64 || active_rows == labels.len() {
-            return Ok((frame.clone(), labels.to_vec()));
+            return Ok((frame.clone(), labels.to_vec(), source_row_indices.to_vec()));
         }
 
-        let mask = BooleanChunked::from_slice(
-            "base_signal_filter".into(),
-            &labels.iter().map(|label| *label != 0).collect::<Vec<_>>(),
-        );
-        let filtered_frame = frame.filter(&mask)?;
-        let filtered_labels = labels
+        let selected_rows = labels
             .iter()
-            .copied()
-            .filter(|label| *label != 0)
+            .enumerate()
+            .filter_map(|(row, label)| (*label != 0).then_some(row))
+            .collect::<Vec<_>>();
+        let filtered_frame = frame.select_rows(&selected_rows)?;
+        let filtered_labels = selected_rows
+            .iter()
+            .map(|&row| labels[row])
+            .collect::<Vec<_>>();
+        let filtered_source_rows = selected_rows
+            .iter()
+            .map(|&row| source_row_indices[row])
             .collect::<Vec<_>>();
 
-        if filtered_frame.height() != filtered_labels.len() || filtered_labels.is_empty() {
+        if filtered_frame.n_samples() != filtered_labels.len() || filtered_labels.is_empty() {
             anyhow::bail!(
                 "base-signal filter produced inconsistent payload: {} rows vs {} labels",
-                filtered_frame.height(),
+                filtered_frame.n_samples(),
                 filtered_labels.len()
             );
         }
 
         info!(
             "Applied base-signal directional filter: kept {} / {} rows",
-            filtered_frame.height(),
-            frame.height()
+            filtered_frame.n_samples(),
+            frame.n_samples()
         );
-        Ok((filtered_frame, filtered_labels))
+        Ok((filtered_frame, filtered_labels, filtered_source_rows))
     }
 
     fn default_model_params(&self, name: &str) -> HashMap<String, String> {
@@ -1424,7 +1871,7 @@ impl TrainingOrchestrator {
         // (D1/W1/MN) triple-barrier targets. The per-(symbol,TF) bar-count
         // scaling of `n_estimators` / `num_iterations` / `iterations` /
         // `min_data_in_leaf` happens later in `train_model_dispatch` where
-        // `payload.frame.height()` is known. Set
+        // `payload.frame.n_samples()` is known. Set
         // `models.regularized_model_defaults = false` to restore the legacy
         // unregularized seeds for a controlled before/after OOS comparison.
         //
@@ -2001,14 +2448,6 @@ impl TrainingOrchestrator {
                     ),
                 ),
                 (
-                    "train_years".to_string(),
-                    self.settings.models.prop_search_train_years.to_string(),
-                ),
-                (
-                    "val_years".to_string(),
-                    self.settings.models.prop_search_val_years.to_string(),
-                ),
-                (
                     "device".to_string(),
                     self.settings.models.prop_search_device.clone(),
                 ),
@@ -2044,172 +2483,137 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "dqn" => {
-                // RLlib/Ray honesty: Ray's RLlib is a Python framework and there is
-                // NO Ray runtime in this pure-Rust build. The `use_rllib_agent` /
-                // `auto_enable_rllib` config flags are kept for compatibility, but
-                // their EFFECT must be truthful — a request for "rllib" can only ever
-                // execute on the real native `rlkit` backend. So we resolve the
-                // `backend` param to the honest `rlkit` label (never a bare "rllib"
-                // that implies a Ray backend that does not exist) and carry the
-                // original request in `__rllib_requested` so the runtime profile /
-                // artifact records the honest requested-vs-effective degradation.
-                let rllib_auto = self.settings.models.auto_enable_rllib
-                    && self.settings.system.enable_gpu
-                    && self.settings.models.ray_tune_max_concurrency > 0;
-                let rllib_requested = self.settings.models.use_rllib_agent || rllib_auto;
-                if rllib_requested {
-                    rllib_unavailable_warn_once();
-                }
+                // rlkit is the explicit native DQN backend. Legacy RLlib/Ray
+                // requests are rejected before dispatch and never arrive here.
                 HashMap::from([
-                (
-                    // Honest backend: rlkit is the only RL backend that exists here.
-                    "backend".to_string(),
-                    "rlkit".to_string(),
-                ),
-                (
-                    // Records that rllib/Ray was requested but is unavailable, so the
-                    // training runtime profile can attach an honest degradation note
-                    // WITHOUT a misleading bare "rllib" backend label.
-                    "__rllib_requested".to_string(),
-                    rllib_requested.to_string(),
-                ),
-                (
-                    "auto_rllib".to_string(),
-                    (self.settings.models.auto_enable_rllib
-                        && !self.settings.models.use_rllib_agent)
-                        .to_string(),
-                ),
-                (
-                    "epochs".to_string(),
-                    Self::epochs_from_seconds(self.settings.models.rl_train_seconds, 48)
-                        .to_string(),
-                ),
-                (
-                    "max_steps".to_string(),
-                    (self.settings.models.rl_timesteps / 10_000)
-                        .clamp(128, 4096)
-                        .to_string(),
-                ),
-                (
-                    "batch_size".to_string(),
-                    self.settings.models.train_batch_size.max(32).to_string(),
-                ),
-                (
-                    "state_bins".to_string(),
-                    self.settings.models.rl_state_bins.to_string(),
-                ),
-                (
-                    "state_encoding".to_string(),
-                    self.settings.models.rl_state_encoding.clone(),
-                ),
-                (
-                    "update_interval".to_string(),
-                    if self.settings.models.rl_update_interval == 0 {
+                    ("backend".to_string(), "rlkit".to_string()),
+                    (
+                        "epochs".to_string(),
+                        Self::epochs_from_seconds(self.settings.models.rl_train_seconds, 48)
+                            .to_string(),
+                    ),
+                    (
+                        "max_steps".to_string(),
+                        (self.settings.models.rl_timesteps / 10_000)
+                            .clamp(128, 4096)
+                            .to_string(),
+                    ),
+                    (
+                        "batch_size".to_string(),
+                        self.settings.models.train_batch_size.max(32).to_string(),
+                    ),
+                    (
+                        "state_bins".to_string(),
+                        self.settings.models.rl_state_bins.to_string(),
+                    ),
+                    (
+                        "state_encoding".to_string(),
+                        self.settings.models.rl_state_encoding.clone(),
+                    ),
+                    (
+                        "update_interval".to_string(),
+                        if self.settings.models.rl_update_interval == 0 {
+                            self.settings
+                                .models
+                                .rl_parallel_envs
+                                .clamp(8, 128)
+                                .to_string()
+                        } else {
+                            self.settings.models.rl_update_interval.max(1).to_string()
+                        },
+                    ),
+                    (
+                        "update_freq".to_string(),
+                        if self.settings.models.rl_update_freq == 0 {
+                            self.settings
+                                .models
+                                .rl_eval_episodes
+                                .clamp(1, 16)
+                                .to_string()
+                        } else {
+                            self.settings.models.rl_update_freq.max(1).to_string()
+                        },
+                    ),
+                    (
+                        "learning_rate".to_string(),
+                        format!("{:.6}", self.settings.models.rl_learning_rate),
+                    ),
+                    (
+                        "gamma".to_string(),
+                        format!("{:.6}", self.settings.models.rl_gamma),
+                    ),
+                    (
+                        "epsilon_start".to_string(),
+                        format!("{:.6}", self.settings.models.rl_epsilon_start),
+                    ),
+                    (
+                        "epsilon_end".to_string(),
+                        format!("{:.6}", self.settings.models.rl_epsilon_end),
+                    ),
+                    (
+                        "epsilon_decay".to_string(),
+                        format!("{:.6}", self.settings.models.rl_epsilon_decay),
+                    ),
+                    (
+                        "buffer_capacity".to_string(),
+                        if self.settings.models.rl_buffer_capacity == 0 {
+                            (self.settings.models.train_batch_size.max(32) * 1024).to_string()
+                        } else {
+                            self.settings.models.rl_buffer_capacity.to_string()
+                        },
+                    ),
+                    (
+                        "parallel_envs".to_string(),
+                        self.settings.models.rl_parallel_envs.max(1).to_string(),
+                    ),
+                    (
+                        "eval_episodes".to_string(),
+                        self.settings.models.rl_eval_episodes.max(1).to_string(),
+                    ),
+                    (
+                        "reward_horizon".to_string(),
+                        if self.settings.models.rl_reward_horizon == 0 {
+                            self.settings
+                                .risk
+                                .triple_barrier_max_bars
+                                .clamp(6, 64)
+                                .to_string()
+                        } else {
+                            self.settings.models.rl_reward_horizon.to_string()
+                        },
+                    ),
+                    (
+                        "episode_len".to_string(),
+                        if self.settings.models.rl_episode_len == 0 {
+                            self.settings
+                                .models
+                                .transformer_seq_len
+                                .clamp(24, 256)
+                                .to_string()
+                        } else {
+                            self.settings.models.rl_episode_len.to_string()
+                        },
+                    ),
+                    (
+                        "ray_tune_max_concurrency".to_string(),
                         self.settings
                             .models
-                            .rl_parallel_envs
-                            .clamp(8, 128)
-                            .to_string()
-                    } else {
-                        self.settings.models.rl_update_interval.max(1).to_string()
-                    },
-                ),
-                (
-                    "update_freq".to_string(),
-                    if self.settings.models.rl_update_freq == 0 {
+                            .ray_tune_max_concurrency
+                            .max(1)
+                            .to_string(),
+                    ),
+                    ("device".to_string(), self.settings.system.device.clone()),
+                    (
+                        "hidden_dims".to_string(),
                         self.settings
                             .models
-                            .rl_eval_episodes
-                            .clamp(1, 16)
-                            .to_string()
-                    } else {
-                        self.settings.models.rl_update_freq.max(1).to_string()
-                    },
-                ),
-                (
-                    "learning_rate".to_string(),
-                    format!("{:.6}", self.settings.models.rl_learning_rate),
-                ),
-                (
-                    "gamma".to_string(),
-                    format!("{:.6}", self.settings.models.rl_gamma),
-                ),
-                (
-                    "epsilon_start".to_string(),
-                    format!("{:.6}", self.settings.models.rl_epsilon_start),
-                ),
-                (
-                    "epsilon_end".to_string(),
-                    format!("{:.6}", self.settings.models.rl_epsilon_end),
-                ),
-                (
-                    "epsilon_decay".to_string(),
-                    format!("{:.6}", self.settings.models.rl_epsilon_decay),
-                ),
-                (
-                    "buffer_capacity".to_string(),
-                    if self.settings.models.rl_buffer_capacity == 0 {
-                        (self.settings.models.train_batch_size.max(32) * 1024).to_string()
-                    } else {
-                        self.settings.models.rl_buffer_capacity.to_string()
-                    },
-                ),
-                (
-                    "parallel_envs".to_string(),
-                    self.settings.models.rl_parallel_envs.max(1).to_string(),
-                ),
-                (
-                    "eval_episodes".to_string(),
-                    self.settings.models.rl_eval_episodes.max(1).to_string(),
-                ),
-                (
-                    "reward_horizon".to_string(),
-                    if self.settings.models.rl_reward_horizon == 0 {
-                        self.settings
-                            .risk
-                            .triple_barrier_max_bars
-                            .clamp(6, 64)
-                            .to_string()
-                    } else {
-                        self.settings.models.rl_reward_horizon.to_string()
-                    },
-                ),
-                (
-                    "episode_len".to_string(),
-                    if self.settings.models.rl_episode_len == 0 {
-                        self.settings
-                            .models
-                            .transformer_seq_len
-                            .clamp(24, 256)
-                            .to_string()
-                    } else {
-                        self.settings.models.rl_episode_len.to_string()
-                    },
-                ),
-                (
-                    "rllib_num_workers".to_string(),
-                    self.settings.models.rllib_num_workers.to_string(),
-                ),
-                (
-                    "ray_tune_max_concurrency".to_string(),
-                    self.settings
-                        .models
-                        .ray_tune_max_concurrency
-                        .max(1)
-                        .to_string(),
-                ),
-                ("device".to_string(), self.settings.system.device.clone()),
-                (
-                    "hidden_dims".to_string(),
-                    self.settings
-                        .models
-                        .rl_network_arch
-                        .iter()
-                        .map(|value| value.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-            ])
+                            .rl_network_arch
+                            .iter()
+                            .map(|value| value.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                ])
             }
             "swarm_forecaster" => HashMap::from([
                 (
@@ -2414,19 +2818,75 @@ impl TrainingOrchestrator {
         let pip_size = broker_truth
             .exact_pip_size_v1(symbol)
             .map_err(anyhow::Error::new)?;
-        self.derive_labels_unchecked_test_oracle(ohlcv, symbol, pip_size)
+        self.derive_labels_unchecked_test_oracle(
+            ohlcv,
+            symbol,
+            pip_size,
+            self.configured_label_round_trip_cost_pips()?,
+        )
+    }
+
+    fn derive_labels_with_screening_costs(
+        &self,
+        ohlcv: &Ohlcv,
+        symbol: &str,
+        pip_size: f64,
+        round_trip_cost_pips: f64,
+    ) -> Result<Vec<i32>> {
+        anyhow::ensure!(
+            pip_size.is_finite() && pip_size > 0.0,
+            "canonical training screening labels require a positive broker pip size"
+        );
+        anyhow::ensure!(
+            round_trip_cost_pips.is_finite() && round_trip_cost_pips >= 0.0,
+            "canonical training labels require non-negative V2 screening costs in pips"
+        );
+        self.derive_labels_unchecked_test_oracle(ohlcv, symbol, pip_size, round_trip_cost_pips)
+    }
+
+    fn configured_label_round_trip_cost_pips(&self) -> Result<f64> {
+        let commission_account_per_lot = self.settings.risk.commission_per_lot;
+        anyhow::ensure!(
+            commission_account_per_lot.is_finite() && commission_account_per_lot >= 0.0,
+            "settings-only training requires a finite, non-negative account-currency commission assumption"
+        );
+        anyhow::ensure!(
+            commission_account_per_lot == 0.0,
+            "settings-only training cannot convert account-currency commission into pips; use the versioned canonical screening-cost contract"
+        );
+        let full_spread_pips = self.settings.risk.backtest_spread_pips;
+        let slippage_pips_per_fill = self.settings.risk.slippage_pips;
+        anyhow::ensure!(
+            full_spread_pips.is_finite() && full_spread_pips >= 0.0,
+            "settings-only training requires a finite, non-negative full-spread assumption"
+        );
+        anyhow::ensure!(
+            slippage_pips_per_fill.is_finite() && slippage_pips_per_fill >= 0.0,
+            "settings-only training requires a finite, non-negative per-fill slippage assumption"
+        );
+        let round_trip_cost_pips = full_spread_pips + 2.0 * slippage_pips_per_fill;
+        Ok(round_trip_cost_pips)
     }
 
     /// Pure label-geometry oracle. This is deliberately private: production
-    /// training may reach it only through [`Self::derive_labels`] after the
-    /// typed broker-truth capability check. Unit tests use the same body to
-    /// retain adversarial formula coverage without weakening that boundary.
+    /// training may reach it through [`Self::derive_labels`] after the typed
+    /// broker-truth capability check, or through the receipt-bound canonical
+    /// research entry after its exact broker pip size is validated. Unit tests
+    /// use the same body to retain adversarial formula coverage without
+    /// weakening either boundary.
     fn derive_labels_unchecked_test_oracle(
         &self,
         ohlcv: &Ohlcv,
         symbol: &str,
         pip_size: f64,
+        round_trip_cost_pips: f64,
     ) -> Result<Vec<i32>> {
+        anyhow::ensure!(
+            !symbol.trim().is_empty()
+                && symbol.len() <= 128
+                && !symbol.chars().any(char::is_control),
+            "derive_labels requires one bounded symbol identity"
+        );
         let n = ohlcv.close.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -2461,9 +2921,11 @@ impl TrainingOrchestrator {
         //
         // The barriers sat at `close +/- distance` and charged nothing, so a
         // label said "price moved" where the gene side asks "did the trade make
-        // money". Discovery charges `backtest_spread_pips + slippage_pips`
-        // (2.0 today) on every trade — see DiscoveryConfig::evaluation_spread_pips
-        // — while `grep -c spread` in this file returned zero. The two halves of
+        // money". Canonical discovery charges a V2 screening envelope: full
+        // spread once, per-fill slippage twice, and per-fill account-currency
+        // commission twice after conversion to pips. The receipt-bound
+        // training entry supplies that same complete screening number. It is
+        // not historical quote replay. Before this boundary, the two halves of
         // the system were optimising different objectives, and on EURUSD M15
         // every directional model collapsed to a constant: three unrelated
         // architectures reporting accuracy identical to sixteen significant
@@ -2477,21 +2939,13 @@ impl TrainingOrchestrator {
         if !(pip_size.is_finite() && pip_size > 0.0) {
             anyhow::bail!("derive_labels requires an exact positive broker pip size");
         }
-        let round_trip_cost = (self.settings.risk.backtest_spread_pips.max(0.0)
-            + self.settings.risk.slippage_pips.max(0.0))
-            * pip_size;
-        let round_trip_cost = if round_trip_cost.is_finite() {
-            round_trip_cost
-        } else {
-            // An unknown symbol yields NaN rather than a wrong pip size. Charge
-            // nothing and say so, instead of poisoning every barrier.
-            tracing::warn!(
-                target: "neoethos_models::training_orchestrator",
-                symbol,
-                "no pip size for this symbol — labels will not charge spread, so they                  answer a different question from the one discovery scores"
-            );
-            0.0
-        };
+        if !(round_trip_cost_pips.is_finite() && round_trip_cost_pips >= 0.0) {
+            anyhow::bail!("derive_labels requires non-negative screening round-trip cost pips");
+        }
+        let round_trip_cost = round_trip_cost_pips * pip_size;
+        if !round_trip_cost.is_finite() {
+            anyhow::bail!("derive_labels round-trip cost overflows price space");
+        }
         // 💰 MONEY PATH. Two fields, one number, silently `.max()`ed: lowering
         // either one alone does NOT lower the stop distance, and the label set
         // this produces is what every model learns to trade.
@@ -2620,7 +3074,9 @@ impl TrainingOrchestrator {
         symbol: &str,
         pip_size: f64,
     ) -> Result<Vec<i32>> {
-        self.derive_labels_unchecked_test_oracle(ohlcv, symbol, pip_size)
+        let round_trip_cost_pips = self.settings.risk.backtest_spread_pips.max(0.0)
+            + 2.0 * self.settings.risk.slippage_pips.max(0.0);
+        self.derive_labels_unchecked_test_oracle(ohlcv, symbol, pip_size, round_trip_cost_pips)
     }
 }
 
@@ -2753,10 +3209,6 @@ fn trailing_average(values: &[f64], end_idx: usize, window: usize) -> f64 {
     }
 }
 
-fn labels_to_series(labels: &[i32]) -> Series {
-    Series::new("label".into(), labels.to_vec())
-}
-
 fn canonical_model_name(name: &str) -> &str {
     if name
         .strip_prefix("transformer_")
@@ -2884,8 +3336,8 @@ fn holdout_pct_from_params(params: &HashMap<String, String>) -> f64 {
     parse_f64_param(params, "__holdout_pct", 0.20).clamp(0.05, 0.45)
 }
 
-fn confidence_threshold_from_params(params: &HashMap<String, String>) -> f32 {
-    parse_f32_param(params, "__conf_threshold", 0.55).clamp(0.0, 1.0)
+fn confidence_threshold_from_params(params: &HashMap<String, String>) -> f64 {
+    parse_f64_param(params, "__conf_threshold", 0.55).clamp(0.0, 1.0)
 }
 
 fn metric_weight_from_params(params: &HashMap<String, String>) -> f64 {
@@ -2910,19 +3362,6 @@ fn parse_survivor_selection_policy(params: &HashMap<String, String>) -> Survivor
             .as_deref()
             .unwrap_or("rank"),
     )
-}
-
-/// Emit a single process-wide warning the first time an RLlib/Ray-backed DQN run
-/// is requested. Ray's RLlib is a Python framework with no Rust runtime in this
-/// build; a request can only execute on the native `rlkit` backend. The warning
-/// makes the honest degradation visible without spamming the log per model run.
-fn rllib_unavailable_warn_once() {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        warn!(
-            "rllib/Ray requested for DQN but is unavailable in the pure-Rust build; using rlkit (native) backend instead"
-        );
-    });
 }
 
 fn training_runtime_profile(
@@ -2960,26 +3399,7 @@ fn training_runtime_profile(
         .get("__planned_memory_budget_gb")
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 0.0);
-    // RLlib honesty: the `backend` param is now ALWAYS the truthful effective
-    // backend (`rlkit`), never a bare "rllib". The original rllib/Ray REQUEST is
-    // carried in `__rllib_requested` (the back-compat fallback `backend == "rllib"`
-    // only matters for older persisted configs). This records the honest
-    // requested-vs-effective degradation in the runtime profile/artifact.
-    let rllib_requested = parse_bool_param(&config.params, "__rllib_requested", false)
-        || requested_backend
-            .as_deref()
-            .is_some_and(|backend| backend.eq_ignore_ascii_case("rllib"));
     let mut notes = Vec::new();
-    if rllib_requested {
-        notes.push(
-            "rllib/Ray was requested for DQN but is unavailable in this pure-Rust build; training executed on the native rlkit backend".to_string(),
-        );
-        if parse_bool_param(&config.params, "auto_rllib", false) {
-            notes.push(
-                "rllib was auto-requested from config because GPU preference and RLlib auto-enable were both active; the effective backend remains native rlkit".to_string(),
-            );
-        }
-    }
     if settings.models.enable_ddp || settings.models.enable_fsdp {
         notes.push(
             format!(
@@ -3005,8 +3425,8 @@ fn training_runtime_profile(
         capability_state: config.capability_state,
         symbol: symbol.to_string(),
         base_timeframe: base_tf.to_string(),
-        feature_count: payload.frame.width(),
-        dataset_rows: payload.frame.height(),
+        feature_count: payload.frame.n_features(),
+        dataset_rows: payload.frame.n_samples(),
         row_budget_applied,
         label_horizon_bars: settings.models.label_horizon_bars,
         effective_label_horizon_bars,
@@ -3038,12 +3458,8 @@ fn training_runtime_profile(
         requested_hpo_trials: hpo_trials_from_params(&config.params),
         holdout_pct: holdout_pct_from_params(&config.params),
         embargo_minutes: embargo_minutes_from_params(&config.params),
-        rllib_requested,
-        rllib_num_workers: parse_usize_param(
-            &config.params,
-            "rllib_num_workers",
-            settings.models.rllib_num_workers,
-        ),
+        rllib_requested: false,
+        rllib_num_workers: 0,
         ray_tune_max_concurrency: parse_usize_param(
             &config.params,
             "ray_tune_max_concurrency",
@@ -3061,25 +3477,7 @@ fn training_profile_higher_timeframes(
     settings: &neoethos_core::Settings,
     base_tf: &str,
 ) -> Vec<String> {
-    if settings.system.multi_resolution_enabled
-        && !settings.system.multi_resolution_timeframes.is_empty()
-    {
-        settings
-            .system
-            .multi_resolution_timeframes
-            .iter()
-            .filter(|tf| !tf.eq_ignore_ascii_case(base_tf))
-            .cloned()
-            .collect()
-    } else {
-        settings
-            .system
-            .higher_timeframes
-            .iter()
-            .filter(|tf| !tf.eq_ignore_ascii_case(base_tf))
-            .cloned()
-            .collect()
-    }
+    settings.system.resolve_higher_timeframes(base_tf)
 }
 
 fn write_training_profile_sidecar(
@@ -3529,23 +3927,24 @@ fn build_expert_model(
             // currently treats both as ModelType::CatBoost; the
             // alt-variant gets its own offset in a follow-up.
             let seeded = inject_tree_seed(params, "random_seed", 5);
-            let mut model = CatBoostExpert::new(0);
-            model.config.params = parse_tree_params(&seeded);
-            Ok(Box::new(model))
+            Ok(Box::new(CatBoostExpert::new_with_params(
+                0,
+                parse_tree_params(&seeded),
+            )))
         }
         ModelType::ElasticNet => {
             let mut model = ElasticNetExpert::new(
                 parse_f64_param(params, "alpha", 0.1),
                 parse_f64_param(params, "l1_ratio", 0.5),
             );
-            model.learning_rate = parse_f32_param(params, "lr", model.learning_rate);
+            model.learning_rate = parse_f64_param(params, "lr", model.learning_rate);
             model.epochs = parse_usize_param(params, "epochs", model.epochs);
             Ok(Box::new(model))
         }
         ModelType::Logistic => {
             let mut model = LogisticExpert::new();
-            model.alpha = parse_f32_param(params, "alpha", model.alpha);
-            model.learning_rate = parse_f32_param(params, "lr", model.learning_rate);
+            model.alpha = parse_f64_param(params, "alpha", model.alpha);
+            model.learning_rate = parse_f64_param(params, "lr", model.learning_rate);
             model.epochs = parse_usize_param(params, "epochs", model.epochs);
             Ok(Box::new(model))
         }
@@ -3560,7 +3959,7 @@ fn build_expert_model(
         ModelType::ConformalGate => {
             let mut model = ConformalPredictionExpert::new(
                 calibration_method_from_params(params),
-                parse_f32_param(params, "alpha", 0.10),
+                parse_f64_param(params, "alpha", 0.10),
             );
             model.min_prediction_set =
                 parse_usize_param(params, "min_prediction_set", model.min_prediction_set);
@@ -3570,7 +3969,7 @@ fn build_expert_model(
         ModelType::MetaStack => {
             let mut model = MetaDecisionStack::new(
                 calibration_method_from_params(params),
-                parse_f32_param(params, "alpha", 0.10),
+                parse_f64_param(params, "alpha", 0.10),
             );
             model.min_prediction_set =
                 parse_usize_param(params, "min_prediction_set", model.min_prediction_set);
@@ -4094,15 +4493,22 @@ fn enforce_planned_resource_caps(params: &mut HashMap<String, String>) {
 fn select_hpo_dataset(
     payload: &TrainingPayload,
     max_rows: usize,
-) -> Result<(DataFrame, Vec<i32>, Option<usize>)> {
-    if payload.frame.height() != payload.labels.len() {
+) -> Result<(FeatureFrame, Vec<i32>, Option<usize>)> {
+    if payload.frame.n_samples() != payload.labels.len() {
         anyhow::bail!(
             "HPO payload mismatch: {} rows vs {} labels",
-            payload.frame.height(),
+            payload.frame.n_samples(),
             payload.labels.len()
         );
     }
-    if max_rows == 0 || payload.frame.height() <= max_rows {
+    if payload.source_row_indices.len() != payload.labels.len() {
+        anyhow::bail!(
+            "HPO payload source receipt mismatch: {} rows vs {} receipts",
+            payload.labels.len(),
+            payload.source_row_indices.len()
+        );
+    }
+    if max_rows == 0 || payload.frame.n_samples() <= max_rows {
         return Ok((
             payload.frame.as_ref().clone(),
             payload.labels.as_ref().clone(),
@@ -4110,25 +4516,17 @@ fn select_hpo_dataset(
         ));
     }
 
-    let start = payload.frame.height().saturating_sub(max_rows);
-    let frame = payload.frame.slice(start as i64, max_rows);
-    let labels = payload
-        .labels
-        .iter()
-        .skip(start)
-        .take(max_rows)
-        .copied()
-        .collect::<Vec<_>>();
+    let start = payload.frame.n_samples().saturating_sub(max_rows);
+    let frame = payload.frame.row_window(start, payload.frame.n_samples())?;
+    let labels = payload.labels[start..].to_vec();
     Ok((frame, labels, Some(max_rows)))
 }
 
 /// Row-gather helper for the non-contiguous CombinatorialPurgedCV index sets
 /// (the purged train fold is a union of groups with holes from purge/embargo,
 /// so a contiguous `slice` cannot express it).
-fn take_frame_rows(frame: &DataFrame, idx: &[usize]) -> Result<DataFrame> {
-    let indices: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
-    let ca = Series::new("__cpcv_idx".into(), indices).u32()?.clone();
-    Ok(frame.take(&ca)?)
+fn take_frame_rows(frame: &FeatureFrame, idx: &[usize]) -> Result<FeatureFrame> {
+    frame.select_rows(idx)
 }
 
 /// Stage 1(c): score each HPO candidate with CombinatorialPurgedCV instead of a
@@ -4142,12 +4540,13 @@ fn take_frame_rows(frame: &DataFrame, idx: &[usize]) -> Result<DataFrame> {
 #[allow(clippy::too_many_arguments)]
 fn optimize_model_config_cpcv(
     config: &ModelConfig,
-    hpo_frame: &DataFrame,
+    hpo_frame: &FeatureFrame,
     hpo_labels: &[i32],
+    lease: &CpuLease,
     backend: &str,
     trials_requested: usize,
     base_params: &HashMap<String, String>,
-    confidence_threshold: f32,
+    confidence_threshold: f64,
     metric_weight: f64,
     accuracy_weight: f64,
     row_budget_applied: Option<usize>,
@@ -4158,7 +4557,7 @@ fn optimize_model_config_cpcv(
     const EMBARGO_PCT: f64 = 0.02;
     const PURGE_PCT: f64 = 0.01;
 
-    let n = hpo_frame.height();
+    let n = hpo_frame.n_samples();
     let cv = neoethos_search::CombinatorialPurgedCV::new(
         N_SPLITS,
         N_TEST_GROUPS,
@@ -4206,23 +4605,23 @@ fn optimize_model_config_cpcv(
             let train_labels: Vec<i32> = train_idx.iter().map(|&i| hpo_labels[i]).collect();
             let test_labels: Vec<i32> = test_idx.iter().map(|&i| hpo_labels[i]).collect();
 
-            let mut model = match build_expert_model(config, hpo_frame.width(), &candidate_params) {
-                Ok(model) => model,
-                Err(error) => {
-                    fold_error = Some(error.to_string());
-                    break;
-                }
-            };
-            let train_labels_series = labels_to_series(&train_labels);
-            let test_labels_series = labels_to_series(&test_labels);
+            let mut model =
+                match build_expert_model(config, hpo_frame.n_features(), &candidate_params) {
+                    Ok(model) => model,
+                    Err(error) => {
+                        fold_error = Some(error.to_string());
+                        break;
+                    }
+                };
             match model
                 .fit_with_validation(
                     &train_frame,
-                    &train_labels_series,
+                    &train_labels,
                     Some(&test_frame),
-                    Some(&test_labels_series),
+                    Some(&test_labels),
+                    lease,
                 )
-                .and_then(|_| model.predict_proba(&test_frame))
+                .and_then(|_| model.predict_proba(&test_frame, lease))
             {
                 Ok(probabilities) => {
                     let metrics = evaluate_prediction_quality(
@@ -4334,6 +4733,7 @@ fn optimize_model_config_cpcv(
 fn optimize_model_config(
     config: &ModelConfig,
     payload: &TrainingPayload,
+    lease: &CpuLease,
     base_tf: &str,
     row_budget_applied: Option<usize>,
 ) -> Result<(HashMap<String, String>, OptimizationReport)> {
@@ -4362,6 +4762,7 @@ fn optimize_model_config(
             config,
             &hpo_frame,
             &hpo_labels,
+            lease,
             &backend,
             trials_requested,
             &base_params,
@@ -4405,7 +4806,7 @@ fn optimize_model_config(
             trials_requested,
             trials_completed: 0,
             holdout_pct,
-            train_rows: hpo_frame.height(),
+            train_rows: hpo_frame.n_samples(),
             val_rows: 0,
             selected_trial_index: 0,
             selected_params: base_params.clone(),
@@ -4437,23 +4838,22 @@ fn optimize_model_config(
             )
         };
 
-        let mut model = match build_expert_model(config, payload.frame.width(), &candidate_params) {
-            Ok(model) => model,
-            Err(error) => {
-                trials.push(OptimizationTrialRecord {
-                    index: trial_idx,
-                    backend: backend.clone(),
-                    params: candidate_params,
-                    metrics: None,
-                    error: Some(error.to_string()),
-                    selected: false,
-                });
-                continue;
-            }
-        };
+        let mut model =
+            match build_expert_model(config, payload.frame.n_features(), &candidate_params) {
+                Ok(model) => model,
+                Err(error) => {
+                    trials.push(OptimizationTrialRecord {
+                        index: trial_idx,
+                        backend: backend.clone(),
+                        params: candidate_params,
+                        metrics: None,
+                        error: Some(error.to_string()),
+                        selected: false,
+                    });
+                    continue;
+                }
+            };
 
-        let train_labels_series = labels_to_series(&train_labels);
-        let val_labels_series = labels_to_series(&val_labels);
         // M5/M6/M7: forward the explicit HPO val frame through to models
         // that support val-based early stopping (Burn deep learners,
         // gradient boosters, anomaly detectors). Models that do not opt in
@@ -4462,11 +4862,12 @@ fn optimize_model_config(
         match model
             .fit_with_validation(
                 &train_frame,
-                &train_labels_series,
+                &train_labels,
                 Some(&val_frame),
-                Some(&val_labels_series),
+                Some(&val_labels),
+                lease,
             )
-            .and_then(|_| model.predict_proba(&val_frame))
+            .and_then(|_| model.predict_proba(&val_frame, lease))
         {
             Ok(probabilities) => {
                 let metrics = evaluate_prediction_quality(
@@ -4531,8 +4932,8 @@ fn optimize_model_config(
         trials_requested,
         trials_completed,
         holdout_pct,
-        train_rows: train_frame.height(),
-        val_rows: val_frame.height(),
+        train_rows: train_frame.n_samples(),
+        val_rows: val_frame.n_samples(),
         selected_trial_index: best_trial_index,
         selected_params: best_params.clone(),
         selected_metrics: best_metrics,
@@ -4547,7 +4948,7 @@ fn optimize_model_config(
 
 /// v0.5 ML-integration Stage 1(b): per-(symbol,TF) overfit gate + tree-budget
 /// scaling for the heavy gradient boosters, applied at train time where the
-/// real bar count (`payload.frame.height()`) is known. No-op when
+/// real bar count (`payload.frame.n_samples()`) is known. No-op when
 /// `regularized_model_defaults` is off or the model is not one of the heavy
 /// boosters (xgboost/xgboost_rf/xgboost_dart/lightgbm/catboost/catboost_alt).
 ///
@@ -4668,11 +5069,10 @@ fn train_model_dispatch(
     row_budget_applied: Option<usize>,
     config: &ModelConfig,
     payload: &TrainingPayload,
-    // Pre-built `(log_return, log_volatility)` observation matrix for the
-    // HMM regime model (derived from raw OHLCV in `train_symbol_with_progress`
-    // — the payload here only carries the feature frame). `Err(reason)` when
-    // the OHLCV couldn't produce observations; surfaced loudly if hmm_regime
-    // is actually dispatched.
+    lease: &CpuLease,
+    // Pre-built exact `(quant_log_return, quant_log_volatility)` observations
+    // from the versioned feature frame before generic feature selection.
+    // `Err(reason)` is surfaced loudly only if hmm_regime is dispatched.
     hmm_observations: &std::result::Result<ndarray::Array2<f64>, String>,
 ) -> Result<()> {
     let artifact_dir = model_artifact_dir(models_dir, symbol, base_tf, &config.name);
@@ -4680,10 +5080,10 @@ fn train_model_dispatch(
     if uses_shared_expert_dispatch(config.model_type) {
         // Stage 1(b): apply the bar-count overfit gate BEFORE HPO so the
         // selection respects the gated budget.
-        let gated = apply_overfit_overrides(settings, config, payload.frame.height());
+        let gated = apply_overfit_overrides(settings, config, payload.frame.n_samples());
         let config = &gated;
         let (selected_params, optimization_report) =
-            optimize_model_config(config, payload, base_tf, row_budget_applied)?;
+            optimize_model_config(config, payload, lease, base_tf, row_budget_applied)?;
         let effective_config = ModelConfig {
             name: config.name.clone(),
             model_type: config.model_type,
@@ -4691,9 +5091,11 @@ fn train_model_dispatch(
             capability_state: config.capability_state,
             params: selected_params.clone(),
         };
-        let labels = labels_to_series(payload.labels.as_ref());
-        let mut model =
-            build_expert_model(&effective_config, payload.frame.width(), &selected_params)?;
+        let mut model = build_expert_model(
+            &effective_config,
+            payload.frame.n_features(),
+            &selected_params,
+        )?;
         // M3: After HPO selects best params on a train/val split, the standard
         // ML practice is to refit on the FULL dataset with those params for
         // production deployment. We do that here, but we also stamp the
@@ -4705,12 +5107,12 @@ fn train_model_dispatch(
         tracing::info!(
             target: "neoethos_models::training",
             model = %config.name,
-            full_refit_rows = payload.frame.height(),
+            full_refit_rows = payload.frame.n_samples(),
             hpo_train_rows = optimization_report.train_rows,
             hpo_val_rows = optimization_report.val_rows,
             "post-HPO full-data refit (val rows were used for HPO selection only)"
         );
-        model.fit(payload.frame.as_ref(), &labels)?;
+        model.fit(payload.frame.as_ref(), payload.labels.as_ref(), lease)?;
         persist_training_artifacts(
             &artifact_dir,
             settings,
@@ -4725,12 +5127,10 @@ fn train_model_dispatch(
         return Ok(());
     }
 
-    let labels = labels_to_series(payload.labels.as_ref());
-
     match config.model_type {
         ModelType::SklearsTree => {
             let mut model = SklearsTreeExpert::new();
-            model.fit(payload.frame.as_ref(), &labels)?;
+            model.fit(payload.frame.as_ref(), payload.labels.as_ref(), lease)?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
@@ -4746,9 +5146,12 @@ fn train_model_dispatch(
         }
         ModelType::ExitAgent => {
             let mut model = ExitAgent::with_hidden_dim(
-                payload.frame.width().max(1),
+                payload.frame.n_features().max(1),
                 parse_usize_param(&config.params, "hidden_dim", 64),
             )
+            .with_device_policy(
+                parse_string_param(&config.params, "device").unwrap_or_else(|| "auto".to_string()),
+            )?
             .with_gamma(parse_f32_param(&config.params, "gamma", 0.99))
             .with_epsilon(parse_f32_param(&config.params, "epsilon", 0.20))
             .with_exploration_schedule(
@@ -4758,7 +5161,7 @@ fn train_model_dispatch(
             .with_memory_capacity(parse_usize_param(&config.params, "memory_capacity", 10_000))
             .with_reward_horizon(parse_usize_param(&config.params, "reward_horizon", 0))
             .with_warmup_steps(parse_usize_param(&config.params, "warmup_steps", 0));
-            model.fit_from_frame(payload.frame.as_ref(), &labels)?;
+            model.fit_from_frame(payload.frame.as_ref(), payload.labels.as_ref(), lease)?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
@@ -4774,9 +5177,12 @@ fn train_model_dispatch(
         }
         ModelType::SacAgent => {
             let mut model = SoftActorCritic::with_hidden_dim(
-                payload.frame.width().max(1),
+                payload.frame.n_features().max(1),
                 parse_usize_param(&config.params, "hidden_dim", 256),
             )
+            .with_device_policy(
+                parse_string_param(&config.params, "device").unwrap_or_else(|| "auto".to_string()),
+            )?
             .with_gamma(parse_f32_param(&config.params, "gamma", 0.99))
             .with_tau(parse_f32_param(&config.params, "tau", 0.01))
             .with_learning_rate(parse_f64_param(&config.params, "learning_rate", 3e-4))
@@ -4793,7 +5199,7 @@ fn train_model_dispatch(
                 parse_usize_param(&config.params, "reward_horizon", 0),
                 parse_usize_param(&config.params, "episode_len", 0),
             );
-            model.train_on_frame(payload.frame.as_ref(), &labels)?;
+            model.train_on_frame(payload.frame.as_ref(), payload.labels.as_ref(), lease)?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
@@ -4841,7 +5247,7 @@ fn train_model_dispatch(
                         .unwrap_or_else(|| "auto".to_string()),
                     parse_usize_param(&config.params, "parallel_envs", 1),
                     parse_usize_param(&config.params, "eval_episodes", 8),
-                    parse_usize_param(&config.params, "rllib_num_workers", 0),
+                    0,
                     parse_usize_param(&config.params, "ray_tune_max_concurrency", 1),
                 )
                 .with_episode_layout(
@@ -4858,7 +5264,7 @@ fn train_model_dispatch(
                     model = model.with_hidden_dims(parsed);
                 }
             }
-            model.train_on_frame(payload.frame.as_ref(), &labels)?;
+            model.train_on_frame(payload.frame.as_ref(), payload.labels.as_ref(), lease)?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
@@ -4922,7 +5328,7 @@ fn train_model_dispatch(
                 "interpretability_needed",
                 model.config.interpretability_needed,
             );
-            model.fit_from_frame(payload.frame.as_ref(), &labels, symbol)?;
+            model.fit_from_frame(payload.frame.as_ref(), symbol, lease)?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
@@ -4947,11 +5353,16 @@ fn train_model_dispatch(
                      observations from the base OHLCV: {reason}"
                 ),
             };
-            let model = RegimeHmmExpert::train(
-                observations,
-                vec!["log_return".to_string(), "log_volatility".to_string()],
-                HmmRegimeConfig::default(),
-            )?;
+            let model = lease.scope(|| {
+                RegimeHmmExpert::train(
+                    observations,
+                    vec![
+                        "quant_log_return".to_string(),
+                        "quant_log_volatility".to_string(),
+                    ],
+                    HmmRegimeConfig::default(),
+                )
+            })?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
@@ -4972,10 +5383,6 @@ fn train_model_dispatch(
                 parse_usize_param(&config.params, "max_indicators", 8),
             )?
             .with_portfolio_size(parse_usize_param(&config.params, "portfolio_size", 12))
-            .with_history_window(
-                parse_usize_param(&config.params, "train_years", 0),
-                parse_usize_param(&config.params, "val_years", 0),
-            )
             .with_search_policy(
                 parse_parent_selection_policy(&config.params),
                 parse_survivor_selection_policy(&config.params),
@@ -4984,7 +5391,12 @@ fn train_model_dispatch(
                 parse_f64_param(&config.params, "selection_temperature", 0.75),
                 parse_usize_param(&config.params, "tournament_size", 3),
             );
-            model.fit(payload.frame.as_ref(), &labels, None, Some(symbol))?;
+            model.fit(
+                payload.frame.as_ref(),
+                payload.labels.as_ref(),
+                Some(symbol),
+                lease,
+            )?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
@@ -5038,6 +5450,105 @@ mod tests {
         ))
     }
 
+    fn test_training_payload(
+        matrix: ndarray::Array2<f64>,
+        feature_names: Vec<String>,
+        labels: Vec<i32>,
+    ) -> TrainingPayload {
+        let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(matrix.nrows());
+        let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+            timestamps,
+            feature_names,
+            matrix,
+        )
+        .expect("build typed test feature frame");
+        TrainingPayload::from_frame(frame, labels).expect("build typed training payload")
+    }
+
+    fn validity_test_column(
+        name: &str,
+        rows: usize,
+        valid_from: usize,
+        invalid_every: Option<usize>,
+    ) -> neoethos_data::FeatureColumnF64 {
+        let mut values = Vec::with_capacity(rows);
+        let mut validity = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let valid = row >= valid_from
+                && invalid_every.is_none_or(|stride| (row - valid_from) % stride != 0);
+            if valid {
+                values.push(row as f64);
+                validity.push(neoethos_data::FeatureCellValidity::Valid);
+            } else {
+                values.push(f64::NAN);
+                validity.push(neoethos_data::FeatureCellValidity::Warmup);
+            }
+        }
+        neoethos_data::FeatureColumnF64::new(name, values, validity)
+            .expect("build typed validity test column")
+    }
+
+    #[test]
+    fn dense_training_suffix_maximizes_valid_cells_and_preserves_required_hmm_inputs() {
+        let rows = 1_000;
+        let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(rows);
+        let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            timestamps,
+            vec![
+                validity_test_column("quant_log_return", rows, 1, None),
+                validity_test_column("quant_log_volatility", rows, 2, None),
+                validity_test_column("dense_signal", rows, 100, None),
+                validity_test_column("intermittent_signal", rows, 0, Some(2)),
+                validity_test_column("never_valid", rows, rows, None),
+            ],
+        )
+        .expect("build dense suffix fixture");
+
+        let projected =
+            project_dense_training_suffix(&frame).expect("project exact dense training suffix");
+        assert_eq!(projected.row_start, 100);
+        assert_eq!(projected.dropped_columns, 2);
+        assert_eq!(projected.frame.n_samples(), 900);
+        assert_eq!(
+            projected.frame.names,
+            vec!["quant_log_return", "quant_log_volatility", "dense_signal"]
+        );
+        for feature in 0..projected.frame.n_features() {
+            assert!(
+                projected
+                    .frame
+                    .feature_column(feature)
+                    .expect("projected column")
+                    .validity
+                    .iter()
+                    .all(|cell| cell.is_valid())
+            );
+        }
+    }
+
+    #[test]
+    fn dense_training_suffix_fails_when_a_required_hmm_input_has_too_little_support() {
+        let rows = 1_000;
+        let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(rows);
+        let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            timestamps,
+            vec![
+                validity_test_column("quant_log_return", rows, 1, None),
+                validity_test_column("quant_log_volatility", rows, 501, None),
+                validity_test_column("dense_signal", rows, 0, None),
+            ],
+        )
+        .expect("build insufficient-support fixture");
+
+        let error = project_dense_training_suffix(&frame)
+            .expect_err("required HMM support below 500 rows must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("quant_log_volatility` has only 499 trailing valid rows")
+        );
+    }
+
     fn persist_sample_tree_training_artifacts(name: &str) -> PathBuf {
         let settings = neoethos_core::Settings::default();
         let config = ModelConfig {
@@ -5050,17 +5561,11 @@ mod tests {
                 ("__planned_device".to_string(), "cpu".to_string()),
             ]),
         };
-        let payload = TrainingPayload::from_named_dense(
-            ndarray::arr2(&[
-                [1.0_f32, 0.1_f32],
-                [1.1_f32, 0.2_f32],
-                [1.2_f32, 0.3_f32],
-                [1.3_f32, 0.4_f32],
-            ]),
-            vec![0, 1, 0, 1],
+        let payload = test_training_payload(
+            ndarray::arr2(&[[1.0, 0.1], [1.1, 0.2], [1.2, 0.3], [1.3, 0.4]]),
             vec!["return_1".to_string(), "volatility_3".to_string()],
-        )
-        .expect("build payload");
+            vec![0, 1, 0, 1],
+        );
         let artifact_dir = unique_test_dir(name);
 
         persist_training_artifacts(
@@ -5489,6 +5994,24 @@ mod tests {
         assert_eq!(labels[0], 1);
     }
 
+    #[test]
+    fn derive_labels_rejects_an_empty_symbol_identity_before_geometry_work() {
+        let orchestrator = orchestrator_with_models(&["lightgbm"]);
+        let ohlcv = Ohlcv {
+            timestamp: Some(Vec::new()),
+            open: Vec::new(),
+            high: Vec::new(),
+            low: Vec::new(),
+            close: Vec::new(),
+            volume: None,
+        };
+
+        let error = orchestrator
+            .derive_labels_test_oracle(&ohlcv, " ", 0.0001)
+            .expect_err("empty symbol identity must fail closed");
+        assert!(error.to_string().contains("bounded symbol identity"));
+    }
+
     /// A move that clears the target but not the target plus the spread.
     ///
     /// The barriers used to sit at `close +/- distance` and charge nothing, so
@@ -5498,9 +6021,9 @@ mod tests {
     /// nobody asks.
     ///
     /// Sizes are explicit rather than derived so the arithmetic is checkable:
-    /// EURUSD pip is 0.0001, spread 1.5 + slippage 0.5 = 2.0 pips = 0.0002 in
-    /// price, and the target sits 0.0010 above entry. The series peaks at
-    /// +0.0011 — past the bare target, short of target-plus-cost at 0.0012.
+    /// EURUSD pip is 0.0001, spread 1.5 + two 0.5-pip slippage fills = 2.5
+    /// pips = 0.00025 in price, and the target sits 0.0010 above entry. The
+    /// series peaks at +0.0011 — past the bare target, short of target-plus-cost.
     #[test]
     fn a_move_that_does_not_clear_the_spread_is_not_a_win() {
         let mut orchestrator = orchestrator_with_models(&["lightgbm"]);
@@ -5536,7 +6059,7 @@ mod tests {
             .expect("aligned OHLCV should derive labels");
         assert_ne!(
             labels[0], 1,
-            "a move of 11 pips against a 10-pip target and a 2-pip round trip is not a              win — the label is charging nothing and the gene side is charging 2.0"
+            "a move of 11 pips against a 10-pip target and a 2.5-pip round trip is not a             win — the label must charge both slippage fills"
         );
 
         // Guard the guard: with the cost removed the same series IS a win, so
@@ -5769,7 +6292,7 @@ mod tests {
 
         let error = orchestrator
             .derive_labels(&malformed, "UNKNOWN-SYMBOL")
-            .expect_err("production labels must require exact broker evidence");
+            .expect_err("production labels must require broker-gated evidence");
         assert!(
             error
                 .to_string()
@@ -5796,9 +6319,11 @@ mod tests {
             .iter()
             .find(|c| c.name == "lightgbm")
             .expect("lightgbm config present");
-        let payload =
-            TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 1)), vec![0, 0, 0, 0])
-                .expect("build payload");
+        let payload = test_training_payload(
+            ndarray::Array2::<f64>::zeros((4, 1)),
+            vec!["feature_0".to_string()],
+            vec![0, 0, 0, 0],
+        );
 
         let geometry = resolve_label_geometry(&orchestrator.settings)
             .expect("default settings resolve a label geometry");
@@ -5834,50 +6359,42 @@ mod tests {
     }
 
     #[test]
-    fn dqn_backend_param_is_honest_rlkit_not_bare_rllib_when_rllib_requested() {
-        let mut orchestrator = orchestrator_with_models(&["dqn"]);
-        // Operator explicitly asks for the (non-existent in Rust) RLlib/Ray agent.
-        orchestrator.settings.models.use_rllib_agent = true;
+    fn every_legacy_rllib_request_fails_before_dispatch() {
+        let mut explicit = orchestrator_with_models(&["dqn"]);
+        explicit.settings.models.use_rllib_agent = true;
 
-        let params = orchestrator.default_model_params("dqn");
+        let mut automatic = orchestrator_with_models(&["dqn"]);
+        automatic.settings.models.auto_enable_rllib = true;
 
-        // The effective backend must be the truthful native `rlkit`, NEVER a bare
-        // "rllib" label that implies a Ray backend that does not exist here.
-        assert_eq!(
-            params.get("backend").map(String::as_str),
-            Some("rlkit"),
-            "dqn backend must resolve to the honest rlkit backend, not a bare rllib claim"
-        );
-        assert_ne!(
-            params.get("backend").map(String::as_str),
-            Some("rllib"),
-            "a bare rllib backend label is misleading (no Ray runtime exists in this build)"
-        );
-        // The honest request-vs-effective degradation signal must be carried so the
-        // runtime profile/artifact can record it.
-        assert_eq!(
-            params.get("__rllib_requested").map(String::as_str),
-            Some("true"),
-            "rllib request must be recorded as a degradation marker"
-        );
+        let mut worker_request = orchestrator_with_models(&["dqn"]);
+        worker_request.settings.models.rllib_num_workers = 2;
+
+        for orchestrator in [explicit, automatic, worker_request] {
+            let error = orchestrator
+                .create_dispatch_plan()
+                .expect_err("legacy RLlib configuration must fail before dispatch");
+            assert_eq!(error.to_string(), LEGACY_RLLIB_MIGRATION_ERROR_V1);
+        }
     }
 
     #[test]
-    fn training_runtime_profile_records_rllib_degradation_reason() {
+    fn dqn_uses_explicit_native_rlkit_without_rllib_degradation() {
         let orchestrator = orchestrator_with_models(&["dqn"]);
+        let params = orchestrator.default_model_params("dqn");
+        assert_eq!(params.get("backend").map(String::as_str), Some("rlkit"));
+
         let config = ModelConfig {
             name: "dqn".to_string(),
             model_type: ModelType::Dqn,
             capability_family: crate::runtime::capabilities::ModelFamily::Rl,
             capability_state: CapabilityState::Implemented,
-            params: HashMap::from([
-                ("backend".to_string(), "rlkit".to_string()),
-                ("__rllib_requested".to_string(), "true".to_string()),
-            ]),
+            params,
         };
-        let payload =
-            TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 1)), vec![0, 0, 0, 0])
-                .expect("build payload");
+        let payload = test_training_payload(
+            ndarray::Array2::<f64>::zeros((4, 1)),
+            vec!["feature_0".to_string()],
+            vec![0, 0, 0, 0],
+        );
 
         let geometry = resolve_label_geometry(&orchestrator.settings)
             .expect("default settings resolve a label geometry");
@@ -5892,19 +6409,12 @@ mod tests {
             &geometry,
         );
 
-        // The effective/requested backend recorded is the honest rlkit, not rllib.
         assert_eq!(profile.requested_backend.as_deref(), Some("rlkit"));
+        assert!(!profile.rllib_requested);
+        assert_eq!(profile.rllib_num_workers, 0);
         assert!(
-            profile.rllib_requested,
-            "rllib request must still be flagged on the profile via the __rllib_requested marker"
-        );
-        // An honest degradation note must be recorded; it must NOT claim rllib ran.
-        assert!(
-            profile
-                .notes
-                .iter()
-                .any(|note| note.contains("rllib") && note.contains("unavailable")),
-            "profile must record the honest rllib-unavailable degradation reason; notes were: {:?}",
+            profile.notes.iter().all(|note| !note.contains("rllib")),
+            "native rlkit must not carry an RLlib degradation note: {:?}",
             profile.notes
         );
     }

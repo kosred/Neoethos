@@ -212,7 +212,11 @@ pub fn compute_stats(trades: &[ClosedTrade], equity: &[EquitySample]) -> Journal
     if s.losses > 0 && s.avg_loss != 0.0 {
         s.payoff_ratio = Some(s.avg_win / s.avg_loss.abs());
     }
-    s.largest_win = if largest_win.is_finite() { largest_win } else { 0.0 };
+    s.largest_win = if largest_win.is_finite() {
+        largest_win
+    } else {
+        0.0
+    };
     s.largest_loss = if largest_loss.is_finite() {
         largest_loss
     } else {
@@ -337,7 +341,10 @@ mod tests {
             account_id: None,
             environment: None,
         };
-        let s = compute_stats(&[], &[eq(1, 100.0), eq(2, 110.0), eq(3, 90.0), eq(4, 120.0)]);
+        let s = compute_stats(
+            &[],
+            &[eq(1, 100.0), eq(2, 110.0), eq(3, 90.0), eq(4, 120.0)],
+        );
         assert!((s.max_drawdown_abs - 20.0).abs() < 1e-9);
         assert!((s.max_drawdown_pct - (20.0 / 110.0 * 100.0)).abs() < 1e-9);
     }

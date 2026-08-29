@@ -220,10 +220,12 @@ void cora_wave_ms1p_wma_time_major_f32(const float* __restrict__ y_tm,
 // disagree with the CPU on exactly one side of that threshold, so both are
 // here, keyed on the same n.
 //
-// The weight vector is REGENERATED inside the dot loop by the same sequence
-// of multiplies the CPU uses to build it (:368-373), so no per-thread weight
-// array exists. The only per-thread array is the smoothing ring, whose length
-// is round(sqrt(period)); CORA_WAVE_NEO_MAX_M bounds it and
+// Gate203 caught the first valid row differing by one bit:
+// CPU 0x3ff1333a931db83d versus CUDA 0x3ff1333a931db83e. The cause was separate
+// host powf and libdevice pow coefficient construction. The exact RedK
+// compound-ratio weights are now built once by the CPU authority and retained
+// by the resident launch. The only per-thread array here is the smoothing ring,
+// whose length is round(sqrt(period)); CORA_WAVE_NEO_MAX_M bounds it and
 // F64Kernel::max_period REFUSES a larger period by name.
 // ===========================================================================
 
@@ -234,12 +236,29 @@ static __forceinline__ __device__ double cora_wave_neo_qnan() {
     return __longlong_as_double(0x7ff8000000000000ULL);
 }
 
+// Gate208 advanced past the coefficient repair and caught the next rolling
+// output at CPU 0x3ff1334448be5cc8 versus CUDA 0x3ff1334448be5cc7.
+// Make both contractions explicit instead of leaving the recurrence to the
+// host and device compilers.
+static __forceinline__ __device__ double cora_wave_roll_forward_exact_v1(
+    double previous,
+    double inv_r,
+    double a_old,
+    double x_old,
+    double w_last,
+    double x_new) {
+    const double without_old = fma(-a_old, x_old, previous * inv_r);
+    return fma(w_last, x_new, without_old);
+}
+
 extern "C" __global__
 void cora_wave_neo_batch_f64(const double* __restrict__ data,
                              int n,
                              const int* __restrict__ periods,
                              int n_combos,
                              int first_valid,
+                             const double* __restrict__ exact_coefficients,
+                             const int coefficient_stride,
                              double* __restrict__ out) {
     const int combo = blockIdx.x * blockDim.x + threadIdx.x;
     if (combo >= n_combos) return;
@@ -249,7 +268,6 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
     const double nn = cora_wave_neo_qnan();
 
     const int p = periods[combo];
-    const double r_multi = 2.0;  // ma_batch.rs:962
 
     // cora_wave_prepare, :325-328 -- !is_nan, which is what
     // F64FirstValidRule::AllInputsNonNan resolves to for a single close
@@ -262,38 +280,21 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
     if (p <= 0 || p > n) refused = true;                     // :339
     if (!refused && (n - first) < p) refused = true;         // :345
     if (p > CORA_WAVE_NEO_MAX_PERIOD) refused = true;
+    if (coefficient_stride <= p) refused = true;
 
     if (refused) {
         for (int i = 0; i < n; ++i) row[i] = nn;
         return;
     }
 
-    // :356-374 -- the geometric weight ladder. w0, w1 and w_last are the three
-    // the rolling update needs; the rest are regenerated below.
-    const double start_wt = 0.01;
-    double base = 0.0;
-    double inv_wsum;
-    double w0, w1 = 0.0, w_last;
-    if (p == 1) {
-        w0 = 1.0;
-        w_last = 1.0;
-        inv_wsum = 1.0;
-    } else {
-        const double end_wt = (double)p;
-        const double r = pow(end_wt / start_wt, 1.0 / ((double)p - 1.0)) - 1.0;
-        base = 1.0 + r * r_multi;
-        double sum = 0.0;
-        double w = start_wt * base;
-        w0 = w;
-        w_last = w;
-        for (int j = 0; j < p; ++j) {
-            if (j == 1) w1 = w;
-            sum += w;
-            w_last = w;
-            w *= base;
-        }
-        inv_wsum = 1.0 / sum;
-    }
+    // Exact oldest-to-newest weights and normalization come from the one CPU
+    // authority. The final stride element is reserved for inv_wsum.
+    const double* __restrict__ weights =
+        exact_coefficients + (size_t)combo * (size_t)coefficient_stride;
+    const double inv_wsum = weights[coefficient_stride - 1];
+    const double w0 = weights[0];
+    const double w1 = p == 1 ? 1.0 : weights[1];
+    const double w_last = weights[p - 1];
 
     // :377-381 -- smooth is true at every row, so m = max(round(sqrt(p)), 1).
     int m = (int)round(sqrt((double)p));
@@ -329,17 +330,16 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
         // (acc0+acc1)+(acc2+acc3). The pairing is load-bearing.
         double acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
         const int end4 = p & ~3;
-        double wj = start_wt * base;
         int j = 0;
         while (j < end4) {
             const double x0 = data[start0 + j];
             const double x1 = data[start0 + j + 1];
             const double x2 = data[start0 + j + 2];
             const double x3 = data[start0 + j + 3];
-            const double y0 = wj; wj *= base;
-            const double y1 = wj; wj *= base;
-            const double y2 = wj; wj *= base;
-            const double y3 = wj; wj *= base;
+            const double y0 = weights[j];
+            const double y1 = weights[j + 1];
+            const double y2 = weights[j + 2];
+            const double y3 = weights[j + 3];
             acc0 = fma(x0, y0, acc0);
             acc1 = fma(x1, y1, acc1);
             acc2 = fma(x2, y2, acc2);
@@ -349,7 +349,7 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
         double S = (acc0 + acc1) + (acc2 + acc3);
         while (j < p) {
             const double x = data[start0 + j];
-            const double y = wj; wj *= base;
+            const double y = weights[j];
             S = fma(x, y, S);
             ++j;
         }
@@ -359,7 +359,7 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
         while (i + 1 < n) {
             const double x_old = data[i + 1 - p];
             const double x_new = data[i + 1];
-            S = (S * inv_R) - a_old * x_old + w_last * x_new;
+            S = cora_wave_roll_forward_exact_v1(S, inv_R, a_old, x_old, w_last, x_new);
             row[i + 1] = S * inv_wsum;
             ++i;
         }
@@ -432,17 +432,16 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
 
     double acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
     const int end4 = p & ~3;
-    double wj = start_wt * base;
     int j = 0;
     while (j < end4) {
         const double x0 = data[start0 + j];
         const double x1 = data[start0 + j + 1];
         const double x2 = data[start0 + j + 2];
         const double x3 = data[start0 + j + 3];
-        const double y0 = wj; wj *= base;
-        const double y1 = wj; wj *= base;
-        const double y2 = wj; wj *= base;
-        const double y3 = wj; wj *= base;
+        const double y0 = weights[j];
+        const double y1 = weights[j + 1];
+        const double y2 = weights[j + 2];
+        const double y3 = weights[j + 3];
         acc0 = fma(x0, y0, acc0);
         acc1 = fma(x1, y1, acc1);
         acc2 = fma(x2, y2, acc2);
@@ -452,7 +451,7 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
     double S = (acc0 + acc1) + (acc2 + acc3);
     while (j < p) {
         const double x = data[start0 + j];
-        const double y = wj; wj *= base;
+        const double y = weights[j];
         S = fma(x, y, S);
         ++j;
     }
@@ -467,7 +466,7 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
     while (i + 1 <= warm_total && i + 1 < n) {
         const double x_old = data[i + 1 - p];
         const double x_new = data[i + 1];
-        S = (S * inv_R) - a_old * x_old + w_last * x_new;
+        S = cora_wave_roll_forward_exact_v1(S, inv_R, a_old, x_old, w_last, x_new);
         y = S * inv_wsum;
         ring[fill] = y;
         ++fill;
@@ -488,7 +487,7 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
         while (i + 1 < n) {
             const double x_old = data[i + 1 - p];
             const double x_new = data[i + 1];
-            S = (S * inv_R) - a_old * x_old + w_last * x_new;
+            S = cora_wave_roll_forward_exact_v1(S, inv_R, a_old, x_old, w_last, x_new);
             const double y_new = S * inv_wsum;
             ring[head] = y_new;
             head = (head + 1) % m;
@@ -514,7 +513,7 @@ void cora_wave_neo_batch_f64(const double* __restrict__ data,
     while (i + 1 < n) {
         const double x_old = data[i + 1 - p];
         const double x_new = data[i + 1];
-        S = (S * inv_R) - a_old * x_old + w_last * x_new;
+        S = cora_wave_roll_forward_exact_v1(S, inv_R, a_old, x_old, w_last, x_new);
         const double y_new = S * inv_wsum;
         wsum = wsum - ssum + (double)m * y_new;
         const double y_old = ring[head];

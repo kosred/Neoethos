@@ -1055,15 +1055,11 @@ extern "C" __global__ void neoethos_tsi_batch_f64(
 }
 
 // ============================================================================
-// OBV — reference: obv.rs::obv_scalar
-//   PERIOD-INVARIANT. warm = first_valid, and out[first_valid] = 0.0 exactly.
-//   The sign is the CPU's integer expression `(c > pc) as i32 - (c < pc) as
-//   i32` cast to f64, so a NaN close gives 0 - 0 = 0 and the running total is
-//   carried unchanged. A `>=` or an `fmax`-shaped rewrite diverges on a flat
-//   bar, which in FX is most bars on a quiet session.
-//   `prev_obv = v.mul_add(s, prev_obv)` -> `fma(v, s, prev_obv)`.
-//   NOTE the hazard: `obv_with_kernel` resolves `Kernel::Auto` to `Avx2` on
-//   this build. The card-less scalar-vs-auto test is what licenses this entry.
+// OBV — official TA-Lib ta_OBV.c semantics
+//   PERIOD-INVARIANT and lookback zero. The first output is the first valid
+//   volume. Every later bar uses a strict sequential add/subtract, while flat
+//   or unordered (NaN) close comparisons carry the accumulator. A prefix scan,
+//   sign multiplication, or FMA would change IEEE-754 and edge-case semantics.
 // ============================================================================
 extern "C" __global__ void neoethos_obv_batch_f64(
     const double* __restrict__ close,
@@ -1083,15 +1079,18 @@ extern "C" __global__ void neoethos_obv_batch_f64(
 
     neo_fill_warmup(row, n, first_valid);
 
-    double prev_obv = 0.0;
+    double prev_obv = volume[first_valid];
     double prev_close = close[first_valid];
-    row[first_valid] = 0.0;
+    row[first_valid] = prev_obv;
 
     for (int i = first_valid + 1; i < n; ++i) {
         const double c = close[i];
         const double v = volume[i];
-        const double s = (double)((c > prev_close) ? 1 : 0) - (double)((c < prev_close) ? 1 : 0);
-        prev_obv = fma(v, s, prev_obv);
+        if (c > prev_close) {
+            prev_obv += v;
+        } else if (c < prev_close) {
+            prev_obv -= v;
+        }
         row[i] = prev_obv;
         prev_close = c;
     }
@@ -1654,9 +1653,12 @@ extern "C" __global__ void neoethos_natr_batch_f64(
 
 // ============================================================================
 // ADXR — reference: adxr.rs::adxr_scalar
-//   warm = first_valid + 2 * period
-//   ADXR averages the current ADX with the ADX from `period` bars ago, so the
-//   kernel keeps a ring of the last `period` ADX values. That ring is a
+// External formula/lookback authorities (audit oracles only; never backends):
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_ADXR.c
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_ADX.c
+//   warm = first_valid + 3 * period - 2
+//   ADXR averages the current ADX with the ADX from `period - 1` bars ago, so
+//   the kernel keeps a ring of the last `period - 1` ADX values. That ring is a
 //   per-thread local array bounded by ADXR_MAX_PERIOD, which is a KERNEL
 //   property; the host refuses a larger period BY NAME rather than truncating
 //   the window. NEVER-OOM: peak memory is fixed by the kernel, never by the
@@ -1669,8 +1671,7 @@ extern "C" __global__ void neoethos_natr_batch_f64(
 //     * the smoothing is `atr.mul_add(om, tr)` -> `fma(atr, om, tr)`, with
 //       om = 1 - 1/period. `adx.rs` writes `atr * one_minus_rp + tr` unfused.
 //   The ring is pre-filled with the CPU's NaN and `prev_adx.is_finite()` gates
-//   the output, so the first `period` emitted bars are NaN by construction
-//   rather than by an index calculation that could be off by one.
+//   the output. For period == 1, the zero-lag ADXR is the current ADX.
 // ============================================================================
 extern "C" __global__ void neoethos_adxr_batch_f64(
     const double* __restrict__ high,
@@ -1694,7 +1695,8 @@ extern "C" __global__ void neoethos_adxr_batch_f64(
         return;
     }
 
-    const int warmup_start = first_valid + 2 * period;
+    const int lag = period - 1;
+    const int warmup_start = first_valid + 3 * period - 2;
     neo_fill_warmup(row, n, warmup_start);
 
     const double p = (double)period;
@@ -1739,8 +1741,28 @@ extern "C" __global__ void neoethos_adxr_batch_f64(
     bool have_adx = false;
 
     double adx_ring[ADXR_MAX_PERIOD];
-    for (int k = 0; k < period; ++k) adx_ring[k] = neo_qnan();
+    for (int k = 0; k < lag; ++k) adx_ring[k] = neo_qnan();
     int head = 0;
+
+    if (dx_count == period) {
+        adx_last = dx_sum * rp;
+        have_adx = true;
+
+        double previous_adx;
+        if (lag == 0) {
+            previous_adx = adx_last;
+        } else {
+            previous_adx = adx_ring[head];
+            adx_ring[head] = adx_last;
+            head += 1;
+            if (head == lag) head = 0;
+        }
+
+        const int initial_adx_index = first_valid + period;
+        if (initial_adx_index >= warmup_start && initial_adx_index < n) {
+            row[initial_adx_index] = 0.5 * (adx_last + previous_adx);
+        }
+    }
 
     for (int i = first_valid + period + 1; i < n; ++i) {
         const double prev_close = close[i - 1];
@@ -1773,10 +1795,15 @@ extern "C" __global__ void neoethos_adxr_batch_f64(
                 adx_last = dx_sum * rp;
                 have_adx = true;
 
-                const double prev_adx = adx_ring[head];
-                adx_ring[head] = adx_last;
-                head += 1;
-                if (head == period) head = 0;
+                double prev_adx;
+                if (lag == 0) {
+                    prev_adx = adx_last;
+                } else {
+                    prev_adx = adx_ring[head];
+                    adx_ring[head] = adx_last;
+                    head += 1;
+                    if (head == lag) head = 0;
+                }
 
                 if (i >= warmup_start) {
                     row[i] = neo_is_finite(prev_adx) ? (0.5 * (adx_last + prev_adx)) : neo_qnan();
@@ -1786,10 +1813,15 @@ extern "C" __global__ void neoethos_adxr_batch_f64(
             const double adx_curr = (adx_last * pm1 + dx) * rp;
             adx_last = adx_curr;
 
-            const double prev_adx = adx_ring[head];
-            adx_ring[head] = adx_curr;
-            head += 1;
-            if (head == period) head = 0;
+            double prev_adx;
+            if (lag == 0) {
+                prev_adx = adx_curr;
+            } else {
+                prev_adx = adx_ring[head];
+                adx_ring[head] = adx_curr;
+                head += 1;
+                if (head == lag) head = 0;
+            }
 
             if (i >= warmup_start) {
                 row[i] = neo_is_finite(prev_adx) ? (0.5 * (adx_curr + prev_adx)) : neo_qnan();

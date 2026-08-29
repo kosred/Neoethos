@@ -23,8 +23,8 @@ extern "C" __global__ void bulls_v_bears_batch_f64(
     const int* raw_rolling_periods,
     const double* raw_threshold_percentiles,
     const double* threshold_levels,
-    int ma_type,
-    int calculation_method,
+    const int* ma_types,
+    const int* calculation_methods,
     int rows,
     double* out_value,
     double* out_bull,
@@ -47,6 +47,8 @@ extern "C" __global__ void bulls_v_bears_batch_f64(
     const int raw_rolling_period = raw_rolling_periods[row];
     const double raw_threshold_percentile = raw_threshold_percentiles[row];
     const double threshold_level = threshold_levels[row];
+    const int ma_type = ma_types[row];
+    const int calculation_method = calculation_methods[row];
 
     double* row_value = out_value + static_cast<size_t>(row) * static_cast<size_t>(len);
     double* row_bull = out_bull + static_cast<size_t>(row) * static_cast<size_t>(len);
@@ -87,7 +89,12 @@ extern "C" __global__ void bulls_v_bears_batch_f64(
 
     const double ema_alpha = 2.0 / (static_cast<double>(period) + 1.0);
     double ema_prev = NAN;
+    double window_sum = 0.0;
+    int finite_count = 0;
+    double wma_weighted = 0.0;
+    bool wma_prev_full_valid = false;
     double prev_total = NAN;
+    int segment_start = 0;
 
     for (int i = 0; i < len; ++i) {
         const double c = close[i];
@@ -100,26 +107,56 @@ extern "C" __global__ void bulls_v_bears_batch_f64(
                 ema_prev = isfinite(ema_prev) ? (ema_prev + ema_alpha * (c - ema_prev)) : c;
                 row_ma[i] = ema_prev;
             }
-        } else if (period <= i + 1) {
-            bool full_valid = true;
-            double sum = 0.0;
-            double weighted = 0.0;
-            const int start = i + 1 - period;
-            for (int j = start; j <= i; ++j) {
-                const double value = close[j];
-                if (!isfinite(value)) {
-                    full_valid = false;
-                    break;
-                }
-                sum += value;
-                if (ma_type == MA_WMA) {
-                    weighted += value * static_cast<double>(j - start + 1);
+        } else if (ma_type == MA_SMA) {
+            if (isfinite(c)) {
+                window_sum += c;
+                finite_count += 1;
+            }
+            if (i >= period) {
+                const double old = close[i - period];
+                if (isfinite(old)) {
+                    window_sum -= old;
+                    finite_count -= 1;
                 }
             }
+            if (i + 1 >= period && finite_count == period) {
+                row_ma[i] = window_sum / static_cast<double>(period);
+            }
+        } else {
+            const double old_window_sum = window_sum;
+            const bool popped = i >= period;
+            if (popped) {
+                const double old = close[i - period];
+                if (isfinite(old)) {
+                    window_sum -= old;
+                    finite_count -= 1;
+                }
+            }
+            if (isfinite(c)) {
+                window_sum += c;
+                finite_count += 1;
+            }
+            const bool full_valid = i + 1 >= period && finite_count == period;
             if (full_valid) {
-                row_ma[i] = ma_type == MA_SMA
-                    ? (sum / static_cast<double>(period))
-                    : (weighted / static_cast<double>(period * (period + 1) / 2));
+                if (wma_prev_full_valid && popped && isfinite(c)) {
+                    wma_weighted = wma_weighted
+                        + static_cast<double>(period) * c
+                        - old_window_sum;
+                } else {
+                    wma_weighted = 0.0;
+                    const int start = i + 1 - period;
+                    for (int j = start; j <= i; ++j) {
+                        wma_weighted +=
+                            close[j] * static_cast<double>(j - start + 1);
+                    }
+                }
+                const double denominator =
+                    static_cast<double>(period) * (static_cast<double>(period) + 1.0) / 2.0;
+                row_ma[i] = wma_weighted / denominator;
+                wma_prev_full_valid = true;
+            } else {
+                wma_weighted = 0.0;
+                wma_prev_full_valid = false;
             }
         }
 
@@ -131,39 +168,47 @@ extern "C" __global__ void bulls_v_bears_batch_f64(
         if (calculation_method == METHOD_NORMALIZED) {
             row_upper[i] = threshold_level;
             row_lower[i] = -threshold_level;
+        }
 
-            if (isfinite(row_bull[i]) && isfinite(row_bear[i])) {
-                const int start = (i + 1 > normalized_bars_back) ? (i + 1 - normalized_bars_back) : 0;
-                double bull_min = NAN;
-                double bull_max = NAN;
-                double bear_min = NAN;
-                double bear_max = NAN;
-                for (int j = start; j <= i; ++j) {
-                    const double bull = row_bull[j];
-                    const double bear = row_bear[j];
-                    if (isfinite(bull)) {
-                        bull_min = isfinite(bull_min) ? fmin(bull_min, bull) : bull;
-                        bull_max = isfinite(bull_max) ? fmax(bull_max, bull) : bull;
-                    }
-                    if (isfinite(bear)) {
-                        bear_min = isfinite(bear_min) ? fmin(bear_min, bear) : bear;
-                        bear_max = isfinite(bear_max) ? fmax(bear_max, bear) : bear;
-                    }
+        if (!(isfinite(row_bull[i]) && isfinite(row_bear[i]))) {
+            segment_start = i + 1;
+            prev_total = NAN;
+            continue;
+        }
+
+        if (calculation_method == METHOD_NORMALIZED) {
+            const int window_start =
+                (i + 1 > normalized_bars_back) ? (i + 1 - normalized_bars_back) : 0;
+            const int start = window_start > segment_start ? window_start : segment_start;
+            double bull_min = NAN;
+            double bull_max = NAN;
+            double bear_min = NAN;
+            double bear_max = NAN;
+            for (int j = start; j <= i; ++j) {
+                const double bull = row_bull[j];
+                const double bear = row_bear[j];
+                if (isfinite(bull)) {
+                    bull_min = isfinite(bull_min) ? fmin(bull_min, bull) : bull;
+                    bull_max = isfinite(bull_max) ? fmax(bull_max, bull) : bull;
                 }
-                const double bull_range = bull_max - bull_min;
-                const double bear_range = bear_max - bear_min;
-                if (bull_range > 0.0 && bear_range > 0.0) {
-                    const double norm_bull = ((row_bull[i] - bull_min) / bull_range - 0.5) * 100.0;
-                    const double norm_bear = ((row_bear[i] - bear_min) / bear_range - 0.5) * 100.0;
-                    row_value[i] = norm_bull - norm_bear;
+                if (isfinite(bear)) {
+                    bear_min = isfinite(bear_min) ? fmin(bear_min, bear) : bear;
+                    bear_max = isfinite(bear_max) ? fmax(bear_max, bear) : bear;
                 }
+            }
+            const double bull_range = bull_max - bull_min;
+            const double bear_range = bear_max - bear_min;
+            if (bull_range > 0.0 && bear_range > 0.0) {
+                const double norm_bull = ((row_bull[i] - bull_min) / bull_range - 0.5) * 100.0;
+                const double norm_bear = ((row_bear[i] - bear_min) / bear_range - 0.5) * 100.0;
+                row_value[i] = norm_bull - norm_bear;
             }
         } else {
-            if (isfinite(row_bull[i]) && isfinite(row_bear[i])) {
-                row_value[i] = row_bull[i] - row_bear[i];
-            }
+            row_value[i] = row_bull[i] - row_bear[i];
 
-            const int start = (i + 1 > raw_rolling_period) ? (i + 1 - raw_rolling_period) : 0;
+            const int window_start =
+                (i + 1 > raw_rolling_period) ? (i + 1 - raw_rolling_period) : 0;
+            const int start = window_start > segment_start ? window_start : segment_start;
             double lowest = NAN;
             double highest = NAN;
             for (int j = start; j <= i; ++j) {
@@ -188,6 +233,8 @@ extern "C" __global__ void bulls_v_bears_batch_f64(
             row_zero_cross_down[i] =
                 isfinite(prev_total) && row_value[i] < 0.0 && prev_total >= 0.0 ? 1.0 : 0.0;
             prev_total = row_value[i];
+        } else {
+            prev_total = NAN;
         }
     }
 }
@@ -288,6 +335,7 @@ extern "C" __global__ void bulls_v_bears_neo_batch_f64(
 
     const double ema_alpha = 2.0 / (static_cast<double>(period) + 1.0);
     double ema_prev = NAN;
+    int segment_start = 0;
 
     for (int i = 0; i < n; ++i) {
         const double c = close[i];
@@ -310,10 +358,13 @@ extern "C" __global__ void bulls_v_bears_neo_batch_f64(
         bear_ring[i % normalized_bars_back] = bear;
 
         if (!(isfinite(bull) && isfinite(bear))) {
+            segment_start = i + 1;
             continue;
         }
 
-        const int start = (i + 1 > normalized_bars_back) ? (i + 1 - normalized_bars_back) : 0;
+        const int window_start =
+            (i + 1 > normalized_bars_back) ? (i + 1 - normalized_bars_back) : 0;
+        const int start = window_start > segment_start ? window_start : segment_start;
         double bull_min = NAN;
         double bull_max = NAN;
         double bear_min = NAN;

@@ -1,25 +1,15 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::CudaWillr;
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
 use std::error::Error;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -40,10 +30,6 @@ pub struct WillrOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct WillrParams {
     pub period: Option<usize>,
 }
@@ -256,7 +242,6 @@ pub fn willr_with_kernel(input: &WillrInput, kernel: Kernel) -> Result<WillrOutp
     Ok(WillrOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn willr_into(dst: &mut [f64], input: &WillrInput) -> Result<(), WillrError> {
     willr_into_slice(dst, input, Kernel::Auto)
@@ -1317,7 +1302,7 @@ impl SharedWillrCtx {
         (self.nan_psum[r + 1] - self.nan_psum[l]) != 0
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-build-native")]
     #[inline]
     fn flatten(&self) -> (Vec<f64>, Vec<f64>, Vec<usize>) {
         let levels = self.st_max.len();
@@ -1343,7 +1328,7 @@ impl SharedWillrCtx {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Debug, Clone)]
 pub struct WillrGpuTables {
     pub log2: Vec<i32>,
@@ -1353,7 +1338,7 @@ pub struct WillrGpuTables {
     pub nan_psum: Vec<i32>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 impl WillrGpuTables {
     #[inline]
     fn from_shared_ctx(ctx: &SharedWillrCtx) -> Self {
@@ -1374,7 +1359,7 @@ impl WillrGpuTables {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[inline]
 pub fn build_willr_gpu_tables(high: &[f32], low: &[f32]) -> WillrGpuTables {
     debug_assert_eq!(high.len(), low.len());
@@ -1927,45 +1912,19 @@ fn willr_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn willr_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = willr_js(high, low, close, period)?;
-    crate::write_wasm_f64_output("willr_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn willr_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = willr_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("willr_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     #[test]
     fn test_willr_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = WillrParams::default();
         let input = WillrInput::from_candles(&candles, params);
@@ -1973,13 +1932,8 @@ mod tests {
         let baseline = willr(&input)?.values;
 
         let mut out = vec![0.0f64; baseline.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             willr_into(&mut out, &input)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            willr_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1992,8 +1946,8 @@ mod tests {
 
     fn check_willr_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = WillrParams { period: None };
         let input = WillrInput::from_candles(&candles, params);
         let output = willr_with_kernel(&input, kernel)?;
@@ -2003,8 +1957,8 @@ mod tests {
 
     fn check_willr_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = WillrParams { period: Some(14) };
         let input = WillrInput::from_candles(&candles, params);
         let output = willr_with_kernel(&input, kernel)?;
@@ -2140,8 +2094,8 @@ mod tests {
     fn check_willr_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             WillrParams::default(),
@@ -2403,8 +2357,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = WillrBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
         let def = WillrParams::default();
         let row = output.values_for(&def).expect("default row missing");
@@ -2450,8 +2404,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2537,512 +2491,4 @@ mod tests {
 
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "willr")]
-#[pyo3(signature = (high, low, close, period, kernel=None))]
-pub fn willr_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = WillrParams {
-        period: Some(period),
-    };
-    let input = WillrInput::from_slices(high_slice, low_slice, close_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| willr_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "WillrStream")]
-pub struct WillrStreamPy {
-    stream: WillrStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl WillrStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = WillrParams {
-            period: Some(period),
-        };
-        let stream =
-            WillrStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(WillrStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "WillrDeviceArrayF32", unsendable)]
-pub struct WillrDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32>,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl WillrDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        let mut device_ordinal: i32 = self.device_id as i32;
-        unsafe {
-            let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-            let mut value = std::mem::MaybeUninit::<i32>::uninit();
-            let ptr = self
-                .inner
-                .as_ref()
-                .map(|inner| inner.buf.as_device_ptr().as_raw())
-                .unwrap_or(0);
-            let err = cust::sys::cuPointerGetAttribute(
-                value.as_mut_ptr() as *mut std::ffi::c_void,
-                attr,
-                ptr,
-            );
-            if err == cust::sys::CUresult::CUDA_SUCCESS {
-                device_ordinal = value.assume_init();
-            }
-        }
-        (2, device_ordinal)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "willr_batch")]
-#[pyo3(signature = (high, low, close, period_range, kernel=None))]
-pub fn willr_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    let sweep = WillrBatchRange {
-        period: period_range,
-    };
-
-    let combos_host = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos_host.len();
-    let cols = high_slice.len();
-
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "willr: rows*cols overflow: rows={}, cols={}",
-            rows, cols
-        ))
-    })?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => match detect_best_batch_kernel() {
-                    Kernel::Avx512Batch => Kernel::Avx2Batch,
-                    other => other,
-                },
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            willr_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &sweep,
-                simd,
-                true,
-                slice_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "willr_cuda_batch_dev")]
-#[pyo3(signature = (high, low, close, period_range, device_id=0))]
-pub fn willr_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: PyReadonlyArray1<'_, f32>,
-    low: PyReadonlyArray1<'_, f32>,
-    close: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<WillrDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    if high_slice.len() != low_slice.len() || high_slice.len() != close_slice.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-
-    let sweep = WillrBatchRange {
-        period: period_range,
-    };
-
-    let (inner, ctx, dev_id_u32) = py.allow_threads(|| {
-        let cuda = CudaWillr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context();
-        let dev_id_u32 = cuda.device_id();
-        let inner = cuda
-            .willr_batch_dev(high_slice, low_slice, close_slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((inner, ctx, dev_id_u32))
-    })?;
-
-    Ok(WillrDeviceArrayF32Py {
-        inner: Some(inner),
-        _ctx: ctx,
-        device_id: dev_id_u32,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "willr_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, close_tm, cols, rows, period, device_id=0))]
-pub fn willr_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: PyReadonlyArray1<'_, f32>,
-    low_tm: PyReadonlyArray1<'_, f32>,
-    close_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<WillrDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high_slice = high_tm.as_slice()?;
-    let low_slice = low_tm.as_slice()?;
-    let close_slice = close_tm.as_slice()?;
-
-    let (inner, ctx, dev_id_u32) = py.allow_threads(|| {
-        let cuda = CudaWillr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context();
-        let dev_id_u32 = cuda.device_id();
-        let inner = cuda
-            .willr_many_series_one_param_time_major_dev(
-                high_slice,
-                low_slice,
-                close_slice,
-                cols,
-                rows,
-                period,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((inner, ctx, dev_id_u32))
-    })?;
-
-    Ok(WillrDeviceArrayF32Py {
-        inner: Some(inner),
-        _ctx: ctx,
-        device_id: dev_id_u32,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn willr_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    if high.len() == 0 || low.len() != high.len() || close.len() != high.len() {
-        return Err(JsValue::from_str("mismatched input lengths"));
-    }
-    let params = WillrParams {
-        period: Some(period),
-    };
-    let input = WillrInput::from_slices(high, low, close, params);
-    let mut out = vec![0.0; high.len()];
-    willr_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WillrBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WillrBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<WillrParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = willr_batch)]
-pub fn willr_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: WillrBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = WillrBatchRange {
-        period: cfg.period_range,
-    };
-    let out = willr_batch_inner(high, low, close, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_out = WillrBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js_out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn willr_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    core::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn willr_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn willr_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to willr_into"));
-    }
-    unsafe {
-        if out_ptr == high_ptr as *mut f64
-            || out_ptr == low_ptr as *mut f64
-            || out_ptr == close_ptr as *mut f64
-        {
-            let mut tmp = vec![0.0f64; len];
-            {
-                let high = core::slice::from_raw_parts(high_ptr, len);
-                let low = core::slice::from_raw_parts(low_ptr, len);
-                let close = core::slice::from_raw_parts(close_ptr, len);
-                let params = WillrParams {
-                    period: Some(period),
-                };
-                let input = WillrInput::from_slices(high, low, close, params);
-                willr_into_slice(&mut tmp, &input, detect_best_kernel())
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-            let out = core::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&tmp);
-            Ok(())
-        } else {
-            let high = core::slice::from_raw_parts(high_ptr, len);
-            let low = core::slice::from_raw_parts(low_ptr, len);
-            let close = core::slice::from_raw_parts(close_ptr, len);
-            let out = core::slice::from_raw_parts_mut(out_ptr, len);
-            let params = WillrParams {
-                period: Some(period),
-            };
-            let input = WillrInput::from_slices(high, low, close, params);
-            willr_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = willr_batch_into)]
-pub fn willr_batch_into_js(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to willr_batch_into"));
-    }
-    unsafe {
-        let high = core::slice::from_raw_parts(high_ptr, len);
-        let low = core::slice::from_raw_parts(low_ptr, len);
-        let close = core::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = WillrBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let total = rows.checked_mul(cols).ok_or_else(|| {
-            JsValue::from_str(&format!(
-                "willr: rows*cols overflow: rows={}, cols={}",
-                rows, cols
-            ))
-        })?;
-
-        let out = core::slice::from_raw_parts_mut(out_ptr, total);
-        willr_batch_inner_into(high, low, close, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
 }

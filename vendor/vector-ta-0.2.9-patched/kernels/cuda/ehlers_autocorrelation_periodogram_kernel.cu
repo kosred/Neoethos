@@ -526,3 +526,290 @@ extern "C" __global__ void ehlers_autocorrelation_periodogram_neo_batch_f64(
         row[i] = state.dom;
     }
 }
+
+// ---------------------------------------------------------------------------
+// NeoEthos canonical production lane.
+//
+// The existing public batch and primary ABIs above remain intact for their
+// standalone callers. Production does not use either one: both derive
+// transcendental coefficients independently on the device and the legacy
+// primary drops normalized_power. The shared-session wrapper uploads only the
+// immutable parameter coefficients and trig tables built by the scalar CPU
+// constructor, then launches this exact two-output row once. Prices stay in
+// the frame's resident close buffer and every bar/state transition runs here.
+// Source closure: eacp/strict-cuda-exact-cooperative-cta/fmad-off/v1.
+// One CTA owns one parameter tuple. Lane zero keeps every cross-period state
+// transition and reduction in ascending scalar order; other lanes only own
+// independent lags or periods, preserving the exact f64 authority schedule.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ void ehlers_autocorrelation_periodogram_exact_row_f64(
+    const double* __restrict__ data,
+    int n,
+    int min_period,
+    int max_period,
+    int avg_length,
+    bool enhance,
+    const double* __restrict__ coefficients,
+    const double* __restrict__ cos_table,
+    const double* __restrict__ sin_table,
+    int trig_stride,
+    double* __restrict__ scratch,
+    int scratch_cap,
+    double* __restrict__ out_dominant_cycle,
+    double* __restrict__ out_normalized_power
+) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int block_width = static_cast<int>(blockDim.x);
+    for (int i = lane; i < n; i += block_width) {
+        out_dominant_cycle[i] = NAN;
+        out_normalized_power[i] = NAN;
+    }
+    __syncthreads();
+    if (n <= 0 || min_period < 3 || max_period <= min_period || max_period > n ||
+        trig_stride != max_period + 1) {
+        return;
+    }
+
+    const int history_cap = max_period + corr_window_device(avg_length, max_period);
+    const int needed = history_cap + 3 * (max_period + 1);
+    if (needed > scratch_cap) {
+        return;
+    }
+
+    double* history_storage = scratch;
+    double* corr_storage = history_storage + history_cap;
+    double* power_storage = corr_storage + (max_period + 1);
+    double* smooth_storage = power_storage + (max_period + 1);
+    __shared__ PeriodogramState state;
+    __shared__ int finite_bar;
+    __shared__ double avg3_x0;
+    __shared__ double avg3_x1;
+    __shared__ double avg3_x2;
+    __shared__ double avg3_sx;
+    __shared__ double avg3_sxx;
+    if (lane == 0) {
+        state.init(
+            min_period,
+            max_period,
+            avg_length,
+            enhance,
+            history_storage,
+            history_cap,
+            corr_storage,
+            power_storage,
+            smooth_storage
+        );
+    }
+    __syncthreads();
+
+    const double hp_coef = coefficients[0];
+    const double hp_prev1_coef = coefficients[1];
+    const double hp_prev2_coef = coefficients[2];
+    const double filt_c1 = coefficients[3];
+    const double filt_c2 = coefficients[4];
+    const double filt_c3 = coefficients[5];
+    const double decay = coefficients[6];
+    const int warmup = warmup_period_device(max_period, avg_length);
+
+    for (int i = 0; i < n; ++i) {
+        if (lane == 0) {
+            const double value = data[i];
+            finite_bar = isfinite(value) ? 1 : 0;
+            if (finite_bar == 0) {
+                state.reset();
+            } else {
+                const double hp = hp_coef * (value - 2.0 * state.prev_price_1 + state.prev_price_2)
+                    + hp_prev1_coef * state.hp_prev_1
+                    - hp_prev2_coef * state.hp_prev_2;
+                const double filt = filt_c1 * (hp + state.hp_prev_1) * 0.5
+                    + filt_c2 * state.filt_prev_1
+                    + filt_c3 * state.filt_prev_2;
+
+                state.prev_price_2 = state.prev_price_1;
+                state.prev_price_1 = value;
+                state.hp_prev_2 = state.hp_prev_1;
+                state.hp_prev_1 = hp;
+                state.filt_prev_2 = state.filt_prev_1;
+                state.filt_prev_1 = filt;
+                state.push_filt(filt);
+                state.bars_seen += 1;
+
+                state.corr[0] = 0.0;
+                if (state.max_period >= 1) {
+                    state.corr[1] = 0.0;
+                }
+                if (avg_length == 3) {
+                    avg3_x0 = state.filt_back(0);
+                    avg3_x1 = state.filt_back(1);
+                    avg3_x2 = state.filt_back(2);
+                    avg3_sx = avg3_x0 + avg3_x1 + avg3_x2;
+                    avg3_sxx = avg3_x0 * avg3_x0 + avg3_x1 * avg3_x1 + avg3_x2 * avg3_x2;
+                }
+            }
+        }
+        __syncthreads();
+        if (finite_bar == 0) {
+            continue;
+        }
+
+        if (avg_length == 3) {
+            for (int lag = 2 + lane; lag <= state.max_period; lag += block_width) {
+                const double y0 = state.filt_back(lag);
+                const double y1 = state.filt_back(lag + 1);
+                const double y2 = state.filt_back(lag + 2);
+                const double sy = y0 + y1 + y2;
+                const double syy = y0 * y0 + y1 * y1 + y2 * y2;
+                const double sxy = avg3_x0 * y0 + avg3_x1 * y1 + avg3_x2 * y2;
+                const double denom_x = 3.0 * avg3_sxx - avg3_sx * avg3_sx;
+                const double denom_y = 3.0 * syy - sy * sy;
+                const double denom = denom_x * denom_y;
+                state.corr[lag] = denom > 0.0
+                    ? (3.0 * sxy - avg3_sx * sy) / sqrt(denom)
+                    : 0.0;
+            }
+        } else {
+            for (int lag = 2 + lane; lag <= state.max_period; lag += block_width) {
+                const int window = corr_window_device(state.avg_length, lag);
+                double sx = 0.0;
+                double sy = 0.0;
+                double sxx = 0.0;
+                double syy = 0.0;
+                double sxy = 0.0;
+                for (int k = 0; k < window; ++k) {
+                    const double x = state.filt_back(k);
+                    const double y = state.filt_back(lag + k);
+                    sx += x;
+                    sy += y;
+                    sxx += x * x;
+                    syy += y * y;
+                    sxy += x * y;
+                }
+                const double valid = static_cast<double>(window);
+                const double denom_x = valid * sxx - sx * sx;
+                const double denom_y = valid * syy - sy * sy;
+                const double denom = denom_x * denom_y;
+                state.corr[lag] = denom > 0.0
+                    ? (valid * sxy - sx * sy) / sqrt(denom)
+                    : 0.0;
+            }
+        }
+        __syncthreads();
+
+        for (int period = state.min_period + lane; period <= state.max_period; period += block_width) {
+            double cos_acc = 0.0;
+            double sin_acc = 0.0;
+            const int trig_base = period * trig_stride;
+            for (int n = 2; n <= state.max_period; ++n) {
+                const double corr = state.corr[n];
+                cos_acc += corr * cos_table[trig_base + n];
+                sin_acc += corr * sin_table[trig_base + n];
+            }
+            const double sq = cos_acc * cos_acc + sin_acc * sin_acc;
+            const double smooth = 0.2 * sq * sq + 0.8 * state.smooth[period];
+            state.smooth[period] = smooth;
+        }
+        __syncthreads();
+
+        if (lane == 0) {
+            double local_max_pwr = 0.0;
+            for (int period = state.min_period; period <= state.max_period; ++period) {
+                const double smooth = state.smooth[period];
+                if (smooth > local_max_pwr) {
+                    local_max_pwr = smooth;
+                }
+            }
+
+            if (local_max_pwr > state.max_pwr) {
+                state.max_pwr = local_max_pwr;
+            } else {
+                state.max_pwr *= decay;
+            }
+        }
+        __syncthreads();
+
+        for (int period = state.min_period + lane; period <= state.max_period; period += block_width) {
+            double pwr = state.max_pwr > 0.0 ? state.smooth[period] / state.max_pwr : 0.0;
+            if (state.enhance) {
+                pwr = pwr * pwr * pwr;
+            }
+            state.power[period] = pwr;
+        }
+        __syncthreads();
+
+        if (lane == 0) {
+            double weighted = 0.0;
+            double sum_weight = 0.0;
+            for (int period = state.min_period; period <= state.max_period; ++period) {
+                const double pwr = state.power[period];
+                if (pwr >= 0.5) {
+                    weighted += static_cast<double>(period) * pwr;
+                    sum_weight += pwr;
+                }
+            }
+
+            const double base = sum_weight >= 0.25 ? weighted / sum_weight : state.dom;
+            state.dom += 0.2 * (base - state.dom);
+            if (state.warmup_bias) {
+                state.e *= 0.8;
+                const double correction = 1.0 / (1.0 - state.e);
+                state.dom *= correction;
+                state.warmup_bias = state.e > 1e-10;
+            }
+            if (state.bars_seen > warmup) {
+                int dom_idx = static_cast<int>(llround(state.dom));
+                if (dom_idx < state.min_period) {
+                    dom_idx = state.min_period;
+                } else if (dom_idx > state.max_period) {
+                    dom_idx = state.max_period;
+                }
+                out_dominant_cycle[i] = state.dom;
+                out_normalized_power[i] = state.power[dom_idx];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void ehlers_autocorrelation_periodogram_outputs_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ parameter_rows,
+    const double* __restrict__ coefficient_rows,
+    const int* __restrict__ trig_offsets,
+    const double* __restrict__ cos_tables,
+    const double* __restrict__ sin_tables,
+    int rows,
+    int scratch_stride,
+    double* __restrict__ scratch,
+    double* __restrict__ out_dominant_cycle,
+    double* __restrict__ out_normalized_power
+) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows || n <= 0) {
+        return;
+    }
+    const int parameter_base = row * 4;
+    const int min_period = parameter_rows[parameter_base];
+    const int max_period = parameter_rows[parameter_base + 1];
+    const int avg_length = parameter_rows[parameter_base + 2];
+    const bool enhance = parameter_rows[parameter_base + 3] != 0;
+    const int trig_offset = trig_offsets[row];
+    const size_t output_offset = static_cast<size_t>(row) * static_cast<size_t>(n);
+    ehlers_autocorrelation_periodogram_exact_row_f64(
+        data,
+        n,
+        min_period,
+        max_period,
+        avg_length,
+        enhance,
+        coefficient_rows + static_cast<size_t>(row) * 7U,
+        cos_tables + trig_offset,
+        sin_tables + trig_offset,
+        max_period + 1,
+        scratch + static_cast<size_t>(row) * static_cast<size_t>(scratch_stride),
+        scratch_stride,
+        out_dominant_cycle + output_offset,
+        out_normalized_power + output_offset
+    );
+}

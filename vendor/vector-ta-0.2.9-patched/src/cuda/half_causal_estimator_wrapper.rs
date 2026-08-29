@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::half_causal_estimator::{
     HalfCausalEstimatorBatchRange, HalfCausalEstimatorConfidenceAdjust,
@@ -8,7 +8,7 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
@@ -39,6 +39,10 @@ pub enum CudaHalfCausalEstimatorError {
     },
     #[error("missing kernel symbol: {name}")]
     MissingKernelSymbol { name: &'static str },
+    #[error(
+        "generic HCE CUDA is unavailable under half-causal-estimator-f64-v2-neoethos-canonical-pine6-script24-utc-day-slot-session-proxy-cached-future-windows-stable-f64; use the strict f64 resident route"
+    )]
+    StableAuthorityV2Unavailable,
     #[error("launch config too large: grid=({gx},{gy},{gz}) block=({bx},{by},{bz})")]
     LaunchConfigTooLarge {
         gx: u32,
@@ -394,8 +398,20 @@ fn first_finite(values: &[f64]) -> usize {
         .unwrap_or(values.len())
 }
 
+// The generic kernel still implements the superseded reverse-history/sum-of-
+// squares schedule. This non-const gate makes the public route fail closed
+// without turning the retained legacy implementation into unreachable Rust;
+// it can be removed only when that ABI receives its own typed HCE-v2 state.
+#[inline(never)]
+fn generic_hce_v2_available() -> bool {
+    false
+}
+
 impl CudaHalfCausalEstimator {
     pub fn new(device_id: usize) -> Result<Self, CudaHalfCausalEstimatorError> {
+        if !generic_hce_v2_available() {
+            return Err(CudaHalfCausalEstimatorError::StableAuthorityV2Unavailable);
+        }
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
@@ -468,6 +484,9 @@ impl CudaHalfCausalEstimator {
         data: &[f64],
         sweep: &HalfCausalEstimatorBatchRange,
     ) -> Result<CudaHalfCausalEstimatorBatchResult, CudaHalfCausalEstimatorError> {
+        if !generic_hce_v2_available() {
+            return Err(CudaHalfCausalEstimatorError::StableAuthorityV2Unavailable);
+        }
         if data.is_empty() {
             return Err(CudaHalfCausalEstimatorError::InvalidInput(
                 "empty input".into(),

@@ -1,6 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{detect_best_batch_kernel, detect_best_kernel};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -9,22 +7,6 @@ use core::arch::x86_64::*;
 use rayon::prelude::*;
 use std::convert::AsRef;
 use thiserror::Error;
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for DamianiVolatmeterInput<'a> {
     #[inline(always)]
@@ -70,10 +52,6 @@ pub struct DamianiVolatmeterOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DamianiVolatmeterParams {
     pub vis_atr: Option<usize>,
     pub vis_std: Option<usize>,
@@ -262,7 +240,9 @@ pub enum DamianiVolatmeterError {
     EmptyInputData,
     #[error("damiani_volatmeter: All values are NaN.")]
     AllValuesNaN,
-    #[error("damiani_volatmeter: Invalid period: data length = {data_len}, vis_atr = {vis_atr}, vis_std = {vis_std}, sed_atr = {sed_atr}, sed_std = {sed_std}")]
+    #[error(
+        "damiani_volatmeter: Invalid period: data length = {data_len}, vis_atr = {vis_atr}, vis_std = {vis_std}, sed_atr = {sed_atr}, sed_std = {sed_std}"
+    )]
     InvalidPeriod {
         data_len: usize,
         vis_atr: usize,
@@ -270,7 +250,9 @@ pub enum DamianiVolatmeterError {
         sed_atr: usize,
         sed_std: usize,
     },
-    #[error("damiani_volatmeter: Not enough valid data after first non-NaN index. needed = {needed}, valid = {valid}")]
+    #[error(
+        "damiani_volatmeter: Not enough valid data after first non-NaN index. needed = {needed}, valid = {valid}"
+    )]
     NotEnoughValidData { needed: usize, valid: usize },
     #[error("damiani_volatmeter: output length mismatch. expected={expected}, got={got}")]
     OutputLengthMismatch { expected: usize, got: usize },
@@ -278,7 +260,9 @@ pub enum DamianiVolatmeterError {
     InvalidRange { start: i64, end: i64, step: i64 },
     #[error("damiani_volatmeter: Empty data provided.")]
     EmptyData,
-    #[error("damiani_volatmeter: Non-batch kernel '{kernel:?}' cannot be used with batch API. Use one of: Auto, Scalar, Avx2Batch, Avx512Batch.")]
+    #[error(
+        "damiani_volatmeter: Non-batch kernel '{kernel:?}' cannot be used with batch API. Use one of: Auto, Scalar, Avx2Batch, Avx512Batch."
+    )]
     NonBatchKernel { kernel: Kernel },
     #[error("damiani_volatmeter: invalid kernel for batch: {0:?}")]
     InvalidKernelForBatch(Kernel),
@@ -486,7 +470,6 @@ pub fn damiani_volatmeter_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn damiani_volatmeter_into(
     input: &DamianiVolatmeterInput,
@@ -648,11 +631,7 @@ fn stddev(sum: f64, sum_sq: f64, n: usize) -> f64 {
     let mean = sum / n as f64;
     let mean_sq = sum_sq / n as f64;
     let var = mean_sq - mean * mean;
-    if var <= 0.0 {
-        0.0
-    } else {
-        var.sqrt()
-    }
+    if var <= 0.0 { 0.0 } else { var.sqrt() }
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -715,10 +694,6 @@ pub fn damiani_volatmeter_batch_with_kernel(
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DamianiVolatmeterBatchRange {
     pub vis_atr: (usize, usize, usize),
     pub vis_std: (usize, usize, usize),
@@ -2003,26 +1978,11 @@ impl DamianiVolatmeterFeedStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn damiani_volatmeter_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = damiani_volatmeter_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "damiani_volatmeter_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     fn check_damiani_partial_params(
@@ -2030,8 +1990,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = DamianiVolatmeterParams::default();
         let input = DamianiVolatmeterInput::from_candles(&candles, "close", params);
         let output = damiani_volatmeter_with_kernel(&input, kernel)?;
@@ -2088,13 +2048,8 @@ mod tests {
 
         let mut out_vol = vec![0.0; len];
         let mut out_anti = vec![0.0; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             damiani_volatmeter_into(&input, &mut out_vol, &mut out_anti)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            damiani_volatmeter_into_slice(&mut out_vol, &mut out_anti, &input, Kernel::Auto)?;
         }
 
         assert_eq!(out_vol.len(), base.vol.len());
@@ -2128,8 +2083,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DamianiVolatmeterInput::from_candles(
             &candles,
             "close",
@@ -2177,8 +2132,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let mut params = DamianiVolatmeterParams::default();
         params.vis_atr = Some(0);
         let input = DamianiVolatmeterInput::from_candles(&candles, "close", params);
@@ -2191,8 +2146,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let mut params = DamianiVolatmeterParams::default();
         params.vis_atr = Some(99999);
         let input = DamianiVolatmeterInput::from_candles(&candles, "close", params);
@@ -2232,8 +2187,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DamianiVolatmeterInput::from_candles(
             &candles,
             "close",
@@ -2297,8 +2252,8 @@ mod tests {
         _test_name: &str,
         _kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DamianiVolatmeterInput::with_default_candles(&candles);
         match input.data {
             DamianiVolatmeterData::Candles { source, .. } => {
@@ -2328,8 +2283,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DamianiVolatmeterParams::default(),
@@ -2411,35 +2366,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in vol array \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in vol array \
 						 with params: vis_atr={}, vis_std={}, sed_atr={}, sed_std={}, threshold={} (param set {})",
-						test_name, val, bits, i,
-						params.vis_atr.unwrap(), params.vis_std.unwrap(),
-						params.sed_atr.unwrap(), params.sed_std.unwrap(),
-						params.threshold.unwrap(), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.vis_atr.unwrap(),
+                        params.vis_std.unwrap(),
+                        params.sed_atr.unwrap(),
+                        params.sed_std.unwrap(),
+                        params.threshold.unwrap(),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in vol array \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in vol array \
 						 with params: vis_atr={}, vis_std={}, sed_atr={}, sed_std={}, threshold={} (param set {})",
-						test_name, val, bits, i,
-						params.vis_atr.unwrap(), params.vis_std.unwrap(),
-						params.sed_atr.unwrap(), params.sed_std.unwrap(),
-						params.threshold.unwrap(), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.vis_atr.unwrap(),
+                        params.vis_std.unwrap(),
+                        params.sed_atr.unwrap(),
+                        params.sed_std.unwrap(),
+                        params.threshold.unwrap(),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in vol array \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in vol array \
 						 with params: vis_atr={}, vis_std={}, sed_atr={}, sed_std={}, threshold={} (param set {})",
-						test_name, val, bits, i,
-						params.vis_atr.unwrap(), params.vis_std.unwrap(),
-						params.sed_atr.unwrap(), params.sed_std.unwrap(),
-						params.threshold.unwrap(), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.vis_atr.unwrap(),
+                        params.vis_std.unwrap(),
+                        params.sed_atr.unwrap(),
+                        params.sed_std.unwrap(),
+                        params.threshold.unwrap(),
+                        param_idx
+                    );
                 }
             }
 
@@ -2452,35 +2425,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in anti array \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in anti array \
 						 with params: vis_atr={}, vis_std={}, sed_atr={}, sed_std={}, threshold={} (param set {})",
-						test_name, val, bits, i,
-						params.vis_atr.unwrap(), params.vis_std.unwrap(),
-						params.sed_atr.unwrap(), params.sed_std.unwrap(),
-						params.threshold.unwrap(), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.vis_atr.unwrap(),
+                        params.vis_std.unwrap(),
+                        params.sed_atr.unwrap(),
+                        params.sed_std.unwrap(),
+                        params.threshold.unwrap(),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in anti array \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in anti array \
 						 with params: vis_atr={}, vis_std={}, sed_atr={}, sed_std={}, threshold={} (param set {})",
-						test_name, val, bits, i,
-						params.vis_atr.unwrap(), params.vis_std.unwrap(),
-						params.sed_atr.unwrap(), params.sed_std.unwrap(),
-						params.threshold.unwrap(), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.vis_atr.unwrap(),
+                        params.vis_std.unwrap(),
+                        params.sed_atr.unwrap(),
+                        params.sed_std.unwrap(),
+                        params.threshold.unwrap(),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in anti array \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in anti array \
 						 with params: vis_atr={}, vis_std={}, sed_atr={}, sed_std={}, threshold={} (param set {})",
-						test_name, val, bits, i,
-						params.vis_atr.unwrap(), params.vis_std.unwrap(),
-						params.sed_atr.unwrap(), params.sed_std.unwrap(),
-						params.threshold.unwrap(), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.vis_atr.unwrap(),
+                        params.vis_std.unwrap(),
+                        params.sed_atr.unwrap(),
+                        params.sed_std.unwrap(),
+                        params.threshold.unwrap(),
+                        param_idx
+                    );
                 }
             }
         }
@@ -2500,8 +2491,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = DamianiVolatmeterBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2538,8 +2529,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 2, 10, 2, 5, 15, 5, 10, 30, 10, 0.5, 2.0, 0.5),
@@ -2596,38 +2587,62 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in vol \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in vol \
 						 at row {} col {} (flat index {}) with params: vis_atr={}, vis_std={}, sed_atr={}, \
 						 sed_std={}, threshold={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.vis_atr.unwrap(), combo.vis_std.unwrap(),
-						combo.sed_atr.unwrap(), combo.sed_std.unwrap(),
-						combo.threshold.unwrap()
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.vis_atr.unwrap(),
+                        combo.vis_std.unwrap(),
+                        combo.sed_atr.unwrap(),
+                        combo.sed_std.unwrap(),
+                        combo.threshold.unwrap()
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in vol \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in vol \
 						 at row {} col {} (flat index {}) with params: vis_atr={}, vis_std={}, sed_atr={}, \
 						 sed_std={}, threshold={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.vis_atr.unwrap(), combo.vis_std.unwrap(),
-						combo.sed_atr.unwrap(), combo.sed_std.unwrap(),
-						combo.threshold.unwrap()
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.vis_atr.unwrap(),
+                        combo.vis_std.unwrap(),
+                        combo.sed_atr.unwrap(),
+                        combo.sed_std.unwrap(),
+                        combo.threshold.unwrap()
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in vol \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in vol \
 						 at row {} col {} (flat index {}) with params: vis_atr={}, vis_std={}, sed_atr={}, \
 						 sed_std={}, threshold={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.vis_atr.unwrap(), combo.vis_std.unwrap(),
-						combo.sed_atr.unwrap(), combo.sed_std.unwrap(),
-						combo.threshold.unwrap()
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.vis_atr.unwrap(),
+                        combo.vis_std.unwrap(),
+                        combo.sed_atr.unwrap(),
+                        combo.sed_std.unwrap(),
+                        combo.threshold.unwrap()
+                    );
                 }
             }
 
@@ -2643,38 +2658,62 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in anti \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in anti \
 						 at row {} col {} (flat index {}) with params: vis_atr={}, vis_std={}, sed_atr={}, \
 						 sed_std={}, threshold={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.vis_atr.unwrap(), combo.vis_std.unwrap(),
-						combo.sed_atr.unwrap(), combo.sed_std.unwrap(),
-						combo.threshold.unwrap()
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.vis_atr.unwrap(),
+                        combo.vis_std.unwrap(),
+                        combo.sed_atr.unwrap(),
+                        combo.sed_std.unwrap(),
+                        combo.threshold.unwrap()
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in anti \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in anti \
 						 at row {} col {} (flat index {}) with params: vis_atr={}, vis_std={}, sed_atr={}, \
 						 sed_std={}, threshold={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.vis_atr.unwrap(), combo.vis_std.unwrap(),
-						combo.sed_atr.unwrap(), combo.sed_std.unwrap(),
-						combo.threshold.unwrap()
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.vis_atr.unwrap(),
+                        combo.vis_std.unwrap(),
+                        combo.sed_atr.unwrap(),
+                        combo.sed_std.unwrap(),
+                        combo.threshold.unwrap()
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in anti \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in anti \
 						 at row {} col {} (flat index {}) with params: vis_atr={}, vis_std={}, sed_atr={}, \
 						 sed_std={}, threshold={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.vis_atr.unwrap(), combo.vis_std.unwrap(),
-						combo.sed_atr.unwrap(), combo.sed_std.unwrap(),
-						combo.threshold.unwrap()
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.vis_atr.unwrap(),
+                        combo.vis_std.unwrap(),
+                        combo.sed_atr.unwrap(),
+                        combo.sed_std.unwrap(),
+                        combo.threshold.unwrap()
+                    );
                 }
             }
         }
@@ -2729,8 +2768,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let mut params = DamianiVolatmeterParams::default();
         params.threshold = Some(f64::NAN);
@@ -2798,8 +2837,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = DamianiVolatmeterParams::default();
         let input = DamianiVolatmeterInput::from_candles(&candles, "close", params);
 
@@ -3117,819 +3156,4 @@ mod tests {
     generate_all_damiani_tests!(check_damiani_property);
 
     gen_batch_tests!(check_batch_default_row);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "damiani")]
-#[pyo3(signature = (data, vis_atr, vis_std, sed_atr, sed_std, threshold, kernel=None))]
-pub fn damiani_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    vis_atr: usize,
-    vis_std: usize,
-    sed_atr: usize,
-    sed_std: usize,
-    threshold: f64,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = DamianiVolatmeterParams {
-        vis_atr: Some(vis_atr),
-        vis_std: Some(vis_std),
-        sed_atr: Some(sed_atr),
-        sed_std: Some(sed_std),
-        threshold: Some(threshold),
-    };
-    let input = DamianiVolatmeterInput::from_slice(slice_in, params);
-
-    let len = slice_in.len();
-
-    let vol_np = unsafe { PyArray1::<f64>::new(py, [len], false) };
-    let anti_np = unsafe { PyArray1::<f64>::new(py, [len], false) };
-
-    unsafe {
-        let vol_sl = vol_np
-            .as_slice_mut()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let anti_sl = anti_np
-            .as_slice_mut()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        py.allow_threads(|| damiani_volatmeter_into_slice(vol_sl, anti_sl, &input, kern))
-    }
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((vol_np, anti_np))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DamianiVolatmeterStream")]
-pub struct DamianiVolatmeterStreamPy {
-    high: Vec<f64>,
-    low: Vec<f64>,
-    close: Vec<f64>,
-
-    vis_atr: usize,
-    vis_std: usize,
-    sed_atr: usize,
-    sed_std: usize,
-    threshold: f64,
-
-    index: usize,
-
-    atr_vis_val: f64,
-    atr_sed_val: f64,
-    sum_vis: f64,
-    sum_sed: f64,
-    prev_close: f64,
-    have_prev: bool,
-
-    ring_vis: Vec<f64>,
-    ring_sed: Vec<f64>,
-    sum_vis_std: f64,
-    sum_sq_vis_std: f64,
-    sum_sed_std: f64,
-    sum_sq_sed_std: f64,
-    idx_vis: usize,
-    idx_sed: usize,
-    filled_vis: usize,
-    filled_sed: usize,
-
-    vol_history: [f64; 3],
-    lag_s: f64,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DamianiVolatmeterStreamPy {
-    #[new]
-    fn new(
-        high: Vec<f64>,
-        low: Vec<f64>,
-        close: Vec<f64>,
-        vis_atr: usize,
-        vis_std: usize,
-        sed_atr: usize,
-        sed_std: usize,
-        threshold: f64,
-    ) -> PyResult<Self> {
-        let len = close.len();
-        if len == 0 {
-            return Err(PyValueError::new_err("Empty data"));
-        }
-
-        if vis_atr == 0
-            || vis_std == 0
-            || sed_atr == 0
-            || sed_std == 0
-            || vis_atr > len
-            || vis_std > len
-            || sed_atr > len
-            || sed_std > len
-        {
-            return Err(PyValueError::new_err(format!(
-				"Invalid period: data length = {}, vis_atr = {}, vis_std = {}, sed_atr = {}, sed_std = {}",
-				len, vis_atr, vis_std, sed_atr, sed_std
-			)));
-        }
-
-        let first = close
-            .iter()
-            .position(|&x| !x.is_nan())
-            .ok_or_else(|| PyValueError::new_err("All values are NaN"))?;
-
-        let needed = *[vis_atr, vis_std, sed_atr, sed_std, 3]
-            .iter()
-            .max()
-            .unwrap();
-        if (len - first) < needed {
-            return Err(PyValueError::new_err(format!(
-                "Not enough valid data: needed {}, valid {}",
-                needed,
-                len - first
-            )));
-        }
-
-        Ok(Self {
-            high,
-            low,
-            close,
-            vis_atr,
-            vis_std,
-            sed_atr,
-            sed_std,
-            threshold,
-            index: first,
-            atr_vis_val: f64::NAN,
-            atr_sed_val: f64::NAN,
-            sum_vis: 0.0,
-            sum_sed: 0.0,
-            prev_close: f64::NAN,
-            have_prev: false,
-            ring_vis: vec![0.0; vis_std],
-            ring_sed: vec![0.0; sed_std],
-            sum_vis_std: 0.0,
-            sum_sq_vis_std: 0.0,
-            sum_sed_std: 0.0,
-            sum_sq_sed_std: 0.0,
-            idx_vis: 0,
-            idx_sed: 0,
-            filled_vis: 0,
-            filled_sed: 0,
-            vol_history: [f64::NAN; 3],
-            lag_s: 0.5,
-        })
-    }
-
-    fn update(&mut self) -> Option<(f64, f64)> {
-        let i = self.index;
-        let len = self.close.len();
-        if i >= len {
-            return None;
-        }
-
-        let tr = if self.have_prev && self.close[i].is_finite() {
-            let hi = self.high[i];
-            let lo = self.low[i];
-            let pc = self.prev_close;
-
-            let tr1 = hi - lo;
-            let tr2 = (hi - pc).abs();
-            let tr3 = (lo - pc).abs();
-            tr1.max(tr2).max(tr3)
-        } else {
-            0.0
-        };
-
-        if self.close[i].is_finite() {
-            self.prev_close = self.close[i];
-            self.have_prev = true;
-        }
-
-        if i < self.vis_atr {
-            self.sum_vis += tr;
-            if i == self.vis_atr - 1 {
-                self.atr_vis_val = self.sum_vis / (self.vis_atr as f64);
-            }
-        } else if self.atr_vis_val.is_finite() {
-            self.atr_vis_val =
-                ((self.vis_atr as f64 - 1.0) * self.atr_vis_val + tr) / (self.vis_atr as f64);
-        }
-
-        if i < self.sed_atr {
-            self.sum_sed += tr;
-            if i == self.sed_atr - 1 {
-                self.atr_sed_val = self.sum_sed / (self.sed_atr as f64);
-            }
-        } else if self.atr_sed_val.is_finite() {
-            self.atr_sed_val =
-                ((self.sed_atr as f64 - 1.0) * self.atr_sed_val + tr) / (self.sed_atr as f64);
-        }
-
-        let val = if self.close[i].is_nan() {
-            0.0
-        } else {
-            self.close[i]
-        };
-
-        let old_v = self.ring_vis[self.idx_vis];
-        self.ring_vis[self.idx_vis] = val;
-        self.idx_vis = (self.idx_vis + 1) % self.vis_std;
-        if self.filled_vis < self.vis_std {
-            self.filled_vis += 1;
-            self.sum_vis_std += val;
-            self.sum_sq_vis_std += val * val;
-        } else {
-            self.sum_vis_std = self.sum_vis_std - old_v + val;
-            self.sum_sq_vis_std = self.sum_sq_vis_std - (old_v * old_v) + (val * val);
-        }
-
-        let old_s = self.ring_sed[self.idx_sed];
-        self.ring_sed[self.idx_sed] = val;
-        self.idx_sed = (self.idx_sed + 1) % self.sed_std;
-        if self.filled_sed < self.sed_std {
-            self.filled_sed += 1;
-            self.sum_sed_std += val;
-            self.sum_sq_sed_std += val * val;
-        } else {
-            self.sum_sed_std = self.sum_sed_std - old_s + val;
-            self.sum_sq_sed_std = self.sum_sq_sed_std - (old_s * old_s) + (val * val);
-        }
-
-        self.index += 1;
-
-        let needed = *[self.vis_atr, self.vis_std, self.sed_atr, self.sed_std, 3]
-            .iter()
-            .max()
-            .unwrap();
-        if i < needed {
-            return None;
-        }
-
-        let p1 = if !self.vol_history[0].is_nan() {
-            self.vol_history[0]
-        } else {
-            0.0
-        };
-        let p3 = if !self.vol_history[2].is_nan() {
-            self.vol_history[2]
-        } else {
-            0.0
-        };
-
-        let sed_safe = if self.atr_sed_val.is_finite() && self.atr_sed_val != 0.0 {
-            self.atr_sed_val
-        } else {
-            self.atr_sed_val + f64::EPSILON
-        };
-
-        let vol_val = (self.atr_vis_val / sed_safe) + self.lag_s * (p1 - p3);
-
-        self.vol_history[2] = self.vol_history[1];
-        self.vol_history[1] = self.vol_history[0];
-        self.vol_history[0] = vol_val;
-
-        let anti_val = if self.filled_vis == self.vis_std && self.filled_sed == self.sed_std {
-            let std_vis = stddev(self.sum_vis_std, self.sum_sq_vis_std, self.vis_std);
-            let std_sed = stddev(self.sum_sed_std, self.sum_sq_sed_std, self.sed_std);
-            let ratio = if std_sed != 0.0 {
-                std_vis / std_sed
-            } else {
-                std_vis / (std_sed + f64::EPSILON)
-            };
-            self.threshold - ratio
-        } else {
-            f64::NAN
-        };
-
-        Some((vol_val, anti_val))
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "damiani_batch")]
-#[pyo3(signature = (data, vis_atr_range, vis_std_range, sed_atr_range, sed_std_range, threshold_range, kernel=None))]
-pub fn damiani_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    vis_atr_range: (usize, usize, usize),
-    vis_std_range: (usize, usize, usize),
-    sed_atr_range: (usize, usize, usize),
-    sed_std_range: (usize, usize, usize),
-    threshold_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let sweep = DamianiVolatmeterBatchRange {
-        vis_atr: vis_atr_range,
-        vis_std: vis_std_range,
-        sed_atr: sed_atr_range,
-        sed_std: sed_std_range,
-        threshold: threshold_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let vol_np = unsafe { PyArray1::<f64>::new(py, [expected], false) };
-    let anti_np = unsafe { PyArray1::<f64>::new(py, [expected], false) };
-    let vol_sl = unsafe { vol_np.as_slice_mut()? };
-    let anti_sl = unsafe { anti_np.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let kernel = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        let simd = match kernel {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => unreachable!(),
-        };
-        damiani_volatmeter_batch_inner_into(slice_in, &sweep, simd, true, vol_sl, anti_sl)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("vol", vol_np.reshape((rows, cols))?)?;
-    d.set_item("anti", anti_np.reshape((rows, cols))?)?;
-    d.set_item(
-        "vis_atr",
-        combos
-            .iter()
-            .map(|p| p.vis_atr.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "vis_std",
-        combos
-            .iter()
-            .map(|p| p.vis_std.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "sed_atr",
-        combos
-            .iter()
-            .map(|p| p.sed_atr.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "sed_std",
-        combos
-            .iter()
-            .map(|p| p.sed_std.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "threshold",
-        combos
-            .iter()
-            .map(|p| p.threshold.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32DamianiPy {
-    pub(crate) inner: crate::cuda::damiani_volatmeter_wrapper::DeviceArrayF32Damiani,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32DamianiPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::cuda::damiani_volatmeter_wrapper::DeviceArrayF32Damiani;
-        use cust::memory::DeviceBuffer;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        if let Some(obj) = &stream {
-            if let Ok(i) = obj.extract::<i64>(py) {
-                if i == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__: stream 0 is disallowed for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = self.inner.ctx.clone();
-        let device_id = self.inner.device_id;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Damiani {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx,
-                device_id,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "damiani_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, vis_atr_range, vis_std_range, sed_atr_range, sed_std_range, threshold_range, device_id=0))]
-pub fn damiani_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: PyReadonlyArray1<'py, f32>,
-    vis_atr_range: (usize, usize, usize),
-    vis_std_range: (usize, usize, usize),
-    sed_atr_range: (usize, usize, usize),
-    sed_std_range: (usize, usize, usize),
-    threshold_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32DamianiPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in = data_f32.as_slice()?;
-    let sweep = DamianiVolatmeterBatchRange {
-        vis_atr: vis_atr_range,
-        vis_std: vis_std_range,
-        sed_atr: sed_atr_range,
-        sed_std: sed_std_range,
-        threshold: threshold_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = crate::cuda::CudaDamianiVolatmeter::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (arr, _combos) = cuda
-            .damiani_volatmeter_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>(arr)
-    })?;
-
-    Ok(DeviceArrayF32DamianiPy { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "damiani_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, vis_atr, vis_std, sed_atr, sed_std, threshold, device_id=0))]
-pub fn damiani_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: PyReadonlyArray1<'py, f32>,
-    low_tm_f32: PyReadonlyArray1<'py, f32>,
-    close_tm_f32: PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    vis_atr: usize,
-    vis_std: usize,
-    sed_atr: usize,
-    sed_std: usize,
-    threshold: f64,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32DamianiPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if h.len() != expected || l.len() != expected || c.len() != expected {
-        return Err(PyValueError::new_err("time-major input lengths mismatch"));
-    }
-    let params = DamianiVolatmeterParams {
-        vis_atr: Some(vis_atr),
-        vis_std: Some(vis_std),
-        sed_atr: Some(sed_atr),
-        sed_std: Some(sed_std),
-        threshold: Some(threshold),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = crate::cuda::CudaDamianiVolatmeter::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.damiani_volatmeter_many_series_one_param_time_major_dev(h, l, c, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32DamianiPy { inner })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DamianiVolatmeterFeedStream")]
-pub struct DamianiVolatmeterFeedStreamPy {
-    stream: DamianiVolatmeterFeedStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DamianiVolatmeterFeedStreamPy {
-    #[new]
-    fn new(
-        vis_atr: usize,
-        vis_std: usize,
-        sed_atr: usize,
-        sed_std: usize,
-        threshold: f64,
-    ) -> PyResult<Self> {
-        let params = DamianiVolatmeterParams {
-            vis_atr: Some(vis_atr),
-            vis_std: Some(vis_std),
-            sed_atr: Some(sed_atr),
-            sed_std: Some(sed_std),
-            threshold: Some(threshold),
-        };
-        let stream = DamianiVolatmeterFeedStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(DamianiVolatmeterFeedStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DamianiJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = damiani_volatmeter_js)]
-pub fn damiani_volatmeter_wasm(
-    data: &[f64],
-    vis_atr: usize,
-    vis_std: usize,
-    sed_atr: usize,
-    sed_std: usize,
-    threshold: f64,
-) -> Result<JsValue, JsValue> {
-    let params = DamianiVolatmeterParams {
-        vis_atr: Some(vis_atr),
-        vis_std: Some(vis_std),
-        sed_atr: Some(sed_atr),
-        sed_std: Some(sed_std),
-        threshold: Some(threshold),
-    };
-    let input = DamianiVolatmeterInput::from_slice(data, params);
-    let out = damiani_volatmeter_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let cols = data.len();
-    let mut values = Vec::with_capacity(2 * cols);
-    values.extend_from_slice(&out.vol);
-    values.extend_from_slice(&out.anti);
-    serde_wasm_bindgen::to_value(&DamianiJsOutput {
-        values,
-        rows: 2,
-        cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn damiani_volatmeter_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn damiani_volatmeter_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn damiani_volatmeter_into(
-    in_ptr: *const f64,
-    out_vol_ptr: *mut f64,
-    out_anti_ptr: *mut f64,
-    len: usize,
-    vis_atr: usize,
-    vis_std: usize,
-    sed_atr: usize,
-    sed_std: usize,
-    threshold: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_vol_ptr.is_null() || out_anti_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to damiani_volatmeter_into",
-        ));
-    }
-
-    if out_vol_ptr == out_anti_ptr {
-        return Err(JsValue::from_str("vol_ptr and anti_ptr cannot be the same"));
-    }
-
-    unsafe {
-        let params = DamianiVolatmeterParams {
-            vis_atr: Some(vis_atr),
-            vis_std: Some(vis_std),
-            sed_atr: Some(sed_atr),
-            sed_std: Some(sed_std),
-            threshold: Some(threshold),
-        };
-
-        let in_addr = in_ptr as usize;
-        let vol_addr = out_vol_ptr as usize;
-        let anti_addr = out_anti_ptr as usize;
-
-        if in_addr == vol_addr || in_addr == anti_addr {
-            let data_copy = std::slice::from_raw_parts(in_ptr, len).to_vec();
-            let vol = std::slice::from_raw_parts_mut(out_vol_ptr, len);
-            let anti = std::slice::from_raw_parts_mut(out_anti_ptr, len);
-            let input = DamianiVolatmeterInput::from_slice(&data_copy, params);
-            damiani_volatmeter_into_slice(vol, anti, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))
-        } else {
-            let data = std::slice::from_raw_parts(in_ptr, len);
-            let vol = std::slice::from_raw_parts_mut(out_vol_ptr, len);
-            let anti = std::slice::from_raw_parts_mut(out_anti_ptr, len);
-            let input = DamianiVolatmeterInput::from_slice(data, params);
-            damiani_volatmeter_into_slice(vol, anti, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DamianiBatchJsOutput {
-    pub vol: Vec<f64>,
-    pub anti: Vec<f64>,
-    pub combos: Vec<DamianiVolatmeterParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = damiani_volatmeter_batch)]
-pub fn damiani_volatmeter_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: DamianiVolatmeterBatchRange = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let out = damiani_volatmeter_batch_inner(data, &cfg, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&DamianiBatchJsOutput {
-        vol: out.vol,
-        anti: out.anti,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn damiani_volatmeter_batch_into(
-    in_ptr: *const f64,
-    vol_ptr: *mut f64,
-    anti_ptr: *mut f64,
-    len: usize,
-    vis_atr_start: usize,
-    vis_atr_end: usize,
-    vis_atr_step: usize,
-    vis_std_start: usize,
-    vis_std_end: usize,
-    vis_std_step: usize,
-    sed_atr_start: usize,
-    sed_atr_end: usize,
-    sed_atr_step: usize,
-    sed_std_start: usize,
-    sed_std_end: usize,
-    sed_std_step: usize,
-    threshold_start: f64,
-    threshold_end: f64,
-    threshold_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || vol_ptr.is_null() || anti_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = DamianiVolatmeterBatchRange {
-            vis_atr: (vis_atr_start, vis_atr_end, vis_atr_step),
-            vis_std: (vis_std_start, vis_std_end, vis_std_step),
-            sed_atr: (sed_atr_start, sed_atr_end, sed_atr_step),
-            sed_std: (sed_std_start, sed_std_end, sed_std_step),
-            threshold: (threshold_start, threshold_end, threshold_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        if vol_ptr == anti_ptr {
-            return Err(JsValue::from_str("vol_ptr and anti_ptr cannot be the same"));
-        }
-
-        if in_ptr == vol_ptr || in_ptr == anti_ptr {
-            let result = damiani_volatmeter_batch_inner(data, &sweep, detect_best_kernel(), false)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let vol_out = std::slice::from_raw_parts_mut(vol_ptr, rows * cols);
-            let anti_out = std::slice::from_raw_parts_mut(anti_ptr, rows * cols);
-
-            vol_out.copy_from_slice(&result.vol);
-            anti_out.copy_from_slice(&result.anti);
-        } else {
-            let vol_out = std::slice::from_raw_parts_mut(vol_ptr, rows * cols);
-            let anti_out = std::slice::from_raw_parts_mut(anti_ptr, rows * cols);
-
-            damiani_volatmeter_batch_inner_into(
-                data,
-                &sweep,
-                detect_best_kernel(),
-                false,
-                vol_out,
-                anti_out,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(rows)
-    }
 }

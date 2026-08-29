@@ -351,13 +351,8 @@ where
 
 fn cleanup_dir_if_present(path: &Path, artifact_label: &str, role: &str) -> Result<()> {
     if path.exists() {
-        fs::remove_dir_all(path).with_context(|| {
-            format!(
-                "remove {role} {} dir {}",
-                artifact_label,
-                path.display()
-            )
-        })?;
+        fs::remove_dir_all(path)
+            .with_context(|| format!("remove {role} {} dir {}", artifact_label, path.display()))?;
     }
     Ok(())
 }
@@ -485,7 +480,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "no temp file may linger: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "no temp file may linger: {leftovers:?}"
+        );
 
         std::fs::remove_dir_all(&dir).expect("cleanup bytes dir");
     }
@@ -521,7 +519,10 @@ mod tests {
         let content = std::fs::read_to_string(&path).expect("final file readable");
         let parts: Vec<&str> = content.trim_end().split('|').collect();
         assert_eq!(parts.len(), 3, "payload structure intact: {content:?}");
-        assert_eq!(parts[0], parts[2], "head/tail markers must match (no torn write)");
+        assert_eq!(
+            parts[0], parts[2],
+            "head/tail markers must match (no torn write)"
+        );
         assert_eq!(parts[1].len(), 512, "body length intact");
 
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -529,7 +530,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "no temp files may linger: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "no temp files may linger: {leftovers:?}"
+        );
         std::fs::remove_dir_all(&dir).expect("cleanup concurrent dir");
     }
 
@@ -541,7 +545,11 @@ mod tests {
         let a = temporary_path(target);
         let b = temporary_path(target);
         assert_ne!(a, b, "each call must yield a unique temp path");
-        assert_eq!(a.parent(), target.parent(), "temp must stay in the same dir");
+        assert_eq!(
+            a.parent(),
+            target.parent(),
+            "temp must stay in the same dir"
+        );
     }
 
     #[test]

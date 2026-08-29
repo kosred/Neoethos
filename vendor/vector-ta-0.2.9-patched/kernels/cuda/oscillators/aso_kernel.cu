@@ -336,7 +336,7 @@ extern "C" __global__ void aso_many_series_one_param_f32(
 }
 
 // ===========================================================================
-// S3 f64 LANE — aso (Average Sentiment Oscillator, bulls line)
+// S3 f64 LANE — aso (Average Sentiment Oscillator, canonical bulls/bears)
 // ===========================================================================
 // Reference: src/indicators/aso.rs
 //   aso_prepare (:370)                   — first_valid + the Err branches
@@ -344,9 +344,9 @@ extern "C" __global__ void aso_many_series_one_param_f32(
 //   aso_scalar_output_selected (:527)    — the window scan and the running mean
 // Batch defaults: period 10, mode 0. Inputs: OPEN, high, low, close.
 //
-// WHICH OUTPUT. aso is multi-output (bulls / bears). compute_aso_batch maps
-// output_id "value" — the id this lane requests — to BULLS, so this kernel is
-// the bulls line.
+// WHICH OUTPUT. The registry contract is exactly bulls / bears. The original
+// production ABI emits bulls; the full resident ABI below emits both from the
+// same row state without replaying the window or running a second launch.
 //
 // FIRST-VALID IS CLOSE ALONE (:405-408):
 //     close.iter().position(|x| !x.is_nan())
@@ -356,12 +356,10 @@ extern "C" __global__ void aso_many_series_one_param_f32(
 // different bars and every value after the seed differs.
 //
 // WHICH BRANCH. period <= 64 (DEQUE_THRESHOLD, :544) takes the LINEAR-SCAN
-// branch, and the batch default period is 10. The scan is O(period) per bar and
-// is reproduced exactly; the >64 monotone-deque branch computes the same
-// extremes by a different route and is not the path a default sweep takes. A
-// period above 64 in the sweep would take the CPU's deque branch — which
-// produces the same gl/gh values, since both are exact extreme selection over
-// the same window under the same comparisons.
+// branch. Above 64 the CPU monotone deque uses <=/>= and NaNs become barriers:
+// the head is the latest tied extreme before the window's first NaN, or that
+// NaN when it is the first element. The direct scans below reproduce those
+// exact value/NaN/signed-zero semantics without a second device workspace.
 //
 // THE SENTINELS ARE f64::MAX AND f64::MIN, AND THEY ARE LOAD-BEARING (:555-556).
 //   gl starts at  f64::MAX =  1.7976931348623157e308
@@ -398,8 +396,9 @@ __device__ __forceinline__ double neo_s3_qnan() {
     return __longlong_as_double(0x7ff8000000000000LL);
 }
 
-// aso_selected_value::<true> — the bulls branch, mode as a runtime value.
-__device__ __forceinline__ double neo_s3_aso_bulls(
+// Exact `aso_selected_value::<BULLS>` authority, with mode as a runtime value.
+template <bool BULLS>
+__device__ __forceinline__ double neo_s3_aso_selected(
     double oi, double hi, double li, double ci,
     double gl, double gh, double gopen, int mode)
 {
@@ -408,8 +407,12 @@ __device__ __forceinline__ double neo_s3_aso_bulls(
     const double gr = gh - gl;
     const double k2 = (gr == 0.0) ? 1.0 : gr;
 
-    const double intrabar = (((ci - li) + (hi - oi)) * 50.0) / k1;
-    const double group    = (((ci - gl) + (gh - gopen)) * 50.0) / k2;
+    const double intrabar = BULLS
+        ? (((ci - li) + (hi - oi)) * 50.0) / k1
+        : (((hi - ci) + (oi - li)) * 50.0) / k1;
+    const double group = BULLS
+        ? (((ci - gl) + (gh - gopen)) * 50.0) / k2
+        : (((gh - ci) + (gopen - gl)) * 50.0) / k2;
 
     if (mode == 1) return intrabar;
     if (mode == 2) return group;
@@ -417,7 +420,8 @@ __device__ __forceinline__ double neo_s3_aso_bulls(
 }
 
 // The window value at bar `i`: gl/gh scanned over [i-period+1, i] with the
-// CPU's sentinels and if-chains.
+// exact selected-output branch semantics.
+template <bool BULLS>
 __device__ __forceinline__ double neo_s3_aso_value_at(
     const double* __restrict__ open,
     const double* __restrict__ high,
@@ -426,15 +430,93 @@ __device__ __forceinline__ double neo_s3_aso_value_at(
     int i, int period, int mode)
 {
     const int start = i + 1 - period;
-    double gl =  1.7976931348623157e308;   // f64::MAX
-    double gh = -1.7976931348623157e308;   // f64::MIN
-    for (int j = start; j <= i; ++j) {
-        const double lj = low[j];
-        const double hj = high[j];
-        if (lj < gl) gl = lj;
-        if (hj > gh) gh = hj;
+    double gl;
+    double gh;
+    if (period <= 64) {
+        gl =  1.7976931348623157e308;   // f64::MAX
+        gh = -1.7976931348623157e308;   // f64::MIN
+        for (int j = start; j <= i; ++j) {
+            const double lj = low[j];
+            const double hj = high[j];
+            if (lj < gl) gl = lj;
+            if (hj > gh) gh = hj;
+        }
+    } else {
+        gl = low[start];
+        for (int j = start + 1; j <= i; ++j) {
+            const double lj = low[j];
+            if (isnan(lj)) break;
+            if (lj <= gl) gl = lj;
+        }
+        gh = high[start];
+        for (int j = start + 1; j <= i; ++j) {
+            const double hj = high[j];
+            if (isnan(hj)) break;
+            if (hj >= gh) gh = hj;
+        }
     }
-    return neo_s3_aso_bulls(open[i], high[i], low[i], close[i], gl, gh, open[start], mode);
+    return neo_s3_aso_selected<BULLS>(
+        open[i], high[i], low[i], close[i], gl, gh, open[start], mode
+    );
+}
+
+// One sequential row state is shared by the primary and full-output ABIs.
+// `out_bears == nullptr` preserves the original bulls-only production ABI;
+// otherwise both exact scalar recurrences are advanced in the same launch.
+__device__ __forceinline__ void neo_s3_aso_row_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    int period,
+    int mode,
+    int first_valid,
+    double* __restrict__ out_bulls,
+    double* __restrict__ out_bears)
+{
+    const bool declined =
+        (n <= 0) ||
+        (first_valid < 0) || (first_valid >= n) ||
+        (period <= 0) || (period > n) ||
+        (mode < 0) || (mode > 2) ||
+        ((n - first_valid) < period);
+    for (int i = 0; i < n; ++i) {
+        out_bulls[i] = neo_s3_qnan();
+        if (out_bears != nullptr) out_bears[i] = neo_s3_qnan();
+    }
+    if (declined) return;
+
+    const int warm = first_valid + period - 1;
+    double sum_bulls = 0.0;
+    double sum_bears = 0.0;
+    for (int i = warm; i < n; ++i) {
+        const double bulls =
+            neo_s3_aso_value_at<true>(open, high, low, close, i, period, mode);
+        const double bears = (out_bears != nullptr)
+            ? neo_s3_aso_value_at<false>(open, high, low, close, i, period, mode)
+            : 0.0;
+
+        const int k = i - warm;
+        const int filled = (k < period) ? (k + 1) : period;
+        const double old_bulls = (k >= period)
+            ? neo_s3_aso_value_at<true>(
+                open, high, low, close, i - period, period, mode
+            )
+            : 0.0;
+        const double old_bears = (out_bears != nullptr && k >= period)
+            ? neo_s3_aso_value_at<false>(
+                open, high, low, close, i - period, period, mode
+            )
+            : 0.0;
+
+        sum_bulls += bulls - old_bulls;
+        out_bulls[i] = sum_bulls / (double)filled;
+        if (out_bears != nullptr) {
+            sum_bears += bears - old_bears;
+            out_bears[i] = sum_bears / (double)filled;
+        }
+    }
 }
 
 extern "C" __global__ void neoethos_aso_batch_f64(
@@ -452,37 +534,47 @@ extern "C" __global__ void neoethos_aso_batch_f64(
     if (r >= n_combos) return;
 
     double* __restrict__ row = out + (size_t)r * (size_t)n;
-    const int period = periods[r];
-    const int mode = NEO_S3_ASO_MODE;
+    neo_s3_aso_row_f64(
+        open,
+        high,
+        low,
+        close,
+        n,
+        periods[r],
+        NEO_S3_ASO_MODE,
+        first_valid,
+        row,
+        nullptr
+    );
+}
 
-    const bool declined =
-        (n <= 0) ||
-        (first_valid < 0) || (first_valid >= n) ||
-        (period == 0) || (period > n) ||
-        (mode > 2) ||
-        ((n - first_valid) < period);
-    if (declined) {
-        for (int i = 0; i < n; ++i) row[i] = neo_s3_qnan();
-        return;
-    }
+extern "C" __global__ void neoethos_aso_outputs_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int n,
+    const int* __restrict__ periods,
+    const int* __restrict__ modes,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out_bulls,
+    double* __restrict__ out_bears)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_combos) return;
 
-    const int warm = first_valid + period - 1;
-    // aso_output_into_slice fills the prefix with NaN; the scalar writes only
-    // from `warm` on (:552).
-    for (int i = 0; i < warm && i < n; ++i) row[i] = neo_s3_qnan();
-    if (warm >= n) return;
-
-    double sum = 0.0;
-    for (int i = warm; i < n; ++i) {
-        const double v = neo_s3_aso_value_at(open, high, low, close, i, period, mode);
-
-        const int k = i - warm;                       // 0-based output index
-        const int filled = (k < period) ? (k + 1) : period;
-        const double old = (k >= period)
-            ? neo_s3_aso_value_at(open, high, low, close, i - period, period, mode)
-            : 0.0;
-
-        sum += v - old;
-        row[i] = sum / (double)filled;
-    }
+    const size_t offset = (size_t)r * (size_t)n;
+    neo_s3_aso_row_f64(
+        open,
+        high,
+        low,
+        close,
+        n,
+        periods[r],
+        modes[r],
+        first_valid,
+        out_bulls + offset,
+        out_bears + offset
+    );
 }

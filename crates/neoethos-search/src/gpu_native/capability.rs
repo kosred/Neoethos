@@ -1,6 +1,6 @@
 //! Typed GPU capability inventory and fail-fast pipeline preflight.
 
-use crate::backend::{EvaluationBackend, FallbackPolicy};
+use crate::backend::EvaluationBackend;
 use std::error::Error;
 use std::fmt;
 
@@ -204,14 +204,10 @@ impl GpuCapabilityManifest {
 }
 
 pub fn gpu_pipeline_preflight(
-    backend: EvaluationBackend,
+    _backend: EvaluationBackend,
     manifest: &GpuCapabilityManifest,
     requested_stages: &[PipelineStage],
 ) -> Result<(), GpuPipelinePreflightError> {
-    if backend.fallback == FallbackPolicy::AllowCpu {
-        return Ok(());
-    }
-
     let mut unsupported = Vec::new();
     for stage in requested_stages {
         match manifest.capability(*stage) {
@@ -262,13 +258,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn optional_backend_does_not_fail_preflight() {
-        gpu_pipeline_preflight(
+    fn auto_backend_cannot_bypass_strict_preflight() {
+        let error = gpu_pipeline_preflight(
             EvaluationBackend::AUTO,
             &GpuCapabilityManifest::stage1_baseline(),
             &PipelineStage::FULL_DISCOVERY,
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(!error.unsupported.is_empty());
     }
 
     #[test]

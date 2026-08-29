@@ -135,14 +135,12 @@ impl DecisionEngine {
         if mark <= 0.0 {
             return None;
         }
-        let strategy_stop = if self.cfg.pip_size > 0.0
-            && signal.sl_pips.is_finite()
-            && signal.sl_pips > 0.0
-        {
-            Some(signal.sl_pips * self.cfg.pip_size)
-        } else {
-            None
-        };
+        let strategy_stop =
+            if self.cfg.pip_size > 0.0 && signal.sl_pips.is_finite() && signal.sl_pips > 0.0 {
+                Some(signal.sl_pips * self.cfg.pip_size)
+            } else {
+                None
+            };
 
         let (stop, target) = match strategy_stop {
             Some(stop) => {
@@ -185,12 +183,7 @@ impl DecisionEngine {
 
     /// Decide the single intent (if any) for this signal given the open
     /// positions on its symbol and the current `mark` price.
-    pub fn intent(
-        &mut self,
-        signal: &Signal,
-        open: &[Position],
-        mark: f64,
-    ) -> Option<TradeIntent> {
+    pub fn intent(&mut self, signal: &Signal, open: &[Position], mark: f64) -> Option<TradeIntent> {
         let existing = open.iter().find(|p| p.symbol == signal.symbol).cloned();
 
         match (signal.dir, existing) {
@@ -294,7 +287,9 @@ mod tests {
     #[test]
     fn no_gene_bracket_falls_back_to_stop_frac() {
         let mut eng = DecisionEngine::new(DecisionConfig::gene_parity(0.0001));
-        let intent = eng.intent(&sig(Direction::Long, 0.0, 0.0), &[], 1.08).unwrap();
+        let intent = eng
+            .intent(&sig(Direction::Long, 0.0, 0.0), &[], 1.08)
+            .unwrap();
         match intent {
             TradeIntent::Open { sl, .. } => {
                 let stop = 1.08 - sl.unwrap();
@@ -311,11 +306,13 @@ mod tests {
         let mut eng = DecisionEngine::new(DecisionConfig::gene_parity(0.0001));
         let open = vec![open_long()];
         assert!(
-            eng.intent(&sig(Direction::Flat, 0.0, 0.0), &open, 1.08).is_none(),
+            eng.intent(&sig(Direction::Flat, 0.0, 0.0), &open, 1.08)
+                .is_none(),
             "flat signal must not close under backtest parity"
         );
         assert!(
-            eng.intent(&sig(Direction::Short, 10.0, 20.0), &open, 1.08).is_none(),
+            eng.intent(&sig(Direction::Short, 10.0, 20.0), &open, 1.08)
+                .is_none(),
             "reversal must not close under backtest parity"
         );
     }
@@ -325,7 +322,13 @@ mod tests {
     fn default_policy_still_closes_on_flat_and_reversal() {
         let mut eng = DecisionEngine::default();
         let open = vec![open_long()];
-        assert!(eng.intent(&sig(Direction::Flat, 0.0, 0.0), &open, 1.08).is_some());
-        assert!(eng.intent(&sig(Direction::Short, 0.0, 0.0), &open, 1.08).is_some());
+        assert!(
+            eng.intent(&sig(Direction::Flat, 0.0, 0.0), &open, 1.08)
+                .is_some()
+        );
+        assert!(
+            eng.intent(&sig(Direction::Short, 0.0, 0.0), &open, 1.08)
+                .is_some()
+        );
     }
 }

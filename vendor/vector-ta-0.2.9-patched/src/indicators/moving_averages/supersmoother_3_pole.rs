@@ -1,10 +1,4 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::supersmoother_3_pole_wrapper::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaSupersmoother3Pole;
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -258,7 +252,6 @@ pub fn supersmoother_3_pole_with_kernel(
     Ok(SuperSmoother3PoleOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn supersmoother_3_pole_into(
     input: &SuperSmoother3PoleInput,
@@ -944,35 +937,11 @@ pub fn supersmoother_3_pole_batch_inner_into(
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = supersmoother_3_pole_js(data, period)?;
-    crate::write_wasm_f64_output("supersmoother_3_pole_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = supersmoother_3_pole_batch_js(data, period_start, period_end, period_step)?;
-    crate::write_wasm_f64_output("supersmoother_3_pole_batch_output_into_js", &values, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
@@ -1012,8 +981,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = SuperSmoother3PoleParams { period: None };
         let input = SuperSmoother3PoleInput::from_candles(&candles, "close", default_params);
         let output = supersmoother_3_pole_with_kernel(&input, kernel)?;
@@ -1026,8 +995,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = SuperSmoother3PoleParams { period: Some(14) };
         let input = SuperSmoother3PoleInput::from_candles(&candles, "close", params);
         let result = supersmoother_3_pole_with_kernel(&input, kernel)?;
@@ -1113,8 +1082,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_input = SuperSmoother3PoleInput::from_candles(
             &candles,
             "close",
@@ -1135,8 +1104,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = SuperSmoother3PoleInput::from_candles(
             &candles,
             "close",
@@ -1155,8 +1124,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 14;
         let input = SuperSmoother3PoleInput::from_candles(
             &candles,
@@ -1382,8 +1351,8 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_periods = vec![5, 10, 14, 20, 30, 50, 100, 200];
 
@@ -1408,23 +1377,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with period {}",
-						test_name, val, bits, i, period
-					);
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with period {}",
+                        test_name, val, bits, i, period
+                    );
                 }
             }
         }
@@ -1457,8 +1426,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = SuperSmoother3PoleBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1508,8 +1477,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let batch_configs = vec![
             (5, 15, 5),
@@ -1578,223 +1547,6 @@ mod tests {
     gen_batch_tests!(check_batch_no_poison);
 }
 
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "supersmoother_3_pole")]
-#[pyo3(signature = (data, period, kernel=None))]
-
-pub fn supersmoother_3_pole_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = SuperSmoother3PoleParams {
-        period: Some(period),
-    };
-    let input = SuperSmoother3PoleInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| supersmoother_3_pole_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "SuperSmoother3PoleStream")]
-pub struct SuperSmoother3PoleStreamPy {
-    stream: SuperSmoother3PoleStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl SuperSmoother3PoleStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = SuperSmoother3PoleParams {
-            period: Some(period),
-        };
-        let stream = SuperSmoother3PoleStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(SuperSmoother3PoleStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> f64 {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "supersmoother_3_pole_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-
-pub fn supersmoother_3_pole_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = SuperSmoother3PoleBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    if combos.is_empty() {
-        return Err(PyValueError::new_err("Invalid period range"));
-    }
-
-    let first = slice_in
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| PyValueError::new_err("All input values are NaN"))?;
-
-    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
-    if slice_in.len() - first < max_p {
-        return Err(PyValueError::new_err(format!(
-            "Not enough valid data: needed = {}, valid = {}",
-            max_p,
-            slice_in.len() - first
-        )));
-    }
-
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow"))?;
-    let warm: Vec<usize> = combos
-        .iter()
-        .map(|c| first + c.period.unwrap() - 1)
-        .collect();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        let kernel = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        let simd = match kernel {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => kernel,
-        };
-        supersmoother_3_pole_batch_inner_into(
-            slice_in, &combos, first, &warm, cols, simd, true, slice_out,
-        );
-    });
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "supersmoother_3_pole_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, device_id=0))]
-pub fn supersmoother_3_pole_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = SuperSmoother3PoleBatchRange {
-        period: period_range,
-    };
-
-    let cuda =
-        CudaSupersmoother3Pole::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let stream = cuda.stream_handle();
-    let dev_id = cuda.device_id();
-    let ctx_guard = cuda.context_arc();
-    let inner = py
-        .allow_threads(|| cuda.supersmoother_3_pole_batch_dev(slice_in, &sweep))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(
-        inner, stream, ctx_guard, dev_id,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "supersmoother_3_pole_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, period, device_id=0))]
-pub fn supersmoother_3_pole_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = SuperSmoother3PoleParams {
-        period: Some(period),
-    };
-
-    let cuda =
-        CudaSupersmoother3Pole::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let stream = cuda.stream_handle();
-    let dev_id = cuda.device_id();
-    let ctx_guard = cuda.context_arc();
-    let inner = py
-        .allow_threads(|| {
-            cuda.supersmoother_3_pole_many_series_one_param_time_major_dev(
-                flat_in, cols, rows, &params,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(
-        inner, stream, ctx_guard, dev_id,
-    ))
-}
-
 #[inline]
 pub fn supersmoother_3_pole_into_slice(
     dst: &mut [f64],
@@ -1855,271 +1607,4 @@ pub fn supersmoother_3_pole_into_slice(
     }
 
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use js_sys::{Object, Reflect};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = SuperSmoother3PoleParams {
-        period: Some(period),
-    };
-    let input = SuperSmoother3PoleInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    supersmoother_3_pole_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct SuperSmoother3PoleBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_batch(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    use serde_wasm_bindgen::{from_value, to_value};
-
-    let config: SuperSmoother3PoleBatchConfig = from_value(config)?;
-    let sweep = SuperSmoother3PoleBatchRange {
-        period: config.period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    if combos.is_empty() {
-        return Err(JsValue::from_str("Invalid period range"));
-    }
-
-    let first = data
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| JsValue::from_str("All input values are NaN"))?;
-
-    let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
-    if data.len() - first < max_p {
-        return Err(JsValue::from_str(&format!(
-            "Not enough valid data: needed = {}, valid = {}",
-            max_p,
-            data.len() - first
-        )));
-    }
-
-    let rows = combos.len();
-    let cols = data.len();
-    let mut output = vec![0.0; rows * cols];
-
-    let chosen = detect_best_batch_kernel();
-    let simd = match chosen {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => chosen,
-    };
-
-    let warm: Vec<usize> = combos
-        .iter()
-        .map(|c| first + c.period.unwrap() - 1)
-        .collect();
-
-    supersmoother_3_pole_batch_inner_into(
-        data,
-        &combos,
-        first,
-        &warm,
-        cols,
-        simd,
-        false,
-        &mut output,
-    );
-
-    let result = Object::new();
-    Reflect::set(&result, &JsValue::from_str("values"), &to_value(&output)?)?;
-    Reflect::set(
-        &result,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(rows as f64),
-    )?;
-    Reflect::set(
-        &result,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(cols as f64),
-    )?;
-    Reflect::set(
-        &result,
-        &JsValue::from_str("periods"),
-        &to_value(&combos.iter().map(|c| c.period.unwrap()).collect::<Vec<_>>())?,
-    )?;
-
-    Ok(JsValue::from(result))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = SuperSmoother3PoleBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    supersmoother_3_pole_batch_inner(data, &sweep, Kernel::Scalar, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = SuperSmoother3PoleBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let mut metadata = Vec::with_capacity(combos.len());
-
-    for combo in combos {
-        metadata.push(combo.period.unwrap() as f64);
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = SuperSmoother3PoleParams {
-            period: Some(period),
-        };
-        let input = SuperSmoother3PoleInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            supersmoother_3_pole_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            supersmoother_3_pole_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn supersmoother_3_pole_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided to batch function"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = SuperSmoother3PoleBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        if combos.is_empty() {
-            return Err(JsValue::from_str("Invalid period range"));
-        }
-
-        let first = data
-            .iter()
-            .position(|x| !x.is_nan())
-            .ok_or_else(|| JsValue::from_str("All input values are NaN"))?;
-
-        let max_p = combos.iter().map(|c| c.period.unwrap()).max().unwrap();
-        if data.len() - first < max_p {
-            return Err(JsValue::from_str(&format!(
-                "Not enough valid data: needed = {}, valid = {}",
-                max_p,
-                data.len() - first
-            )));
-        }
-
-        let rows = combos.len();
-        let cols = data.len();
-        let total_size = rows * cols;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
-
-        let chosen = detect_best_batch_kernel();
-        let simd = match chosen {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => chosen,
-        };
-
-        let warm: Vec<usize> = combos
-            .iter()
-            .map(|c| first + c.period.unwrap() - 1)
-            .collect();
-
-        supersmoother_3_pole_batch_inner_into(data, &combos, first, &warm, cols, simd, false, out);
-
-        Ok(rows)
-    }
 }

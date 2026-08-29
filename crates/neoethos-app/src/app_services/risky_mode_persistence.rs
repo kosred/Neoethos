@@ -71,8 +71,7 @@ const STATE_FILENAME: &str = "risky_mode_state.json";
 // remove_var calls readable (and `cargo check` clean) without
 // duplicating the string literal.
 #[cfg(test)]
-const ENV_OVERRIDE_VAR: &str =
-    crate::app_services::env_overrides::ENV_RISKY_MODE_STATE_PATH;
+const ENV_OVERRIDE_VAR: &str = crate::app_services::env_overrides::ENV_RISKY_MODE_STATE_PATH;
 
 /// On-disk representation of the operator's Risky Mode arm decision.
 ///
@@ -203,9 +202,7 @@ pub fn state_file_path() -> Result<PathBuf> {
     //
     // **F-CORE3 closure (2026-05-25)**: routed through the canonical
     // `env_overrides::risky_mode_state_path_override` typed getter.
-    if let Some(custom) =
-        crate::app_services::env_overrides::risky_mode_state_path_override()
-    {
+    if let Some(custom) = crate::app_services::env_overrides::risky_mode_state_path_override() {
         return Ok(PathBuf::from(custom));
     }
 

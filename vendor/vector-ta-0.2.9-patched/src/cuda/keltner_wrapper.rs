@@ -1,12 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::{CudaEma, CudaSma, DeviceArrayF32};
 use crate::indicators::keltner::{KeltnerBatchRange, KeltnerParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -79,11 +79,6 @@ impl CudaKeltner {
         cust::init(CudaFlags::empty())?;
         let dev = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(dev)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/keltner_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("keltner_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         let max_grid_y = Device::get_device(device_id as u32)?

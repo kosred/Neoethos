@@ -290,9 +290,9 @@ extern "C" __global__ void cyberpunk_value_trend_analyzer_batch_f64(
 // NEOETHOS f64 LANE  --  closer 3
 //
 // CPU reference: src/indicators/cyberpunk_value_trend_analyzer.rs:641
-// (cyberpunk_value_trend_analyzer_with_kernel). The column this emits is
-// value_trend, which is what output_id == "value" resolves to
-// (dispatch/cpu_batch.rs:14627-14630).
+// (cyberpunk_value_trend_analyzer_with_kernel). The column this emits is the
+// canonical primary `value_trend`; the retired unversioned `value` alias is
+// deliberately not part of the production schema.
 //
 // SHAPE: one thread per combo, bars ascending. FORCED sequential -- two
 // monotone deques carrying the 75-bar low and high, and two chained one-pole

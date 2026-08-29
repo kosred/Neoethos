@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 extern crate vector_ta;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use cust::memory::mem_get_info;
 use std::any::Any;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 use vector_ta::cuda::{self, CudaBenchScenario};
 
@@ -113,8 +113,6 @@ fn collect_registered_profiles() -> Vec<CudaBenchScenario> {
 
     v.extend(vector_ta::cuda::oscillators::qqe_wrapper::benches::bench_profiles());
 
-    v.extend(vector_ta::cuda::pivot_wrapper::benches::bench_profiles());
-
     v.extend(vector_ta::cuda::obv_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::oscillators::msw_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::moving_averages::macz_wrapper::benches::bench_profiles());
@@ -140,7 +138,6 @@ fn collect_registered_profiles() -> Vec<CudaBenchScenario> {
 
     v.extend(vector_ta::cuda::linearreg_angle_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::percentile_nearest_rank_wrapper::benches::bench_profiles());
-    v.extend(vector_ta::cuda::prb_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::moving_averages::mab_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::oscillators::kdj_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::oscillators::stochf_wrapper::benches::bench_profiles());
@@ -196,7 +193,6 @@ fn collect_registered_profiles() -> Vec<CudaBenchScenario> {
     v.extend(vector_ta::cuda::chandelier_exit_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::damiani_volatmeter_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::eri_wrapper::benches::bench_profiles());
-    v.extend(vector_ta::cuda::oscillators::acosc_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::oscillators::aroonosc_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::oscillators::cfo_wrapper::benches::bench_profiles());
     v.extend(vector_ta::cuda::oscillators::dpo_wrapper::benches::bench_profiles());

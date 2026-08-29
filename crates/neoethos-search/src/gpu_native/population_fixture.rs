@@ -68,12 +68,12 @@ pub struct TinyPopulationFixture {
     close: Vec<f64>,
     high: Vec<f64>,
     low: Vec<f64>,
-    indicators: Array2<f32>,
+    indicators: Array2<f64>,
     gene_offsets: Vec<i32>,
     gene_indices: Vec<i32>,
-    gene_weights: Vec<f32>,
-    long_thresholds: Vec<f32>,
-    short_thresholds: Vec<f32>,
+    gene_weights: Vec<f64>,
+    long_thresholds: Vec<f64>,
+    short_thresholds: Vec<f64>,
     months: Vec<i64>,
     days: Vec<i64>,
     timestamps: Vec<i64>,
@@ -82,7 +82,7 @@ pub struct TinyPopulationFixture {
     stop_vol_multipliers: Vec<f64>,
     smc_data: Vec<SmcRow>,
     gene_smc_flags: Vec<SmcRow>,
-    smc_weights: [f32; 11],
+    smc_weights: [f64; 11],
     settings: BacktestSettings,
 }
 
@@ -100,8 +100,8 @@ impl TinyPopulationFixture {
         let high = close.iter().map(|price| price + 0.0007).collect();
         let low = close.iter().map(|price| price - 0.0007).collect();
         let indicators = Array2::from_shape_fn((features, bars), |(feature, bar)| {
-            let phase = feature as f32 * 0.37;
-            let x = bar as f32 * (0.017 + feature as f32 * 0.0003);
+            let phase = feature as f64 * 0.37;
+            let x = bar as f64 * (0.017 + feature as f64 * 0.0003);
             (x + phase).sin() * 0.75 + (x * 0.31 - phase).cos() * 0.20
         });
 
@@ -113,7 +113,7 @@ impl TinyPopulationFixture {
         for candidate in 0..population {
             for term in 0..terms_per_gene {
                 gene_indices.push(((candidate + term * 3) % features) as i32);
-                let magnitude = 0.35 + ((candidate + term) % 5) as f32 * 0.11;
+                let magnitude = 0.35 + ((candidate + term) % 5) as f64 * 0.11;
                 gene_weights.push(if (candidate + term) % 2 == 0 {
                     magnitude
                 } else {
@@ -129,10 +129,10 @@ impl TinyPopulationFixture {
         let months = (0..bars).map(|bar| (bar / 43_200) as i64).collect();
         let days = (0..bars).map(|bar| (bar / 1_440) as i64).collect();
         let long_thresholds = (0..population)
-            .map(|candidate| 0.20 + (candidate % 3) as f32 * 0.03)
+            .map(|candidate| 0.20 + (candidate % 3) as f64 * 0.03)
             .collect();
         let short_thresholds = (0..population)
-            .map(|candidate| -0.20 - (candidate % 3) as f32 * 0.03)
+            .map(|candidate| -0.20 - (candidate % 3) as f64 * 0.03)
             .collect();
         let stop_pips = vec![18.0; population];
         let target_pips = vec![36.0; population];
@@ -265,21 +265,21 @@ impl TinyPopulationFixture {
         PopulationEvalInputs {
             close: &self.close,
             high: &self.high,
-                low: &self.low,
-                indicators: self.indicators.view(),
-                gene_offsets: &self.gene_offsets,
-                gene_indices: &self.gene_indices,
-                gene_weights: &self.gene_weights,
-                long_thr: &self.long_thresholds,
-                short_thr: &self.short_thresholds,
-                month_idx: &self.months,
-                day_idx: &self.days,
-                timestamps: &self.timestamps,
-                sl_pips: &self.stop_pips,
-                tp_pips: &self.target_pips,
-                stop_vol_mult: &self.stop_vol_multipliers,
-                smc_data: &self.smc_data,
-                gene_smc_flags: &self.gene_smc_flags,
+            low: &self.low,
+            indicators: self.indicators.view(),
+            gene_offsets: &self.gene_offsets,
+            gene_indices: &self.gene_indices,
+            gene_weights: &self.gene_weights,
+            long_thr: &self.long_thresholds,
+            short_thr: &self.short_thresholds,
+            month_idx: &self.months,
+            day_idx: &self.days,
+            timestamps: &self.timestamps,
+            sl_pips: &self.stop_pips,
+            tp_pips: &self.target_pips,
+            stop_vol_mult: &self.stop_vol_multipliers,
+            smc_data: &self.smc_data,
+            gene_smc_flags: &self.gene_smc_flags,
             gate_threshold: 0.0,
             weights: &self.smc_weights,
             settings: &self.settings,
@@ -287,7 +287,7 @@ impl TinyPopulationFixture {
     }
 
     #[cfg(test)]
-    fn evaluate_test_oracle(
+    pub(crate) fn evaluate_test_oracle(
         &self,
         backend: EvaluationBackend,
         audit: &CpuStrategyAuditContext,

@@ -7,15 +7,16 @@ use neoethos_core::storage::json::{
     JsonBackupWriteConfig, read_json as read_json_artifact,
     write_json_with_backup as write_json_artifact_with_backup,
 };
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
-    dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
-    try_build_runtime_artifact_metadata,
+    feature_columns_from_frame, feature_frame_to_f64_array, three_class_runtime_confidence,
+    try_build_runtime_artifact_metadata, validate_model_labels,
 };
 use crate::burn_models::{
     BurnDeviceSelection, BurnKAN, BurnKANConfig, BurnMLP, BurnMLPConfig, BurnNBeats,
@@ -37,6 +38,32 @@ use crate::runtime::prediction::RuntimePrediction;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const CONFIG_FILE_NAME: &str = "config.json";
 const MODEL_RECORD_BASENAME: &str = "model";
+
+/// Checked, backend-local narrowing for Burn, whose public tensor input is
+/// intrinsically f32. Shared model input remains `FeatureFrame` f64+validity;
+/// values that cannot survive this explicit boundary fail closed.
+fn deep_backend_f32_matrix(frame: &FeatureFrame) -> Result<Array2<f32>> {
+    let source = feature_frame_to_f64_array(frame).context("materialize typed deep-model frame")?;
+    let mut narrowed = Vec::with_capacity(source.len());
+    for ((row, column), value) in source.indexed_iter() {
+        if value.abs() > f32::MAX as f64 {
+            bail!(
+                "deep backend f32 adapter cannot represent feature row {row} column {column}: {value}"
+            );
+        }
+        let converted = *value as f32;
+        if !converted.is_finite() {
+            bail!("deep backend f32 adapter produced non-finite feature row {row} column {column}");
+        }
+        if *value != 0.0 && converted == 0.0 {
+            bail!(
+                "deep backend f32 adapter underflowed non-zero feature row {row} column {column}: {value}"
+            );
+        }
+        narrowed.push(converted);
+    }
+    Array2::from_shape_vec(source.dim(), narrowed).context("shape deep backend f32 feature matrix")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeepModelKind {
@@ -362,8 +389,8 @@ impl BurnDeepExpert {
                 | "wgpu_discrete_gpu"
                 | "wgpu_integrated_gpu"
                 | "wgpu_virtual_gpu"
-                // Native Burn CUDA backend (gpu-cuda build): neural models train
-                // on the card. `resolve_cuda_device_policy` reports "cuda".
+                // Native Burn CUDA backend (`burn-cuda-backend` build): neural
+                // models train on the selected card and report "cuda".
                 | "cuda"
                 | "cuda_default"
                 | "cuda_discrete_gpu"
@@ -778,10 +805,10 @@ impl BurnDeepExpert {
 
     fn resolve_runtime_infer_device(
         &self,
-    ) -> (
+    ) -> Result<(
         <InferBackend as burn::tensor::backend::BackendTypes>::Device,
         BurnDeviceSelection,
-    ) {
+    )> {
         let requested_device = self.configured_requested_device_policy();
         resolve_infer_device(&requested_device)
     }
@@ -818,7 +845,7 @@ impl BurnDeepExpert {
     }
 
     fn init_runtime_model(&self, input_dim: usize) -> Result<RuntimeDeepModel> {
-        let (device, _) = self.resolve_runtime_infer_device();
+        let (device, _) = self.resolve_runtime_infer_device()?;
         let runtime_dtype = self.runtime_model_dtype(&device)?;
         match self.kind {
             DeepModelKind::Mlp => Ok(RuntimeDeepModel::Mlp(cast_module_float_tensors(
@@ -899,7 +926,7 @@ impl BurnDeepExpert {
         let train_config = self.train_config();
         let requested_device = self.configured_requested_device_policy();
         let requested_training_precision = self.configured_requested_training_precision();
-        let (device, device_selection) = resolve_train_device(&requested_device);
+        let (device, device_selection) = resolve_train_device(&requested_device)?;
         match self.kind {
             DeepModelKind::Mlp => {
                 let model = self.mlp_config(input_dim).init::<TrainBackend>(&device);
@@ -1122,24 +1149,6 @@ impl BurnDeepExpert {
         }
     }
 
-    fn labels_from_series(y: &Series) -> Result<Vec<i32>> {
-        let labels = y
-            .cast(&DataType::Int32)
-            .context("cast deep-model labels to Int32")?;
-        let values = labels.i32().context("access deep-model labels as Int32")?;
-
-        values
-            .into_iter()
-            .map(|value| match value {
-                Some(label @ -1..=1) => Ok(label),
-                Some(other) => {
-                    bail!("unsupported deep-model label: {other}; expected one of -1, 0, 1")
-                }
-                None => bail!("deep-model labels may not contain nulls"),
-            })
-            .collect()
-    }
-
     fn model_record_path(path: &Path) -> PathBuf {
         path.join(MODEL_RECORD_BASENAME)
     }
@@ -1310,7 +1319,9 @@ impl BurnDeepExpert {
             && !self.feature_columns.is_empty()
             && self.training_summary.is_some()
         {
-            Some(self.resolve_runtime_infer_device().1)
+            self.resolve_runtime_infer_device()
+                .ok()
+                .map(|(_, selection)| selection)
         } else {
             self.host_runtime_selection.clone()
         };
@@ -1382,8 +1393,12 @@ impl BurnDeepExpert {
         )
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
         let (execution_backend, degraded_reason) = self.runtime_details();
         let mut predictions = Vec::with_capacity(probabilities.nrows());
         for row in probabilities.outer_iter() {
@@ -1410,40 +1425,32 @@ impl BurnDeepExpert {
     /// supplied we fall back to Burn's internal time_series_split holdout.
     fn fit_internal(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        val_x: Option<&DataFrame>,
-        val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
     ) -> Result<()> {
-        let features = dataframe_to_float32_array(x)
+        let features = deep_backend_f32_matrix(x)
             .with_context(|| format!("build {} feature matrix", self.model_name()))?;
-        let labels = Self::labels_from_series(y)?;
-        if features.nrows() != labels.len() {
-            bail!(
-                "{} training feature/label mismatch: {} rows vs {} labels",
-                self.model_name(),
-                features.nrows(),
-                labels.len()
-            );
-        }
+        validate_model_labels(y, features.nrows())
+            .with_context(|| format!("validate {} training labels", self.model_name()))?;
         let input_dim = features.ncols();
 
         let val_arrays = match (val_x, val_y) {
             (Some(vx), Some(vy)) => {
-                let vx_array = dataframe_to_float32_array(vx).with_context(|| {
+                x.ensure_semantically_compatible(vx).with_context(|| {
+                    format!(
+                        "validate {} train/validation feature plan",
+                        self.model_name()
+                    )
+                })?;
+                let vx_array = deep_backend_f32_matrix(vx).with_context(|| {
                     format!("build {} validation feature matrix", self.model_name())
                 })?;
-                let vy_labels = Self::labels_from_series(vy)?;
-                if vx_array.nrows() != vy_labels.len() {
-                    bail!(
-                        "{} validation feature/label mismatch: {} rows vs {} labels",
-                        self.model_name(),
-                        vx_array.nrows(),
-                        vy_labels.len()
-                    );
-                }
-                let val_columns = feature_columns_from_dataframe(vx);
-                let train_columns = feature_columns_from_dataframe(x);
+                validate_model_labels(vy, vx_array.nrows())
+                    .with_context(|| format!("validate {} validation labels", self.model_name()))?;
+                let val_columns = feature_columns_from_frame(vx);
+                let train_columns = feature_columns_from_frame(x);
                 if val_columns != train_columns {
                     bail!(
                         "{} validation column mismatch: train {:?} vs val {:?}",
@@ -1452,7 +1459,7 @@ impl BurnDeepExpert {
                         val_columns
                     );
                 }
-                Some((vx_array, vy_labels))
+                Some((vx_array, vy.to_vec()))
             }
             (None, None) => None,
             _ => bail!(
@@ -1461,14 +1468,14 @@ impl BurnDeepExpert {
             ),
         };
 
-        self.feature_columns = feature_columns_from_dataframe(x);
+        self.feature_columns = feature_columns_from_frame(x);
         self.validate_model_params()?;
         let (val_x_ref, val_y_ref) = match val_arrays.as_ref() {
             Some((vx, vy)) => (Some(vx), Some(vy.as_slice())),
             None => (None, None),
         };
         let (model, summary, device_selection, burn_training_report) =
-            self.train_runtime_model_with_val(input_dim, &features, &labels, val_x_ref, val_y_ref)?;
+            self.train_runtime_model_with_val(input_dim, &features, y, val_x_ref, val_y_ref)?;
         self.training_summary = Some(summary);
         self.burn_training_report = Some(burn_training_report);
         self.params.insert(
@@ -1503,48 +1510,52 @@ impl BurnDeepExpert {
 }
 
 impl ExpertModel for BurnDeepExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        self.fit_internal(x, y, None, None)
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| self.fit_internal(x, y, None, None))
     }
 
     fn fit_with_validation(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        val_x: Option<&DataFrame>,
-        val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+        lease: &CpuLease,
     ) -> Result<()> {
-        self.fit_internal(x, y, val_x, val_y)
+        lease.scope(|| self.fit_internal(x, y, val_x, val_y))
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        self.ensure_runtime_state_ready()?;
-        let model = self
-            .model
-            .as_ref()
-            .with_context(|| format!("{} model is not trained or loaded", self.model_name()))?;
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| {
+            self.ensure_runtime_state_ready()?;
+            let model = self
+                .model
+                .as_ref()
+                .with_context(|| format!("{} model is not trained or loaded", self.model_name()))?;
 
-        let actual_columns = feature_columns_from_dataframe(x);
-        if !self.feature_columns.is_empty() && self.feature_columns != actual_columns {
-            bail!(
-                "feature column mismatch for persisted deep model; expected {:?}, got {:?}",
-                self.feature_columns,
-                actual_columns
-            );
-        }
+            let actual_columns = feature_columns_from_frame(x);
+            if !self.feature_columns.is_empty() && self.feature_columns != actual_columns {
+                bail!(
+                    "feature column mismatch for persisted deep model; expected {:?}, got {:?}",
+                    self.feature_columns,
+                    actual_columns
+                );
+            }
 
-        let features = dataframe_to_float32_array(x)
-            .with_context(|| format!("build {} inference matrix", self.model_name()))?;
-        let (device, _) = self.resolve_runtime_infer_device();
-        let probabilities = model.predict_probabilities(&features, self.batch_size(), &device)?;
-        if probabilities.ncols() != 3 {
-            bail!(
-                "{} should output 3 probability columns, got {}",
-                self.model_name(),
-                probabilities.ncols()
-            );
-        }
-        Ok(probabilities)
+            let features = deep_backend_f32_matrix(x)
+                .with_context(|| format!("build {} inference matrix", self.model_name()))?;
+            let (device, _) = self.resolve_runtime_infer_device()?;
+            let probabilities =
+                model.predict_probabilities(&features, self.batch_size(), &device)?;
+            if probabilities.ncols() != 3 {
+                bail!(
+                    "{} should output 3 probability columns, got {}",
+                    self.model_name(),
+                    probabilities.ncols()
+                );
+            }
+            Ok(probabilities.mapv(f64::from))
+        })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -1608,7 +1619,7 @@ impl ExpertModel for BurnDeepExpert {
 
         let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         let base_path = Self::model_record_path(path);
-        let (device, host_runtime_selection) = next_state.resolve_runtime_infer_device();
+        let (device, host_runtime_selection) = next_state.resolve_runtime_infer_device()?;
         if let Some(persisted_runtime_selection) = next_state.persisted_runtime_selection.as_ref()
             && (persisted_runtime_selection.requested_policy
                 != host_runtime_selection.requested_policy
@@ -1700,8 +1711,12 @@ macro_rules! define_deep_expert {
                 }
             }
 
-            pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-                self.inner.predict_runtime(x)
+            pub fn predict_runtime(
+                &self,
+                x: &FeatureFrame,
+                lease: &CpuLease,
+            ) -> Result<Vec<RuntimePrediction>> {
+                self.inner.predict_runtime(x, lease)
             }
 
             /// Read-only view of the trained feature column names +
@@ -1719,12 +1734,12 @@ macro_rules! define_deep_expert {
         }
 
         impl ExpertModel for $name {
-            fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-                self.inner.fit(x, y)
+            fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+                self.inner.fit(x, y, lease)
             }
 
-            fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-                self.inner.predict_proba(x)
+            fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+                self.inner.predict_proba(x, lease)
             }
 
             fn save(&self, path: &Path) -> Result<()> {
@@ -1752,6 +1767,53 @@ define_deep_expert!(TimesNetExpert, DeepModelKind::TimesNet);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+    use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
+
+    fn one_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker is valid");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("isolated deep-model test lease")
+    }
+
+    fn typed_frame(columns: Vec<(&str, Vec<f64>)>) -> Result<FeatureFrame> {
+        let rows = columns.first().map_or(0, |(_, values)| values.len());
+        let columns = columns
+            .into_iter()
+            .map(|(name, values)| {
+                FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+    }
+
+    #[test]
+    fn deep_backend_f32_adapter_preserves_shape_and_row_order() -> Result<()> {
+        let frame = typed_frame(vec![("rsi", vec![0.25, 0.5]), ("atr", vec![1.25, 1.5])])?;
+        let matrix = deep_backend_f32_matrix(&frame)?;
+
+        assert_eq!(matrix.dim(), (2, 2));
+        assert_eq!(matrix[(0, 0)].to_bits(), 0.25_f32.to_bits());
+        assert_eq!(matrix[(0, 1)].to_bits(), 1.25_f32.to_bits());
+        assert_eq!(matrix[(1, 0)].to_bits(), 0.5_f32.to_bits());
+        assert_eq!(matrix[(1, 1)].to_bits(), 1.5_f32.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn deep_backend_f32_adapter_rejects_nonzero_underflow() -> Result<()> {
+        let below_smallest_f32_subnormal = f64::from(f32::from_bits(1)) / 4.0;
+        assert_ne!(below_smallest_f32_subnormal, 0.0);
+        let frame = typed_frame(vec![("rsi", vec![below_smallest_f32_subnormal])])?;
+        let error = deep_backend_f32_matrix(&frame)
+            .expect_err("non-zero f64 feature must not silently narrow to zero");
+        assert!(error.to_string().contains("underflowed non-zero"));
+        Ok(())
+    }
 
     #[test]
     fn metadata_requires_training_summary() {
@@ -2020,7 +2082,11 @@ mod tests {
         let model = expert
             .init_runtime_model(2)
             .expect("runtime model should initialize");
-        let live_backend = expert.resolve_runtime_infer_device().1.execution_backend;
+        let live_backend = expert
+            .resolve_runtime_infer_device()
+            .expect("runtime device must resolve")
+            .1
+            .execution_backend;
         expert.model = Some(model);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
         expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
@@ -2048,10 +2114,10 @@ mod tests {
     #[test]
     fn fit_persists_effective_burn_device_metadata() -> Result<()> {
         let rsi = (0..140)
-            .map(|idx| 0.1_f32 + idx as f32 * 0.01)
+            .map(|idx| 0.1_f64 + idx as f64 * 0.01)
             .collect::<Vec<_>>();
         let atr = (0..140)
-            .map(|idx| 1.0_f32 + idx as f32 * 0.01)
+            .map(|idx| 1.0_f64 + idx as f64 * 0.01)
             .collect::<Vec<_>>();
         let labels = (0..140)
             .map(|idx| match idx % 3 {
@@ -2060,11 +2126,8 @@ mod tests {
                 _ => -1_i32,
             })
             .collect::<Vec<_>>();
-        let df = DataFrame::new(vec![
-            Series::new("rsi".into(), rsi).into(),
-            Series::new("atr".into(), atr).into(),
-        ])?;
-        let labels = Series::new("label".into(), labels);
+        let frame = typed_frame(vec![("rsi", rsi), ("atr", atr)])?;
+        let lease = one_worker_lease();
         let mut expert = BurnDeepExpert::new(
             DeepModelKind::Mlp,
             7,
@@ -2074,7 +2137,7 @@ mod tests {
                 ("batch_size".to_string(), "4".to_string()),
             ])),
         );
-        expert.fit(&df, &labels)?;
+        expert.fit(&frame, &labels, &lease)?;
 
         assert_eq!(
             expert

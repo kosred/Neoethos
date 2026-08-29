@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -28,15 +10,6 @@ use rayon::prelude::*;
 use std::error::Error;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaAo;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 
 impl<'a> AsRef<[f64]> for AoInput<'a> {
     #[inline(always)]
@@ -66,10 +39,6 @@ pub struct AoOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AoParams {
     pub short_period: Option<usize>,
     pub long_period: Option<usize>,
@@ -221,7 +190,6 @@ pub fn ao(input: &AoInput) -> Result<AoOutput, AoError> {
     ao_with_kernel(input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn ao_into(input: &AoInput, out: &mut [f64]) -> Result<(), AoError> {
     let (data, short, long, first, len) = ao_prepare(input)?;
     if out.len() != len {
@@ -1078,62 +1046,11 @@ pub unsafe fn ao_row_avx512_long(
     ao_scalar(data, short, long, first, out)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    short_period: usize,
-    long_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ao_js(high, low, short_period, long_period)?;
-    crate::write_wasm_f64_output("ao_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    short_start: usize,
-    short_end: usize,
-    short_step: usize,
-    long_start: usize,
-    long_end: usize,
-    long_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ao_batch_js(
-        high,
-        low,
-        short_start,
-        short_end,
-        short_step,
-        long_start,
-        long_end,
-        long_step,
-    )?;
-    crate::write_wasm_f64_output("ao_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ao_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs("ao_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
 
     #[test]
@@ -1171,8 +1088,8 @@ mod tests {
 
     fn check_ao_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = AoParams {
             short_period: Some(3),
             long_period: None,
@@ -1184,8 +1101,8 @@ mod tests {
     }
     fn check_ao_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AoInput::with_default_candles(&candles);
         let result = ao_with_kernel(&input, kernel)?;
         let expected_last_five = [-1671.3, -1401.6706, -1262.3559, -1178.4941, -1157.4118];
@@ -1206,8 +1123,8 @@ mod tests {
     }
     fn check_ao_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AoInput::with_default_candles(&candles);
         match input.data {
             AoData::Candles { source, .. } => assert_eq!(source, "hl2"),
@@ -1270,8 +1187,8 @@ mod tests {
     }
     fn check_ao_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = AoParams {
             short_period: Some(5),
             long_period: Some(34),
@@ -1289,8 +1206,8 @@ mod tests {
     }
     fn check_ao_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AoInput::from_candles(
             &candles,
             "hl2",
@@ -1318,8 +1235,8 @@ mod tests {
     fn check_ao_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             AoParams::default(),
@@ -1676,8 +1593,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = AoBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "hl2")?;
@@ -1699,8 +1616,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 15, 40, 5),
@@ -1735,34 +1652,34 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) with params: short={}, long={}",
-							test,
-							cfg_idx,
-							val,
-							bits,
-							row,
-							col,
-							idx,
-							combo.short_period.unwrap_or(5),
-							combo.long_period.unwrap_or(34)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.short_period.unwrap_or(5),
+                            combo.long_period.unwrap_or(34)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) with params: short={}, long={}",
-							test,
-							cfg_idx,
-							val,
-							bits,
-							row,
-							col,
-							idx,
-							combo.short_period.unwrap_or(5),
-							combo.long_period.unwrap_or(34)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            combo.short_period.unwrap_or(5),
+                            combo.long_period.unwrap_or(34)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
@@ -1813,581 +1730,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ao")]
-#[pyo3(signature = (high, low, short_period, long_period, kernel=None))]
-pub fn ao_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    short_period: usize,
-    long_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| -> Result<Vec<f64>, AoError> {
-            let hl2 = compute_hl2(high_slice, low_slice)?;
-
-            let params = AoParams {
-                short_period: Some(short_period),
-                long_period: Some(long_period),
-            };
-            let ao_in = AoInput::from_slice(&hl2, params);
-
-            ao_with_kernel(&ao_in, kern).map(|o| o.values)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AoStream")]
-pub struct AoStreamPy {
-    stream: AoStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AoStreamPy {
-    #[new]
-    fn new(short_period: usize, long_period: usize) -> PyResult<Self> {
-        let params = AoParams {
-            short_period: Some(short_period),
-            long_period: Some(long_period),
-        };
-        let stream = AoStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AoStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
-        let hl2 = (high + low) / 2.0;
-        self.stream.update(hl2)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ao_batch")]
-#[pyo3(signature = (high, low, short_period_range, long_period_range, kernel=None))]
-pub fn ao_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    short_period_range: (usize, usize, usize),
-    long_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = AoBatchRange {
-        short_period: short_period_range,
-        long_period: long_period_range,
-    };
-
-    let combos = expand_grid_checked(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = high_slice.len();
-
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [expected], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| -> Result<Vec<AoParams>, AoError> {
-            let hl2 = compute_hl2(high_slice, low_slice)?;
-
-            let first = hl2.iter().position(|x| !x.is_nan()).unwrap_or(0);
-            let warm: Vec<usize> = combos
-                .iter()
-                .map(|c| first + c.long_period.unwrap() - 1)
-                .collect();
-
-            let slice_mu = unsafe {
-                std::slice::from_raw_parts_mut(
-                    slice_out.as_mut_ptr() as *mut MaybeUninit<f64>,
-                    slice_out.len(),
-                )
-            };
-
-            init_matrix_prefixes(slice_mu, cols, &warm);
-
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-
-            ao_batch_inner_into(&hl2, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "short_periods",
-        combos
-            .iter()
-            .map(|p| p.short_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "long_periods",
-        combos
-            .iter()
-            .map(|p| p.long_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32AoPy {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32AoPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        if let Some(obj) = stream.as_ref() {
-            if let Ok(i) = obj.extract::<i64>(py) {
-                if i == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__: stream 0 is disallowed for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ao_cuda_batch_dev")]
-#[pyo3(signature = (high, low, short_period_range, long_period_range, device_id=0))]
-pub fn ao_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: numpy::PyReadonlyArray1<'_, f32>,
-    low: numpy::PyReadonlyArray1<'_, f32>,
-    short_period_range: (usize, usize, usize),
-    long_period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32AoPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    if high_slice.len() != low_slice.len() {
-        return Err(PyValueError::new_err("high/low length mismatch"));
-    }
-    let mut hl2_f32 = vec![0f32; high_slice.len()];
-    for i in 0..high_slice.len() {
-        let h = high_slice[i];
-        let l = low_slice[i];
-        hl2_f32[i] = (h + l) * 0.5;
-    }
-    let sweep = AoBatchRange {
-        short_period: short_period_range,
-        long_period: long_period_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaAo::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.ao_batch_dev(&hl2_f32, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let crate::cuda::oscillators::ao_wrapper::DeviceArrayF32Ao {
-        buf,
-        rows,
-        cols,
-        ctx,
-        device_id: dev_id,
-    } = inner;
-    Ok(DeviceArrayF32AoPy {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ao_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, cols, rows, short_period, long_period, device_id=0))]
-pub fn ao_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    short_period: usize,
-    long_period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32AoPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high_slice = high_tm.as_slice()?;
-    let low_slice = low_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if high_slice.len() != expected || low_slice.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let mut hl2_f32 = vec![0f32; expected];
-    for i in 0..expected {
-        hl2_f32[i] = (high_slice[i] + low_slice[i]) * 0.5;
-    }
-    let inner = py.allow_threads(|| {
-        let cuda = CudaAo::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.ao_many_series_one_param_time_major_dev(
-            &hl2_f32,
-            cols,
-            rows,
-            short_period,
-            long_period,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let crate::cuda::oscillators::ao_wrapper::DeviceArrayF32Ao {
-        buf,
-        rows,
-        cols,
-        ctx,
-        device_id: dev_id,
-    } = inner;
-    Ok(DeviceArrayF32AoPy {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_js(
-    high: &[f64],
-    low: &[f64],
-    short_period: usize,
-    long_period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let hl2 = compute_hl2(high, low).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let params = AoParams {
-        short_period: Some(short_period),
-        long_period: Some(long_period),
-    };
-    let input = AoInput::from_slice(&hl2, params);
-
-    ao_with_kernel(&input, Kernel::Auto)
-        .map(|o| o.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_batch_js(
-    high: &[f64],
-    low: &[f64],
-    short_start: usize,
-    short_end: usize,
-    short_step: usize,
-    long_start: usize,
-    long_end: usize,
-    long_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let hl2 = compute_hl2(high, low).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let sweep = AoBatchRange {
-        short_period: (short_start, short_end, short_step),
-        long_period: (long_start, long_end, long_step),
-    };
-
-    ao_batch_inner(&hl2, &sweep, Kernel::Scalar, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_batch_metadata_js(
-    short_start: usize,
-    short_end: usize,
-    short_step: usize,
-    long_start: usize,
-    long_end: usize,
-    long_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AoBatchRange {
-        short_period: (short_start, short_end, short_step),
-        long_period: (long_start, long_end, long_step),
-    };
-
-    let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut metadata = Vec::with_capacity(combos.len() * 2);
-
-    for combo in combos {
-        metadata.push(combo.short_period.unwrap() as f64);
-        metadata.push(combo.long_period.unwrap() as f64);
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AoBatchConfig {
-    pub short_period_range: (usize, usize, usize),
-    pub long_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AoBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AoParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ao_batch)]
-pub fn ao_batch_unified_js(high: &[f64], low: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: AoBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let hl2 = compute_hl2(high, low).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let sweep = AoBatchRange {
-        short_period: config.short_period_range,
-        long_period: config.long_period_range,
-    };
-
-    let output = ao_batch_inner(&hl2, &sweep, Kernel::Scalar, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = AoBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_into(
-    in_high_ptr: *const f64,
-    in_low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period: usize,
-    long_period: usize,
-) -> Result<(), JsValue> {
-    if in_high_ptr.is_null() || in_low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    #[inline(always)]
-    unsafe fn overlaps(a: *const f64, b: *const f64, n: usize) -> bool {
-        let as_ = a as usize;
-        let ae = as_.wrapping_add(n * core::mem::size_of::<f64>());
-        let bs_ = b as usize;
-        let be = bs_.wrapping_add(n * core::mem::size_of::<f64>());
-        !(ae <= bs_ || be <= as_)
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(in_high_ptr, len);
-        let low = std::slice::from_raw_parts(in_low_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-        let alias = overlaps(in_high_ptr, out_ptr as *const f64, len)
-            || overlaps(in_low_ptr, out_ptr as *const f64, len);
-
-        let hl2 = compute_hl2(high, low).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let params = AoParams {
-            short_period: Some(short_period),
-            long_period: Some(long_period),
-        };
-        let input = AoInput::from_slice(&hl2, params);
-
-        if alias {
-            let mut tmp = vec![0.0; len];
-            ao_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            out.copy_from_slice(&tmp);
-        } else {
-            ao_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ao_batch_into(
-    in_high_ptr: *const f64,
-    in_low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    short_period_start: usize,
-    short_period_end: usize,
-    short_period_step: usize,
-    long_period_start: usize,
-    long_period_end: usize,
-    long_period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_high_ptr.is_null() || in_low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(in_high_ptr, len);
-        let low = std::slice::from_raw_parts(in_low_ptr, len);
-
-        let sweep = AoBatchRange {
-            short_period: (short_period_start, short_period_end, short_period_step),
-            long_period: (long_period_start, long_period_end, long_period_step),
-        };
-
-        let combos = expand_grid_checked(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*len overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let hl2 = compute_hl2(high, low).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        ao_batch_inner_into(&hl2, &sweep, Kernel::Scalar, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

@@ -1,5 +1,10 @@
 // n_order_ema — CUDA f64 kernel.
 //
+// Creator authority: https://www.tradingview.com/script/Hgvs8kZi-N-Order-EMA/
+// Facade identity: PUB;0d0d8869215f4446b4c17e62c6080830
+// Exact Pine source SHA-256:
+// 539EEC25A8422DDE96705873212CD55302301BD6CE3284A411C2010536B843D3
+//
 // WHAT THIS REPLACES
 // ------------------
 // NOTHING. No `.cu`, no wrapper, no `F64_KERNELS` row: the lane answered
@@ -9,8 +14,6 @@
 // --------------------------------------------------------------
 //   :340 IirCoefficients / :347 IirCoreFilter
 //   :373 IirCoreFilter::update       — the recurrence, rounding for rounding
-//   :548 base_lookback / :553 warmup_len
-//   :568 required_valid_len
 //   :581 binomial / :599 build_coefficients
 //   :666 resolve_params / :704 validate_input
 //   :739 n_order_ema                 — the entry the brief names
@@ -55,18 +58,16 @@
 //
 //   acc = 0.2 * value;  acc -= -0.8 * old
 //
-// and gates on `count > 8`. With period = 9: fc = 2/10 = 0.2 exactly,
-// r = 0.8 exactly, b0 = 0.2, a0 = -0.8, and warmup = 1 * (9 - 1) = 8. The seed
-// is identical too — the fast path's `else` arm uses `value` for `old`, the
-// filter's empty `y_hist` uses `first`, and at the first bar of a run those
-// are the same number. So ONE implementation serves both branches; there is no
-// period at which they disagree.
+// With period = 9: fc = 2/10 = 0.2 exactly, r = 0.8 exactly, b0 = 0.2 and
+// a0 = -0.8. The seed is identical too — the fast path's `else` arm uses the
+// safe source for `old`, while the filter's empty `y_hist` is prefilled with
+// that same safe source. Both branches emit immediately.
 //
 // SHAPE — ONE THREAD PER COLUMN, BARS ASCENDING
 // ---------------------------------------------
-// A first-order IIR is a serial recurrence and a non-finite bar RESETS it
-// (:377, :806-810), which no scan reformulation survives. One thread walks the
-// column.
+// A first-order IIR is a serial recurrence. Leading NaNs remain unstarted;
+// creator `nz` maps later NaNs to zero without resetting. Infinity is outside
+// Pine's representable series domain and fails this lane closed by resetting.
 //
 // ARITHMETIC
 // ----------
@@ -94,39 +95,11 @@ extern "C" __global__ void n_order_ema_neo_batch_f64(
     double* __restrict__ row = out + (size_t)r * (size_t)n;
     const int period_i = periods[r];
 
-    // resolve_params (:666): period must be finite, >= 1.0, and
-    // `period.ceil() as usize <= len`. The lane hands whole numbers, so
-    // ceil(period) == period.
-    const bool bad_params = (n <= 0) || (period_i < 1) || (period_i > n);
+    // resolve_params: period must be finite and >= 1.0. The lane hands ints.
+    const bool bad_params = (n <= 0) || (period_i < 1);
     if (bad_params) {
         for (int i = 0; i < n; ++i) row[i] = noe_qnan();
         return;
-    }
-
-    // warmup_len (:553) for Ema = base_lookback (:548) = order * (ceil(period)
-    // - 1), and order is 1.
-    const int warmup = period_i - 1;
-
-    // validate_input (:704): the series must contain a RUN of
-    // required_valid_len (:568) = warmup + 1 = period consecutive finite
-    // values, otherwise the CPU returns Err and produces no series at all.
-    // AllValuesNaN (:730) is the same rejection by another name.
-    {
-        const int needed = warmup + 1;
-        int cur = 0;
-        bool ok = false;
-        for (int i = 0; i < n; ++i) {
-            if (isfinite(data[i])) {
-                cur += 1;
-                if (cur >= needed) { ok = true; break; }
-            } else {
-                cur = 0;
-            }
-        }
-        if (!ok) {
-            for (int i = 0; i < n; ++i) row[i] = noe_qnan();
-            return;
-        }
     }
 
     const double period = (double)period_i;
@@ -134,38 +107,33 @@ extern "C" __global__ void n_order_ema_neo_batch_f64(
     const double b0 = fc;
     const double a0 = -(1.0 - fc);
 
-    // `first_valid` is deliberately UNUSED for the series start: the CPU walks
-    // from index 0 and resets on every non-finite bar (:781-792, :802-832), so
-    // there is no single warmup prefix to hang off it. The row is registered
-    // F64FirstValidRule::Ignored for that reason.
+    // The CPU walks from index 0. `first_valid` remains shape metadata only;
+    // creator `nz` semantics are applied per bar after the first finite source.
     (void)first_valid;
 
     double y = 0.0;
     bool has_y = false;
-    int count = 0;
 
     for (int i = 0; i < n; ++i) {
         const double x = data[i];
-        if (!isfinite(x)) {
-            // update (:374-378) resets the whole filter and returns None.
+        if (isinf(x)) {
             has_y = false;
-            count = 0;
             row[i] = noe_qnan();
             continue;
         }
+        if (isnan(x) && !has_y) {
+            row[i] = noe_qnan();
+            continue;
+        }
+        const double safe_x = isnan(x) ? 0.0 : x;
 
-        // `first_value.get_or_insert(value)` (:379): on the first bar of a run
-        // the history slot reads `first`, which IS this bar's value.
-        const double y_in = has_y ? y : x;
+        const double y_in = has_y ? y : safe_x;
 
-        double acc = b0 * x;
+        double acc = b0 * safe_x;
         acc = acc - (a0 * y_in);
 
         y = acc;
         has_y = true;
-        count += 1;
-
-        // NOrderEmaStream::update (:527-531) emits only past the warmup.
-        row[i] = (count > warmup) ? acc : noe_qnan();
+        row[i] = acc;
     }
 }

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::jsa::{JsaBatchRange, JsaParams};
@@ -6,15 +6,15 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::convert::TryFrom;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug)]
 pub enum BatchThreadsPerOutput {
@@ -142,15 +142,6 @@ impl fmt::Display for CudaJsaError {
 
 impl std::error::Error for CudaJsaError {}
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub struct JsaDeviceHandle {
-    pub(crate) buf: DeviceBuffer<f32>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
 pub struct CudaJsa {
     module: Module,
     stream: Stream,
@@ -185,19 +176,7 @@ impl CudaJsa {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/jsa_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
-        let module = match Module::from_ptx(ptx, jit_opts) {
-            Ok(m) => m,
-            Err(_) => match Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]) {
-                Ok(m) => m,
-                Err(_) => Module::from_ptx(ptx, &[])?,
-            },
-        };
+        let module = crate::load_cuda_embedded_module!("jsa_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
         let max_grid_x = device.get_attribute(DeviceAttribute::MaxGridDimX)? as usize;
@@ -319,11 +298,11 @@ impl CudaJsa {
         }
         unsafe {
             use cust::sys::{
-                cuCtxSetLimit, cuDeviceGetAttribute, cuStreamSetAttribute,
                 CUaccessPolicyWindow_v1 as CUaccessPolicyWindow,
                 CUaccessProperty_enum as AccessProp, CUdevice_attribute_enum as DevAttr,
                 CUlimit_enum as CULimit, CUstreamAttrID_enum as StreamAttrId,
-                CUstreamAttrValue_v1 as CUstreamAttrValue,
+                CUstreamAttrValue_v1 as CUstreamAttrValue, cuCtxSetLimit, cuDeviceGetAttribute,
+                cuStreamSetAttribute,
             };
 
             let mut max_window_bytes_i32: i32 = 0;
@@ -353,52 +332,6 @@ impl CudaJsa {
                 &mut val as *mut _,
             );
         }
-    }
-
-    #[cfg(all(feature = "python", feature = "cuda"))]
-    pub fn jsa_batch_dev_handle(
-        &self,
-        data_f32: &[f32],
-        sweep: &JsaBatchRange,
-    ) -> Result<JsaDeviceHandle, CudaJsaError> {
-        use core::mem::ManuallyDrop;
-        let arr = self.jsa_batch_dev(data_f32, sweep)?;
-        let arr = ManuallyDrop::new(arr);
-
-        let buf = unsafe { std::ptr::read(&arr.buf) };
-        Ok(JsaDeviceHandle {
-            buf,
-            rows: arr.rows,
-            cols: arr.cols,
-            _ctx: self._context.clone(),
-            device_id: self.device_id,
-        })
-    }
-
-    #[cfg(all(feature = "python", feature = "cuda"))]
-    pub fn jsa_many_series_one_param_time_major_dev_handle(
-        &self,
-        data_tm_f32: &[f32],
-        num_series: usize,
-        series_len: usize,
-        params: &JsaParams,
-    ) -> Result<JsaDeviceHandle, CudaJsaError> {
-        use core::mem::ManuallyDrop;
-        let arr = self.jsa_many_series_one_param_time_major_dev(
-            data_tm_f32,
-            num_series,
-            series_len,
-            params,
-        )?;
-        let arr = ManuallyDrop::new(arr);
-        let buf = unsafe { std::ptr::read(&arr.buf) };
-        Ok(JsaDeviceHandle {
-            buf,
-            rows: arr.rows,
-            cols: arr.cols,
-            _ctx: self._context.clone(),
-            device_id: self.device_id,
-        })
     }
 
     pub fn jsa_batch_dev(

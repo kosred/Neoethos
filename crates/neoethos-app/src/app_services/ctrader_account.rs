@@ -1,8 +1,9 @@
-use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+use crate::app_services::broker_deal_economics::BrokerPnlConversionFeeV1;
 use crate::app_services::ctrader_data::{CTraderAssetInfo, parse_asset_list_response};
+use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
-    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
@@ -16,9 +17,9 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE, CTraderDealListRequest, CTraderOpenApiTransport,
     CTraderPositionUnrealizedPnL, CTraderUnrealizedPnLSnapshot, ProductionCTraderOpenApiTransport,
     build_account_auth_request, build_application_auth_request, build_asset_list_request,
-    build_deal_list_request,
-    build_get_position_unrealized_pnl_request, build_reconcile_request, build_trader_request,
-    parse_ctrader_error_payload, parse_get_position_unrealized_pnl_response, parse_open_api_envelope,
+    build_deal_list_request, build_get_position_unrealized_pnl_request, build_reconcile_request,
+    build_trader_request, parse_ctrader_error_payload, parse_get_position_unrealized_pnl_response,
+    parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,7 @@ pub struct CTraderPendingOrderSnapshot {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTraderDealSnapshot {
+    pub account_id: i64,
     pub deal_id: i64,
     pub order_id: i64,
     pub position_id: i64,
@@ -102,6 +104,9 @@ pub struct CTraderDealSnapshot {
     pub deal_status: String,
     pub volume: f64,
     pub filled_volume: f64,
+    /// Exact `ProtoOADeal.filledVolume` wire integer. cTrader volume fields are
+    /// centi-units; standard lots require the same symbol's broker `lotSize`.
+    pub filled_volume_raw_centi_units: i64,
     pub execution_timestamp_ms: i64,
     pub execution_price: Option<f64>,
     pub entry_price: Option<f64>,
@@ -109,7 +114,15 @@ pub struct CTraderDealSnapshot {
     pub fee: Option<f64>,
     pub swap: Option<f64>,
     pub pnl_conversion_fee: Option<f64>,
-    pub net_profit: Option<f64>,
+    /// Scale carried by `ProtoOAClosePositionDetail` for all closing money.
+    pub money_digits: Option<u32>,
+    pub gross_profit_raw_scaled: Option<i64>,
+    pub commission_raw_scaled_signed: Option<i64>,
+    pub swap_raw_scaled_signed: Option<i64>,
+    pub pnl_conversion_fee_state: Option<BrokerPnlConversionFeeV1>,
+    /// Checked sum of signed broker components. This is derived locally and is
+    /// deliberately not named or treated as an independently reported net.
+    pub component_sum_account_currency: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +134,7 @@ pub struct CTraderReconcileSnapshot {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTraderAccountRuntimeSnapshot {
+    pub environment: CTraderEnvironment,
     pub trader: CTraderTraderSnapshot,
     pub reconcile: CTraderReconcileSnapshot,
     pub recent_deals: Vec<CTraderDealSnapshot>,
@@ -233,6 +247,8 @@ struct DealListEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct DealListPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
     #[serde(default, rename = "deal")]
     deals: Vec<DealPayload>,
 }
@@ -431,36 +447,35 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
             .positions
             .into_iter()
             .map(|position| -> Result<CTraderPositionSnapshot> {
-                let (swap, commission, mirroring_commission, used_margin) = if position
-                    .swap
-                    .is_some()
-                    || position.commission.is_some()
-                    || position.mirroring_commission.is_some()
-                    || position.used_margin.is_some()
-                {
-                    let money_digits =
-                        required_money_digits(position.money_digits, "position.money_digits")?;
-                    (
-                        position
-                            .swap
-                            .map(|raw| scaled_money(raw, money_digits))
-                            .transpose()?,
-                        position
-                            .commission
-                            .map(|raw| scaled_money(raw, money_digits))
-                            .transpose()?,
-                        position
-                            .mirroring_commission
-                            .map(|raw| scaled_money(raw, money_digits))
-                            .transpose()?,
-                        position
-                            .used_margin
-                            .map(|raw| scaled_unsigned_money(raw, money_digits))
-                            .transpose()?,
-                    )
-                } else {
-                    (None, None, None, None)
-                };
+                let (swap, commission, mirroring_commission, used_margin) =
+                    if position.swap.is_some()
+                        || position.commission.is_some()
+                        || position.mirroring_commission.is_some()
+                        || position.used_margin.is_some()
+                    {
+                        let money_digits =
+                            required_money_digits(position.money_digits, "position.money_digits")?;
+                        (
+                            position
+                                .swap
+                                .map(|raw| scaled_money(raw, money_digits))
+                                .transpose()?,
+                            position
+                                .commission
+                                .map(|raw| scaled_money(raw, money_digits))
+                                .transpose()?,
+                            position
+                                .mirroring_commission
+                                .map(|raw| scaled_money(raw, money_digits))
+                                .transpose()?,
+                            position
+                                .used_margin
+                                .map(|raw| scaled_unsigned_money(raw, money_digits))
+                                .transpose()?,
+                        )
+                    } else {
+                        (None, None, None, None)
+                    };
                 Ok(CTraderPositionSnapshot {
                     swap,
                     commission,
@@ -512,11 +527,12 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
             envelope.payload_type
         ));
     }
+    let account_id = envelope.payload.ctid_trader_account_id;
     Ok(envelope
         .payload
         .deals
         .into_iter()
-        .map(deal_payload_to_snapshot)
+        .map(|deal| deal_payload_to_snapshot(account_id, deal))
         .collect::<Result<Vec<_>>>()?)
 }
 
@@ -537,11 +553,12 @@ pub fn parse_deal_list_by_position_id_response(
             envelope.payload_type
         ));
     }
+    let account_id = envelope.payload.ctid_trader_account_id;
     Ok(envelope
         .payload
         .deals
         .into_iter()
-        .map(deal_payload_to_snapshot)
+        .map(|deal| deal_payload_to_snapshot(account_id, deal))
         .collect::<Result<Vec<_>>>()?)
 }
 
@@ -589,14 +606,15 @@ pub fn parse_order_details_response(response_json: &str) -> Result<CTraderOrderD
             envelope.payload_type
         ));
     }
+    let account_id = envelope.payload.ctid_trader_account_id;
     Ok(CTraderOrderDetailsSnapshot {
-        account_id: envelope.payload.ctid_trader_account_id,
+        account_id,
         order: order_payload_to_snapshot(envelope.payload.order),
         deals: envelope
             .payload
             .deals
             .into_iter()
-            .map(deal_payload_to_snapshot)
+            .map(|deal| deal_payload_to_snapshot(account_id, deal))
             .collect::<Result<Vec<_>>>()?,
     })
 }
@@ -638,23 +656,49 @@ pub fn parse_symbol_category_list_response(
         .collect())
 }
 
-fn deal_payload_to_snapshot(deal: DealPayload) -> Result<CTraderDealSnapshot> {
-    let (gross_profit, close_fee, swap, pnl_conversion_fee) =
-        match deal.close_position_detail.as_ref() {
-            Some(detail) => {
-                let digits = required_money_digits(detail.money_digits, "deal.close.money_digits")?;
-                (
-                    Some(scaled_money(detail.gross_profit, digits)?),
-                    Some(scaled_money(detail.commission, digits)?),
-                    Some(scaled_money(detail.swap, digits)?),
-                    detail
-                        .pnl_conversion_fee
-                        .map(|fee| scaled_money(fee, digits))
-                        .transpose()?,
-                )
-            }
-            None => (None, None, None, None),
-        };
+fn deal_payload_to_snapshot(account_id: i64, deal: DealPayload) -> Result<CTraderDealSnapshot> {
+    let (
+        gross_profit,
+        close_fee,
+        swap,
+        pnl_conversion_fee,
+        close_money_digits,
+        gross_profit_raw_scaled,
+        close_commission_raw_scaled_signed,
+        swap_raw_scaled_signed,
+        pnl_conversion_fee_state,
+        component_sum_account_currency,
+    ) = match deal.close_position_detail.as_ref() {
+        Some(detail) => {
+            let digits = required_money_digits(detail.money_digits, "deal.close.money_digits")?;
+            let conversion_state = match detail.pnl_conversion_fee {
+                Some(raw_scaled_signed) => BrokerPnlConversionFeeV1::Charged { raw_scaled_signed },
+                None => BrokerPnlConversionFeeV1::NotApplied,
+            };
+            let component_sum_raw_scaled = detail
+                .gross_profit
+                .checked_add(detail.commission)
+                .and_then(|sum| sum.checked_add(detail.swap))
+                .and_then(|sum| sum.checked_add(conversion_state.raw_scaled_signed()))
+                .ok_or_else(|| anyhow!("cTrader closing-deal money components overflow i64"))?;
+            (
+                Some(scaled_money(detail.gross_profit, digits)?),
+                Some(scaled_money(detail.commission, digits)?),
+                Some(scaled_money(detail.swap, digits)?),
+                detail
+                    .pnl_conversion_fee
+                    .map(|fee| scaled_money(fee, digits))
+                    .transpose()?,
+                Some(digits),
+                Some(detail.gross_profit),
+                Some(detail.commission),
+                Some(detail.swap),
+                Some(conversion_state),
+                Some(scaled_money(component_sum_raw_scaled, digits)?),
+            )
+        }
+        None => (None, None, None, None, None, None, None, None, None, None),
+    };
     let fee = match close_fee {
         Some(value) => Some(value),
         None => match deal.commission {
@@ -665,17 +709,22 @@ fn deal_payload_to_snapshot(deal: DealPayload) -> Result<CTraderDealSnapshot> {
             None => None,
         },
     };
-    let net_profit = match (gross_profit, fee, swap) {
-        (Some(gross), Some(fee), Some(swap)) => {
-            // ProtoOAClosePositionDetail.pnlConversionFee is optional and is
-            // present only when the broker applied quote/deposit conversion.
-            let conversion_fee = pnl_conversion_fee.unwrap_or_default();
-            Some(gross + fee + swap + conversion_fee)
-        }
-        _ => None,
+    let (money_digits, commission_raw_scaled_signed) = match close_money_digits {
+        Some(digits) => (Some(digits), close_commission_raw_scaled_signed),
+        None => match deal.commission {
+            Some(commission) => (
+                Some(required_money_digits(
+                    deal.money_digits,
+                    "deal.money_digits",
+                )?),
+                Some(commission),
+            ),
+            None => (None, None),
+        },
     };
 
     Ok(CTraderDealSnapshot {
+        account_id,
         deal_id: deal.deal_id,
         order_id: deal.order_id,
         position_id: deal.position_id,
@@ -684,6 +733,7 @@ fn deal_payload_to_snapshot(deal: DealPayload) -> Result<CTraderDealSnapshot> {
         deal_status: deal_status_label(deal.deal_status),
         volume: volume_to_units(deal.volume),
         filled_volume: volume_to_units(deal.filled_volume),
+        filled_volume_raw_centi_units: deal.filled_volume,
         execution_timestamp_ms: deal.execution_timestamp,
         execution_price: deal.execution_price,
         entry_price: deal
@@ -694,7 +744,12 @@ fn deal_payload_to_snapshot(deal: DealPayload) -> Result<CTraderDealSnapshot> {
         fee,
         swap,
         pnl_conversion_fee,
-        net_profit,
+        money_digits,
+        gross_profit_raw_scaled,
+        commission_raw_scaled_signed,
+        swap_raw_scaled_signed,
+        pnl_conversion_fee_state,
+        component_sum_account_currency,
     })
 }
 
@@ -788,11 +843,23 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
         .values()
         .map(|position| position.net_unrealized_pnl)
         .sum();
+    let recent_deals = parse_deal_list_response(&responses[4])?;
+    if trader.account_id != account_id
+        || reconcile.account_id != account_id
+        || recent_deals
+            .iter()
+            .any(|deal| deal.account_id != account_id)
+    {
+        return Err(anyhow!(
+            "cTrader account-runtime response identity differs from requested account {account_id}"
+        ));
+    }
 
     Ok(CTraderAccountRuntimeSnapshot {
+        environment: request.environment,
         trader,
         reconcile,
-        recent_deals: parse_deal_list_response(&responses[4])?,
+        recent_deals,
         unrealized_pnl,
         unrealized_pnl_by_position,
         deposit_asset_name,
@@ -803,16 +870,14 @@ fn resolve_deposit_asset_name(
     trader: &CTraderTraderSnapshot,
     assets: &[CTraderAssetInfo],
 ) -> Result<String> {
-    let deposit_asset_id = trader.deposit_asset_id.ok_or_else(|| {
-        anyhow!("cTrader trader response omitted required depositAssetId")
-    })?;
+    let deposit_asset_id = trader
+        .deposit_asset_id
+        .ok_or_else(|| anyhow!("cTrader trader response omitted required depositAssetId"))?;
     let mut matches = assets
         .iter()
         .filter(|asset| asset.asset_id == deposit_asset_id);
     let asset = matches.next().ok_or_else(|| {
-        anyhow!(
-            "cTrader asset registry has no row for depositAssetId={deposit_asset_id}"
-        )
+        anyhow!("cTrader asset registry has no row for depositAssetId={deposit_asset_id}")
     })?;
     if matches.next().is_some() {
         return Err(anyhow!(
@@ -864,9 +929,7 @@ fn reconcile_broker_unrealized_pnl(
                 position.position_id
             ));
         }
-        if !position.gross_unrealized_pnl.is_finite()
-            || !position.net_unrealized_pnl.is_finite()
-        {
+        if !position.gross_unrealized_pnl.is_finite() || !position.net_unrealized_pnl.is_finite() {
             return Err(anyhow!(
                 "cTrader unrealized-PnL response returned non-finite values for position {}",
                 position.position_id

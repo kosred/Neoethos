@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::edcf::{EdcfBatchRange, EdcfParams};
@@ -8,15 +8,15 @@ use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
 use cust::memory::AsyncCopyDestination;
-use cust::memory::{mem_get_info, CopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -27,7 +27,9 @@ pub enum CudaEdcfError {
     InvalidInput(String),
     #[error("invalid policy: {0}")]
     InvalidPolicy(&'static str),
-    #[error("Out of memory on device: required={required} bytes, free={free} bytes, headroom={headroom} bytes")]
+    #[error(
+        "Out of memory on device: required={required} bytes, free={free} bytes, headroom={headroom} bytes"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -113,11 +115,6 @@ impl CudaEdcf {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/edcf_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("edcf_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -233,11 +230,11 @@ impl CudaEdcf {
         unsafe {
             use cust::device::Device as CuDevice;
             use cust::sys::{
-                cuCtxSetLimit, cuDeviceGetAttribute, cuStreamSetAttribute,
                 CUaccessPolicyWindow_v1 as CUaccessPolicyWindow,
                 CUaccessProperty_enum as AccessProp, CUdevice_attribute_enum as DevAttr,
                 CUlimit_enum as CULimit, CUstreamAttrID_enum as StreamAttrId,
-                CUstreamAttrValue_v1 as CUstreamAttrValue,
+                CUstreamAttrValue_v1 as CUstreamAttrValue, cuCtxSetLimit, cuDeviceGetAttribute,
+                cuStreamSetAttribute,
             };
 
             let mut max_window_bytes_i32: i32 = 0;

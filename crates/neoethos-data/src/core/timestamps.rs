@@ -136,15 +136,36 @@ pub fn normalize_timestamps_to_inferred_millis(values: &[i64]) -> Result<Vec<i64
 
 pub fn validate_monotonic_timestamps(values: &[i64]) -> Result<()> {
     for window in values.windows(2) {
-        if window[1] < window[0] {
+        if window[1] <= window[0] {
             bail!(
-                "timestamps must be sorted ascending: {} came after {}",
+                "timestamps must be strictly increasing: {} came after {}",
                 window[1],
                 window[0]
             );
         }
     }
     Ok(())
+}
+
+pub const MIN_CANONICAL_MARKET_TIMESTAMP_MS: i64 = 946_684_800_000; // 2000-01-01 UTC
+pub const MAX_CANONICAL_MARKET_TIMESTAMP_MS: i64 = 32_503_680_000_000; // 3000-01-01 UTC
+
+/// Validate the canonical on-disk timestamp contract without guessing units or
+/// repairing order. Explicit legacy/import boundaries perform any evidenced
+/// checked conversion before calling this function.
+pub fn validate_canonical_millisecond_timestamps(values: &[i64]) -> Result<()> {
+    if values.is_empty() {
+        bail!("canonical market timestamps must not be empty");
+    }
+    for (index, &value) in values.iter().enumerate() {
+        if !(MIN_CANONICAL_MARKET_TIMESTAMP_MS..=MAX_CANONICAL_MARKET_TIMESTAMP_MS).contains(&value)
+        {
+            bail!(
+                "canonical timestamp at row {index} is not an in-range i64 Unix millisecond value: {value}"
+            );
+        }
+    }
+    validate_monotonic_timestamps(values)
 }
 
 pub fn day_key_from_millis(timestamp_ms: i64) -> i64 {
@@ -204,7 +225,7 @@ mod tests {
 
     #[test]
     fn rejects_non_monotonic_timestamps() {
-        assert!(validate_monotonic_timestamps(&[1, 2, 2, 3]).is_ok());
+        assert!(validate_monotonic_timestamps(&[1, 2, 2, 3]).is_err());
         assert!(validate_monotonic_timestamps(&[1, 3, 2]).is_err());
     }
 

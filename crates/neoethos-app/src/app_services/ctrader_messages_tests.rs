@@ -1,6 +1,70 @@
 use super::*;
 
 #[test]
+fn six_historical_messages_on_one_connection_are_strictly_spaced() {
+    let interval = std::time::Duration::from_millis(15);
+    let mut admission = ConnectionHistoricalAdmission::new(interval);
+
+    let admitted_at = (0..6)
+        .map(|_| {
+            admission
+                .admit_and_send(None, || Ok::<_, std::convert::Infallible>(()))
+                .expect("a historical request must be admitted")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        CTRADER_HISTORICAL_REQUEST_MIN_INTERVAL,
+        std::time::Duration::from_millis(225),
+        "the connection-local production lane must keep the live-proven safe spacing"
+    );
+    for pair in admitted_at.windows(2) {
+        assert!(
+            pair[1].duration_since(pair[0]) >= interval,
+            "one connection must not grant a historical token-bucket burst: {admitted_at:?}"
+        );
+    }
+}
+
+#[test]
+fn separate_connections_do_not_share_historical_delay() {
+    let interval = std::time::Duration::from_secs(2);
+    let mut first_connection = ConnectionHistoricalAdmission::new(interval);
+    let mut second_connection = ConnectionHistoricalAdmission::new(interval);
+    let started = std::time::Instant::now();
+
+    first_connection
+        .admit_and_send(None, || Ok::<_, std::convert::Infallible>(()))
+        .expect("the first connection's first historical request must be immediate");
+    second_connection
+        .admit_and_send(None, || Ok::<_, std::convert::Infallible>(()))
+        .expect("the second connection must have an independent first admission");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a process-wide gate incorrectly delayed the independent connection"
+    );
+}
+
+#[test]
+fn only_official_historical_request_payloads_enter_the_connection_lane() {
+    for payload_type in [
+        CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE,
+        CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE,
+        CTRADER_OA_CASH_FLOW_HISTORY_LIST_REQUEST_PAYLOAD_TYPE,
+        CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE,
+    ] {
+        assert!(is_ctrader_historical_request(payload_type));
+    }
+    assert!(!is_ctrader_historical_request(
+        CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE
+    ));
+    assert!(!is_ctrader_historical_request(
+        CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE
+    ));
+}
+
+#[test]
 fn parse_open_api_envelope_tolerates_heartbeat_without_client_msg_id() {
     // v0.4.13 regression test — the cTrader Open API server emits
     // `ProtoHeartbeatEvent` frames (payloadType 51) every ~30 s with
@@ -589,6 +653,146 @@ fn ctrader_error_payload_parts_separates_code_and_message() {
 }
 
 #[test]
+fn blocked_payload_type_surfaces_retry_after_without_resilient_retry() {
+    struct BlockedTransport {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CTraderOpenApiTransport for BlockedTransport {
+        fn send_sequence(
+            &self,
+            _messages: &[CTraderOpenApiJsonMessage],
+        ) -> anyhow::Result<Vec<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                serde_json::json!({
+                    "clientMsgId": "trendbars-1",
+                    "payloadType": CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+                    "payload": {
+                        "errorCode": "BLOCKED_PAYLOAD_TYPE",
+                        "description": "Historical request limit exceeded",
+                        "retryAfter": "7"
+                    }
+                })
+                .to_string(),
+            ])
+        }
+    }
+
+    let transport = BlockedTransport {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let error = send_sequence_resilient(&transport, &[], 1, "historical fixture")
+        .expect_err("broker rate-limit response must fail immediately")
+        .to_string();
+
+    assert_eq!(
+        transport.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "BLOCKED_PAYLOAD_TYPE was retried"
+    );
+    assert!(error.contains("BLOCKED_PAYLOAD_TYPE"), "{error}");
+    assert!(error.contains("retryAfter=7s"), "{error}");
+    assert!(error.contains("without retry"), "{error}");
+}
+
+#[test]
+fn historical_blocked_error_preserves_retry_after_through_anyhow_context() {
+    let response = serde_json::json!({
+        "clientMsgId": "trendbars-1",
+        "payloadType": CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+        "payload": {
+            "errorCode": "BLOCKED_PAYLOAD_TYPE",
+            "description": "Historical request limit exceeded",
+            "retryAfter": "7"
+        }
+    })
+    .to_string();
+
+    let error = ctrader_historical_session_error_from_response(&response)
+        .expect("valid broker error envelope")
+        .context("cTrader historical session failed")
+        .context("persistent historical page failed");
+    let blocked = error
+        .downcast_ref::<CTraderBlockedPayloadError>()
+        .expect("typed BLOCKED_PAYLOAD_TYPE must survive anyhow contexts");
+
+    assert_eq!(blocked.retry_after_seconds(), Some(7));
+    assert!(
+        format!("{error:#}").contains("BLOCKED_PAYLOAD_TYPE"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn historical_cannot_route_error_preserves_a_typed_reconnect_signal() {
+    let response = serde_json::json!({
+        "clientMsgId": "history-application-auth",
+        "payloadType": CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+        "payload": {
+            "errorCode": "CANT_ROUTE_REQUEST",
+            "description": "Cannot route request"
+        }
+    })
+    .to_string();
+
+    let error = ctrader_historical_session_error_from_response(&response)
+        .expect("valid broker error envelope")
+        .context("cTrader historical stage application-auth failed");
+    let cannot_route = error
+        .downcast_ref::<CTraderCannotRouteRequestError>()
+        .expect("CANT_ROUTE_REQUEST must remain a typed reconnect signal");
+
+    assert_eq!(
+        cannot_route.to_string(),
+        "CANT_ROUTE_REQUEST: Cannot route request"
+    );
+}
+
+#[test]
+fn historical_blocked_error_preserves_missing_retry_after_as_none() {
+    let response = serde_json::json!({
+        "clientMsgId": "history-symbols",
+        "payloadType": CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+        "payload": {
+            "errorCode": "BLOCKED_PAYLOAD_TYPE",
+            "description": "Historical request limit exceeded"
+        }
+    })
+    .to_string();
+
+    let error = ctrader_historical_session_error_from_response(&response)
+        .expect("valid broker error envelope")
+        .context("cTrader historical session failed");
+    let blocked = error
+        .downcast_ref::<CTraderBlockedPayloadError>()
+        .expect("missing retryAfter must still be a typed blocked error");
+
+    assert_eq!(blocked.retry_after_seconds(), None);
+    assert_eq!(
+        blocked.to_string(),
+        "BLOCKED_PAYLOAD_TYPE: Historical request limit exceeded"
+    );
+}
+
+#[test]
+fn historical_data_broker_error_arm_preserves_the_typed_anyhow_source() {
+    let source = include_str!("ctrader_data.rs");
+    let broker_error_arm = source
+        .split("CTraderOpenApiSessionResponse::BrokerError(response) =>")
+        .nth(1)
+        .and_then(|tail| tail.split("\n        }").next())
+        .expect("historical BrokerError response arm");
+
+    assert!(broker_error_arm.contains("ctrader_historical_session_error_from_response"));
+    assert!(broker_error_arm.contains(".context(\"cTrader historical session failed\")"));
+    assert!(
+        !broker_error_arm.contains("parse_ctrader_error_payload"),
+        "formatting the broker error into a string erases its concrete type"
+    );
+}
+
+#[test]
 fn auth_token_error_classifier_matches_known_codes() {
     for code in [
         "OA_AUTH_TOKEN_EXPIRED",
@@ -743,7 +947,10 @@ fn amend_position_sltp_response_is_an_execution_event() {
 #[test]
 fn version_request_carries_no_account() {
     let message = build_version_request("ver-1");
-    assert_eq!(message.payload_type, CTRADER_OA_VERSION_REQUEST_PAYLOAD_TYPE);
+    assert_eq!(
+        message.payload_type,
+        CTRADER_OA_VERSION_REQUEST_PAYLOAD_TYPE
+    );
     assert_eq!(message.payload_type, 2104);
     assert_eq!(
         expected_response_payload_type(CTRADER_OA_VERSION_REQUEST_PAYLOAD_TYPE).unwrap(),
@@ -779,7 +986,10 @@ fn expected_margin_request_uses_documented_payload_and_fields() {
 #[test]
 fn order_list_and_cash_flow_history_carry_time_window() {
     let orders = build_order_list_request(7001, 1_000, 2_000, "ol-1");
-    assert_eq!(orders.payload_type, CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE);
+    assert_eq!(
+        orders.payload_type,
+        CTRADER_OA_ORDER_LIST_REQUEST_PAYLOAD_TYPE
+    );
     assert_eq!(orders.payload_type, 2175);
     assert_eq!(
         orders.payload.get("fromTimestamp").and_then(Value::as_i64),

@@ -497,6 +497,9 @@ pub struct RiskConfig {
     // out (`trailing_atr_multiplier` → `trailing_stop_multiplier`; despite the
     // old name it was never an ATR multiple).
     // ---------------------------------------------------------------------
+    /// Adverse slippage assumption in pips **per fill**. Broad flat-cost
+    /// screening charges it once at entry and once at exit. This is an operator
+    /// assumption, not historical Bid/Ask or broker-deal evidence.
     pub slippage_pips: f64,
     pub commission_per_lot: f64,
     /// Is `commission_per_lot` the charge for ONE SIDE, or for the round trip?
@@ -769,9 +772,7 @@ impl RiskConfig {
     ///
     /// Every evaluator subtracts this exactly once per closed trade, so this —
     /// not the per-side quote — is what belongs in `commission_per_trade`.
-    pub fn round_trip_commission_per_lot(
-        &self,
-    ) -> Result<f64, crate::BrokerFinancialTruthErrorV1> {
+    pub fn round_trip_commission_per_lot(&self) -> Result<f64, crate::BrokerFinancialTruthErrorV1> {
         crate::current_broker_financial_truth_capability_v1()
             .require(crate::BrokerFinancialOperationV1::HistoricalEvaluation)?;
         let per_lot = self.commission_per_lot.max(0.0);
@@ -806,8 +807,15 @@ pub struct ModelsConfig {
     pub ml_models: Vec<String>,
     pub use_rl_agent: bool,
     pub use_sac_agent: bool,
+    /// Legacy Ray/RLlib request retained only so older configuration files can
+    /// be read and rejected with an actionable migration error. NeoEthos does
+    /// not ship a Ray runtime; `true` fails before model dispatch.
     pub use_rllib_agent: bool,
+    /// Legacy RLlib worker count retained for config migration only. A non-zero
+    /// value is an RLlib request and fails at the same pre-dispatch boundary.
     pub rllib_num_workers: usize,
+    /// Legacy auto-RLlib request. This must remain `false`; `true` is rejected
+    /// before dispatch instead of silently substituting the native rlkit DQN.
     pub auto_enable_rllib: bool,
     pub use_neuroevolution: bool,
     /// ⚠ UNWIRED — nothing reads this field.
@@ -874,8 +882,6 @@ pub struct ModelsConfig {
     pub prop_search_max_indicators: usize,
     pub prop_search_checkpoint: PathBuf,
     pub prop_search_device: String,
-    pub prop_search_train_years: usize,
-    pub prop_search_val_years: usize,
     pub prop_search_val_candidates: usize,
     pub prop_search_val_min_positive_months: usize,
     pub prop_search_val_min_trades_per_month: usize,
@@ -1240,7 +1246,7 @@ pub struct ModelsConfig {
     /// `NEOETHOS_BOT_PROP_SMC_*` env vars). See [`SmcSearchRuntimeConfig`].
     pub smc_search_runtime: SmcSearchRuntimeConfig,
     /// Data-layer behavior knobs (config-driven replacement for the
-    /// `NEOETHOS_BOT_NORMALIZE_FEATURES` / `..._REBUILD_STALE_HIGHER_TFS`
+    /// `NEOETHOS_BOT_NORMALIZE_FEATURES`
     /// env vars). See [`DataRuntimeConfig`].
     pub data_runtime: DataRuntimeConfig,
     /// Tree-model training knobs (config-driven replacement for the
@@ -1355,10 +1361,10 @@ pub struct SearchRuntimeConfig {
     pub tournament_size_override: Option<usize>,
     pub archive_cap_override: Option<usize>,
     pub seen_retry_attempts: usize,
-    pub smc_gate_start: f32,
-    pub smc_gate_end: f32,
-    pub smc_gate_curve: f32,
-    pub smc_gate_stagnation_step: f32,
+    pub smc_gate_start: f64,
+    pub smc_gate_end: f64,
+    pub smc_gate_curve: f64,
+    pub smc_gate_stagnation_step: f64,
     pub disable_smc_gate: bool,
     pub archive_mode: String,
     pub archive_min_net: f64,
@@ -1533,28 +1539,6 @@ pub struct DiscoveryRuntimeConfig {
     /// See [`PropFirmGateConfig`]. (was the
     /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides)
     pub prop_firm_gate: PropFirmGateConfig,
-    /// Apply the 20% out-of-sample holdout to the `GeneticStrategyExpert`
-    /// training path (`neoethos-models`), the way the desktop app, the CLI and
-    /// the batch orchestrator already do.
-    ///
-    /// `run_discovery_cycle_with_holdout` documents itself as the single
-    /// source of truth for "discovery never sees the tail" and says every
-    /// production caller must go through it. Audit B02/B03 (2026-07-13) routed
-    /// the CLI and the orchestrator through it. `GeneticStrategyExpert::train_with_discovery`
-    /// was not part of that pass and still calls the unwrapped
-    /// `run_discovery_cycle` with the FULL series — so when the training
-    /// orchestrator trains that expert, its genes are selected on 100% of the
-    /// data and its reported fitness is entirely in-sample.
-    ///
-    /// Default `false` = exactly that behaviour, because turning it on is a
-    /// selection change in both directions: the GA searches 80% of the rows
-    /// (different genes), and the holdout wrapper REFUSES datasets whose
-    /// in-sample half would be under 64 rows, which turns some short-fold
-    /// trainings that "succeed" today into a loud error. Set `true` once you
-    /// are ready for the expert's numbers to become out-of-sample — and to
-    /// find out which folds were too short to be meaningful in the first
-    /// place.
-    pub genetic_expert_holdout: bool,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -1573,9 +1557,6 @@ impl Default for DiscoveryRuntimeConfig {
             // produced; see the field docs.
             adaptive_thresholds: true,
             prop_firm_gate: PropFirmGateConfig::default(),
-            // false = today: the GeneticStrategyExpert searches the full
-            // series. See the field docs for why this is not simply `true`.
-            genetic_expert_holdout: false,
         }
     }
 }
@@ -1669,18 +1650,18 @@ pub struct EvalRuntimeConfig {
     pub spread_pips: Option<f64>,
     pub commission_per_trade: Option<f64>,
     pub reject_pip_fallback: bool,
-    pub smc_gate_threshold: f32,
-    pub smc_w_ob: f32,
-    pub smc_w_fvg: f32,
-    pub smc_w_liq: f32,
-    pub smc_w_mtf: f32,
-    pub smc_w_premium: f32,
-    pub smc_w_inducement: f32,
-    pub smc_w_bos: f32,
-    pub smc_w_choch: f32,
-    pub smc_w_eqh: f32,
-    pub smc_w_eql: f32,
-    pub smc_w_displacement: f32,
+    pub smc_gate_threshold: f64,
+    pub smc_w_ob: f64,
+    pub smc_w_fvg: f64,
+    pub smc_w_liq: f64,
+    pub smc_w_mtf: f64,
+    pub smc_w_premium: f64,
+    pub smc_w_inducement: f64,
+    pub smc_w_bos: f64,
+    pub smc_w_choch: f64,
+    pub smc_w_eqh: f64,
+    pub smc_w_eql: f64,
+    pub smc_w_displacement: f64,
 }
 
 impl Default for EvalRuntimeConfig {
@@ -2124,7 +2105,7 @@ impl Default for SeenSignatureRuntimeConfig {
 ///
 /// Cross-run dedup of the seeded hashes only takes effect for the GA when an
 /// on-disk seen-signature file is configured (`seen_signature_runtime.file_path`):
-/// the genetic engine builds its own `SeenSignatureMemory::from_env()` and reads
+/// the genetic engine builds its own `SeenSignatureMemory::current()` and reads
 /// previously-persisted hashes from that file. When `file_path` is unset
 /// (in-memory only, the default), the ledger is still recorded + the seed step
 /// runs, but the seeded hashes are not visible to the engine's fresh in-memory
@@ -2269,8 +2250,8 @@ impl FeatureCubeMode {
 }
 
 /// Data-layer behavior knobs — config-driven replacement for the
-/// `NEOETHOS_BOT_NORMALIZE_FEATURES` / `NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS`
-/// / `NEOETHOS_FEATURE_CUBE_MODE` env vars. Consumed by the data crate via
+/// `NEOETHOS_BOT_NORMALIZE_FEATURES` / `NEOETHOS_FEATURE_CUBE_MODE` env vars.
+/// Consumed by the data crate via
 /// `neoethos_data::install_data_runtime_overrides(...)` and
 /// `neoethos_data::install_feature_cube_policy(...)` at startup.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2291,24 +2272,21 @@ pub struct DataRuntimeConfig {
     /// own module docs, and names the empty-portfolio bug it produced on EURJPY
     /// (magnitudes ±3.5e11) and XAUUSD.
     ///
-    /// With this on, `normalize_feature_series_in_place` applies a robust
-    /// per-column z-score — `(x − median) / (1.4826·MAD)`, clipped to ±10,
-    /// fitted on the leading 80% of rows so the out-of-sample tail cannot leak
-    /// into its own scale — and the weight ladder starts deciding something.
+    /// With this on, `normalize_feature_column_f64` applies a robust per-column
+    /// z-score — `(x − median) / (1.4826·MAD)`, clipped to ±10 — fitted only on
+    /// the exact in-sample row range supplied by the split contract. No 80%
+    /// window or other fit range is inferred inside the normalizer.
     ///
     /// ## What this changes, stated plainly
     ///
     /// 1. **Every gene threshold now means what the static ladder always said
     ///    it meant.** `evolution_math.rs:560` calls that ladder "Calibrated for
     ///    z-score-normalised features"; until now nothing produced them.
-    /// 2. **Non-finite cells become exactly 0.0.** That includes the leading
-    ///    NaN run every higher-timeframe column carries from
-    ///    `align_features_by_ns`. Those rows stop being *skippable* and start
-    ///    being *data* — a constant block at the column's median. The prefilter's
-    ///    pairwise-complete correlation will therefore report `skipped = 0` and
-    ///    a slightly attenuated |r| for those columns, so the alignment gap
-    ///    stops being visible THERE. `run_discovery_cycle` logs this interaction
-    ///    once per run rather than letting it be inferred.
+    /// 2. **Invalid cells never become numeric zero.** Warmup, missing input,
+    ///    gaps, stale alignment, zero denominators and non-finite results retain
+    ///    their typed validity reason and canonical NaN payload. Fits and
+    ///    transforms consume only explicitly valid cells, so alignment gaps
+    ///    remain visible to search/model gates instead of becoming data.
     /// 3. **Prior artifacts are not comparable.** Anything fitted on the raw
     ///    cube — trained models, exported genes, saved thresholds — was fitted
     ///    on a different feature scale. Retrain and re-search; do not mix.
@@ -2317,10 +2295,6 @@ pub struct DataRuntimeConfig {
     /// It makes the search's own parameters mean something, which is the
     /// precondition for finding out whether there is any.
     pub normalize_features: bool,
-    /// Auto-rebuild a present-but-stale higher timeframe from the base
-    /// instead of NaN-ing the stale tail (was
-    /// `NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS`). OFF by default.
-    pub rebuild_stale_higher_tfs: bool,
     /// Where the multi-TF feature cube is assembled — see [`FeatureCubeMode`].
     /// Was `NEOETHOS_FEATURE_CUBE_MODE`, retired 2026-08-10 because its `ram`
     /// arm returned before the free-RAM check. `ram` is not an accepted value
@@ -2335,7 +2309,6 @@ impl Default for DataRuntimeConfig {
             // without it the GA's 5:1 weight ladder cannot reorder terms that
             // differ by 1e5, so a multi-indicator gene equalled its largest term.
             normalize_features: true,
-            rebuild_stale_higher_tfs: false,
             // `Auto` reproduces exactly what every run got with the env var
             // unset, which is what the operator's live store has always had.
             feature_cube_mode: FeatureCubeMode::Auto,
@@ -2453,7 +2426,7 @@ impl Default for ModelsConfig {
             use_sac_agent: true,
             use_rllib_agent: false,
             rllib_num_workers: 0,
-            auto_enable_rllib: true,
+            auto_enable_rllib: false,
             use_neuroevolution: true,
             rl_population_size: 5,
             rl_timesteps: 10_000_000,
@@ -2501,8 +2474,6 @@ impl Default for ModelsConfig {
             // pinned the whole GA (~97% of a run) to the CPU while validation
             // used the card, the 8-month asymmetry. Falls back to CPU with no card.
             prop_search_device: "auto".to_string(),
-            prop_search_train_years: 0,
-            prop_search_val_years: 0,
             prop_search_val_candidates: 0,
             prop_search_val_min_positive_months: 0,
             prop_search_val_min_trades_per_month: 0,
@@ -4779,26 +4750,6 @@ mod tests {
         );
         assert_eq!(settings.risk.initial_balance, 10_000.0);
         assert!(!settings.models.ml_models.is_empty());
-    }
-
-    /// The genetic expert's OOS holdout must stay OFF by default. Turning it
-    /// on changes which genes that expert produces (the GA sees 80% of the
-    /// rows instead of all of them) and makes short folds fail loudly rather
-    /// than quietly succeed. Both are the right end state; neither should
-    /// arrive as a side effect of picking up a new build.
-    #[test]
-    fn genetic_expert_holdout_defaults_to_todays_behaviour() {
-        assert!(
-            !DiscoveryRuntimeConfig::default().genetic_expert_holdout,
-            "default must reproduce the full-series search this path has always done"
-        );
-        assert!(
-            !Settings::default()
-                .models
-                .discovery_runtime
-                .genetic_expert_holdout,
-            "a default Settings must not silently enable the holdout"
-        );
     }
 
     // ─── UI↔CLI parity: the shared timeframe/symbol resolvers ───────────────

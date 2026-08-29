@@ -3,714 +3,719 @@ use super::{
     IndicatorParamSet, ParamKV, ParamValue,
 };
 use crate::indicators::absolute_strength_index_oscillator::{
-    absolute_strength_index_oscillator_output_into_slice,
-    absolute_strength_index_oscillator_with_kernel, AbsoluteStrengthIndexOscillatorInput,
-    AbsoluteStrengthIndexOscillatorOutputField, AbsoluteStrengthIndexOscillatorParams,
+    AbsoluteStrengthIndexOscillatorInput, AbsoluteStrengthIndexOscillatorOutputField,
+    AbsoluteStrengthIndexOscillatorParams, absolute_strength_index_oscillator_output_into_slice,
+    absolute_strength_index_oscillator_with_kernel,
 };
 use crate::indicators::accumulation_swing_index::{
-    accumulation_swing_index_into_slice, accumulation_swing_index_with_kernel,
-    AccumulationSwingIndexInput, AccumulationSwingIndexParams,
+    AccumulationSwingIndexInput, AccumulationSwingIndexParams, accumulation_swing_index_into_slice,
+    accumulation_swing_index_with_kernel,
 };
 use crate::indicators::acosc::{
-    acosc_output_into_slice, AcoscInput, AcoscOutputField, AcoscParams,
+    AcoscInput, AcoscOutputField, AcoscParams, acosc_output_into_slice,
 };
-use crate::indicators::ad::{ad_with_kernel, AdInput, AdParams};
+use crate::indicators::ad::{AdInput, AdParams, ad_with_kernel};
 use crate::indicators::adaptive_bandpass_trigger_oscillator::{
-    adaptive_bandpass_trigger_oscillator_with_kernel, AdaptiveBandpassTriggerOscillatorInput,
-    AdaptiveBandpassTriggerOscillatorParams,
+    AdaptiveBandpassTriggerOscillatorInput, AdaptiveBandpassTriggerOscillatorParams,
+    adaptive_bandpass_trigger_oscillator_with_kernel,
 };
 use crate::indicators::adaptive_bounds_rsi::{
-    adaptive_bounds_rsi_output_into_slice, AdaptiveBoundsRsiInput, AdaptiveBoundsRsiOutputField,
-    AdaptiveBoundsRsiParams,
+    AdaptiveBoundsRsiInput, AdaptiveBoundsRsiOutputField, AdaptiveBoundsRsiParams,
+    adaptive_bounds_rsi_output_into_slice,
 };
 use crate::indicators::adaptive_macd::{
-    adaptive_macd_output_into_slice, adaptive_macd_with_kernel, AdaptiveMacdInput,
-    AdaptiveMacdOutputField, AdaptiveMacdParams,
+    AdaptiveMacdInput, AdaptiveMacdOutputField, AdaptiveMacdParams,
+    adaptive_macd_output_into_slice, adaptive_macd_with_kernel,
 };
 use crate::indicators::adaptive_momentum_oscillator::{
-    adaptive_momentum_oscillator_output_into_slice, adaptive_momentum_oscillator_with_kernel,
     AdaptiveMomentumOscillatorInput, AdaptiveMomentumOscillatorOutputField,
-    AdaptiveMomentumOscillatorParams,
+    AdaptiveMomentumOscillatorParams, adaptive_momentum_oscillator_output_into_slice,
+    adaptive_momentum_oscillator_with_kernel,
 };
 use crate::indicators::adaptive_schaff_trend_cycle::{
-    adaptive_schaff_trend_cycle_output_into_slice, adaptive_schaff_trend_cycle_with_kernel,
     AdaptiveSchaffTrendCycleInput, AdaptiveSchaffTrendCycleOutputField,
-    AdaptiveSchaffTrendCycleParams,
+    AdaptiveSchaffTrendCycleParams, adaptive_schaff_trend_cycle_output_into_slice,
+    adaptive_schaff_trend_cycle_with_kernel,
 };
 use crate::indicators::adjustable_ma_alternating_extremities::{
+    AdjustableMaAlternatingExtremitiesInput, AdjustableMaAlternatingExtremitiesOutputField,
+    AdjustableMaAlternatingExtremitiesParams,
     adjustable_ma_alternating_extremities_output_into_slice,
-    adjustable_ma_alternating_extremities_with_kernel, AdjustableMaAlternatingExtremitiesInput,
-    AdjustableMaAlternatingExtremitiesOutputField, AdjustableMaAlternatingExtremitiesParams,
+    adjustable_ma_alternating_extremities_with_kernel,
 };
-use crate::indicators::adosc::{adosc_with_kernel, AdoscInput, AdoscParams};
+use crate::indicators::adosc::{AdoscInput, AdoscParams, adosc_with_kernel};
 use crate::indicators::advance_decline_line::{
-    advance_decline_line_into_slice, advance_decline_line_with_kernel, AdvanceDeclineLineInput,
-    AdvanceDeclineLineParams,
+    AdvanceDeclineLineInput, AdvanceDeclineLineParams, advance_decline_line_into_slice,
+    advance_decline_line_with_kernel,
 };
-use crate::indicators::adx::{adx_with_kernel, AdxInput, AdxParams};
-use crate::indicators::adxr::{adxr_with_kernel, AdxrInput, AdxrParams};
+use crate::indicators::adx::{AdxInput, AdxParams, adx_with_kernel};
+use crate::indicators::adxr::{AdxrInput, AdxrParams, adxr_with_kernel};
 use crate::indicators::alligator::{
-    alligator_output_into_slice, AlligatorInput, AlligatorOutputField, AlligatorParams,
+    AlligatorInput, AlligatorOutputField, AlligatorParams, alligator_output_into_slice,
 };
 use crate::indicators::alphatrend::{
-    alphatrend_output_into_slice, AlphaTrendInput, AlphaTrendOutputField, AlphaTrendParams,
+    AlphaTrendInput, AlphaTrendOutputField, AlphaTrendParams, alphatrend_output_into_slice,
 };
 use crate::indicators::andean_oscillator::{
-    andean_oscillator_output_into_slice, andean_oscillator_with_kernel, AndeanOscillatorInput,
-    AndeanOscillatorOutputField, AndeanOscillatorParams,
+    AndeanOscillatorInput, AndeanOscillatorOutputField, AndeanOscillatorParams,
+    andean_oscillator_output_into_slice, andean_oscillator_with_kernel,
 };
-use crate::indicators::ao::{ao_into_slice, AoInput, AoParams};
-use crate::indicators::apo::{apo_into_slice, ApoInput, ApoParams};
+use crate::indicators::ao::{AoInput, AoParams, ao_into_slice};
+use crate::indicators::apo::{ApoInput, ApoParams, apo_into_slice};
 use crate::indicators::aroon::{
-    aroon_output_into_slice, AroonInput, AroonOutputField, AroonParams,
+    AroonInput, AroonOutputField, AroonParams, aroon_output_into_slice,
 };
 use crate::indicators::aroonosc::{
-    aroon_osc_into_slice, aroon_osc_with_kernel, AroonOscInput, AroonOscParams,
+    AroonOscInput, AroonOscParams, aroon_osc_into_slice, aroon_osc_with_kernel,
 };
-use crate::indicators::aso::{aso_output_into_slice, AsoInput, AsoOutputField, AsoParams};
-use crate::indicators::atr::{atr_with_kernel, AtrInput, AtrParams};
+use crate::indicators::aso::{AsoInput, AsoOutputField, AsoParams, aso_output_into_slice};
+use crate::indicators::atr::{AtrInput, AtrParams, atr_with_kernel};
 use crate::indicators::atr_percentile::{
-    atr_percentile_into_slice, atr_percentile_with_kernel, AtrPercentileInput, AtrPercentileParams,
+    AtrPercentileInput, AtrPercentileParams, atr_percentile_into_slice, atr_percentile_with_kernel,
 };
 use crate::indicators::autocorrelation_indicator::{
-    autocorrelation_indicator_output_into_slice, autocorrelation_indicator_with_kernel,
     AutocorrelationIndicatorInput, AutocorrelationIndicatorOutputField,
-    AutocorrelationIndicatorParams,
+    AutocorrelationIndicatorParams, autocorrelation_indicator_output_into_slice,
+    autocorrelation_indicator_with_kernel,
 };
-use crate::indicators::avsl::{avsl_into_slice, avsl_with_kernel, AvslInput, AvslParams};
+use crate::indicators::avsl::{AvslInput, AvslParams, avsl_into_slice, avsl_with_kernel};
 use crate::indicators::bandpass::{
-    bandpass_output_into_slice, BandPassInput, BandPassOutputField, BandPassParams,
+    BandPassInput, BandPassOutputField, BandPassParams, bandpass_output_into_slice,
 };
 use crate::indicators::bollinger_bands::{
-    bollinger_bands_with_kernel, BollingerBandsInput, BollingerBandsParams,
+    BollingerBandsInput, BollingerBandsParams, bollinger_bands_with_kernel,
 };
 use crate::indicators::bollinger_bands_width::{
-    bollinger_bands_width_with_kernel, BollingerBandsWidthInput, BollingerBandsWidthParams,
+    BollingerBandsWidthInput, BollingerBandsWidthParams, bollinger_bands_width_with_kernel,
 };
-use crate::indicators::bop::{bop_with_kernel, BopInput, BopParams};
+use crate::indicators::bop::{BopInput, BopParams, bop_with_kernel};
 use crate::indicators::bull_power_vs_bear_power::{
-    bull_power_vs_bear_power_into_slice, bull_power_vs_bear_power_with_kernel,
-    BullPowerVsBearPowerInput, BullPowerVsBearPowerParams,
+    BullPowerVsBearPowerInput, BullPowerVsBearPowerParams, bull_power_vs_bear_power_into_slice,
+    bull_power_vs_bear_power_with_kernel,
 };
 use crate::indicators::bulls_v_bears::{
-    bulls_v_bears_output_into_slice, bulls_v_bears_with_kernel, BullsVBearsCalculationMethod,
-    BullsVBearsInput, BullsVBearsMaType, BullsVBearsOutputField, BullsVBearsParams,
+    BullsVBearsCalculationMethod, BullsVBearsInput, BullsVBearsMaType, BullsVBearsOutputField,
+    BullsVBearsParams, bulls_v_bears_output_into_slice, bulls_v_bears_with_kernel,
 };
 use crate::indicators::candle_strength_oscillator::{
-    candle_strength_oscillator_output_into_slice, candle_strength_oscillator_with_kernel,
     CandleStrengthOscillatorInput, CandleStrengthOscillatorOutputField,
-    CandleStrengthOscillatorParams,
+    CandleStrengthOscillatorParams, candle_strength_oscillator_output_into_slice,
+    candle_strength_oscillator_with_kernel,
 };
-use crate::indicators::cci::{cci_with_kernel, CciInput, CciParams};
-use crate::indicators::cci_cycle::{cci_cycle_with_kernel, CciCycleInput, CciCycleParams};
-use crate::indicators::cfo::{cfo_with_kernel, CfoInput, CfoParams};
-use crate::indicators::chande::{chande_with_kernel, ChandeInput, ChandeParams};
+use crate::indicators::cci::{CciInput, CciParams, cci_with_kernel};
+use crate::indicators::cci_cycle::{CciCycleInput, CciCycleParams, cci_cycle_with_kernel};
+use crate::indicators::cfo::{CfoInput, CfoParams, cfo_with_kernel};
+use crate::indicators::chande::{ChandeInput, ChandeParams, chande_with_kernel};
 use crate::indicators::chandelier_exit::{
-    chandelier_exit_with_kernel, ChandelierExitInput, ChandelierExitParams,
+    ChandelierExitInput, ChandelierExitParams, chandelier_exit_with_kernel,
 };
-use crate::indicators::chop::{chop_with_kernel, ChopInput, ChopParams};
-use crate::indicators::cksp::{cksp_with_kernel, CkspInput, CkspParams};
-use crate::indicators::cmo::{cmo_with_kernel, CmoInput, CmoParams};
-use crate::indicators::coppock::{coppock_with_kernel, CoppockInput, CoppockParams};
-use crate::indicators::correl_hl::{correl_hl_with_kernel, CorrelHlInput, CorrelHlParams};
+use crate::indicators::chop::{ChopInput, ChopParams, chop_with_kernel};
+use crate::indicators::cksp::{CkspInput, CkspParams, cksp_with_kernel};
+use crate::indicators::cmo::{CmoInput, CmoParams, cmo_with_kernel};
+use crate::indicators::coppock::{CoppockInput, CoppockParams, coppock_with_kernel};
+use crate::indicators::correl_hl::{CorrelHlInput, CorrelHlParams, correl_hl_with_kernel};
 use crate::indicators::correlation_cycle::{
-    correlation_cycle_with_kernel, CorrelationCycleInput, CorrelationCycleParams,
+    CorrelationCycleInput, CorrelationCycleParams, correlation_cycle_with_kernel,
 };
+use crate::indicators::cvi::{CviInput, CviParams, cvi_with_kernel};
 use crate::indicators::cyberpunk_value_trend_analyzer::{
-    cyberpunk_value_trend_analyzer_output_into_slice, cyberpunk_value_trend_analyzer_with_kernel,
     CyberpunkValueTrendAnalyzerInput, CyberpunkValueTrendAnalyzerOutputField,
-    CyberpunkValueTrendAnalyzerParams,
+    CyberpunkValueTrendAnalyzerParams, cyberpunk_value_trend_analyzer_output_into_slice,
+    cyberpunk_value_trend_analyzer_with_kernel,
 };
 use crate::indicators::cycle_channel_oscillator::{
-    cycle_channel_oscillator_output_into_slice, cycle_channel_oscillator_with_kernel,
     CycleChannelOscillatorInput, CycleChannelOscillatorOutputField, CycleChannelOscillatorParams,
+    cycle_channel_oscillator_output_into_slice, cycle_channel_oscillator_with_kernel,
 };
 use crate::indicators::daily_factor::{
-    daily_factor_output_into_slice, daily_factor_with_kernel, DailyFactorInput,
-    DailyFactorOutputField, DailyFactorParams,
+    DailyFactorInput, DailyFactorOutputField, DailyFactorParams, daily_factor_output_into_slice,
+    daily_factor_with_kernel,
 };
 use crate::indicators::damiani_volatmeter::{
-    damiani_volatmeter_with_kernel, DamianiVolatmeterInput, DamianiVolatmeterParams,
+    DamianiVolatmeterInput, DamianiVolatmeterParams, damiani_volatmeter_with_kernel,
 };
 use crate::indicators::decisionpoint_breadth_swenlin_trading_oscillator::{
-    decisionpoint_breadth_swenlin_trading_oscillator_into_slice,
-    decisionpoint_breadth_swenlin_trading_oscillator_with_kernel,
     DecisionPointBreadthSwenlinTradingOscillatorInput,
     DecisionPointBreadthSwenlinTradingOscillatorParams,
+    decisionpoint_breadth_swenlin_trading_oscillator_into_slice,
+    decisionpoint_breadth_swenlin_trading_oscillator_with_kernel,
 };
 use crate::indicators::demand_index::{
-    demand_index_with_kernel, DemandIndexInput, DemandIndexParams,
+    DemandIndexInput, DemandIndexParams, demand_index_with_kernel,
 };
-use crate::indicators::deviation::{deviation_with_kernel, DeviationInput, DeviationParams};
-use crate::indicators::devstop::{devstop_with_kernel, DevStopInput, DevStopParams};
-use crate::indicators::di::{di_minus_with_kernel, di_plus_with_kernel, DiInput, DiParams};
+use crate::indicators::deviation::{DeviationInput, DeviationParams, deviation_with_kernel};
+use crate::indicators::devstop::{DevStopInput, DevStopParams, devstop_with_kernel};
+use crate::indicators::di::{DiInput, DiParams, di_minus_with_kernel, di_plus_with_kernel};
 use crate::indicators::didi_index::{
-    didi_index_output_into_slice, didi_index_with_kernel, DidiIndexInput, DidiIndexOutputField,
-    DidiIndexParams,
+    DidiIndexInput, DidiIndexOutputField, DidiIndexParams, didi_index_output_into_slice,
+    didi_index_with_kernel,
 };
 use crate::indicators::directional_imbalance_index::{
-    directional_imbalance_index_output_into_slice, directional_imbalance_index_with_kernel,
     DirectionalImbalanceIndexInput, DirectionalImbalanceIndexOutputField,
-    DirectionalImbalanceIndexParams,
+    DirectionalImbalanceIndexParams, directional_imbalance_index_output_into_slice,
+    directional_imbalance_index_with_kernel,
 };
 use crate::indicators::disparity_index::{
-    disparity_index_into_slice, DisparityIndexInput, DisparityIndexParams,
+    DisparityIndexInput, DisparityIndexParams, disparity_index_into_slice,
 };
-use crate::indicators::dm::{dm_minus_with_kernel, dm_plus_with_kernel, DmInput, DmParams};
+use crate::indicators::dm::{DmInput, DmParams, dm_minus_with_kernel, dm_plus_with_kernel};
 use crate::indicators::donchian::{
-    donchian_lower_with_kernel, donchian_middle_with_kernel, donchian_upper_with_kernel,
-    DonchianInput, DonchianParams,
+    DonchianInput, DonchianParams, donchian_lower_with_kernel, donchian_middle_with_kernel,
+    donchian_upper_with_kernel,
 };
 use crate::indicators::donchian_channel_width::{
-    donchian_channel_width_into_slice, DonchianChannelWidthInput, DonchianChannelWidthParams,
+    DonchianChannelWidthInput, DonchianChannelWidthParams, donchian_channel_width_into_slice,
 };
-use crate::indicators::dpo::{dpo_into_slice, DpoInput, DpoParams};
-use crate::indicators::dti::{dti_into_slice, DtiInput, DtiParams};
+use crate::indicators::dpo::{DpoInput, DpoParams, dpo_into_slice};
+use crate::indicators::dti::{DtiInput, DtiParams, dti_into_slice};
 use crate::indicators::dual_ulcer_index::{
-    dual_ulcer_index_output_into_slice, dual_ulcer_index_with_kernel, DualUlcerIndexInput,
-    DualUlcerIndexOutputField, DualUlcerIndexParams,
+    DualUlcerIndexInput, DualUlcerIndexOutputField, DualUlcerIndexParams,
+    dual_ulcer_index_output_into_slice, dual_ulcer_index_with_kernel,
 };
 use crate::indicators::dvdiqqe::{
-    dvdiqqe_output_into_slice, DvdiqqeInput, DvdiqqeOutputField, DvdiqqeParams,
+    DvdiqqeInput, DvdiqqeOutputField, DvdiqqeParams, dvdiqqe_output_into_slice,
 };
-use crate::indicators::dx::{dx_batch_with_kernel, dx_into_slice, DxBatchRange, DxInput, DxParams};
+use crate::indicators::dx::{DxBatchRange, DxInput, DxParams, dx_batch_with_kernel, dx_into_slice};
 use crate::indicators::dynamic_momentum_index::{
-    dynamic_momentum_index_into_slice, dynamic_momentum_index_with_kernel,
-    DynamicMomentumIndexInput, DynamicMomentumIndexParams,
+    DynamicMomentumIndexInput, DynamicMomentumIndexParams, dynamic_momentum_index_into_slice,
+    dynamic_momentum_index_with_kernel,
 };
-use crate::indicators::efi::{efi_into_slice, EfiInput, EfiParams};
+use crate::indicators::efi::{EfiInput, EfiParams, efi_into_slice};
 use crate::indicators::ehlers_adaptive_cg::{
-    ehlers_adaptive_cg_with_kernel, EhlersAdaptiveCgInput, EhlersAdaptiveCgParams,
+    EhlersAdaptiveCgInput, EhlersAdaptiveCgParams, ehlers_adaptive_cg_with_kernel,
 };
 use crate::indicators::ehlers_adaptive_cyber_cycle::{
-    ehlers_adaptive_cyber_cycle_with_kernel, EhlersAdaptiveCyberCycleInput,
-    EhlersAdaptiveCyberCycleParams,
+    EhlersAdaptiveCyberCycleInput, EhlersAdaptiveCyberCycleParams,
+    ehlers_adaptive_cyber_cycle_with_kernel,
 };
 use crate::indicators::ehlers_autocorrelation_periodogram::{
-    ehlers_autocorrelation_periodogram_with_kernel, EhlersAutocorrelationPeriodogramInput,
-    EhlersAutocorrelationPeriodogramParams,
+    EhlersAutocorrelationPeriodogramInput, EhlersAutocorrelationPeriodogramParams,
+    ehlers_autocorrelation_periodogram_with_kernel,
 };
 use crate::indicators::ehlers_data_sampling_relative_strength_indicator::{
-    ehlers_data_sampling_relative_strength_indicator_with_kernel,
     EhlersDataSamplingRelativeStrengthIndicatorInput,
     EhlersDataSamplingRelativeStrengthIndicatorParams,
+    ehlers_data_sampling_relative_strength_indicator_with_kernel,
 };
 use crate::indicators::ehlers_detrending_filter::{
-    ehlers_detrending_filter_with_kernel, EhlersDetrendingFilterInput, EhlersDetrendingFilterParams,
+    EhlersDetrendingFilterInput, EhlersDetrendingFilterParams, ehlers_detrending_filter_with_kernel,
 };
 use crate::indicators::ehlers_fm_demodulator::{
-    ehlers_fm_demodulator_with_kernel, EhlersFmDemodulatorInput, EhlersFmDemodulatorParams,
+    EhlersFmDemodulatorInput, EhlersFmDemodulatorParams, ehlers_fm_demodulator_with_kernel,
 };
 use crate::indicators::ehlers_linear_extrapolation_predictor::{
-    ehlers_linear_extrapolation_predictor_with_kernel, EhlersLinearExtrapolationPredictorInput,
-    EhlersLinearExtrapolationPredictorParams,
+    EhlersLinearExtrapolationPredictorInput, EhlersLinearExtrapolationPredictorParams,
+    ehlers_linear_extrapolation_predictor_with_kernel,
 };
 use crate::indicators::ehlers_simple_cycle_indicator::{
-    ehlers_simple_cycle_indicator_with_kernel, EhlersSimpleCycleIndicatorInput,
-    EhlersSimpleCycleIndicatorParams,
+    EhlersSimpleCycleIndicatorInput, EhlersSimpleCycleIndicatorParams,
+    ehlers_simple_cycle_indicator_with_kernel,
 };
 use crate::indicators::ehlers_smoothed_adaptive_momentum::{
-    ehlers_smoothed_adaptive_momentum_with_kernel, EhlersSmoothedAdaptiveMomentumInput,
-    EhlersSmoothedAdaptiveMomentumParams,
+    EhlersSmoothedAdaptiveMomentumInput, EhlersSmoothedAdaptiveMomentumParams,
+    ehlers_smoothed_adaptive_momentum_with_kernel,
 };
-use crate::indicators::emd::{emd_with_kernel, EmdInput, EmdParams};
-use crate::indicators::emd_trend::{emd_trend_with_kernel, EmdTrendInput, EmdTrendParams};
-use crate::indicators::emv::{emv_with_kernel, EmvInput};
-use crate::indicators::er::{er_with_kernel, ErInput, ErParams};
-use crate::indicators::eri::{eri_with_kernel, EriInput, EriParams};
+use crate::indicators::emd::{EmdInput, EmdParams, emd_with_kernel};
+use crate::indicators::emd_trend::{EmdTrendInput, EmdTrendParams, emd_trend_with_kernel};
+use crate::indicators::emv::{EmvInput, emv_with_kernel};
+use crate::indicators::er::{ErInput, ErParams, er_with_kernel};
+use crate::indicators::eri::{EriInput, EriParams, eri_with_kernel};
 use crate::indicators::evasive_supertrend::{
-    evasive_supertrend_with_kernel, EvasiveSuperTrendInput, EvasiveSuperTrendParams,
+    EvasiveSuperTrendInput, EvasiveSuperTrendParams, evasive_supertrend_with_kernel,
 };
 use crate::indicators::ewma_volatility::{
-    ewma_volatility_with_kernel, EwmaVolatilityInput, EwmaVolatilityParams,
+    EwmaVolatilityInput, EwmaVolatilityParams, ewma_volatility_with_kernel,
 };
 use crate::indicators::exponential_trend::{
-    exponential_trend_with_kernel, ExponentialTrendInput, ExponentialTrendParams,
+    ExponentialTrendInput, ExponentialTrendParams, exponential_trend_with_kernel,
 };
 use crate::indicators::fibonacci_entry_bands::{
-    fibonacci_entry_bands_with_kernel, FibonacciEntryBandsInput, FibonacciEntryBandsParams,
+    FibonacciEntryBandsInput, FibonacciEntryBandsParams, fibonacci_entry_bands_with_kernel,
 };
 use crate::indicators::fibonacci_trailing_stop::{
-    fibonacci_trailing_stop_with_kernel, FibonacciTrailingStopInput, FibonacciTrailingStopParams,
+    FibonacciTrailingStopInput, FibonacciTrailingStopParams, fibonacci_trailing_stop_with_kernel,
 };
-use crate::indicators::fisher::{fisher_with_kernel, FisherInput, FisherParams};
+use crate::indicators::fisher::{FisherInput, FisherParams, fisher_with_kernel};
 use crate::indicators::forward_backward_exponential_oscillator::{
-    forward_backward_exponential_oscillator_with_kernel, ForwardBackwardExponentialOscillatorInput,
-    ForwardBackwardExponentialOscillatorParams,
+    ForwardBackwardExponentialOscillatorInput, ForwardBackwardExponentialOscillatorParams,
+    forward_backward_exponential_oscillator_with_kernel,
 };
-use crate::indicators::fosc::{fosc_with_kernel, FoscInput, FoscParams};
+use crate::indicators::fosc::{FoscInput, FoscParams, fosc_with_kernel};
 use crate::indicators::fractal_dimension_index::{
-    fractal_dimension_index_with_kernel, FractalDimensionIndexInput, FractalDimensionIndexParams,
+    FractalDimensionIndexInput, FractalDimensionIndexParams, fractal_dimension_index_with_kernel,
 };
 use crate::indicators::fvg_positioning_average::{
-    fvg_positioning_average_with_kernel, FvgPositioningAverageInput, FvgPositioningAverageParams,
+    FvgPositioningAverageInput, FvgPositioningAverageParams, fvg_positioning_average_with_kernel,
 };
 use crate::indicators::fvg_trailing_stop::{
-    fvg_trailing_stop_with_kernel, FvgTrailingStopInput, FvgTrailingStopParams,
+    FvgTrailingStopInput, FvgTrailingStopParams, fvg_trailing_stop_with_kernel,
 };
 use crate::indicators::garman_klass_volatility::{
-    garman_klass_volatility_with_kernel, GarmanKlassVolatilityInput, GarmanKlassVolatilityParams,
+    GarmanKlassVolatilityInput, GarmanKlassVolatilityParams, garman_klass_volatility_with_kernel,
 };
-use crate::indicators::gatorosc::{gatorosc_with_kernel, GatorOscInput, GatorOscParams};
+use crate::indicators::gatorosc::{GatorOscInput, GatorOscParams, gatorosc_with_kernel};
 use crate::indicators::geometric_bias_oscillator::{
-    geometric_bias_oscillator_with_kernel, GeometricBiasOscillatorInput,
-    GeometricBiasOscillatorParams,
+    GeometricBiasOscillatorInput, GeometricBiasOscillatorParams,
+    geometric_bias_oscillator_with_kernel,
 };
 use crate::indicators::gmma_oscillator::{
-    gmma_oscillator_with_kernel, GmmaOscillatorInput, GmmaOscillatorParams,
+    GmmaOscillatorInput, GmmaOscillatorParams, gmma_oscillator_with_kernel,
 };
 use crate::indicators::goertzel_cycle_composite_wave::{
-    goertzel_cycle_composite_wave_into_slice, GoertzelCycleCompositeWaveInput,
-    GoertzelCycleCompositeWaveParams, GoertzelDetrendMode,
+    GoertzelCycleCompositeWaveInput, GoertzelCycleCompositeWaveParams, GoertzelDetrendMode,
+    goertzel_cycle_composite_wave_into_slice,
 };
 use crate::indicators::gopalakrishnan_range_index::{
-    gopalakrishnan_range_index_with_kernel, GopalakrishnanRangeIndexInput,
-    GopalakrishnanRangeIndexParams,
+    GopalakrishnanRangeIndexInput, GopalakrishnanRangeIndexParams,
+    gopalakrishnan_range_index_with_kernel,
 };
 use crate::indicators::grover_llorens_cycle_oscillator::{
-    grover_llorens_cycle_oscillator_with_kernel, GroverLlorensCycleOscillatorInput,
-    GroverLlorensCycleOscillatorParams,
+    GroverLlorensCycleOscillatorInput, GroverLlorensCycleOscillatorParams,
+    grover_llorens_cycle_oscillator_with_kernel,
 };
 use crate::indicators::half_causal_estimator::{
-    half_causal_estimator_with_kernel, HalfCausalEstimatorConfidenceAdjust,
-    HalfCausalEstimatorInput, HalfCausalEstimatorKernelType, HalfCausalEstimatorParams,
+    HalfCausalEstimatorConfidenceAdjust, HalfCausalEstimatorInput, HalfCausalEstimatorKernelType,
+    HalfCausalEstimatorParams, half_causal_estimator_with_kernel,
 };
-use crate::indicators::halftrend::{halftrend_with_kernel, HalfTrendInput, HalfTrendParams};
+use crate::indicators::halftrend::{HalfTrendInput, HalfTrendParams, halftrend_with_kernel};
 use crate::indicators::hema_trend_levels::{
-    hema_trend_levels_output_into_slice, HemaTrendLevelsInput, HemaTrendLevelsOutputField,
-    HemaTrendLevelsParams,
+    HemaTrendLevelsInput, HemaTrendLevelsOutputField, HemaTrendLevelsParams,
+    hema_trend_levels_output_into_slice,
 };
 use crate::indicators::historical_volatility::{
-    historical_volatility_into_slice, historical_volatility_with_kernel, HistoricalVolatilityInput,
-    HistoricalVolatilityParams,
+    HistoricalVolatilityInput, HistoricalVolatilityParams, historical_volatility_into_slice,
+    historical_volatility_with_kernel,
 };
 use crate::indicators::historical_volatility_percentile::{
-    historical_volatility_percentile_with_kernel, HistoricalVolatilityPercentileInput,
-    HistoricalVolatilityPercentileParams,
+    HistoricalVolatilityPercentileInput, HistoricalVolatilityPercentileParams,
+    historical_volatility_percentile_with_kernel,
 };
 use crate::indicators::historical_volatility_rank::{
-    historical_volatility_rank_output_into_slice, historical_volatility_rank_with_kernel,
     HistoricalVolatilityRankInput, HistoricalVolatilityRankOutputField,
-    HistoricalVolatilityRankParams,
+    HistoricalVolatilityRankParams, historical_volatility_rank_output_into_slice,
+    historical_volatility_rank_with_kernel,
 };
 use crate::indicators::hull_butterfly_oscillator::{
-    hull_butterfly_oscillator_output_into_slice, HullButterflyOscillatorInput,
-    HullButterflyOscillatorOutputField, HullButterflyOscillatorParams,
+    HullButterflyOscillatorInput, HullButterflyOscillatorOutputField,
+    HullButterflyOscillatorParams, hull_butterfly_oscillator_output_into_slice,
 };
 use crate::indicators::hypertrend::{
-    hypertrend_output_into_slice, HyperTrendInput, HyperTrendOutputField, HyperTrendParams,
+    HyperTrendInput, HyperTrendOutputField, HyperTrendParams, hypertrend_output_into_slice,
 };
 use crate::indicators::ichimoku_oscillator::{
-    ichimoku_oscillator_with_kernel, IchimokuOscillatorInput, IchimokuOscillatorNormalizeMode,
-    IchimokuOscillatorParams,
+    IchimokuOscillatorInput, IchimokuOscillatorNormalizeMode, IchimokuOscillatorParams,
+    ichimoku_oscillator_with_kernel,
 };
 use crate::indicators::ict_propulsion_block::{
-    ict_propulsion_block_into_slice, IctPropulsionBlockInput, IctPropulsionBlockMitigationPrice,
-    IctPropulsionBlockParams,
+    IctPropulsionBlockInput, IctPropulsionBlockMitigationPrice, IctPropulsionBlockParams,
+    ict_propulsion_block_into_slice,
 };
-use crate::indicators::ift_rsi::{ift_rsi_with_kernel, IftRsiInput, IftRsiParams};
+use crate::indicators::ift_rsi::{IftRsiInput, IftRsiParams, ift_rsi_with_kernel};
 use crate::indicators::impulse_macd::{
-    impulse_macd_with_kernel, ImpulseMacdInput, ImpulseMacdParams,
+    ImpulseMacdInput, ImpulseMacdParams, impulse_macd_with_kernel,
 };
 use crate::indicators::intraday_momentum_index::{
-    intraday_momentum_index_with_kernel, IntradayMomentumIndexInput, IntradayMomentumIndexParams,
+    IntradayMomentumIndexInput, IntradayMomentumIndexParams, intraday_momentum_index_with_kernel,
 };
 use crate::indicators::kairi_relative_index::{
-    kairi_relative_index_into_slice, KairiRelativeIndexInput, KairiRelativeIndexParams,
+    KairiRelativeIndexInput, KairiRelativeIndexParams, kairi_relative_index_into_slice,
 };
 use crate::indicators::kase_peak_oscillator_with_divergences::{
-    kase_peak_oscillator_with_divergences_with_kernel, KasePeakOscillatorWithDivergencesInput,
-    KasePeakOscillatorWithDivergencesParams,
+    KasePeakOscillatorWithDivergencesInput, KasePeakOscillatorWithDivergencesParams,
+    kase_peak_oscillator_with_divergences_with_kernel,
 };
 use crate::indicators::kaufmanstop::{
-    kaufmanstop_with_kernel, KaufmanstopInput, KaufmanstopParams,
+    KaufmanstopInput, KaufmanstopParams, kaufmanstop_with_kernel,
 };
-use crate::indicators::kdj::{kdj_with_kernel, KdjInput, KdjParams};
-use crate::indicators::keltner::{keltner_with_kernel, KeltnerInput, KeltnerParams};
+use crate::indicators::kdj::{KdjInput, KdjParams, kdj_with_kernel};
+use crate::indicators::keltner::{KeltnerInput, KeltnerParams, keltner_with_kernel};
 use crate::indicators::keltner_channel_width_oscillator::{
-    keltner_channel_width_oscillator_with_kernel, KeltnerChannelWidthOscillatorInput,
-    KeltnerChannelWidthOscillatorParams,
+    KeltnerChannelWidthOscillatorInput, KeltnerChannelWidthOscillatorParams,
+    keltner_channel_width_oscillator_with_kernel,
 };
-use crate::indicators::kst::{kst_with_kernel, KstInput, KstParams};
-use crate::indicators::kurtosis::{kurtosis_with_kernel, KurtosisInput, KurtosisParams};
-use crate::indicators::kvo::{kvo_with_kernel, KvoInput, KvoParams};
+use crate::indicators::kst::{KstInput, KstParams, kst_with_kernel};
+use crate::indicators::kurtosis::{KurtosisInput, KurtosisParams, kurtosis_with_kernel};
+use crate::indicators::kvo::{KvoInput, KvoParams, kvo_with_kernel};
 use crate::indicators::l1_ehlers_phasor::{
-    l1_ehlers_phasor_with_kernel, L1EhlersPhasorInput, L1EhlersPhasorParams,
+    L1EhlersPhasorInput, L1EhlersPhasorParams, l1_ehlers_phasor_with_kernel,
 };
 use crate::indicators::l2_ehlers_signal_to_noise::{
-    l2_ehlers_signal_to_noise_with_kernel, L2EhlersSignalToNoiseInput, L2EhlersSignalToNoiseParams,
+    L2EhlersSignalToNoiseInput, L2EhlersSignalToNoiseParams, l2_ehlers_signal_to_noise_with_kernel,
 };
 use crate::indicators::leavitt_convolution_acceleration::{
-    leavitt_convolution_acceleration_with_kernel, LeavittConvolutionAccelerationInput,
-    LeavittConvolutionAccelerationParams,
+    LeavittConvolutionAccelerationInput, LeavittConvolutionAccelerationParams,
+    leavitt_convolution_acceleration_with_kernel,
 };
 use crate::indicators::linear_correlation_oscillator::{
-    linear_correlation_oscillator_with_kernel, LinearCorrelationOscillatorInput,
-    LinearCorrelationOscillatorParams,
+    LinearCorrelationOscillatorInput, LinearCorrelationOscillatorParams,
+    linear_correlation_oscillator_with_kernel,
 };
 use crate::indicators::linear_regression_intensity::{
-    linear_regression_intensity_with_kernel, LinearRegressionIntensityInput,
-    LinearRegressionIntensityParams,
+    LinearRegressionIntensityInput, LinearRegressionIntensityParams,
+    linear_regression_intensity_with_kernel,
 };
 use crate::indicators::linearreg_angle::{
-    linearreg_angle_with_kernel, Linearreg_angleInput, Linearreg_angleParams,
+    Linearreg_angleInput, Linearreg_angleParams, linearreg_angle_with_kernel,
 };
 use crate::indicators::linearreg_intercept::{
-    linearreg_intercept_with_kernel, LinearRegInterceptInput, LinearRegInterceptParams,
+    LinearRegInterceptInput, LinearRegInterceptParams, linearreg_intercept_with_kernel,
 };
 use crate::indicators::linearreg_slope::{
-    linearreg_slope_with_kernel, LinearRegSlopeInput, LinearRegSlopeParams,
+    LinearRegSlopeInput, LinearRegSlopeParams, linearreg_slope_with_kernel,
 };
-use crate::indicators::lpc::{lpc_with_kernel, LpcInput, LpcParams};
-use crate::indicators::lrsi::{lrsi_with_kernel, LrsiInput, LrsiParams};
-use crate::indicators::mab::{mab_with_kernel, MabInput, MabParams};
-use crate::indicators::macd::{macd_with_kernel, MacdInput, MacdParams};
+use crate::indicators::lpc::{LpcInput, LpcParams, lpc_with_kernel};
+use crate::indicators::lrsi::{LrsiInput, LrsiParams, lrsi_with_kernel};
+use crate::indicators::mab::{MabInput, MabParams, mab_with_kernel};
+use crate::indicators::macd::{MacdInput, MacdParams, macd_with_kernel};
 use crate::indicators::macd_wave_signal_pro::{
-    macd_wave_signal_pro_with_kernel, MacdWaveSignalProInput,
+    MacdWaveSignalProInput, macd_wave_signal_pro_with_kernel,
 };
-use crate::indicators::macz::{macz_with_kernel, MaczInput, MaczParams};
+use crate::indicators::macz::{MaczInput, MaczParams, macz_with_kernel};
 use crate::indicators::market_meanness_index::{
-    market_meanness_index_with_kernel, MarketMeannessIndexInput, MarketMeannessIndexParams,
+    MarketMeannessIndexInput, MarketMeannessIndexParams, market_meanness_index_with_kernel,
 };
 use crate::indicators::market_structure_confluence::{
-    market_structure_confluence_with_kernel, MarketStructureConfluenceInput,
-    MarketStructureConfluenceParams,
+    MarketStructureConfluenceInput, MarketStructureConfluenceParams,
+    market_structure_confluence_with_kernel,
 };
 use crate::indicators::market_structure_trailing_stop::{
-    market_structure_trailing_stop_with_kernel, MarketStructureTrailingStopInput,
-    MarketStructureTrailingStopParams,
+    MarketStructureTrailingStopInput, MarketStructureTrailingStopParams,
+    market_structure_trailing_stop_with_kernel,
 };
-use crate::indicators::mass::{mass_with_kernel, MassInput, MassParams};
-use crate::indicators::mean_ad::{mean_ad_with_kernel, MeanAdInput, MeanAdParams};
-use crate::indicators::medium_ad::{medium_ad_with_kernel, MediumAdInput, MediumAdParams};
-use crate::indicators::medprice::{medprice_with_kernel, MedpriceInput, MedpriceParams};
+use crate::indicators::marketefi::{MarketefiInput, MarketefiParams, marketefi_with_kernel};
+use crate::indicators::mass::{MassInput, MassParams, mass_with_kernel};
+use crate::indicators::mean_ad::{MeanAdInput, MeanAdParams, mean_ad_with_kernel};
+use crate::indicators::medium_ad::{MediumAdInput, MediumAdParams, medium_ad_with_kernel};
+use crate::indicators::medprice::{MedpriceInput, MedpriceParams, medprice_with_kernel};
 use crate::indicators::mesa_stochastic_multi_length::{
-    mesa_stochastic_multi_length_with_kernel, MesaStochasticMultiLengthInput,
-    MesaStochasticMultiLengthParams,
+    MesaStochasticMultiLengthInput, MesaStochasticMultiLengthParams,
+    mesa_stochastic_multi_length_with_kernel,
 };
 use crate::indicators::mfi::{
-    mfi_batch_with_kernel, mfi_into_slice, MfiBatchRange, MfiInput, MfiParams,
+    MfiBatchRange, MfiInput, MfiParams, mfi_batch_with_kernel, mfi_into_slice,
 };
-use crate::indicators::midpoint::{midpoint_with_kernel, MidpointInput, MidpointParams};
-use crate::indicators::midprice::{midprice_with_kernel, MidpriceInput, MidpriceParams};
-use crate::indicators::minmax::{minmax_with_kernel, MinmaxInput, MinmaxParams};
+use crate::indicators::midpoint::{MidpointInput, MidpointParams, midpoint_with_kernel};
+use crate::indicators::midprice::{MidpriceInput, MidpriceParams, midprice_with_kernel};
+use crate::indicators::minmax::{MinmaxInput, MinmaxParams, minmax_with_kernel};
 use crate::indicators::mod_god_mode::{
-    mod_god_mode, ModGodModeData, ModGodModeInput, ModGodModeMode, ModGodModeParams,
+    ModGodModeData, ModGodModeInput, ModGodModeMode, ModGodModeParams, mod_god_mode,
 };
-use crate::indicators::mom::{mom_with_kernel, MomInput, MomParams};
+use crate::indicators::mom::{MomInput, MomParams, mom_with_kernel};
 use crate::indicators::momentum_ratio_oscillator::{
-    momentum_ratio_oscillator_with_kernel, MomentumRatioOscillatorInput,
-    MomentumRatioOscillatorParams,
+    MomentumRatioOscillatorInput, MomentumRatioOscillatorParams,
+    momentum_ratio_oscillator_with_kernel,
 };
 use crate::indicators::monotonicity_index::{
-    monotonicity_index_with_kernel, MonotonicityIndexInput, MonotonicityIndexMode,
-    MonotonicityIndexParams,
+    MonotonicityIndexInput, MonotonicityIndexMode, MonotonicityIndexParams,
+    monotonicity_index_with_kernel,
 };
 use crate::indicators::moving_average_cross_probability::{
-    moving_average_cross_probability_with_kernel, MovingAverageCrossProbabilityInput,
-    MovingAverageCrossProbabilityMaType, MovingAverageCrossProbabilityParams,
+    MovingAverageCrossProbabilityInput, MovingAverageCrossProbabilityMaType,
+    MovingAverageCrossProbabilityParams, moving_average_cross_probability_with_kernel,
 };
-use crate::indicators::moving_averages::edcf::{edcf_into_slice, EdcfInput, EdcfParams};
+use crate::indicators::moving_averages::edcf::{EdcfInput, EdcfParams, edcf_into_slice};
 use crate::indicators::moving_averages::logarithmic_moving_average::{
-    logarithmic_moving_average_with_kernel, LogarithmicMovingAverageInput,
-    LogarithmicMovingAverageParams,
+    LogarithmicMovingAverageInput, LogarithmicMovingAverageParams,
+    logarithmic_moving_average_with_kernel,
 };
 use crate::indicators::moving_averages::ma::MaData;
 use crate::indicators::moving_averages::ma_batch::{
-    ma_batch_with_kernel_and_typed_params, MaBatchParamKV, MaBatchParamValue,
+    MaBatchParamKV, MaBatchParamValue, ma_batch_with_kernel_and_typed_params,
 };
 use crate::indicators::moving_averages::registry::list_moving_averages;
 use crate::indicators::moving_averages::wilders::{
-    wilders_into_slice, WildersInput, WildersParams,
+    WildersInput, WildersParams, wilders_into_slice,
 };
-use crate::indicators::moving_averages::zlema::{zlema_into_slice, ZlemaInput, ZlemaParams};
-use crate::indicators::msw::{msw_with_kernel, MswInput, MswParams};
+use crate::indicators::moving_averages::zlema::{ZlemaInput, ZlemaParams, zlema_into_slice};
+use crate::indicators::msw::{MswInput, MswParams, msw_with_kernel};
 use crate::indicators::multi_length_stochastic_average::{
-    multi_length_stochastic_average_with_kernel, MultiLengthStochasticAverageInput,
-    MultiLengthStochasticAverageParams,
+    MultiLengthStochasticAverageInput, MultiLengthStochasticAverageParams,
+    multi_length_stochastic_average_with_kernel,
 };
 use crate::indicators::nadaraya_watson_envelope::{
-    nadaraya_watson_envelope_with_kernel, NweInput, NweParams,
+    NweInput, NweParams, nadaraya_watson_envelope_with_kernel,
 };
-use crate::indicators::natr::{natr_with_kernel, NatrInput, NatrParams};
+use crate::indicators::natr::{NatrInput, NatrParams, natr_with_kernel};
 use crate::indicators::neighboring_trailing_stop::{
-    neighboring_trailing_stop_with_kernel, NeighboringTrailingStopInput,
-    NeighboringTrailingStopParams,
+    NeighboringTrailingStopInput, NeighboringTrailingStopParams,
+    neighboring_trailing_stop_with_kernel,
 };
-use crate::indicators::net_myrsi::{net_myrsi_with_kernel, NetMyrsiInput, NetMyrsiParams};
+use crate::indicators::net_myrsi::{NetMyrsiInput, NetMyrsiParams, net_myrsi_with_kernel};
 use crate::indicators::nonlinear_regression_zero_lag_moving_average::{
-    nonlinear_regression_zero_lag_moving_average_with_kernel,
     NonlinearRegressionZeroLagMovingAverageInput, NonlinearRegressionZeroLagMovingAverageParams,
+    nonlinear_regression_zero_lag_moving_average_with_kernel,
 };
 use crate::indicators::normalized_resonator::{
-    normalized_resonator_with_kernel, NormalizedResonatorInput, NormalizedResonatorParams,
+    NormalizedResonatorInput, NormalizedResonatorParams, normalized_resonator_with_kernel,
 };
 use crate::indicators::normalized_volume_true_range::{
-    normalized_volume_true_range_with_kernel, NormalizedVolumeTrueRangeInput,
-    NormalizedVolumeTrueRangeParams, NormalizedVolumeTrueRangeStyle,
+    NormalizedVolumeTrueRangeInput, NormalizedVolumeTrueRangeParams,
+    NormalizedVolumeTrueRangeStyle, normalized_volume_true_range_with_kernel,
 };
-use crate::indicators::nvi::{nvi_with_kernel, NviInput, NviParams};
-use crate::indicators::obv::{obv_with_kernel, ObvInput, ObvParams};
+use crate::indicators::nvi::{NviInput, NviParams, nvi_with_kernel};
+use crate::indicators::obv::{ObvInput, ObvParams, obv_with_kernel};
 use crate::indicators::on_balance_volume_oscillator::{
-    on_balance_volume_oscillator_with_kernel, OnBalanceVolumeOscillatorInput,
-    OnBalanceVolumeOscillatorParams,
+    OnBalanceVolumeOscillatorInput, OnBalanceVolumeOscillatorParams,
+    on_balance_volume_oscillator_with_kernel,
 };
-use crate::indicators::otto::{otto_with_kernel, OttoInput, OttoParams};
+use crate::indicators::otto::{OttoInput, OttoParams, otto_with_kernel};
 use crate::indicators::parkinson_volatility::{
-    parkinson_volatility_with_kernel, ParkinsonVolatilityInput, ParkinsonVolatilityParams,
+    ParkinsonVolatilityInput, ParkinsonVolatilityParams, parkinson_volatility_with_kernel,
 };
 use crate::indicators::percentile_nearest_rank::{
-    percentile_nearest_rank_with_kernel, PercentileNearestRankInput, PercentileNearestRankParams,
+    PercentileNearestRankInput, PercentileNearestRankParams, percentile_nearest_rank_with_kernel,
 };
-use crate::indicators::pfe::{pfe_with_kernel, PfeInput, PfeParams};
-use crate::indicators::pivot::{pivot_with_kernel, PivotInput, PivotParams};
-use crate::indicators::pma::{pma_with_kernel, PmaInput, PmaParams};
+use crate::indicators::pfe::{PfeInput, PfeParams, pfe_with_kernel};
+use crate::indicators::pivot::{PivotInput, PivotParams, pivot_with_kernel};
+use crate::indicators::pma::{PmaInput, PmaParams, pma_with_kernel};
 use crate::indicators::polynomial_regression_extrapolation::{
-    polynomial_regression_extrapolation_with_kernel, PolynomialRegressionExtrapolationInput,
-    PolynomialRegressionExtrapolationParams,
+    PolynomialRegressionExtrapolationInput, PolynomialRegressionExtrapolationParams,
+    polynomial_regression_extrapolation_with_kernel,
 };
 use crate::indicators::possible_rsi::{
-    possible_rsi_with_kernel, PossibleRsiInput, PossibleRsiParams,
+    PossibleRsiInput, PossibleRsiParams, possible_rsi_with_kernel,
 };
-use crate::indicators::ppo::{ppo_with_kernel, PpoInput, PpoParams};
-use crate::indicators::prb::{prb_with_kernel, PrbInput, PrbParams};
+use crate::indicators::ppo::{PpoInput, PpoParams, ppo_with_kernel};
+use crate::indicators::prb::{PrbInput, PrbParams, prb_with_kernel};
 use crate::indicators::premier_rsi_oscillator::{
-    premier_rsi_oscillator_with_kernel, PremierRsiOscillatorInput, PremierRsiOscillatorParams,
+    PremierRsiOscillatorInput, PremierRsiOscillatorParams, premier_rsi_oscillator_with_kernel,
 };
 use crate::indicators::pretty_good_oscillator::{
-    pretty_good_oscillator_with_kernel, PrettyGoodOscillatorInput, PrettyGoodOscillatorParams,
+    PrettyGoodOscillatorInput, PrettyGoodOscillatorParams, pretty_good_oscillator_with_kernel,
 };
 use crate::indicators::price_density_market_noise::{
-    price_density_market_noise_with_kernel, PriceDensityMarketNoiseInput,
-    PriceDensityMarketNoiseParams,
+    PriceDensityMarketNoiseInput, PriceDensityMarketNoiseParams,
+    price_density_market_noise_with_kernel,
 };
 use crate::indicators::price_moving_average_ratio_percentile::{
-    price_moving_average_ratio_percentile_with_kernel, PriceMovingAverageRatioPercentileInput,
-    PriceMovingAverageRatioPercentileLineMode, PriceMovingAverageRatioPercentileMaType,
-    PriceMovingAverageRatioPercentileParams,
+    PriceMovingAverageRatioPercentileInput, PriceMovingAverageRatioPercentileLineMode,
+    PriceMovingAverageRatioPercentileMaType, PriceMovingAverageRatioPercentileParams,
+    price_moving_average_ratio_percentile_with_kernel,
 };
 use crate::indicators::projection_oscillator::{
-    projection_oscillator_with_kernel, ProjectionOscillatorInput, ProjectionOscillatorParams,
+    ProjectionOscillatorInput, ProjectionOscillatorParams, projection_oscillator_with_kernel,
 };
 use crate::indicators::psychological_line::{
-    psychological_line_with_kernel, PsychologicalLineInput, PsychologicalLineParams,
+    PsychologicalLineInput, PsychologicalLineParams, psychological_line_with_kernel,
 };
-use crate::indicators::pvi::{pvi_with_kernel, PviInput, PviParams};
-use crate::indicators::qqe::{qqe_with_kernel, QqeInput, QqeParams};
+use crate::indicators::pvi::{PviInput, PviParams, pvi_with_kernel};
+use crate::indicators::qqe::{QqeInput, QqeParams, qqe_with_kernel};
 use crate::indicators::qqe_weighted_oscillator::{
-    qqe_weighted_oscillator_with_kernel, QqeWeightedOscillatorInput, QqeWeightedOscillatorParams,
+    QqeWeightedOscillatorInput, QqeWeightedOscillatorParams, qqe_weighted_oscillator_with_kernel,
 };
-use crate::indicators::qstick::{qstick_with_kernel, QstickInput, QstickParams};
+use crate::indicators::qstick::{QstickInput, QstickParams, qstick_with_kernel};
 use crate::indicators::random_walk_index::{
-    random_walk_index_with_kernel, RandomWalkIndexInput, RandomWalkIndexParams,
+    RandomWalkIndexInput, RandomWalkIndexParams, random_walk_index_with_kernel,
 };
 use crate::indicators::range_breakout_signals::{
-    range_breakout_signals_with_kernel, RangeBreakoutSignalsInput, RangeBreakoutSignalsParams,
+    RangeBreakoutSignalsInput, RangeBreakoutSignalsParams, range_breakout_signals_with_kernel,
 };
 use crate::indicators::range_filter::{
-    range_filter_with_kernel, RangeFilterInput, RangeFilterParams,
+    RangeFilterInput, RangeFilterParams, range_filter_with_kernel,
 };
 use crate::indicators::range_filtered_trend_signals::{
-    range_filtered_trend_signals_with_kernel, RangeFilteredTrendSignalsInput,
-    RangeFilteredTrendSignalsParams,
+    RangeFilteredTrendSignalsInput, RangeFilteredTrendSignalsParams,
+    range_filtered_trend_signals_with_kernel,
 };
 use crate::indicators::range_oscillator::{
-    range_oscillator_with_kernel, RangeOscillatorInput, RangeOscillatorParams,
+    RangeOscillatorInput, RangeOscillatorParams, range_oscillator_with_kernel,
 };
 use crate::indicators::rank_correlation_index::{
-    rank_correlation_index_with_kernel, RankCorrelationIndexInput, RankCorrelationIndexParams,
+    RankCorrelationIndexInput, RankCorrelationIndexParams, rank_correlation_index_with_kernel,
 };
 use crate::indicators::registry::{
-    get_indicator, IndicatorInfo, IndicatorInputKind, ParamValueStatic,
+    IndicatorInfo, IndicatorInputKind, ParamValueStatic, get_indicator,
 };
 use crate::indicators::regression_slope_oscillator::{
-    regression_slope_oscillator_with_kernel, RegressionSlopeOscillatorInput,
-    RegressionSlopeOscillatorParams,
+    RegressionSlopeOscillatorInput, RegressionSlopeOscillatorParams,
+    regression_slope_oscillator_with_kernel,
 };
 use crate::indicators::relative_strength_index_wave_indicator::{
-    relative_strength_index_wave_indicator_with_kernel, RelativeStrengthIndexWaveIndicatorInput,
-    RelativeStrengthIndexWaveIndicatorParams,
+    RelativeStrengthIndexWaveIndicatorInput, RelativeStrengthIndexWaveIndicatorParams,
+    relative_strength_index_wave_indicator_with_kernel,
 };
 use crate::indicators::reversal_signals::{
-    reversal_signals_with_kernel, ReversalSignalsInput, ReversalSignalsParams,
+    ReversalSignalsInput, ReversalSignalsParams, reversal_signals_with_kernel,
 };
-use crate::indicators::reverse_rsi::{reverse_rsi_with_kernel, ReverseRsiInput, ReverseRsiParams};
-use crate::indicators::roc::{roc_with_kernel, RocInput, RocParams};
-use crate::indicators::rocp::{rocp_with_kernel, RocpInput, RocpParams};
-use crate::indicators::rocr::{rocr_with_kernel, RocrInput, RocrParams};
+use crate::indicators::reverse_rsi::{ReverseRsiInput, ReverseRsiParams, reverse_rsi_with_kernel};
+use crate::indicators::roc::{RocInput, RocParams, roc_with_kernel};
+use crate::indicators::rocp::{RocpInput, RocpParams, rocp_with_kernel};
+use crate::indicators::rocr::{RocrInput, RocrParams, rocr_with_kernel};
 use crate::indicators::rogers_satchell_volatility::{
-    rogers_satchell_volatility_with_kernel, RogersSatchellVolatilityInput,
-    RogersSatchellVolatilityParams,
+    RogersSatchellVolatilityInput, RogersSatchellVolatilityParams,
+    rogers_satchell_volatility_with_kernel,
 };
 use crate::indicators::rolling_skewness_kurtosis::{
-    rolling_skewness_kurtosis_with_kernel, RollingSkewnessKurtosisInput,
-    RollingSkewnessKurtosisParams,
+    RollingSkewnessKurtosisInput, RollingSkewnessKurtosisParams,
+    rolling_skewness_kurtosis_with_kernel,
 };
 use crate::indicators::rolling_z_score_trend::{
-    rolling_z_score_trend_with_kernel, RollingZScoreTrendInput, RollingZScoreTrendParams,
+    RollingZScoreTrendInput, RollingZScoreTrendParams, rolling_z_score_trend_with_kernel,
 };
-use crate::indicators::rsi::{rsi_with_kernel, RsiInput, RsiParams};
-use crate::indicators::rsmk::{rsmk_with_kernel, RsmkInput, RsmkParams};
-use crate::indicators::rvi::{rvi_with_kernel, RviInput, RviParams};
+use crate::indicators::rsi::{RsiInput, RsiParams, rsi_with_kernel};
+use crate::indicators::rsmk::{RsmkInput, RsmkParams, rsmk_with_kernel};
+use crate::indicators::rvi::{RviInput, RviParams, rvi_with_kernel};
 use crate::indicators::safezonestop::{
-    safezonestop_with_kernel, SafeZoneStopInput, SafeZoneStopParams,
+    SafeZoneStopInput, SafeZoneStopParams, safezonestop_with_kernel,
 };
+use crate::indicators::sar::{SarInput, SarParams, sar_with_kernel};
 use crate::indicators::smooth_theil_sen::{
-    smooth_theil_sen_with_kernel, SmoothTheilSenDeviationType, SmoothTheilSenInput,
-    SmoothTheilSenParams, SmoothTheilSenStatStyle,
+    SmoothTheilSenDeviationType, SmoothTheilSenInput, SmoothTheilSenParams,
+    SmoothTheilSenStatStyle, smooth_theil_sen_with_kernel,
 };
 use crate::indicators::smoothed_gaussian_trend_filter::{
-    smoothed_gaussian_trend_filter_filter_with_kernel, smoothed_gaussian_trend_filter_with_kernel,
     SmoothedGaussianTrendFilterInput, SmoothedGaussianTrendFilterParams,
+    smoothed_gaussian_trend_filter_filter_with_kernel, smoothed_gaussian_trend_filter_with_kernel,
 };
 use crate::indicators::spearman_correlation::{
-    spearman_correlation_with_kernel, SpearmanCorrelationInput, SpearmanCorrelationParams,
+    SpearmanCorrelationInput, SpearmanCorrelationParams, spearman_correlation_with_kernel,
 };
 use crate::indicators::squeeze_index::{
-    squeeze_index_with_kernel, SqueezeIndexInput, SqueezeIndexParams,
+    SqueezeIndexInput, SqueezeIndexParams, squeeze_index_with_kernel,
 };
 use crate::indicators::squeeze_momentum::{
-    squeeze_momentum_with_kernel, SqueezeMomentumInput, SqueezeMomentumParams,
+    SqueezeMomentumInput, SqueezeMomentumParams, squeeze_momentum_with_kernel,
 };
-use crate::indicators::srsi::{srsi_with_kernel, SrsiInput, SrsiParams};
+use crate::indicators::srsi::{SrsiInput, SrsiParams, srsi_with_kernel};
 use crate::indicators::standardized_psar_oscillator::{
-    standardized_psar_oscillator_with_kernel, StandardizedPsarOscillatorInput,
-    StandardizedPsarOscillatorParams,
+    StandardizedPsarOscillatorInput, StandardizedPsarOscillatorParams,
+    standardized_psar_oscillator_with_kernel,
 };
 use crate::indicators::statistical_trailing_stop::{
-    statistical_trailing_stop_with_kernel, StatisticalTrailingStopInput,
-    StatisticalTrailingStopParams,
+    StatisticalTrailingStopInput, StatisticalTrailingStopParams,
+    statistical_trailing_stop_with_kernel,
 };
-use crate::indicators::stc::{stc_with_kernel, StcInput, StcParams};
-use crate::indicators::stddev::{stddev_with_kernel, StdDevInput, StdDevParams};
-use crate::indicators::stoch::{stoch_with_kernel, StochInput, StochParams};
+use crate::indicators::stc::{StcInput, StcParams, stc_with_kernel};
+use crate::indicators::stddev::{StdDevInput, StdDevParams, stddev_with_kernel};
+use crate::indicators::stoch::{StochInput, StochParams, stoch_with_kernel};
 use crate::indicators::stochastic_adaptive_d::{
-    stochastic_adaptive_d_with_kernel, StochasticAdaptiveDInput, StochasticAdaptiveDParams,
+    StochasticAdaptiveDInput, StochasticAdaptiveDParams, stochastic_adaptive_d_with_kernel,
 };
 use crate::indicators::stochastic_connors_rsi::{
-    stochastic_connors_rsi_with_kernel, StochasticConnorsRsiInput, StochasticConnorsRsiParams,
+    StochasticConnorsRsiInput, StochasticConnorsRsiParams, stochastic_connors_rsi_with_kernel,
 };
 use crate::indicators::stochastic_distance::{
-    stochastic_distance_with_kernel, StochasticDistanceInput, StochasticDistanceParams,
+    StochasticDistanceInput, StochasticDistanceParams, stochastic_distance_with_kernel,
 };
 use crate::indicators::stochastic_money_flow_index::{
-    stochastic_money_flow_index_with_kernel, StochasticMoneyFlowIndexInput,
-    StochasticMoneyFlowIndexParams,
+    StochasticMoneyFlowIndexInput, StochasticMoneyFlowIndexParams,
+    stochastic_money_flow_index_with_kernel,
 };
-use crate::indicators::stochf::{stochf_with_kernel, StochfInput, StochfParams};
-use crate::indicators::supertrend::{supertrend_with_kernel, SuperTrendInput, SuperTrendParams};
+use crate::indicators::stochf::{StochfInput, StochfParams, stochf_with_kernel};
+use crate::indicators::supertrend::{SuperTrendInput, SuperTrendParams, supertrend_with_kernel};
 use crate::indicators::supertrend_oscillator::{
-    supertrend_oscillator_with_kernel, SuperTrendOscillatorInput, SuperTrendOscillatorParams,
+    SuperTrendOscillatorInput, SuperTrendOscillatorParams, supertrend_oscillator_with_kernel,
 };
 use crate::indicators::supertrend_recovery::{
-    supertrend_recovery_with_kernel, SuperTrendRecoveryInput, SuperTrendRecoveryParams,
+    SuperTrendRecoveryInput, SuperTrendRecoveryParams, supertrend_recovery_with_kernel,
 };
 use crate::indicators::trend_continuation_factor::{
-    trend_continuation_factor_with_kernel, TrendContinuationFactorInput,
-    TrendContinuationFactorParams,
+    TrendContinuationFactorInput, TrendContinuationFactorParams,
+    trend_continuation_factor_with_kernel,
 };
 use crate::indicators::trend_direction_force_index::{
-    trend_direction_force_index_into_slice, TrendDirectionForceIndexInput,
-    TrendDirectionForceIndexParams,
+    TrendDirectionForceIndexInput, TrendDirectionForceIndexParams,
+    trend_direction_force_index_into_slice,
 };
 use crate::indicators::trend_flow_trail::{
-    trend_flow_trail_with_kernel, TrendFlowTrailInput, TrendFlowTrailParams,
+    TrendFlowTrailInput, TrendFlowTrailParams, trend_flow_trail_with_kernel,
 };
 use crate::indicators::trend_trigger_factor::{
-    trend_trigger_factor_with_kernel, TrendTriggerFactorInput, TrendTriggerFactorParams,
+    TrendTriggerFactorInput, TrendTriggerFactorParams, trend_trigger_factor_with_kernel,
 };
 use crate::indicators::trix::{
-    trix_batch_with_kernel, trix_into_slice, trix_with_kernel, TrixBatchRange, TrixInput,
-    TrixParams,
+    TrixBatchRange, TrixInput, TrixParams, trix_batch_with_kernel, trix_into_slice,
+    trix_with_kernel,
 };
-use crate::indicators::tsf::{tsf_with_kernel, TsfInput, TsfParams};
-use crate::indicators::tsi::{tsi_with_kernel, TsiInput, TsiParams};
-use crate::indicators::ttm_squeeze::{ttm_squeeze_with_kernel, TtmSqueezeInput, TtmSqueezeParams};
-use crate::indicators::ttm_trend::{ttm_trend_with_kernel, TtmTrendInput, TtmTrendParams};
+use crate::indicators::tsf::{TsfInput, TsfParams, tsf_with_kernel};
+use crate::indicators::tsi::{TsiInput, TsiParams, tsi_with_kernel};
+use crate::indicators::ttm_squeeze::{TtmSqueezeInput, TtmSqueezeParams, ttm_squeeze_with_kernel};
+use crate::indicators::ttm_trend::{TtmTrendInput, TtmTrendParams, ttm_trend_with_kernel};
 use crate::indicators::twiggs_money_flow::{
-    twiggs_money_flow_with_kernel, TwiggsMoneyFlowInput, TwiggsMoneyFlowParams,
+    TwiggsMoneyFlowInput, TwiggsMoneyFlowParams, twiggs_money_flow_with_kernel,
 };
-use crate::indicators::ui::{ui_with_kernel, UiInput, UiParams};
-use crate::indicators::ultosc::{ultosc_with_kernel, UltOscInput, UltOscParams};
-use crate::indicators::var::{var_with_kernel, VarInput, VarParams};
+use crate::indicators::ui::{UiInput, UiParams, ui_with_kernel};
+use crate::indicators::ultosc::{UltOscInput, UltOscParams, ultosc_with_kernel};
+use crate::indicators::var::{VarInput, VarParams, var_with_kernel};
 use crate::indicators::vdubus_divergence_wave_pattern_generator::{
-    vdubus_divergence_wave_pattern_generator_with_kernel,
     VdubusDivergenceWavePatternGeneratorInput, VdubusDivergenceWavePatternGeneratorParams,
+    vdubus_divergence_wave_pattern_generator_with_kernel,
 };
-use crate::indicators::velocity::{velocity_with_kernel, VelocityInput, VelocityParams};
+use crate::indicators::velocity::{VelocityInput, VelocityParams, velocity_with_kernel};
 use crate::indicators::velocity_acceleration_convergence_divergence_indicator::{
-    velocity_acceleration_convergence_divergence_indicator_with_kernel,
     VelocityAccelerationConvergenceDivergenceIndicatorInput,
     VelocityAccelerationConvergenceDivergenceIndicatorParams,
+    velocity_acceleration_convergence_divergence_indicator_with_kernel,
 };
 use crate::indicators::velocity_acceleration_indicator::{
-    velocity_acceleration_indicator_with_kernel, VelocityAccelerationIndicatorInput,
-    VelocityAccelerationIndicatorParams,
+    VelocityAccelerationIndicatorInput, VelocityAccelerationIndicatorParams,
+    velocity_acceleration_indicator_with_kernel,
 };
 use crate::indicators::vertical_horizontal_filter::{
-    vertical_horizontal_filter_with_kernel, VerticalHorizontalFilterInput,
-    VerticalHorizontalFilterParams,
+    VerticalHorizontalFilterInput, VerticalHorizontalFilterParams,
+    vertical_horizontal_filter_with_kernel,
 };
-use crate::indicators::vi::{vi_with_kernel, ViInput, ViParams};
-use crate::indicators::vidya::{vidya_with_kernel, VidyaInput, VidyaParams};
-use crate::indicators::vlma::{vlma_with_kernel, VlmaInput, VlmaParams};
+use crate::indicators::vi::{ViInput, ViParams, vi_with_kernel};
+use crate::indicators::vidya::{VidyaInput, VidyaParams, vidya_with_kernel};
+use crate::indicators::vlma::{VlmaInput, VlmaParams, vlma_with_kernel};
 use crate::indicators::volatility_quality_index::{
-    volatility_quality_index_with_kernel, VolatilityQualityIndexInput, VolatilityQualityIndexParams,
+    VolatilityQualityIndexInput, VolatilityQualityIndexParams, volatility_quality_index_with_kernel,
 };
 use crate::indicators::volatility_ratio_adaptive_rsx::{
-    volatility_ratio_adaptive_rsx_with_kernel, VolatilityRatioAdaptiveRsxInput,
-    VolatilityRatioAdaptiveRsxParams,
+    VolatilityRatioAdaptiveRsxInput, VolatilityRatioAdaptiveRsxParams,
+    volatility_ratio_adaptive_rsx_with_kernel,
 };
 use crate::indicators::volume_energy_reservoirs::{
-    volume_energy_reservoirs_output_into_slice, VolumeEnergyReservoirsInput,
-    VolumeEnergyReservoirsOutputField, VolumeEnergyReservoirsParams,
+    VolumeEnergyReservoirsInput, VolumeEnergyReservoirsOutputField, VolumeEnergyReservoirsParams,
+    volume_energy_reservoirs_output_into_slice,
 };
 use crate::indicators::volume_weighted_relative_strength_index::{
-    volume_weighted_relative_strength_index_output_into_slice,
     VolumeWeightedRelativeStrengthIndexInput, VolumeWeightedRelativeStrengthIndexOutputField,
     VolumeWeightedRelativeStrengthIndexParams,
+    volume_weighted_relative_strength_index_output_into_slice,
 };
 use crate::indicators::volume_weighted_rsi::{
-    volume_weighted_rsi_batch_with_kernel, volume_weighted_rsi_into_slice,
     VolumeWeightedRsiBatchRange, VolumeWeightedRsiInput, VolumeWeightedRsiParams,
+    volume_weighted_rsi_batch_with_kernel, volume_weighted_rsi_into_slice,
 };
 use crate::indicators::volume_weighted_stochastic_rsi::{
-    volume_weighted_stochastic_rsi_output_into_slice, VolumeWeightedStochasticRsiInput,
-    VolumeWeightedStochasticRsiOutputField, VolumeWeightedStochasticRsiParams,
+    VolumeWeightedStochasticRsiInput, VolumeWeightedStochasticRsiOutputField,
+    VolumeWeightedStochasticRsiParams, volume_weighted_stochastic_rsi_output_into_slice,
 };
 use crate::indicators::volume_zone_oscillator::{
-    volume_zone_oscillator_into_slice, VolumeZoneOscillatorInput, VolumeZoneOscillatorParams,
+    VolumeZoneOscillatorInput, VolumeZoneOscillatorParams, volume_zone_oscillator_into_slice,
 };
-use crate::indicators::vosc::{vosc_into_slice, VoscInput, VoscParams};
-use crate::indicators::voss::{voss_output_into_slice, VossInput, VossOutputField, VossParams};
-use crate::indicators::vpci::{vpci_output_into_slice, VpciInput, VpciOutputField, VpciParams};
+use crate::indicators::vosc::{VoscInput, VoscParams, vosc_into_slice};
+use crate::indicators::voss::{VossInput, VossOutputField, VossParams, voss_output_into_slice};
+use crate::indicators::vpci::{VpciInput, VpciOutputField, VpciParams, vpci_output_into_slice};
 use crate::indicators::vpt::vpt_into_slice;
 use crate::indicators::vwap_deviation_oscillator::{
-    vwap_deviation_oscillator_output_into_slice, VwapDeviationMode, VwapDeviationOscillatorInput,
-    VwapDeviationOscillatorOutputField, VwapDeviationOscillatorParams, VwapDeviationSessionMode,
+    VwapDeviationMode, VwapDeviationOscillatorInput, VwapDeviationOscillatorOutputField,
+    VwapDeviationOscillatorParams, VwapDeviationSessionMode,
+    vwap_deviation_oscillator_output_into_slice,
 };
 use crate::indicators::vwap_zscore_with_signals::{
-    vwap_zscore_with_signals_output_into_slice, VwapZscoreWithSignalsInput,
-    VwapZscoreWithSignalsOutputField, VwapZscoreWithSignalsParams,
+    VwapZscoreWithSignalsInput, VwapZscoreWithSignalsOutputField, VwapZscoreWithSignalsParams,
+    vwap_zscore_with_signals_output_into_slice,
 };
 use crate::indicators::vwmacd::{
-    vwmacd_output_into_slice, VwmacdInput, VwmacdOutputField, VwmacdParams,
+    VwmacdInput, VwmacdOutputField, VwmacdParams, vwmacd_output_into_slice,
 };
-use crate::indicators::wad::{wad_into_slice, WadInput};
+use crate::indicators::wad::{WadInput, wad_into_slice};
 use crate::indicators::wavetrend::{
-    wavetrend_output_into_slice, WavetrendInput, WavetrendOutputField, WavetrendParams,
+    WavetrendInput, WavetrendOutputField, WavetrendParams, wavetrend_output_into_slice,
 };
-use crate::indicators::wclprice::{wclprice_into_slice, WclpriceInput};
-use crate::indicators::willr::{willr_into_slice, WillrInput, WillrParams};
-use crate::indicators::wto::{wto_output_into_slice, WtoInput, WtoOutputField, WtoParams};
+use crate::indicators::wclprice::{WclpriceInput, wclprice_into_slice};
+use crate::indicators::willr::{WillrInput, WillrParams, willr_into_slice};
+use crate::indicators::wto::{WtoInput, WtoOutputField, WtoParams, wto_output_into_slice};
 use crate::indicators::yang_zhang_volatility::{
-    yang_zhang_volatility_with_kernel, YangZhangVolatilityInput, YangZhangVolatilityParams,
+    YangZhangVolatilityInput, YangZhangVolatilityParams, yang_zhang_volatility_with_kernel,
 };
 use crate::indicators::zig_zag_channels::{
-    zig_zag_channels_into_slice, ZigZagChannelsInput, ZigZagChannelsParams,
+    ZigZagChannelsInput, ZigZagChannelsParams, zig_zag_channels_into_slice,
 };
-use crate::indicators::zscore::{zscore_into_slice, ZscoreInput, ZscoreParams};
-use crate::indicators::{cg::cg_with_kernel, cg::CgInput, cg::CgParams};
+use crate::indicators::zscore::{ZscoreInput, ZscoreParams, zscore_into_slice};
+use crate::indicators::{cg::CgInput, cg::CgParams, cg::cg_with_kernel};
 use crate::utilities::data_loader::source_type;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::alloc_uninit_f64;
@@ -1077,13 +1082,9 @@ fn try_fast_dispatch_non_strict(
                 req,
                 output_id.unwrap_or("value"),
             )),
-            "didi_index" => Some(compute_didi_index_batch(req, output_id.unwrap_or("short"))),
-            "ehlers_autocorrelation_periodogram" => {
-                Some(compute_ehlers_autocorrelation_periodogram_batch(
-                    req,
-                    output_id.unwrap_or("dominant_cycle"),
-                ))
-            }
+            "didi_index" => output_id.map(|output| compute_didi_index_batch(req, output)),
+            "ehlers_autocorrelation_periodogram" => output_id
+                .map(|output| compute_ehlers_autocorrelation_periodogram_batch(req, output)),
             "ehlers_linear_extrapolation_predictor" => {
                 Some(compute_ehlers_linear_extrapolation_predictor_batch(
                     req,
@@ -1123,10 +1124,9 @@ fn try_fast_dispatch_non_strict(
                 req,
                 output_id.unwrap_or("trailing_stop"),
             )),
-            "fibonacci_entry_bands" => Some(compute_fibonacci_entry_bands_batch(
-                req,
-                output_id.unwrap_or("middle"),
-            )),
+            "fibonacci_entry_bands" => {
+                output_id.map(|output| compute_fibonacci_entry_bands_batch(req, output))
+            }
             "volume_energy_reservoirs" => Some(compute_volume_energy_reservoirs_batch(
                 req,
                 output_id.unwrap_or("momentum"),
@@ -1566,13 +1566,18 @@ fn try_fast_dispatch_non_strict(
         ));
     }
     if id.eq_ignore_ascii_case("didi_index") {
-        return Some(compute_didi_index_batch(req, output_id.unwrap_or("short")));
+        if let Some(output) = output_id {
+            return Some(compute_didi_index_batch(req, output));
+        }
+        return None;
     }
     if id.eq_ignore_ascii_case("ehlers_autocorrelation_periodogram") {
-        return Some(compute_ehlers_autocorrelation_periodogram_batch(
-            req,
-            output_id.unwrap_or("dominant_cycle"),
-        ));
+        if let Some(output) = output_id {
+            return Some(compute_ehlers_autocorrelation_periodogram_batch(
+                req, output,
+            ));
+        }
+        return None;
     }
     if id.eq_ignore_ascii_case("ehlers_linear_extrapolation_predictor") {
         return Some(compute_ehlers_linear_extrapolation_predictor_batch(
@@ -1623,10 +1628,7 @@ fn try_fast_dispatch_non_strict(
         ));
     }
     if id.eq_ignore_ascii_case("fibonacci_entry_bands") {
-        return Some(compute_fibonacci_entry_bands_batch(
-            req,
-            output_id.unwrap_or("middle"),
-        ));
+        return output_id.map(|output| compute_fibonacci_entry_bands_batch(req, output));
     }
     if id.eq_ignore_ascii_case("volume_energy_reservoirs") {
         return Some(compute_volume_energy_reservoirs_batch(
@@ -1826,6 +1828,8 @@ fn dispatch_cpu_batch_by_indicator(
         "trend_flow_trail" => compute_trend_flow_trail_batch(req, output_id),
         "range_breakout_signals" => compute_range_breakout_signals_batch(req, output_id),
         "cmo" => compute_cmo_batch(req, output_id),
+        "cvi" => compute_cvi_batch(req, output_id),
+        "marketefi" => compute_marketefi_batch(req, output_id),
         "rocp" => compute_rocp_batch(req, output_id),
         "rocr" => compute_rocr_batch(req, output_id),
         "ppo" => compute_ppo_batch(req, output_id),
@@ -2070,6 +2074,7 @@ fn dispatch_cpu_batch_by_indicator(
         "stc" => compute_stc_batch(req, output_id),
         "rvi" => compute_rvi_batch(req, output_id),
         "safezonestop" => compute_safezonestop_batch(req, output_id),
+        "sar" => compute_sar_batch(req, output_id),
         "devstop" => compute_devstop_batch(req, output_id),
         "chop" => compute_chop_batch(req, output_id),
         "pivot" => compute_pivot_batch(req, output_id),
@@ -2143,11 +2148,7 @@ fn normalize_output_token(value: &str) -> String {
             normalized.push(ch.to_ascii_lowercase());
         }
     }
-    if normalized == "values" {
-        "value".to_string()
-    } else {
-        normalized
-    }
+    normalized
 }
 
 fn output_id_matches(candidate: &str, requested: &str) -> bool {
@@ -2218,6 +2219,9 @@ fn compute_ma_batch(
     info: &IndicatorInfo,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
+    for combo in req.combos {
+        validate_production_evwma_params(info, combo.params)?;
+    }
     let data = ma_data_from_req(info.id, req.data)?;
     let cols = ma_len_from_req(info.id, req.data)?;
     let period_based = ma_is_period_based(info);
@@ -2737,7 +2741,7 @@ fn compute_ao_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "ao".to_string(),
                 input: IndicatorInputKind::HighLow,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -2800,7 +2804,7 @@ fn compute_bop_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "bop".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -2899,7 +2903,7 @@ fn compute_mfi_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "mfi".to_string(),
                 input: IndicatorInputKind::CloseVolume,
-            })
+            });
         }
     };
 
@@ -3730,7 +3734,7 @@ fn compute_qstick_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "qstick".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -3798,7 +3802,7 @@ fn compute_ehlers_fm_demodulator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "ehlers_fm_demodulator".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -4197,22 +4201,28 @@ fn compute_velocity_batch(
     })
 }
 
+fn adaptive_momentum_oscillator_field(
+    output_id: &str,
+) -> Result<AdaptiveMomentumOscillatorOutputField, IndicatorDispatchError> {
+    if output_id.eq_ignore_ascii_case("amo") {
+        Ok(AdaptiveMomentumOscillatorOutputField::Amo)
+    } else if output_id.eq_ignore_ascii_case("ama") {
+        Ok(AdaptiveMomentumOscillatorOutputField::Ama)
+    } else {
+        Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "adaptive_momentum_oscillator".to_string(),
+            output: output_id.to_string(),
+        })
+    }
+}
+
 fn compute_adaptive_momentum_oscillator_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let data = extract_slice_input("adaptive_momentum_oscillator", req.data, "close")?;
     let kernel = req.kernel.to_non_batch();
-    let field = match output_id {
-        "amo" | "value" => AdaptiveMomentumOscillatorOutputField::Amo,
-        "ama" => AdaptiveMomentumOscillatorOutputField::Ama,
-        other => {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: "adaptive_momentum_oscillator".to_string(),
-                output: other.to_string(),
-            })
-        }
-    };
+    let field = adaptive_momentum_oscillator_field(output_id)?;
     collect_f64_into_rows(
         "adaptive_momentum_oscillator",
         output_id,
@@ -4569,6 +4579,50 @@ fn compute_cmo_batch(
     })
 }
 
+fn compute_cvi_batch(
+    req: IndicatorBatchRequest<'_>,
+    output_id: &str,
+) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
+    expect_value_output("cvi", output_id)?;
+    let (high, low) = extract_high_low_input("cvi", req.data)?;
+    let kernel = req.kernel.to_non_batch();
+    collect_f64("cvi", output_id, req.combos, high.len(), |params| {
+        let period = get_usize_param("cvi", params, "period", 10)?;
+        let input = CviInput::from_slices(
+            high,
+            low,
+            CviParams {
+                period: Some(period),
+            },
+        );
+        let out =
+            cvi_with_kernel(&input, kernel).map_err(|e| IndicatorDispatchError::ComputeFailed {
+                indicator: "cvi".to_string(),
+                details: e.to_string(),
+            })?;
+        Ok(out.values)
+    })
+}
+
+fn compute_marketefi_batch(
+    req: IndicatorBatchRequest<'_>,
+    output_id: &str,
+) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
+    expect_value_output("marketefi", output_id)?;
+    let (high, low, _close, volume) = extract_hlcv_input("marketefi", req.data)?;
+    let kernel = req.kernel.to_non_batch();
+    collect_f64("marketefi", output_id, req.combos, high.len(), |_params| {
+        let input = MarketefiInput::from_slices(high, low, volume, MarketefiParams::default());
+        let out = marketefi_with_kernel(&input, kernel).map_err(|e| {
+            IndicatorDispatchError::ComputeFailed {
+                indicator: "marketefi".to_string(),
+                details: e.to_string(),
+            }
+        })?;
+        Ok(out.values)
+    })
+}
+
 fn compute_rocp_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
@@ -4791,25 +4845,28 @@ fn compute_polynomial_regression_extrapolation_batch(
     )
 }
 
+fn adaptive_macd_field(output_id: &str) -> Result<AdaptiveMacdOutputField, IndicatorDispatchError> {
+    if output_id.eq_ignore_ascii_case("macd") {
+        Ok(AdaptiveMacdOutputField::Macd)
+    } else if output_id.eq_ignore_ascii_case("signal") {
+        Ok(AdaptiveMacdOutputField::Signal)
+    } else if output_id.eq_ignore_ascii_case("hist") {
+        Ok(AdaptiveMacdOutputField::Hist)
+    } else {
+        Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "adaptive_macd".to_string(),
+            output: output_id.to_string(),
+        })
+    }
+}
+
 fn compute_adaptive_macd_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let data = extract_slice_input("adaptive_macd", req.data, "close")?;
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("macd") || output_id.eq_ignore_ascii_case("value")
-    {
-        AdaptiveMacdOutputField::Macd
-    } else if output_id.eq_ignore_ascii_case("signal") {
-        AdaptiveMacdOutputField::Signal
-    } else if output_id.eq_ignore_ascii_case("hist") {
-        AdaptiveMacdOutputField::Hist
-    } else {
-        return Err(IndicatorDispatchError::UnknownOutput {
-            indicator: "adaptive_macd".to_string(),
-            output: output_id.to_string(),
-        });
-    };
+    let field = adaptive_macd_field(output_id)?;
     collect_f64_into_rows(
         "adaptive_macd",
         output_id,
@@ -4931,7 +4988,7 @@ fn compute_supertrend_recovery_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("band") || output_id.eq_ignore_ascii_case("value") {
+            if output_id.eq_ignore_ascii_case("band") {
                 return Ok(out.band);
             }
             if output_id.eq_ignore_ascii_case("switch_price") {
@@ -5096,7 +5153,6 @@ fn compute_vdubus_divergence_wave_pattern_generator_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
-    expect_value_output("vdubus_divergence_wave_pattern_generator", output_id)?;
     let (high, low, close) =
         extract_ohlc_input("vdubus_divergence_wave_pattern_generator", req.data)?;
     let kernel = req.kernel.to_non_batch();
@@ -5509,7 +5565,7 @@ fn compute_bollinger_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("upper") || output_id.eq_ignore_ascii_case("value") {
+            if output_id.eq_ignore_ascii_case("upper") {
                 return Ok(out.upper_band);
             }
             if output_id.eq_ignore_ascii_case("middle") {
@@ -5845,7 +5901,7 @@ fn compute_ttm_trend_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "ttm_trend".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -5931,13 +5987,9 @@ fn compute_aroon_batch(
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let (high, low) = extract_high_low_input("aroon", req.data)?;
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("up")
-        || output_id.eq_ignore_ascii_case("aroon_up")
-        || output_id.eq_ignore_ascii_case("value")
-    {
+    let field = if output_id.eq_ignore_ascii_case("up") {
         AroonOutputField::Up
-    } else if output_id.eq_ignore_ascii_case("down") || output_id.eq_ignore_ascii_case("aroon_down")
-    {
+    } else if output_id.eq_ignore_ascii_case("down") {
         AroonOutputField::Down
     } else {
         return Err(IndicatorDispatchError::UnknownOutput {
@@ -6015,17 +6067,16 @@ fn compute_di_batch(
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let (high, low, close) = extract_ohlc_input("di", req.data)?;
     let kernel = req.kernel.to_non_batch();
-    let selected =
-        if output_id.eq_ignore_ascii_case("plus") || output_id.eq_ignore_ascii_case("value") {
-            1u8
-        } else if output_id.eq_ignore_ascii_case("minus") {
-            2u8
-        } else {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: "di".to_string(),
-                output: output_id.to_string(),
-            });
-        };
+    let selected = if output_id.eq_ignore_ascii_case("plus") {
+        1u8
+    } else if output_id.eq_ignore_ascii_case("minus") {
+        2u8
+    } else {
+        return Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "di".to_string(),
+            output: output_id.to_string(),
+        });
+    };
     collect_f64("di", output_id, req.combos, close.len(), |params| {
         let period = get_usize_param("di", params, "period", 14)?;
         let input = DiInput::from_slices(
@@ -6053,17 +6104,16 @@ fn compute_dm_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
-    let selected =
-        if output_id.eq_ignore_ascii_case("plus") || output_id.eq_ignore_ascii_case("value") {
-            1
-        } else if output_id.eq_ignore_ascii_case("minus") {
-            2
-        } else {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: "dm".to_string(),
-                output: output_id.to_string(),
-            });
-        };
+    let selected = if output_id.eq_ignore_ascii_case("plus") {
+        1
+    } else if output_id.eq_ignore_ascii_case("minus") {
+        2
+    } else {
+        return Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "dm".to_string(),
+            output: output_id.to_string(),
+        });
+    };
     let (high, low) = extract_high_low_input("dm", req.data)?;
     let kernel = req.kernel.to_non_batch();
     collect_f64("dm", output_id, req.combos, high.len(), |params| {
@@ -6119,19 +6169,18 @@ fn compute_donchian_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
-    let selected =
-        if output_id.eq_ignore_ascii_case("upper") || output_id.eq_ignore_ascii_case("value") {
-            0
-        } else if output_id.eq_ignore_ascii_case("middle") {
-            1
-        } else if output_id.eq_ignore_ascii_case("lower") {
-            2
-        } else {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: "donchian".to_string(),
-                output: output_id.to_string(),
-            });
-        };
+    let selected = if output_id.eq_ignore_ascii_case("upper") {
+        0
+    } else if output_id.eq_ignore_ascii_case("middle") {
+        1
+    } else if output_id.eq_ignore_ascii_case("lower") {
+        2
+    } else {
+        return Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "donchian".to_string(),
+            output: output_id.to_string(),
+        });
+    };
     let (high, low) = extract_high_low_input("donchian", req.data)?;
     let kernel = req.kernel.to_non_batch();
     collect_f64("donchian", output_id, req.combos, high.len(), |params| {
@@ -6376,13 +6425,10 @@ fn compute_supertrend_batch(
     })
 }
 
-fn compute_adjustable_ma_alternating_extremities_batch(
-    req: IndicatorBatchRequest<'_>,
+fn adjustable_ma_alternating_extremities_field(
     output_id: &str,
-) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
-    let (high, low, close) = extract_ohlc_input("adjustable_ma_alternating_extremities", req.data)?;
-    let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("ma") || output_id.eq_ignore_ascii_case("value") {
+) -> Result<AdjustableMaAlternatingExtremitiesOutputField, IndicatorDispatchError> {
+    let field = if output_id.eq_ignore_ascii_case("ma") {
         AdjustableMaAlternatingExtremitiesOutputField::Ma
     } else if output_id.eq_ignore_ascii_case("upper") {
         AdjustableMaAlternatingExtremitiesOutputField::Upper
@@ -6408,6 +6454,16 @@ fn compute_adjustable_ma_alternating_extremities_batch(
             output: output_id.to_string(),
         });
     };
+    Ok(field)
+}
+
+fn compute_adjustable_ma_alternating_extremities_batch(
+    req: IndicatorBatchRequest<'_>,
+    output_id: &str,
+) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
+    let (high, low, close) = extract_ohlc_input("adjustable_ma_alternating_extremities", req.data)?;
+    let kernel = req.kernel.to_non_batch();
+    let field = adjustable_ma_alternating_extremities_field(output_id)?;
     collect_f64_into_rows(
         "adjustable_ma_alternating_extremities",
         output_id,
@@ -6697,14 +6753,9 @@ fn compute_dual_ulcer_index_batch(
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let data = extract_slice_input("dual_ulcer_index", req.data, "close")?;
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("long_ulcer")
-        || output_id.eq_ignore_ascii_case("uulcer")
-        || output_id.eq_ignore_ascii_case("value")
-    {
+    let field = if output_id.eq_ignore_ascii_case("long_ulcer") {
         DualUlcerIndexOutputField::LongUlcer
-    } else if output_id.eq_ignore_ascii_case("short_ulcer")
-        || output_id.eq_ignore_ascii_case("dulcer")
-    {
+    } else if output_id.eq_ignore_ascii_case("short_ulcer") {
         DualUlcerIndexOutputField::ShortUlcer
     } else if output_id.eq_ignore_ascii_case("threshold") {
         DualUlcerIndexOutputField::Threshold
@@ -7251,7 +7302,7 @@ fn compute_evasive_supertrend_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("band") || output_id.eq_ignore_ascii_case("value") {
+            if output_id.eq_ignore_ascii_case("band") {
                 return Ok(out.band);
             }
             if output_id.eq_ignore_ascii_case("state") {
@@ -7409,7 +7460,7 @@ fn compute_directional_imbalance_index_batch(
         }
     };
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("up") || output_id.eq_ignore_ascii_case("value") {
+    let field = if output_id.eq_ignore_ascii_case("up") {
         DirectionalImbalanceIndexOutputField::Up
     } else if output_id.eq_ignore_ascii_case("down") {
         DirectionalImbalanceIndexOutputField::Down
@@ -7486,25 +7537,24 @@ fn compute_candle_strength_oscillator_batch(
         }
     };
     let kernel = req.kernel.to_non_batch();
-    let field =
-        if output_id.eq_ignore_ascii_case("strength") || output_id.eq_ignore_ascii_case("value") {
-            CandleStrengthOscillatorOutputField::Strength
-        } else if output_id.eq_ignore_ascii_case("highs") {
-            CandleStrengthOscillatorOutputField::Highs
-        } else if output_id.eq_ignore_ascii_case("lows") {
-            CandleStrengthOscillatorOutputField::Lows
-        } else if output_id.eq_ignore_ascii_case("mid") {
-            CandleStrengthOscillatorOutputField::Mid
-        } else if output_id.eq_ignore_ascii_case("long_signal") {
-            CandleStrengthOscillatorOutputField::LongSignal
-        } else if output_id.eq_ignore_ascii_case("short_signal") {
-            CandleStrengthOscillatorOutputField::ShortSignal
-        } else {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: "candle_strength_oscillator".to_string(),
-                output: output_id.to_string(),
-            });
-        };
+    let field = if output_id.eq_ignore_ascii_case("strength") {
+        CandleStrengthOscillatorOutputField::Strength
+    } else if output_id.eq_ignore_ascii_case("highs") {
+        CandleStrengthOscillatorOutputField::Highs
+    } else if output_id.eq_ignore_ascii_case("lows") {
+        CandleStrengthOscillatorOutputField::Lows
+    } else if output_id.eq_ignore_ascii_case("mid") {
+        CandleStrengthOscillatorOutputField::Mid
+    } else if output_id.eq_ignore_ascii_case("long_signal") {
+        CandleStrengthOscillatorOutputField::LongSignal
+    } else if output_id.eq_ignore_ascii_case("short_signal") {
+        CandleStrengthOscillatorOutputField::ShortSignal
+    } else {
+        return Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "candle_strength_oscillator".to_string(),
+            output: output_id.to_string(),
+        });
+    };
     collect_f64_into_rows(
         "candle_strength_oscillator",
         output_id,
@@ -7517,6 +7567,17 @@ fn compute_candle_strength_oscillator_batch(
             let atr_length =
                 get_usize_param("candle_strength_oscillator", params, "atr_length", 50)?;
             let mode = get_enum_param("candle_strength_oscillator", params, "mode", "bollinger")?;
+            let mode = if mode.eq_ignore_ascii_case("bollinger") {
+                "bollinger"
+            } else if mode.eq_ignore_ascii_case("donchian") {
+                "donchian"
+            } else {
+                return Err(IndicatorDispatchError::InvalidParam {
+                    indicator: "candle_strength_oscillator".to_string(),
+                    key: "mode".to_string(),
+                    reason: format!("expected canonical 'bollinger' or 'donchian', found '{mode}'"),
+                });
+            };
             let input = CandleStrengthOscillatorInput::from_slices(
                 open,
                 high,
@@ -7775,8 +7836,7 @@ fn compute_autocorrelation_indicator_batch(
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let data = extract_slice_input("autocorrelation_indicator", req.data, "close")?;
     let kernel = req.kernel.to_non_batch();
-    let output_is_filtered =
-        output_id.eq_ignore_ascii_case("filtered") || output_id.eq_ignore_ascii_case("value");
+    let output_is_filtered = output_id.eq_ignore_ascii_case("filtered");
     let output_is_correlation = output_id.eq_ignore_ascii_case("correlation");
     if !(output_is_filtered || output_is_correlation) {
         return Err(IndicatorDispatchError::UnknownOutput {
@@ -8101,7 +8161,7 @@ fn compute_ehlers_data_sampling_relative_strength_indicator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "ehlers_data_sampling_relative_strength_indicator".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -8129,14 +8189,10 @@ fn compute_ehlers_data_sampling_relative_strength_indicator_batch(
                     indicator: "ehlers_data_sampling_relative_strength_indicator".to_string(),
                     details: e.to_string(),
                 })?;
-            if output_id.eq_ignore_ascii_case("ds_rsi")
-                || output_id.eq_ignore_ascii_case("data_sampling_rsi")
-            {
+            if output_id.eq_ignore_ascii_case("ds_rsi") {
                 return Ok(out.ds_rsi);
             }
-            if output_id.eq_ignore_ascii_case("original_rsi")
-                || output_id.eq_ignore_ascii_case("orig_rsi")
-            {
+            if output_id.eq_ignore_ascii_case("original_rsi") {
                 return Ok(out.original_rsi);
             }
             if output_id.eq_ignore_ascii_case("signal") {
@@ -8479,21 +8535,20 @@ fn compute_didi_index_batch(
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let data = extract_slice_input("didi_index", req.data, "close")?;
     let kernel = req.kernel.to_non_batch();
-    let field =
-        if output_id.eq_ignore_ascii_case("short") || output_id.eq_ignore_ascii_case("value") {
-            DidiIndexOutputField::Short
-        } else if output_id.eq_ignore_ascii_case("long") {
-            DidiIndexOutputField::Long
-        } else if output_id.eq_ignore_ascii_case("crossover") {
-            DidiIndexOutputField::Crossover
-        } else if output_id.eq_ignore_ascii_case("crossunder") {
-            DidiIndexOutputField::Crossunder
-        } else {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: "didi_index".to_string(),
-                output: output_id.to_string(),
-            });
-        };
+    let field = if output_id.eq_ignore_ascii_case("short") {
+        DidiIndexOutputField::Short
+    } else if output_id.eq_ignore_ascii_case("long") {
+        DidiIndexOutputField::Long
+    } else if output_id.eq_ignore_ascii_case("crossover") {
+        DidiIndexOutputField::Crossover
+    } else if output_id.eq_ignore_ascii_case("crossunder") {
+        DidiIndexOutputField::Crossunder
+    } else {
+        return Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "didi_index".to_string(),
+            output: output_id.to_string(),
+        });
+    };
     collect_f64_into_rows(
         "didi_index",
         output_id,
@@ -8825,9 +8880,7 @@ fn compute_fibonacci_trailing_stop_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("trailing_stop")
-                || output_id.eq_ignore_ascii_case("value")
-            {
+            if output_id.eq_ignore_ascii_case("trailing_stop") {
                 return Ok(out.trailing_stop);
             }
             if output_id.eq_ignore_ascii_case("long_stop") {
@@ -8884,7 +8937,7 @@ fn compute_fibonacci_entry_bands_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("middle") || output_id.eq_ignore_ascii_case("basis") {
+            if output_id.eq_ignore_ascii_case("middle") {
                 return Ok(out.basis);
             }
             if output_id.eq_ignore_ascii_case("trend") {
@@ -8920,14 +8973,10 @@ fn compute_fibonacci_entry_bands_batch(
             if output_id.eq_ignore_ascii_case("tp_short_band") {
                 return Ok(out.tp_short_band);
             }
-            if output_id.eq_ignore_ascii_case("go_long")
-                || output_id.eq_ignore_ascii_case("long_entry")
-            {
+            if output_id.eq_ignore_ascii_case("go_long") {
                 return Ok(out.long_entry);
             }
-            if output_id.eq_ignore_ascii_case("go_short")
-                || output_id.eq_ignore_ascii_case("short_entry")
-            {
+            if output_id.eq_ignore_ascii_case("go_short") {
                 return Ok(out.short_entry);
             }
             if output_id.eq_ignore_ascii_case("rejection_long") {
@@ -8968,7 +9017,7 @@ fn compute_volume_energy_reservoirs_batch(
             return Err(IndicatorDispatchError::UnknownOutput {
                 indicator: "volume_energy_reservoirs".to_string(),
                 output: output_id.to_string(),
-            })
+            });
         }
     };
     let rows = req.combos.len();
@@ -9162,9 +9211,7 @@ fn compute_ehlers_autocorrelation_periodogram_batch(
                         details: e.to_string(),
                     }
                 })?;
-            if output_id.eq_ignore_ascii_case("dominant_cycle")
-                || output_id.eq_ignore_ascii_case("value")
-            {
+            if output_id.eq_ignore_ascii_case("dominant_cycle") {
                 return Ok(out.dominant_cycle);
             }
             if output_id.eq_ignore_ascii_case("normalized_power") {
@@ -9232,9 +9279,7 @@ fn compute_ehlers_linear_extrapolation_predictor_batch(
                         details: e.to_string(),
                     }
                 })?;
-            if output_id.eq_ignore_ascii_case("prediction")
-                || output_id.eq_ignore_ascii_case("value")
-            {
+            if output_id.eq_ignore_ascii_case("prediction") {
                 return Ok(out.prediction);
             }
             if output_id.eq_ignore_ascii_case("filter") {
@@ -9545,7 +9590,7 @@ fn compute_half_causal_estimator_batch(
                         indicator: "half_causal_estimator".to_string(),
                         key: "kernel_type".to_string(),
                         reason: format!("unsupported value '{other}'"),
-                    })
+                    });
                 }
             };
             let confidence_adjust = match get_enum_param(
@@ -9565,7 +9610,7 @@ fn compute_half_causal_estimator_batch(
                         indicator: "half_causal_estimator".to_string(),
                         key: "confidence_adjust".to_string(),
                         reason: format!("unsupported value '{other}'"),
-                    })
+                    });
                 }
             };
 
@@ -9881,7 +9926,7 @@ fn compute_l2_ehlers_signal_to_noise_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "l2_ehlers_signal_to_noise".to_string(),
                 input: IndicatorInputKind::Candles,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -9909,7 +9954,7 @@ fn compute_l2_ehlers_signal_to_noise_batch(
                     return Err(IndicatorDispatchError::MissingRequiredInput {
                         indicator: "l2_ehlers_signal_to_noise".to_string(),
                         input: IndicatorInputKind::Candles,
-                    })
+                    });
                 }
             };
             let input = L2EhlersSignalToNoiseInput::from_slices(
@@ -9943,12 +9988,11 @@ fn compute_cycle_channel_oscillator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "cycle_channel_oscillator".to_string(),
                 input: IndicatorInputKind::Candles,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("fast") || output_id.eq_ignore_ascii_case("value")
-    {
+    let field = if output_id.eq_ignore_ascii_case("fast") {
         CycleChannelOscillatorOutputField::Fast
     } else if output_id.eq_ignore_ascii_case("slow") {
         CycleChannelOscillatorOutputField::Slow
@@ -10112,7 +10156,7 @@ fn compute_ehlers_adaptive_cyber_cycle_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "ehlers_adaptive_cyber_cycle".to_string(),
                 input: IndicatorInputKind::Candles,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -10166,7 +10210,7 @@ fn compute_ehlers_simple_cycle_indicator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "ehlers_simple_cycle_indicator".to_string(),
                 input: IndicatorInputKind::Candles,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -10253,7 +10297,7 @@ fn compute_ehlers_smoothed_adaptive_momentum_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "ehlers_smoothed_adaptive_momentum".to_string(),
                 input: IndicatorInputKind::Candles,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -10377,7 +10421,7 @@ fn compute_price_moving_average_ratio_percentile_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "price_moving_average_ratio_percentile".to_string(),
                 input: IndicatorInputKind::CloseVolume,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -10563,7 +10607,7 @@ fn compute_mesa_stochastic_multi_length_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "mesa_stochastic_multi_length".to_string(),
                 input: IndicatorInputKind::Candles,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -10645,7 +10689,7 @@ fn compute_spearman_correlation_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "spearman_correlation".to_string(),
                 input: IndicatorInputKind::Candles,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -10708,7 +10752,7 @@ fn compute_relative_strength_index_wave_indicator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "relative_strength_index_wave_indicator".to_string(),
                 input: IndicatorInputKind::Candles,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -11017,7 +11061,7 @@ fn compute_vwap_deviation_oscillator_batch(
                 return Err(IndicatorDispatchError::MissingRequiredInput {
                     indicator: "vwap_deviation_oscillator".to_string(),
                     input: IndicatorInputKind::Candles,
-                })
+                });
             }
         };
     let kernel = req.kernel.to_non_batch();
@@ -11311,7 +11355,7 @@ fn compute_regression_slope_oscillator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "regression_slope_oscillator".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -11391,7 +11435,7 @@ fn compute_linear_regression_intensity_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "linear_regression_intensity".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -11456,7 +11500,7 @@ fn compute_moving_average_cross_probability_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "moving_average_cross_probability".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -11595,7 +11639,7 @@ fn compute_market_meanness_index_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "market_meanness_index".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -11673,7 +11717,7 @@ fn compute_momentum_ratio_oscillator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "momentum_ratio_oscillator".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -11738,7 +11782,7 @@ fn compute_pretty_good_oscillator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "pretty_good_oscillator".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -11893,7 +11937,7 @@ fn compute_psychological_line_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "psychological_line".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -11946,7 +11990,7 @@ fn compute_rank_correlation_index_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "rank_correlation_index".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -12121,7 +12165,7 @@ fn compute_stochastic_connors_rsi_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "stochastic_connors_rsi".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -12202,7 +12246,7 @@ fn compute_supertrend_oscillator_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "supertrend_oscillator".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -12331,7 +12375,7 @@ fn compute_trend_continuation_factor_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "trend_continuation_factor".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -12459,7 +12503,7 @@ fn compute_logarithmic_moving_average_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "logarithmic_moving_average".to_string(),
                 input: IndicatorInputKind::CloseVolume,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -12552,19 +12596,19 @@ fn adaptive_bounds_rsi_field(
     if output_id.eq_ignore_ascii_case("rsi") || output_id.eq_ignore_ascii_case("value") {
         return Ok(AdaptiveBoundsRsiOutputField::Rsi);
     }
-    if output_id.eq_ignore_ascii_case("lower_bound") {
+    if output_id.eq_ignore_ascii_case("lower") {
         return Ok(AdaptiveBoundsRsiOutputField::LowerBound);
     }
     if output_id.eq_ignore_ascii_case("lower_mid") {
         return Ok(AdaptiveBoundsRsiOutputField::LowerMid);
     }
-    if output_id.eq_ignore_ascii_case("mid") {
+    if output_id.eq_ignore_ascii_case("middle") {
         return Ok(AdaptiveBoundsRsiOutputField::Mid);
     }
     if output_id.eq_ignore_ascii_case("upper_mid") {
         return Ok(AdaptiveBoundsRsiOutputField::UpperMid);
     }
-    if output_id.eq_ignore_ascii_case("upper_bound") {
+    if output_id.eq_ignore_ascii_case("upper") {
         return Ok(AdaptiveBoundsRsiOutputField::UpperBound);
     }
     if output_id.eq_ignore_ascii_case("regime") {
@@ -12618,24 +12662,28 @@ fn compute_adaptive_bounds_rsi_batch(
     )
 }
 
+fn adaptive_schaff_trend_cycle_field(
+    output_id: &str,
+) -> Result<AdaptiveSchaffTrendCycleOutputField, IndicatorDispatchError> {
+    if output_id.eq_ignore_ascii_case("stc") {
+        Ok(AdaptiveSchaffTrendCycleOutputField::Stc)
+    } else if output_id.eq_ignore_ascii_case("histogram") {
+        Ok(AdaptiveSchaffTrendCycleOutputField::Histogram)
+    } else {
+        Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "adaptive_schaff_trend_cycle".to_string(),
+            output: output_id.to_string(),
+        })
+    }
+}
+
 fn compute_adaptive_schaff_trend_cycle_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let (high, low, close) = extract_ohlc_input("adaptive_schaff_trend_cycle", req.data)?;
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("stc") || output_id.eq_ignore_ascii_case("value")
-    {
-        AdaptiveSchaffTrendCycleOutputField::Stc
-    } else if output_id.eq_ignore_ascii_case("histogram") || output_id.eq_ignore_ascii_case("hist")
-    {
-        AdaptiveSchaffTrendCycleOutputField::Histogram
-    } else {
-        return Err(IndicatorDispatchError::UnknownOutput {
-            indicator: "adaptive_schaff_trend_cycle".to_string(),
-            output: output_id.to_string(),
-        });
-    };
+    let field = adaptive_schaff_trend_cycle_field(output_id)?;
     collect_f64_into_rows(
         "adaptive_schaff_trend_cycle",
         output_id,
@@ -12692,7 +12740,7 @@ fn compute_ehlers_detrending_filter_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "ehlers_detrending_filter".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -12756,7 +12804,7 @@ fn compute_hypertrend_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "hypertrend".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -12926,7 +12974,7 @@ fn compute_ict_propulsion_block_batch(
                             indicator: "ict_propulsion_block".to_string(),
                             key: "mitigation_price".to_string(),
                             reason: format!("unsupported value '{other}'"),
-                        })
+                        });
                     }
                 };
             let input = IctPropulsionBlockInput::from_slices(
@@ -13194,7 +13242,7 @@ fn compute_leavitt_convolution_acceleration_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "leavitt_convolution_acceleration".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -13865,23 +13913,26 @@ fn compute_gopalakrishnan_range_index_batch(
     )
 }
 
+fn acosc_field(output_id: &str) -> Result<AcoscOutputField, IndicatorDispatchError> {
+    if output_id.eq_ignore_ascii_case("osc") {
+        Ok(AcoscOutputField::Osc)
+    } else if output_id.eq_ignore_ascii_case("change") {
+        Ok(AcoscOutputField::Change)
+    } else {
+        Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "acosc".to_string(),
+            output: output_id.to_string(),
+        })
+    }
+}
+
 fn compute_acosc_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let (high, low) = extract_high_low_input("acosc", req.data)?;
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("osc") || output_id.eq_ignore_ascii_case("value")
-    {
-        AcoscOutputField::Osc
-    } else if output_id.eq_ignore_ascii_case("change") {
-        AcoscOutputField::Change
-    } else {
-        return Err(IndicatorDispatchError::UnknownOutput {
-            indicator: "acosc".to_string(),
-            output: output_id.to_string(),
-        });
-    };
+    let field = acosc_field(output_id)?;
     let rows = req.combos.len();
     let cols = high.len();
     let total = rows
@@ -13911,8 +13962,7 @@ fn compute_alligator_batch(
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let data = extract_slice_input("alligator", req.data, "hl2")?;
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("jaw") || output_id.eq_ignore_ascii_case("value")
-    {
+    let field = if output_id.eq_ignore_ascii_case("jaw") {
         AlligatorOutputField::Jaw
     } else if output_id.eq_ignore_ascii_case("teeth") {
         AlligatorOutputField::Teeth
@@ -13966,13 +14016,8 @@ fn compute_alligator_batch(
     Ok(f64_output(output_id, rows, cols, matrix))
 }
 
-fn compute_alphatrend_batch(
-    req: IndicatorBatchRequest<'_>,
-    output_id: &str,
-) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
-    let (open, high, low, close, volume) = extract_ohlcv_full_input("alphatrend", req.data)?;
-    let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("k1") || output_id.eq_ignore_ascii_case("value") {
+fn alphatrend_field(output_id: &str) -> Result<AlphaTrendOutputField, IndicatorDispatchError> {
+    let field = if output_id.eq_ignore_ascii_case("k1") {
         AlphaTrendOutputField::K1
     } else if output_id.eq_ignore_ascii_case("k2") {
         AlphaTrendOutputField::K2
@@ -13982,6 +14027,16 @@ fn compute_alphatrend_batch(
             output: output_id.to_string(),
         });
     };
+    Ok(field)
+}
+
+fn compute_alphatrend_batch(
+    req: IndicatorBatchRequest<'_>,
+    output_id: &str,
+) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
+    let (open, high, low, close, volume) = extract_ohlcv_full_input("alphatrend", req.data)?;
+    let kernel = req.kernel.to_non_batch();
+    let field = alphatrend_field(output_id)?;
 
     let rows = req.combos.len();
     let cols = close.len();
@@ -14067,17 +14122,16 @@ fn compute_aso_batch(
         }
     };
     let kernel = req.kernel.to_non_batch();
-    let field =
-        if output_id.eq_ignore_ascii_case("bulls") || output_id.eq_ignore_ascii_case("value") {
-            AsoOutputField::Bulls
-        } else if output_id.eq_ignore_ascii_case("bears") {
-            AsoOutputField::Bears
-        } else {
-            return Err(IndicatorDispatchError::UnknownOutput {
-                indicator: "aso".to_string(),
-                output: output_id.to_string(),
-            });
-        };
+    let field = if output_id.eq_ignore_ascii_case("bulls") {
+        AsoOutputField::Bulls
+    } else if output_id.eq_ignore_ascii_case("bears") {
+        AsoOutputField::Bears
+    } else {
+        return Err(IndicatorDispatchError::UnknownOutput {
+            indicator: "aso".to_string(),
+            output: output_id.to_string(),
+        });
+    };
 
     let rows = req.combos.len();
     let cols = close.len();
@@ -14149,11 +14203,9 @@ fn compute_bandpass_batch(
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
     let data = extract_slice_input("bandpass", req.data, "close")?;
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("bp") || output_id.eq_ignore_ascii_case("value") {
+    let field = if output_id.eq_ignore_ascii_case("bp") {
         BandPassOutputField::Bp
-    } else if output_id.eq_ignore_ascii_case("bp_normalized")
-        || output_id.eq_ignore_ascii_case("normalized")
-    {
+    } else if output_id.eq_ignore_ascii_case("bp_normalized") {
         BandPassOutputField::BpNormalized
     } else if output_id.eq_ignore_ascii_case("signal") {
         BandPassOutputField::Signal
@@ -14259,9 +14311,7 @@ fn compute_chandelier_exit_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("long_stop")
-                || output_id.eq_ignore_ascii_case("value")
-            {
+            if output_id.eq_ignore_ascii_case("long_stop") {
                 return Ok(out.long_stop);
             }
             if output_id.eq_ignore_ascii_case("short_stop") {
@@ -14301,14 +14351,10 @@ fn compute_cksp_batch(
                 details: e.to_string(),
             }
         })?;
-        if output_id.eq_ignore_ascii_case("long_values")
-            || output_id.eq_ignore_ascii_case("long")
-            || output_id.eq_ignore_ascii_case("value")
-        {
+        if output_id.eq_ignore_ascii_case("long_values") {
             return Ok(out.long_values);
         }
-        if output_id.eq_ignore_ascii_case("short_values") || output_id.eq_ignore_ascii_case("short")
-        {
+        if output_id.eq_ignore_ascii_case("short_values") {
             return Ok(out.short_values);
         }
         Err(IndicatorDispatchError::UnknownOutput {
@@ -14345,7 +14391,7 @@ fn compute_correlation_cycle_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("real") || output_id.eq_ignore_ascii_case("value") {
+            if output_id.eq_ignore_ascii_case("real") {
                 return Ok(out.real);
             }
             if output_id.eq_ignore_ascii_case("imag") {
@@ -14398,7 +14444,7 @@ fn compute_damiani_volatmeter_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("vol") || output_id.eq_ignore_ascii_case("value") {
+            if output_id.eq_ignore_ascii_case("vol") {
                 return Ok(out.vol);
             }
             if output_id.eq_ignore_ascii_case("anti") {
@@ -14454,20 +14500,17 @@ fn compute_dvdiqqe_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "dvdiqqe".to_string(),
                 input: IndicatorInputKind::Ohlc,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("dvdi") || output_id.eq_ignore_ascii_case("value")
-    {
+    let field = if output_id.eq_ignore_ascii_case("dvdi") {
         DvdiqqeOutputField::Dvdi
-    } else if output_id.eq_ignore_ascii_case("fast_tl") || output_id.eq_ignore_ascii_case("fast") {
+    } else if output_id.eq_ignore_ascii_case("fast_tl") {
         DvdiqqeOutputField::FastTl
-    } else if output_id.eq_ignore_ascii_case("slow_tl") || output_id.eq_ignore_ascii_case("slow") {
+    } else if output_id.eq_ignore_ascii_case("slow_tl") {
         DvdiqqeOutputField::SlowTl
-    } else if output_id.eq_ignore_ascii_case("center_line")
-        || output_id.eq_ignore_ascii_case("center")
-    {
+    } else if output_id.eq_ignore_ascii_case("center_line") {
         DvdiqqeOutputField::CenterLine
     } else {
         return Err(IndicatorDispatchError::UnknownOutput {
@@ -14527,17 +14570,15 @@ fn compute_emd_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
-    let (high, low, close, volume) = extract_hlcv_input("emd", req.data)?;
+    let (high, low) = extract_high_low_input("emd", req.data)?;
     let kernel = req.kernel.to_non_batch();
-    collect_f64("emd", output_id, req.combos, close.len(), |params| {
+    collect_f64("emd", output_id, req.combos, high.len(), |params| {
         let period = get_usize_param("emd", params, "period", 20)?;
         let delta = get_f64_param("emd", params, "delta", 0.5)?;
         let fraction = get_f64_param("emd", params, "fraction", 0.1)?;
-        let input = EmdInput::from_slices(
+        let input = EmdInput::from_high_low_slices(
             high,
             low,
-            close,
-            volume,
             EmdParams {
                 period: Some(period),
                 delta: Some(delta),
@@ -14549,17 +14590,13 @@ fn compute_emd_batch(
                 indicator: "emd".to_string(),
                 details: e.to_string(),
             })?;
-        if output_id.eq_ignore_ascii_case("upperband")
-            || output_id.eq_ignore_ascii_case("upper")
-            || output_id.eq_ignore_ascii_case("value")
-        {
+        if output_id.eq_ignore_ascii_case("upperband") {
             return Ok(out.upperband);
         }
-        if output_id.eq_ignore_ascii_case("middleband") || output_id.eq_ignore_ascii_case("middle")
-        {
+        if output_id.eq_ignore_ascii_case("middleband") {
             return Ok(out.middleband);
         }
-        if output_id.eq_ignore_ascii_case("lowerband") || output_id.eq_ignore_ascii_case("lower") {
+        if output_id.eq_ignore_ascii_case("lowerband") {
             return Ok(out.lowerband);
         }
         Err(IndicatorDispatchError::UnknownOutput {
@@ -14601,7 +14638,7 @@ fn compute_emd_trend_batch(
         if output_id.eq_ignore_ascii_case("direction") {
             return Ok(out.direction);
         }
-        if output_id.eq_ignore_ascii_case("average") || output_id.eq_ignore_ascii_case("value") {
+        if output_id.eq_ignore_ascii_case("average") {
             return Ok(out.average);
         }
         if output_id.eq_ignore_ascii_case("upper") {
@@ -14624,19 +14661,13 @@ fn compute_cyberpunk_value_trend_analyzer_batch(
     let (open, high, low, close) =
         extract_ohlc_full_input("cyberpunk_value_trend_analyzer", req.data)?;
     let kernel = req.kernel.to_non_batch();
-    let field = if output_id.eq_ignore_ascii_case("value_trend")
-        || output_id.eq_ignore_ascii_case("value")
-    {
+    let field = if output_id.eq_ignore_ascii_case("value_trend") {
         CyberpunkValueTrendAnalyzerOutputField::ValueTrend
-    } else if output_id.eq_ignore_ascii_case("value_trend_lag")
-        || output_id.eq_ignore_ascii_case("lag")
-    {
+    } else if output_id.eq_ignore_ascii_case("value_trend_lag") {
         CyberpunkValueTrendAnalyzerOutputField::ValueTrendLag
     } else if output_id.eq_ignore_ascii_case("deviation_index") {
         CyberpunkValueTrendAnalyzerOutputField::DeviationIndex
-    } else if output_id.eq_ignore_ascii_case("overbought_signal")
-        || output_id.eq_ignore_ascii_case("overbought")
-    {
+    } else if output_id.eq_ignore_ascii_case("overbought_signal") {
         CyberpunkValueTrendAnalyzerOutputField::OverboughtSignal
     } else if output_id.eq_ignore_ascii_case("buy_signal") {
         CyberpunkValueTrendAnalyzerOutputField::BuySignal
@@ -14740,7 +14771,7 @@ fn compute_eri_batch(
                 indicator: "eri".to_string(),
                 details: e.to_string(),
             })?;
-        if output_id.eq_ignore_ascii_case("bull") || output_id.eq_ignore_ascii_case("value") {
+        if output_id.eq_ignore_ascii_case("bull") {
             return Ok(out.bull);
         }
         if output_id.eq_ignore_ascii_case("bear") {
@@ -14774,7 +14805,7 @@ fn compute_fisher_batch(
                 details: e.to_string(),
             }
         })?;
-        if output_id.eq_ignore_ascii_case("fisher") || output_id.eq_ignore_ascii_case("value") {
+        if output_id.eq_ignore_ascii_case("fisher") {
             return Ok(out.fisher);
         }
         if output_id.eq_ignore_ascii_case("signal") {
@@ -14881,7 +14912,7 @@ fn compute_fvg_trailing_stop_batch(
                     details: e.to_string(),
                 }
             })?;
-            if output_id.eq_ignore_ascii_case("upper") || output_id.eq_ignore_ascii_case("value") {
+            if output_id.eq_ignore_ascii_case("upper") {
                 return Ok(out.upper);
             }
             if output_id.eq_ignore_ascii_case("lower") {
@@ -14931,7 +14962,7 @@ fn compute_gatorosc_batch(
                 details: e.to_string(),
             }
         })?;
-        if output_id.eq_ignore_ascii_case("upper") || output_id.eq_ignore_ascii_case("value") {
+        if output_id.eq_ignore_ascii_case("upper") {
             return Ok(out.upper);
         }
         if output_id.eq_ignore_ascii_case("lower") {
@@ -14976,7 +15007,7 @@ fn compute_halftrend_batch(
                 details: e.to_string(),
             }
         })?;
-        if output_id.eq_ignore_ascii_case("halftrend") || output_id.eq_ignore_ascii_case("value") {
+        if output_id.eq_ignore_ascii_case("halftrend") {
             return Ok(out.halftrend);
         }
         if output_id.eq_ignore_ascii_case("trend") {
@@ -14988,10 +15019,10 @@ fn compute_halftrend_batch(
         if output_id.eq_ignore_ascii_case("atr_low") {
             return Ok(out.atr_low);
         }
-        if output_id.eq_ignore_ascii_case("buy_signal") || output_id.eq_ignore_ascii_case("buy") {
+        if output_id.eq_ignore_ascii_case("buy_signal") {
             return Ok(out.buy_signal);
         }
-        if output_id.eq_ignore_ascii_case("sell_signal") || output_id.eq_ignore_ascii_case("sell") {
+        if output_id.eq_ignore_ascii_case("sell_signal") {
             return Ok(out.sell_signal);
         }
         Err(IndicatorDispatchError::UnknownOutput {
@@ -15042,6 +15073,33 @@ fn compute_safezonestop_batch(
             })
         },
     )
+}
+
+fn compute_sar_batch(
+    req: IndicatorBatchRequest<'_>,
+    output_id: &str,
+) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
+    expect_value_output("sar", output_id)?;
+    let (high, low) = extract_high_low_input("sar", req.data)?;
+    let kernel = req.kernel.to_non_batch();
+    collect_f64("sar", output_id, req.combos, high.len(), |params| {
+        let acceleration = get_f64_param("sar", params, "acceleration", 0.02)?;
+        let maximum = get_f64_param("sar", params, "maximum", 0.2)?;
+        let input = SarInput::from_slices(
+            high,
+            low,
+            SarParams {
+                acceleration: Some(acceleration),
+                maximum: Some(maximum),
+            },
+        );
+        let out =
+            sar_with_kernel(&input, kernel).map_err(|e| IndicatorDispatchError::ComputeFailed {
+                indicator: "sar".to_string(),
+                details: e.to_string(),
+            })?;
+        Ok(out.values)
+    })
 }
 
 fn compute_devstop_batch(
@@ -15377,7 +15435,7 @@ fn compute_macz_batch(
             return Err(IndicatorDispatchError::MissingRequiredInput {
                 indicator: "macz".to_string(),
                 input: IndicatorInputKind::Slice,
-            })
+            });
         }
     };
     let kernel = req.kernel.to_non_batch();
@@ -15990,20 +16048,13 @@ fn compute_forward_backward_exponential_oscillator_batch(
                     details: e.to_string(),
                 },
             )?;
-            if output_id.eq_ignore_ascii_case("forward_backward")
-                || output_id.eq_ignore_ascii_case("value")
-                || output_id.eq_ignore_ascii_case("fb")
-            {
+            if output_id.eq_ignore_ascii_case("forward_backward") {
                 return Ok(out.forward_backward);
             }
-            if output_id.eq_ignore_ascii_case("backward")
-                || output_id.eq_ignore_ascii_case("bwrd")
-                || output_id.eq_ignore_ascii_case("bw")
-            {
+            if output_id.eq_ignore_ascii_case("backward") {
                 return Ok(out.backward);
             }
-            if output_id.eq_ignore_ascii_case("histogram") || output_id.eq_ignore_ascii_case("hist")
-            {
+            if output_id.eq_ignore_ascii_case("histogram") {
                 return Ok(out.histogram);
             }
             Err(IndicatorDispatchError::UnknownOutput {
@@ -16637,6 +16688,7 @@ fn compute_coppock_batch(
     req: IndicatorBatchRequest<'_>,
     output_id: &str,
 ) -> Result<IndicatorBatchOutput, IndicatorDispatchError> {
+    expect_value_output("coppock", output_id)?;
     let data = extract_slice_input("coppock", req.data, "close")?;
     let kernel = req.kernel.to_non_batch();
     collect_f64("coppock", output_id, req.combos, data.len(), |params| {
@@ -16658,13 +16710,7 @@ fn compute_coppock_batch(
                 details: e.to_string(),
             }
         })?;
-        if output_id.eq_ignore_ascii_case("value") || output_id.eq_ignore_ascii_case("values") {
-            return Ok(out.values);
-        }
-        Err(IndicatorDispatchError::UnknownOutput {
-            indicator: "coppock".to_string(),
-            output: output_id.to_string(),
-        })
+        Ok(out.values)
     })
 }
 
@@ -16847,6 +16893,38 @@ fn ma_period_for_combo(
     info: &IndicatorInfo,
     params: &[ParamKV<'_>],
 ) -> Result<usize, IndicatorDispatchError> {
+    if info
+        .id
+        .eq_ignore_ascii_case("elastic_volume_weighted_moving_average")
+    {
+        if let Some(value) = find_param(params, "length") {
+            return parse_usize_param_value(info.id, "length", value);
+        }
+        let default = info
+            .params
+            .iter()
+            .find(|parameter| parameter.key.eq_ignore_ascii_case("length"))
+            .and_then(|parameter| parameter.default.as_ref())
+            .ok_or_else(|| IndicatorDispatchError::InvalidParam {
+                indicator: info.id.to_string(),
+                key: "length".to_string(),
+                reason: "missing rolling EVWMA length default".to_string(),
+            })?;
+        return match default {
+            ParamValueStatic::Int(value) if *value > 0 => {
+                usize::try_from(*value).map_err(|_| IndicatorDispatchError::InvalidParam {
+                    indicator: info.id.to_string(),
+                    key: "length".to_string(),
+                    reason: format!("integer default {value} exceeds usize"),
+                })
+            }
+            other => Err(IndicatorDispatchError::InvalidParam {
+                indicator: info.id.to_string(),
+                key: "length".to_string(),
+                reason: format!("expected positive integer default, found {other:?}"),
+            }),
+        };
+    }
     if let Some(v) = find_param(params, "period") {
         return parse_usize_param_value(info.id, "period", v);
     }
@@ -16862,7 +16940,57 @@ fn ma_period_for_combo(
             }
         }
     }
+    if info.id.eq_ignore_ascii_case("buff_averages") {
+        if let Some(value) = find_param(params, "slow_period") {
+            return parse_usize_param_value(info.id, "slow_period", value);
+        }
+        let slow_default = info
+            .params
+            .iter()
+            .find(|parameter| parameter.key.eq_ignore_ascii_case("slow_period"))
+            .and_then(|parameter| parameter.default.as_ref())
+            .ok_or_else(|| IndicatorDispatchError::InvalidParam {
+                indicator: info.id.to_string(),
+                key: "slow_period".to_string(),
+                reason: "missing canonical integer default".to_string(),
+            })?;
+        return match slow_default {
+            ParamValueStatic::Int(value) if *value > 0 => {
+                usize::try_from(*value).map_err(|_| IndicatorDispatchError::InvalidParam {
+                    indicator: info.id.to_string(),
+                    key: "slow_period".to_string(),
+                    reason: format!("integer default {value} exceeds usize"),
+                })
+            }
+            other => Err(IndicatorDispatchError::InvalidParam {
+                indicator: info.id.to_string(),
+                key: "slow_period".to_string(),
+                reason: format!("expected positive integer default, found {other:?}"),
+            }),
+        };
+    }
     Ok(14)
+}
+
+fn validate_production_evwma_params(
+    info: &IndicatorInfo,
+    params: &[ParamKV<'_>],
+) -> Result<(), IndicatorDispatchError> {
+    if info
+        .id
+        .eq_ignore_ascii_case("elastic_volume_weighted_moving_average")
+        && matches!(
+            find_param(params, "use_volume_sum"),
+            Some(ParamValue::Bool(false))
+        )
+    {
+        return Err(IndicatorDispatchError::InvalidParam {
+            indicator: info.id.to_string(),
+            key: "use_volume_sum".to_string(),
+            reason: "generic/search EVWMA only admits rolling volume-sum semantics; use the dedicated EVWMA API for fixed gamma N".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn convert_ma_params<'a>(
@@ -16883,7 +17011,7 @@ fn convert_ma_params<'a>(
                         indicator: indicator.to_string(),
                         key: "output".to_string(),
                         reason: "expected EnumString".to_string(),
-                    })
+                    });
                 }
             };
             if !selected.eq_ignore_ascii_case(output_id) {
@@ -17572,229 +17700,229 @@ fn get_enum_param(
 mod tests {
     use super::*;
     use crate::indicators::absolute_strength_index_oscillator::{
-        absolute_strength_index_oscillator_with_kernel, AbsoluteStrengthIndexOscillatorInput,
-        AbsoluteStrengthIndexOscillatorParams,
+        AbsoluteStrengthIndexOscillatorInput, AbsoluteStrengthIndexOscillatorParams,
+        absolute_strength_index_oscillator_with_kernel,
     };
     use crate::indicators::accumulation_swing_index::{
-        accumulation_swing_index_with_kernel, AccumulationSwingIndexInput,
-        AccumulationSwingIndexParams,
+        AccumulationSwingIndexInput, AccumulationSwingIndexParams,
+        accumulation_swing_index_with_kernel,
     };
-    use crate::indicators::ad::{ad_with_kernel, AdInput, AdParams};
+    use crate::indicators::ad::{AdInput, AdParams, ad_with_kernel};
     use crate::indicators::adaptive_bandpass_trigger_oscillator::{
-        adaptive_bandpass_trigger_oscillator_with_kernel, AdaptiveBandpassTriggerOscillatorInput,
-        AdaptiveBandpassTriggerOscillatorParams,
+        AdaptiveBandpassTriggerOscillatorInput, AdaptiveBandpassTriggerOscillatorParams,
+        adaptive_bandpass_trigger_oscillator_with_kernel,
     };
     use crate::indicators::advance_decline_line::{
-        advance_decline_line_with_kernel, AdvanceDeclineLineInput, AdvanceDeclineLineParams,
+        AdvanceDeclineLineInput, AdvanceDeclineLineParams, advance_decline_line_with_kernel,
     };
-    use crate::indicators::adx::{adx_with_kernel, AdxInput, AdxParams};
-    use crate::indicators::ao::{ao_with_kernel, AoInput, AoParams};
-    use crate::indicators::apo::{apo_with_kernel, ApoInput, ApoParams};
+    use crate::indicators::adx::{AdxInput, AdxParams, adx_with_kernel};
+    use crate::indicators::ao::{AoInput, AoParams, ao_with_kernel};
+    use crate::indicators::apo::{ApoInput, ApoParams, apo_with_kernel};
     use crate::indicators::atr_percentile::{
-        atr_percentile_with_kernel, AtrPercentileInput, AtrPercentileParams,
+        AtrPercentileInput, AtrPercentileParams, atr_percentile_with_kernel,
     };
     use crate::indicators::bull_power_vs_bear_power::{
-        bull_power_vs_bear_power_with_kernel, BullPowerVsBearPowerInput, BullPowerVsBearPowerParams,
+        BullPowerVsBearPowerInput, BullPowerVsBearPowerParams, bull_power_vs_bear_power_with_kernel,
     };
-    use crate::indicators::cg::{cg_with_kernel, CgInput, CgParams};
-    use crate::indicators::cmo::{cmo_with_kernel, CmoInput, CmoParams};
+    use crate::indicators::cg::{CgInput, CgParams, cg_with_kernel};
+    use crate::indicators::cmo::{CmoInput, CmoParams, cmo_with_kernel};
     use crate::indicators::cycle_channel_oscillator::{
-        cycle_channel_oscillator_with_kernel, CycleChannelOscillatorInput,
-        CycleChannelOscillatorParams,
+        CycleChannelOscillatorInput, CycleChannelOscillatorParams,
+        cycle_channel_oscillator_with_kernel,
     };
     use crate::indicators::daily_factor::{
-        daily_factor_with_kernel, DailyFactorInput, DailyFactorParams,
+        DailyFactorInput, DailyFactorParams, daily_factor_with_kernel,
     };
     use crate::indicators::decisionpoint_breadth_swenlin_trading_oscillator::{
-        decisionpoint_breadth_swenlin_trading_oscillator_with_kernel,
         DecisionPointBreadthSwenlinTradingOscillatorInput,
         DecisionPointBreadthSwenlinTradingOscillatorParams,
+        decisionpoint_breadth_swenlin_trading_oscillator_with_kernel,
     };
     use crate::indicators::demand_index::{
-        demand_index_with_kernel, DemandIndexInput, DemandIndexParams,
+        DemandIndexInput, DemandIndexParams, demand_index_with_kernel,
     };
-    use crate::indicators::deviation::{deviation_with_kernel, DeviationInput, DeviationParams};
+    use crate::indicators::deviation::{DeviationInput, DeviationParams, deviation_with_kernel};
     use crate::indicators::dx::{
-        dx_batch_with_kernel, dx_with_kernel, DxBatchRange, DxInput, DxParams,
+        DxBatchRange, DxInput, DxParams, dx_batch_with_kernel, dx_with_kernel,
     };
-    use crate::indicators::efi::{efi_with_kernel, EfiInput, EfiParams};
+    use crate::indicators::efi::{EfiInput, EfiParams, efi_with_kernel};
     use crate::indicators::ehlers_adaptive_cyber_cycle::{
-        ehlers_adaptive_cyber_cycle_with_kernel, EhlersAdaptiveCyberCycleInput,
-        EhlersAdaptiveCyberCycleParams,
+        EhlersAdaptiveCyberCycleInput, EhlersAdaptiveCyberCycleParams,
+        ehlers_adaptive_cyber_cycle_with_kernel,
     };
     use crate::indicators::ehlers_linear_extrapolation_predictor::{
-        ehlers_linear_extrapolation_predictor_with_kernel, EhlersLinearExtrapolationPredictorInput,
-        EhlersLinearExtrapolationPredictorParams,
+        EhlersLinearExtrapolationPredictorInput, EhlersLinearExtrapolationPredictorParams,
+        ehlers_linear_extrapolation_predictor_with_kernel,
     };
     use crate::indicators::ehlers_simple_cycle_indicator::{
-        ehlers_simple_cycle_indicator_with_kernel, EhlersSimpleCycleIndicatorInput,
-        EhlersSimpleCycleIndicatorParams,
+        EhlersSimpleCycleIndicatorInput, EhlersSimpleCycleIndicatorParams,
+        ehlers_simple_cycle_indicator_with_kernel,
     };
     use crate::indicators::ehlers_smoothed_adaptive_momentum::{
-        ehlers_smoothed_adaptive_momentum_with_kernel, EhlersSmoothedAdaptiveMomentumInput,
-        EhlersSmoothedAdaptiveMomentumParams,
+        EhlersSmoothedAdaptiveMomentumInput, EhlersSmoothedAdaptiveMomentumParams,
+        ehlers_smoothed_adaptive_momentum_with_kernel,
     };
     use crate::indicators::ewma_volatility::{
-        ewma_volatility_with_kernel, EwmaVolatilityInput, EwmaVolatilityParams,
+        EwmaVolatilityInput, EwmaVolatilityParams, ewma_volatility_with_kernel,
     };
     use crate::indicators::fibonacci_entry_bands::{
-        fibonacci_entry_bands_with_kernel, FibonacciEntryBandsInput, FibonacciEntryBandsParams,
+        FibonacciEntryBandsInput, FibonacciEntryBandsParams, fibonacci_entry_bands_with_kernel,
     };
     use crate::indicators::fibonacci_trailing_stop::{
-        fibonacci_trailing_stop_with_kernel, FibonacciTrailingStopInput,
-        FibonacciTrailingStopParams,
+        FibonacciTrailingStopInput, FibonacciTrailingStopParams,
+        fibonacci_trailing_stop_with_kernel,
     };
-    use crate::indicators::fosc::{fosc_with_kernel, FoscInput, FoscParams};
+    use crate::indicators::fosc::{FoscInput, FoscParams, fosc_with_kernel};
     use crate::indicators::garman_klass_volatility::{
-        garman_klass_volatility_with_kernel, GarmanKlassVolatilityInput,
-        GarmanKlassVolatilityParams,
+        GarmanKlassVolatilityInput, GarmanKlassVolatilityParams,
+        garman_klass_volatility_with_kernel,
     };
     use crate::indicators::gopalakrishnan_range_index::{
-        gopalakrishnan_range_index_with_kernel, GopalakrishnanRangeIndexInput,
-        GopalakrishnanRangeIndexParams,
+        GopalakrishnanRangeIndexInput, GopalakrishnanRangeIndexParams,
+        gopalakrishnan_range_index_with_kernel,
     };
     use crate::indicators::grover_llorens_cycle_oscillator::{
-        grover_llorens_cycle_oscillator_with_kernel, GroverLlorensCycleOscillatorInput,
-        GroverLlorensCycleOscillatorParams,
+        GroverLlorensCycleOscillatorInput, GroverLlorensCycleOscillatorParams,
+        grover_llorens_cycle_oscillator_with_kernel,
     };
     use crate::indicators::hema_trend_levels::{
-        hema_trend_levels_with_kernel, HemaTrendLevelsInput, HemaTrendLevelsParams,
+        HemaTrendLevelsInput, HemaTrendLevelsParams, hema_trend_levels_with_kernel,
     };
     use crate::indicators::historical_volatility::{
-        historical_volatility_with_kernel, HistoricalVolatilityInput, HistoricalVolatilityParams,
+        HistoricalVolatilityInput, HistoricalVolatilityParams, historical_volatility_with_kernel,
     };
     use crate::indicators::historical_volatility_percentile::{
-        historical_volatility_percentile_with_kernel, HistoricalVolatilityPercentileInput,
-        HistoricalVolatilityPercentileParams,
+        HistoricalVolatilityPercentileInput, HistoricalVolatilityPercentileParams,
+        historical_volatility_percentile_with_kernel,
     };
     use crate::indicators::hull_butterfly_oscillator::{
-        hull_butterfly_oscillator_with_kernel, HullButterflyOscillatorInput,
-        HullButterflyOscillatorParams,
+        HullButterflyOscillatorInput, HullButterflyOscillatorParams,
+        hull_butterfly_oscillator_with_kernel,
     };
     use crate::indicators::ichimoku_oscillator::{
-        ichimoku_oscillator_with_kernel, IchimokuOscillatorInput, IchimokuOscillatorNormalizeMode,
-        IchimokuOscillatorParams,
+        IchimokuOscillatorInput, IchimokuOscillatorNormalizeMode, IchimokuOscillatorParams,
+        ichimoku_oscillator_with_kernel,
     };
-    use crate::indicators::ift_rsi::{ift_rsi_with_kernel, IftRsiInput, IftRsiParams};
+    use crate::indicators::ift_rsi::{IftRsiInput, IftRsiParams, ift_rsi_with_kernel};
     use crate::indicators::intraday_momentum_index::{
-        intraday_momentum_index_with_kernel, IntradayMomentumIndexInput,
-        IntradayMomentumIndexParams,
+        IntradayMomentumIndexInput, IntradayMomentumIndexParams,
+        intraday_momentum_index_with_kernel,
     };
-    use crate::indicators::kvo::{kvo_with_kernel, KvoInput, KvoParams};
+    use crate::indicators::kvo::{KvoInput, KvoParams, kvo_with_kernel};
     use crate::indicators::l2_ehlers_signal_to_noise::{
-        l2_ehlers_signal_to_noise_with_kernel, L2EhlersSignalToNoiseInput,
-        L2EhlersSignalToNoiseParams,
+        L2EhlersSignalToNoiseInput, L2EhlersSignalToNoiseParams,
+        l2_ehlers_signal_to_noise_with_kernel,
     };
     use crate::indicators::linearreg_angle::{
-        linearreg_angle_with_kernel, Linearreg_angleInput, Linearreg_angleParams,
+        Linearreg_angleInput, Linearreg_angleParams, linearreg_angle_with_kernel,
     };
     use crate::indicators::linearreg_intercept::{
-        linearreg_intercept_with_kernel, LinearRegInterceptInput, LinearRegInterceptParams,
+        LinearRegInterceptInput, LinearRegInterceptParams, linearreg_intercept_with_kernel,
     };
     use crate::indicators::linearreg_slope::{
-        linearreg_slope_with_kernel, LinearRegSlopeInput, LinearRegSlopeParams,
+        LinearRegSlopeInput, LinearRegSlopeParams, linearreg_slope_with_kernel,
     };
-    use crate::indicators::macd::{macd_with_kernel, MacdInput, MacdParams};
+    use crate::indicators::macd::{MacdInput, MacdParams, macd_with_kernel};
     use crate::indicators::macd_wave_signal_pro::{
-        macd_wave_signal_pro_with_kernel, MacdWaveSignalProInput,
+        MacdWaveSignalProInput, macd_wave_signal_pro_with_kernel,
     };
-    use crate::indicators::mean_ad::{mean_ad_with_kernel, MeanAdInput, MeanAdParams};
-    use crate::indicators::medprice::{medprice_with_kernel, MedpriceInput, MedpriceParams};
+    use crate::indicators::mean_ad::{MeanAdInput, MeanAdParams, mean_ad_with_kernel};
+    use crate::indicators::medprice::{MedpriceInput, MedpriceParams, medprice_with_kernel};
     use crate::indicators::mesa_stochastic_multi_length::{
-        mesa_stochastic_multi_length_with_kernel, MesaStochasticMultiLengthInput,
-        MesaStochasticMultiLengthParams,
+        MesaStochasticMultiLengthInput, MesaStochasticMultiLengthParams,
+        mesa_stochastic_multi_length_with_kernel,
     };
     use crate::indicators::mfi::{
-        mfi_batch_with_kernel, mfi_with_kernel, MfiBatchRange, MfiInput, MfiParams,
+        MfiBatchRange, MfiInput, MfiParams, mfi_batch_with_kernel, mfi_with_kernel,
     };
     use crate::indicators::monotonicity_index::{
-        monotonicity_index_with_kernel, MonotonicityIndexInput, MonotonicityIndexMode,
-        MonotonicityIndexParams,
+        MonotonicityIndexInput, MonotonicityIndexMode, MonotonicityIndexParams,
+        monotonicity_index_with_kernel,
     };
     use crate::indicators::moving_averages::ma::MaData;
     use crate::indicators::moving_averages::ma_batch::{
-        ma_batch_with_kernel_and_typed_params, MaBatchParamKV, MaBatchParamValue,
+        MaBatchParamKV, MaBatchParamValue, ma_batch_with_kernel_and_typed_params,
     };
     use crate::indicators::multi_length_stochastic_average::{
-        multi_length_stochastic_average_with_kernel, MultiLengthStochasticAverageInput,
-        MultiLengthStochasticAverageParams,
+        MultiLengthStochasticAverageInput, MultiLengthStochasticAverageParams,
+        multi_length_stochastic_average_with_kernel,
     };
-    use crate::indicators::natr::{natr_with_kernel, NatrInput, NatrParams};
+    use crate::indicators::natr::{NatrInput, NatrParams, natr_with_kernel};
     use crate::indicators::neighboring_trailing_stop::{
-        neighboring_trailing_stop_with_kernel, NeighboringTrailingStopInput,
-        NeighboringTrailingStopParams,
+        NeighboringTrailingStopInput, NeighboringTrailingStopParams,
+        neighboring_trailing_stop_with_kernel,
     };
     use crate::indicators::percentile_nearest_rank::{
-        percentile_nearest_rank_with_kernel, PercentileNearestRankInput,
-        PercentileNearestRankParams,
+        PercentileNearestRankInput, PercentileNearestRankParams,
+        percentile_nearest_rank_with_kernel,
     };
-    use crate::indicators::ppo::{ppo_with_kernel, PpoInput, PpoParams};
+    use crate::indicators::ppo::{PpoInput, PpoParams, ppo_with_kernel};
     use crate::indicators::premier_rsi_oscillator::{
-        premier_rsi_oscillator_with_kernel, PremierRsiOscillatorInput, PremierRsiOscillatorParams,
+        PremierRsiOscillatorInput, PremierRsiOscillatorParams, premier_rsi_oscillator_with_kernel,
     };
     use crate::indicators::price_moving_average_ratio_percentile::{
-        price_moving_average_ratio_percentile_with_kernel, PriceMovingAverageRatioPercentileInput,
-        PriceMovingAverageRatioPercentileLineMode, PriceMovingAverageRatioPercentileMaType,
-        PriceMovingAverageRatioPercentileParams,
+        PriceMovingAverageRatioPercentileInput, PriceMovingAverageRatioPercentileLineMode,
+        PriceMovingAverageRatioPercentileMaType, PriceMovingAverageRatioPercentileParams,
+        price_moving_average_ratio_percentile_with_kernel,
     };
-    use crate::indicators::pvi::{pvi_with_kernel, PviInput, PviParams};
+    use crate::indicators::pvi::{PviInput, PviParams, pvi_with_kernel};
     use crate::indicators::random_walk_index::{
-        random_walk_index_with_kernel, RandomWalkIndexInput, RandomWalkIndexParams,
+        RandomWalkIndexInput, RandomWalkIndexParams, random_walk_index_with_kernel,
     };
-    use crate::indicators::registry::{list_indicators, IndicatorParamKind};
+    use crate::indicators::registry::{IndicatorParamKind, list_indicators};
     use crate::indicators::spearman_correlation::{
-        spearman_correlation_with_kernel, SpearmanCorrelationInput, SpearmanCorrelationParams,
+        SpearmanCorrelationInput, SpearmanCorrelationParams, spearman_correlation_with_kernel,
     };
     use crate::indicators::squeeze_index::{
-        squeeze_index_with_kernel, SqueezeIndexInput, SqueezeIndexParams,
+        SqueezeIndexInput, SqueezeIndexParams, squeeze_index_with_kernel,
     };
     use crate::indicators::stochastic_distance::{
-        stochastic_distance_with_kernel, StochasticDistanceInput, StochasticDistanceParams,
+        StochasticDistanceInput, StochasticDistanceParams, stochastic_distance_with_kernel,
     };
     use crate::indicators::trend_trigger_factor::{
-        trend_trigger_factor_with_kernel, TrendTriggerFactorInput, TrendTriggerFactorParams,
+        TrendTriggerFactorInput, TrendTriggerFactorParams, trend_trigger_factor_with_kernel,
     };
     use crate::indicators::trix::{
-        trix_batch_with_kernel, trix_with_kernel, TrixBatchRange, TrixInput, TrixParams,
+        TrixBatchRange, TrixInput, TrixParams, trix_batch_with_kernel, trix_with_kernel,
     };
-    use crate::indicators::ttm_trend::{ttm_trend_with_kernel, TtmTrendInput, TtmTrendParams};
+    use crate::indicators::ttm_trend::{TtmTrendInput, TtmTrendParams, ttm_trend_with_kernel};
     use crate::indicators::velocity_acceleration_convergence_divergence_indicator::{
-        velocity_acceleration_convergence_divergence_indicator_with_kernel,
         VelocityAccelerationConvergenceDivergenceIndicatorInput,
         VelocityAccelerationConvergenceDivergenceIndicatorParams,
+        velocity_acceleration_convergence_divergence_indicator_with_kernel,
     };
     use crate::indicators::velocity_acceleration_indicator::{
-        velocity_acceleration_indicator_with_kernel, VelocityAccelerationIndicatorInput,
-        VelocityAccelerationIndicatorParams,
+        VelocityAccelerationIndicatorInput, VelocityAccelerationIndicatorParams,
+        velocity_acceleration_indicator_with_kernel,
     };
     use crate::indicators::volatility_quality_index::{
-        volatility_quality_index_with_kernel, VolatilityQualityIndexInput,
-        VolatilityQualityIndexParams,
+        VolatilityQualityIndexInput, VolatilityQualityIndexParams,
+        volatility_quality_index_with_kernel,
     };
     use crate::indicators::volatility_ratio_adaptive_rsx::{
-        volatility_ratio_adaptive_rsx_with_kernel, VolatilityRatioAdaptiveRsxInput,
-        VolatilityRatioAdaptiveRsxParams,
+        VolatilityRatioAdaptiveRsxInput, VolatilityRatioAdaptiveRsxParams,
+        volatility_ratio_adaptive_rsx_with_kernel,
     };
     use crate::indicators::volume_energy_reservoirs::{
-        volume_energy_reservoirs_with_kernel, VolumeEnergyReservoirsInput,
-        VolumeEnergyReservoirsParams,
+        VolumeEnergyReservoirsInput, VolumeEnergyReservoirsParams,
+        volume_energy_reservoirs_with_kernel,
     };
     use crate::indicators::volume_zone_oscillator::{
-        volume_zone_oscillator_with_kernel, VolumeZoneOscillatorInput, VolumeZoneOscillatorParams,
+        VolumeZoneOscillatorInput, VolumeZoneOscillatorParams, volume_zone_oscillator_with_kernel,
     };
-    use crate::indicators::vpci::{vpci_with_kernel, VpciInput, VpciParams};
+    use crate::indicators::vpci::{VpciInput, VpciParams, vpci_with_kernel};
     use crate::indicators::vwap_deviation_oscillator::{
-        vwap_deviation_oscillator_with_kernel, VwapDeviationMode, VwapDeviationOscillatorInput,
-        VwapDeviationOscillatorParams, VwapDeviationSessionMode,
+        VwapDeviationMode, VwapDeviationOscillatorInput, VwapDeviationOscillatorParams,
+        VwapDeviationSessionMode, vwap_deviation_oscillator_with_kernel,
     };
     use crate::indicators::vwap_zscore_with_signals::{
-        vwap_zscore_with_signals_with_kernel, VwapZscoreWithSignalsInput,
-        VwapZscoreWithSignalsParams,
+        VwapZscoreWithSignalsInput, VwapZscoreWithSignalsParams,
+        vwap_zscore_with_signals_with_kernel,
     };
     use crate::indicators::yang_zhang_volatility::{
-        yang_zhang_volatility_with_kernel, YangZhangVolatilityInput, YangZhangVolatilityParams,
+        YangZhangVolatilityInput, YangZhangVolatilityParams, yang_zhang_volatility_with_kernel,
     };
-    use crate::indicators::zscore::{zscore_with_kernel, ZscoreInput, ZscoreParams};
+    use crate::indicators::zscore::{ZscoreInput, ZscoreParams, zscore_with_kernel};
     use crate::utilities::data_loader::Candles;
     use crate::utilities::enums::Kernel;
     use std::time::Instant;
@@ -17831,6 +17959,1284 @@ mod tests {
                 "mismatch at index {i}: actual={a}, expected={b}, tol={tol}"
             );
         }
+    }
+
+    #[test]
+    fn adaptive_bounds_rsi_uses_registry_output_ids_without_retired_aliases() {
+        for (output_id, expected) in [
+            ("lower", AdaptiveBoundsRsiOutputField::LowerBound),
+            ("middle", AdaptiveBoundsRsiOutputField::Mid),
+            ("upper", AdaptiveBoundsRsiOutputField::UpperBound),
+        ] {
+            assert_eq!(adaptive_bounds_rsi_field(output_id).unwrap(), expected);
+        }
+        for retired in ["lower_bound", "mid", "upper_bound"] {
+            assert!(matches!(
+                adaptive_bounds_rsi_field(retired),
+                Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                    if indicator == "adaptive_bounds_rsi" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn aroon_uses_registry_output_ids_without_retired_aliases() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("aroon").unwrap();
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["up", "down"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["length"]
+        );
+        let length = &info.params[0];
+        assert!(matches!(length.kind, IndicatorParamKind::Int));
+        assert!(!length.required);
+        assert_eq!(length.default, Some(ParamValueStatic::Int(14)));
+        assert_eq!(length.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(length.max, None);
+
+        let (_open, high, low, _close) = sample_ohlc();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["up", "down"] {
+            let output = compute_aroon_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "aroon",
+                    output_id: Some(output_id),
+                    data: IndicatorDataRef::HighLow {
+                        high: &high,
+                        low: &low,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                output_id,
+            )
+            .unwrap();
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, high.len()));
+            assert_eq!(output.values_f64.unwrap().len(), high.len());
+        }
+
+        for retired in ["value", "aroon_up", "aroon_down"] {
+            assert!(matches!(
+                compute_aroon_batch(
+                    IndicatorBatchRequest {
+                        indicator_id: "aroon",
+                        output_id: Some(retired),
+                        data: IndicatorDataRef::HighLow {
+                            high: &high,
+                            low: &low,
+                        },
+                        combos: &combos,
+                        kernel: Kernel::Scalar,
+                    },
+                    retired,
+                ),
+                Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                    if indicator == "aroon" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn aso_uses_registry_output_ids_and_exact_mode_bounds_without_retired_aliases() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("aso").unwrap();
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["bulls", "bears"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "mode"]
+        );
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(10)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(period.max, None);
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+
+        let mode = &info.params[1];
+        assert!(matches!(mode.kind, IndicatorParamKind::Int));
+        assert!(!mode.required);
+        assert_eq!(mode.default, Some(ParamValueStatic::Int(0)));
+        assert_eq!(mode.min.map(f64::to_bits), Some(0.0_f64.to_bits()));
+        assert_eq!(mode.max.map(f64::to_bits), Some(2.0_f64.to_bits()));
+        assert_eq!(mode.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+
+        let (open, high, low, close) = sample_ohlc();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["bulls", "bears"] {
+            let output = compute_aso_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "aso",
+                    output_id: Some(output_id),
+                    data: IndicatorDataRef::Ohlc {
+                        open: &open,
+                        high: &high,
+                        low: &low,
+                        close: &close,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                output_id,
+            )
+            .unwrap();
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+            assert_eq!(output.values_f64.unwrap().len(), close.len());
+        }
+
+        for retired in ["value", "bull", "bear", "output_0", "output_1"] {
+            assert!(matches!(
+                compute_aso_batch(
+                    IndicatorBatchRequest {
+                        indicator_id: "aso",
+                        output_id: Some(retired),
+                        data: IndicatorDataRef::Ohlc {
+                            open: &open,
+                            high: &high,
+                            low: &low,
+                            close: &close,
+                        },
+                        combos: &combos,
+                        kernel: Kernel::Scalar,
+                    },
+                    retired,
+                ),
+                Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                    if indicator == "aso" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn autocorrelation_indicator_uses_exact_registry_contract_without_value_alias() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("autocorrelation_indicator")
+            .expect("autocorrelation_indicator needs one canonical registry entry");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["filtered", "correlation"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["length", "lag", "use_test_signal"]
+        );
+
+        for (index, (key, default)) in [("length", 20_i64), ("lag", 1_i64)].into_iter().enumerate()
+        {
+            let parameter = &info.params[index];
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert_eq!(parameter.max, None);
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+        let use_test_signal = &info.params[2];
+        assert!(matches!(use_test_signal.kind, IndicatorParamKind::Bool));
+        assert!(!use_test_signal.required);
+        assert_eq!(use_test_signal.default, Some(ParamValueStatic::Bool(false)));
+        assert_eq!(use_test_signal.min, None);
+        assert_eq!(use_test_signal.max, None);
+        assert_eq!(use_test_signal.step, None);
+        assert_eq!(use_test_signal.enum_values, ["true", "false"]);
+
+        let data = sample_series();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["filtered", "correlation"] {
+            let output = compute_autocorrelation_indicator_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "autocorrelation_indicator",
+                    output_id: Some(output_id),
+                    data: IndicatorDataRef::Slice { values: &data },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                output_id,
+            )
+            .unwrap();
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, data.len()));
+            assert_eq!(output.values_f64.unwrap().len(), data.len());
+        }
+        assert!(matches!(
+            compute_autocorrelation_indicator_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "autocorrelation_indicator",
+                    output_id: Some("value"),
+                    data: IndicatorDataRef::Slice { values: &data },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                "value",
+            ),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "autocorrelation_indicator" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn avsl_uses_exact_registry_contract_and_only_canonical_value_output() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("avsl")
+            .expect("AVSL needs one canonical runtime registry entry");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["value"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["fast_period", "slow_period", "multiplier"]
+        );
+
+        for (index, (key, default)) in [("fast_period", 12_i64), ("slow_period", 26_i64)]
+            .into_iter()
+            .enumerate()
+        {
+            let parameter = &info.params[index];
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert_eq!(parameter.max, None);
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+        let multiplier = &info.params[2];
+        assert_eq!(multiplier.key, "multiplier");
+        assert!(matches!(multiplier.kind, IndicatorParamKind::Float));
+        assert!(!multiplier.required);
+        assert_eq!(multiplier.default, Some(ParamValueStatic::Float(2.0)));
+        assert_eq!(multiplier.min.map(f64::to_bits), Some(0.1_f64.to_bits()));
+        assert_eq!(multiplier.max, None);
+        assert_eq!(multiplier.step.map(f64::to_bits), Some(0.1_f64.to_bits()));
+        assert!(multiplier.enum_values.is_empty());
+
+        let (open, high, low, close) = sample_ohlc();
+        let volume: Vec<f64> = (0..close.len())
+            .map(|index| 1_000.0 + index as f64 * 3.0)
+            .collect();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let request = |output_id: &'static str| IndicatorBatchRequest {
+            indicator_id: "avsl",
+            output_id: Some(output_id),
+            data: IndicatorDataRef::Ohlcv {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+                volume: &volume,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        };
+        let output = compute_avsl_batch(request("value"), "value").unwrap();
+        assert_eq!(output.output_id, "value");
+        assert_eq!((output.rows, output.cols), (1, close.len()));
+        assert_eq!(output.values_f64.unwrap().len(), close.len());
+
+        assert!(matches!(
+            compute_avsl_batch(request("values"), "values"),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "avsl" && output == "values"
+        ));
+    }
+
+    #[test]
+    fn bandpass_uses_exact_registry_contract_without_retired_output_aliases() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("bandpass")
+            .expect("Bandpass needs one canonical runtime registry entry");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["bp", "bp_normalized", "signal", "trigger"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "bandwidth"]
+        );
+
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(20)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(period.max, None);
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let bandwidth = &info.params[1];
+        assert!(matches!(bandwidth.kind, IndicatorParamKind::Float));
+        assert!(!bandwidth.required);
+        assert_eq!(bandwidth.default, Some(ParamValueStatic::Float(0.3)));
+        assert_eq!(
+            bandwidth.min.map(f64::to_bits),
+            Some(f64::from_bits(1).to_bits())
+        );
+        assert_eq!(bandwidth.max.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(bandwidth.step, None);
+        assert!(bandwidth.enum_values.is_empty());
+
+        let seed = sample_series();
+        let data = seed.iter().copied().cycle().take(512).collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let request = |output_id: &'static str| IndicatorBatchRequest {
+            indicator_id: "bandpass",
+            output_id: Some(output_id),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        };
+        for canonical in ["bp", "bp_normalized", "signal", "trigger"] {
+            let output = compute_bandpass_batch(request(canonical), canonical).unwrap();
+            assert_eq!(output.output_id, canonical);
+            assert_eq!((output.rows, output.cols), (1, data.len()));
+            assert_eq!(output.values_f64.unwrap().len(), data.len());
+        }
+        for retired in ["value", "normalized"] {
+            assert!(matches!(
+                compute_bandpass_batch(request(retired), retired),
+                Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                    if indicator == "bandpass" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn bollinger_bands_uses_exact_registry_contract_without_value_alias() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("bollinger_bands")
+            .expect("Bollinger Bands needs one canonical runtime registry entry");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["upper", "middle", "lower"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "devup", "devdn"]
+        );
+
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(20)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(period.max, None);
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        for (parameter, key) in info.params[1..].iter().zip(["devup", "devdn"]) {
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Float));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Float(2.0)));
+            assert_eq!(parameter.min, None);
+            assert_eq!(parameter.max, None);
+            assert_eq!(parameter.step, None);
+            assert!(parameter.enum_values.is_empty());
+        }
+
+        let seed = sample_series();
+        let data = seed.iter().copied().cycle().take(512).collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let request = |output_id: &'static str| IndicatorBatchRequest {
+            indicator_id: "bollinger_bands",
+            output_id: Some(output_id),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        };
+        for canonical in ["upper", "middle", "lower"] {
+            let output = compute_bollinger_batch(request(canonical), canonical).unwrap();
+            assert_eq!(output.output_id, canonical);
+            assert_eq!((output.rows, output.cols), (1, data.len()));
+            assert_eq!(output.values_f64.unwrap().len(), data.len());
+        }
+        assert!(matches!(
+            compute_bollinger_batch(request("value"), "value"),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "bollinger_bands" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn buff_averages_uses_exact_registry_defaults_without_legacy_output_aliases() {
+        use crate::indicators::moving_averages::buff_averages::{
+            BuffAveragesBatchRange, buff_averages_batch_with_kernel,
+        };
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("buff_averages")
+            .expect("Buff Averages needs one canonical runtime registry entry");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["fast", "slow"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["fast_period", "slow_period", "output"]
+        );
+        assert_eq!(info.params[0].default, Some(ParamValueStatic::Int(5)));
+        assert_eq!(info.params[1].default, Some(ParamValueStatic::Int(20)));
+        assert_eq!(
+            info.params[2].default,
+            Some(ParamValueStatic::EnumString("fast"))
+        );
+
+        let candles = sample_candles();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let direct = buff_averages_batch_with_kernel(
+            &candles.close,
+            &candles.volume,
+            &BuffAveragesBatchRange {
+                fast_period: (5, 5, 0),
+                slow_period: (20, 20, 0),
+            },
+            Kernel::ScalarBatch,
+        )
+        .expect("the exact registry default tuple must compute on CPU");
+        for (output_id, expected) in [("fast", direct.fast), ("slow", direct.slow)] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "buff_averages",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Candles {
+                    candles: &candles,
+                    source: Some("close"),
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect("canonical Buff Averages CPU dispatch must accept its default tuple");
+            let actual = output
+                .values_f64
+                .expect("Buff Averages canonical outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost the NaN prefix");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] did not use exact default tuple (5,20)"
+                    );
+                }
+            }
+        }
+
+        for retired in ["fast_buff", "slow_buff"] {
+            let params = [MaBatchParamKV {
+                key: "output",
+                value: MaBatchParamValue::EnumString(retired),
+            }];
+            let error = ma_batch_with_kernel_and_typed_params(
+                "buff_averages",
+                MaData::Candles {
+                    candles: &candles,
+                    source: "close",
+                },
+                (20, 20, 0),
+                Kernel::Scalar,
+                &params,
+            )
+            .expect_err("retired Buff Averages aliases must fail closed")
+            .to_string();
+            assert!(error.contains("expected 'fast' or 'slow'"));
+        }
+    }
+
+    #[test]
+    fn candle_strength_oscillator_uses_exact_registry_defaults_without_retired_aliases() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("candle_strength_oscillator")
+            .expect("Candle Strength Oscillator needs one canonical runtime registry entry");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            [
+                "strength",
+                "highs",
+                "lows",
+                "mid",
+                "long_signal",
+                "short_signal",
+            ]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "atr_enabled", "atr_length", "mode"]
+        );
+
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(50)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(period.max, None);
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let atr_enabled = &info.params[1];
+        assert!(matches!(atr_enabled.kind, IndicatorParamKind::Bool));
+        assert!(!atr_enabled.required);
+        assert_eq!(atr_enabled.default, Some(ParamValueStatic::Bool(false)));
+        assert_eq!(atr_enabled.min, None);
+        assert_eq!(atr_enabled.max, None);
+        assert_eq!(atr_enabled.step, None);
+        assert!(atr_enabled.enum_values.is_empty());
+
+        let atr_length = &info.params[2];
+        assert!(matches!(atr_length.kind, IndicatorParamKind::Int));
+        assert!(!atr_length.required);
+        assert_eq!(atr_length.default, Some(ParamValueStatic::Int(50)));
+        assert_eq!(atr_length.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(atr_length.max, None);
+        assert_eq!(atr_length.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(atr_length.enum_values.is_empty());
+
+        let mode = &info.params[3];
+        assert!(matches!(mode.kind, IndicatorParamKind::EnumString));
+        assert!(!mode.required);
+        assert_eq!(
+            mode.default,
+            Some(ParamValueStatic::EnumString("bollinger"))
+        );
+        assert_eq!(mode.min, None);
+        assert_eq!(mode.max, None);
+        assert_eq!(mode.step, None);
+        assert_eq!(mode.enum_values, ["bollinger", "donchian"]);
+
+        let candles = sample_candles();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let direct = candle_strength_oscillator_with_kernel(
+            &CandleStrengthOscillatorInput::from_candles(
+                &candles,
+                CandleStrengthOscillatorParams::default(),
+            ),
+            Kernel::Scalar,
+        )
+        .expect("the exact registry default tuple must compute on CPU");
+        for (output_id, expected) in [
+            ("strength", direct.strength),
+            ("highs", direct.highs),
+            ("lows", direct.lows),
+            ("mid", direct.mid),
+            ("long_signal", direct.long_signal),
+            ("short_signal", direct.short_signal),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "candle_strength_oscillator",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Candles {
+                    candles: &candles,
+                    source: None,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect("canonical Candle Strength Oscillator CPU dispatch must accept its defaults");
+            let actual = output
+                .values_f64
+                .expect("Candle Strength Oscillator canonical outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost the NaN prefix");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] did not use the exact default tuple"
+                    );
+                }
+            }
+        }
+
+        assert!(matches!(
+            compute_candle_strength_oscillator_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "candle_strength_oscillator",
+                    output_id: Some("value"),
+                    data: IndicatorDataRef::Candles {
+                        candles: &candles,
+                        source: None,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                "value",
+            ),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "candle_strength_oscillator" && output == "value"
+        ));
+
+        for retired_mode in ["bb", "dc"] {
+            let params = [ParamKV {
+                key: "mode",
+                value: ParamValue::EnumString(retired_mode),
+            }];
+            let alias_combos = [IndicatorParamSet { params: &params }];
+            assert!(matches!(
+                compute_candle_strength_oscillator_batch(
+                    IndicatorBatchRequest {
+                        indicator_id: "candle_strength_oscillator",
+                        output_id: Some("strength"),
+                        data: IndicatorDataRef::Candles {
+                            candles: &candles,
+                            source: None,
+                        },
+                        combos: &alias_combos,
+                        kernel: Kernel::Scalar,
+                    },
+                    "strength",
+                ),
+                Err(IndicatorDispatchError::InvalidParam { indicator, key, .. })
+                    if indicator == "candle_strength_oscillator" && key == "mode"
+            ));
+        }
+    }
+
+    #[test]
+    fn chandelier_exit_uses_exact_registry_defaults_without_value_alias() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("chandelier_exit")
+            .expect("Chandelier Exit needs one canonical runtime registry entry");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["long_stop", "short_stop"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "mult", "use_close"]
+        );
+
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(22)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(period.max, None);
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let mult = &info.params[1];
+        assert!(matches!(mult.kind, IndicatorParamKind::Float));
+        assert!(!mult.required);
+        assert_eq!(mult.default, Some(ParamValueStatic::Float(3.0)));
+        assert_eq!(mult.min.map(f64::to_bits), Some(0.0_f64.to_bits()));
+        assert_eq!(mult.max, None);
+        assert_eq!(mult.step, None);
+        assert!(mult.enum_values.is_empty());
+
+        let use_close = &info.params[2];
+        assert!(matches!(use_close.kind, IndicatorParamKind::Bool));
+        assert!(!use_close.required);
+        assert_eq!(use_close.default, Some(ParamValueStatic::Bool(true)));
+        assert_eq!(use_close.min, None);
+        assert_eq!(use_close.max, None);
+        assert_eq!(use_close.step, None);
+        assert_eq!(use_close.enum_values, ["true", "false"]);
+
+        let candles = sample_candles();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let direct = chandelier_exit_with_kernel(
+            &ChandelierExitInput::from_candles(&candles, ChandelierExitParams::default()),
+            Kernel::Scalar,
+        )
+        .expect("the exact Chandelier Exit registry default tuple must compute on CPU");
+        for (output_id, expected) in [
+            ("long_stop", direct.long_stop),
+            ("short_stop", direct.short_stop),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "chandelier_exit",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Candles {
+                    candles: &candles,
+                    source: None,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect("canonical Chandelier Exit CPU dispatch must accept its defaults");
+            let actual = output
+                .values_f64
+                .expect("Chandelier Exit canonical outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost the NaN prefix");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] did not use the exact default tuple"
+                    );
+                }
+            }
+        }
+
+        assert!(matches!(
+            compute_chandelier_exit_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "chandelier_exit",
+                    output_id: Some("value"),
+                    data: IndicatorDataRef::Candles {
+                        candles: &candles,
+                        source: None,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                "value",
+            ),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "chandelier_exit" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn cksp_uses_exact_registry_defaults_without_retired_output_aliases() {
+        use crate::indicators::registry::ParamValueStatic;
+
+        let info = crate::indicators::registry::get_indicator("cksp")
+            .expect("CKSP needs one canonical runtime registry entry");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["long_values", "short_values"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["p", "x", "q"]
+        );
+
+        let p = &info.params[0];
+        assert!(matches!(p.kind, IndicatorParamKind::Int));
+        assert!(!p.required);
+        assert_eq!(p.default, Some(ParamValueStatic::Int(10)));
+        assert_eq!(p.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(p.max, None);
+        assert_eq!(p.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(p.enum_values.is_empty());
+
+        let x = &info.params[1];
+        assert!(matches!(x.kind, IndicatorParamKind::Float));
+        assert!(!x.required);
+        assert_eq!(x.default, Some(ParamValueStatic::Float(1.0)));
+        assert_eq!(x.min.map(f64::to_bits), Some(0.0_f64.to_bits()));
+        assert_eq!(x.max, None);
+        assert_eq!(x.step, None);
+        assert!(x.enum_values.is_empty());
+
+        let q = &info.params[2];
+        assert!(matches!(q.kind, IndicatorParamKind::Int));
+        assert!(!q.required);
+        assert_eq!(q.default, Some(ParamValueStatic::Int(9)));
+        assert_eq!(q.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(q.max, None);
+        assert_eq!(q.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(q.enum_values.is_empty());
+
+        let candles = sample_candles();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let direct = cksp_with_kernel(
+            &CkspInput::from_candles(&candles, CkspParams::default()),
+            Kernel::Scalar,
+        )
+        .expect("the exact CKSP registry default tuple must compute on CPU");
+        for (output_id, expected) in [
+            ("long_values", direct.long_values),
+            ("short_values", direct.short_values),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "cksp",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Candles {
+                    candles: &candles,
+                    source: None,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect("canonical CKSP CPU dispatch must accept its defaults");
+            let actual = output
+                .values_f64
+                .expect("CKSP canonical outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost the NaN prefix");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] did not use the exact default tuple"
+                    );
+                }
+            }
+        }
+
+        for retired in ["long", "short", "value"] {
+            assert!(matches!(
+                compute_cksp_batch(
+                    IndicatorBatchRequest {
+                        indicator_id: "cksp",
+                        output_id: Some(retired),
+                        data: IndicatorDataRef::Candles {
+                            candles: &candles,
+                            source: None,
+                        },
+                        combos: &combos,
+                        kernel: Kernel::Scalar,
+                    },
+                    retired,
+                ),
+                Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                    if indicator == "cksp" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn adaptive_macd_uses_registry_output_ids_without_value_alias() {
+        for (output_id, expected) in [
+            ("macd", AdaptiveMacdOutputField::Macd),
+            ("signal", AdaptiveMacdOutputField::Signal),
+            ("hist", AdaptiveMacdOutputField::Hist),
+        ] {
+            assert_eq!(adaptive_macd_field(output_id).unwrap(), expected);
+        }
+        assert!(matches!(
+            adaptive_macd_field("value"),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "adaptive_macd" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn adaptive_momentum_uses_registry_output_ids_without_value_alias() {
+        for (output_id, expected) in [
+            ("amo", AdaptiveMomentumOscillatorOutputField::Amo),
+            ("ama", AdaptiveMomentumOscillatorOutputField::Ama),
+        ] {
+            assert_eq!(
+                adaptive_momentum_oscillator_field(output_id).unwrap(),
+                expected
+            );
+        }
+        assert!(matches!(
+            adaptive_momentum_oscillator_field("value"),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "adaptive_momentum_oscillator" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn adaptive_schaff_uses_registry_output_ids_without_retired_aliases() {
+        for (output_id, expected) in [
+            ("stc", AdaptiveSchaffTrendCycleOutputField::Stc),
+            ("histogram", AdaptiveSchaffTrendCycleOutputField::Histogram),
+        ] {
+            assert_eq!(
+                adaptive_schaff_trend_cycle_field(output_id).unwrap(),
+                expected
+            );
+        }
+        for retired in ["value", "hist"] {
+            assert!(matches!(
+                adaptive_schaff_trend_cycle_field(retired),
+                Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                    if indicator == "adaptive_schaff_trend_cycle" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn adjustable_ma_uses_registry_output_ids_without_value_alias() {
+        let (open, high, low, close) = sample_ohlc();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in [
+            "ma",
+            "upper",
+            "lower",
+            "extremity",
+            "state",
+            "changed",
+            "smoothed_open",
+            "smoothed_high",
+            "smoothed_low",
+            "smoothed_close",
+        ] {
+            let field = adjustable_ma_alternating_extremities_field(output_id).unwrap();
+            assert!(matches!(
+                (output_id, field),
+                ("ma", AdjustableMaAlternatingExtremitiesOutputField::Ma)
+                    | (
+                        "upper",
+                        AdjustableMaAlternatingExtremitiesOutputField::Upper
+                    )
+                    | (
+                        "lower",
+                        AdjustableMaAlternatingExtremitiesOutputField::Lower
+                    )
+                    | (
+                        "extremity",
+                        AdjustableMaAlternatingExtremitiesOutputField::Extremity
+                    )
+                    | (
+                        "state",
+                        AdjustableMaAlternatingExtremitiesOutputField::State
+                    )
+                    | (
+                        "changed",
+                        AdjustableMaAlternatingExtremitiesOutputField::Changed
+                    )
+                    | (
+                        "smoothed_open",
+                        AdjustableMaAlternatingExtremitiesOutputField::SmoothedOpen
+                    )
+                    | (
+                        "smoothed_high",
+                        AdjustableMaAlternatingExtremitiesOutputField::SmoothedHigh
+                    )
+                    | (
+                        "smoothed_low",
+                        AdjustableMaAlternatingExtremitiesOutputField::SmoothedLow
+                    )
+                    | (
+                        "smoothed_close",
+                        AdjustableMaAlternatingExtremitiesOutputField::SmoothedClose
+                    )
+            ));
+
+            let output = compute_cpu_batch_strict(IndicatorBatchRequest {
+                indicator_id: "adjustable_ma_alternating_extremities",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Auto,
+            })
+            .unwrap();
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+            assert_eq!(output.values_f64.unwrap().len(), close.len());
+        }
+        assert!(matches!(
+            adjustable_ma_alternating_extremities_field("value"),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "adjustable_ma_alternating_extremities" && output == "value"
+        ));
+        assert!(matches!(
+            compute_cpu_batch_strict(IndicatorBatchRequest {
+                indicator_id: "adjustable_ma_alternating_extremities",
+                output_id: Some("value"),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Auto,
+            }),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "adjustable_ma_alternating_extremities" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn alligator_uses_registry_output_ids_without_value_alias() {
+        let info = crate::indicators::registry::get_indicator("alligator").unwrap();
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["jaw", "teeth", "lips"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|param| param.key)
+                .collect::<Vec<_>>(),
+            [
+                "jaw_period",
+                "jaw_offset",
+                "teeth_period",
+                "teeth_offset",
+                "lips_period",
+                "lips_offset",
+            ]
+        );
+
+        let (_open, high, low, _close) = sample_ohlc();
+        let hl2 = high
+            .iter()
+            .zip(&low)
+            .map(|(high, low)| (high + low) / 2.0)
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["jaw", "teeth", "lips"] {
+            let output = compute_alligator_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "alligator",
+                    output_id: Some(output_id),
+                    data: IndicatorDataRef::Slice { values: &hl2 },
+                    combos: &combos,
+                    kernel: Kernel::Auto,
+                },
+                output_id,
+            )
+            .unwrap();
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, hl2.len()));
+            assert_eq!(output.values_f64.unwrap().len(), hl2.len());
+        }
+        assert!(matches!(
+            compute_alligator_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "alligator",
+                    output_id: Some("value"),
+                    data: IndicatorDataRef::Slice { values: &hl2 },
+                    combos: &combos,
+                    kernel: Kernel::Auto,
+                },
+                "value",
+            ),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "alligator" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn alphatrend_uses_registry_output_ids_without_value_alias() {
+        let info = crate::indicators::registry::get_indicator("alphatrend").unwrap();
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["k1", "k2"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|param| param.key)
+                .collect::<Vec<_>>(),
+            ["coeff", "period", "no_volume"]
+        );
+        assert!(matches!(
+            info.params[0].default,
+            Some(ParamValueStatic::Float(value)) if value.to_bits() == 1.0_f64.to_bits()
+        ));
+        assert!(matches!(
+            info.params[1].default,
+            Some(ParamValueStatic::Int(14))
+        ));
+        assert!(matches!(
+            info.params[2].default,
+            Some(ParamValueStatic::Bool(false))
+        ));
+
+        for (output_id, expected) in [
+            ("k1", AlphaTrendOutputField::K1),
+            ("k2", AlphaTrendOutputField::K2),
+        ] {
+            assert!(matches!(
+                (alphatrend_field(output_id).unwrap(), expected),
+                (AlphaTrendOutputField::K1, AlphaTrendOutputField::K1)
+                    | (AlphaTrendOutputField::K2, AlphaTrendOutputField::K2)
+            ));
+        }
+
+        let candles = sample_candles();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["k1", "k2"] {
+            let output = compute_alphatrend_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "alphatrend",
+                    output_id: Some(output_id),
+                    data: IndicatorDataRef::Candles {
+                        candles: &candles,
+                        source: None,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                output_id,
+            )
+            .unwrap();
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, candles.close.len()));
+            assert_eq!(output.values_f64.unwrap().len(), candles.close.len());
+        }
+        assert!(matches!(
+            compute_alphatrend_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "alphatrend",
+                    output_id: Some("value"),
+                    data: IndicatorDataRef::Candles {
+                        candles: &candles,
+                        source: None,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                "value",
+            ),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "alphatrend" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn acosc_uses_registry_output_ids_without_value_alias() {
+        let info = crate::indicators::registry::get_indicator("acosc").unwrap();
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["osc", "change"]
+        );
+        assert!(info.params.is_empty());
+
+        for (output_id, expected) in [
+            ("osc", AcoscOutputField::Osc),
+            ("change", AcoscOutputField::Change),
+        ] {
+            assert!(matches!(
+                (acosc_field(output_id).unwrap(), expected),
+                (AcoscOutputField::Osc, AcoscOutputField::Osc)
+                    | (AcoscOutputField::Change, AcoscOutputField::Change)
+            ));
+        }
+
+        let (open, high, low, close) = sample_ohlc();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["osc", "change"] {
+            let output = compute_acosc_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "acosc",
+                    output_id: Some(output_id),
+                    data: IndicatorDataRef::Ohlc {
+                        open: &open,
+                        high: &high,
+                        low: &low,
+                        close: &close,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                output_id,
+            )
+            .unwrap();
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+            assert_eq!(output.values_f64.unwrap().len(), close.len());
+        }
+        assert!(matches!(
+            compute_acosc_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "acosc",
+                    output_id: Some("value"),
+                    data: IndicatorDataRef::Ohlc {
+                        open: &open,
+                        high: &high,
+                        low: &low,
+                        close: &close,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                "value",
+            ),
+            Err(IndicatorDispatchError::UnknownOutput { indicator, output })
+                if indicator == "acosc" && output == "value"
+        ));
     }
 
     #[test]
@@ -19267,6 +20673,25 @@ mod tests {
             .values;
         let got = out.values_f64.unwrap();
         assert_series_eq(&got, &direct, 1e-12);
+    }
+
+    #[test]
+    fn emd_accepts_its_actual_high_low_contract_without_close_or_volume() {
+        let (_open, high, low, _close) = sample_ohlc();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let req = IndicatorBatchRequest {
+            indicator_id: "emd",
+            output_id: Some("upperband"),
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Auto,
+        };
+        let output = compute_cpu_batch_strict(req)
+            .expect("EMD reads high/low only; close and volume are not required inputs");
+        assert_eq!(output.values_f64.expect("f64 EMD output").len(), high.len());
     }
 
     #[test]
@@ -22593,6 +24018,28 @@ mod tests {
         let values = dispatched.values_f64.as_ref().unwrap();
         assert_eq!(values.len(), close.len());
         assert_series_eq(values, &direct.trailing_stop, 1e-9);
+
+        let retired_alias = compute_fibonacci_trailing_stop_batch(
+            IndicatorBatchRequest {
+                indicator_id: "fibonacci_trailing_stop",
+                output_id: Some("value"),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Auto,
+            },
+            "value",
+        )
+        .expect_err("retired fibonacci_trailing_stop `value` alias must fail closed");
+        assert!(matches!(
+            retired_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "fibonacci_trailing_stop" && output == "value"
+        ));
     }
 
     #[test]
@@ -23289,5 +24736,4094 @@ mod tests {
         let values = dispatched.values_f64.as_ref().unwrap();
         assert_eq!(values.len(), high.len());
         assert_series_eq(values, &direct.values, 1e-9);
+    }
+
+    #[test]
+    fn coppock_uses_exact_registry_ratio_tuples_without_values_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        assert!(output_id_matches("values", "VALUES"));
+        assert!(output_id_matches("upper_band", "Upper-Band"));
+        assert!(
+            !output_id_matches("value", "values"),
+            "unversioned plural/singular output identities must not be aliased"
+        );
+
+        let info = get_indicator("coppock").expect("Coppock must remain registered");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["value"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["short_roc_period", "long_roc_period", "ma_period"]
+        );
+        for (parameter, expected_default) in info.params.iter().zip([11_i64, 14, 10]) {
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(
+                parameter.default,
+                Some(ParamValueStatic::Int(expected_default))
+            );
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+
+        let data = (0..512)
+            .map(|index| {
+                100.0
+                    + index as f64 * 0.07
+                    + (index as f64 * 0.13).sin() * 1.4
+                    + (index as f64 * 0.037).cos() * 0.6
+            })
+            .collect::<Vec<_>>();
+        let tuples = [
+            (11_usize, 14_usize, 10_usize),
+            (6, 7, 5),
+            (17, 21, 15),
+            (39, 50, 36),
+            (79, 100, 71),
+            (157, 200, 143),
+        ];
+        let parameter_storage = tuples
+            .iter()
+            .map(|&(short, long, ma)| {
+                vec![
+                    ParamKV {
+                        key: "short_roc_period",
+                        value: ParamValue::Int(short as i64),
+                    },
+                    ParamKV {
+                        key: "long_roc_period",
+                        value: ParamValue::Int(long as i64),
+                    },
+                    ParamKV {
+                        key: "ma_period",
+                        value: ParamValue::Int(ma as i64),
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let combos = parameter_storage
+            .iter()
+            .map(|params| IndicatorParamSet {
+                params: params.as_slice(),
+            })
+            .collect::<Vec<_>>();
+
+        let dispatched = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "coppock",
+            output_id: Some("value"),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect("every canonical Coppock tuple must dispatch");
+        assert_eq!(
+            (dispatched.rows, dispatched.cols),
+            (tuples.len(), data.len())
+        );
+        let actual = dispatched
+            .values_f64
+            .as_ref()
+            .expect("Coppock must produce f64 values");
+        for (row, &(short, long, ma)) in tuples.iter().enumerate() {
+            let expected = coppock_with_kernel(
+                &CoppockInput::from_slice(
+                    &data,
+                    CoppockParams {
+                        short_roc_period: Some(short),
+                        long_roc_period: Some(long),
+                        ma_period: Some(ma),
+                        ma_type: Some("wma".to_string()),
+                    },
+                ),
+                Kernel::Scalar,
+            )
+            .expect("the scalar Coppock authority must accept the canonical tuple")
+            .values;
+            for (column, (&cpu_batch, &cpu_scalar)) in actual
+                [row * data.len()..(row + 1) * data.len()]
+                .iter()
+                .zip(&expected)
+                .enumerate()
+            {
+                if cpu_scalar.is_nan() {
+                    assert!(cpu_batch.is_nan(), "row {row} column {column} lost NaN");
+                } else {
+                    assert_eq!(
+                        cpu_batch.to_bits(),
+                        cpu_scalar.to_bits(),
+                        "row {row} column {column} drifted from exact scalar bits"
+                    );
+                }
+            }
+        }
+
+        let alias_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "coppock",
+            output_id: Some("values"),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos[..1],
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("the retired unversioned `values` alias must fail closed");
+        assert!(matches!(
+            alias_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "coppock" && output == "values"
+        ));
+    }
+
+    #[test]
+    fn correlation_cycle_uses_exact_canonical_schema_without_value_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("correlation_cycle")
+            .expect("Correlation Cycle must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["real", "imag", "angle", "state"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "threshold"]
+        );
+
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(20)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let threshold = &info.params[1];
+        assert!(matches!(threshold.kind, IndicatorParamKind::Float));
+        assert!(!threshold.required);
+        assert_eq!(threshold.default, Some(ParamValueStatic::Float(9.0)));
+        assert!(threshold.min.is_none());
+        assert!(threshold.max.is_none());
+        assert!(threshold.step.is_none());
+        assert!(threshold.enum_values.is_empty());
+
+        let data = (0..512)
+            .map(|index| {
+                100.0
+                    + index as f64 * 0.07
+                    + (index as f64 * 0.13).sin() * 1.4
+                    + (index as f64 * 0.037).cos() * 0.6
+            })
+            .collect::<Vec<_>>();
+        let params = [
+            ParamKV {
+                key: "period",
+                value: ParamValue::Int(20),
+            },
+            ParamKV {
+                key: "threshold",
+                value: ParamValue::Float(9.0),
+            },
+        ];
+        let combos = [IndicatorParamSet { params: &params }];
+
+        for output_id in ["real", "imag", "angle", "state"] {
+            compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "correlation_cycle",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Correlation Cycle output `{output_id}` failed: {error}")
+            });
+        }
+
+        let public_alias_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "correlation_cycle",
+            output_id: Some("value"),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("the public resolver must reject the retired Correlation Cycle `value` alias");
+        assert!(matches!(
+            public_alias_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "correlation_cycle" && output == "value"
+        ));
+
+        let direct_alias_error = compute_correlation_cycle_batch(
+            IndicatorBatchRequest {
+                indicator_id: "correlation_cycle",
+                output_id: Some("value"),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("the retired direct Correlation Cycle `value` alias must fail closed");
+        assert!(matches!(
+            direct_alias_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "correlation_cycle" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn cvi_uses_exact_canonical_schema_and_rejects_values_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("cvi").expect("CVI must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["value"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period"]
+        );
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(10)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let high = (0..512)
+            .map(|index| 101.0 + index as f64 * 0.03 + (index as f64 * 0.11).sin())
+            .collect::<Vec<_>>();
+        let low = high
+            .iter()
+            .enumerate()
+            .map(|(index, high)| high - 0.7 - (index as f64 * 0.07).cos().abs())
+            .collect::<Vec<_>>();
+        let params = [ParamKV {
+            key: "period",
+            value: ParamValue::Int(10),
+        }];
+        let combos = [IndicatorParamSet { params: &params }];
+
+        let default_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "cvi",
+            output_id: None,
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect("the unsuffixed canonical CVI receipt must resolve to value");
+        assert_eq!(default_output.output_id, "value");
+        assert_eq!((default_output.rows, default_output.cols), (1, high.len()));
+
+        let canonical = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "cvi",
+            output_id: Some("value"),
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect("canonical CVI value output must dispatch");
+        assert_eq!((canonical.rows, canonical.cols), (1, high.len()));
+
+        let alias_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "cvi",
+            output_id: Some("values"),
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("the struct-field `values` alias must fail closed");
+        assert!(matches!(
+            alias_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "cvi" && output == "values"
+        ));
+    }
+
+    #[test]
+    fn cyberpunk_value_trend_analyzer_uses_exact_canonical_schema_and_rejects_aliases() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        const OUTPUT_IDS: [&str; 6] = [
+            "value_trend",
+            "value_trend_lag",
+            "deviation_index",
+            "overbought_signal",
+            "buy_signal",
+            "sell_signal",
+        ];
+        let info = get_indicator("cyberpunk_value_trend_analyzer")
+            .expect("Cyberpunk Value Trend Analyzer must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["entry_level", "exit_level"]
+        );
+        for (parameter, default) in info.params.iter().zip([30_i64, 75]) {
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert_eq!(parameter.max.map(f64::to_bits), Some(100.0_f64.to_bits()));
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+
+        let close = (0..256)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let open = close
+            .iter()
+            .enumerate()
+            .map(|(index, close)| close - 0.2 + (index as f64 * 0.03).cos() * 0.05)
+            .collect::<Vec<_>>();
+        let high = open
+            .iter()
+            .zip(&close)
+            .map(|(open, close)| f64::max(*open, *close) + 0.6)
+            .collect::<Vec<_>>();
+        let low = open
+            .iter()
+            .zip(&close)
+            .map(|(open, close)| f64::min(*open, *close) - 0.7)
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+
+        for output_id in OUTPUT_IDS {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "cyberpunk_value_trend_analyzer",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "canonical Cyberpunk Value Trend Analyzer output `{output_id}` failed: {error}"
+                )
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "cyberpunk_value_trend_analyzer",
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a six-output family must reject an ambiguous default output request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "cyberpunk_value_trend_analyzer" && key == "output_id"
+        ));
+
+        for alias in ["value", "lag", "overbought"] {
+            let public_error = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "cyberpunk_value_trend_analyzer",
+                output_id: Some(alias),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect_err("retired Cyberpunk Value Trend Analyzer alias must fail closed");
+            assert!(matches!(
+                public_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == "cyberpunk_value_trend_analyzer" && output == alias
+            ));
+
+            let direct_error = compute_cyberpunk_value_trend_analyzer_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "cyberpunk_value_trend_analyzer",
+                    output_id: Some(alias),
+                    data: IndicatorDataRef::Ohlc {
+                        open: &open,
+                        high: &high,
+                        low: &low,
+                        close: &close,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                alias,
+            )
+            .expect_err("retired direct Cyberpunk Value Trend Analyzer alias must fail closed");
+            assert!(matches!(
+                direct_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == "cyberpunk_value_trend_analyzer" && output == alias
+            ));
+        }
+    }
+
+    #[test]
+    fn cycle_channel_oscillator_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("cycle_channel_oscillator")
+            .expect("Cycle Channel Oscillator must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["fast", "slow"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            [
+                "source",
+                "short_cycle_length",
+                "medium_cycle_length",
+                "short_multiplier",
+                "medium_multiplier",
+            ]
+        );
+        assert!(matches!(
+            info.params[0].kind,
+            IndicatorParamKind::EnumString
+        ));
+        assert_eq!(
+            info.params[0].default,
+            Some(ParamValueStatic::EnumString("close"))
+        );
+        assert_eq!(
+            info.params[0].enum_values,
+            [
+                "open", "high", "low", "close", "hl2", "hlc3", "ohlc4", "hlcc4"
+            ]
+        );
+        for (parameter, default) in info.params[1..3].iter().zip([10_i64, 30]) {
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(2.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        }
+        for (parameter, default) in info.params[3..].iter().zip([1.0_f64, 3.0]) {
+            assert!(matches!(parameter.kind, IndicatorParamKind::Float));
+            assert_eq!(parameter.default, Some(ParamValueStatic::Float(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(0.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(0.1_f64.to_bits()));
+        }
+
+        let close = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let open = close
+            .iter()
+            .enumerate()
+            .map(|(index, close)| close - 0.2 + (index as f64 * 0.03).cos() * 0.05)
+            .collect::<Vec<_>>();
+        let high = open
+            .iter()
+            .zip(&close)
+            .map(|(open, close)| f64::max(*open, *close) + 0.6)
+            .collect::<Vec<_>>();
+        let low = open
+            .iter()
+            .zip(&close)
+            .map(|(open, close)| f64::min(*open, *close) - 0.7)
+            .collect::<Vec<_>>();
+        let timestamps = (0..close.len()).map(|index| index as i64).collect();
+        let volume = vec![1.0; close.len()];
+        let candles = Candles::new(timestamps, open, high, low, close, volume);
+        let combos = [IndicatorParamSet { params: &[] }];
+
+        for output_id in ["fast", "slow"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "cycle_channel_oscillator",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Candles {
+                    candles: &candles,
+                    source: Some("close"),
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Cycle Channel Oscillator output `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, candles.close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "cycle_channel_oscillator",
+            output_id: None,
+            data: IndicatorDataRef::Candles {
+                candles: &candles,
+                source: Some("close"),
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a two-output family must reject an ambiguous default output request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "cycle_channel_oscillator" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "cycle_channel_oscillator",
+            output_id: Some("value"),
+            data: IndicatorDataRef::Candles {
+                candles: &candles,
+                source: Some("close"),
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired Cycle Channel Oscillator `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "cycle_channel_oscillator" && output == "value"
+        ));
+
+        let direct_error = compute_cycle_channel_oscillator_batch(
+            IndicatorBatchRequest {
+                indicator_id: "cycle_channel_oscillator",
+                output_id: Some("value"),
+                data: IndicatorDataRef::Candles {
+                    candles: &candles,
+                    source: Some("close"),
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct Cycle Channel Oscillator `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "cycle_channel_oscillator" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn daily_factor_uses_exact_canonical_schema_and_rejects_unknown_output() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("daily_factor")
+            .expect("Daily Factor must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["value", "ema", "signal"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["threshold_level"]
+        );
+        let parameter = &info.params[0];
+        assert!(matches!(parameter.kind, IndicatorParamKind::Float));
+        assert!(!parameter.required);
+        assert_eq!(parameter.default, Some(ParamValueStatic::Float(0.35_f64)));
+        assert_eq!(parameter.min.map(f64::to_bits), Some(0.0_f64.to_bits()));
+        assert_eq!(parameter.max.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(parameter.step.map(f64::to_bits), Some(0.01_f64.to_bits()));
+        assert!(parameter.enum_values.is_empty());
+
+        let close = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let open = close
+            .iter()
+            .enumerate()
+            .map(|(index, close)| close - 0.2 + (index as f64 * 0.03).cos() * 0.05)
+            .collect::<Vec<_>>();
+        let high = open
+            .iter()
+            .zip(&close)
+            .map(|(open, close)| f64::max(*open, *close) + 0.6)
+            .collect::<Vec<_>>();
+        let low = open
+            .iter()
+            .zip(&close)
+            .map(|(open, close)| f64::min(*open, *close) - 0.7)
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+
+        for output_id in ["value", "ema", "signal"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "daily_factor",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Daily Factor output `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "daily_factor",
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a three-output family must reject an ambiguous default output request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "daily_factor" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "daily_factor",
+            output_id: Some("factor"),
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("unknown Daily Factor output must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "daily_factor" && output == "factor"
+        ));
+
+        let direct_error = compute_daily_factor_batch(
+            IndicatorBatchRequest {
+                indicator_id: "daily_factor",
+                output_id: Some("factor"),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "factor",
+        )
+        .expect_err("unknown direct Daily Factor output must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "daily_factor" && output == "factor"
+        ));
+    }
+
+    #[test]
+    fn damiani_volatmeter_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("damiani_volatmeter")
+            .expect("Damiani Volatmeter must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["vol", "anti"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["vis_atr", "vis_std", "sed_atr", "sed_std", "threshold"]
+        );
+        for (parameter, expected_default) in info.params[..4].iter().zip([13_i64, 20, 40, 100]) {
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(
+                parameter.default,
+                Some(ParamValueStatic::Int(expected_default))
+            );
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+        let threshold = &info.params[4];
+        assert!(matches!(threshold.kind, IndicatorParamKind::Float));
+        assert!(!threshold.required);
+        assert_eq!(threshold.default, Some(ParamValueStatic::Float(1.4_f64)));
+        assert!(threshold.min.is_none());
+        assert!(threshold.max.is_none());
+        assert!(threshold.step.is_none());
+        assert!(threshold.enum_values.is_empty());
+
+        let close = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["vol", "anti"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "damiani_volatmeter",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &close },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Damiani Volatmeter output `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "damiani_volatmeter",
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &close },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a two-output family must reject an ambiguous default output request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "damiani_volatmeter" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "damiani_volatmeter",
+            output_id: Some("value"),
+            data: IndicatorDataRef::Slice { values: &close },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired Damiani Volatmeter `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "damiani_volatmeter" && output == "value"
+        ));
+
+        let direct_error = compute_damiani_volatmeter_batch(
+            IndicatorBatchRequest {
+                indicator_id: "damiani_volatmeter",
+                output_id: Some("value"),
+                data: IndicatorDataRef::Slice { values: &close },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct Damiani Volatmeter `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "damiani_volatmeter" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn di_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("di").expect("DI must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["plus", "minus"]
+        );
+        assert_eq!(info.params.len(), 1);
+        let period = &info.params[0];
+        assert_eq!(period.key, "period");
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(14)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let close = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let high = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.4 + (index as f64 * 0.03).sin().abs())
+            .collect::<Vec<_>>();
+        let low = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.4 - (index as f64 * 0.05).cos().abs())
+            .collect::<Vec<_>>();
+        let open = close.clone();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["plus", "minus"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "di",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical DI output `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "di",
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a two-output DI family must reject an ambiguous default request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "di" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "di",
+            output_id: Some("value"),
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired DI `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "di" && output == "value"
+        ));
+
+        let direct_error = compute_di_batch(
+            IndicatorBatchRequest {
+                indicator_id: "di",
+                output_id: Some("value"),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct DI `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "di" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn didi_index_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("didi_index").expect("Didi Index must remain registered once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["short", "long", "crossover", "crossunder"]
+        );
+        assert_eq!(info.params.len(), 3);
+        for ((parameter, key), default) in info
+            .params
+            .iter()
+            .zip(["short_length", "medium_length", "long_length"])
+            .zip([3_i64, 8, 20])
+        {
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+
+        let data = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["short", "long", "crossover", "crossunder"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "didi_index",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Didi Index output `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, data.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "didi_index",
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a four-output Didi Index family must reject an ambiguous default request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "didi_index" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "didi_index",
+            output_id: Some("value"),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired Didi Index `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "didi_index" && output == "value"
+        ));
+
+        let direct_error = compute_didi_index_batch(
+            IndicatorBatchRequest {
+                indicator_id: "didi_index",
+                output_id: Some("value"),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct Didi Index `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "didi_index" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn directional_imbalance_index_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        let info = get_indicator("directional_imbalance_index")
+            .expect("Directional Imbalance Index must remain registered once");
+        assert_eq!(info.input_kind, IndicatorInputKind::HighLow);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["up", "down", "bulls", "bears", "upper", "lower"]
+        );
+        assert_eq!(info.params.len(), 2);
+        for ((parameter, key), default) in info
+            .params
+            .iter()
+            .zip(["length", "period"])
+            .zip([10_i64, 70])
+        {
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+
+        let high = (0..512)
+            .map(|index| 101.0 + index as f64 * 0.03 + (index as f64 * 0.11).sin())
+            .collect::<Vec<_>>();
+        let low = high
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.8 - (index as f64 * 0.07).cos().abs())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["up", "down", "bulls", "bears", "upper", "lower"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "directional_imbalance_index",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Directional Imbalance Index output `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, high.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "directional_imbalance_index",
+            output_id: None,
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a six-output family must reject an ambiguous default request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "directional_imbalance_index" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "directional_imbalance_index",
+            output_id: Some("value"),
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired Directional Imbalance Index `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "directional_imbalance_index" && output == "value"
+        ));
+
+        let direct_error = compute_directional_imbalance_index_batch(
+            IndicatorBatchRequest {
+                indicator_id: "directional_imbalance_index",
+                output_id: Some("value"),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct Directional Imbalance Index alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "directional_imbalance_index" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn disparity_index_uses_exact_canonical_schema_and_rejects_retired_output_aliases() {
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        let info = get_indicator("disparity_index")
+            .expect("Disparity Index must have one canonical registry entry");
+        assert_eq!(info.input_kind, IndicatorInputKind::Slice);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["value"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            [
+                "ema_period",
+                "lookback_period",
+                "smoothing_period",
+                "smoothing_type",
+            ]
+        );
+        for (parameter, default) in info.params[..3].iter().zip([14_i64, 14, 9]) {
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+        let smoothing_type = &info.params[3];
+        assert!(matches!(
+            smoothing_type.kind,
+            IndicatorParamKind::EnumString
+        ));
+        assert_eq!(
+            smoothing_type.default,
+            Some(ParamValueStatic::EnumString("ema"))
+        );
+        assert_eq!(smoothing_type.enum_values, ["ema", "sma"]);
+
+        let data = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.03 + (index as f64 * 0.11).sin())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in [None, Some("value")] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "disparity_index",
+                output_id,
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Disparity Index output {output_id:?} failed: {error}")
+            });
+            assert_eq!(output.output_id, "value");
+            assert_eq!((output.rows, output.cols), (1, data.len()));
+        }
+
+        for retired in ["values", "disparity"] {
+            let public_error = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "disparity_index",
+                output_id: Some(retired),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect_err("retired Disparity Index output alias must fail publicly");
+            assert!(matches!(
+                public_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == "disparity_index" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn dm_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("dm").expect("DM must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["plus", "minus"]
+        );
+        assert_eq!(info.params.len(), 1);
+        let period = &info.params[0];
+        assert_eq!(period.key, "period");
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(14)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let close = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let high = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.4 + (index as f64 * 0.03).sin().abs())
+            .collect::<Vec<_>>();
+        let low = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.4 - (index as f64 * 0.05).cos().abs())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["plus", "minus"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "dm",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical DM output `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "dm",
+            output_id: None,
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a two-output DM family must reject an ambiguous default request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "dm" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "dm",
+            output_id: Some("value"),
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired DM `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "dm" && output == "value"
+        ));
+
+        let direct_error = compute_dm_batch(
+            IndicatorBatchRequest {
+                indicator_id: "dm",
+                output_id: Some("value"),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct DM `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "dm" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn fisher_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("fisher").expect("Fisher must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["fisher", "signal"]
+        );
+        assert_eq!(info.params.len(), 1);
+        let period = &info.params[0];
+        assert_eq!(period.key, "period");
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(9)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let high = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let low = high
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.8 - (index as f64 * 0.05).cos().abs())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["fisher", "signal"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "fisher",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Fisher output `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, high.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "fisher",
+            output_id: None,
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a two-output Fisher family must reject an ambiguous default request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "fisher" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "fisher",
+            output_id: Some("value"),
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired Fisher `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "fisher" && output == "value"
+        ));
+
+        let direct_error = compute_fisher_batch(
+            IndicatorBatchRequest {
+                indicator_id: "fisher",
+                output_id: Some("value"),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct Fisher `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "fisher" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn forward_backward_exponential_oscillator_uses_exact_canonical_schema_and_rejects_aliases() {
+        use crate::indicators::forward_backward_exponential_oscillator::{
+            ForwardBackwardExponentialOscillatorInput, ForwardBackwardExponentialOscillatorParams,
+            forward_backward_exponential_oscillator_with_kernel,
+        };
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "forward_backward_exponential_oscillator";
+        const OUTPUT_IDS: [&str; 3] = ["forward_backward", "backward", "histogram"];
+        let info = get_indicator(ID).expect("FBEO must remain registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Slice);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(info.params.len(), 2);
+        for (parameter, key, default) in [
+            (&info.params[0], "length", 20),
+            (&info.params[1], "smooth", 10),
+        ] {
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+
+        let mut data = (0..1_024)
+            .map(|index| 100.0 + index as f64 * 0.017 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        data[..3].fill(f64::NAN);
+        data[311] = f64::NAN;
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = forward_backward_exponential_oscillator_with_kernel(
+            &ForwardBackwardExponentialOscillatorInput::from_slice(
+                &data,
+                ForwardBackwardExponentialOscillatorParams::default(),
+            ),
+            Kernel::Scalar,
+        )
+        .expect("scalar FBEO must accept canonical defaults");
+        for (output_id, expected) in [
+            ("forward_backward", expected.forward_backward.as_slice()),
+            ("backward", expected.backward.as_slice()),
+            ("histogram", expected.histogram.as_slice()),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical FBEO `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            let actual = output.values_f64.expect("FBEO outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output FBEO must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        for retired in ["value", "fb", "bwrd", "bw", "hist"] {
+            let public_alias = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(retired),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect_err("retired public FBEO output alias must fail closed");
+            assert!(matches!(
+                public_alias,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == retired
+            ));
+
+            let direct_alias = compute_forward_backward_exponential_oscillator_batch(
+                IndicatorBatchRequest {
+                    indicator_id: ID,
+                    output_id: Some(retired),
+                    data: IndicatorDataRef::Slice { values: &data },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                retired,
+            )
+            .expect_err("retired direct FBEO output alias must fail closed");
+            assert!(matches!(
+                direct_alias,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn fvg_trailing_stop_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::fvg_trailing_stop::{
+            FvgTrailingStopInput, FvgTrailingStopParams, fvg_trailing_stop_with_kernel,
+        };
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "fvg_trailing_stop";
+        const OUTPUT_IDS: [&str; 4] = ["upper", "lower", "upper_ts", "lower_ts"];
+        let info = get_indicator(ID).expect("FVG Trailing Stop must be registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Ohlc);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            [
+                "unmitigated_fvg_lookback",
+                "smoothing_length",
+                "reset_on_cross",
+            ]
+        );
+        for (parameter, default) in [(&info.params[0], 5), (&info.params[1], 9)] {
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+        let reset = &info.params[2];
+        assert!(matches!(reset.kind, IndicatorParamKind::Bool));
+        assert!(!reset.required);
+        assert_eq!(reset.default, Some(ParamValueStatic::Bool(false)));
+        assert!(reset.min.is_none() && reset.max.is_none() && reset.step.is_none());
+        assert_eq!(reset.enum_values, ["true", "false"]);
+
+        let mut close = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.013 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let mut high = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.7 + (index as f64 * 0.031).cos() * 0.08)
+            .collect::<Vec<_>>();
+        let mut low = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.7 - (index as f64 * 0.043).sin() * 0.08)
+            .collect::<Vec<_>>();
+        close[..3].fill(f64::NAN);
+        high[..3].fill(f64::NAN);
+        low[..3].fill(f64::NAN);
+        let open = close.clone();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = fvg_trailing_stop_with_kernel(
+            &FvgTrailingStopInput::from_slices(
+                &high,
+                &low,
+                &close,
+                FvgTrailingStopParams::default(),
+            ),
+            Kernel::Scalar,
+        )
+        .expect("scalar FVG Trailing Stop must accept canonical defaults");
+        for (output_id, expected) in [
+            ("upper", expected.upper.as_slice()),
+            ("lower", expected.lower.as_slice()),
+            ("upper_ts", expected.upper_ts.as_slice()),
+            ("lower_ts", expected.lower_ts.as_slice()),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical FVG Trailing Stop `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            let actual = output
+                .values_f64
+                .expect("FVG Trailing Stop outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output FVG Trailing Stop must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        let public_alias = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: Some("value"),
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired public FVG Trailing Stop `value` alias must fail closed");
+        assert!(matches!(
+            public_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+
+        let direct_alias = compute_fvg_trailing_stop_batch(
+            IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some("value"),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct FVG Trailing Stop `value` alias must fail closed");
+        assert!(matches!(
+            direct_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+    }
+
+    #[test]
+    fn donchian_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{IndicatorParamKind, ParamValueStatic, get_indicator};
+
+        let info = get_indicator("donchian").expect("Donchian must remain registered exactly once");
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["upper", "middle", "lower"]
+        );
+        assert_eq!(info.params.len(), 1);
+        let period = &info.params[0];
+        assert_eq!(period.key, "period");
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(20)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let close = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let high = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.4 + (index as f64 * 0.03).sin().abs())
+            .collect::<Vec<_>>();
+        let low = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.4 - (index as f64 * 0.05).cos().abs())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["upper", "middle", "lower"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "donchian",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Donchian output `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "donchian",
+            output_id: None,
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a three-output Donchian family must reject an ambiguous default request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "donchian" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "donchian",
+            output_id: Some("value"),
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired Donchian `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "donchian" && output == "value"
+        ));
+
+        let direct_error = compute_donchian_batch(
+            IndicatorBatchRequest {
+                indicator_id: "donchian",
+                output_id: Some("value"),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct Donchian `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "donchian" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn dual_ulcer_index_uses_exact_canonical_schema_and_rejects_retired_aliases() {
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        let info = get_indicator("dual_ulcer_index")
+            .expect("Dual Ulcer Index must remain registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Slice);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["long_ulcer", "short_ulcer", "threshold"]
+        );
+        assert_eq!(info.params.len(), 3);
+        assert_eq!(info.params[0].key, "period");
+        assert!(matches!(info.params[0].kind, IndicatorParamKind::Int));
+        assert_eq!(info.params[0].default, Some(ParamValueStatic::Int(5)));
+        assert_eq!(
+            info.params[0].min.map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert!(info.params[0].max.is_none());
+        assert_eq!(
+            info.params[0].step.map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert_eq!(info.params[1].key, "auto_threshold");
+        assert!(matches!(info.params[1].kind, IndicatorParamKind::Bool));
+        assert_eq!(info.params[1].default, Some(ParamValueStatic::Bool(true)));
+        assert_eq!(info.params[2].key, "threshold");
+        assert!(matches!(info.params[2].kind, IndicatorParamKind::Float));
+        assert_eq!(info.params[2].default, Some(ParamValueStatic::Float(0.1)));
+        assert_eq!(
+            info.params[2].min.map(f64::to_bits),
+            Some(0.0_f64.to_bits())
+        );
+        assert!(info.params[2].max.is_none());
+        assert_eq!(
+            info.params[2].step.map(f64::to_bits),
+            Some(0.1_f64.to_bits())
+        );
+
+        let close = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.04 + (index as f64 * 0.09).sin())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["long_ulcer", "short_ulcer", "threshold"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "dual_ulcer_index",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &close },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Dual Ulcer Index output `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "dual_ulcer_index",
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &close },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a three-output Dual Ulcer Index family must reject an ambiguous default");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "dual_ulcer_index" && key == "output_id"
+        ));
+
+        for retired in ["value", "uulcer", "dulcer"] {
+            let public_error = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "dual_ulcer_index",
+                output_id: Some(retired),
+                data: IndicatorDataRef::Slice { values: &close },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect_err("retired Dual Ulcer Index alias must fail publicly");
+            assert!(matches!(
+                public_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == "dual_ulcer_index" && output == retired
+            ));
+
+            let direct_error = compute_dual_ulcer_index_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "dual_ulcer_index",
+                    output_id: Some(retired),
+                    data: IndicatorDataRef::Slice { values: &close },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                retired,
+            )
+            .expect_err("retired direct Dual Ulcer Index alias must fail closed");
+            assert!(matches!(
+                direct_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == "dual_ulcer_index" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn dvdiqqe_uses_exact_canonical_schema_and_rejects_retired_aliases() {
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        let info = get_indicator("dvdiqqe").expect("DVDIQQE must remain registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Ohlc);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["dvdi", "fast_tl", "slow_tl", "center_line"]
+        );
+        assert_eq!(info.params.len(), 7);
+        assert_eq!(info.params[0].key, "period");
+        assert!(matches!(info.params[0].kind, IndicatorParamKind::Int));
+        assert_eq!(info.params[0].default, Some(ParamValueStatic::Int(13)));
+        assert_eq!(
+            info.params[0].min.map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert!(info.params[0].max.is_none());
+        assert_eq!(
+            info.params[0].step.map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert_eq!(info.params[1].key, "smoothing_period");
+        assert!(matches!(info.params[1].kind, IndicatorParamKind::Int));
+        assert_eq!(info.params[1].default, Some(ParamValueStatic::Int(6)));
+        assert_eq!(info.params[2].key, "fast_multiplier");
+        assert_eq!(info.params[2].default, Some(ParamValueStatic::Float(2.618)));
+        assert_eq!(info.params[3].key, "slow_multiplier");
+        assert_eq!(info.params[3].default, Some(ParamValueStatic::Float(4.236)));
+        assert_eq!(info.params[4].key, "volume_type");
+        assert!(matches!(
+            info.params[4].kind,
+            IndicatorParamKind::EnumString
+        ));
+        assert_eq!(
+            info.params[4].default,
+            Some(ParamValueStatic::EnumString("default"))
+        );
+        assert_eq!(info.params[5].key, "center_type");
+        assert!(matches!(
+            info.params[5].kind,
+            IndicatorParamKind::EnumString
+        ));
+        assert_eq!(
+            info.params[5].default,
+            Some(ParamValueStatic::EnumString("dynamic"))
+        );
+        assert_eq!(info.params[6].key, "tick_size");
+        assert_eq!(info.params[6].default, Some(ParamValueStatic::Float(0.01)));
+
+        let open = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.03 + (index as f64 * 0.07).sin())
+            .collect::<Vec<_>>();
+        let close = open
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + (index as f64 * 0.11).cos() * 0.4)
+            .collect::<Vec<_>>();
+        let high = open
+            .iter()
+            .zip(&close)
+            .map(|(&open, &close)| open.max(close) + 0.5)
+            .collect::<Vec<_>>();
+        let low = open
+            .iter()
+            .zip(&close)
+            .map(|(&open, &close)| open.min(close) - 0.5)
+            .collect::<Vec<_>>();
+        let volume = (0..512)
+            .map(|index| 1_000.0 + index as f64 * 2.0 + (index as f64 * 0.13).sin() * 70.0)
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let data = || IndicatorDataRef::Ohlcv {
+            open: &open,
+            high: &high,
+            low: &low,
+            close: &close,
+            volume: &volume,
+        };
+        for output_id in ["dvdi", "fast_tl", "slow_tl", "center_line"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "dvdiqqe",
+                output_id: Some(output_id),
+                data: data(),
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical DVDIQQE `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "dvdiqqe",
+            output_id: None,
+            data: data(),
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a four-output DVDIQQE family must reject an ambiguous default");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "dvdiqqe" && key == "output_id"
+        ));
+
+        for retired in ["value", "fast", "slow", "center"] {
+            let public_error = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "dvdiqqe",
+                output_id: Some(retired),
+                data: data(),
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect_err("retired DVDIQQE alias must fail publicly");
+            assert!(matches!(
+                public_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == "dvdiqqe" && output == retired
+            ));
+
+            let direct_error = compute_dvdiqqe_batch(
+                IndicatorBatchRequest {
+                    indicator_id: "dvdiqqe",
+                    output_id: Some(retired),
+                    data: data(),
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                retired,
+            )
+            .expect_err("retired direct DVDIQQE alias must fail closed");
+            assert!(matches!(
+                direct_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == "dvdiqqe" && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn ehlers_autocorrelation_periodogram_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        let info = get_indicator("ehlers_autocorrelation_periodogram")
+            .expect("Ehlers Autocorrelation Periodogram must remain registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Slice);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["dominant_cycle", "normalized_power"]
+        );
+        assert_eq!(info.params.len(), 4);
+        for (index, key, default, minimum) in [
+            (0, "min_period", 8, 3.0_f64),
+            (1, "max_period", 48, 4.0_f64),
+            (2, "avg_length", 3, 0.0_f64),
+        ] {
+            let parameter = &info.params[index];
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(minimum.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+        let enhance = &info.params[3];
+        assert_eq!(enhance.key, "enhance");
+        assert!(matches!(enhance.kind, IndicatorParamKind::Bool));
+        assert!(!enhance.required);
+        assert_eq!(enhance.default, Some(ParamValueStatic::Bool(true)));
+        assert!(enhance.min.is_none());
+        assert!(enhance.max.is_none());
+        assert!(enhance.step.is_none());
+        assert_eq!(enhance.enum_values, ["true", "false"]);
+
+        let data = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.03 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["dominant_cycle", "normalized_power"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: "ehlers_autocorrelation_periodogram",
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "canonical Ehlers Autocorrelation Periodogram output `{output_id}` failed: {error}"
+                )
+            });
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, data.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "ehlers_autocorrelation_periodogram",
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a two-output periodogram must reject an ambiguous default request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == "ehlers_autocorrelation_periodogram" && key == "output_id"
+        ));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "ehlers_autocorrelation_periodogram",
+            output_id: Some("value"),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired periodogram `value` alias must fail publicly");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "ehlers_autocorrelation_periodogram" && output == "value"
+        ));
+
+        let direct_error = compute_ehlers_autocorrelation_periodogram_batch(
+            IndicatorBatchRequest {
+                indicator_id: "ehlers_autocorrelation_periodogram",
+                output_id: Some("value"),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct periodogram `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == "ehlers_autocorrelation_periodogram" && output == "value"
+        ));
+    }
+
+    #[test]
+    fn ehlers_data_sampling_rsi_uses_exact_canonical_schema_and_rejects_retired_aliases() {
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "ehlers_data_sampling_relative_strength_indicator";
+        let info = get_indicator(ID).expect("Ehlers Data Sampling RSI must remain registered once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Ohlc);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["ds_rsi", "original_rsi", "signal"]
+        );
+        assert_eq!(info.params.len(), 1);
+        let length = &info.params[0];
+        assert_eq!(length.key, "length");
+        assert!(matches!(length.kind, IndicatorParamKind::Int));
+        assert!(!length.required);
+        assert_eq!(length.default, Some(ParamValueStatic::Int(14)));
+        assert_eq!(length.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(length.max.is_none());
+        assert_eq!(length.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(length.enum_values.is_empty());
+
+        let open = (0..512)
+            .map(|index| 100.0 + index as f64 * 0.03 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let high = open.iter().map(|value| value + 0.8).collect::<Vec<_>>();
+        let low = open.iter().map(|value| value - 0.7).collect::<Vec<_>>();
+        let close = open
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + (index as f64 * 0.093).cos() * 0.2)
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["ds_rsi", "original_rsi", "signal"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical EDSRSI `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, close.len()));
+        }
+
+        let default_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("a three-output family must reject an ambiguous default request");
+        assert!(matches!(
+            default_error,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        for retired in ["data_sampling_rsi", "orig_rsi", "value"] {
+            let public_error = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(retired),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect_err("retired public EDSRSI output alias must fail closed");
+            assert!(matches!(
+                public_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == retired
+            ));
+
+            let direct_error = compute_ehlers_data_sampling_relative_strength_indicator_batch(
+                IndicatorBatchRequest {
+                    indicator_id: ID,
+                    output_id: Some(retired),
+                    data: IndicatorDataRef::Ohlc {
+                        open: &open,
+                        high: &high,
+                        low: &low,
+                        close: &close,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                retired,
+            )
+            .expect_err("retired direct EDSRSI output alias must fail closed");
+            assert!(matches!(
+                direct_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn ehlers_linear_extrapolation_predictor_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "ehlers_linear_extrapolation_predictor";
+        let info = get_indicator(ID).expect("ELEP must remain registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Slice);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["prediction", "filter", "state", "go_long", "go_short"]
+        );
+        assert_eq!(info.params.len(), 5);
+
+        for (index, key, default, minimum, maximum, step) in [
+            (
+                0,
+                "high_pass_length",
+                125,
+                Some(1.0_f64),
+                None,
+                Some(1.0_f64),
+            ),
+            (1, "low_pass_length", 12, Some(1.0_f64), None, Some(1.0_f64)),
+            (
+                3,
+                "bars_forward",
+                5,
+                Some(0.0_f64),
+                Some(10.0_f64),
+                Some(1.0_f64),
+            ),
+        ] {
+            let parameter = &info.params[index];
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), minimum.map(f64::to_bits));
+            assert_eq!(parameter.max.map(f64::to_bits), maximum.map(f64::to_bits));
+            assert_eq!(parameter.step.map(f64::to_bits), step.map(f64::to_bits));
+            assert!(parameter.enum_values.is_empty());
+        }
+        let gain = &info.params[2];
+        assert_eq!(gain.key, "gain");
+        assert!(matches!(gain.kind, IndicatorParamKind::Float));
+        assert!(!gain.required);
+        assert_eq!(
+            gain.default,
+            Some(ParamValueStatic::Float(f64::from_bits(0.7_f64.to_bits())))
+        );
+        assert!(gain.min.is_none());
+        assert!(gain.max.is_none());
+        assert!(gain.step.is_none());
+        assert!(gain.enum_values.is_empty());
+
+        let signal_mode = &info.params[4];
+        assert_eq!(signal_mode.key, "signal_mode");
+        assert!(matches!(signal_mode.kind, IndicatorParamKind::EnumString));
+        assert!(!signal_mode.required);
+        assert_eq!(
+            signal_mode.default,
+            Some(ParamValueStatic::EnumString("predict_filter_crosses"))
+        );
+        assert!(signal_mode.min.is_none());
+        assert!(signal_mode.max.is_none());
+        assert!(signal_mode.step.is_none());
+        assert_eq!(
+            signal_mode.enum_values,
+            [
+                "predict_filter_crosses",
+                "predict_middle_crosses",
+                "filter_middle_crosses",
+            ]
+        );
+
+        let data = (0..1_024)
+            .map(|index| 100.0 + index as f64 * 0.01 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        for output_id in ["prediction", "filter", "state", "go_long", "go_short"] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical ELEP `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            assert_eq!((output.rows, output.cols), (1, data.len()));
+        }
+
+        let default_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect("the established public default request must resolve to canonical prediction");
+        assert_eq!(default_output.output_id, "prediction");
+        assert_eq!((default_output.rows, default_output.cols), (1, data.len()));
+
+        let public_error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: Some("value"),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired public ELEP `value` alias must fail closed");
+        assert!(matches!(
+            public_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+
+        let direct_error = compute_ehlers_linear_extrapolation_predictor_batch(
+            IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some("value"),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct ELEP `value` alias must fail closed");
+        assert!(matches!(
+            direct_error,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+    }
+
+    #[test]
+    fn ehlers_undersampled_double_moving_average_uses_exact_canonical_schema_and_rejects_value_alias()
+     {
+        use crate::indicators::moving_averages::ehlers_undersampled_double_moving_average::{
+            EhlersUndersampledDoubleMovingAverageInput,
+            EhlersUndersampledDoubleMovingAverageParams,
+            ehlers_undersampled_double_moving_average_with_kernel,
+        };
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "ehlers_undersampled_double_moving_average";
+        let info = get_indicator(ID).expect("EUDMA must remain registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Slice);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["fast", "slow"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["fast_length", "slow_length", "sample_length", "output"]
+        );
+        for (index, default) in [(0, 6), (1, 12), (2, 5)] {
+            let parameter = &info.params[index];
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert_eq!(parameter.max.map(f64::to_bits), Some(4096.0_f64.to_bits()));
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+        let output_parameter = &info.params[3];
+        assert!(matches!(
+            output_parameter.kind,
+            IndicatorParamKind::EnumString
+        ));
+        assert!(!output_parameter.required);
+        assert_eq!(
+            output_parameter.default,
+            Some(ParamValueStatic::EnumString("fast"))
+        );
+        assert_eq!(output_parameter.enum_values, ["fast", "slow"]);
+        assert!(info.capabilities.supports_cuda_batch);
+        assert!(info.capabilities.supports_cuda_vram);
+
+        let data = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.01 + (index as f64 * 0.073).sin())
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = ehlers_undersampled_double_moving_average_with_kernel(
+            &EhlersUndersampledDoubleMovingAverageInput::from_slice(
+                &data,
+                EhlersUndersampledDoubleMovingAverageParams::default(),
+            ),
+            Kernel::Scalar,
+        )
+        .expect("the scalar EUDMA authority must accept registry defaults");
+        for (output_id, expected) in [("fast", expected.fast), ("slow", expected.slow)] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical EUDMA `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            let actual = output.values_f64.expect("EUDMA outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output EUDMA must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        let public_alias = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: Some("value"),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired public EUDMA `value` alias must fail closed");
+        assert!(matches!(
+            public_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+
+        let direct_alias = [MaBatchParamKV {
+            key: "output",
+            value: MaBatchParamValue::EnumString("value"),
+        }];
+        let direct_error = ma_batch_with_kernel_and_typed_params(
+            ID,
+            MaData::Slice(&data),
+            (1, 1, 0),
+            Kernel::Scalar,
+            &direct_alias,
+        )
+        .expect_err("retired direct EUDMA `value` alias must fail closed")
+        .to_string();
+        assert!(direct_error.contains("expected 'fast' or 'slow'"));
+    }
+
+    #[test]
+    fn ema_deviation_corrected_t3_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::moving_averages::ema_deviation_corrected_t3::{
+            EmaDeviationCorrectedT3Input, EmaDeviationCorrectedT3Params,
+            ema_deviation_corrected_t3_with_kernel,
+        };
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "ema_deviation_corrected_t3";
+        let info = get_indicator(ID).expect("EDCT3 must remain registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Slice);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            ["corrected", "t3"]
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "hot", "t3_mode", "output"]
+        );
+
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(10)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        let hot = &info.params[1];
+        assert!(matches!(hot.kind, IndicatorParamKind::Float));
+        assert!(!hot.required);
+        assert_eq!(hot.default, Some(ParamValueStatic::Float(0.7)));
+        assert_eq!(hot.min.map(f64::to_bits), Some((-16.0_f64).to_bits()));
+        assert_eq!(hot.max.map(f64::to_bits), Some(16.0_f64.to_bits()));
+        assert_eq!(hot.step.map(f64::to_bits), Some(0.01_f64.to_bits()));
+        assert!(hot.enum_values.is_empty());
+
+        let t3_mode = &info.params[2];
+        assert!(matches!(t3_mode.kind, IndicatorParamKind::Int));
+        assert!(!t3_mode.required);
+        assert_eq!(t3_mode.default, Some(ParamValueStatic::Int(0)));
+        assert_eq!(t3_mode.min.map(f64::to_bits), Some(0.0_f64.to_bits()));
+        assert_eq!(t3_mode.max.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert_eq!(t3_mode.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(t3_mode.enum_values.is_empty());
+
+        let output = &info.params[3];
+        assert!(matches!(output.kind, IndicatorParamKind::EnumString));
+        assert!(!output.required);
+        assert_eq!(
+            output.default,
+            Some(ParamValueStatic::EnumString("corrected"))
+        );
+        assert_eq!(output.enum_values, ["corrected", "t3"]);
+        assert!(output.min.is_none() && output.max.is_none() && output.step.is_none());
+
+        assert!(info.capabilities.supports_cuda_single);
+        assert!(info.capabilities.supports_cuda_batch);
+        assert!(info.capabilities.supports_cuda_vram);
+
+        let mut data = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.01 + (index as f64 * 0.073).sin())
+            .collect::<Vec<_>>();
+        data[0] = f64::NAN;
+        data[811] = f64::INFINITY;
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = ema_deviation_corrected_t3_with_kernel(
+            &EmaDeviationCorrectedT3Input::from_slice(
+                &data,
+                EmaDeviationCorrectedT3Params::default(),
+            ),
+            Kernel::Scalar,
+        )
+        .expect("the scalar EDCT3 authority must accept its period-10 defaults");
+        for (output_id, expected) in [("corrected", expected.corrected), ("t3", expected.t3)] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical EDCT3 `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            let actual = output.values_f64.expect("EDCT3 outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output EDCT3 must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        let public_alias = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: Some("value"),
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired public EDCT3 `value` alias must fail closed");
+        assert!(matches!(
+            public_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+
+        let direct_alias = [MaBatchParamKV {
+            key: "output",
+            value: MaBatchParamValue::EnumString("value"),
+        }];
+        let direct_error = ma_batch_with_kernel_and_typed_params(
+            ID,
+            MaData::Slice(&data),
+            (10, 10, 0),
+            Kernel::Scalar,
+            &direct_alias,
+        )
+        .expect_err("retired direct EDCT3 `value` alias must fail closed")
+        .to_string();
+        assert!(direct_error.contains("expected 'corrected' or 't3'"));
+    }
+
+    #[test]
+    fn emd_uses_exact_canonical_schema_and_rejects_retired_output_aliases() {
+        use crate::indicators::emd::{EmdInput, EmdParams, emd_with_kernel};
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "emd";
+        const OUTPUT_IDS: [&str; 3] = ["upperband", "middleband", "lowerband"];
+        let info = get_indicator(ID).expect("EMD must remain registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::HighLow);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "delta", "fraction"]
+        );
+
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(20)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+
+        for (index, key, default) in [(1, "delta", 0.5_f64), (2, "fraction", 0.1_f64)] {
+            let parameter = &info.params[index];
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Float));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Float(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(0.0_f64.to_bits()));
+            assert!(parameter.max.is_none() && parameter.step.is_none());
+            assert!(parameter.enum_values.is_empty());
+        }
+        assert!(
+            !info.capabilities.supports_cuda_single,
+            "supplemental EMD has no public CUDA-single dispatcher"
+        );
+        assert!(info.capabilities.supports_cuda_batch);
+        assert!(info.capabilities.supports_cuda_vram);
+
+        let high = (0..2_048)
+            .map(|index| 102.0 + index as f64 * 0.012 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let low = high
+            .iter()
+            .enumerate()
+            .map(|(index, high)| high - 1.25 - (index as f64 * 0.043).cos() * 0.07)
+            .collect::<Vec<_>>();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = emd_with_kernel(
+            &EmdInput::from_high_low_slices(&high, &low, EmdParams::default()),
+            Kernel::Scalar,
+        )
+        .expect("scalar EMD must accept its canonical registry defaults");
+        for (output_id, expected) in [
+            ("upperband", expected.upperband),
+            ("middleband", expected.middleband),
+            ("lowerband", expected.lowerband),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical EMD `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            let actual = output.values_f64.expect("EMD outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::HighLow {
+                high: &high,
+                low: &low,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output EMD must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        for alias in ["upper", "middle", "lower", "value"] {
+            let public_error = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(alias),
+                data: IndicatorDataRef::HighLow {
+                    high: &high,
+                    low: &low,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect_err("retired public EMD output alias must fail closed");
+            assert!(matches!(
+                public_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == alias
+            ));
+
+            let direct_error = compute_emd_batch(
+                IndicatorBatchRequest {
+                    indicator_id: ID,
+                    output_id: Some(alias),
+                    data: IndicatorDataRef::HighLow {
+                        high: &high,
+                        low: &low,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                alias,
+            )
+            .expect_err("retired direct EMD output alias must fail closed");
+            assert!(matches!(
+                direct_error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == alias
+            ));
+        }
+    }
+
+    #[test]
+    fn emd_trend_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::emd_trend::{EmdTrendInput, EmdTrendParams, emd_trend_with_kernel};
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "emd_trend";
+        const OUTPUT_IDS: [&str; 4] = ["direction", "average", "upper", "lower"];
+        let info = get_indicator(ID).expect("EMD Trend must be registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Ohlc);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["source", "avg_type", "length", "mult"]
+        );
+
+        let source = &info.params[0];
+        assert!(matches!(source.kind, IndicatorParamKind::EnumString));
+        assert!(!source.required);
+        assert_eq!(source.default, Some(ParamValueStatic::EnumString("close")));
+        assert_eq!(
+            source.enum_values,
+            [
+                "open", "high", "low", "close", "oc2", "hl2", "occ3", "hlc3", "ohlc4", "hlcc4"
+            ]
+        );
+        assert!(source.min.is_none() && source.max.is_none() && source.step.is_none());
+
+        let avg_type = &info.params[1];
+        assert!(matches!(avg_type.kind, IndicatorParamKind::EnumString));
+        assert!(!avg_type.required);
+        assert_eq!(avg_type.default, Some(ParamValueStatic::EnumString("SMA")));
+        assert_eq!(
+            avg_type.enum_values,
+            ["SMA", "EMA", "HMA", "DEMA", "TEMA", "RMA", "FRAMA"]
+        );
+        assert!(avg_type.min.is_none() && avg_type.max.is_none() && avg_type.step.is_none());
+
+        let length = &info.params[2];
+        assert!(matches!(length.kind, IndicatorParamKind::Int));
+        assert!(!length.required);
+        assert_eq!(length.default, Some(ParamValueStatic::Int(28)));
+        assert_eq!(length.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(length.max.is_none());
+        assert_eq!(length.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(length.enum_values.is_empty());
+
+        let mult = &info.params[3];
+        assert!(matches!(mult.kind, IndicatorParamKind::Float));
+        assert!(!mult.required);
+        assert_eq!(mult.default, Some(ParamValueStatic::Float(1.0)));
+        assert_eq!(mult.min.map(f64::to_bits), Some(0.05_f64.to_bits()));
+        assert!(mult.max.is_none() && mult.step.is_none());
+        assert!(mult.enum_values.is_empty());
+        assert!(info.capabilities.supports_cuda_batch);
+        assert!(info.capabilities.supports_cuda_vram);
+
+        let open = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.013 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let high = open
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.8 + (index as f64 * 0.031).cos() * 0.04)
+            .collect::<Vec<_>>();
+        let low = open
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.7 - (index as f64 * 0.043).sin() * 0.03)
+            .collect::<Vec<_>>();
+        let mut close = open
+            .iter()
+            .zip(&high)
+            .zip(&low)
+            .map(|((open, high), low)| (open + high + low) / 3.0)
+            .collect::<Vec<_>>();
+        close[..3].fill(f64::NAN);
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = emd_trend_with_kernel(
+            &EmdTrendInput::from_slices(&open, &high, &low, &close, EmdTrendParams::default()),
+            Kernel::Scalar,
+        )
+        .expect("scalar EMD Trend must accept its canonical registry defaults");
+        for (output_id, expected) in [
+            ("direction", expected.direction),
+            ("average", expected.average),
+            ("upper", expected.upper),
+            ("lower", expected.lower),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical EMD Trend `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            let actual = output
+                .values_f64
+                .expect("EMD Trend outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output EMD Trend must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        let public_alias = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: Some("value"),
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired public EMD Trend `value` alias must fail closed");
+        assert!(matches!(
+            public_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+
+        let direct_alias = compute_emd_trend_batch(
+            IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some("value"),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct EMD Trend `value` alias must fail closed");
+        assert!(matches!(
+            direct_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+    }
+
+    #[test]
+    fn eri_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::eri::{EriInput, EriParams, eri_with_kernel};
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "eri";
+        const OUTPUT_IDS: [&str; 2] = ["bull", "bear"];
+        let info = get_indicator(ID).expect("ERI must be registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Ohlc);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["period", "ma_type"]
+        );
+        let period = &info.params[0];
+        assert!(matches!(period.kind, IndicatorParamKind::Int));
+        assert!(!period.required);
+        assert_eq!(period.default, Some(ParamValueStatic::Int(13)));
+        assert_eq!(period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.max.is_none());
+        assert_eq!(period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(period.enum_values.is_empty());
+        let ma_type = &info.params[1];
+        assert!(matches!(ma_type.kind, IndicatorParamKind::EnumString));
+        assert!(!ma_type.required);
+        assert_eq!(ma_type.default, Some(ParamValueStatic::EnumString("ema")));
+        assert!(ma_type.min.is_none() && ma_type.max.is_none() && ma_type.step.is_none());
+        assert!(ma_type.enum_values.is_empty());
+
+        let mut close = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.013 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let mut high = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.8 + (index as f64 * 0.031).cos() * 0.04)
+            .collect::<Vec<_>>();
+        let mut low = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.7 - (index as f64 * 0.043).sin() * 0.03)
+            .collect::<Vec<_>>();
+        close[..3].fill(f64::NAN);
+        high[..3].fill(f64::NAN);
+        low[..3].fill(f64::NAN);
+        let open = close.clone();
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = eri_with_kernel(
+            &EriInput::from_slices(&high, &low, &close, EriParams::default()),
+            Kernel::Scalar,
+        )
+        .expect("scalar ERI must accept its canonical registry defaults");
+        for (output_id, expected) in [
+            ("bull", expected.bull.as_slice()),
+            ("bear", expected.bear.as_slice()),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical ERI `{output_id}` failed: {error}"));
+            assert_eq!(output.output_id, output_id);
+            let actual = output.values_f64.expect("ERI outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output ERI must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        let public_alias = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: Some("value"),
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired public ERI `value` alias must fail closed");
+        assert!(matches!(
+            public_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+
+        let direct_alias = compute_eri_batch(
+            IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some("value"),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct ERI `value` alias must fail closed");
+        assert!(matches!(
+            direct_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+    }
+
+    #[test]
+    fn evasive_supertrend_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::evasive_supertrend::{
+            EvasiveSuperTrendInput, EvasiveSuperTrendParams, evasive_supertrend_with_kernel,
+        };
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "evasive_supertrend";
+        const OUTPUT_IDS: [&str; 4] = ["band", "state", "noisy", "changed"];
+        let info = get_indicator(ID).expect("Evasive Supertrend must be registered exactly once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Ohlc);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            [
+                "atr_length",
+                "base_multiplier",
+                "noise_threshold",
+                "expansion_alpha",
+            ]
+        );
+
+        let atr_length = &info.params[0];
+        assert!(matches!(atr_length.kind, IndicatorParamKind::Int));
+        assert!(!atr_length.required);
+        assert_eq!(atr_length.default, Some(ParamValueStatic::Int(10)));
+        assert_eq!(atr_length.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(atr_length.max.is_none());
+        assert_eq!(atr_length.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(atr_length.enum_values.is_empty());
+
+        for (index, key, default, min) in [
+            (1, "base_multiplier", 3.0_f64, 0.1_f64),
+            (2, "noise_threshold", 1.0_f64, 0.1_f64),
+            (3, "expansion_alpha", 0.5_f64, 0.0_f64),
+        ] {
+            let parameter = &info.params[index];
+            assert_eq!(parameter.key, key);
+            assert!(matches!(parameter.kind, IndicatorParamKind::Float));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Float(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(min.to_bits()));
+            assert!(parameter.max.is_none() && parameter.step.is_none());
+            assert!(parameter.enum_values.is_empty());
+        }
+
+        let mut close = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.013 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let mut open = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + (index as f64 * 0.019).sin() * 0.02)
+            .collect::<Vec<_>>();
+        let mut high = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.8 + (index as f64 * 0.031).cos() * 0.04)
+            .collect::<Vec<_>>();
+        let mut low = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.7 - (index as f64 * 0.043).sin() * 0.03)
+            .collect::<Vec<_>>();
+        close[..3].fill(f64::NAN);
+        open[..3].fill(f64::NAN);
+        high[..3].fill(f64::NAN);
+        low[..3].fill(f64::NAN);
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = evasive_supertrend_with_kernel(
+            &EvasiveSuperTrendInput::from_slices(
+                &open,
+                &high,
+                &low,
+                &close,
+                EvasiveSuperTrendParams::default(),
+            ),
+            Kernel::Scalar,
+        )
+        .expect("scalar Evasive Supertrend must accept canonical defaults");
+        for (output_id, expected) in [
+            ("band", expected.band.as_slice()),
+            ("state", expected.state.as_slice()),
+            ("noisy", expected.noisy.as_slice()),
+            ("changed", expected.changed.as_slice()),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Evasive Supertrend `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            let actual = output
+                .values_f64
+                .expect("Evasive Supertrend outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output Evasive Supertrend must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        let public_alias = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: Some("value"),
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("retired public Evasive Supertrend `value` alias must fail closed");
+        assert!(matches!(
+            public_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+
+        let direct_alias = compute_evasive_supertrend_batch(
+            IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some("value"),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            },
+            "value",
+        )
+        .expect_err("retired direct Evasive Supertrend `value` alias must fail closed");
+        assert!(matches!(
+            direct_alias,
+            IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                if indicator == ID && output == "value"
+        ));
+    }
+
+    #[test]
+    fn fibonacci_entry_bands_uses_exact_canonical_schema_and_rejects_retired_aliases() {
+        use crate::indicators::fibonacci_entry_bands::{
+            FibonacciEntryBandsInput, FibonacciEntryBandsParams, fibonacci_entry_bands_with_kernel,
+        };
+        use crate::indicators::registry::{
+            IndicatorInputKind, IndicatorParamKind, ParamValueStatic, get_indicator,
+        };
+
+        const ID: &str = "fibonacci_entry_bands";
+        const OUTPUT_IDS: [&str; 18] = [
+            "middle",
+            "trend",
+            "upper_0618",
+            "upper_1000",
+            "upper_1618",
+            "upper_2618",
+            "lower_0618",
+            "lower_1000",
+            "lower_1618",
+            "lower_2618",
+            "tp_long_band",
+            "tp_short_band",
+            "go_long",
+            "go_short",
+            "rejection_long",
+            "rejection_short",
+            "long_bounce",
+            "short_bounce",
+        ];
+        let info = get_indicator(ID).expect("Fibonacci Entry Bands must be registered once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Ohlc);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            [
+                "source",
+                "length",
+                "atr_length",
+                "use_atr",
+                "tp_aggressiveness",
+            ]
+        );
+        assert!(matches!(
+            info.params[0].kind,
+            IndicatorParamKind::EnumString
+        ));
+        assert_eq!(
+            info.params[0].default,
+            Some(ParamValueStatic::EnumString("hlc3"))
+        );
+        assert!(matches!(info.params[1].kind, IndicatorParamKind::Int));
+        assert_eq!(info.params[1].default, Some(ParamValueStatic::Int(21)));
+        assert_eq!(
+            info.params[1].min.map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert!(info.params[1].max.is_none());
+        assert_eq!(
+            info.params[1].step.map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert!(matches!(info.params[2].kind, IndicatorParamKind::Int));
+        assert_eq!(info.params[2].default, Some(ParamValueStatic::Int(14)));
+        assert_eq!(
+            info.params[2].min.map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert!(info.params[2].max.is_none());
+        assert_eq!(
+            info.params[2].step.map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert!(matches!(info.params[3].kind, IndicatorParamKind::Bool));
+        assert_eq!(info.params[3].default, Some(ParamValueStatic::Bool(true)));
+        assert!(matches!(
+            info.params[4].kind,
+            IndicatorParamKind::EnumString
+        ));
+        assert_eq!(
+            info.params[4].default,
+            Some(ParamValueStatic::EnumString("low"))
+        );
+
+        let mut close = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.013 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let mut open = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + (index as f64 * 0.019).sin() * 0.02)
+            .collect::<Vec<_>>();
+        let mut high = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.8 + (index as f64 * 0.031).cos() * 0.04)
+            .collect::<Vec<_>>();
+        let mut low = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.7 - (index as f64 * 0.043).sin() * 0.03)
+            .collect::<Vec<_>>();
+        for index in [0, 1, 311] {
+            open[index] = f64::NAN;
+            high[index] = f64::NAN;
+            low[index] = f64::NAN;
+            close[index] = f64::NAN;
+        }
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = fibonacci_entry_bands_with_kernel(
+            &FibonacciEntryBandsInput::from_slices(
+                &open,
+                &high,
+                &low,
+                &close,
+                FibonacciEntryBandsParams::default(),
+            ),
+            Kernel::Scalar,
+        )
+        .expect("scalar Fibonacci Entry Bands must accept canonical defaults");
+        for (output_id, expected) in [
+            ("middle", expected.basis.as_slice()),
+            ("trend", expected.trend.as_slice()),
+            ("upper_0618", expected.upper_0618.as_slice()),
+            ("upper_1000", expected.upper_1000.as_slice()),
+            ("upper_1618", expected.upper_1618.as_slice()),
+            ("upper_2618", expected.upper_2618.as_slice()),
+            ("lower_0618", expected.lower_0618.as_slice()),
+            ("lower_1000", expected.lower_1000.as_slice()),
+            ("lower_1618", expected.lower_1618.as_slice()),
+            ("lower_2618", expected.lower_2618.as_slice()),
+            ("tp_long_band", expected.tp_long_band.as_slice()),
+            ("tp_short_band", expected.tp_short_band.as_slice()),
+            ("go_long", expected.long_entry.as_slice()),
+            ("go_short", expected.short_entry.as_slice()),
+            ("rejection_long", expected.rejection_long.as_slice()),
+            ("rejection_short", expected.rejection_short.as_slice()),
+            ("long_bounce", expected.long_bounce.as_slice()),
+            ("short_bounce", expected.short_bounce.as_slice()),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| {
+                panic!("canonical Fibonacci Entry Bands `{output_id}` failed: {error}")
+            });
+            assert_eq!(output.output_id, output_id);
+            let actual = output
+                .values_f64
+                .expect("Fibonacci Entry Bands outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted from exact scalar CPU bits"
+                    );
+                }
+            }
+        }
+
+        let missing_output = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Ohlc {
+                open: &open,
+                high: &high,
+                low: &low,
+                close: &close,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output Fibonacci Entry Bands must require one canonical output ID");
+        assert!(matches!(
+            missing_output,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        for retired in ["basis", "long_entry", "short_entry", "value"] {
+            let public_alias = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(retired),
+                data: IndicatorDataRef::Ohlc {
+                    open: &open,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .expect_err("retired public Fibonacci Entry Bands alias must fail closed");
+            assert!(matches!(
+                public_alias,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == retired
+            ));
+
+            let direct_alias = compute_fibonacci_entry_bands_batch(
+                IndicatorBatchRequest {
+                    indicator_id: ID,
+                    output_id: Some(retired),
+                    data: IndicatorDataRef::Ohlc {
+                        open: &open,
+                        high: &high,
+                        low: &low,
+                        close: &close,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                },
+                retired,
+            )
+            .expect_err("retired direct Fibonacci Entry Bands alias must fail closed");
+            assert!(matches!(
+                direct_alias,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn gatorosc_uses_exact_canonical_schema_and_rejects_value_alias() {
+        use crate::indicators::gatorosc::{GatorOscInput, GatorOscParams, gatorosc_with_kernel};
+
+        const ID: &str = "gatorosc";
+        const OUTPUT_IDS: [&str; 4] = ["upper", "lower", "upper_change", "lower_change"];
+        const PARAMETER_KEYS: [&str; 6] = [
+            "jaws_length",
+            "jaws_shift",
+            "teeth_length",
+            "teeth_shift",
+            "lips_length",
+            "lips_shift",
+        ];
+        let info = get_indicator(ID).expect("Gator Oscillator must be registered once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Slice);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            PARAMETER_KEYS
+        );
+        for (index, (default, minimum)) in [
+            (13, 1.0_f64),
+            (8, 0.0),
+            (8, 1.0),
+            (5, 0.0),
+            (5, 1.0),
+            (3, 0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parameter = &info.params[index];
+            assert!(matches!(parameter.kind, IndicatorParamKind::Int));
+            assert!(!parameter.required);
+            assert_eq!(parameter.default, Some(ParamValueStatic::Int(default)));
+            assert_eq!(parameter.min.map(f64::to_bits), Some(minimum.to_bits()));
+            assert!(parameter.max.is_none());
+            assert_eq!(parameter.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+            assert!(parameter.enum_values.is_empty());
+        }
+
+        let mut data = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.013 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        for index in [0, 1, 311, 937] {
+            data[index] = f64::NAN;
+        }
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = gatorosc_with_kernel(
+            &GatorOscInput::from_slice(&data, GatorOscParams::default()),
+            Kernel::Scalar,
+        )
+        .expect("scalar Gator Oscillator must accept canonical defaults");
+        for (output_id, expected) in [
+            ("upper", expected.upper.as_slice()),
+            ("lower", expected.lower.as_slice()),
+            ("upper_change", expected.upper_change.as_slice()),
+            ("lower_change", expected.lower_change.as_slice()),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical Gator `{output_id}` failed: {error}"));
+            let actual = output.values_f64.expect("Gator outputs must remain f64");
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted"
+                    );
+                }
+            }
+        }
+
+        let missing = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: ID,
+            output_id: None,
+            data: IndicatorDataRef::Slice { values: &data },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("multi-output Gator Oscillator must require a canonical output ID");
+        assert!(matches!(
+            missing,
+            IndicatorDispatchError::InvalidParam { ref indicator, ref key, .. }
+                if indicator == ID && key == "output_id"
+        ));
+
+        for direct in [false, true] {
+            let request = IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some("value"),
+                data: IndicatorDataRef::Slice { values: &data },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            };
+            let error = if direct {
+                compute_gatorosc_batch(request, "value")
+            } else {
+                compute_cpu_batch(request)
+            }
+            .expect_err("retired Gator Oscillator `value` alias must fail closed");
+            assert!(matches!(
+                error,
+                IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                    if indicator == ID && output == "value"
+            ));
+        }
+    }
+
+    #[test]
+    fn halftrend_uses_exact_canonical_schema_and_rejects_retired_aliases() {
+        use crate::indicators::halftrend::{
+            HalfTrendInput, HalfTrendParams, halftrend_with_kernel,
+        };
+
+        const ID: &str = "halftrend";
+        const OUTPUT_IDS: [&str; 6] = [
+            "halftrend",
+            "trend",
+            "atr_high",
+            "atr_low",
+            "buy_signal",
+            "sell_signal",
+        ];
+        let info = get_indicator(ID).expect("HalfTrend must be registered once");
+        assert_eq!(info.input_kind, IndicatorInputKind::Ohlc);
+        assert_eq!(
+            info.outputs
+                .iter()
+                .map(|output| output.id)
+                .collect::<Vec<_>>(),
+            OUTPUT_IDS
+        );
+        assert_eq!(
+            info.params
+                .iter()
+                .map(|parameter| parameter.key)
+                .collect::<Vec<_>>(),
+            ["amplitude", "channel_deviation", "atr_period"]
+        );
+        let amplitude = &info.params[0];
+        assert!(matches!(amplitude.kind, IndicatorParamKind::Int));
+        assert!(!amplitude.required);
+        assert_eq!(amplitude.default, Some(ParamValueStatic::Int(2)));
+        assert_eq!(amplitude.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(amplitude.max.is_none());
+        assert_eq!(amplitude.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(amplitude.enum_values.is_empty());
+
+        let channel_deviation = &info.params[1];
+        assert!(matches!(channel_deviation.kind, IndicatorParamKind::Float));
+        assert!(!channel_deviation.required);
+        assert_eq!(
+            channel_deviation.default,
+            Some(ParamValueStatic::Float(2.0))
+        );
+        assert_eq!(
+            channel_deviation.min.map(f64::to_bits),
+            Some(0.0_f64.to_bits())
+        );
+        assert!(channel_deviation.max.is_none());
+        assert!(channel_deviation.step.is_none());
+        assert!(channel_deviation.enum_values.is_empty());
+
+        let atr_period = &info.params[2];
+        assert!(matches!(atr_period.kind, IndicatorParamKind::Int));
+        assert!(!atr_period.required);
+        assert_eq!(atr_period.default, Some(ParamValueStatic::Int(100)));
+        assert_eq!(atr_period.min.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(atr_period.max.is_none());
+        assert_eq!(atr_period.step.map(f64::to_bits), Some(1.0_f64.to_bits()));
+        assert!(atr_period.enum_values.is_empty());
+
+        let mut close = (0..2_048)
+            .map(|index| 100.0 + index as f64 * 0.013 + (index as f64 * 0.071).sin())
+            .collect::<Vec<_>>();
+        let mut high = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.7 + (index % 7) as f64 * 0.01)
+            .collect::<Vec<_>>();
+        let mut low = close
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value - 0.6 - (index % 5) as f64 * 0.01)
+            .collect::<Vec<_>>();
+        high[..3].fill(f64::NAN);
+        low[..3].fill(f64::NAN);
+        close[..3].fill(f64::NAN);
+        let combos = [IndicatorParamSet { params: &[] }];
+        let expected = halftrend_with_kernel(
+            &HalfTrendInput::from_slices(&high, &low, &close, HalfTrendParams::default()),
+            Kernel::Scalar,
+        )
+        .expect("scalar HalfTrend must accept canonical defaults");
+        for (output_id, expected) in [
+            ("halftrend", expected.halftrend.as_slice()),
+            ("trend", expected.trend.as_slice()),
+            ("atr_high", expected.atr_high.as_slice()),
+            ("atr_low", expected.atr_low.as_slice()),
+            ("buy_signal", expected.buy_signal.as_slice()),
+            ("sell_signal", expected.sell_signal.as_slice()),
+        ] {
+            let output = compute_cpu_batch(IndicatorBatchRequest {
+                indicator_id: ID,
+                output_id: Some(output_id),
+                data: IndicatorDataRef::Ohlc {
+                    open: &close,
+                    high: &high,
+                    low: &low,
+                    close: &close,
+                },
+                combos: &combos,
+                kernel: Kernel::Scalar,
+            })
+            .unwrap_or_else(|error| panic!("canonical HalfTrend `{output_id}` failed: {error}"));
+            let actual = output
+                .values_f64
+                .expect("HalfTrend outputs must remain f64");
+            for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{output_id}[{index}] lost CPU NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{output_id}[{index}] drifted"
+                    );
+                }
+            }
+        }
+
+        for retired in ["value", "buy", "sell"] {
+            for direct in [false, true] {
+                let request = IndicatorBatchRequest {
+                    indicator_id: ID,
+                    output_id: Some(retired),
+                    data: IndicatorDataRef::Ohlc {
+                        open: &close,
+                        high: &high,
+                        low: &low,
+                        close: &close,
+                    },
+                    combos: &combos,
+                    kernel: Kernel::Scalar,
+                };
+                let error = if direct {
+                    compute_halftrend_batch(request, retired)
+                } else {
+                    compute_cpu_batch(request)
+                }
+                .expect_err("retired HalfTrend output alias must fail closed");
+                assert!(matches!(
+                    error,
+                    IndicatorDispatchError::UnknownOutput { ref indicator, ref output }
+                        if indicator == ID && output == retired
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn evwma_generic_dispatch_resolves_length_instead_of_fallback_period() {
+        let info = crate::indicators::registry::get_indicator(
+            "elastic_volume_weighted_moving_average",
+        )
+        .expect("EVWMA must remain registered");
+
+        assert_eq!(
+            ma_period_for_combo(info, &[]).unwrap(),
+            30,
+            "the production rolling EVWMA base must use its declared length default"
+        );
+
+        let requested = [ParamKV {
+            key: "length",
+            value: ParamValue::Int(7),
+        }];
+        assert_eq!(
+            ma_period_for_combo(info, &requested).unwrap(),
+            7,
+            "an explicit rolling EVWMA length must not fall through to period=14"
+        );
+    }
+
+    #[test]
+    fn evwma_generic_dispatch_rejects_fixed_gamma_mode_alias() {
+        let close = [1.0, 1.1, 1.2, 1.3];
+        let volume = [10.0, 11.0, 12.0, 13.0];
+        let params = [ParamKV {
+            key: "use_volume_sum",
+            value: ParamValue::Bool(false),
+        }];
+        let combos = [IndicatorParamSet { params: &params }];
+
+        let error = compute_cpu_batch(IndicatorBatchRequest {
+            indicator_id: "elastic_volume_weighted_moving_average",
+            output_id: Some("value"),
+            data: IndicatorDataRef::CloseVolume {
+                close: &close,
+                volume: &volume,
+            },
+            combos: &combos,
+            kernel: Kernel::Scalar,
+        })
+        .expect_err("generic/search EVWMA must not alias the fixed-gamma-N identity");
+
+        assert!(matches!(
+            error,
+            IndicatorDispatchError::InvalidParam {
+                ref indicator,
+                ref key,
+                ref reason,
+            } if indicator == "elastic_volume_weighted_moving_average"
+                && key == "use_volume_sum"
+                && reason.contains("dedicated EVWMA API")
+        ));
     }
 }

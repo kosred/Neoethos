@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -79,10 +63,6 @@ pub enum AlligatorOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AlligatorParams {
     pub jaw_period: Option<usize>,
     pub jaw_offset: Option<usize>,
@@ -1625,98 +1605,11 @@ fn expand_grid_len(r: &AlligatorBatchRange) -> usize {
         * axis(r.lips_offset)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_output_into_js(
-    data: &[f64],
-    jaw_period: usize,
-    jaw_offset: usize,
-    teeth_period: usize,
-    teeth_offset: usize,
-    lips_period: usize,
-    lips_offset: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = alligator_js(
-        data,
-        jaw_period,
-        jaw_offset,
-        teeth_period,
-        teeth_offset,
-        lips_period,
-        lips_offset,
-    )?;
-    crate::write_wasm_f64_output("alligator_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_batch_output_into_js(
-    data: &[f64],
-    jaw_period_start: usize,
-    jaw_period_end: usize,
-    jaw_period_step: usize,
-    jaw_offset_start: usize,
-    jaw_offset_end: usize,
-    jaw_offset_step: usize,
-    teeth_period_start: usize,
-    teeth_period_end: usize,
-    teeth_period_step: usize,
-    teeth_offset_start: usize,
-    teeth_offset_end: usize,
-    teeth_offset_step: usize,
-    lips_period_start: usize,
-    lips_period_end: usize,
-    lips_period_step: usize,
-    lips_offset_start: usize,
-    lips_offset_end: usize,
-    lips_offset_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = alligator_batch_js(
-        data,
-        jaw_period_start,
-        jaw_period_end,
-        jaw_period_step,
-        jaw_offset_start,
-        jaw_offset_end,
-        jaw_offset_step,
-        teeth_period_start,
-        teeth_period_end,
-        teeth_period_step,
-        teeth_offset_start,
-        teeth_offset_end,
-        teeth_offset_step,
-        lips_period_start,
-        lips_period_end,
-        lips_period_step,
-        lips_offset_start,
-        lips_offset_end,
-        lips_offset_step,
-    )?;
-    crate::write_wasm_f64_output("alligator_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = alligator_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "alligator_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_alligator_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
@@ -1780,8 +1673,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = AlligatorParams {
             jaw_period: Some(14),
             jaw_offset: None,
@@ -1802,8 +1695,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let hl2_prices = candles.get_calculated_field("hl2").expect("hl2 fail");
         let input = AlligatorInput::with_default_candles(&candles);
         let result = alligator_with_kernel(&input, kernel)?;
@@ -1851,8 +1744,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AlligatorInput::with_default_candles(&candles);
         match input.data {
             AlligatorData::Candles { source, .. } => assert_eq!(source, "hl2"),
@@ -1867,8 +1760,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_input = AlligatorInput::with_default_candles(&candles);
         let first_result = alligator_with_kernel(&first_input, kernel)?;
         let second_input =
@@ -1884,8 +1777,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AlligatorInput::with_default_candles(&candles);
         let result = alligator_with_kernel(&input, kernel)?;
         if result.jaw.len() > 50 {
@@ -2264,8 +2157,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             AlligatorParams::default(),
@@ -2316,53 +2209,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at jaw index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at jaw index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at jaw index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at jaw index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at jaw index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at jaw index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
             }
 
@@ -2375,53 +2268,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at teeth index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at teeth index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at teeth index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at teeth index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at teeth index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at teeth index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
             }
 
@@ -2434,53 +2327,53 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at lips index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at lips index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at lips index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at lips index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at lips index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at lips index {} \
 						with params: jaw_period={}, jaw_offset={}, teeth_period={}, teeth_offset={}, lips_period={}, lips_offset={}",
-						test_name,
-						val,
-						bits,
-						i,
-						params.jaw_period.unwrap_or(13),
-						params.jaw_offset.unwrap_or(8),
-						params.teeth_period.unwrap_or(8),
-						params.teeth_offset.unwrap_or(5),
-						params.lips_period.unwrap_or(5),
-						params.lips_offset.unwrap_or(3),
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.jaw_period.unwrap_or(13),
+                        params.jaw_offset.unwrap_or(8),
+                        params.teeth_period.unwrap_or(8),
+                        params.teeth_offset.unwrap_or(5),
+                        params.lips_period.unwrap_or(5),
+                        params.lips_offset.unwrap_or(3),
+                    );
                 }
             }
         }
@@ -2533,8 +2426,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = AlligatorBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "hl2")?;
@@ -2575,8 +2468,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (5, 15, 2, 3, 10, 2, 3, 10, 2, 2, 8, 2, 2, 8, 2, 1, 5, 2),
@@ -2890,192 +2783,6 @@ mod tests {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "alligator")]
-#[pyo3(signature = (data, jaw_period=13, jaw_offset=8, teeth_period=8, teeth_offset=5, lips_period=5, lips_offset=3, kernel=None))]
-pub fn alligator_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    jaw_period: usize,
-    jaw_offset: usize,
-    teeth_period: usize,
-    teeth_offset: usize,
-    lips_period: usize,
-    lips_offset: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let params = AlligatorParams {
-        jaw_period: Some(jaw_period),
-        jaw_offset: Some(jaw_offset),
-        teeth_period: Some(teeth_period),
-        teeth_offset: Some(teeth_offset),
-        lips_period: Some(lips_period),
-        lips_offset: Some(lips_offset),
-    };
-    let input = AlligatorInput::from_slice(slice_in, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    let out = py
-        .allow_threads(|| alligator_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("jaw", out.jaw.into_pyarray(py))?;
-    dict.set_item("teeth", out.teeth.into_pyarray(py))?;
-    dict.set_item("lips", out.lips.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AlligatorStream")]
-pub struct AlligatorStreamPy {
-    stream: AlligatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AlligatorStreamPy {
-    #[new]
-    #[pyo3(signature = (jaw_period=13, jaw_offset=8, teeth_period=8, teeth_offset=5, lips_period=5, lips_offset=3))]
-    fn new(
-        jaw_period: usize,
-        jaw_offset: usize,
-        teeth_period: usize,
-        teeth_offset: usize,
-        lips_period: usize,
-        lips_offset: usize,
-    ) -> PyResult<Self> {
-        let params = AlligatorParams {
-            jaw_period: Some(jaw_period),
-            jaw_offset: Some(jaw_offset),
-            teeth_period: Some(teeth_period),
-            teeth_offset: Some(teeth_offset),
-            lips_period: Some(lips_period),
-            lips_offset: Some(lips_offset),
-        };
-        let stream =
-            AlligatorStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AlligatorStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "alligator_batch")]
-#[pyo3(signature = (data, jaw_period_range, jaw_offset_range, teeth_period_range, teeth_offset_range, lips_period_range, lips_offset_range, kernel=None))]
-pub fn alligator_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    jaw_period_range: (usize, usize, usize),
-    jaw_offset_range: (usize, usize, usize),
-    teeth_period_range: (usize, usize, usize),
-    teeth_offset_range: (usize, usize, usize),
-    lips_period_range: (usize, usize, usize),
-    lips_offset_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-    let sweep = AlligatorBatchRange {
-        jaw_period: jaw_period_range,
-        jaw_offset: jaw_offset_range,
-        teeth_period: teeth_period_range,
-        teeth_offset: teeth_offset_range,
-        lips_period: lips_period_range,
-        lips_offset: lips_offset_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("alligator_batch_py: rows*cols overflow"))?;
-
-    let jaw_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let teeth_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let lips_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let jaw_out = unsafe { jaw_arr.as_slice_mut()? };
-    let teeth_out = unsafe { teeth_arr.as_slice_mut()? };
-    let lips_out = unsafe { lips_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    let combos = py
-        .allow_threads(|| {
-            let batch_k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            alligator_batch_inner_into(
-                slice_in, &sweep, batch_k, true, jaw_out, teeth_out, lips_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("jaw", jaw_arr.reshape((rows, cols))?)?;
-    dict.set_item("teeth", teeth_arr.reshape((rows, cols))?)?;
-    dict.set_item("lips", lips_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "jaw_periods",
-        combos
-            .iter()
-            .map(|p| p.jaw_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "jaw_offsets",
-        combos
-            .iter()
-            .map(|p| p.jaw_offset.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "teeth_periods",
-        combos
-            .iter()
-            .map(|p| p.teeth_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "teeth_offsets",
-        combos
-            .iter()
-            .map(|p| p.teeth_offset.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "lips_periods",
-        combos
-            .iter()
-            .map(|p| p.lips_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "lips_offsets",
-        combos
-            .iter()
-            .map(|p| p.lips_offset.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
 pub fn alligator_into_slice(
     jaw_dst: &mut [f64],
     teeth_dst: &mut [f64],
@@ -3190,178 +2897,6 @@ pub fn alligator_into_slice(
     }
 
     Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaAlligator};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "CudaContextGuard", unsendable)]
-struct CudaContextGuardPy {
-    #[pyo3(get)]
-    device_id: u32,
-    _ctx: Arc<Context>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "alligator_cuda_batch_dev")]
-#[pyo3(signature = (prices_f32, jaw_period, jaw_offset, teeth_period, teeth_offset, lips_period, lips_offset, device_id=0))]
-pub fn alligator_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    prices_f32: numpy::PyReadonlyArray1<'py, f32>,
-    jaw_period: (usize, usize, usize),
-    jaw_offset: (usize, usize, usize),
-    teeth_period: (usize, usize, usize),
-    teeth_offset: (usize, usize, usize),
-    lips_period: (usize, usize, usize),
-    lips_offset: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = prices_f32.as_slice()?;
-    let sweep = AlligatorBatchRange {
-        jaw_period,
-        jaw_offset,
-        teeth_period,
-        teeth_offset,
-        lips_period,
-        lips_offset,
-    };
-    let (jaw, teeth, lips, rows, cols, jp, jo, tp, to, lp, lo, guard_dev, guard_ctx) = py
-        .allow_threads(|| {
-            let cuda =
-                CudaAlligator::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let res = cuda
-                .alligator_batch_dev(slice, &sweep)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let rows = res.outputs.rows();
-            let cols = res.outputs.cols();
-            let jp: Vec<usize> = res.combos.iter().map(|c| c.jaw_period.unwrap()).collect();
-            let jo: Vec<usize> = res.combos.iter().map(|c| c.jaw_offset.unwrap()).collect();
-            let tp: Vec<usize> = res.combos.iter().map(|c| c.teeth_period.unwrap()).collect();
-            let to: Vec<usize> = res.combos.iter().map(|c| c.teeth_offset.unwrap()).collect();
-            let lp: Vec<usize> = res.combos.iter().map(|c| c.lips_period.unwrap()).collect();
-            let lo: Vec<usize> = res.combos.iter().map(|c| c.lips_offset.unwrap()).collect();
-            Ok::<_, PyErr>((
-                res.outputs.jaw,
-                res.outputs.teeth,
-                res.outputs.lips,
-                rows,
-                cols,
-                jp,
-                jo,
-                tp,
-                to,
-                lp,
-                lo,
-                res.outputs.device_id,
-                res.outputs._ctx.clone(),
-            ))
-        })?;
-    use numpy::IntoPyArray;
-    let d = PyDict::new(py);
-    let jaw_py = make_device_array_py(guard_dev as usize, jaw)?;
-    let teeth_py = make_device_array_py(guard_dev as usize, teeth)?;
-    let lips_py = make_device_array_py(guard_dev as usize, lips)?;
-    d.set_item("jaw", Py::new(py, jaw_py)?)?;
-    d.set_item("teeth", Py::new(py, teeth_py)?)?;
-    d.set_item("lips", Py::new(py, lips_py)?)?;
-    d.set_item("rows", rows)?;
-    d.set_item("cols", cols)?;
-    d.set_item("jaw_periods", jp.into_pyarray(py))?;
-    d.set_item("jaw_offsets", jo.into_pyarray(py))?;
-    d.set_item("teeth_periods", tp.into_pyarray(py))?;
-    d.set_item("teeth_offsets", to.into_pyarray(py))?;
-    d.set_item("lips_periods", lp.into_pyarray(py))?;
-    d.set_item("lips_offsets", lo.into_pyarray(py))?;
-    d.set_item(
-        "context_guard",
-        Py::new(
-            py,
-            CudaContextGuardPy {
-                device_id: guard_dev,
-                _ctx: guard_ctx,
-            },
-        )?,
-    )?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "alligator_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, jaw_period, jaw_offset, teeth_period, teeth_offset, lips_period, lips_offset, device_id=0))]
-pub fn alligator_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    jaw_period: usize,
-    jaw_offset: usize,
-    teeth_period: usize,
-    teeth_offset: usize,
-    lips_period: usize,
-    lips_offset: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = AlligatorParams {
-        jaw_period: Some(jaw_period),
-        jaw_offset: Some(jaw_offset),
-        teeth_period: Some(teeth_period),
-        teeth_offset: Some(teeth_offset),
-        lips_period: Some(lips_period),
-        lips_offset: Some(lips_offset),
-    };
-    let (jaw, teeth, lips, guard_dev, guard_ctx) = py.allow_threads(|| {
-        let cuda =
-            CudaAlligator::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .alligator_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((
-            out.jaw,
-            out.teeth,
-            out.lips,
-            cuda.device_id(),
-            cuda.context_arc(),
-        ))
-    })?;
-    let d = PyDict::new(py);
-    let jaw_py = make_device_array_py(guard_dev as usize, jaw)?;
-    let teeth_py = make_device_array_py(guard_dev as usize, teeth)?;
-    let lips_py = make_device_array_py(guard_dev as usize, lips)?;
-    d.set_item("jaw", Py::new(py, jaw_py)?)?;
-    d.set_item("teeth", Py::new(py, teeth_py)?)?;
-    d.set_item("lips", Py::new(py, lips_py)?)?;
-    d.set_item("rows", rows)?;
-    d.set_item("cols", cols)?;
-    d.set_item(
-        "context_guard",
-        Py::new(
-            py,
-            CudaContextGuardPy {
-                device_id: guard_dev,
-                _ctx: guard_ctx,
-            },
-        )?,
-    )?;
-    Ok(d)
 }
 
 #[inline]
@@ -3489,7 +3024,6 @@ pub fn alligator_into_slices(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn alligator_into(
     input: &AlligatorInput,
@@ -3498,352 +3032,4 @@ pub fn alligator_into(
     lips_out: &mut [f64],
 ) -> Result<(), AlligatorError> {
     alligator_into_slices(jaw_out, teeth_out, lips_out, input, Kernel::Auto)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_js(
-    data: &[f64],
-    jaw_period: usize,
-    jaw_offset: usize,
-    teeth_period: usize,
-    teeth_offset: usize,
-    lips_period: usize,
-    lips_offset: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = AlligatorParams {
-        jaw_period: Some(jaw_period),
-        jaw_offset: Some(jaw_offset),
-        teeth_period: Some(teeth_period),
-        teeth_offset: Some(teeth_offset),
-        lips_period: Some(lips_period),
-        lips_offset: Some(lips_offset),
-    };
-    let input = AlligatorInput::from_slice(data, params);
-    let out = alligator_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let total = data
-        .len()
-        .checked_mul(3)
-        .ok_or_else(|| JsValue::from_str("alligator_js: data length overflow"))?;
-    let mut result = Vec::with_capacity(total);
-    result.extend_from_slice(&out.jaw);
-    result.extend_from_slice(&out.teeth);
-    result.extend_from_slice(&out.lips);
-    Ok(result)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_into(
-    in_ptr: *const f64,
-    jaw_ptr: *mut f64,
-    teeth_ptr: *mut f64,
-    lips_ptr: *mut f64,
-    len: usize,
-    jaw_period: usize,
-    jaw_offset: usize,
-    teeth_period: usize,
-    teeth_offset: usize,
-    lips_period: usize,
-    lips_offset: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || jaw_ptr.is_null() || teeth_ptr.is_null() || lips_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = AlligatorParams {
-            jaw_period: Some(jaw_period),
-            jaw_offset: Some(jaw_offset),
-            teeth_period: Some(teeth_period),
-            teeth_offset: Some(teeth_offset),
-            lips_period: Some(lips_period),
-            lips_offset: Some(lips_offset),
-        };
-        let input = AlligatorInput::from_slice(data, params);
-
-        let aliased = in_ptr == jaw_ptr as *const f64
-            || in_ptr == teeth_ptr as *const f64
-            || in_ptr == lips_ptr as *const f64
-            || jaw_ptr == teeth_ptr
-            || jaw_ptr == lips_ptr
-            || teeth_ptr == lips_ptr;
-
-        if aliased {
-            let mut temp_jaw = vec![0.0; len];
-            let mut temp_teeth = vec![0.0; len];
-            let mut temp_lips = vec![0.0; len];
-
-            alligator_into_slices(
-                &mut temp_jaw,
-                &mut temp_teeth,
-                &mut temp_lips,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let jaw_out = std::slice::from_raw_parts_mut(jaw_ptr, len);
-            let teeth_out = std::slice::from_raw_parts_mut(teeth_ptr, len);
-            let lips_out = std::slice::from_raw_parts_mut(lips_ptr, len);
-
-            jaw_out.copy_from_slice(&temp_jaw);
-            teeth_out.copy_from_slice(&temp_teeth);
-            lips_out.copy_from_slice(&temp_lips);
-        } else {
-            let jaw_out = std::slice::from_raw_parts_mut(jaw_ptr, len);
-            let teeth_out = std::slice::from_raw_parts_mut(teeth_ptr, len);
-            let lips_out = std::slice::from_raw_parts_mut(lips_ptr, len);
-
-            alligator_into_slices(jaw_out, teeth_out, lips_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_batch_js(
-    data: &[f64],
-    jaw_period_start: usize,
-    jaw_period_end: usize,
-    jaw_period_step: usize,
-    jaw_offset_start: usize,
-    jaw_offset_end: usize,
-    jaw_offset_step: usize,
-    teeth_period_start: usize,
-    teeth_period_end: usize,
-    teeth_period_step: usize,
-    teeth_offset_start: usize,
-    teeth_offset_end: usize,
-    teeth_offset_step: usize,
-    lips_period_start: usize,
-    lips_period_end: usize,
-    lips_period_step: usize,
-    lips_offset_start: usize,
-    lips_offset_end: usize,
-    lips_offset_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AlligatorBatchRange {
-        jaw_period: (jaw_period_start, jaw_period_end, jaw_period_step),
-        jaw_offset: (jaw_offset_start, jaw_offset_end, jaw_offset_step),
-        teeth_period: (teeth_period_start, teeth_period_end, teeth_period_step),
-        teeth_offset: (teeth_offset_start, teeth_offset_end, teeth_offset_step),
-        lips_period: (lips_period_start, lips_period_end, lips_period_step),
-        lips_offset: (lips_offset_start, lips_offset_end, lips_offset_step),
-    };
-
-    alligator_batch_inner(data, &sweep, Kernel::ScalarBatch, false)
-        .map(|output| {
-            let mut result =
-                Vec::with_capacity((output.jaw.len() + output.teeth.len() + output.lips.len()));
-            result.extend_from_slice(&output.jaw);
-            result.extend_from_slice(&output.teeth);
-            result.extend_from_slice(&output.lips);
-            result
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_batch_metadata_js(
-    jaw_period_start: usize,
-    jaw_period_end: usize,
-    jaw_period_step: usize,
-    jaw_offset_start: usize,
-    jaw_offset_end: usize,
-    jaw_offset_step: usize,
-    teeth_period_start: usize,
-    teeth_period_end: usize,
-    teeth_period_step: usize,
-    teeth_offset_start: usize,
-    teeth_offset_end: usize,
-    teeth_offset_step: usize,
-    lips_period_start: usize,
-    lips_period_end: usize,
-    lips_period_step: usize,
-    lips_offset_start: usize,
-    lips_offset_end: usize,
-    lips_offset_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AlligatorBatchRange {
-        jaw_period: (jaw_period_start, jaw_period_end, jaw_period_step),
-        jaw_offset: (jaw_offset_start, jaw_offset_end, jaw_offset_step),
-        teeth_period: (teeth_period_start, teeth_period_end, teeth_period_step),
-        teeth_offset: (teeth_offset_start, teeth_offset_end, teeth_offset_step),
-        lips_period: (lips_period_start, lips_period_end, lips_period_step),
-        lips_offset: (lips_offset_start, lips_offset_end, lips_offset_step),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut metadata = Vec::with_capacity(combos.len() * 6);
-
-    for combo in combos {
-        metadata.push(combo.jaw_period.unwrap() as f64);
-        metadata.push(combo.jaw_offset.unwrap() as f64);
-        metadata.push(combo.teeth_period.unwrap() as f64);
-        metadata.push(combo.teeth_offset.unwrap() as f64);
-        metadata.push(combo.lips_period.unwrap() as f64);
-        metadata.push(combo.lips_offset.unwrap() as f64);
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AlligatorBatchJsOutput {
-    pub jaw: Vec<f64>,
-    pub teeth: Vec<f64>,
-    pub lips: Vec<f64>,
-    pub combos: Vec<AlligatorParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AlligatorBatchConfig {
-    pub jaw_period_range: (usize, usize, usize),
-    pub jaw_offset_range: (usize, usize, usize),
-    pub teeth_period_range: (usize, usize, usize),
-    pub teeth_offset_range: (usize, usize, usize),
-    pub lips_period_range: (usize, usize, usize),
-    pub lips_offset_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = alligator_batch)]
-pub fn alligator_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: AlligatorBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AlligatorBatchRange {
-        jaw_period: config.jaw_period_range,
-        jaw_offset: config.jaw_offset_range,
-        teeth_period: config.teeth_period_range,
-        teeth_offset: config.teeth_offset_range,
-        lips_period: config.lips_period_range,
-        lips_offset: config.lips_offset_range,
-    };
-    let rows = expand_grid(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("alligator_batch_unified_js: rows*cols overflow"))?;
-    let mut jaw = vec![f64::NAN; total];
-    let mut teeth = vec![f64::NAN; total];
-    let mut lips = vec![f64::NAN; total];
-
-    let combos = alligator_batch_inner_into(
-        data,
-        &sweep,
-        Kernel::ScalarBatch,
-        false,
-        &mut jaw,
-        &mut teeth,
-        &mut lips,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js = AlligatorBatchJsOutput {
-        jaw,
-        teeth,
-        lips,
-        combos,
-        rows,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&js).map_err(|e| JsValue::from_str(&format!("serde: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alligator_batch_into(
-    in_ptr: *const f64,
-    jaw_out_ptr: *mut f64,
-    teeth_out_ptr: *mut f64,
-    lips_out_ptr: *mut f64,
-    len: usize,
-
-    jp_s: usize,
-    jp_e: usize,
-    jp_step: usize,
-    jo_s: usize,
-    jo_e: usize,
-    jo_step: usize,
-    tp_s: usize,
-    tp_e: usize,
-    tp_step: usize,
-    to_s: usize,
-    to_e: usize,
-    to_step: usize,
-    lp_s: usize,
-    lp_e: usize,
-    lp_step: usize,
-    lo_s: usize,
-    lo_e: usize,
-    lo_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null()
-        || jaw_out_ptr.is_null()
-        || teeth_out_ptr.is_null()
-        || lips_out_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to alligator_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = AlligatorBatchRange {
-            jaw_period: (jp_s, jp_e, jp_step),
-            jaw_offset: (jo_s, jo_e, jo_step),
-            teeth_period: (tp_s, tp_e, tp_step),
-            teeth_offset: (to_s, to_e, to_step),
-            lips_period: (lp_s, lp_e, lp_step),
-            lips_offset: (lo_s, lo_e, lo_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("alligator_batch_into: rows*cols overflow"))?;
-
-        let jaw = std::slice::from_raw_parts_mut(jaw_out_ptr, total);
-        let teeth = std::slice::from_raw_parts_mut(teeth_out_ptr, total);
-        let lips = std::slice::from_raw_parts_mut(lips_out_ptr, total);
-
-        alligator_batch_inner_into(data, &sweep, Kernel::ScalarBatch, false, jaw, teeth, lips)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
 }

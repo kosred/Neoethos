@@ -30,10 +30,11 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use polars::prelude::DataFrame;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 
 use super::tree_adapters::classification3_per_row;
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, project_expert_frame};
 use crate::base::ExpertModel as BaseExpertModel;
 use crate::evolution::{NeatExpert, NeuroEvoExpert};
 use crate::runtime::capabilities::ModelFamily;
@@ -71,10 +72,11 @@ impl ExpertModel for NeatAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .context("neat predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -91,9 +93,9 @@ impl ExpertLoader for NeatAdapterLoader {
         // input_dim is a placeholder — `load` restores every dimension,
         // the scaler, the genome and the feature columns from the artifact.
         let mut inner = NeatExpert::new(0);
-        inner.load(artifact_dir).with_context(|| {
-            format!("NeatExpert::load({}) failed", artifact_dir.display())
-        })?;
+        inner
+            .load(artifact_dir)
+            .with_context(|| format!("NeatExpert::load({}) failed", artifact_dir.display()))?;
         Ok(Box::new(NeatAdapter::new(inner)))
     }
 }
@@ -131,10 +133,11 @@ impl ExpertModel for NeuroEvoAdapter {
     fn feature_columns(&self) -> &[String] {
         self.inner.feature_columns()
     }
-    fn predict(&self, df: &DataFrame) -> Result<Vec<ExpertPrediction>> {
+    fn predict(&self, frame: &FeatureFrame, lease: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+        let projected = project_expert_frame(frame, self.feature_columns(), self.name())?;
         let probs = self
             .inner
-            .predict_proba(df)
+            .predict_proba(&projected, lease)
             .context("neuro_evo predict_proba failed")?;
         classification3_per_row(&probs)
     }
@@ -149,9 +152,9 @@ impl ExpertLoader for NeuroEvoAdapterLoader {
     }
     fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
         let mut inner = NeuroEvoExpert::new(0);
-        inner.load(artifact_dir).with_context(|| {
-            format!("NeuroEvoExpert::load({}) failed", artifact_dir.display())
-        })?;
+        inner
+            .load(artifact_dir)
+            .with_context(|| format!("NeuroEvoExpert::load({}) failed", artifact_dir.display()))?;
         Ok(Box::new(NeuroEvoAdapter::new(inner)))
     }
 }

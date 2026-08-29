@@ -1,26 +1,10 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::moving_averages::ma::{ma, MaData};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::moving_averages::ma::{MaData, ma};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1513,173 +1497,6 @@ fn generic_update(st: &mut GenericState, ma_type: &str, x: f64) -> Option<f64> {
     m.last().copied()
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "eri")]
-#[pyo3(signature = (high, low, source, period=13, ma_type="ema", kernel=None))]
-pub fn eri_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    source: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let source_slice = source.as_slice()?;
-
-    if high_slice.len() != low_slice.len() || high_slice.len() != source_slice.len() {
-        return Err(PyValueError::new_err(
-            "high, low, and source arrays must have the same length",
-        ));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = EriParams {
-        period: Some(period),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = EriInput::from_slices(high_slice, low_slice, source_slice, params);
-
-    let result = py
-        .allow_threads(|| eri_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((result.bull.into_pyarray(py), result.bear.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EriStream")]
-pub struct EriStreamPy {
-    stream: EriStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EriStreamPy {
-    #[new]
-    fn new(period: usize, ma_type: Option<&str>) -> PyResult<Self> {
-        let params = EriParams {
-            period: Some(period),
-            ma_type: ma_type
-                .map(|s| s.to_string())
-                .or_else(|| Some("ema".to_string())),
-        };
-        let stream =
-            EriStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(EriStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, source: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low, source)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "eri_batch")]
-#[pyo3(signature = (high, low, source, period_range=(13, 13, 0), ma_type="ema", kernel=None))]
-pub fn eri_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    source: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let source_slice = source.as_slice()?;
-
-    if high_slice.len() != low_slice.len() || high_slice.len() != source_slice.len() {
-        return Err(PyValueError::new_err(
-            "high, low, and source arrays must have the same length",
-        ));
-    }
-
-    let sweep = EriBatchRange {
-        period: period_range,
-        ma_type: ma_type.to_string(),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = high_slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let bull_array: Bound<'py, PyArray1<f64>> = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bear_array: Bound<'py, PyArray1<f64>> = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let bull_slice = unsafe { bull_array.as_slice_mut()? };
-    let bear_slice = unsafe { bear_array.as_slice_mut()? };
-
-    let first_valid = high_slice
-        .iter()
-        .zip(low_slice.iter())
-        .zip(source_slice.iter())
-        .position(|((h, l), s)| !h.is_nan() && !l.is_nan() && !s.is_nan())
-        .unwrap_or(0);
-
-    for (row, combo) in combos.iter().enumerate() {
-        let period = combo.period.unwrap();
-        let warmup = first_valid + period - 1;
-        let row_start = row * cols;
-        for i in 0..warmup.min(cols) {
-            bull_slice[row_start + i] = f64::NAN;
-            bear_slice[row_start + i] = f64::NAN;
-        }
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-    let kernel_to_use = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        k => k,
-    };
-    let simd = match kernel_to_use {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => Kernel::Scalar,
-    };
-
-    let combos = py
-        .allow_threads(|| {
-            eri_batch_inner_into(
-                high_slice,
-                low_slice,
-                source_slice,
-                &sweep,
-                simd,
-                true,
-                bull_slice,
-                bear_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let bull_reshaped = bull_array.reshape([rows, cols])?;
-    let bear_reshaped = bear_array.reshape([rows, cols])?;
-
-    let periods: Vec<usize> = combos.iter().map(|c| c.period.unwrap()).collect();
-    let ma_types: Vec<&str> = vec![ma_type; combos.len()];
-
-    let dict = PyDict::new(py);
-    dict.set_item("bull_values", bull_reshaped)?;
-    dict.set_item("bear_values", bear_reshaped)?;
-    dict.set_item("periods", periods.into_pyarray(py))?;
-    dict.set_item("ma_types", ma_types)?;
-
-    Ok(dict.into())
-}
-
 pub fn eri_into_slice(
     dst_bull: &mut [f64],
     dst_bear: &mut [f64],
@@ -1827,7 +1644,6 @@ pub fn eri_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn eri_into(
     input: &EriInput,
@@ -1835,307 +1651,6 @@ pub fn eri_into(
     bear_out: &mut [f64],
 ) -> Result<(), EriError> {
     eri_into_slice(bull_out, bear_out, input, Kernel::Auto)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EriResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn eri_js_flat(
-    high: &[f64],
-    low: &[f64],
-    source: &[f64],
-    period: usize,
-    ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() || high.len() != source.len() {
-        return Err(JsValue::from_str("length mismatch"));
-    }
-    let params = EriParams {
-        period: Some(period),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = EriInput::from_slices(high, low, source, params);
-
-    let mut bull = vec![0.0; source.len()];
-    let mut bear = vec![0.0; source.len()];
-    eri_into_slice(&mut bull, &mut bear, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = bull;
-    values.extend_from_slice(&bear);
-
-    let out = EriResult {
-        values,
-        rows: 2,
-        cols: source.len(),
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn eri_js(
-    high: &[f64],
-    low: &[f64],
-    source: &[f64],
-    period: usize,
-    ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    if high.len() != low.len() || high.len() != source.len() {
-        return Err(JsValue::from_str(
-            "high, low, and source arrays must have the same length",
-        ));
-    }
-
-    let params = EriParams {
-        period: Some(period),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = EriInput::from_slices(high, low, source, params);
-
-    let total = source
-        .len()
-        .checked_mul(2)
-        .ok_or_else(|| JsValue::from_str("length overflow"))?;
-    let mut output = vec![0.0; total];
-    let (bull_part, bear_part) = output.split_at_mut(source.len());
-
-    eri_into_slice(bull_part, bear_part, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::eri_wrapper::CudaEri;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "eri_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, source_f32, period_range, ma_type, device_id=0))]
-pub fn eri_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    source_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let s = source_f32.as_slice()?;
-    let sweep = EriBatchRange {
-        period: period_range,
-        ma_type: ma_type.to_string(),
-    };
-    let (bull, bear) = py.allow_threads(|| {
-        let cuda = CudaEri::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.eri_batch_dev(h, l, s, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-            .map(|((bull, bear), _combos)| (bull, bear))
-    })?;
-    let bull_dev = make_device_array_py(device_id, bull)?;
-    let bear_dev = make_device_array_py(device_id, bear)?;
-    Ok((bull_dev, bear_dev))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "eri_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, source_tm_f32, cols, rows, period, ma_type, device_id=0))]
-pub fn eri_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    source_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let s = source_tm_f32.as_slice()?;
-    let (bull, bear) = py.allow_threads(|| {
-        let cuda = CudaEri::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.eri_many_series_one_param_time_major_dev(h, l, s, cols, rows, period, ma_type)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-            .map(|(bull, bear)| (bull, bear))
-    })?;
-    let bull_dev = make_device_array_py(device_id, bull)?;
-    let bear_dev = make_device_array_py(device_id, bear)?;
-    Ok((bull_dev, bear_dev))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn eri_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    source_ptr: *const f64,
-    bull_ptr: *mut f64,
-    bear_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || source_ptr.is_null()
-        || bull_ptr.is_null()
-        || bear_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let source = std::slice::from_raw_parts(source_ptr, len);
-
-        let params = EriParams {
-            period: Some(period),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let input = EriInput::from_slices(high, low, source, params);
-
-        let needs_temp = bull_ptr as *const f64 == high_ptr
-            || bull_ptr as *const f64 == low_ptr
-            || bull_ptr as *const f64 == source_ptr
-            || bear_ptr as *const f64 == high_ptr
-            || bear_ptr as *const f64 == low_ptr
-            || bear_ptr as *const f64 == source_ptr
-            || bull_ptr == bear_ptr;
-
-        if needs_temp {
-            let mut temp_bull = vec![0.0; len];
-            let mut temp_bear = vec![0.0; len];
-            eri_into_slice(&mut temp_bull, &mut temp_bear, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let bull_out = std::slice::from_raw_parts_mut(bull_ptr, len);
-            let bear_out = std::slice::from_raw_parts_mut(bear_ptr, len);
-            bull_out.copy_from_slice(&temp_bull);
-            bear_out.copy_from_slice(&temp_bear);
-        } else {
-            let bull_out = std::slice::from_raw_parts_mut(bull_ptr, len);
-            let bear_out = std::slice::from_raw_parts_mut(bear_ptr, len);
-            eri_into_slice(bull_out, bear_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn eri_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn eri_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EriBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub ma_type: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EriBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub periods: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = eri_batch)]
-pub fn eri_batch_js(
-    high: &[f64],
-    low: &[f64],
-    source: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() || high.len() != source.len() {
-        return Err(JsValue::from_str(
-            "high, low, and source arrays must have the same length",
-        ));
-    }
-
-    let config: EriBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = EriBatchRange {
-        period: config.period_range,
-        ma_type: config.ma_type,
-    };
-
-    let output = eri_batch_with_kernel(high, low, source, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let rows = output
-        .rows
-        .checked_mul(2)
-        .ok_or_else(|| JsValue::from_str("rows overflow"))?;
-    let cols = output.cols;
-
-    let cap = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let mut values = Vec::with_capacity(cap);
-
-    for r in 0..output.rows {
-        let start = r * cols;
-        values.extend_from_slice(&output.bull[start..start + cols]);
-    }
-
-    for r in 0..output.rows {
-        let start = r * cols;
-        values.extend_from_slice(&output.bear[start..start + cols]);
-    }
-
-    let periods: Vec<usize> = output.params.iter().map(|p| p.period.unwrap()).collect();
-
-    let js_output = EriBatchJsOutput {
-        values,
-        rows,
-        cols,
-        periods,
-    };
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }
 
 #[inline]
@@ -2262,38 +1777,11 @@ unsafe fn eri_scalar_classic_ema_13(
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn eri_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    source: &[f64],
-    period: usize,
-    ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = eri_js(high, low, source, period, ma_type)?;
-    crate::write_wasm_f64_output("eri_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn eri_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    source: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = eri_batch_js(high, low, source, config)?;
-    crate::write_wasm_selected_object_f64_outputs("eri_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     fn check_eri_partial_params(
@@ -2301,8 +1789,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = EriParams {
             period: None,
@@ -2339,8 +1827,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_prices = candles
             .select_candle_field("close")
             .expect("Failed to extract close prices");
@@ -2399,8 +1887,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EriInput::with_default_candles(&candles);
         match input.data {
@@ -2485,8 +1973,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = EriParams {
             period: Some(14),
@@ -2533,8 +2021,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EriInput::from_candles(
             &candles,
@@ -2576,8 +2064,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             EriParams::default(),
@@ -2644,44 +2132,44 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at bull index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at bull index {} \
 						 with params: period={}, ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(13),
-						params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(13),
+                        params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at bull index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at bull index {} \
 						 with params: period={}, ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(13),
-						params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(13),
+                        params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at bull index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at bull index {} \
 						 with params: period={}, ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(13),
-						params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(13),
+                        params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
+                        param_idx
+                    );
                 }
             }
 
@@ -2694,44 +2182,44 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at bear index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at bear index {} \
 						 with params: period={}, ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(13),
-						params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(13),
+                        params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at bear index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at bear index {} \
 						 with params: period={}, ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(13),
-						params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(13),
+                        params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at bear index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at bear index {} \
 						 with params: period={}, ma_type={} (param set {})",
-						test_name,
-						val,
-						bits,
-						i,
-						params.period.unwrap_or(13),
-						params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(13),
+                        params.ma_type.as_ref().unwrap_or(&"ema".to_string()),
+                        param_idx
+                    );
                 }
             }
         }
@@ -2792,8 +2280,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let high = c.select_candle_field("high").unwrap();
         let low = c.select_candle_field("low").unwrap();
@@ -2849,13 +2337,8 @@ mod tests {
 
         let mut bull = vec![0.0; len];
         let mut bear = vec![0.0; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             eri_into(&input, &mut bull, &mut bear)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            eri_into_slice(&mut bull, &mut bear, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.bull.len(), bull.len());
@@ -2887,8 +2370,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let high = c.select_candle_field("high").unwrap();
         let low = c.select_candle_field("low").unwrap();

@@ -1,31 +1,15 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::convert::AsRef;
 use std::error::Error;
 use thiserror::Error;
-
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 impl<'a> AsRef<[f64]> for CorrectedMovingAverageInput<'a> {
     #[inline(always)]
@@ -52,10 +36,6 @@ pub struct CorrectedMovingAverageOutput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct CorrectedMovingAverageParams {
     pub period: Option<usize>,
 }
@@ -190,13 +170,9 @@ pub enum CorrectedMovingAverageError {
     InvalidPeriod { period: usize, data_len: usize },
     #[error("corrected_moving_average: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error(
-        "corrected_moving_average: Output length mismatch: expected = {expected}, got = {got}"
-    )]
+    #[error("corrected_moving_average: Output length mismatch: expected = {expected}, got = {got}")]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error(
-        "corrected_moving_average: Invalid range: start = {start}, end = {end}, step = {step}"
-    )]
+    #[error("corrected_moving_average: Invalid range: start = {start}, end = {end}, step = {step}")]
     InvalidRange {
         start: usize,
         end: usize,
@@ -445,7 +421,6 @@ pub fn corrected_moving_average_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn corrected_moving_average_into(
     input: &CorrectedMovingAverageInput,
     out: &mut [f64],
@@ -695,277 +670,10 @@ fn corrected_moving_average_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "corrected_moving_average")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn corrected_moving_average_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = CorrectedMovingAverageInput::from_slice(
-        slice,
-        CorrectedMovingAverageParams {
-            period: Some(period),
-        },
-    );
-    let values = py
-        .allow_threads(|| corrected_moving_average_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "CorrectedMovingAverageStream")]
-pub struct CorrectedMovingAverageStreamPy {
-    stream: CorrectedMovingAverageStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl CorrectedMovingAverageStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let stream = CorrectedMovingAverageStream::try_new(CorrectedMovingAverageParams {
-            period: Some(period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "corrected_moving_average_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn corrected_moving_average_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let batch_kernel = match kern {
-        Kernel::Auto => detect_best_batch_kernel(),
-        other => other,
-    };
-    let output = py
-        .allow_threads(|| {
-            corrected_moving_average_batch_with_kernel(
-                slice,
-                &CorrectedMovingAverageBatchRange {
-                    period: period_range,
-                },
-                batch_kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    let values = output
-        .values
-        .into_pyarray(py)
-        .reshape((output.rows, output.cols))?;
-    dict.set_item("values", values)?;
-    dict.set_item(
-        "periods",
-        output
-            .combos
-            .iter()
-            .map(|p| p.period.unwrap_or(35) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn corrected_moving_average_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let input = CorrectedMovingAverageInput::from_slice(
-        data,
-        CorrectedMovingAverageParams {
-            period: Some(period),
-        },
-    );
-    let mut output = alloc_with_nan_prefix(data.len(), 0);
-    corrected_moving_average_into_slice(&mut output, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CorrectedMovingAverageBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct CorrectedMovingAverageBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<CorrectedMovingAverageParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn corrected_moving_average_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: CorrectedMovingAverageBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let output = corrected_moving_average_batch_with_kernel(
-        data,
-        &CorrectedMovingAverageBatchRange {
-            period: config.period_range,
-        },
-        Kernel::ScalarBatch,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&CorrectedMovingAverageBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn corrected_moving_average_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn corrected_moving_average_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn corrected_moving_average_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to corrected_moving_average_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = CorrectedMovingAverageInput::from_slice(
-            data,
-            CorrectedMovingAverageParams {
-                period: Some(period),
-            },
-        );
-        if in_ptr == out_ptr {
-            let mut tmp = alloc_with_nan_prefix(len, 0);
-            corrected_moving_average_into_slice(&mut tmp, &input, Kernel::Scalar)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            corrected_moving_average_into_slice(
-                std::slice::from_raw_parts_mut(out_ptr, len),
-                &input,
-                Kernel::Scalar,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn corrected_moving_average_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to corrected_moving_average_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = CorrectedMovingAverageBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos = expand_grid_corrected_moving_average(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        corrected_moving_average_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::ScalarBatch,
-            false,
-            std::slice::from_raw_parts_mut(out_ptr, rows * len),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn corrected_moving_average_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = corrected_moving_average_js(data, period)?;
-    crate::write_wasm_f64_output("corrected_moving_average_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn corrected_moving_average_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = corrected_moving_average_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "corrected_moving_average_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indicators::moving_averages::ma::{ma, ma_with_kernel, MaData};
+    use crate::indicators::moving_averages::ma::{MaData, ma, ma_with_kernel};
 
     #[test]
     fn corrected_moving_average_constant_series_stays_constant() -> Result<(), Box<dyn Error>> {

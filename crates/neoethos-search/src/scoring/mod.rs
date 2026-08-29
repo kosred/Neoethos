@@ -96,14 +96,13 @@ pub mod ingredients;
 pub mod named;
 
 pub use ingredients::{
-    consistency_component, drawdown_penalty, expectancy_component, ga_pf_component,
-    net_component, profit_factor_component, sharpe_component, trades_confidence,
-    win_rate_component,
+    consistency_component, drawdown_penalty, expectancy_component, ga_pf_component, net_component,
+    profit_factor_component, sharpe_component, trades_confidence, win_rate_component,
 };
 
 pub use named::{
-    archive_score, ga_fitness, ga_fitness_growth, quality_score, window_score, ScoringVersion,
-    SCORING_VERSION_CURRENT,
+    SCORING_VERSION_CURRENT, ScoringVersion, archive_score, ga_fitness, ga_fitness_growth,
+    quality_score, window_score,
 };
 
 #[cfg(test)]

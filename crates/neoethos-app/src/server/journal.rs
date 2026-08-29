@@ -17,8 +17,10 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
+use neoethos_data::{CanonicalDatasetIdentity, CanonicalOhlcvFrame};
 use serde::Deserialize;
 
+use super::chart::ExactDatasetReceipt;
 use super::state::AppApiState;
 use crate::app_services::{journal_analytics, journal_stats, journal_store};
 
@@ -36,6 +38,14 @@ pub struct JournalQuery {
     /// carry placeholder symbols (`#1`, `#5`, `#41`) written before the broker
     /// catalog populated — filtering on the raw value would silently drop them.
     pub symbol: Option<String>,
+    /// Optional exact market-data identity for excursion analytics. This is a
+    /// pair with `expected_generation`; partial pairs are rejected.
+    #[serde(
+        default,
+        deserialize_with = "super::chart::deserialize_optional_dataset_identity"
+    )]
+    pub dataset_identity: Option<CanonicalDatasetIdentity>,
+    pub expected_generation: Option<String>,
 }
 
 /// Keep only rows for `symbol` when one was asked for. Returns how many rows
@@ -170,32 +180,32 @@ pub async fn stats(State(state): State<AppApiState>, Query(q): Query<JournalQuer
     Json(journal_stats::compute_stats(&trades, &equity)).into_response()
 }
 
-
-/// Bars for a trade's own window, read from the price store the engine already
-/// keeps.
-///
-/// The broker reports where a trade opened and closed and nothing in between,
-/// so how far it ran in favour before giving the move back is invisible in the
-/// account history — which is exactly the question being asked. The stored
-/// series has it. The finest timeframe present wins, because excursion measured
-/// on daily bars would flatten intraday trades to nothing.
+/// One fully verified and pinned immutable price generation used for excursion
+/// analytics. A different symbol/source/account/timeframe is never guessed.
 struct StorePrices {
-    root: std::path::PathBuf,
+    frame: CanonicalOhlcvFrame,
 }
 
 impl StorePrices {
-    /// Finest first: a trade held for an hour needs minute bars to show its
-    /// path, and reading a coarse series would silently understate excursion.
-    const TIMEFRAMES: [&'static str; 8] = ["M1", "M3", "M5", "M15", "M30", "H1", "H4", "D1"];
+    fn open(root: &std::path::Path, receipt: &ExactDatasetReceipt) -> anyhow::Result<Self> {
+        Ok(Self {
+            frame: super::chart::load_exact_current_frame(root, receipt)?,
+        })
+    }
 }
 
 impl journal_analytics::PriceWindow for StorePrices {
     fn window(&self, symbol: &str, from_ms: i64, to_ms: i64) -> Option<(Vec<f64>, Vec<f64>)> {
-        let available = neoethos_data::discover_timeframes(&self.root, symbol).ok()?;
-        let timeframe = Self::TIMEFRAMES
-            .iter()
-            .find(|tf| available.iter().any(|have| have.eq_ignore_ascii_case(tf)))?;
-        let ohlcv = neoethos_data::load_symbol_timeframe(&self.root, symbol, timeframe).ok()?;
+        if !self
+            .frame
+            .artifact()
+            .identity()
+            .symbol_name()
+            .eq_ignore_ascii_case(symbol)
+        {
+            return None;
+        }
+        let ohlcv = self.frame.ohlcv();
         let stamps = ohlcv.timestamp.as_ref()?;
         let mut highs = Vec::new();
         let mut lows = Vec::new();
@@ -251,6 +261,42 @@ pub async fn analytics(
         Ok(d) => d,
         Err(resp) => return resp,
     };
+    let receipt: Option<ExactDatasetReceipt> =
+        match ExactDatasetReceipt::from_optional(q.dataset_identity, q.expected_generation) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("invalid journal price dataset receipt: {error}"),
+                        "code": "invalid_dataset_receipt",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    if let (Some(receipt), Some(asserted)) = (
+        receipt.as_ref(),
+        q.symbol
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        if !asserted.eq_ignore_ascii_case(receipt.identity().symbol_name()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "journal symbol assertion {asserted:?} disagrees with exact dataset identity symbol {:?}",
+                        receipt.identity().symbol_name()
+                    ),
+                    "code": "dataset_identity_mismatch",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let names = state.symbol_catalog_snapshot().await;
     let mut trades = journal_store::query_closed_trades(&data_dir, q.from_ms, q.to_ms);
     if let Some(active) = journal_store::active_account_id() {
@@ -274,10 +320,40 @@ pub async fn analytics(
             "journal analytics: narrowed to one instrument"
         );
     }
-    // Excursion needs the price store. When it is absent the analytics still
-    // return — with the excursion fields empty rather than zeroed, so a missing
-    // series never reads as "the trades never went anywhere". `coverage` on the
-    // response says exactly how many rows each derived figure was available for.
-    let prices = StorePrices { root: data_dir };
-    Json(journal_analytics::analyse(&trades, Some(&prices))).into_response()
+    // Absence of a receipt is an explicit no-price-data mode: optional
+    // excursion fields stay unavailable and the analytics layer records that
+    // absence. When a receipt is supplied, open/verify/pin it before deriving a
+    // single high/low value; generation drift is a loud conflict.
+    let prices = match receipt {
+        Some(receipt) => {
+            let root = data_dir.clone();
+            match tokio::task::spawn_blocking(move || StorePrices::open(&root, &receipt)).await {
+                Ok(Ok(prices)) => Some(prices),
+                Ok(Err(error)) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "journal price generation could not be fully verified and pinned: {error}"
+                            ),
+                            "code": "dataset_generation_conflict",
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(join_error) => {
+                    return super::errors::internal_panic(
+                        "Loading exact journal price generation",
+                        join_error,
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    let result = match prices.as_ref() {
+        Some(prices) => journal_analytics::analyse(&trades, Some(prices)),
+        None => journal_analytics::analyse(&trades, None),
+    };
+    Json(result).into_response()
 }

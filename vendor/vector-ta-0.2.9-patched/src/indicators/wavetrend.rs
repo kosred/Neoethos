@@ -1,35 +1,11 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::wavetrend::CudaWavetrend;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::moving_averages::ema::{ema, EmaError, EmaInput, EmaParams};
-use crate::indicators::moving_averages::sma::{sma, SmaError, SmaInput, SmaParams};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::moving_averages::ema::{EmaError, EmaInput, EmaParams, ema};
+use crate::indicators::moving_averages::sma::{SmaError, SmaInput, SmaParams, sma};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -1554,94 +1530,6 @@ fn fast_abs_f64(x: f64) -> f64 {
     f64::from_bits(x.to_bits() & 0x7FFF_FFFF_FFFF_FFFF)
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "WavetrendDeviceArrayF32", unsendable)]
-pub struct WavetrendDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl WavetrendDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy = cust::memory::DeviceBuffer::from_slice(&[])
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct WavetrendBatchRange {
     pub channel_length: (usize, usize, usize),
@@ -2409,36 +2297,12 @@ unsafe fn wavetrend_row_with_kernel(
         kernel,
     )
 }
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wavetrend_output_into_js(
-    data: &[f64],
-    channel_length: usize,
-    average_length: usize,
-    ma_length: usize,
-    factor: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = wavetrend_js(data, channel_length, average_length, ma_length, factor)?;
-    crate::write_wasm_f64_output("wavetrend_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wavetrend_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = wavetrend_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("wavetrend_batch_output_into_js", &value, out)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     fn check_wavetrend_partial_params(
@@ -2446,8 +2310,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = WavetrendParams {
             channel_length: None,
             average_length: None,
@@ -2465,8 +2329,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = WavetrendInput::from_candles(&candles, "hlc3", WavetrendParams::default());
         let result = wavetrend_with_kernel(&input, kernel)?;
         let len = result.wt1.len();
@@ -2530,8 +2394,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = WavetrendInput::with_default_candles(&candles);
         match input.data {
             WavetrendData::Candles { source, .. } => assert_eq!(source, "hlc3"),
@@ -2608,8 +2472,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = WavetrendInput::from_candles(
             &candles,
             "hlc3",
@@ -2642,8 +2506,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             WavetrendParams::default(),
@@ -2764,41 +2628,50 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
 						 in wt1 output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
 						 in wt1 output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
 						 in wt1 output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
             }
 
@@ -2811,41 +2684,50 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
 						 in wt2 output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
 						 in wt2 output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
 						 in wt2 output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
             }
 
@@ -2858,41 +2740,50 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
 						 in wt_diff output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
 						 in wt_diff output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
 						 in wt_diff output with params: channel_length={}, average_length={}, ma_length={}, factor={} (param set {})",
-						test_name, val, bits, i,
-						params.channel_length.unwrap_or(9),
-						params.average_length.unwrap_or(12),
-						params.ma_length.unwrap_or(3),
-						params.factor.unwrap_or(0.015),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.channel_length.unwrap_or(9),
+                        params.average_length.unwrap_or(12),
+                        params.ma_length.unwrap_or(3),
+                        params.factor.unwrap_or(0.015),
+                        param_idx
+                    );
                 }
             }
         }
@@ -2914,8 +2805,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let channel_length = 9;
         let average_length = 12;
@@ -3015,14 +2906,14 @@ mod tests {
             }
             let diff = (b - s).abs();
             assert!(
-				diff < 1e-9,
-				"[{}] Wavetrend streaming wt_diff f64 mismatch at idx {}: full={}, stream={}, diff={}",
-				test_name,
-				i,
-				b,
-				s,
-				diff
-			);
+                diff < 1e-9,
+                "[{}] Wavetrend streaming wt_diff f64 mismatch at idx {}: full={}, stream={}, diff={}",
+                test_name,
+                i,
+                b,
+                s,
+                diff
+            );
         }
         Ok(())
     }
@@ -3329,8 +3220,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = WavetrendBatchBuilder::new()
             .kernel(kernel)
@@ -3386,8 +3277,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 3, 12, 3, 1, 5, 1, 0.005, 0.015, 0.005),
@@ -3421,38 +3312,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt1 output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt1 output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt1 output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
             }
 
@@ -3468,38 +3377,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt2 output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt2 output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt2 output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
             }
 
@@ -3515,38 +3442,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt_diff output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt_diff output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) \
 						 at row {} col {} (flat index {}) in wt_diff output with params: channel_length={}, average_length={}, ma_length={}, factor={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.channel_length.unwrap_or(9),
-						combo.average_length.unwrap_or(12),
-						combo.ma_length.unwrap_or(3),
-						combo.factor.unwrap_or(0.015)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.channel_length.unwrap_or(9),
+                        combo.average_length.unwrap_or(12),
+                        combo.ma_length.unwrap_or(3),
+                        combo.factor.unwrap_or(0.015)
+                    );
                 }
             }
         }
@@ -3584,567 +3529,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "wavetrend")]
-#[pyo3(signature = (data, channel_length, average_length, ma_length, factor, kernel=None))]
-pub fn wavetrend_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    channel_length: usize,
-    average_length: usize,
-    ma_length: usize,
-    factor: f64,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = WavetrendParams {
-        channel_length: Some(channel_length),
-        average_length: Some(average_length),
-        ma_length: Some(ma_length),
-        factor: Some(factor),
-    };
-    let input = WavetrendInput::from_slice(slice_in, params);
-
-    let (wt1_vec, wt2_vec, wt_diff_vec) = py
-        .allow_threads(|| wavetrend_with_kernel(&input, kern).map(|o| (o.wt1, o.wt2, o.wt_diff)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        wt1_vec.into_pyarray(py),
-        wt2_vec.into_pyarray(py),
-        wt_diff_vec.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "WavetrendStream")]
-pub struct WavetrendStreamPy {
-    stream: WavetrendStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl WavetrendStreamPy {
-    #[new]
-    fn new(
-        channel_length: usize,
-        average_length: usize,
-        ma_length: usize,
-        factor: f64,
-    ) -> PyResult<Self> {
-        let params = WavetrendParams {
-            channel_length: Some(channel_length),
-            average_length: Some(average_length),
-            ma_length: Some(ma_length),
-            factor: Some(factor),
-        };
-        let stream =
-            WavetrendStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(WavetrendStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "wavetrend_batch")]
-#[pyo3(signature = (data, channel_length_range, average_length_range, ma_length_range, factor_range, kernel=None))]
-pub fn wavetrend_batch_py<'py>(
-    py: Python<'py>,
-    data: numpy::PyReadonlyArray1<'py, f64>,
-    channel_length_range: (usize, usize, usize),
-    average_length_range: (usize, usize, usize),
-    ma_length_range: (usize, usize, usize),
-    factor_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = WavetrendBatchRange {
-        channel_length: channel_length_range,
-        average_length: average_length_range,
-        ma_length: ma_length_range,
-        factor: factor_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow for wavetrend_batch"))?;
-    let wt1_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let wt2_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let wt_diff_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let slice_wt1 = unsafe { wt1_arr.as_slice_mut()? };
-    let slice_wt2 = unsafe { wt2_arr.as_slice_mut()? };
-    let slice_wt_diff = unsafe { wt_diff_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            wavetrend_batch_inner_into(
-                slice_in,
-                &sweep,
-                simd,
-                true,
-                slice_wt1,
-                slice_wt2,
-                slice_wt_diff,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("wt1", wt1_arr.reshape((rows, cols))?)?;
-    dict.set_item("wt2", wt2_arr.reshape((rows, cols))?)?;
-    dict.set_item("wt_diff", wt_diff_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "channel_lengths",
-        combos
-            .iter()
-            .map(|p| p.channel_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "average_lengths",
-        combos
-            .iter()
-            .map(|p| p.average_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_lengths",
-        combos
-            .iter()
-            .map(|p| p.ma_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "factors",
-        combos
-            .iter()
-            .map(|p| p.factor.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wavetrend_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, channel_length_range, average_length_range, ma_length_range, factor_range, device_id=0))]
-pub fn wavetrend_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    channel_length_range: (usize, usize, usize),
-    average_length_range: (usize, usize, usize),
-    ma_length_range: (usize, usize, usize),
-    factor_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::IntoPyArray;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = WavetrendBatchRange {
-        channel_length: channel_length_range,
-        average_length: average_length_range,
-        ma_length: ma_length_range,
-        factor: factor_range,
-    };
-
-    let (batch, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaWavetrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.wavetrend_batch_dev(slice_in, &sweep)
-            .map(|b| (b, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "wt1",
-        Py::new(
-            py,
-            WavetrendDeviceArrayF32Py {
-                inner: batch.wt1,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "wt2",
-        Py::new(
-            py,
-            WavetrendDeviceArrayF32Py {
-                inner: batch.wt2,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "wt_diff",
-        Py::new(
-            py,
-            WavetrendDeviceArrayF32Py {
-                inner: batch.wt_diff,
-                _ctx: ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-
-    let (c0, c1, cstep) = channel_length_range;
-    let (a0, a1, astep) = average_length_range;
-    let (m0, m1, mstep) = ma_length_range;
-    let (f0, f1, fstep) = factor_range;
-    let channel_axis: Vec<usize> = if cstep == 0 {
-        vec![c0]
-    } else {
-        (c0..=c1).step_by(cstep).collect()
-    };
-    let average_axis: Vec<usize> = if astep == 0 {
-        vec![a0]
-    } else {
-        (a0..=a1).step_by(astep).collect()
-    };
-    let ma_axis: Vec<usize> = if mstep == 0 {
-        vec![m0]
-    } else {
-        (m0..=m1).step_by(mstep).collect()
-    };
-    let mut factor_axis: Vec<f64> = Vec::new();
-    if fstep.abs() < f64::EPSILON || (f0 - f1).abs() < f64::EPSILON {
-        factor_axis.push(f0);
-    } else {
-        let mut v = f0;
-        while v <= f1 + fstep.abs() * 1e-12 {
-            factor_axis.push(v);
-            v += fstep;
-        }
-    }
-
-    dict.set_item("channel_lengths", channel_axis.into_pyarray(py))?;
-    dict.set_item("average_lengths", average_axis.into_pyarray(py))?;
-    dict.set_item("ma_lengths", ma_axis.into_pyarray(py))?;
-    dict.set_item("factors", factor_axis.into_pyarray(py))?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wavetrend_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, channel_length, average_length, ma_length, factor, device_id=0))]
-pub fn wavetrend_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    channel_length: usize,
-    average_length: usize,
-    ma_length: usize,
-    factor: f64,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array (rows x cols)"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-
-    let params = WavetrendParams {
-        channel_length: Some(channel_length),
-        average_length: Some(average_length),
-        ma_length: Some(ma_length),
-        factor: Some(factor),
-    };
-
-    let (wt1, wt2, wt_diff, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaWavetrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        cuda.wavetrend_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map(|(a, b, c)| (a, b, c, ctx, dev_id))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "wt1",
-        Py::new(
-            py,
-            WavetrendDeviceArrayF32Py {
-                inner: wt1,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "wt2",
-        Py::new(
-            py,
-            WavetrendDeviceArrayF32Py {
-                inner: wt2,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "wt_diff",
-        Py::new(
-            py,
-            WavetrendDeviceArrayF32Py {
-                inner: wt_diff,
-                _ctx: ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("channel_length", channel_length)?;
-    dict.set_item("average_length", average_length)?;
-    dict.set_item("ma_length", ma_length)?;
-    dict.set_item("factor", factor)?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wavetrend_js(
-    data: &[f64],
-    channel_length: usize,
-    average_length: usize,
-    ma_length: usize,
-    factor: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let params = WavetrendParams {
-        channel_length: Some(channel_length),
-        average_length: Some(average_length),
-        ma_length: Some(ma_length),
-        factor: Some(factor),
-    };
-    let input = WavetrendInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len() * 3];
-    let (wt1_part, rest) = output.split_at_mut(data.len());
-    let (wt2_part, wt_diff_part) = rest.split_at_mut(data.len());
-
-    wavetrend_into_slice(wt1_part, wt2_part, wt_diff_part, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wavetrend_into(
-    in_ptr: *const f64,
-    wt1_ptr: *mut f64,
-    wt2_ptr: *mut f64,
-    wt_diff_ptr: *mut f64,
-    len: usize,
-    channel_length: usize,
-    average_length: usize,
-    ma_length: usize,
-    factor: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || wt1_ptr.is_null() || wt2_ptr.is_null() || wt_diff_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = WavetrendParams {
-            channel_length: Some(channel_length),
-            average_length: Some(average_length),
-            ma_length: Some(ma_length),
-            factor: Some(factor),
-        };
-        let input = WavetrendInput::from_slice(data, params);
-
-        let needs_temp = in_ptr as *const u8 == wt1_ptr as *const u8
-            || in_ptr as *const u8 == wt2_ptr as *const u8
-            || in_ptr as *const u8 == wt_diff_ptr as *const u8;
-
-        if needs_temp {
-            let mut temp = vec![0.0; len * 3];
-            let (temp_wt1, rest) = temp.split_at_mut(len);
-            let (temp_wt2, temp_wt_diff) = rest.split_at_mut(len);
-
-            wavetrend_into_slice(temp_wt1, temp_wt2, temp_wt_diff, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let wt1_out = std::slice::from_raw_parts_mut(wt1_ptr, len);
-            let wt2_out = std::slice::from_raw_parts_mut(wt2_ptr, len);
-            let wt_diff_out = std::slice::from_raw_parts_mut(wt_diff_ptr, len);
-
-            wt1_out.copy_from_slice(temp_wt1);
-            wt2_out.copy_from_slice(temp_wt2);
-            wt_diff_out.copy_from_slice(temp_wt_diff);
-        } else {
-            let wt1_out = std::slice::from_raw_parts_mut(wt1_ptr, len);
-            let wt2_out = std::slice::from_raw_parts_mut(wt2_ptr, len);
-            let wt_diff_out = std::slice::from_raw_parts_mut(wt_diff_ptr, len);
-
-            wavetrend_into_slice(wt1_out, wt2_out, wt_diff_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wavetrend_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wavetrend_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WavetrendBatchConfig {
-    pub channel_length_range: (usize, usize, usize),
-    pub average_length_range: (usize, usize, usize),
-    pub ma_length_range: (usize, usize, usize),
-    pub factor_range: (f64, f64, f64),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WavetrendBatchJsOutput {
-    pub wt1_values: Vec<f64>,
-    pub wt2_values: Vec<f64>,
-    pub wt_diff_values: Vec<f64>,
-    pub channel_lengths: Vec<usize>,
-    pub average_lengths: Vec<usize>,
-    pub ma_lengths: Vec<usize>,
-    pub factors: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = wavetrend_batch)]
-pub fn wavetrend_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: WavetrendBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let sweep = WavetrendBatchRange {
-        channel_length: (
-            config.channel_length_range.0,
-            config.channel_length_range.1,
-            config.channel_length_range.2,
-        ),
-        average_length: (
-            config.average_length_range.0,
-            config.average_length_range.1,
-            config.average_length_range.2,
-        ),
-        ma_length: (
-            config.ma_length_range.0,
-            config.ma_length_range.1,
-            config.ma_length_range.2,
-        ),
-        factor: (
-            config.factor_range.0,
-            config.factor_range.1,
-            config.factor_range.2,
-        ),
-    };
-
-    let batch_output = wavetrend_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = WavetrendBatchJsOutput {
-        wt1_values: batch_output.wt1,
-        wt2_values: batch_output.wt2,
-        wt_diff_values: batch_output.wt_diff,
-        channel_lengths: batch_output
-            .combos
-            .iter()
-            .map(|p| p.channel_length.unwrap())
-            .collect(),
-        average_lengths: batch_output
-            .combos
-            .iter()
-            .map(|p| p.average_length.unwrap())
-            .collect(),
-        ma_lengths: batch_output
-            .combos
-            .iter()
-            .map(|p| p.ma_length.unwrap())
-            .collect(),
-        factors: batch_output
-            .combos
-            .iter()
-            .map(|p| p.factor.unwrap())
-            .collect(),
-        rows: batch_output.combos.len(),
-        cols: data.len(),
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }

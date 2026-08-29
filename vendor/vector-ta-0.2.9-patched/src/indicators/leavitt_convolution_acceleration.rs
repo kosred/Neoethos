@@ -1,22 +1,6 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{detect_best_batch_kernel, make_uninit_matrix};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -71,10 +55,6 @@ pub struct LeavittConvolutionAccelerationOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct LeavittConvolutionAccelerationParams {
     pub length: Option<usize>,
     pub norm_length: Option<usize>,
@@ -655,17 +635,9 @@ impl LeavittConvolutionAccelerationStream {
             conv_acceleration - self.prev_conv_acceleration
         };
         let signal = if slo > 0.0 && is_accelerated {
-            if slo > self.prev_slo {
-                2.0
-            } else {
-                1.0
-            }
+            if slo > self.prev_slo { 2.0 } else { 1.0 }
         } else if slo < 0.0 && !is_accelerated {
-            if slo < self.prev_slo {
-                -2.0
-            } else {
-                -1.0
-            }
+            if slo < self.prev_slo { -2.0 } else { -1.0 }
         } else {
             0.0
         };
@@ -852,7 +824,6 @@ pub fn leavitt_convolution_acceleration_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn leavitt_convolution_acceleration_into(
     input: &LeavittConvolutionAccelerationInput,
@@ -1288,401 +1259,12 @@ fn leavitt_convolution_acceleration_batch_inner_into(
     Ok(())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "leavitt_convolution_acceleration")]
-#[pyo3(signature = (data, length=DEFAULT_LENGTH, norm_length=DEFAULT_NORM_LENGTH, use_norm_hyperbolic=true, kernel=None))]
-pub fn leavitt_convolution_acceleration_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    norm_length: usize,
-    use_norm_hyperbolic: bool,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = LeavittConvolutionAccelerationInput::from_slice(
-        data,
-        LeavittConvolutionAccelerationParams {
-            length: Some(length),
-            norm_length: Some(norm_length),
-            use_norm_hyperbolic: Some(use_norm_hyperbolic),
-        },
-    );
-    let output = py
-        .allow_threads(|| leavitt_convolution_acceleration_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        output.conv_acceleration.into_pyarray(py),
-        output.signal.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "LeavittConvolutionAccelerationStream")]
-pub struct LeavittConvolutionAccelerationStreamPy {
-    stream: LeavittConvolutionAccelerationStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl LeavittConvolutionAccelerationStreamPy {
-    #[new]
-    #[pyo3(signature = (length=DEFAULT_LENGTH, norm_length=DEFAULT_NORM_LENGTH, use_norm_hyperbolic=true))]
-    fn new(length: usize, norm_length: usize, use_norm_hyperbolic: bool) -> PyResult<Self> {
-        let stream =
-            LeavittConvolutionAccelerationStream::try_new(LeavittConvolutionAccelerationParams {
-                length: Some(length),
-                norm_length: Some(norm_length),
-                use_norm_hyperbolic: Some(use_norm_hyperbolic),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "leavitt_convolution_acceleration_batch")]
-#[pyo3(signature = (data, length_range, norm_length_range, use_norm_hyperbolic=true, kernel=None))]
-pub fn leavitt_convolution_acceleration_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    norm_length_range: (usize, usize, usize),
-    use_norm_hyperbolic: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let sweep = LeavittConvolutionAccelerationBatchRange {
-        length: length_range,
-        norm_length: norm_length_range,
-        use_norm_hyperbolic: Some(use_norm_hyperbolic),
-    };
-    let combos = expand_grid_leavitt_convolution_acceleration(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let conv_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_conv = unsafe { conv_arr.as_slice_mut()? };
-    let out_signal = unsafe { signal_arr.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        leavitt_convolution_acceleration_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            out_conv,
-            out_signal,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let lengths: Vec<usize> = combos
-        .iter()
-        .map(|p| p.length.unwrap_or(DEFAULT_LENGTH))
-        .collect();
-    let norm_lengths: Vec<usize> = combos
-        .iter()
-        .map(|p| p.norm_length.unwrap_or(DEFAULT_NORM_LENGTH))
-        .collect();
-    let dict = PyDict::new(py);
-    dict.set_item("conv_acceleration", conv_arr.reshape((rows, cols))?)?;
-    dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("lengths", lengths.into_pyarray(py))?;
-    dict.set_item("norm_lengths", norm_lengths.into_pyarray(py))?;
-    dict.set_item("use_norm_hyperbolic", use_norm_hyperbolic)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_leavitt_convolution_acceleration_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(leavitt_convolution_acceleration_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        leavitt_convolution_acceleration_batch_py,
-        m
-    )?)?;
-    m.add_class::<LeavittConvolutionAccelerationStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LeavittConvolutionAccelerationJsOutput {
-    conv_acceleration: Vec<f64>,
-    signal: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LeavittConvolutionAccelerationBatchConfig {
-    length_range: Vec<usize>,
-    norm_length_range: Vec<usize>,
-    use_norm_hyperbolic: Option<bool>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LeavittConvolutionAccelerationBatchJsOutput {
-    conv_acceleration: Vec<f64>,
-    signal: Vec<f64>,
-    rows: usize,
-    cols: usize,
-    combos: Vec<LeavittConvolutionAccelerationParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn leavitt_convolution_acceleration_js(
-    data: &[f64],
-    length: usize,
-    norm_length: usize,
-    use_norm_hyperbolic: bool,
-) -> Result<JsValue, JsValue> {
-    let input = LeavittConvolutionAccelerationInput::from_slice(
-        data,
-        LeavittConvolutionAccelerationParams {
-            length: Some(length),
-            norm_length: Some(norm_length),
-            use_norm_hyperbolic: Some(use_norm_hyperbolic),
-        },
-    );
-    let output = leavitt_convolution_acceleration_with_kernel(&input, Kernel::Scalar)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&LeavittConvolutionAccelerationJsOutput {
-        conv_acceleration: output.conv_acceleration,
-        signal: output.signal,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "leavitt_convolution_acceleration_batch_js")]
-pub fn leavitt_convolution_acceleration_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: LeavittConvolutionAccelerationBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 || config.norm_length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: each range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let sweep = LeavittConvolutionAccelerationBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-        norm_length: (
-            config.norm_length_range[0],
-            config.norm_length_range[1],
-            config.norm_length_range[2],
-        ),
-        use_norm_hyperbolic: config.use_norm_hyperbolic,
-    };
-    let batch = leavitt_convolution_acceleration_batch_slice(data, &sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&LeavittConvolutionAccelerationBatchJsOutput {
-        conv_acceleration: batch.conv_acceleration,
-        signal: batch.signal,
-        rows: batch.rows,
-        cols: batch.cols,
-        combos: batch.combos,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn leavitt_convolution_acceleration_alloc(len: usize) -> *mut f64 {
-    let mut buf = vec![0.0_f64; len * 2];
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn leavitt_convolution_acceleration_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len * 2);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn leavitt_convolution_acceleration_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    norm_length: usize,
-    use_norm_hyperbolic: bool,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to leavitt_convolution_acceleration_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len * 2);
-        let (out_conv, out_signal) = out.split_at_mut(len);
-        let input = LeavittConvolutionAccelerationInput::from_slice(
-            data,
-            LeavittConvolutionAccelerationParams {
-                length: Some(length),
-                norm_length: Some(norm_length),
-                use_norm_hyperbolic: Some(use_norm_hyperbolic),
-            },
-        );
-        leavitt_convolution_acceleration_into_slice(out_conv, out_signal, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "leavitt_convolution_acceleration_into_host")]
-pub fn leavitt_convolution_acceleration_into_host(
-    data: &[f64],
-    out_ptr: *mut f64,
-    length: usize,
-    norm_length: usize,
-    use_norm_hyperbolic: bool,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to leavitt_convolution_acceleration_into_host",
-        ));
-    }
-    unsafe {
-        let out = std::slice::from_raw_parts_mut(out_ptr, data.len() * 2);
-        let (out_conv, out_signal) = out.split_at_mut(data.len());
-        let input = LeavittConvolutionAccelerationInput::from_slice(
-            data,
-            LeavittConvolutionAccelerationParams {
-                length: Some(length),
-                norm_length: Some(norm_length),
-                use_norm_hyperbolic: Some(use_norm_hyperbolic),
-            },
-        );
-        leavitt_convolution_acceleration_into_slice(out_conv, out_signal, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn leavitt_convolution_acceleration_batch_into(
-    data: &[f64],
-    out_ptr: *mut f64,
-    config: JsValue,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to leavitt_convolution_acceleration_batch_into",
-        ));
-    }
-    let config: LeavittConvolutionAccelerationBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 || config.norm_length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: each range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let sweep = LeavittConvolutionAccelerationBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-        norm_length: (
-            config.norm_length_range[0],
-            config.norm_length_range[1],
-            config.norm_length_range[2],
-        ),
-        use_norm_hyperbolic: config.use_norm_hyperbolic,
-    };
-    let combos = expand_grid_leavitt_convolution_acceleration(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let expected = rows
-        .checked_mul(cols)
-        .and_then(|x| x.checked_mul(2))
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, expected) };
-    let (out_conv, out_signal) = out.split_at_mut(rows * cols);
-    leavitt_convolution_acceleration_batch_inner_into(
-        data,
-        &sweep,
-        Kernel::Scalar,
-        false,
-        out_conv,
-        out_signal,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn leavitt_convolution_acceleration_output_into_js(
-    data: &[f64],
-    length: usize,
-    norm_length: usize,
-    use_norm_hyperbolic: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value =
-        leavitt_convolution_acceleration_js(data, length, norm_length, use_norm_hyperbolic)?;
-    crate::write_wasm_object_f64_outputs(
-        "leavitt_convolution_acceleration_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn leavitt_convolution_acceleration_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = leavitt_convolution_acceleration_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "leavitt_convolution_acceleration_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-        ParamValue,
+        IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+        compute_cpu_batch,
     };
 
     fn sample_data(len: usize) -> Vec<f64> {
@@ -1803,17 +1385,9 @@ mod tests {
                     let src2 = if i >= 2 { data[i - 2] } else { 0.0 };
                     let is_accelerated = src2 - 2.0 * src1 + data[i] > 0.0;
                     signal[i] = if slo > 0.0 && is_accelerated {
-                        if slo > prev_slo {
-                            2.0
-                        } else {
-                            1.0
-                        }
+                        if slo > prev_slo { 2.0 } else { 1.0 }
                     } else if slo < 0.0 && !is_accelerated {
-                        if slo < prev_slo {
-                            -2.0
-                        } else {
-                            -1.0
-                        }
+                        if slo < prev_slo { -2.0 } else { -1.0 }
                     } else {
                         0.0
                     };

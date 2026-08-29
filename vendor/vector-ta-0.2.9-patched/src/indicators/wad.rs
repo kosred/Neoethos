@@ -1,30 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaWad;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -240,7 +219,7 @@ pub unsafe fn wad_avx2(high: &[f64], low: &[f64], close: &[f64], out: &mut [f64]
         let mut i = 1usize;
 
         while i + 7 < n {
-            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             if i + 40 < n {
                 _mm_prefetch(cp.add(i + 32) as *const i8, _MM_HINT_T0);
                 _mm_prefetch(hp.add(i + 32) as *const i8, _MM_HINT_T0);
@@ -519,7 +498,7 @@ pub unsafe fn wad_avx512_long(high: &[f64], low: &[f64], close: &[f64], out: &mu
         let mut pc = *cp;
         let mut i = 1usize;
         while i + 15 < n {
-            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             if i + 96 < n {
                 _mm_prefetch(cp.add(i + 64) as *const i8, _MM_HINT_T0);
                 _mm_prefetch(hp.add(i + 64) as *const i8, _MM_HINT_T0);
@@ -846,42 +825,17 @@ fn wad_batch_inner_into(
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wad_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = wad_js(high, low, close)?;
-    crate::write_wasm_f64_output("wad_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wad_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    _config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = wad_batch_unified_js(high, low, close, _config)?;
-    crate::write_wasm_selected_object_f64_outputs("wad_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     fn check_wad_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = WadInput::from_candles(&candles);
         let output = wad_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -890,8 +844,8 @@ mod tests {
 
     fn check_wad_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = WadInput::from_candles(&candles);
         let output = wad_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -952,8 +906,8 @@ mod tests {
 
     fn check_wad_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let high = source_type(&candles, "high");
         let low = source_type(&candles, "low");
         let close = source_type(&candles, "close");
@@ -1014,8 +968,8 @@ mod tests {
     fn check_wad_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_configs = vec![WadParams::default()];
 
@@ -1071,8 +1025,8 @@ mod tests {
     fn check_batch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_configs = vec!["high", "low", "close"];
 
@@ -1372,8 +1326,8 @@ mod tests {
 
     #[test]
     fn test_wad_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = WadInput::from_candles(&candles);
 
         let baseline = wad(&input)?.values;
@@ -1381,13 +1335,8 @@ mod tests {
         let mut out = vec![0.0; baseline.len()];
         #[allow(unused_variables)]
         {
-            #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
             {
                 wad_into(&input, &mut out)?;
-            }
-            #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-            {
-                wad_into_slice(&mut out, &input, Kernel::Auto)?;
             }
         }
 
@@ -1478,300 +1427,6 @@ pub fn wad_into_slice(dst: &mut [f64], input: &WadInput, kern: Kernel) -> Result
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
-
 pub fn wad_into(input: &WadInput, out: &mut [f64]) -> Result<(), WadError> {
     wad_into_slice(out, input, Kernel::Auto)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wad_cuda_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, device_id=0))]
-pub fn wad_cuda_dev_py(
-    py: Python<'_>,
-    high_f32: PyReadonlyArray1<'_, f32>,
-    low_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high = high_f32.as_slice()?;
-    let low = low_f32.as_slice()?;
-    let close = close_f32.as_slice()?;
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaWad::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.wad_series_dev(high, low, close)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wad_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, device_id=0))]
-pub fn wad_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: PyReadonlyArray1<'_, f32>,
-    low_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high = high_f32.as_slice()?;
-    let low = low_f32.as_slice()?;
-    let close = close_f32.as_slice()?;
-    let inner = py.allow_threads(|| {
-        let cuda = CudaWad::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.wad_batch_dev(high, low, close)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wad_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, device_id=0))]
-pub fn wad_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let rows = high_tm_f32.shape()[0];
-    let cols = high_tm_f32.shape()[1];
-    if low_tm_f32.shape() != [rows, cols] || close_tm_f32.shape() != [rows, cols] {
-        return Err(PyValueError::new_err("high/low/close shapes must match"));
-    }
-    let high = high_tm_f32.as_slice()?;
-    let low = low_tm_f32.as_slice()?;
-    let close = close_tm_f32.as_slice()?;
-    let inner = py.allow_threads(|| {
-        let cuda = CudaWad::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.wad_many_series_one_param_time_major_dev(high, low, close, cols, rows)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let handle = make_device_array_py(device_id, inner)?;
-    Ok(handle)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "wad")]
-#[pyo3(signature = (high, low, close, kernel=None))]
-pub fn wad_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let input = WadInput::from_slices(high_slice, low_slice, close_slice);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| wad_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "WadStream")]
-pub struct WadStreamPy {
-    stream: WadStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl WadStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        let stream = WadStream::try_new().map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(WadStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> f64 {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "wad_batch")]
-#[pyo3(signature = (high, low, close, kernel=None))]
-pub fn wad_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    let cols = high_slice.len();
-    let rows = 1usize;
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("wad_batch: size overflow in rows*cols"))?;
-
-    let out_arr = unsafe { numpy::PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        wad_batch_inner_into(high_slice, low_slice, close_slice, kern, true, out_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wad_js(high: &[f64], low: &[f64], close: &[f64]) -> Result<Vec<f64>, JsValue> {
-    let input = WadInput::from_slices(high, low, close);
-
-    let mut output = vec![0.0; high.len()];
-
-    wad_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wad_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wad_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wad_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to wad_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let input = WadInput::from_slices(high, low, close);
-
-        if high_ptr as *const f64 == out_ptr as *const f64
-            || low_ptr as *const f64 == out_ptr as *const f64
-            || close_ptr as *const f64 == out_ptr as *const f64
-        {
-            let mut temp = vec![0.0; len];
-            wad_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            wad_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wad_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to wad_batch_into"));
-    }
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        wad_batch_inner_into(high, low, close, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(1)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WadBatchConfig {
-    pub dummy: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WadBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = wad_batch)]
-pub fn wad_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    _config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let out = wad_batch_inner(high, low, close, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = WadBatchJsOutput {
-        values: out.values,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }

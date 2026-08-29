@@ -1,0 +1,41 @@
+schema = "vector-ta.creator-audit-receipt.v1"
+indicator = "half_causal_estimator"
+runtime_authority = "VectorTA only"
+oracle_role = "external creator source used only to audit formula and update schedule"
+
+[creator]
+name = "The_Peaceful_Lizard"
+listing_url = "https://www.tradingview.com/script/QETnobDk-Half-Causal-Estimator/"
+facade_url = "https://pine-facade.tradingview.com/pine-facade/get/PUB%3B28b6b0520c9b45c597b96d7644327a89/last"
+license = "Mozilla Public License 2.0"
+
+[facade]
+http_date = "Tue, 25 Aug 2026 22:59:45 GMT"
+content_type = "text/plain; charset=utf-8"
+etag = '"A/IEbg1V6Vb3cwTBy1VyI8iSoyZWwHIEdGrkFAuoqDc="'
+raw_http_body_bytes = 21005
+raw_http_body_sha256 = "03F2046E0D55E956F77304C1CB557223C892A32656C07204746AE4140BA8A837"
+stored_path = "audit_receipts/half_causal_estimator/tradingview_pine_facade_script24_raw.json"
+stored_bytes = 21006
+stored_sha256 = "D371BB32D723C17997EA210E230597FFFD1AD876C7A537DA3DFCD272EC4582AD"
+storage_note = "The stored text is the exact 21005-byte response body followed by one repository terminal LF. Remove only that final LF to reproduce raw_http_body_sha256."
+
+[pine]
+script_name = "Half Causal Estimator"
+pine_version = "6.0"
+original_script_version = "24.0"
+original_script_id = "USER;7ac22a187a4d48cba745f97bcb970ebe"
+created = "2025-04-17T21:01:02.849339Z"
+updated = "2025-04-17T21:01:02.849339Z"
+access = "open_no_auth"
+decoded_utf8_bytes = 19463
+decoded_crlf_count = 520
+decoded_lf_without_cr_count = 0
+decoded_utf8_sha256 = "4B7FD8AEC6B333A4ECE967D7CFA6D957357CE436CB098E96EB1EB8A1480A8080"
+
+[audited_schedule]
+future_estimate = "make_window: init_make_window at session.isfirstbar/session.isfirstbar_regular, otherwise one maintain_window pop/append from prior window_key"
+expected_value = "independent expected_value_make_window/expected_value_maintain_window cache"
+tod_insert = "data.add_element runs after estimate and expected-value calculation; non-finite source is skipped"
+wma = "wma is evaluated every bar; a finite first value fills missing historical samples"
+change_source = "abs(close - nz(close[1], close)) / min(close, nz(close[1], close)) * 100"

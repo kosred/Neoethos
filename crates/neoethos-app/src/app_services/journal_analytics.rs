@@ -249,17 +249,17 @@ pub fn derive_trade_with_basis(
     prices: Option<&dyn PriceWindow>,
 ) -> DerivedTrade {
     let duration_hours = match (trade.entry_ts_ms, trade.exit_ts_ms) {
-        (Some(entry), Some(exit)) if exit >= entry => {
-            Some((exit - entry) as f64 / 3_600_000.0)
-        }
+        (Some(entry), Some(exit)) if exit >= entry => Some((exit - entry) as f64 / 3_600_000.0),
         _ => None,
     };
     let pip_size = prices.and_then(|p| p.pip_size(&trade.symbol));
     let long = is_long(&trade.side);
     let pips = match (trade.entry_price, trade.exit_price, pip_size) {
-        (Some(entry), Some(exit), Some(pip)) if pip > 0.0 => {
-            Some(if long { (exit - entry) / pip } else { (entry - exit) / pip })
-        }
+        (Some(entry), Some(exit), Some(pip)) if pip > 0.0 => Some(if long {
+            (exit - entry) / pip
+        } else {
+            (entry - exit) / pip
+        }),
         _ => None,
     };
     let r_multiple = risk_per_lot
@@ -324,7 +324,12 @@ pub fn derive_trade_with_basis(
         entry_hour_utc,
         entry_weekday: trade.entry_ts_ms.and_then(weekday_name),
         risk_per_lot: r_multiple.and(risk_per_lot),
-        risk_basis: if r_multiple.is_some() { risk_basis } else { "none" }.to_string(),
+        risk_basis: if r_multiple.is_some() {
+            risk_basis
+        } else {
+            "none"
+        }
+        .to_string(),
     }
 }
 
@@ -380,7 +385,8 @@ pub fn analyse(trades: &[ClosedTrade], prices: Option<&dyn PriceWindow>) -> Jour
     let pooled_risk = estimate_risk_per_lot(trades);
     let per_symbol_risk = estimate_risk_per_lot_by_symbol(trades);
 
-    let mut fallback_symbols: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut fallback_symbols: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     let derived: Vec<DerivedTrade> = trades
         .iter()
         .map(|t| match per_symbol_risk.get(&t.symbol) {
@@ -403,7 +409,10 @@ pub fn analyse(trades: &[ClosedTrade], prices: Option<&dyn PriceWindow>) -> Jour
         with_pips: derived.iter().filter(|t| t.pips.is_some()).count(),
         with_excursion: derived.iter().filter(|t| t.mfe_pips.is_some()).count(),
         with_r_multiple: derived.iter().filter(|t| t.r_multiple.is_some()).count(),
-        with_duration: derived.iter().filter(|t| t.duration_hours.is_some()).count(),
+        with_duration: derived
+            .iter()
+            .filter(|t| t.duration_hours.is_some())
+            .count(),
         missing_entry_time: trades.iter().filter(|t| t.entry_ts_ms.is_none()).count(),
         missing_price_series: trades
             .iter()
@@ -667,7 +676,8 @@ mod tests {
     /// own measurement.
     #[test]
     fn a_thin_symbol_falls_back_and_the_fallback_is_named() {
-        let mut trades: Vec<ClosedTrade> = (0..8).map(|_| trade_on("EURUSD", -200.0, 1.0)).collect();
+        let mut trades: Vec<ClosedTrade> =
+            (0..8).map(|_| trade_on("EURUSD", -200.0, 1.0)).collect();
         trades.push(trade_on("GBPJPY", -180.0, 1.0)); // one loss: not enough
         trades.push(trade_on("GBPJPY", 90.0, 1.0));
 
@@ -676,8 +686,18 @@ mod tests {
             analytics.coverage.symbols_using_fallback_risk,
             vec!["GBPJPY".to_string()]
         );
-        assert!(analytics.coverage.risk_per_lot_by_symbol.contains_key("EURUSD"));
-        assert!(!analytics.coverage.risk_per_lot_by_symbol.contains_key("GBPJPY"));
+        assert!(
+            analytics
+                .coverage
+                .risk_per_lot_by_symbol
+                .contains_key("EURUSD")
+        );
+        assert!(
+            !analytics
+                .coverage
+                .risk_per_lot_by_symbol
+                .contains_key("GBPJPY")
+        );
         let gbp = analytics
             .trades
             .iter()
@@ -706,7 +726,10 @@ mod tests {
             "one row had everything the replay needs and still got no bars"
         );
         assert_eq!(analytics.coverage.with_duration, 1);
-        assert_eq!(analytics.coverage.min_losses_for_symbol_risk, MIN_LOSSES_FOR_SYMBOL_RISK);
+        assert_eq!(
+            analytics.coverage.min_losses_for_symbol_risk,
+            MIN_LOSSES_FOR_SYMBOL_RISK
+        );
     }
 
     /// Without a price source the journal still works; it simply reports less,

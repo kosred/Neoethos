@@ -63,6 +63,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 
 use super::{
     ExpertLoadOutcome, ExpertRegistry, SoftVotingEnsemble, SoftVotingEnsembleConfig,
@@ -222,11 +224,11 @@ fn voting_config(
         expert_weights: voting
             .expert_weights
             .iter()
-            .map(|(name, weight)| (name.clone(), *weight as f32))
+            .map(|(name, weight)| (name.clone(), *weight))
             .collect(),
         excluded_names: voting.excluded_experts.iter().cloned().collect(),
-        anomaly_lo: voting.anomaly_lo as f32,
-        anomaly_hi: voting.anomaly_hi as f32,
+        anomaly_lo: voting.anomaly_lo,
+        anomaly_hi: voting.anomaly_hi,
     })
 }
 
@@ -253,22 +255,18 @@ pub fn load_experts_for_symbol(
 /// feature-column CONTRACT so the trader never feeds mis-columned data to the
 /// experts.
 ///
-/// Builds the symbol's ensemble, reads the experts' shared `feature_columns()`
-/// (asserting all loaded experts agree), selects the FeatureFrame columns to
-/// EXACTLY that set BY NAME (the experts bail unless the DataFrame columns equal
-/// their trained set), runs [`SoftVotingEnsemble::predict_with_roles`], and
-/// returns one decision per row. FAILS LOUD on any column mismatch / missing
-/// feature — the caller (the trader) then falls back to gene-only rather than
-/// trading on a wrong-columned ensemble.
+/// Each adapter projects its own trained feature set by name from the shared
+/// frame, so heterogeneous experts do not need to pretend they were trained on
+/// one identical column list. Missing/invalid required features fail closed.
 pub fn role_decisions_from_feature_frame(
     models_root: &Path,
     symbol: &str,
     timeframe: &str,
-    features: &neoethos_data::FeatureFrame,
+    features: &FeatureFrame,
+    lease: &CpuLease,
 ) -> Result<Vec<super::EnsembleDecision>> {
     let ensemble = build_ensemble_for_symbol(models_root, symbol, timeframe)?;
-    let df = ensemble_feature_dataframe(&ensemble, features, FrameRows::All)?;
-    ensemble.predict_with_roles(&df)
+    ensemble.predict_with_roles(features, lease)
 }
 
 /// LIVE-path variant: one role-aware decision for the LAST row of `features`,
@@ -290,14 +288,12 @@ pub fn role_decisions_from_feature_frame(
 /// voters actually vote.
 pub fn role_decision_for_last_row(
     ensemble: &SoftVotingEnsemble,
-    features: &neoethos_data::FeatureFrame,
+    features: &FeatureFrame,
+    lease: &CpuLease,
 ) -> Result<super::EnsembleDecision> {
-    let df = ensemble_feature_dataframe(
-        ensemble,
-        features,
-        FrameRows::Tail(LIVE_DECISION_TAIL_ROWS),
-    )?;
-    let decisions = ensemble.predict_with_roles(&df)?;
+    let start = features.n_samples().saturating_sub(LIVE_DECISION_TAIL_ROWS);
+    let window = features.row_window(start, features.n_samples())?;
+    let decisions = ensemble.predict_with_roles(&window, lease)?;
     decisions
         .into_iter()
         .next_back()
@@ -309,76 +305,6 @@ pub fn role_decision_for_last_row(
 /// few hundred for stable candidate models) while keeping the per-bar batch
 /// cost of the row-wise classifiers negligible.
 pub const LIVE_DECISION_TAIL_ROWS: usize = 256;
-
-/// Row selector for [`ensemble_feature_dataframe`].
-enum FrameRows {
-    All,
-    /// The trailing `n` rows (fewer when the frame is shorter).
-    Tail(usize),
-}
-
-/// Shared column-contract core: read the experts' agreed feature columns,
-/// select EXACTLY those from the cube BY NAME, and build the DataFrame the
-/// experts expect. FAILS LOUD on any mismatch.
-fn ensemble_feature_dataframe(
-    ensemble: &SoftVotingEnsemble,
-    features: &neoethos_data::FeatureFrame,
-    rows: FrameRows,
-) -> Result<polars::prelude::DataFrame> {
-    use anyhow::{anyhow, bail};
-    use polars::prelude::{Column, DataFrame, NamedFrom, Series};
-
-    // `load_outcome` is an `EnsemblePredictor` trait method.
-    use super::EnsemblePredictor;
-
-    // Determine the experts' shared feature-column set; assert all loaded
-    // experts that expose columns agree on them.
-    let mut expected: Option<Vec<String>> = None;
-    for expert in &ensemble.load_outcome().loaded {
-        let cols = expert.feature_columns();
-        if cols.is_empty() {
-            continue;
-        }
-        match &expected {
-            None => expected = Some(cols.to_vec()),
-            Some(prev) => {
-                if prev.as_slice() != cols {
-                    bail!(
-                        "ensemble experts disagree on feature columns; \
-                         refusing to feed mis-columned data"
-                    );
-                }
-            }
-        }
-    }
-    let expected =
-        expected.ok_or_else(|| anyhow!("no loaded expert exposes feature_columns"))?;
-
-    // Build a DataFrame with EXACTLY `expected` columns, by name, from the cube.
-    let mut columns = Vec::with_capacity(expected.len());
-    for name in &expected {
-        let idx = features
-            .names
-            .iter()
-            .position(|n| n == name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "feature '{name}' required by the ensemble is absent from the \
-                     trader feature cube; refusing to trade on incomplete features"
-                )
-            })?;
-        let col: Vec<f32> = match rows {
-            FrameRows::All => features.feature_column(idx).to_vec(),
-            FrameRows::Tail(n) => {
-                let full = features.feature_column(idx);
-                let start = full.len().saturating_sub(n);
-                full.iter().skip(start).copied().collect()
-            }
-        };
-        columns.push(Column::from(Series::new(name.as_str().into(), col)));
-    }
-    DataFrame::new(columns).context("build ensemble feature DataFrame")
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -493,7 +419,7 @@ mod tests {
         voting.expert_weights.insert("xgboost".into(), 3.0);
         voting.excluded_experts.push("tide".into());
         let resolved = voting_config(&voting).expect("valid");
-        assert_eq!(resolved.expert_weights.get("xgboost"), Some(&3.0_f32));
+        assert_eq!(resolved.expert_weights.get("xgboost"), Some(&3.0_f64));
         assert!(resolved.excluded_names.contains("tide"));
     }
 

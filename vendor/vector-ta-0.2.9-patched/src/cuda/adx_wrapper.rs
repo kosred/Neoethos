@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::adx::{AdxBatchRange, AdxParams};
@@ -6,8 +6,8 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -90,7 +90,6 @@ impl CudaAdx {
         let device = Device::get_device(device_id as u32)?;
         let context = Context::new(device)?;
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/adx_kernel.ptx"));
         let module = crate::load_cuda_embedded_module!("adx_kernel")?;
 
         let pr = cust::context::CurrentContext::get_stream_priority_range()?;

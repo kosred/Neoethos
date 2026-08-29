@@ -1,13 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
-use crate::indicators::mass::{mass_with_kernel, MassBatchRange, MassData, MassInput, MassParams};
-use crate::utilities::enums::Kernel;
+use crate::indicators::mass::{MassBatchRange, MassParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust_derive::DeviceCopy;
@@ -115,11 +114,6 @@ impl CudaMass {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/mass_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("mass_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -611,79 +605,6 @@ impl CudaMass {
             combos,
         ))
     }
-
-    pub fn mass_many_series_one_param_time_major_dev(
-        &mut self,
-        high_tm: &[f32],
-        low_tm: &[f32],
-        cols: usize,
-        rows: usize,
-        params: &MassParams,
-    ) -> Result<DeviceArrayF32, CudaMassError> {
-        // COUNTED, not disguised. See rvi_wrapper.rs for the full reasoning:
-        // this function name ends in `_dev` and returns a DeviceArray, but the
-        // arithmetic below runs on the HOST and is then uploaded. A caller
-        // holding that pointer cannot tell the device never ran.
-        //
-        // The rule is not "never compute on the host". It is: card present and a
-        // kernel exists -> the card runs it; card present and no kernel -> the
-        // host may compute it, but the call is RECORDED by indicator id so it
-        // shows up as work still owed. host_fallback::total() is meant to reach
-        // zero by achievement; it was returning zero by construction because
-        // record() had no call sites anywhere in the crate.
-        crate::cuda::host_fallback::record("mass");
-
-        let period = params.period.unwrap_or(0);
-        if period == 0 {
-            return Err(CudaMassError::InvalidInput("period=0".into()));
-        }
-        let total = cols
-            .checked_mul(rows)
-            .ok_or_else(|| CudaMassError::InvalidInput("grid size overflow".into()))?;
-        if high_tm.len() != total || low_tm.len() != total {
-            return Err(CudaMassError::InvalidInput(
-                "time-major inputs wrong length".into(),
-            ));
-        }
-
-        let bytes_out = total
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| CudaMassError::InvalidInput("output bytes overflow".into()))?;
-        Self::will_fit(bytes_out, 64usize << 20)?;
-
-        let mut host_tm = vec![0f32; total];
-        for s in 0..cols {
-            let mut h = vec![f64::NAN; rows];
-            let mut l = vec![f64::NAN; rows];
-            for t in 0..rows {
-                h[t] = high_tm[t * cols + s] as f64;
-                l[t] = low_tm[t * cols + s] as f64;
-            }
-            let p = MassParams {
-                period: Some(period),
-            };
-            let input = MassInput {
-                data: MassData::Slices { high: &h, low: &l },
-                params: p,
-            };
-            let out = mass_with_kernel(&input, Kernel::Scalar)
-                .map_err(|e| CudaMassError::InvalidInput(format!("cpu mass error: {}", e)))?;
-            for t in 0..rows {
-                host_tm[t * cols + s] = out.values[t] as f32;
-            }
-        }
-
-        let mut d_out_tm: DeviceBuffer<f32> = unsafe { DeviceBuffer::uninitialized(total) }?;
-        unsafe {
-            d_out_tm.async_copy_from(host_tm.as_slice(), &self.stream)?;
-        }
-        self.stream.synchronize()?;
-        Ok(DeviceArrayF32 {
-            buf: d_out_tm,
-            rows,
-            cols,
-        })
-    }
 }
 
 fn expand_mass_combos(r: &MassBatchRange) -> Result<Vec<MassParams>, CudaMassError> {
@@ -847,13 +768,15 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "mass",
-            "batch_dev",
-            "mass_cuda_batch_dev",
-            "1m_x_250",
-            prep_mass_batch,
-        )
-        .with_inner_iters(4)]
+        vec![
+            CudaBenchScenario::new(
+                "mass",
+                "batch_dev",
+                "mass_cuda_batch_dev",
+                "1m_x_250",
+                prep_mass_batch,
+            )
+            .with_inner_iters(4),
+        ]
     }
 }

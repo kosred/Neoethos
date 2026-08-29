@@ -1,41 +1,10 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaDma;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-use core::arch::x86_64::*;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -86,10 +55,6 @@ pub struct DmaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DmaParams {
     pub hull_length: Option<usize>,
     pub ema_length: Option<usize>,
@@ -319,7 +284,6 @@ pub fn dma_with_kernel(input: &DmaInput, kernel: Kernel) -> Result<DmaOutput, Dm
     Ok(DmaOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline(always)]
 pub fn dma_into(input: &DmaInput, out: &mut [f64]) -> Result<(), DmaError> {
     let (data, hull_len, ema_len, ema_gain_limit, hull_ma_type, first, chosen) =
@@ -557,6 +521,69 @@ fn dma_compute_into(
     }
 }
 
+/// Canonical f64 reduction order for DMA seeds.
+///
+/// DMA is a stateful recurrence, so even a one-ULP seed reassociation changes
+/// later bars. Keep this single accumulator in oldest-to-newest order across
+/// Scalar, Auto/AVX, batch, stream, and the strict CUDA f64 lane. In
+/// particular, an AVX horizontal sum is not an equivalent implementation of
+/// this f64 contract.
+#[inline]
+fn dma_sum_chronological_f64(values: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    for &value in values {
+        sum += value;
+    }
+    sum
+}
+
+/// Return the unweighted and linearly weighted sums in the canonical DMA f64
+/// order. `values` is oldest-to-newest and therefore receives weights 1..=N.
+#[inline]
+fn dma_seed_wma_chronological_f64(values: &[f64]) -> (f64, f64) {
+    let mut sum = 0.0;
+    let mut weighted_sum = 0.0;
+    for (index, &value) in values.iter().enumerate() {
+        sum += value;
+        let weighted_value = (index + 1) as f64 * value;
+        weighted_sum += weighted_value;
+    }
+    (sum, weighted_sum)
+}
+
+/// Exact minimizer of Dickson's quantized gain search without evaluating all
+/// `2 * limit + 1` candidates.
+///
+/// Nathan Dickson's primary definition searches integer tenths from
+/// `-ema_gain_limit` through `+ema_gain_limit`. For `t != 0`, minimizing
+/// `abs(r - t * gain)` over that grid is the nearest clamped point to `r / t`;
+/// evaluating `floor(target)` and its next grid point preserves the creator's
+/// lower-gain tie break while remaining O(1).
+#[inline]
+fn dma_quantized_best_gain_f64(r: f64, t: f64, ema_gain_limit: usize) -> f64 {
+    if t == 0.0 {
+        return 0.0;
+    }
+
+    let limit_i = i64::try_from(ema_gain_limit).unwrap_or(i64::MAX);
+    let lower_i = -limit_i;
+    let target = (r / t) * 10.0;
+    let mut i0 = target.floor() as i64;
+    if i0 < lower_i {
+        i0 = lower_i;
+    } else if i0 > limit_i {
+        i0 = limit_i;
+    }
+    let i1 = if i0 < limit_i { i0 + 1 } else { i0 };
+    // Preserve Dickson's `value1 / 10` construction. Multiplying by the
+    // already-rounded binary64 literal 0.1 is a different f64 schedule.
+    let g0 = (i0 as f64) / 10.0;
+    let g1 = (i1 as f64) / 10.0;
+    let e0 = (r - t * g0).abs();
+    let e1 = (r - t * g1).abs();
+    if e0 <= e1 { g0 } else { g1 }
+}
+
 #[inline]
 pub fn dma_scalar(
     data: &[f64],
@@ -637,10 +664,7 @@ pub fn dma_scalar(
         if !e0_init_done {
             if i >= i0_e {
                 let start = i + 1 - ema_length;
-                let mut sum = 0.0;
-                for k in start..=i {
-                    sum += data[k];
-                }
+                let sum = dma_sum_chronological_f64(&data[start..=i]);
                 e0_prev = sum / ema_length as f64;
                 e0_init_done = true;
             }
@@ -655,14 +679,7 @@ pub fn dma_scalar(
                 if !half_ready {
                     if i >= i0_half {
                         let start = i + 1 - half;
-                        let mut sum = 0.0;
-                        let mut wsum_local = 0.0;
-                        for (j, idx) in (start..=i).enumerate() {
-                            let w = (j + 1) as f64;
-                            let v = data[idx];
-                            sum += v;
-                            wsum_local += w * v;
-                        }
+                        let (sum, wsum_local) = dma_seed_wma_chronological_f64(&data[start..=i]);
                         a_half = sum;
                         s_half = wsum_local;
                         half_ready = true;
@@ -678,14 +695,7 @@ pub fn dma_scalar(
                 if !full_ready {
                     if i >= i0_full {
                         let start = i + 1 - hull_length;
-                        let mut sum = 0.0;
-                        let mut wsum_local = 0.0;
-                        for (j, idx) in (start..=i).enumerate() {
-                            let w = (j + 1) as f64;
-                            let v = data[idx];
-                            sum += v;
-                            wsum_local += w * v;
-                        }
+                        let (sum, wsum_local) = dma_seed_wma_chronological_f64(&data[start..=i]);
                         a_full = sum;
                         s_full = wsum_local;
                         full_ready = true;
@@ -707,10 +717,7 @@ pub fn dma_scalar(
                 if !e_half_init_done {
                     if i >= i0_half {
                         let start = i + 1 - half;
-                        let mut sum = 0.0;
-                        for k in start..=i {
-                            sum += data[k];
-                        }
+                        let sum = dma_sum_chronological_f64(&data[start..=i]);
                         e_half_prev = sum / half as f64;
                         e_half_init_done = true;
                     }
@@ -723,10 +730,7 @@ pub fn dma_scalar(
                 if !e_full_init_done {
                     if i >= i0_full {
                         let start = i + 1 - hull_length;
-                        let mut sum = 0.0;
-                        for k in start..=i {
-                            sum += data[k];
-                        }
+                        let sum = dma_sum_chronological_f64(&data[start..=i]);
                         e_full_prev = sum / hull_length as f64;
                         e_full_init_done = true;
                     }
@@ -748,13 +752,7 @@ pub fn dma_scalar(
 
                 if diff_filled == sqrt_len {
                     if is_wma {
-                        a_diff = 0.0;
-                        s_diff = 0.0;
-                        for (j, &v) in diff_ring.iter().enumerate() {
-                            let w = (j + 1) as f64;
-                            a_diff += v;
-                            s_diff += w * v;
-                        }
+                        (a_diff, s_diff) = dma_seed_wma_chronological_f64(&diff_ring);
                         diff_wma_init_done = true;
                         hull_val = s_diff / wsum(sqrt_len).max(1.0);
                     } else {
@@ -791,29 +789,7 @@ pub fn dma_scalar(
                 let t = alpha_e * dx;
                 let base = e0_prev.mul_add(alpha_e, one_minus_alpha_e * ec_prev);
                 let r = x - base;
-
-                let g_sel = if t == 0.0 {
-                    0.0
-                } else {
-                    let limit_i = ema_gain_limit as i64;
-                    let target = (r / t) * 10.0;
-                    let mut i0 = target.floor() as i64;
-                    if i0 < 0 {
-                        i0 = 0;
-                    } else if i0 > limit_i {
-                        i0 = limit_i;
-                    }
-                    let i1 = if i0 < limit_i { i0 + 1 } else { i0 };
-                    let g0 = (i0 as f64) * 0.1;
-                    let g1 = (i1 as f64) * 0.1;
-                    let e0 = (r - t * g0).abs();
-                    let e1 = (r - t * g1).abs();
-                    if e0 <= e1 {
-                        g0
-                    } else {
-                        g1
-                    }
-                };
+                let g_sel = dma_quantized_best_gain_f64(r, t, ema_gain_limit);
 
                 ec_now = (e0_prev + g_sel * dx).mul_add(alpha_e, one_minus_alpha_e * ec_prev);
                 ec_prev = ec_now;
@@ -847,256 +823,6 @@ unsafe fn dma_simd128(
         first_val,
         out,
     );
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn hsum256d(v: __m256d) -> f64 {
-    let mut buf = [0.0f64; 4];
-    _mm256_storeu_pd(buf.as_mut_ptr(), v);
-    buf[0] + buf[1] + buf[2] + buf[3]
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn hsum512d(v: __m512d) -> f64 {
-    let mut buf = [0.0f64; 8];
-    _mm512_storeu_pd(buf.as_mut_ptr(), v);
-    buf.iter().sum()
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn vabs256d(x: __m256d) -> __m256d {
-    let sign = _mm256_set1_pd(-0.0);
-    _mm256_andnot_pd(sign, x)
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn vabs512d(x: __m512d) -> __m512d {
-    let sign = _mm512_set1_epi64(i64::MIN as i64);
-    let xi = _mm512_castpd_si512(x);
-    let cleared = _mm512_andnot_si512(sign, xi);
-    _mm512_castsi512_pd(cleared)
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn sum_unweighted_avx2(ptr: *const f64, len: usize) -> f64 {
-    let mut i = 0usize;
-    let mut acc = _mm256_setzero_pd();
-    while i + 4 <= len {
-        let v = _mm256_loadu_pd(ptr.add(i));
-        acc = _mm256_add_pd(acc, v);
-        i += 4;
-    }
-    let mut s = hsum256d(acc);
-    while i < len {
-        s += *ptr.add(i);
-        i += 1;
-    }
-    s
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn sum_unweighted_avx512(ptr: *const f64, len: usize) -> f64 {
-    let mut i = 0usize;
-    let mut acc = _mm512_setzero_pd();
-    while i + 8 <= len {
-        let v = _mm512_loadu_pd(ptr.add(i));
-        acc = _mm512_add_pd(acc, v);
-        i += 8;
-    }
-    let mut s = hsum512d(acc);
-    while i < len {
-        s += *ptr.add(i);
-        i += 1;
-    }
-    s
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn seed_wma_window_avx2(ptr: *const f64, len: usize) -> (f64, f64) {
-    let mut i = 0usize;
-    let mut acc_v = _mm256_setzero_pd();
-    let mut acc_wv = _mm256_setzero_pd();
-    let inc = _mm256_set_pd(3.0, 2.0, 1.0, 0.0);
-    let mut wbase = 1.0f64;
-    while i + 4 <= len {
-        let v = _mm256_loadu_pd(ptr.add(i));
-        let w = _mm256_add_pd(_mm256_set1_pd(wbase), inc);
-        acc_v = _mm256_add_pd(acc_v, v);
-        acc_wv = _mm256_add_pd(acc_wv, _mm256_mul_pd(w, v));
-        wbase += 4.0;
-        i += 4;
-    }
-    let mut s = hsum256d(acc_v);
-    let mut sw = hsum256d(acc_wv);
-    while i < len {
-        let val = *ptr.add(i);
-        s += val;
-        sw += (i as f64 + 1.0) * val;
-        i += 1;
-    }
-    (s, sw)
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn seed_wma_window_avx512(ptr: *const f64, len: usize) -> (f64, f64) {
-    let mut i = 0usize;
-    let mut acc_v = _mm512_setzero_pd();
-    let mut acc_wv = _mm512_setzero_pd();
-    let inc = _mm512_set_pd(7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0);
-    let mut wbase = 1.0f64;
-    while i + 8 <= len {
-        let v = _mm512_loadu_pd(ptr.add(i));
-        let w = _mm512_add_pd(_mm512_set1_pd(wbase), inc);
-        acc_v = _mm512_add_pd(acc_v, v);
-        acc_wv = _mm512_add_pd(acc_wv, _mm512_mul_pd(w, v));
-        wbase += 8.0;
-        i += 8;
-    }
-    let mut s = hsum512d(acc_v);
-    let mut sw = hsum512d(acc_wv);
-    while i < len {
-        let val = *ptr.add(i);
-        s += val;
-        sw += (i as f64 + 1.0) * val;
-        i += 1;
-    }
-    (s, sw)
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn best_gain_search_avx2(
-    x: f64,
-    e0_prev: f64,
-    ec_prev: f64,
-    alpha_e: f64,
-    ema_gain_limit: usize,
-) -> f64 {
-    let width = 4usize;
-    let dx = _mm256_set1_pd(x - ec_prev);
-    let x_v = _mm256_set1_pd(x);
-    let e0_v = _mm256_set1_pd(e0_prev);
-    let ec_prev_v = _mm256_set1_pd(ec_prev);
-    let a_v = _mm256_set1_pd(alpha_e);
-    let om_a_v = _mm256_set1_pd(1.0 - alpha_e);
-    let inf_v = _mm256_set1_pd(f64::INFINITY);
-    let limit_f = ema_gain_limit as f64;
-    let limit_v = _mm256_set1_pd(limit_f);
-    let scale = _mm256_set1_pd(0.1);
-
-    let mut best_err = _mm256_set1_pd(f64::INFINITY);
-    let mut best_g = _mm256_set1_pd(0.0);
-
-    let mut idx = 0usize;
-    while idx <= ema_gain_limit {
-        let base = _mm256_set1_pd(idx as f64);
-        let inc = _mm256_set_pd(3.0, 2.0, 1.0, 0.0);
-        let idx_v = _mm256_add_pd(base, inc);
-
-        let gt_mask = _mm256_cmp_pd(idx_v, limit_v, _CMP_GT_OQ);
-
-        let g = _mm256_mul_pd(idx_v, scale);
-        let e0_plus = _mm256_fmadd_pd(g, dx, e0_v);
-        let pred = _mm256_fmadd_pd(a_v, e0_plus, _mm256_mul_pd(om_a_v, ec_prev_v));
-        let err = vabs256d(_mm256_sub_pd(x_v, pred));
-
-        let err_masked = _mm256_blendv_pd(err, inf_v, gt_mask);
-
-        let lt = _mm256_cmp_pd(err_masked, best_err, _CMP_LT_OQ);
-        best_err = _mm256_blendv_pd(best_err, err_masked, lt);
-        best_g = _mm256_blendv_pd(best_g, g, lt);
-
-        idx += width;
-    }
-
-    let mut e = [0.0f64; 4];
-    let mut g = [0.0f64; 4];
-    _mm256_storeu_pd(e.as_mut_ptr(), best_err);
-    _mm256_storeu_pd(g.as_mut_ptr(), best_g);
-
-    let mut best_e = f64::INFINITY;
-    let mut best_gg = 0.0;
-    for k in 0..4 {
-        let ek = e[k];
-        let gk = g[k];
-        if ek < best_e || (ek == best_e && gk < best_gg) {
-            best_e = ek;
-            best_gg = gk;
-        }
-    }
-    best_gg
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn best_gain_search_avx512(
-    x: f64,
-    e0_prev: f64,
-    ec_prev: f64,
-    alpha_e: f64,
-    ema_gain_limit: usize,
-) -> f64 {
-    let width = 8usize;
-    let dx = _mm512_set1_pd(x - ec_prev);
-    let x_v = _mm512_set1_pd(x);
-    let e0_v = _mm512_set1_pd(e0_prev);
-    let ec_prev_v = _mm512_set1_pd(ec_prev);
-    let a_v = _mm512_set1_pd(alpha_e);
-    let om_a_v = _mm512_set1_pd(1.0 - alpha_e);
-    let inf_v = _mm512_set1_pd(f64::INFINITY);
-    let limit_f = ema_gain_limit as f64;
-    let limit_v = _mm512_set1_pd(limit_f);
-    let scale = _mm512_set1_pd(0.1);
-
-    let mut best_err = _mm512_set1_pd(f64::INFINITY);
-    let mut best_g = _mm512_set1_pd(0.0);
-
-    let mut idx = 0usize;
-    while idx <= ema_gain_limit {
-        let base = _mm512_set1_pd(idx as f64);
-        let inc = _mm512_set_pd(7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0);
-        let idx_v = _mm512_add_pd(base, inc);
-
-        let k_invalid = _mm512_cmp_pd_mask(idx_v, limit_v, _CMP_GT_OQ);
-
-        let g = _mm512_mul_pd(idx_v, scale);
-        let e0_plus = _mm512_fmadd_pd(g, dx, e0_v);
-        let pred = _mm512_fmadd_pd(a_v, e0_plus, _mm512_mul_pd(om_a_v, ec_prev_v));
-        let err = vabs512d(_mm512_sub_pd(x_v, pred));
-
-        let err_masked = _mm512_mask_mov_pd(err, k_invalid, inf_v);
-
-        let k_lt = _mm512_cmp_pd_mask(err_masked, best_err, _CMP_LT_OQ);
-        best_err = _mm512_mask_mov_pd(best_err, k_lt, err_masked);
-        best_g = _mm512_mask_mov_pd(best_g, k_lt, g);
-
-        idx += width;
-    }
-
-    let mut e = [0.0f64; 8];
-    let mut g = [0.0f64; 8];
-    _mm512_storeu_pd(e.as_mut_ptr(), best_err);
-    _mm512_storeu_pd(g.as_mut_ptr(), best_g);
-
-    let mut best_e = f64::INFINITY;
-    let mut best_gg = 0.0;
-    for k in 0..8 {
-        let ek = e[k];
-        let gk = g[k];
-        if ek < best_e || (ek == best_e && gk < best_gg) {
-            best_e = ek;
-            best_gg = gk;
-        }
-    }
-    best_gg
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -1179,7 +905,7 @@ unsafe fn dma_avx2(
         if !e0_init_done {
             if i >= i0_e {
                 let start = i + 1 - ema_length;
-                let sum = sum_unweighted_avx2(data.as_ptr().add(start), ema_length);
+                let sum = dma_sum_chronological_f64(&data[start..=i]);
                 e0_prev = sum / ema_length as f64;
                 e0_init_done = true;
             }
@@ -1194,8 +920,7 @@ unsafe fn dma_avx2(
                 if !half_ready {
                     if i >= i0_half {
                         let start = i + 1 - half;
-                        let (sum, wsum_local) =
-                            seed_wma_window_avx2(data.as_ptr().add(start), half);
+                        let (sum, wsum_local) = dma_seed_wma_chronological_f64(&data[start..=i]);
                         a_half = sum;
                         s_half = wsum_local;
                         half_ready = true;
@@ -1211,8 +936,7 @@ unsafe fn dma_avx2(
                 if !full_ready {
                     if i >= i0_full {
                         let start = i + 1 - hull_length;
-                        let (sum, wsum_local) =
-                            seed_wma_window_avx2(data.as_ptr().add(start), hull_length);
+                        let (sum, wsum_local) = dma_seed_wma_chronological_f64(&data[start..=i]);
                         a_full = sum;
                         s_full = wsum_local;
                         full_ready = true;
@@ -1234,7 +958,7 @@ unsafe fn dma_avx2(
                 if !e_half_init_done {
                     if i >= i0_half {
                         let start = i + 1 - half;
-                        let sum = sum_unweighted_avx2(data.as_ptr().add(start), half);
+                        let sum = dma_sum_chronological_f64(&data[start..=i]);
                         e_half_prev = sum / half as f64;
                         e_half_init_done = true;
                     }
@@ -1247,7 +971,7 @@ unsafe fn dma_avx2(
                 if !e_full_init_done {
                     if i >= i0_full {
                         let start = i + 1 - hull_length;
-                        let sum = sum_unweighted_avx2(data.as_ptr().add(start), hull_length);
+                        let sum = dma_sum_chronological_f64(&data[start..=i]);
                         e_full_prev = sum / hull_length as f64;
                         e_full_init_done = true;
                     }
@@ -1269,9 +993,7 @@ unsafe fn dma_avx2(
 
                 if diff_filled == sqrt_len {
                     if is_wma {
-                        let (a0, s0) = seed_wma_window_avx2(diff_ring.as_ptr(), sqrt_len);
-                        a_diff = a0;
-                        s_diff = s0;
+                        (a_diff, s_diff) = dma_seed_wma_chronological_f64(&diff_ring);
                         diff_wma_init_done = true;
                         let wsum_d = (sqrt_len * (sqrt_len + 1)) as f64 / 2.0;
                         hull_val = s_diff / wsum_d.max(1.0);
@@ -1310,29 +1032,7 @@ unsafe fn dma_avx2(
                 let t = alpha_e * dx;
                 let base = e0_prev.mul_add(alpha_e, (1.0 - alpha_e) * ec_prev);
                 let r = x - base;
-
-                let g_sel = if t == 0.0 {
-                    0.0
-                } else {
-                    let limit_i = ema_gain_limit as i64;
-                    let target = (r / t) * 10.0;
-                    let mut i0 = target.floor() as i64;
-                    if i0 < 0 {
-                        i0 = 0;
-                    } else if i0 > limit_i {
-                        i0 = limit_i;
-                    }
-                    let i1 = if i0 < limit_i { i0 + 1 } else { i0 };
-                    let g0 = (i0 as f64) * 0.1;
-                    let g1 = (i1 as f64) * 0.1;
-                    let e0 = (r - t * g0).abs();
-                    let e1 = (r - t * g1).abs();
-                    if e0 <= e1 {
-                        g0
-                    } else {
-                        g1
-                    }
-                };
+                let g_sel = dma_quantized_best_gain_f64(r, t, ema_gain_limit);
 
                 ec_now = (e0_prev + g_sel * dx).mul_add(alpha_e, (1.0 - alpha_e) * ec_prev);
                 ec_prev = ec_now;
@@ -1425,7 +1125,7 @@ unsafe fn dma_avx512(
         if !e0_init_done {
             if i >= i0_e {
                 let start = i + 1 - ema_length;
-                let sum = sum_unweighted_avx512(data.as_ptr().add(start), ema_length);
+                let sum = dma_sum_chronological_f64(&data[start..=i]);
                 e0_prev = sum / ema_length as f64;
                 e0_init_done = true;
             }
@@ -1440,8 +1140,7 @@ unsafe fn dma_avx512(
                 if !half_ready {
                     if i >= i0_half {
                         let start = i + 1 - half;
-                        let (sum, wsum_local) =
-                            seed_wma_window_avx512(data.as_ptr().add(start), half);
+                        let (sum, wsum_local) = dma_seed_wma_chronological_f64(&data[start..=i]);
                         a_half = sum;
                         s_half = wsum_local;
                         half_ready = true;
@@ -1457,8 +1156,7 @@ unsafe fn dma_avx512(
                 if !full_ready {
                     if i >= i0_full {
                         let start = i + 1 - hull_length;
-                        let (sum, wsum_local) =
-                            seed_wma_window_avx512(data.as_ptr().add(start), hull_length);
+                        let (sum, wsum_local) = dma_seed_wma_chronological_f64(&data[start..=i]);
                         a_full = sum;
                         s_full = wsum_local;
                         full_ready = true;
@@ -1480,7 +1178,7 @@ unsafe fn dma_avx512(
                 if !e_half_init_done {
                     if i >= i0_half {
                         let start = i + 1 - half;
-                        let sum = sum_unweighted_avx512(data.as_ptr().add(start), half);
+                        let sum = dma_sum_chronological_f64(&data[start..=i]);
                         e_half_prev = sum / half as f64;
                         e_half_init_done = true;
                     }
@@ -1493,7 +1191,7 @@ unsafe fn dma_avx512(
                 if !e_full_init_done {
                     if i >= i0_full {
                         let start = i + 1 - hull_length;
-                        let sum = sum_unweighted_avx512(data.as_ptr().add(start), hull_length);
+                        let sum = dma_sum_chronological_f64(&data[start..=i]);
                         e_full_prev = sum / hull_length as f64;
                         e_full_init_done = true;
                     }
@@ -1515,9 +1213,7 @@ unsafe fn dma_avx512(
 
                 if diff_filled == sqrt_len {
                     if is_wma {
-                        let (a0, s0) = seed_wma_window_avx512(diff_ring.as_ptr(), sqrt_len);
-                        a_diff = a0;
-                        s_diff = s0;
+                        (a_diff, s_diff) = dma_seed_wma_chronological_f64(&diff_ring);
                         diff_wma_init_done = true;
                         let wsum_d = (sqrt_len * (sqrt_len + 1)) as f64 / 2.0;
                         hull_val = s_diff / wsum_d.max(1.0);
@@ -1556,29 +1252,7 @@ unsafe fn dma_avx512(
                 let t = alpha_e * dx;
                 let base = e0_prev.mul_add(alpha_e, (1.0 - alpha_e) * ec_prev);
                 let r = x - base;
-
-                let g_sel = if t == 0.0 {
-                    0.0
-                } else {
-                    let limit_i = ema_gain_limit as i64;
-                    let target = (r / t) * 10.0;
-                    let mut i0 = target.floor() as i64;
-                    if i0 < 0 {
-                        i0 = 0;
-                    } else if i0 > limit_i {
-                        i0 = limit_i;
-                    }
-                    let i1 = if i0 < limit_i { i0 + 1 } else { i0 };
-                    let g0 = (i0 as f64) * 0.1;
-                    let g1 = (i1 as f64) * 0.1;
-                    let e0 = (r - t * g0).abs();
-                    let e1 = (r - t * g1).abs();
-                    if e0 <= e1 {
-                        g0
-                    } else {
-                        g1
-                    }
-                };
+                let g_sel = dma_quantized_best_gain_f64(r, t, ema_gain_limit);
 
                 ec_now = (e0_prev + g_sel * dx).mul_add(alpha_e, (1.0 - alpha_e) * ec_prev);
                 ec_prev = ec_now;
@@ -1608,7 +1282,6 @@ pub struct DmaStream {
     seen_first: bool,
 
     alpha_e: f64,
-    sum_e0: f64,
     e0_prev: f64,
     e0_ready: bool,
 
@@ -1631,11 +1304,9 @@ pub struct DmaStream {
 
     a_diff: f64,
     s_diff: f64,
-    diff_wma_ready: bool,
 
     alpha_sqrt: f64,
     diff_ema: f64,
-    diff_ema_ready: bool,
 
     diff_ring: Vec<f64>,
     diff_head: usize,
@@ -1680,7 +1351,6 @@ impl DmaStream {
             seen_first: false,
 
             alpha_e: 2.0 / (ema_length as f64 + 1.0),
-            sum_e0: 0.0,
             e0_prev: 0.0,
             e0_ready: false,
 
@@ -1691,8 +1361,8 @@ impl DmaStream {
             sum_full: 0.0,
             s_half: 0.0,
             s_full: 0.0,
-            half_ready: half == 0,
-            full_ready: hull_length == 0,
+            half_ready: false,
+            full_ready: false,
 
             alpha_half: if half > 0 {
                 2.0 / (half as f64 + 1.0)
@@ -1702,19 +1372,17 @@ impl DmaStream {
             alpha_full: 2.0 / (hull_length as f64 + 1.0),
             e_half_prev: 0.0,
             e_full_prev: 0.0,
-            e_half_ready: half == 0,
-            e_full_ready: hull_length == 0,
+            e_half_ready: false,
+            e_full_ready: false,
 
             a_diff: 0.0,
             s_diff: 0.0,
-            diff_wma_ready: sqrt_len == 0,
             alpha_sqrt: if sqrt_len > 0 {
                 2.0 / (sqrt_len as f64 + 1.0)
             } else {
                 0.0
             },
             diff_ema: 0.0,
-            diff_ema_ready: sqrt_len == 0,
             diff_ring: vec![f64::NAN; sqrt_len.max(1)],
             diff_head: 0,
             diff_filled: 0,
@@ -1732,6 +1400,7 @@ impl DmaStream {
         }
 
         let old_head = self.head;
+        let overwritten = self.ring[old_head];
         self.ring[old_head] = x;
         self.head = (old_head + 1) % self.cap;
         if self.filled < self.cap {
@@ -1744,84 +1413,95 @@ impl DmaStream {
             ring[idx]
         }
 
-        if self.filled < self.ema_length {
-            if x.is_finite() {
-                self.sum_e0 += x;
+        #[inline(always)]
+        fn outgoing(ring: &[f64], head: usize, cap: usize, window: usize, overwritten: f64) -> f64 {
+            if window == cap {
+                overwritten
+            } else {
+                kback(ring, head, cap, window + 1)
+            }
+        }
+
+        #[inline]
+        fn ring_sum_chronological(ring: &[f64], head: usize, cap: usize, window: usize) -> f64 {
+            let mut sum = 0.0;
+            for j in 0..window {
+                sum += kback(ring, head, cap, window - j);
+            }
+            sum
+        }
+
+        #[inline]
+        fn ring_wma_seed_chronological(
+            ring: &[f64],
+            head: usize,
+            cap: usize,
+            window: usize,
+        ) -> (f64, f64) {
+            let mut sum = 0.0;
+            let mut weighted_sum = 0.0;
+            for j in 0..window {
+                let value = kback(ring, head, cap, window - j);
+                sum += value;
+                let weighted_value = (j + 1) as f64 * value;
+                weighted_sum += weighted_value;
+            }
+            (sum, weighted_sum)
+        }
+
+        if !self.e0_ready {
+            if self.filled >= self.ema_length {
+                self.e0_prev =
+                    ring_sum_chronological(&self.ring, self.head, self.cap, self.ema_length)
+                        / self.ema_length as f64;
+                self.e0_ready = true;
             }
         } else {
-            let out_e = kback(&self.ring, self.head, self.cap, self.ema_length);
-            if x.is_finite() {
-                self.sum_e0 += x;
-            }
-            if out_e.is_finite() {
-                self.sum_e0 -= out_e;
-            }
-            if !self.e0_ready {
-                self.e0_prev = self.sum_e0 / self.ema_length as f64;
-                self.e0_ready = true;
-            } else {
-                self.e0_prev = self.alpha_e * x + (1.0 - self.alpha_e) * self.e0_prev;
-            }
+            self.e0_prev = x.mul_add(self.alpha_e, (1.0 - self.alpha_e) * self.e0_prev);
         }
 
         let mut diff_now = f64::NAN;
 
         if self.is_wma {
             if self.half > 0 {
-                if self.filled < self.half {
-                    if x.is_finite() {
-                        self.sum_half += x;
-                    }
-                } else {
-                    let out_h = kback(&self.ring, self.head, self.cap, self.half);
-                    if x.is_finite() {
-                        self.sum_half += x;
-                    }
-                    if out_h.is_finite() {
-                        self.sum_half -= out_h;
-                    }
-                    if !self.half_ready {
-                        self.s_half = 0.0;
-                        for j in 0..self.half {
-                            let v = kback(&self.ring, self.head, self.cap, self.half - j);
-                            self.s_half += (j as f64 + 1.0) * v;
-                        }
+                if !self.half_ready {
+                    if self.filled >= self.half {
+                        (self.sum_half, self.s_half) =
+                            ring_wma_seed_chronological(&self.ring, self.head, self.cap, self.half);
                         self.half_ready = true;
-                    } else {
-                        let a_prev = self.sum_half + out_h - x;
-                        self.s_half = self.s_half + (self.half as f64) * x - a_prev;
                     }
-                }
-            } else {
-                self.half_ready = true;
-            }
-
-            if self.filled < self.hull_length {
-                if x.is_finite() {
-                    self.sum_full += x;
-                }
-            } else {
-                let out_f = kback(&self.ring, self.head, self.cap, self.hull_length);
-                if x.is_finite() {
-                    self.sum_full += x;
-                }
-                if out_f.is_finite() {
-                    self.sum_full -= out_f;
-                }
-                if !self.full_ready {
-                    self.s_full = 0.0;
-                    for j in 0..self.hull_length {
-                        let v = kback(&self.ring, self.head, self.cap, self.hull_length - j);
-                        self.s_full += (j as f64 + 1.0) * v;
-                    }
-                    self.full_ready = true;
                 } else {
-                    let a_prev = self.sum_full + out_f - x;
-                    self.s_full = self.s_full + (self.hull_length as f64) * x - a_prev;
+                    let old = outgoing(&self.ring, self.head, self.cap, self.half, overwritten);
+                    let a_prev = self.sum_half;
+                    self.sum_half = a_prev + x - old;
+                    self.s_half = self.s_half + (self.half as f64) * x - a_prev;
                 }
             }
 
-            if self.half_ready && self.full_ready && self.sqrt_len > 0 {
+            if !self.full_ready {
+                if self.filled >= self.hull_length {
+                    (self.sum_full, self.s_full) = ring_wma_seed_chronological(
+                        &self.ring,
+                        self.head,
+                        self.cap,
+                        self.hull_length,
+                    );
+                    self.full_ready = true;
+                }
+            } else {
+                let old = outgoing(
+                    &self.ring,
+                    self.head,
+                    self.cap,
+                    self.hull_length,
+                    overwritten,
+                );
+                let a_prev = self.sum_full;
+                self.sum_full = a_prev + x - old;
+                self.s_full = self.s_full + (self.hull_length as f64) * x - a_prev;
+            }
+
+            if self.half_ready && self.full_ready {
                 let wsum = |p: usize| (p * (p + 1)) as f64 / 2.0;
                 let w_half = self.s_half / wsum(self.half).max(1.0);
                 let w_full = self.s_full / wsum(self.hull_length).max(1.0);
@@ -1829,83 +1509,68 @@ impl DmaStream {
             }
         } else {
             if self.half > 0 {
-                if self.filled < self.half {
-                } else if !self.e_half_ready {
-                    let mut s = 0.0;
-                    for j in 0..self.half {
-                        s += kback(&self.ring, self.head, self.cap, self.half - j);
+                if !self.e_half_ready {
+                    if self.filled >= self.half {
+                        self.e_half_prev =
+                            ring_sum_chronological(&self.ring, self.head, self.cap, self.half)
+                                / self.half as f64;
+                        self.e_half_ready = true;
                     }
-                    self.e_half_prev = s / self.half as f64;
-                    self.e_half_ready = true;
                 } else {
                     self.e_half_prev =
-                        self.alpha_half * x + (1.0 - self.alpha_half) * self.e_half_prev;
+                        x.mul_add(self.alpha_half, (1.0 - self.alpha_half) * self.e_half_prev);
                 }
-            } else {
-                self.e_half_ready = true;
             }
 
-            if self.filled < self.hull_length {
-            } else if !self.e_full_ready {
-                let mut s = 0.0;
-                for j in 0..self.hull_length {
-                    s += kback(&self.ring, self.head, self.cap, self.hull_length - j);
+            if !self.e_full_ready {
+                if self.filled >= self.hull_length {
+                    self.e_full_prev =
+                        ring_sum_chronological(&self.ring, self.head, self.cap, self.hull_length)
+                            / self.hull_length as f64;
+                    self.e_full_ready = true;
                 }
-                self.e_full_prev = s / self.hull_length as f64;
-                self.e_full_ready = true;
             } else {
-                self.e_full_prev = self.alpha_full * x + (1.0 - self.alpha_full) * self.e_full_prev;
+                self.e_full_prev =
+                    x.mul_add(self.alpha_full, (1.0 - self.alpha_full) * self.e_full_prev);
             }
 
-            if self.e_half_ready && self.e_full_ready && self.sqrt_len > 0 {
+            if self.e_half_ready && self.e_full_ready {
                 diff_now = 2.0 * self.e_half_prev - self.e_full_prev;
             }
         }
 
         let mut hull_val = f64::NAN;
-        if self.sqrt_len == 0 {
-            if diff_now.is_finite() {
-                hull_val = diff_now;
-            }
-        } else if diff_now.is_finite() {
-            let old = self.diff_ring[self.diff_head];
-            self.diff_ring[self.diff_head] = diff_now;
-            self.diff_head = (self.diff_head + 1) % self.sqrt_len;
+        if diff_now.is_finite() && self.sqrt_len > 0 {
             if self.diff_filled < self.sqrt_len {
+                self.diff_ring[self.diff_filled] = diff_now;
                 self.diff_filled += 1;
-            }
 
-            if self.is_wma {
-                if !self.diff_wma_ready && self.diff_filled == self.sqrt_len {
-                    self.a_diff = 0.0;
-                    self.s_diff = 0.0;
-                    for j in 0..self.sqrt_len {
-                        let v = self.diff_ring[(self.diff_head + j) % self.sqrt_len];
-                        self.a_diff += v;
-                        self.s_diff += (j as f64 + 1.0) * v;
+                if self.diff_filled == self.sqrt_len {
+                    if self.is_wma {
+                        (self.a_diff, self.s_diff) =
+                            dma_seed_wma_chronological_f64(&self.diff_ring[..self.sqrt_len]);
+                        let wsum = (self.sqrt_len * (self.sqrt_len + 1)) as f64 / 2.0;
+                        hull_val = self.s_diff / wsum.max(1.0);
+                    } else {
+                        self.diff_ema = dma_sum_chronological_f64(&self.diff_ring[..self.sqrt_len])
+                            / self.sqrt_len as f64;
+                        hull_val = self.diff_ema;
                     }
-                    self.diff_wma_ready = true;
-                    let wsum = (self.sqrt_len * (self.sqrt_len + 1)) as f64 / 2.0;
-                    hull_val = self.s_diff / wsum.max(1.0);
-                } else if self.diff_wma_ready {
-                    let wsum = (self.sqrt_len * (self.sqrt_len + 1)) as f64 / 2.0;
-                    let a_prev = self.a_diff;
-                    self.s_diff = self.s_diff + (self.sqrt_len as f64) * diff_now - a_prev;
-                    self.a_diff = a_prev + diff_now - old;
-                    hull_val = self.s_diff / wsum.max(1.0);
                 }
             } else {
-                if !self.diff_ema_ready && self.diff_filled == self.sqrt_len {
-                    let mut s = 0.0;
-                    for j in 0..self.sqrt_len {
-                        s += self.diff_ring[j];
-                    }
-                    self.diff_ema = s / self.sqrt_len as f64;
-                    self.diff_ema_ready = true;
-                    hull_val = self.diff_ema;
-                } else if self.diff_ema_ready {
+                let old = self.diff_ring[self.diff_head];
+                self.diff_ring[self.diff_head] = diff_now;
+                self.diff_head = (self.diff_head + 1) % self.sqrt_len;
+
+                if self.is_wma {
+                    let a_prev = self.a_diff;
+                    self.a_diff = a_prev + diff_now - old;
+                    self.s_diff = self.s_diff + (self.sqrt_len as f64) * diff_now - a_prev;
+                    let wsum = (self.sqrt_len * (self.sqrt_len + 1)) as f64 / 2.0;
+                    hull_val = self.s_diff / wsum.max(1.0);
+                } else {
                     self.diff_ema =
-                        self.alpha_sqrt * diff_now + (1.0 - self.alpha_sqrt) * self.diff_ema;
+                        diff_now.mul_add(self.alpha_sqrt, (1.0 - self.alpha_sqrt) * self.diff_ema);
                     hull_val = self.diff_ema;
                 }
             }
@@ -1922,37 +1587,13 @@ impl DmaStream {
                 let dx = x - self.ec_prev;
                 let t = self.alpha_e * dx;
                 let base = self
-                    .alpha_e
-                    .mul_add(self.e0_prev, one_minus_alpha_e * self.ec_prev);
+                    .e0_prev
+                    .mul_add(self.alpha_e, one_minus_alpha_e * self.ec_prev);
                 let r = x - base;
+                let g_sel = dma_quantized_best_gain_f64(r, t, self.ema_gain_limit);
 
-                let g_sel = if t == 0.0 {
-                    0.0
-                } else {
-                    let target = (r / t) * 10.0;
-                    let limit_i = self.ema_gain_limit as i64;
-                    let mut i0 = target.floor() as i64;
-                    if i0 < 0 {
-                        i0 = 0;
-                    } else if i0 > limit_i {
-                        i0 = limit_i;
-                    }
-                    let i1 = if i0 < limit_i { i0 + 1 } else { i0 };
-                    let g0 = (i0 as f64) * 0.1;
-                    let g1 = (i1 as f64) * 0.1;
-                    let e0 = (r - t * g0).abs();
-                    let e1 = (r - t * g1).abs();
-                    if e0 <= e1 {
-                        g0
-                    } else {
-                        g1
-                    }
-                };
-
-                let ec = self.alpha_e.mul_add(
-                    self.e0_prev + g_sel * dx,
-                    (1.0 - self.alpha_e) * self.ec_prev,
-                );
+                let ec = (self.e0_prev + g_sel * dx)
+                    .mul_add(self.alpha_e, one_minus_alpha_e * self.ec_prev);
                 self.ec_prev = ec;
                 ec_now = ec;
             }
@@ -2316,492 +1957,17 @@ fn dma_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "dma")]
-#[pyo3(signature = (data, hull_length=7, ema_length=20, ema_gain_limit=50, hull_ma_type="WMA", kernel=None))]
-pub fn dma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    hull_length: usize,
-    ema_length: usize,
-    ema_gain_limit: usize,
-    hull_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = DmaParams {
-        hull_length: Some(hull_length),
-        ema_length: Some(ema_length),
-        ema_gain_limit: Some(ema_gain_limit),
-        hull_ma_type: Some(hull_ma_type.to_string()),
-    };
-    let input = DmaInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| dma_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DmaStream")]
-pub struct DmaStreamPy {
-    stream: DmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DmaStreamPy {
-    #[new]
-    fn new(
-        hull_length: usize,
-        ema_length: usize,
-        ema_gain_limit: usize,
-        hull_ma_type: &str,
-    ) -> PyResult<Self> {
-        let params = DmaParams {
-            hull_length: Some(hull_length),
-            ema_length: Some(ema_length),
-            ema_gain_limit: Some(ema_gain_limit),
-            hull_ma_type: Some(hull_ma_type.to_string()),
-        };
-        let stream =
-            DmaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(DmaStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dma_batch")]
-#[pyo3(signature = (data, hull_length_range, ema_length_range, ema_gain_limit_range, hull_ma_type="WMA", kernel=None))]
-pub fn dma_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    hull_length_range: (usize, usize, usize),
-    ema_length_range: (usize, usize, usize),
-    ema_gain_limit_range: (usize, usize, usize),
-    hull_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let slice_in = data.as_slice()?;
-
-    let sweep = DmaBatchRange {
-        hull_length: hull_length_range,
-        ema_length: ema_length_range,
-        ema_gain_limit: ema_gain_limit_range,
-        hull_ma_type: hull_ma_type.to_string(),
-    };
-
-    let combos = expand_grid_dma(&sweep);
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                other => return Err(DmaError::InvalidKernelForBatch(other)),
-            };
-            dma_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "hull_lengths",
-        combos
-            .iter()
-            .map(|p| p.hull_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ema_lengths",
-        combos
-            .iter()
-            .map(|p| p.ema_length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ema_gain_limits",
-        combos
-            .iter()
-            .map(|p| p.ema_gain_limit.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("hull_ma_type", hull_ma_type)?;
-
-    dict.set_item(
-        "hull_ma_types",
-        combos
-            .iter()
-            .map(|p| p.hull_ma_type.as_deref().unwrap_or("WMA"))
-            .collect::<Vec<_>>(),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dma_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, hull_length_range, ema_length_range, ema_gain_limit_range, hull_ma_type="WMA", device_id=0))]
-pub fn dma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    hull_length_range: (usize, usize, usize),
-    ema_length_range: (usize, usize, usize),
-    ema_gain_limit_range: (usize, usize, usize),
-    hull_ma_type: &str,
-    device_id: usize,
-) -> PyResult<DmaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let sweep = DmaBatchRange {
-        hull_length: hull_length_range,
-        ema_length: ema_length_range,
-        ema_gain_limit: ema_gain_limit_range,
-        hull_ma_type: hull_ma_type.to_string(),
-    };
-
-    let slice_in = data_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .dma_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(DmaDeviceArrayF32Py {
-        inner: Some(inner),
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, hull_length, ema_length, ema_gain_limit, hull_ma_type="WMA", device_id=0))]
-pub fn dma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    hull_length: usize,
-    ema_length: usize,
-    ema_gain_limit: usize,
-    hull_ma_type: &str,
-    device_id: usize,
-) -> PyResult<DmaDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let flat_in: &[f32] = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = DmaParams {
-        hull_length: Some(hull_length),
-        ema_length: Some(ema_length),
-        ema_gain_limit: Some(ema_gain_limit),
-        hull_ma_type: Some(hull_ma_type.to_string()),
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaDma::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .dma_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(DmaDeviceArrayF32Py {
-        inner: Some(inner),
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dma_js(
-    data: &[f64],
-    hull_length: usize,
-    ema_length: usize,
-    ema_gain_limit: usize,
-    hull_ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let params = DmaParams {
-        hull_length: Some(hull_length),
-        ema_length: Some(ema_length),
-        ema_gain_limit: Some(ema_gain_limit),
-        hull_ma_type: Some(hull_ma_type.to_string()),
-    };
-    let input = DmaInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-    dma_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dma_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dma_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dma_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    hull_length: usize,
-    ema_length: usize,
-    ema_gain_limit: usize,
-    hull_ma_type: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to dma_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let params = DmaParams {
-            hull_length: Some(hull_length),
-            ema_length: Some(ema_length),
-            ema_gain_limit: Some(ema_gain_limit),
-            hull_ma_type: Some(hull_ma_type.to_string()),
-        };
-        let input = DmaInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            dma_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            dma_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DmaBatchConfig {
-    pub hull_length_range: (usize, usize, usize),
-    pub ema_length_range: (usize, usize, usize),
-    pub ema_gain_limit_range: (usize, usize, usize),
-    pub hull_ma_type: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DmaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<DmaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dma_batch)]
-pub fn dma_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: DmaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-
-    let sweep = DmaBatchRange {
-        hull_length: cfg.hull_length_range,
-        ema_length: cfg.ema_length_range,
-        ema_gain_limit: cfg.ema_gain_limit_range,
-        hull_ma_type: cfg.hull_ma_type,
-    };
-
-    let combos = expand_grid_dma(&sweep);
-    let rows = combos.len();
-    let cols = data.len();
-    if rows == 0 {
-        return Err(JsValue::from_str("no parameter combinations"));
-    }
-
-    let mut buf_mu = make_uninit_matrix(rows, cols);
-    let first = data
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| JsValue::from_str("All NaN"))?;
-    let warm: Vec<usize> = combos
-        .iter()
-        .map(|c| {
-            let h = c.hull_length.unwrap();
-            let e = c.ema_length.unwrap();
-            let sqrt_len = (h as f64).sqrt().round() as usize;
-            first + h.max(e) + sqrt_len - 1
-        })
-        .collect();
-    init_matrix_prefixes(&mut buf_mu, cols, &warm);
-
-    let mut guard = core::mem::ManuallyDrop::new(buf_mu);
-    let out: &mut [f64] =
-        unsafe { core::slice::from_raw_parts_mut(guard.as_mut_ptr() as *mut f64, guard.len()) };
-
-    dma_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let values = unsafe {
-        Vec::from_raw_parts(
-            guard.as_mut_ptr() as *mut f64,
-            guard.len(),
-            guard.capacity(),
-        )
-    };
-    let js = DmaBatchJsOutput {
-        values,
-        combos,
-        rows,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dma_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    hull_start: usize,
-    hull_end: usize,
-    hull_step: usize,
-    ema_start: usize,
-    ema_end: usize,
-    ema_step: usize,
-    gain_start: usize,
-    gain_end: usize,
-    gain_step: usize,
-    hull_ma_type: &str,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to dma_batch_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = DmaBatchRange {
-            hull_length: (hull_start, hull_end, hull_step),
-            ema_length: (ema_start, ema_end, ema_step),
-            ema_gain_limit: (gain_start, gain_end, gain_step),
-            hull_ma_type: hull_ma_type.to_string(),
-        };
-        let combos = expand_grid_dma(&sweep);
-        let rows = combos.len();
-        let cols = len;
-
-        let out_mu = std::slice::from_raw_parts_mut(out_ptr as *mut MaybeUninit<f64>, rows * cols);
-        let first = data
-            .iter()
-            .position(|x| !x.is_nan())
-            .ok_or_else(|| JsValue::from_str("All NaN"))?;
-        let warm: Vec<usize> = combos
-            .iter()
-            .map(|c| {
-                let h = c.hull_length.unwrap();
-                let e = c.ema_length.unwrap();
-                let sqrt_len = (h as f64).sqrt().round() as usize;
-                first + h.max(e) + sqrt_len - 1
-            })
-            .collect();
-        init_matrix_prefixes(out_mu, cols, &warm);
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-        dma_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dma_output_into_js(
-    data: &[f64],
-    hull_length: usize,
-    ema_length: usize,
-    ema_gain_limit: usize,
-    hull_ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = dma_js(data, hull_length, ema_length, ema_gain_limit, hull_ma_type)?;
-    crate::write_wasm_f64_output("dma_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dma_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dma_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("dma_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     fn check_dma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DmaInput::from_candles(&candles, "close", DmaParams::default());
         let result = dma_with_kernel(&input, kernel)?;
@@ -2833,8 +1999,8 @@ mod tests {
 
     fn check_dma_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = DmaParams {
             hull_length: None,
@@ -2851,8 +2017,8 @@ mod tests {
 
     fn check_dma_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DmaInput::with_default_candles(&candles);
         match input.data {
@@ -3038,8 +2204,8 @@ mod tests {
 
     fn check_dma_reinput(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let first = DmaInput::from_candles(&c, "close", DmaParams::default());
         let out1 = dma_with_kernel(&first, kernel)?.values;
@@ -3053,8 +2219,8 @@ mod tests {
 
     fn check_dma_nan_handling(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let p = DmaParams::default();
         let input = DmaInput::from_candles(&c, "close", p.clone());
@@ -3072,8 +2238,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let out = DmaBatchBuilder::new()
             .kernel(kernel)
@@ -3086,8 +2252,8 @@ mod tests {
 
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = DmaBatchBuilder::new()
             .kernel(kernel)
             .hull_length_range(7, 18, 1)
@@ -3103,8 +2269,8 @@ mod tests {
 
     fn check_dma_streaming(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let p = DmaParams::default();
 
         let batch =
@@ -3191,8 +2357,8 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn test_dma_no_poison_values() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = DmaInput::from_candles(&candles, "close", DmaParams::default());
         let output = dma(&input)?;
@@ -3260,7 +2426,7 @@ mod tests {
             hull_ma_type: Some("WMA".to_string()),
         };
 
-        let mut stream = DmaStream::try_new(params)?;
+        let mut stream = DmaStream::try_new(params.clone())?;
         let data = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
 
         let mut results = Vec::new();
@@ -3281,9 +2447,9 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn test_dma_batch_no_poison_values() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = DmaBatchBuilder::new()
             .hull_length_range(3, 8, 1)
             .ema_length_range(5, 10, 1)
@@ -3315,13 +2481,8 @@ mod tests {
         let baseline = dma(&input)?;
 
         let mut out = vec![0.0; data.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             dma_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            dma_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.values.len(), out.len());
@@ -3332,88 +2493,158 @@ mod tests {
         }
         Ok(())
     }
-}
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DmaDeviceArrayF32", unsendable)]
-pub struct DmaDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32>,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DmaDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
+    fn reviewed_routeable_close_v3(rows: usize) -> Vec<f64> {
+        let mut close = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let drift = row as f64 * 0.000_000_7;
+            let wave = match row % 11 {
+                0 => 0.000_041,
+                1 => -0.000_027,
+                2 => 0.000_013,
+                3 => -0.000_036,
+                4 => 0.000_022,
+                5 => -0.000_009,
+                6 => 0.000_033,
+                7 => -0.000_019,
+                8 => 0.000_006,
+                9 => -0.000_031,
+                _ => 0.000_017,
+            };
+            close.push(1.075 + drift + wave);
         }
+        let final_row = rows - 1;
+        close[final_row] = f64::from_bits(close[final_row].to_bits() ^ 1);
+        close
+    }
 
-        let _ = stream;
+    #[test]
+    fn dma_f64_reviewed_route_uses_one_chronological_schedule() -> Result<(), Box<dyn Error>> {
+        let close = reviewed_routeable_close_v3(4_096);
+        let sweep = DmaBatchRange {
+            hull_length: (14, 14, 0),
+            ema_length: (20, 20, 0),
+            ema_gain_limit: (50, 50, 0),
+            hull_ma_type: "WMA".to_string(),
+        };
+        let scalar = dma_batch_with_kernel(&close, &sweep, Kernel::ScalarBatch)?;
+        let auto = dma_batch_with_kernel(&close, &sweep, Kernel::Auto)?;
 
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
+        // Independent exact-rational evaluation of the binary64 fixture and
+        // Dickson/Hull equations rounds row 21 to 0x3ff13340e42dc558.
+        // The frozen chronological RN schedule yields ...55f (6.704 ULP from
+        // that real-valued oracle); the old AVX horizontal reduction yielded
+        // ...560 (7.704 ULP away) and was the RTX fixture's first mismatch.
+        const CHRONOLOGICAL_ROW_21_BITS: u64 = 0x3ff1_3340_e42d_c55f;
+        assert_eq!(scalar.values[21].to_bits(), CHRONOLOGICAL_ROW_21_BITS);
+        assert_eq!(auto.values[21].to_bits(), CHRONOLOGICAL_ROW_21_BITS);
+        assert_eq!(
+            scalar
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            auto.values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
 
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
+    #[test]
+    fn dma_f64_uses_creator_symmetric_gain_domain_and_stream_is_exact() -> Result<(), Box<dyn Error>>
+    {
+        let data = (0..80)
+            .map(|row| {
+                if row < 30 {
+                    row as f64
+                } else {
+                    (60 - row) as f64
+                }
+            })
+            .collect::<Vec<_>>();
+        let params = DmaParams {
+            hull_length: Some(7),
+            ema_length: Some(20),
+            ema_gain_limit: Some(50),
+            hull_ma_type: Some("WMA".to_string()),
+        };
+        let scalar = dma_with_kernel(&DmaInput::from_slice(&data, params.clone()), Kernel::Scalar)?;
 
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
+        // Nathan Dickson's original loop is -gain_limit..=+gain_limit.
+        // On this exact-integer reversal, row 33 selects -5.0. Both an
+        // exhaustive high-precision oracle and the frozen binary64 schedule
+        // round the final DMA value to this bit pattern. The old one-sided
+        // 0..=limit implementation selected 0.0 and returned ...26e8.
+        const CREATOR_SYMMETRIC_ROW_33_BITS: u64 = 0x403b_8ddc_7c4e_0dc3;
+        assert_eq!(scalar.values[33].to_bits(), CREATOR_SYMMETRIC_ROW_33_BITS);
 
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
+        let mut stream = DmaStream::try_new(params.clone())?;
+        let streamed = data
+            .iter()
+            .map(|&value| stream.update(value).unwrap_or(f64::NAN))
+            .collect::<Vec<_>>();
+        assert_eq!(streamed[33].to_bits(), CREATOR_SYMMETRIC_ROW_33_BITS);
+        assert_eq!(
+            scalar
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            streamed
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        // A second, continuous piecewise-linear fixture selects the interior
+        // creator candidate -3.3 at row 21 (not merely the -5.0 clamp). The
+        // exact-rational formula over these binary64 inputs rounds to
+        // 0x4000cfe9b0ef58cd; the canonical binary64 schedule is two ULP above
+        // it. The old one-sided route selected 0.0 and returned ...6376.
+        let interior_negative = (0..80)
+            .map(|row| {
+                if row < 20 {
+                    row as f64 * 0.15
+                } else {
+                    19.0 * 0.15 - (row - 19) as f64 * 0.5
+                }
+            })
+            .collect::<Vec<_>>();
+        let interior_scalar = dma_with_kernel(
+            &DmaInput::from_slice(&interior_negative, params.clone()),
+            Kernel::Scalar,
+        )?;
+        const INTERIOR_NEGATIVE_ROW_21_BITS: u64 = 0x4000_cfe9_b0ef_58cf;
+        assert_eq!(
+            interior_scalar.values[21].to_bits(),
+            INTERIOR_NEGATIVE_ROW_21_BITS
+        );
+
+        // Preserve the creator's `value1 / 10` binary64 construction too;
+        // `-33 * 0.1` is the adjacent, less accurate bit pattern ...6667.
+        assert_eq!(
+            dma_quantized_best_gain_f64(-3.3, 1.0, 50).to_bits(),
+            0xc00a_6666_6666_6666
+        );
+
+        let mut interior_stream = DmaStream::try_new(params)?;
+        let interior_streamed = interior_negative
+            .iter()
+            .map(|&value| interior_stream.update(value).unwrap_or(f64::NAN))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            interior_scalar
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            interior_streamed
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
     }
 }

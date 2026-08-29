@@ -1,26 +1,10 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::moving_averages::ma::{ma, ma_with_kernel, MaData};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::moving_averages::ma::{MaData, ma, ma_with_kernel};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -58,43 +42,7 @@ pub enum VwmacdOutputField {
     Hist,
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[derive(Serialize, Deserialize)]
-pub struct VwmacdJsOutput {
-    #[wasm_bindgen(getter_with_clone)]
-    pub macd: Vec<f64>,
-    #[wasm_bindgen(getter_with_clone)]
-    pub signal: Vec<f64>,
-    #[wasm_bindgen(getter_with_clone)]
-    pub hist: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VwmacdBatchConfig {
-    pub fast_range: (usize, usize, usize),
-    pub slow_range: (usize, usize, usize),
-    pub signal_range: (usize, usize, usize),
-    pub fast_ma_type: Option<String>,
-    pub slow_ma_type: Option<String>,
-    pub signal_ma_type: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VwmacdBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<VwmacdParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VwmacdParams {
     pub fast_period: Option<usize>,
     pub slow_period: Option<usize>,
@@ -565,7 +513,6 @@ pub fn vwmacd_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn vwmacd_into(
     input: &VwmacdInput,
     macd_out: &mut [f64],
@@ -2723,846 +2670,16 @@ fn vwmacd_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = vwmacd_unified)]
-pub fn vwmacd_unified_js(
-    close: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    signal_ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    let params = VwmacdParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        signal_period: Some(signal_period),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-        signal_ma_type: Some(signal_ma_type.to_string()),
-    };
-    let input = VwmacdInput::from_slices(close, volume, params);
-    let (c, v, f, s, g, fmt, smt, sigt, first, macd_warmup_abs, total_warmup_abs, k) =
-        vwmacd_prepare(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut macd = alloc_with_nan_prefix(close.len(), macd_warmup_abs);
-    let mut signal = alloc_with_nan_prefix(close.len(), total_warmup_abs);
-    let mut hist = alloc_with_nan_prefix(close.len(), total_warmup_abs);
-
-    vwmacd_compute_into(
-        c,
-        v,
-        f,
-        s,
-        g,
-        fmt,
-        smt,
-        sigt,
-        first,
-        macd_warmup_abs,
-        total_warmup_abs,
-        k,
-        &mut macd,
-        &mut signal,
-        &mut hist,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let out = VwmacdJsOutput { macd, signal, hist };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwmacd_js(
-    close: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    signal_ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    if close.len() != volume.len() {
-        return Err(JsValue::from_str(
-            "Close and volume arrays must have the same length",
-        ));
-    }
-
-    let params = VwmacdParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        signal_period: Some(signal_period),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-        signal_ma_type: Some(signal_ma_type.to_string()),
-    };
-    let input = VwmacdInput::from_slices(close, volume, params);
-
-    let (
-        close_data,
-        volume_data,
-        fast,
-        slow,
-        signal,
-        fast_ma_type,
-        slow_ma_type,
-        signal_ma_type,
-        first,
-        macd_warmup,
-        total_warmup,
-        kernel_enum,
-    ) = vwmacd_prepare(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut macd = alloc_with_nan_prefix(close.len(), macd_warmup);
-    let mut signal_vec = alloc_with_nan_prefix(close.len(), total_warmup);
-    let mut hist = alloc_with_nan_prefix(close.len(), total_warmup);
-
-    vwmacd_compute_into(
-        close_data,
-        volume_data,
-        fast,
-        slow,
-        signal,
-        fast_ma_type,
-        slow_ma_type,
-        signal_ma_type,
-        first,
-        macd_warmup,
-        total_warmup,
-        kernel_enum,
-        &mut macd,
-        &mut signal_vec,
-        &mut hist,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut result = Vec::with_capacity(close.len() * 3);
-    result.extend_from_slice(&macd);
-    result.extend_from_slice(&signal_vec);
-    result.extend_from_slice(&hist);
-
-    Ok(result)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwmacd_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwmacd_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwmacd_into(
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    macd_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    hist_ptr: *mut f64,
-    len: usize,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    signal_ma_type: &str,
-) -> Result<(), JsValue> {
-    if close_ptr.is_null()
-        || volume_ptr.is_null()
-        || macd_ptr.is_null()
-        || signal_ptr.is_null()
-        || hist_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let macd = std::slice::from_raw_parts_mut(macd_ptr, len);
-        let signal = std::slice::from_raw_parts_mut(signal_ptr, len);
-        let hist = std::slice::from_raw_parts_mut(hist_ptr, len);
-
-        let params = VwmacdParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            signal_period: Some(signal_period),
-            fast_ma_type: Some(fast_ma_type.to_string()),
-            slow_ma_type: Some(slow_ma_type.to_string()),
-            signal_ma_type: Some(signal_ma_type.to_string()),
-        };
-        let input = VwmacdInput::from_slices(close, volume, params);
-
-        let (c, v, f, s, g, fmt, smt, sigt, first, macd_warmup_abs, total_warmup_abs, k) =
-            vwmacd_prepare(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        vwmacd_compute_into(
-            c,
-            v,
-            f,
-            s,
-            g,
-            fmt,
-            smt,
-            sigt,
-            first,
-            macd_warmup_abs,
-            total_warmup_abs,
-            k,
-            macd,
-            signal,
-            hist,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = vwmacd_batch)]
-pub fn vwmacd_batch_unified_js(
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: VwmacdBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = VwmacdBatchRange {
-        fast: cfg.fast_range,
-        slow: cfg.slow_range,
-        signal: cfg.signal_range,
-        fast_ma_type: cfg.fast_ma_type.unwrap_or_else(|| "sma".into()),
-        slow_ma_type: cfg.slow_ma_type.unwrap_or_else(|| "sma".into()),
-        signal_ma_type: cfg.signal_ma_type.unwrap_or_else(|| "ema".into()),
-    };
-
-    let out = vwmacd_batch_inner(close, volume, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(out.macd.len() + out.signal.len() + out.hist.len());
-    values.extend_from_slice(&out.macd);
-    values.extend_from_slice(&out.signal);
-    values.extend_from_slice(&out.hist);
-
-    let js = VwmacdBatchJsOutput {
-        values,
-        combos: out.params,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vwmacd")]
-#[pyo3(signature=(close, volume, fast, slow, signal, fast_ma_type="sma", slow_ma_type="sma", signal_ma_type="ema", kernel=None))]
-pub fn vwmacd_py<'py>(
-    py: Python<'py>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    fast: usize,
-    slow: usize,
-    signal: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    signal_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let close = close.as_slice()?;
-    let volume = volume.as_slice()?;
-    let params = VwmacdParams {
-        fast_period: Some(fast),
-        slow_period: Some(slow),
-        signal_period: Some(signal),
-        fast_ma_type: Some(fast_ma_type.to_string()),
-        slow_ma_type: Some(slow_ma_type.to_string()),
-        signal_ma_type: Some(signal_ma_type.to_string()),
-    };
-    let input = VwmacdInput::from_slices(close, volume, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    let macd_arr = unsafe { PyArray1::<f64>::new(py, [close.len()], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [close.len()], false) };
-    let hist_arr = unsafe { PyArray1::<f64>::new(py, [close.len()], false) };
-
-    let macd_slice = unsafe { macd_arr.as_slice_mut()? };
-    let signal_slice = unsafe { signal_arr.as_slice_mut()? };
-    let hist_slice = unsafe { hist_arr.as_slice_mut()? };
-
-    py.allow_threads(|| vwmacd_into_slice(macd_slice, signal_slice, hist_slice, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((macd_arr, signal_arr, hist_arr))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VwmacdStream")]
-pub struct VwmacdStreamPy {
-    stream: VwmacdStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VwmacdStreamPy {
-    #[new]
-    #[pyo3(signature = (fast_period=None, slow_period=None, signal_period=None, fast_ma_type=None, slow_ma_type=None, signal_ma_type=None))]
-    fn new(
-        fast_period: Option<usize>,
-        slow_period: Option<usize>,
-        signal_period: Option<usize>,
-        fast_ma_type: Option<&str>,
-        slow_ma_type: Option<&str>,
-        signal_ma_type: Option<&str>,
-    ) -> PyResult<Self> {
-        let params = VwmacdParams {
-            fast_period,
-            slow_period,
-            signal_period,
-            fast_ma_type: fast_ma_type.map(|s| s.to_string()),
-            slow_ma_type: slow_ma_type.map(|s| s.to_string()),
-            signal_ma_type: signal_ma_type.map(|s| s.to_string()),
-        };
-
-        let stream =
-            VwmacdStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        Ok(VwmacdStreamPy { stream })
-    }
-
-    fn update(&mut self, close: f64, volume: f64) -> (Option<f64>, Option<f64>, Option<f64>) {
-        match self.stream.update(close, volume) {
-            Some((macd, signal, hist)) => (Some(macd), Some(signal), Some(hist)),
-            None => (None, None, None),
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vwmacd_batch")]
-#[pyo3(signature=(close, volume, fast_range, slow_range, signal_range, fast_ma_type="sma", slow_ma_type="sma", signal_ma_type="ema", kernel=None))]
-pub fn vwmacd_batch_py<'py>(
-    py: Python<'py>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    fast_range: (usize, usize, usize),
-    slow_range: (usize, usize, usize),
-    signal_range: (usize, usize, usize),
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    signal_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let close = close.as_slice()?;
-    let volume = volume.as_slice()?;
-
-    let sweep = VwmacdBatchRange {
-        fast: fast_range,
-        slow: slow_range,
-        signal: signal_range,
-        fast_ma_type: fast_ma_type.to_string(),
-        slow_ma_type: slow_ma_type.to_string(),
-        signal_ma_type: signal_ma_type.to_string(),
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("vwmacd_batch: rows*cols overflow".to_string()))?;
-
-    let macd_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let hist_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let macd_slice = unsafe { macd_arr.as_slice_mut()? };
-    let signal_slice = unsafe { signal_arr.as_slice_mut()? };
-    let hist_slice = unsafe { hist_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let simd = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        vwmacd_batch_inner_into(
-            close,
-            volume,
-            &sweep,
-            simd,
-            true,
-            macd_slice,
-            signal_slice,
-            hist_slice,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let d = PyDict::new(py);
-    d.set_item("macd", macd_arr.reshape((rows, cols))?)?;
-    d.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    d.set_item("hist", hist_arr.reshape((rows, cols))?)?;
-    d.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "signal_periods",
-        combos
-            .iter()
-            .map(|p| p.signal_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "fast_ma_types",
-        combos
-            .iter()
-            .map(|p| p.fast_ma_type.as_deref().unwrap_or("sma"))
-            .collect::<Vec<_>>(),
-    )?;
-    d.set_item(
-        "slow_ma_types",
-        combos
-            .iter()
-            .map(|p| p.slow_ma_type.as_deref().unwrap_or("sma"))
-            .collect::<Vec<_>>(),
-    )?;
-    d.set_item(
-        "signal_ma_types",
-        combos
-            .iter()
-            .map(|p| p.signal_ma_type.as_deref().unwrap_or("ema"))
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::vwmacd_wrapper::CudaVwmacdBatchPlan;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaVwmacd};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::make_device_array_py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::{CopyDestination, DeviceBuffer};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "VwmacdCudaBatchPlan", unsendable)]
-pub struct VwmacdCudaBatchPlanPy {
-    cuda: CudaVwmacd,
-    plan: CudaVwmacdBatchPlan,
-    device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl VwmacdCudaBatchPlanPy {
-    #[getter]
-    fn rows(&self) -> usize {
-        self.plan.rows()
-    }
-
-    #[getter]
-    fn cols(&self) -> usize {
-        self.plan.cols()
-    }
-
-    #[getter]
-    fn device_id(&self) -> u32 {
-        self.device_id
-    }
-
-    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        let params = pyo3::types::PyList::empty(py);
-        for combo in self.plan.params() {
-            let item = PyDict::new(py);
-            item.set_item("fast_period", combo.fast_period.unwrap_or(12))?;
-            item.set_item("slow_period", combo.slow_period.unwrap_or(26))?;
-            item.set_item("signal_period", combo.signal_period.unwrap_or(9))?;
-            item.set_item(
-                "fast_ma_type",
-                combo.fast_ma_type.as_deref().unwrap_or("sma"),
-            )?;
-            item.set_item(
-                "slow_ma_type",
-                combo.slow_ma_type.as_deref().unwrap_or("sma"),
-            )?;
-            item.set_item(
-                "signal_ma_type",
-                combo.signal_ma_type.as_deref().unwrap_or("ema"),
-            )?;
-            params.append(item)?;
-        }
-        dict.set_item("params", params)?;
-        dict.set_item(
-            "fasts",
-            self.plan
-                .params()
-                .iter()
-                .map(|c| c.fast_period.unwrap_or(12) as u64)
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        dict.set_item(
-            "slows",
-            self.plan
-                .params()
-                .iter()
-                .map(|c| c.slow_period.unwrap_or(26) as u64)
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        dict.set_item(
-            "signals",
-            self.plan
-                .params()
-                .iter()
-                .map(|c| c.signal_period.unwrap_or(9) as u64)
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        dict.set_item("rows", self.plan.rows())?;
-        dict.set_item("cols", self.plan.cols())?;
-        Ok(dict)
-    }
-
-    fn execute<'py>(
-        &mut self,
-        py: Python<'py>,
-        close_f32: numpy::PyReadonlyArray1<'py, f32>,
-        volume_f32: numpy::PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let close = close_f32.as_slice()?;
-        let volume = volume_f32.as_slice()?;
-        let rows = self.plan.rows();
-        let cols = self.plan.cols();
-        if close.len() != cols || volume.len() != cols {
-            return Err(PyValueError::new_err(
-                "VWMACD CUDA plan input length mismatch",
-            ));
-        }
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("VWMACD CUDA plan rows*cols overflow"))?;
-        let (macd, signal, hist) =
-            py.allow_threads(|| -> PyResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-                let d_close = DeviceBuffer::from_slice(close)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                let d_volume = DeviceBuffer::from_slice(volume)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                self.cuda
-                    .launch_vwmacd_batch_plan(&d_close, &d_volume, &mut self.plan)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                self.cuda
-                    .synchronize()
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-                let mut macd = vec![0f32; total];
-                let mut signal = vec![0f32; total];
-                let mut hist = vec![0f32; total];
-                let (macd_buf, signal_buf, hist_buf) = self.plan.outputs();
-                macd_buf
-                    .copy_to(&mut macd)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                signal_buf
-                    .copy_to(&mut signal)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                hist_buf
-                    .copy_to(&mut hist)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                Ok((macd, signal, hist))
-            })?;
-
-        let dict = self.metadata(py)?;
-        let macd_arr = macd.into_pyarray(py);
-        let signal_arr = signal.into_pyarray(py);
-        let hist_arr = hist.into_pyarray(py);
-        dict.set_item("macd", macd_arr.reshape((rows, cols))?)?;
-        dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-        dict.set_item("hist", hist_arr.reshape((rows, cols))?)?;
-        Ok(dict)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vwmacd_cuda_batch_plan_create")]
-#[pyo3(signature = (series_len, first_valid, fast_range, slow_range, signal_range, device_id=0))]
-pub fn vwmacd_cuda_batch_plan_create_py(
-    py: Python<'_>,
-    series_len: usize,
-    first_valid: usize,
-    fast_range: (usize, usize, usize),
-    slow_range: (usize, usize, usize),
-    signal_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<VwmacdCudaBatchPlanPy> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sweep = VwmacdBatchRange {
-        fast: fast_range,
-        slow: slow_range,
-        signal: signal_range,
-        fast_ma_type: "sma".to_string(),
-        slow_ma_type: "sma".to_string(),
-        signal_ma_type: "ema".to_string(),
-    };
-    let (cuda, plan, dev_id) = py.allow_threads(|| {
-        let cuda = CudaVwmacd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let plan = cuda
-            .prepare_vwmacd_batch_plan(series_len, first_valid, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = plan.device_id();
-        Ok::<_, PyErr>((cuda, plan, dev_id))
-    })?;
-    Ok(VwmacdCudaBatchPlanPy {
-        cuda,
-        plan,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vwmacd_cuda_batch_dev")]
-#[pyo3(signature = (close_f32, volume_f32, fast_range, slow_range, signal_range, device_id=0))]
-pub fn vwmacd_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    volume_f32: numpy::PyReadonlyArray1<'py, f32>,
-    fast_range: (usize, usize, usize),
-    slow_range: (usize, usize, usize),
-    signal_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let prices = close_f32.as_slice()?;
-    let volumes = volume_f32.as_slice()?;
-    let sweep = VwmacdBatchRange {
-        fast: fast_range,
-        slow: slow_range,
-        signal: signal_range,
-        fast_ma_type: "sma".to_string(),
-        slow_ma_type: "sma".to_string(),
-        signal_ma_type: "ema".to_string(),
-    };
-
-    let ((macd_buf, signal_buf, hist_buf), combos) = py.allow_threads(|| {
-        let cuda = CudaVwmacd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.vwmacd_batch_dev(prices, volumes, &sweep)
-            .map(|(triplet, combos)| ((triplet.macd, triplet.signal, triplet.hist), combos))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = pyo3::types::PyDict::new(py);
-    let macd_dev = make_device_array_py(device_id, macd_buf)?;
-    dict.set_item("macd", Py::new(py, macd_dev)?)?;
-    let signal_dev = make_device_array_py(device_id, signal_buf)?;
-    dict.set_item("signal", Py::new(py, signal_dev)?)?;
-    let hist_dev = make_device_array_py(device_id, hist_buf)?;
-    dict.set_item("hist", Py::new(py, hist_dev)?)?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", prices.len())?;
-    dict.set_item(
-        "fasts",
-        combos
-            .iter()
-            .map(|c| c.fast_period.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slows",
-        combos
-            .iter()
-            .map(|c| c.slow_period.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signals",
-        combos
-            .iter()
-            .map(|c| c.signal_period.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vwmacd_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, volumes_tm_f32, fast, slow, signal, device_id=0))]
-pub fn vwmacd_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    prices_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    volumes_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    fast: usize,
-    slow: usize,
-    signal: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let ps = prices_tm_f32.shape();
-    let vs = volumes_tm_f32.shape();
-    if ps.len() != 2 || vs.len() != 2 || ps != vs {
-        return Err(PyValueError::new_err(
-            "expected two 2D arrays with same shape",
-        ));
-    }
-    let rows = ps[0];
-    let cols = ps[1];
-    let p = prices_tm_f32.as_slice()?;
-    let v = volumes_tm_f32.as_slice()?;
-    let params = VwmacdParams {
-        fast_period: Some(fast),
-        slow_period: Some(slow),
-        signal_period: Some(signal),
-        fast_ma_type: Some("sma".into()),
-        slow_ma_type: Some("sma".into()),
-        signal_ma_type: Some("ema".into()),
-    };
-
-    let (macd_buf, signal_buf, hist_buf) = py.allow_threads(|| {
-        let cuda = CudaVwmacd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.vwmacd_many_series_one_param_time_major_dev(p, v, cols, rows, &params)
-            .map(|triplet| (triplet.macd, triplet.signal, triplet.hist))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = pyo3::types::PyDict::new(py);
-    let macd_dev = make_device_array_py(device_id, macd_buf)?;
-    dict.set_item("macd", Py::new(py, macd_dev)?)?;
-    let signal_dev = make_device_array_py(device_id, signal_buf)?;
-    dict.set_item("signal", Py::new(py, signal_dev)?)?;
-    let hist_dev = make_device_array_py(device_id, hist_buf)?;
-    dict.set_item("hist", Py::new(py, hist_dev)?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("fast", fast)?;
-    dict.set_item("slow", slow)?;
-    dict.set_item("signal_len", signal)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwmacd_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    signal_ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = vwmacd_js(
-        close,
-        volume,
-        fast_period,
-        slow_period,
-        signal_period,
-        fast_ma_type,
-        slow_ma_type,
-        signal_ma_type,
-    )?;
-    crate::write_wasm_f64_output("vwmacd_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwmacd_batch_unified_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vwmacd_batch_unified_js(close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "vwmacd_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vwmacd_unified_output_into_js(
-    close: &[f64],
-    volume: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    fast_ma_type: &str,
-    slow_ma_type: &str,
-    signal_ma_type: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vwmacd_unified_js(
-        close,
-        volume,
-        fast_period,
-        slow_period,
-        signal_period,
-        fast_ma_type,
-        slow_ma_type,
-        signal_ma_type,
-    )?;
-    crate::write_wasm_object_f64_outputs("vwmacd_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_vwmacd_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = VwmacdParams {
             fast_period: None,
             slow_period: None,
@@ -3579,8 +2696,8 @@ mod tests {
 
     fn check_vwmacd_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VwmacdInput::with_default_candles(&candles);
         let result = vwmacd_with_kernel(&input, kernel)?;
 
@@ -3651,8 +2768,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = VwmacdParams {
             fast_period: Some(12),
@@ -3765,8 +2882,8 @@ mod tests {
     fn check_vwmacd_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             VwmacdParams::default(),
@@ -3857,47 +2974,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in MACD at index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in MACD at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in MACD at index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in MACD at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in MACD at index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in MACD at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
             }
 
@@ -3910,47 +3036,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in Signal at index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in Signal at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in Signal at index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in Signal at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in Signal at index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in Signal at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
             }
 
@@ -3963,47 +3098,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in Histogram at index {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) in Histogram at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in Histogram at index {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) in Histogram at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in Histogram at index {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) in Histogram at index {} \
 						 with params: fast={}, slow={}, signal={}, fast_ma={}, slow_ma={}, signal_ma={} (param set {})",
-						test_name, val, bits, i,
-						params.fast_period.unwrap_or(12),
-						params.slow_period.unwrap_or(26),
-						params.signal_period.unwrap_or(9),
-						params.fast_ma_type.as_deref().unwrap_or("sma"),
-						params.slow_ma_type.as_deref().unwrap_or("sma"),
-						params.signal_ma_type.as_deref().unwrap_or("ema"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fast_period.unwrap_or(12),
+                        params.slow_period.unwrap_or(26),
+                        params.signal_period.unwrap_or(9),
+                        params.fast_ma_type.as_deref().unwrap_or("sma"),
+                        params.slow_ma_type.as_deref().unwrap_or("sma"),
+                        params.signal_ma_type.as_deref().unwrap_or("ema"),
+                        param_idx
+                    );
                 }
             }
         }
@@ -4320,8 +3464,8 @@ mod tests {
     fn check_vwmacd_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let fast_period = 12;
         let slow_period = 26;
@@ -4378,9 +3522,9 @@ mod tests {
 
                 if relative_diff > 0.5 && diff > 10.0 {
                     eprintln!(
-						"[{}] Warning: Large VWMACD streaming difference at idx {}: batch={}, stream={}, diff={}",
-						test_name, i, b, s, diff
-					);
+                        "[{}] Warning: Large VWMACD streaming difference at idx {}: batch={}, stream={}, diff={}",
+                        test_name, i, b, s, diff
+                    );
                 }
             }
         }
@@ -4396,9 +3540,9 @@ mod tests {
 
                 if relative_diff > 0.5 && diff > 10.0 {
                     eprintln!(
-						"[{}] Warning: Large signal streaming difference at idx {}: batch={}, stream={}, diff={}",
-						test_name, i, b, s, diff
-					);
+                        "[{}] Warning: Large signal streaming difference at idx {}: batch={}, stream={}, diff={}",
+                        test_name, i, b, s, diff
+                    );
                 }
             }
         }
@@ -4431,8 +3575,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let close = &c.close;
         let volume = &c.volume;
@@ -4503,8 +3647,8 @@ mod tests {
     fn check_batch_grid(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let close = &c.close;
         let volume = &c.volume;
@@ -4533,11 +3677,10 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_vwmacd_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = VwmacdInput::with_default_candles(&candles);
 
         let base = vwmacd(&input)?;
@@ -4586,8 +3729,8 @@ mod tests {
     fn check_batch_param_map(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let close = &c.close;
         let volume = &c.volume;
@@ -4625,8 +3768,8 @@ mod tests {
     fn check_batch_custom_ma_types(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let close = &c.close;
         let volume = &c.volume;
@@ -4678,8 +3821,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let close = &c.close;
         let volume = &c.volume;

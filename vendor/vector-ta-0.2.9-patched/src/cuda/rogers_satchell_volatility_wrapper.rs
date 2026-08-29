@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 //! `rogers_satchell_volatility` on the card.
 //!
@@ -30,7 +30,7 @@
 //! is an `Err` naming the indicator, never a quiet host recomputation.
 
 use crate::cuda::f64_launch::{
-    checked_mul, plan_slots, validate_launch, LaunchPlanError, DEFAULT_HEADROOM,
+    DEFAULT_HEADROOM, LaunchPlanError, checked_mul, plan_slots, validate_launch,
 };
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::rogers_satchell_volatility::{
@@ -263,7 +263,10 @@ impl CudaRogersSatchellVolatility {
                     .checked_mul(f64_size + i32_size)
                     .and_then(|c| b.checked_add(c))
             })
-            .and_then(|b| cols.checked_mul(4 * f32_size).and_then(|c| b.checked_add(c)))
+            .and_then(|b| {
+                cols.checked_mul(4 * f32_size)
+                    .and_then(|c| b.checked_add(c))
+            })
             .ok_or(LaunchPlanError::SizeOverflow {
                 indicator: INDICATOR,
                 what: "fixed bytes",
@@ -347,19 +350,21 @@ impl CudaRogersSatchellVolatility {
                     dst.as_device_ptr(),
                     output_elems as i64
                 ))
-                .map_err(|source| CudaRogersSatchellVolatilityError::LaunchFailed {
-                    kernel: KERNEL_NARROW,
-                    source,
+                .map_err(|source| {
+                    CudaRogersSatchellVolatilityError::LaunchFailed {
+                        kernel: KERNEL_NARROW,
+                        source,
+                    }
                 })?;
             }
         }
 
-        self.stream
-            .synchronize()
-            .map_err(|source| CudaRogersSatchellVolatilityError::LaunchFailed {
+        self.stream.synchronize().map_err(|source| {
+            CudaRogersSatchellVolatilityError::LaunchFailed {
                 kernel: KERNEL_BATCH,
                 source,
-            })?;
+            }
+        })?;
 
         Ok(CudaRogersSatchellBatchResult {
             outputs: DeviceArrayF32Pair {
@@ -466,7 +471,13 @@ impl CudaRogersSatchellVolatility {
                     what: "prefix bytes/slot",
                 })?;
         let fixed_bytes = checked_mul(INDICATOR, "io bytes", total, 6 * f32_size)?;
-        let plan = plan_slots(INDICATOR, cols, fixed_bytes, bytes_per_slot, DEFAULT_HEADROOM)?;
+        let plan = plan_slots(
+            INDICATOR,
+            cols,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )?;
 
         let func = self.module.get_function(KERNEL_MANY).map_err(|_| {
             CudaRogersSatchellVolatilityError::MissingKernelSymbol { name: KERNEL_MANY }
@@ -508,12 +519,12 @@ impl CudaRogersSatchellVolatility {
             })?;
         }
 
-        self.stream
-            .synchronize()
-            .map_err(|source| CudaRogersSatchellVolatilityError::LaunchFailed {
+        self.stream.synchronize().map_err(|source| {
+            CudaRogersSatchellVolatilityError::LaunchFailed {
                 kernel: KERNEL_MANY,
                 source,
-            })?;
+            }
+        })?;
 
         Ok(CudaRogersSatchellManySeriesResult {
             rs: DeviceArrayF32 {

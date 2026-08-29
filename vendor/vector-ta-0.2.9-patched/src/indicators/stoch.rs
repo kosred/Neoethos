@@ -1,25 +1,11 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::{exceptions::PyValueError, prelude::*};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::moving_averages::ma::{ma, MaData};
+use crate::indicators::moving_averages::ma::{MaData, ma};
 use crate::indicators::utility_functions::{max_rolling, min_rolling};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
     init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -49,10 +35,6 @@ pub struct StochOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct StochParams {
     pub fastk_period: Option<usize>,
     pub slowk_period: Option<usize>,
@@ -705,7 +687,6 @@ fn stoch_compute_into(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn stoch_into(
     input: &StochInput,
     out_k: &mut [f64],
@@ -2044,605 +2025,17 @@ impl StochStream {
     }
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "StochDeviceArrayF32", unsendable)]
-pub struct StochDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl StochDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let buf = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let ptr = buf.as_device_ptr().as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "stoch: device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err(
-                            "stoch: requested dl_device does not match buffer device",
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        if let Some(copy_obj) = copy.as_ref() {
-            let do_copy: bool = copy_obj.extract(py)?;
-            if do_copy {
-                return Err(PyValueError::new_err(
-                    "stoch: __dlpack__(copy=True) not supported",
-                ));
-            }
-        }
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "stoch_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, fastk_period=(14,14,0), slowk_period=(3,3,0), slowd_period=(3,3,0), slowk_ma_type="sma", slowd_ma_type="sma", device_id=0))]
-pub fn stoch_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_f32: numpy::PyReadonlyArray1<'_, f32>,
-    fastk_period: (usize, usize, usize),
-    slowk_period: (usize, usize, usize),
-    slowd_period: (usize, usize, usize),
-    slowk_ma_type: &str,
-    slowd_ma_type: &str,
-    device_id: usize,
-) -> PyResult<(StochDeviceArrayF32Py, StochDeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = StochBatchRange {
-        fastk_period,
-        slowk_period,
-        slowk_ma_type: (slowk_ma_type.to_string(), slowk_ma_type.to_string(), 0.0),
-        slowd_period,
-        slowd_ma_type: (slowd_ma_type.to_string(), slowd_ma_type.to_string(), 0.0),
-    };
-    let (k_buf, d_buf, rows, cols, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = crate::cuda::oscillators::CudaStoch::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let batch = cuda
-            .stoch_batch_dev(h, l, c, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        Ok::<_, PyErr>((
-            batch.k.buf,
-            batch.d.buf,
-            batch.k.rows,
-            batch.k.cols,
-            ctx,
-            cuda.device_id(),
-        ))
-    })?;
-    Ok((
-        StochDeviceArrayF32Py {
-            buf: Some(k_buf),
-            rows,
-            cols,
-            _ctx: ctx.clone(),
-            device_id: dev_id,
-        },
-        StochDeviceArrayF32Py {
-            buf: Some(d_buf),
-            rows,
-            cols,
-            _ctx: ctx,
-            device_id: dev_id,
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "stoch_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, fastk_period=14, slowk_period=3, slowd_period=3, slowk_ma_type="sma", slowd_ma_type="sma", device_id=0))]
-pub fn stoch_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    fastk_period: usize,
-    slowk_period: usize,
-    slowd_period: usize,
-    slowk_ma_type: &str,
-    slowd_ma_type: &str,
-    device_id: usize,
-) -> PyResult<(StochDeviceArrayF32Py, StochDeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let params = StochParams {
-        fastk_period: Some(fastk_period),
-        slowk_period: Some(slowk_period),
-        slowk_ma_type: Some(slowk_ma_type.to_string()),
-        slowd_period: Some(slowd_period),
-        slowd_ma_type: Some(slowd_ma_type.to_string()),
-    };
-    let (k_dev, d_dev, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = crate::cuda::oscillators::CudaStoch::new(device_id)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (k, d) = cuda
-            .stoch_many_series_one_param_time_major_dev(h, l, c, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        Ok::<_, PyErr>((k.buf, d.buf, ctx, cuda.device_id()))
-    })?;
-    Ok((
-        StochDeviceArrayF32Py {
-            buf: Some(k_dev),
-            rows,
-            cols,
-            _ctx: ctx.clone(),
-            device_id: dev_id,
-        },
-        StochDeviceArrayF32Py {
-            buf: Some(d_dev),
-            rows,
-            cols,
-            _ctx: ctx,
-            device_id: dev_id,
-        },
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "stoch")]
-#[pyo3(signature = (high, low, close, fastk_period=14, slowk_period=3, slowk_ma_type="sma", slowd_period=3, slowd_ma_type="sma", kernel=None))]
-pub fn stoch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    fastk_period: usize,
-    slowk_period: usize,
-    slowk_ma_type: &str,
-    slowd_period: usize,
-    slowd_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let hi = high.as_slice()?;
-    let lo = low.as_slice()?;
-    let cl = close.as_slice()?;
-    let params = StochParams {
-        fastk_period: Some(fastk_period),
-        slowk_period: Some(slowk_period),
-        slowk_ma_type: Some(slowk_ma_type.to_string()),
-        slowd_period: Some(slowd_period),
-        slowd_ma_type: Some(slowd_ma_type.to_string()),
-    };
-    let kern = validate_kernel(kernel, false)?;
-    let input = StochInput::from_slices(hi, lo, cl, params);
-    let out = py
-        .allow_threads(|| stoch_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((out.k.into_pyarray(py), out.d.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "stoch_batch")]
-#[pyo3(signature = (high, low, close, fastk_range, slowk_range, slowk_ma_type, slowd_range, slowd_ma_type, kernel=None))]
-pub fn stoch_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    fastk_range: (usize, usize, usize),
-    slowk_range: (usize, usize, usize),
-    slowk_ma_type: &str,
-    slowd_range: (usize, usize, usize),
-    slowd_ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let hi = high.as_slice()?;
-    let lo = low.as_slice()?;
-    let cl = close.as_slice()?;
-
-    let sweep = StochBatchRange {
-        fastk_period: fastk_range,
-        slowk_period: slowk_range,
-        slowk_ma_type: (slowk_ma_type.to_string(), slowk_ma_type.to_string(), 0.0),
-        slowd_period: slowd_range,
-        slowd_ma_type: (slowd_ma_type.to_string(), slowd_ma_type.to_string(), 0.0),
-    };
-
-    let kern = validate_kernel(kernel, true)?;
-    let out = py
-        .allow_threads(|| stoch_batch_with_kernel(hi, lo, cl, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("stoch_batch: size overflow in rows*cols"))?;
-
-    let dict = PyDict::new(py);
-
-    let k_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let d_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    unsafe { k_arr.as_slice_mut()? }.copy_from_slice(&out.k);
-    unsafe { d_arr.as_slice_mut()? }.copy_from_slice(&out.d);
-
-    dict.set_item("k", k_arr.reshape((rows, cols))?)?;
-    dict.set_item("d", d_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fastk_periods",
-        out.combos
-            .iter()
-            .map(|p| p.fastk_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slowk_periods",
-        out.combos
-            .iter()
-            .map(|p| p.slowk_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slowk_types",
-        out.combos
-            .iter()
-            .map(|p| p.slowk_ma_type.as_deref().unwrap_or("sma"))
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "slowd_periods",
-        out.combos
-            .iter()
-            .map(|p| p.slowd_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slowd_types",
-        out.combos
-            .iter()
-            .map(|p| p.slowd_ma_type.as_deref().unwrap_or("sma"))
-            .collect::<Vec<_>>(),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "StochStream")]
-pub struct StochStreamPy {
-    stream: StochStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl StochStreamPy {
-    #[new]
-    fn new(
-        fastk_period: usize,
-        slowk_period: usize,
-        slowk_ma_type: &str,
-        slowd_period: usize,
-        slowd_ma_type: &str,
-    ) -> PyResult<Self> {
-        let params = StochParams {
-            fastk_period: Some(fastk_period),
-            slowk_period: Some(slowk_period),
-            slowk_ma_type: Some(slowk_ma_type.to_string()),
-            slowd_period: Some(slowd_period),
-            slowd_ma_type: Some(slowd_ma_type.to_string()),
-        };
-        Ok(Self {
-            stream: StochStream::try_new(params)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct StochResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = stoch)]
-pub fn stoch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fastk_period: usize,
-    slowk_period: usize,
-    slowk_ma_type: &str,
-    slowd_period: usize,
-    slowd_ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    let params = StochParams {
-        fastk_period: Some(fastk_period),
-        slowk_period: Some(slowk_period),
-        slowk_ma_type: Some(slowk_ma_type.to_string()),
-        slowd_period: Some(slowd_period),
-        slowd_ma_type: Some(slowd_ma_type.to_string()),
-    };
-    let input = StochInput::from_slices(high, low, close, params);
-    let out = stoch_with_kernel(&input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut values = out.k;
-    values.extend_from_slice(&out.d);
-    serde_wasm_bindgen::to_value(&StochResult {
-        values,
-        rows: 2,
-        cols: high.len(),
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct StochBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<StochParams>,
-    pub rows_per_combo: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = stoch_batch)]
-pub fn stoch_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fastk_start: usize,
-    fastk_end: usize,
-    fastk_step: usize,
-    slowk_start: usize,
-    slowk_end: usize,
-    slowk_step: usize,
-    slowk_ma_type: &str,
-    slowd_start: usize,
-    slowd_end: usize,
-    slowd_step: usize,
-    slowd_ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    let sweep = StochBatchRange {
-        fastk_period: (fastk_start, fastk_end, fastk_step),
-        slowk_period: (slowk_start, slowk_end, slowk_step),
-        slowk_ma_type: (slowk_ma_type.to_string(), slowk_ma_type.to_string(), 0.0),
-        slowd_period: (slowd_start, slowd_end, slowd_step),
-        slowd_ma_type: (slowd_ma_type.to_string(), slowd_ma_type.to_string(), 0.0),
-    };
-    let out = stoch_batch_inner(high, low, close, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut values = out.k.clone();
-    values.extend_from_slice(&out.d);
-    let js = StochBatchJsOutput {
-        values,
-        combos: out.combos,
-        rows_per_combo: 2,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stoch_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    core::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stoch_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = stoch_into)]
-pub fn stoch_into_js(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    len: usize,
-    fastk_period: usize,
-    slowk_period: usize,
-    slowk_ma_type: &str,
-    slowd_period: usize,
-    slowd_ma_type: &str,
-    out_k_ptr: *mut f64,
-    out_d_ptr: *mut f64,
-) -> Result<(), JsValue> {
-    if [high_ptr, low_ptr, close_ptr, out_k_ptr, out_d_ptr]
-        .iter()
-        .any(|p| p.is_null())
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let hi = core::slice::from_raw_parts(high_ptr, len);
-        let lo = core::slice::from_raw_parts(low_ptr, len);
-        let cl = core::slice::from_raw_parts(close_ptr, len);
-        let mut ok = core::slice::from_raw_parts_mut(out_k_ptr, len);
-        let mut od = core::slice::from_raw_parts_mut(out_d_ptr, len);
-        let params = StochParams {
-            fastk_period: Some(fastk_period),
-            slowk_period: Some(slowk_period),
-            slowk_ma_type: Some(slowk_ma_type.to_string()),
-            slowd_period: Some(slowd_period),
-            slowd_ma_type: Some(slowd_ma_type.to_string()),
-        };
-        let input = StochInput::from_slices(hi, lo, cl, params);
-        stoch_into_slices(&mut ok, &mut od, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stoch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fastk_period: usize,
-    slowk_period: usize,
-    slowk_ma_type: &str,
-    slowd_period: usize,
-    slowd_ma_type: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = stoch_js(
-        high,
-        low,
-        close,
-        fastk_period,
-        slowk_period,
-        slowk_ma_type,
-        slowd_period,
-        slowd_ma_type,
-    )?;
-    crate::write_wasm_object_f64_outputs("stoch_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stoch_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    fastk_start: usize,
-    fastk_end: usize,
-    fastk_step: usize,
-    slowk_start: usize,
-    slowk_end: usize,
-    slowk_step: usize,
-    slowk_ma_type: &str,
-    slowd_start: usize,
-    slowd_end: usize,
-    slowd_step: usize,
-    slowd_ma_type: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = stoch_batch_unified_js(
-        high,
-        low,
-        close,
-        fastk_start,
-        fastk_end,
-        fastk_step,
-        slowk_start,
-        slowk_end,
-        slowk_step,
-        slowk_ma_type,
-        slowd_start,
-        slowd_end,
-        slowd_step,
-        slowd_ma_type,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs("stoch_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     fn check_stoch_partial_params(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = StochParams::default();
         let input = StochInput::from_candles(&candles, default_params);
         let output = stoch_with_kernel(&input, kernel)?;
@@ -2652,8 +2045,8 @@ mod tests {
     }
     fn check_stoch_accuracy(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = StochInput::from_candles(&candles, StochParams::default());
         let result = stoch_with_kernel(&input, kernel)?;
         assert_eq!(result.k.len(), candles.close.len());
@@ -2694,8 +2087,8 @@ mod tests {
     }
     fn check_stoch_default_candles(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = StochInput::with_default_candles(&candles);
         let output = stoch_with_kernel(&input, kernel)?;
         assert_eq!(output.k.len(), candles.close.len());
@@ -2744,8 +2137,8 @@ mod tests {
     fn check_stoch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             StochParams::default(),
@@ -2827,47 +2220,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in K values \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in K values \
 						 with params: fastk_period={}, slowk_period={}, slowd_period={}, \
 						 slowk_ma_type={}, slowd_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(14),
-						params.slowk_period.unwrap_or(3),
-						params.slowd_period.unwrap_or(3),
-						params.slowk_ma_type.as_deref().unwrap_or("sma"),
-						params.slowd_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(14),
+                        params.slowk_period.unwrap_or(3),
+                        params.slowd_period.unwrap_or(3),
+                        params.slowk_ma_type.as_deref().unwrap_or("sma"),
+                        params.slowd_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in K values \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in K values \
 						 with params: fastk_period={}, slowk_period={}, slowd_period={}, \
 						 slowk_ma_type={}, slowd_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(14),
-						params.slowk_period.unwrap_or(3),
-						params.slowd_period.unwrap_or(3),
-						params.slowk_ma_type.as_deref().unwrap_or("sma"),
-						params.slowd_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(14),
+                        params.slowk_period.unwrap_or(3),
+                        params.slowd_period.unwrap_or(3),
+                        params.slowk_ma_type.as_deref().unwrap_or("sma"),
+                        params.slowd_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in K values \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in K values \
 						 with params: fastk_period={}, slowk_period={}, slowd_period={}, \
 						 slowk_ma_type={}, slowd_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(14),
-						params.slowk_period.unwrap_or(3),
-						params.slowd_period.unwrap_or(3),
-						params.slowk_ma_type.as_deref().unwrap_or("sma"),
-						params.slowd_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(14),
+                        params.slowk_period.unwrap_or(3),
+                        params.slowd_period.unwrap_or(3),
+                        params.slowk_ma_type.as_deref().unwrap_or("sma"),
+                        params.slowd_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
             }
 
@@ -2880,47 +2282,56 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in D values \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in D values \
 						 with params: fastk_period={}, slowk_period={}, slowd_period={}, \
 						 slowk_ma_type={}, slowd_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(14),
-						params.slowk_period.unwrap_or(3),
-						params.slowd_period.unwrap_or(3),
-						params.slowk_ma_type.as_deref().unwrap_or("sma"),
-						params.slowd_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(14),
+                        params.slowk_period.unwrap_or(3),
+                        params.slowd_period.unwrap_or(3),
+                        params.slowk_ma_type.as_deref().unwrap_or("sma"),
+                        params.slowd_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in D values \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in D values \
 						 with params: fastk_period={}, slowk_period={}, slowd_period={}, \
 						 slowk_ma_type={}, slowd_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(14),
-						params.slowk_period.unwrap_or(3),
-						params.slowd_period.unwrap_or(3),
-						params.slowk_ma_type.as_deref().unwrap_or("sma"),
-						params.slowd_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(14),
+                        params.slowk_period.unwrap_or(3),
+                        params.slowd_period.unwrap_or(3),
+                        params.slowk_ma_type.as_deref().unwrap_or("sma"),
+                        params.slowd_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in D values \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in D values \
 						 with params: fastk_period={}, slowk_period={}, slowd_period={}, \
 						 slowk_ma_type={}, slowd_ma_type={} (param set {})",
-						test_name, val, bits, i,
-						params.fastk_period.unwrap_or(14),
-						params.slowk_period.unwrap_or(3),
-						params.slowd_period.unwrap_or(3),
-						params.slowk_ma_type.as_deref().unwrap_or("sma"),
-						params.slowd_ma_type.as_deref().unwrap_or("sma"),
-						param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.fastk_period.unwrap_or(14),
+                        params.slowk_period.unwrap_or(3),
+                        params.slowd_period.unwrap_or(3),
+                        params.slowk_ma_type.as_deref().unwrap_or("sma"),
+                        params.slowd_ma_type.as_deref().unwrap_or("sma"),
+                        param_idx
+                    );
                 }
             }
         }
@@ -3299,8 +2710,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = StochBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -3344,8 +2755,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 1, 5, 1, 1, 5, 1),
@@ -3559,8 +2970,8 @@ mod tests {
 
     #[test]
     fn test_stoch_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = StochInput::with_default_candles(&candles);
 
         let baseline = stoch(&input)?;
@@ -3568,13 +2979,8 @@ mod tests {
         let mut out_k = vec![0.0; baseline.k.len()];
         let mut out_d = vec![0.0; baseline.d.len()];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             stoch_into(&input, &mut out_k, &mut out_d)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            stoch_into_slices(&mut out_k, &mut out_d, &input, detect_best_kernel())?;
         }
 
         assert_eq!(out_k.len(), baseline.k.len());
@@ -3600,8 +3006,8 @@ mod tests {
 
     #[test]
     fn test_stoch_compute_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = StochInput::with_default_candles(&candles);
 
         let baseline = stoch(&input)?;

@@ -94,8 +94,8 @@ static __device__ inline void edsrsi_compute_rsi_row(
         double d1 = curr1 - prev1;
         double g1 = d1 > 0.0 ? d1 : 0.0;
         double l1 = d1 < 0.0 ? -d1 : 0.0;
-        avg_gain = avg_gain * beta + inv_period * g1;
-        avg_loss = avg_loss * beta + inv_period * l1;
+        avg_gain = fma(avg_gain, beta, inv_period * g1);
+        avg_loss = fma(avg_loss, beta, inv_period * l1);
         double denom1 = avg_gain + avg_loss;
         out[j] = denom1 == 0.0 ? 50.0 : (100.0 * avg_gain / denom1);
 
@@ -104,8 +104,8 @@ static __device__ inline void edsrsi_compute_rsi_row(
         double d2 = curr2 - prev2;
         double g2 = d2 > 0.0 ? d2 : 0.0;
         double l2 = d2 < 0.0 ? -d2 : 0.0;
-        avg_gain = avg_gain * beta + inv_period * g2;
-        avg_loss = avg_loss * beta + inv_period * l2;
+        avg_gain = fma(avg_gain, beta, inv_period * g2);
+        avg_loss = fma(avg_loss, beta, inv_period * l2);
         double denom2 = avg_gain + avg_loss;
         out[j + 1] = denom2 == 0.0 ? 50.0 : (100.0 * avg_gain / denom2);
 
@@ -118,8 +118,8 @@ static __device__ inline void edsrsi_compute_rsi_row(
         double d = curr - prev_value;
         double g = d > 0.0 ? d : 0.0;
         double l = d < 0.0 ? -d : 0.0;
-        avg_gain = avg_gain * beta + inv_period * g;
-        avg_loss = avg_loss * beta + inv_period * l;
+        avg_gain = fma(avg_gain, beta, inv_period * g);
+        avg_loss = fma(avg_loss, beta, inv_period * l);
         double denom = avg_gain + avg_loss;
         out[j] = denom == 0.0 ? 50.0 : (100.0 * avg_gain / denom);
     }
@@ -198,8 +198,8 @@ extern "C" __global__ void ehlers_data_sampling_relative_strength_indicator_batc
 // (ehlers_data_sampling_relative_strength_indicator_with_kernel).
 //
 // WHICH COLUMN, AND WHY IT IS NAMED HERE. The CPU batch
-// (cpu_batch.rs:8132-8144) accepts ds_rsi / data_sampling_rsi, original_rsi
-// and signal -- it has NO "value" alias and returns UnknownOutput for one. So
+// accepts only ds_rsi / original_rsi / signal -- it has NO "value" alias and
+// returns UnknownOutput for one. So
 // a parity run must ask the CPU for ds_rsi explicitly; this kernel emits that
 // column, which is the RSI of the bar MIDPOINT (open + close) / 2, and never
 // the close-only original.
@@ -214,9 +214,8 @@ extern "C" __global__ void ehlers_data_sampling_relative_strength_indicator_batc
 // additions therefore associate in that order. Reproduced exactly, including
 // the tail.
 //
-// PERIOD-INVARIANT. The CPU batch (cpu_batch.rs:8114-8119) reads length and
-// NEVER period, so five swept periods give five identical CPU columns and this
-// kernel emits five identical rows. The CPU default 14 is pinned below.
+// LENGTH-SWEPT. The canonical registry names `length`; the primary ABI's
+// historical `periods` array carries that exact length for each requested row.
 //
 // INPUT SHAPE: only OPEN and CLOSE are read. The lane row declares
 // F64InputKind::Ohlc4 for the same reason Qstick does -- the resident upload
@@ -235,8 +234,6 @@ extern "C" __global__ void ehlers_data_sampling_relative_strength_indicator_batc
 // exact == 0.0.
 // ---------------------------------------------------------------------------
 
-#define NEO_EDSRSI_LENGTH 14
-
 extern "C" __global__ void ehlers_data_sampling_relative_strength_indicator_neo_batch_f64(
     const double* __restrict__ open,
     const double* __restrict__ high,
@@ -254,7 +251,6 @@ extern "C" __global__ void ehlers_data_sampling_relative_strength_indicator_neo_
     }
     (void)high;
     (void)low;
-    (void)periods;
     (void)first_valid;
 
     double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
@@ -262,7 +258,7 @@ extern "C" __global__ void ehlers_data_sampling_relative_strength_indicator_neo_
         row[i] = NAN;
     }
 
-    const int period = NEO_EDSRSI_LENGTH;
+    const int period = periods[row_idx];
     if (period <= 0 || period > n) {
         return;
     }

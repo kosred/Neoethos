@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
     init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::mem::ManuallyDrop;
@@ -44,10 +28,6 @@ pub struct BullPowerVsBearPowerOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct BullPowerVsBearPowerParams {
     pub period: Option<usize>,
 }
@@ -190,16 +170,16 @@ pub enum BullPowerVsBearPowerError {
     InvalidPeriod { period: usize, data_len: usize },
     #[error("bull_power_vs_bear_power: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("bull_power_vs_bear_power: Inconsistent slice lengths: open={open_len}, high={high_len}, low={low_len}, close={close_len}")]
+    #[error(
+        "bull_power_vs_bear_power: Inconsistent slice lengths: open={open_len}, high={high_len}, low={low_len}, close={close_len}"
+    )]
     InconsistentSliceLengths {
         open_len: usize,
         high_len: usize,
         low_len: usize,
         close_len: usize,
     },
-    #[error(
-        "bull_power_vs_bear_power: Output length mismatch: expected = {expected}, got = {got}"
-    )]
+    #[error("bull_power_vs_bear_power: Output length mismatch: expected = {expected}, got = {got}")]
     OutputLengthMismatch { expected: usize, got: usize },
     #[error("bull_power_vs_bear_power: Invalid range: start={start}, end={end}, step={step}")]
     InvalidRange {
@@ -517,7 +497,6 @@ pub fn bull_power_vs_bear_power_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn bull_power_vs_bear_power_into(
     input: &BullPowerVsBearPowerInput,
@@ -898,376 +877,6 @@ pub fn bull_power_vs_bear_power_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bull_power_vs_bear_power")]
-#[pyo3(signature = (open, high, low, close, period=5, kernel=None))]
-pub fn bull_power_vs_bear_power_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    if open.len() != high.len() || open.len() != low.len() || open.len() != close.len() {
-        return Err(PyValueError::new_err("OHLC slice length mismatch"));
-    }
-
-    let kernel = validate_kernel(kernel, false)?;
-    let input = BullPowerVsBearPowerInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        BullPowerVsBearPowerParams {
-            period: Some(period),
-        },
-    );
-    let output = py
-        .allow_threads(|| bull_power_vs_bear_power_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(output.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "BullPowerVsBearPowerStream")]
-pub struct BullPowerVsBearPowerStreamPy {
-    stream: BullPowerVsBearPowerStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl BullPowerVsBearPowerStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let stream = BullPowerVsBearPowerStream::try_new(BullPowerVsBearPowerParams {
-            period: Some(period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, open: f64, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(open, high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bull_power_vs_bear_power_batch")]
-#[pyo3(signature = (open, high, low, close, period_range, kernel=None))]
-pub fn bull_power_vs_bear_power_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    if open.len() != high.len() || open.len() != low.len() || open.len() != close.len() {
-        return Err(PyValueError::new_err("OHLC slice length mismatch"));
-    }
-
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = BullPowerVsBearPowerBatchRange {
-        period: period_range,
-    };
-    let combos = expand_grid_bull_power_vs_bear_power(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            bull_power_vs_bear_power_batch_inner_into(
-                open,
-                high,
-                low,
-                close,
-                &sweep,
-                batch.to_non_batch(),
-                true,
-                slice_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|combo| combo.period.unwrap_or(5) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_bull_power_vs_bear_power_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(bull_power_vs_bear_power_py, module)?)?;
-    module.add_function(wrap_pyfunction!(bull_power_vs_bear_power_batch_py, module)?)?;
-    module.add_class::<BullPowerVsBearPowerStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "bull_power_vs_bear_power_js")]
-pub fn bull_power_vs_bear_power_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let input = BullPowerVsBearPowerInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        BullPowerVsBearPowerParams {
-            period: Some(period),
-        },
-    );
-    let mut output = vec![0.0; close.len()];
-    bull_power_vs_bear_power_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bull_power_vs_bear_power_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bull_power_vs_bear_power_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bull_power_vs_bear_power_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let input = BullPowerVsBearPowerInput::from_slices(
-            open,
-            high,
-            low,
-            close,
-            BullPowerVsBearPowerParams {
-                period: Some(period),
-            },
-        );
-        if open_ptr == out_ptr || high_ptr == out_ptr || low_ptr == out_ptr || close_ptr == out_ptr
-        {
-            let mut tmp = vec![0.0; len];
-            bull_power_vs_bear_power_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            bull_power_vs_bear_power_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BullPowerVsBearPowerBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BullPowerVsBearPowerBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<BullPowerVsBearPowerParams>,
-    pub periods: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "bull_power_vs_bear_power_batch_js")]
-pub fn bull_power_vs_bear_power_batch_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: BullPowerVsBearPowerBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = BullPowerVsBearPowerBatchRange {
-        period: config.period_range,
-    };
-    let output = bull_power_vs_bear_power_batch_inner(
-        open,
-        high,
-        low,
-        close,
-        &sweep,
-        detect_best_kernel(),
-        false,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&BullPowerVsBearPowerBatchJsOutput {
-        periods: output
-            .combos
-            .iter()
-            .map(|combo| combo.period.unwrap_or(5))
-            .collect(),
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bull_power_vs_bear_power_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = BullPowerVsBearPowerBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-    let combos = expand_grid_bull_power_vs_bear_power(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        bull_power_vs_bear_power_batch_inner_into(
-            open,
-            high,
-            low,
-            close,
-            &sweep,
-            detect_best_kernel(),
-            false,
-            out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bull_power_vs_bear_power_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = bull_power_vs_bear_power_js(open, high, low, close, period)?;
-    crate::write_wasm_f64_output("bull_power_vs_bear_power_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bull_power_vs_bear_power_batch_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = bull_power_vs_bear_power_batch_js(open, high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "bull_power_vs_bear_power_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

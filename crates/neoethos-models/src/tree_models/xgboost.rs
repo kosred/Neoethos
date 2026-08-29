@@ -1,30 +1,32 @@
-// Tree-models XGBoost expert — Phase B5. Scaffolding allow because
-// the runtime-artifact validator (`XGBoostRuntimeArtifact::validate_runtime_artifact`)
-// and the file-name constant `XGBOOST_RUNTIME_FILE_NAME` are part of
-// the disk-layout contract that the ensemble loader pins on,
-// referenced via re-exports from `crate::tree_models::common` rather
-// than the methods directly. Tests below cover the on-disk round
-// trip end-to-end.
-#![allow(dead_code, unused_imports)]
+// Tree-models XGBoost expert. Native-only imports and helpers are gated by the
+// exact `xgboost` feature so standalone feature builds remain warning-clean.
 
+use super::common::build_tree_runtime_predictions;
+#[cfg(feature = "xgboost")]
 use super::common::{
-    TreeLocalFallbackArtifact, XGBOOST_MODEL_FILE_NAME, build_tree_local_fallback_artifact,
-    build_tree_runtime_predictions, calibrate_three_class_probabilities,
-    dataframe_to_row_major_vec, default_training_summary, ensure_feature_columns_match,
-    normalize_three_class_probabilities, predict_tree_local_fallback, read_runtime_metadata,
-    read_tree_json_artifact, remap_labels_to_tree_targets, tree_artifact_paths,
-    tree_runtime_metadata, validate_tree_local_fallback_artifact, write_runtime_metadata,
-    write_tree_json_artifact,
+    XGBOOST_MODEL_FILE_NAME, calibrate_three_class_probabilities, default_training_summary,
+    ensure_feature_columns_match, feature_frame_to_tree_f32_row_major,
+    normalize_three_class_probabilities, read_runtime_metadata, read_tree_json_artifact,
+    remap_labels_to_tree_targets, tree_artifact_paths, tree_runtime_metadata,
+    write_runtime_metadata, write_tree_json_artifact,
 };
 use super::config::*;
 use crate::base::ExpertModel;
-use crate::base::{compute_sample_weights, feature_columns_from_dataframe};
-use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
+#[cfg(feature = "xgboost")]
+use crate::base::{compute_sample_weights, feature_columns_from_frame};
+#[cfg(feature = "xgboost")]
+use crate::common::CudaDevicePolicy;
+#[cfg(feature = "xgboost")]
+use crate::runtime::artifacts::RuntimeArtifactMetadata;
+use crate::runtime::artifacts::TrainingSummaryMetadata;
+#[cfg(feature = "xgboost")]
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
+#[cfg(feature = "xgboost")]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,26 +46,36 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType};
 #[cfg(feature = "xgboost")]
 use xgb::{PredictConfig, PredictType};
 
+#[cfg(feature = "xgboost")]
 const XGBOOST_RUNTIME_FILE_NAME: &str = "xgboost_runtime.json";
-const XGBOOST_LOCAL_RUNTIME_FILE_NAME: &str = "xgboost_local_runtime.json";
 
 /// One-time runtime probe: does the *linked* libxgboost actually support the
-/// CUDA (`gpu_hist`) updater? A present GPU (`gpu_count() > 0`) is NOT enough —
+/// CUDA device? A present GPU (`gpu_count() > 0`) is NOT enough —
 /// the `xgb` crate's bundled libxgboost is built CPU-only by default, so a
-/// `gpu_hist` booster fails at `update()` ("update XGBoost booster at iteration
-/// 0"). That single failure used to sink SIX models at once (xgboost,
+/// CUDA-device booster fails at `update()` ("update XGBoost booster at
+/// iteration 0"). That single failure used to sink SIX models at once (xgboost,
 /// xgboost_dart, meta_stack, meta_blender, probability_calibrator,
 /// conformal_gate) because they all route through this expert. We detect the
-/// capability ONCE by training a tiny GPU booster; on failure every
-/// XGBoost-family model degrades to CPU `hist` (fast at our row counts) instead
-/// of dying. Dropping a CUDA-enabled libxgboost on the box makes the probe pass
-/// and the GPU path lights up automatically — no code change required.
+/// capability ONCE by training a tiny booster with the production XGBoost 2+
+/// spelling (`tree_method=hist`, `device=cuda:N`). Explicit or auto-resolved GPU
+/// training fails loudly when that probe fails; CPU remains valid only when no
+/// card is visible or the operator explicitly selects it.
 #[cfg(feature = "xgboost")]
-fn xgboost_cuda_runtime_available() -> bool {
-    use std::sync::OnceLock;
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        if gpu_count() == 0 {
+fn xgboost_cuda_runtime_available(cuda_ordinal: usize) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static AVAILABLE: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
+    let available = AVAILABLE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = available
+        .lock()
+        .expect("XGBoost CUDA probe cache lock poisoned")
+        .get(&cuda_ordinal)
+        .copied()
+    {
+        return cached;
+    }
+
+    let result = {
+        if nvidia_gpu_count() == 0 {
             return false;
         }
         let probe = || -> Result<()> {
@@ -75,7 +87,7 @@ fn xgboost_cuda_runtime_available() -> bool {
                 .set_labels(&[0.0f32, 1.0, 2.0])
                 .context("xgboost gpu probe: labels")?;
             let tree_params = TreeBoosterParametersBuilder::default()
-                .tree_method(TreeMethod::GpuHist)
+                .tree_method(TreeMethod::Hist)
                 .predictor(Predictor::Gpu)
                 .build()
                 .context("xgboost gpu probe: tree params")?;
@@ -91,6 +103,10 @@ fn xgboost_cuda_runtime_available() -> bool {
                 .context("xgboost gpu probe: booster params")?;
             let mut booster = xgb::Booster::new_with_cached_dmats(&booster_params, &[&dtrain])
                 .context("xgboost gpu probe: create booster")?;
+            let device = format!("cuda:{cuda_ordinal}");
+            booster
+                .set_param("device", &device)
+                .with_context(|| format!("xgboost gpu probe: set device={device}"))?;
             booster
                 .update(&dtrain, 0)
                 .context("xgboost gpu probe: update booster")?;
@@ -100,33 +116,42 @@ fn xgboost_cuda_runtime_available() -> bool {
             Ok(()) => {
                 tracing::info!(
                     target: "neoethos_models::tree_models::xgboost",
-                    "XGBoost CUDA runtime probe succeeded — XGBoost-family models train on GPU (gpu_hist)"
+                    cuda_ordinal,
+                    "XGBoost CUDA runtime probe succeeded"
                 );
                 true
             }
             Err(error) => {
                 tracing::warn!(
                     target: "neoethos_models::tree_models::xgboost",
+                    cuda_ordinal,
                     %error,
-                    "XGBoost CUDA runtime probe failed (linked libxgboost is CPU-only) — \
-                     XGBoost-family models will train on CPU `hist`"
+                    "XGBoost CUDA runtime probe failed"
                 );
                 false
             }
         }
-    })
+    };
+    available
+        .lock()
+        .expect("XGBoost CUDA probe cache lock poisoned")
+        .insert(cuda_ordinal, result);
+    result
 }
 
+#[cfg(feature = "xgboost")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct XGBoostRuntimeArtifact {
     configured_params: HashMap<String, ParamValue>,
     resolved_params: HashMap<String, ParamValue>,
     feature_columns: Vec<String>,
     training_summary: TrainingSummaryMetadata,
+    requested_device_policy: String,
     device_pref: DevicePreference,
     booster_variant: String,
     configured_tree_method: String,
     effective_tree_method: String,
+    effective_device: String,
     objective: String,
     predictor: String,
     num_parallel_tree: u32,
@@ -139,11 +164,8 @@ pub struct XGBoostExpert {
     pub idx: usize,
     pub config: TreeModelConfig,
     gpu_only_disabled: bool,
-    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     pub(crate) feature_columns: Vec<String>,
-    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     training_summary: Option<TrainingSummaryMetadata>,
-    local_fallback: Option<TreeLocalFallbackArtifact>,
     #[cfg(feature = "xgboost")]
     _model: Option<xgb::Booster>,
     #[cfg(not(feature = "xgboost"))]
@@ -153,6 +175,7 @@ pub struct XGBoostExpert {
 impl XGBoostExpert {
     pub fn new(idx: usize, params: Option<HashMap<String, ParamValue>>) -> Self {
         let params = params.unwrap_or_else(Self::default_params);
+        let requested_device_policy = tree_device_policy_from_params(&params, "xgboost");
         let device_pref =
             device_preference_from_params(&params, tree_device_preference_for("xgboost"));
         let gpu_only = gpu_only_from_params(&params, gpu_only_mode_for("xgboost"));
@@ -162,6 +185,7 @@ impl XGBoostExpert {
             config: TreeModelConfig {
                 idx,
                 params,
+                requested_device_policy,
                 device_pref,
                 gpu_only,
                 cpu_threads: Some(cpu_threads),
@@ -169,7 +193,6 @@ impl XGBoostExpert {
             gpu_only_disabled: false,
             feature_columns: Vec::new(),
             training_summary: None,
-            local_fallback: None,
             _model: None,
         }
     }
@@ -215,21 +238,35 @@ impl XGBoostExpert {
     }
 
     #[cfg(feature = "xgboost")]
-    fn effective_tree_method(&self) -> TreeMethod {
-        let gpu_available = xgboost_cuda_runtime_available();
-        match self.config.device_pref {
-            DevicePreference::Gpu if gpu_available => match self.configured_tree_method() {
-                TreeMethod::Auto | TreeMethod::Hist => TreeMethod::GpuHist,
-                TreeMethod::Exact => TreeMethod::GpuExact,
-                other => other,
+    fn effective_tree_method(&self) -> Result<TreeMethod> {
+        match self.resolved_cuda_device()? {
+            crate::common::ResolvedCudaDevicePolicy::Cuda { .. } => {
+                match self.configured_tree_method() {
+                    TreeMethod::GpuHist => Ok(TreeMethod::Hist),
+                    TreeMethod::GpuExact => Ok(TreeMethod::Exact),
+                    other => Ok(other),
+                }
+            }
+            crate::common::ResolvedCudaDevicePolicy::Cpu => match self.configured_tree_method() {
+                TreeMethod::GpuHist => Ok(TreeMethod::Hist),
+                TreeMethod::GpuExact => Ok(TreeMethod::Exact),
+                other => Ok(other),
             },
-            DevicePreference::Auto if gpu_available => match self.configured_tree_method() {
-                TreeMethod::Auto | TreeMethod::Hist => TreeMethod::GpuHist,
-                TreeMethod::Exact => TreeMethod::GpuExact,
-                other => other,
-            },
-            _ => self.configured_tree_method(),
         }
+    }
+
+    #[cfg(feature = "xgboost")]
+    fn resolved_cuda_device(&self) -> Result<crate::common::ResolvedCudaDevicePolicy> {
+        let resolved = self.config.resolved_cuda_device()?;
+        if let crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } = resolved
+            && !xgboost_cuda_runtime_available(ordinal)
+        {
+            bail!(
+                "XGBoost resolved CUDA from policy `{}`, but the linked CUDA runtime probe failed; refusing CPU fallback",
+                self.config.requested_device_policy
+            );
+        }
+        Ok(resolved)
     }
 
     /// `cuda` or `cpu` for XGBoost's `device` parameter.
@@ -241,23 +278,20 @@ impl XGBoostExpert {
     /// it will stop honouring, and the warning is one line in a training log
     /// nobody reads to the end.
     #[cfg(feature = "xgboost")]
-    fn device_param(&self) -> &'static str {
-        let gpu_available = xgboost_cuda_runtime_available();
-        match self.config.device_pref {
-            DevicePreference::Gpu | DevicePreference::Auto if gpu_available => "cuda",
-            _ => "cpu",
+    fn device_param(&self) -> Result<String> {
+        match self.resolved_cuda_device()? {
+            crate::common::ResolvedCudaDevicePolicy::Cpu => Ok("cpu".to_string()),
+            crate::common::ResolvedCudaDevicePolicy::Cuda {
+                ordinal: cuda_ordinal,
+            } => Ok(format!("cuda:{cuda_ordinal}")),
         }
     }
 
     #[cfg(feature = "xgboost")]
-    fn predictor(&self) -> Predictor {
-        let gpu_available = xgboost_cuda_runtime_available();
-        match self.config.device_pref {
-            DevicePreference::Gpu if gpu_available => Predictor::Gpu,
-            DevicePreference::Gpu => Predictor::Cpu,
-            DevicePreference::Cpu => Predictor::Cpu,
-            DevicePreference::Auto if gpu_available => Predictor::Gpu,
-            DevicePreference::Auto => Predictor::Cpu,
+    fn predictor(&self) -> Result<Predictor> {
+        match self.resolved_cuda_device()? {
+            crate::common::ResolvedCudaDevicePolicy::Cuda { .. } => Ok(Predictor::Gpu),
+            crate::common::ResolvedCudaDevicePolicy::Cpu => Ok(Predictor::Cpu),
         }
     }
 
@@ -306,6 +340,7 @@ impl XGBoostExpert {
         }
     }
 
+    #[cfg(feature = "xgboost")]
     fn probability_temperature(&self) -> f64 {
         let configured = param_float(&self.config.params, "probability_temperature", 1.0);
         if configured.is_finite() && configured > 0.0 {
@@ -316,13 +351,14 @@ impl XGBoostExpert {
     }
 
     #[cfg(feature = "xgboost")]
-    fn runtime_params(&self) -> HashMap<String, ParamValue> {
+    fn runtime_params(&self) -> Result<HashMap<String, ParamValue>> {
         let mut params = self.config.params.clone();
         params.insert("variant".into(), ParamValue::String(self.booster_variant()));
         params.insert(
             "tree_method".into(),
-            ParamValue::String(self.effective_tree_method().to_string()),
+            ParamValue::String(self.effective_tree_method()?.to_string()),
         );
+        params.insert("device".into(), ParamValue::String(self.device_param()?));
         params.insert(
             "objective".into(),
             ParamValue::String(param_string(
@@ -333,7 +369,7 @@ impl XGBoostExpert {
         );
         params.insert(
             "predictor".into(),
-            ParamValue::String(self.predictor().to_string()),
+            ParamValue::String(self.predictor()?.to_string()),
         );
         params.insert(
             "num_parallel_tree".into(),
@@ -366,52 +402,29 @@ impl XGBoostExpert {
                 ParamValue::Int(cpu_threads.max(1) as i32),
             );
         }
-        params
+        Ok(params)
     }
 
     #[cfg(feature = "xgboost")]
-    fn runtime_artifact(&self) -> XGBoostRuntimeArtifact {
-        XGBoostRuntimeArtifact {
+    fn runtime_artifact(&self) -> Result<XGBoostRuntimeArtifact> {
+        Ok(XGBoostRuntimeArtifact {
             configured_params: self.config.params.clone(),
-            resolved_params: self.runtime_params(),
+            resolved_params: self.runtime_params()?,
             feature_columns: self.feature_columns.clone(),
             training_summary: self.stored_training_summary(),
+            requested_device_policy: self.config.requested_device_policy.clone(),
             device_pref: self.config.device_pref,
             booster_variant: self.booster_variant(),
             configured_tree_method: self.configured_tree_method().to_string(),
-            effective_tree_method: self.effective_tree_method().to_string(),
+            effective_tree_method: self.effective_tree_method()?.to_string(),
+            effective_device: self.device_param()?,
             objective: param_string(&self.config.params, "objective", "multi:softprob"),
-            predictor: self.predictor().to_string(),
+            predictor: self.predictor()?.to_string(),
             num_parallel_tree: self.tree_num_parallel(),
             probability_temperature: self.probability_temperature(),
             gpu_only: self.config.gpu_only,
             cpu_threads: self.config.cpu_threads,
-        }
-    }
-
-    fn local_runtime_artifact(&self) -> Option<TreeLocalFallbackArtifact> {
-        self.local_fallback.clone()
-    }
-
-    fn persist_local_runtime_artifact(&self, path: &Path) -> Result<()> {
-        if let Some(artifact) = self.local_runtime_artifact() {
-            validate_tree_local_fallback_artifact(&artifact, &self.feature_columns)?;
-            write_tree_json_artifact(
-                &path.join(XGBOOST_LOCAL_RUNTIME_FILE_NAME),
-                &artifact,
-                "XGBoost local fallback artifact",
-            )?;
-        }
-        Ok(())
-    }
-
-    fn read_local_runtime_artifact(path: &Path) -> Result<Option<TreeLocalFallbackArtifact>> {
-        let artifact_path = path.join(XGBOOST_LOCAL_RUNTIME_FILE_NAME);
-        if !artifact_path.exists() {
-            return Ok(None);
-        }
-        let artifact = read_tree_json_artifact(&artifact_path, "XGBoost local fallback artifact")?;
-        Ok(Some(artifact))
+        })
     }
 
     #[cfg(feature = "xgboost")]
@@ -437,8 +450,11 @@ impl XGBoostExpert {
             )
             .context("set XGBoost configured_tree_method attribute")?;
         model
-            .set_attribute("tree_method", &self.effective_tree_method().to_string())
+            .set_attribute("tree_method", &self.effective_tree_method()?.to_string())
             .context("set XGBoost tree_method attribute")?;
+        model
+            .set_attribute("device", &self.device_param()?)
+            .context("set XGBoost device attribute")?;
         model
             .set_attribute(
                 "objective",
@@ -446,7 +462,7 @@ impl XGBoostExpert {
             )
             .context("set XGBoost objective attribute")?;
         model
-            .set_attribute("predictor", &self.predictor().to_string())
+            .set_attribute("predictor", &self.predictor()?.to_string())
             .context("set XGBoost predictor attribute")?;
         model
             .set_attribute("num_parallel_tree", &self.tree_num_parallel().to_string())
@@ -479,9 +495,17 @@ impl XGBoostExpert {
     fn persist_runtime_artifact(&self, path: &Path) -> Result<()> {
         write_tree_json_artifact(
             &path.join(XGBOOST_RUNTIME_FILE_NAME),
-            &self.runtime_artifact(),
+            &self.runtime_artifact()?,
             "XGBoost runtime artifact",
         )
+    }
+
+    #[cfg(feature = "xgboost")]
+    fn apply_runtime_device(&self, model: &mut xgb::Booster) -> Result<()> {
+        let device = self.device_param()?;
+        model
+            .set_param("device", &device)
+            .with_context(|| format!("apply XGBoost runtime device {device}"))
     }
 
     #[cfg(feature = "xgboost")]
@@ -528,6 +552,7 @@ impl XGBoostExpert {
         Ok(())
     }
 
+    #[cfg(feature = "xgboost")]
     fn stored_training_summary(&self) -> TrainingSummaryMetadata {
         self.training_summary
             .clone()
@@ -553,15 +578,13 @@ impl XGBoostExpert {
                 summary.val_rows
             );
         }
-        if self._model.is_none() && self.local_fallback.is_none() {
-            bail!("XGBoost runtime state has neither a native booster nor a local surrogate");
-        }
-        if let Some(fallback) = self.local_fallback.as_ref() {
-            validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+        if self._model.is_none() {
+            bail!("XGBoost runtime state is missing its native booster");
         }
         Ok(())
     }
 
+    #[cfg(feature = "xgboost")]
     fn validate_runtime_artifact(
         artifact: &XGBoostRuntimeArtifact,
         expected_feature_columns: &[String],
@@ -612,6 +635,7 @@ impl XGBoostExpert {
                 "effective_tree_method",
                 artifact.effective_tree_method.as_str(),
             ),
+            ("effective_device", artifact.effective_device.as_str()),
             ("objective", artifact.objective.as_str()),
             ("predictor", artifact.predictor.as_str()),
         ] {
@@ -622,33 +646,82 @@ impl XGBoostExpert {
         if artifact.resolved_params.is_empty() {
             bail!("XGBoost runtime artifact must persist resolved runtime params");
         }
+        let requested_device = parse_tree_cuda_device_policy(&artifact.requested_device_policy)
+            .with_context(|| {
+                format!(
+                    "validate XGBoost requested device policy `{}`",
+                    artifact.requested_device_policy
+                )
+            })?;
+        let effective_cuda_ordinal = if artifact.effective_device == "cpu" {
+            None
+        } else if let Some(raw_ordinal) = artifact.effective_device.strip_prefix("cuda:") {
+            Some(raw_ordinal.parse::<usize>().with_context(|| {
+                format!(
+                    "XGBoost runtime artifact has invalid effective CUDA ordinal `{}`",
+                    artifact.effective_device
+                )
+            })?)
+        } else {
+            bail!(
+                "XGBoost runtime artifact effective_device must be `cpu` or `cuda:<ordinal>`, got {}",
+                artifact.effective_device
+            );
+        };
+        match (requested_device, effective_cuda_ordinal) {
+            (CudaDevicePolicy::Cpu, Some(_)) => {
+                bail!("XGBoost runtime artifact requested CPU but recorded CUDA execution")
+            }
+            (CudaDevicePolicy::Gpu { .. }, None) => {
+                bail!("XGBoost runtime artifact requested explicit CUDA but recorded CPU execution")
+            }
+            (CudaDevicePolicy::Gpu { ordinal: requested }, Some(recorded))
+                if requested != recorded =>
+            {
+                bail!(
+                    "XGBoost runtime artifact CUDA ordinal mismatch: requested {requested}, recorded {recorded}"
+                )
+            }
+            (CudaDevicePolicy::Auto, Some(recorded)) if recorded != 0 => {
+                bail!("XGBoost Auto runtime artifact must record CUDA ordinal 0, got {recorded}")
+            }
+            _ => {}
+        }
+        if artifact.resolved_params.get("device")
+            != Some(&ParamValue::String(artifact.effective_device.clone()))
+        {
+            bail!(
+                "XGBoost runtime artifact resolved device parameter does not match effective_device"
+            );
+        }
+        let expected_predictor = if effective_cuda_ordinal.is_some() {
+            "gpu_predictor"
+        } else {
+            "cpu_predictor"
+        };
+        if artifact.predictor != expected_predictor
+            || artifact.resolved_params.get("predictor")
+                != Some(&ParamValue::String(expected_predictor.to_string()))
+        {
+            bail!(
+                "XGBoost runtime artifact predictor is inconsistent with effective_device: expected {expected_predictor}, got {}",
+                artifact.predictor
+            );
+        }
         Ok(())
     }
 
-    fn build_local_fallback_artifact(
-        &self,
-        x: &DataFrame,
-        y: &Series,
-    ) -> Result<TreeLocalFallbackArtifact> {
-        build_tree_local_fallback_artifact(x, y, self.stored_training_summary())
-    }
-
-    fn local_predict_proba_from_artifact(
-        artifact: &TreeLocalFallbackArtifact,
-        x: &DataFrame,
-    ) -> Result<Array2<f32>> {
-        predict_tree_local_fallback(artifact, x)
-    }
-
-    fn calibrate_probabilities(&self, probabilities: Array2<f32>) -> Result<Array2<f32>> {
+    #[cfg(feature = "xgboost")]
+    fn calibrate_probabilities(&self, probabilities: Array2<f64>) -> Result<Array2<f64>> {
         calibrate_three_class_probabilities(
             probabilities,
-            self.probability_temperature() as f32,
+            self.probability_temperature(),
             "XGBoost",
         )
     }
 
-    fn normalize_probabilities(probabilities: Array2<f32>) -> Result<Array2<f32>> {
+    #[cfg(feature = "xgboost")]
+    fn normalize_probabilities(probabilities: Array2<f64>) -> Result<Array2<f64>> {
         normalize_three_class_probabilities(probabilities, "XGBoost")
     }
 
@@ -659,49 +732,64 @@ impl XGBoostExpert {
     /// external val, runs the full `n_estimators` rounds as before.
     fn fit_internal(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        val_x: Option<&DataFrame>,
-        val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+        lease_width: usize,
     ) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
-            if x.height() == 0 || y.is_empty() {
+            if x.n_samples() == 0 || y.is_empty() {
                 anyhow::bail!("XGBoost requires non-empty training features and labels");
             }
-            if x.height() != y.len() {
+            if x.n_samples() != y.len() {
                 anyhow::bail!(
                     "XGBoost requires matching feature and label rows: {} features vs {} labels",
-                    x.height(),
+                    x.n_samples(),
                     y.len()
                 );
             }
+            self.config.cpu_threads = Some(
+                self.config
+                    .cpu_threads
+                    .unwrap_or(lease_width)
+                    .min(lease_width)
+                    .max(1),
+            );
 
-            if self.config.gpu_only && gpu_count() == 0 {
+            let resolved_cuda_device = self.resolved_cuda_device()?;
+            if self.config.gpu_only
+                && matches!(
+                    resolved_cuda_device,
+                    crate::common::ResolvedCudaDevicePolicy::Cpu
+                )
+            {
                 self.gpu_only_disabled = true;
                 self._model = None;
-                anyhow::bail!("XGBoost gpu-only mode requested but no GPU is available");
-            }
-
-            let effective_tree_method = self.effective_tree_method();
-            if matches!(
-                effective_tree_method,
-                TreeMethod::GpuExact | TreeMethod::GpuHist
-            ) && gpu_count() == 0
-            {
-                self._model = None;
                 anyhow::bail!(
-                    "XGBoost tree_method `{}` requires a GPU, but none is available",
-                    effective_tree_method
+                    "XGBoost gpu-only mode resolved CPU from policy `{}` because no NVIDIA device is visible",
+                    self.config.requested_device_policy
                 );
             }
 
-            let (flat_x, n_rows, _n_cols) = dataframe_to_row_major_vec(x)?;
+            let effective_tree_method = self.effective_tree_method()?;
+
+            let (flat_x, n_rows, _n_cols) = feature_frame_to_tree_f32_row_major(x)?;
             let labels = remap_labels_to_tree_targets(y)?;
-            let sample_weights = compute_sample_weights(y)?;
+            let sample_weights = compute_sample_weights(y)?
+                .into_iter()
+                .map(|weight| {
+                    let narrowed = weight as f32;
+                    if !narrowed.is_finite() || (weight != 0.0 && narrowed == 0.0) {
+                        bail!("XGBoost cannot represent sample weight {weight} as f32");
+                    }
+                    Ok(narrowed)
+                })
+                .collect::<Result<Vec<_>>>()?;
 
             let mut dtrain = xgb::DMatrix::from_dense(&flat_x, n_rows)
-                .context("create XGBoost training matrix from dataframe")?;
+                .context("create XGBoost training matrix from typed feature frame")?;
             dtrain
                 .set_labels(&labels)
                 .context("set XGBoost training labels")?;
@@ -711,24 +799,24 @@ impl XGBoostExpert {
 
             let dval = match (val_x, val_y) {
                 (Some(vx), Some(vy)) => {
-                    if vx.width() != x.width() {
+                    if vx.n_features() != x.n_features() {
                         anyhow::bail!(
                             "XGBoost validation column count mismatch: train {}, val {}",
-                            x.width(),
-                            vx.width()
+                            x.n_features(),
+                            vx.n_features()
                         );
                     }
-                    if vx.height() != vy.len() {
+                    if vx.n_samples() != vy.len() {
                         anyhow::bail!(
                             "XGBoost validation row/label mismatch: {} rows vs {} labels",
-                            vx.height(),
+                            vx.n_samples(),
                             vy.len()
                         );
                     }
-                    let (vflat, v_rows, _vcols) = dataframe_to_row_major_vec(vx)?;
+                    let (vflat, v_rows, _vcols) = feature_frame_to_tree_f32_row_major(vx)?;
                     let vlabels = remap_labels_to_tree_targets(vy)?;
                     let mut dval = xgb::DMatrix::from_dense(&vflat, v_rows)
-                        .context("create XGBoost validation matrix from dataframe")?;
+                        .context("create XGBoost validation matrix from typed feature frame")?;
                     dval.set_labels(&vlabels)
                         .context("set XGBoost validation labels")?;
                     Some(dval)
@@ -757,14 +845,14 @@ impl XGBoostExpert {
                     )
                     .colsample_bynode(self.tree_colsample_bynode())
                     .min_child_weight(
-                        param_float(&self.config.params, "min_child_weight", 1.0) as f32,
+                        param_float(&self.config.params, "min_child_weight", 1.0) as f32
                     )
                     .gamma(param_float(&self.config.params, "gamma", 0.0) as f32)
                     .lambda(param_float(&self.config.params, "reg_lambda", 1.0) as f32)
                     .alpha(param_float(&self.config.params, "reg_alpha", 0.0) as f32)
                     .num_parallel_tree(self.tree_num_parallel())
                     .tree_method(effective_tree_method)
-                    .predictor(self.predictor())
+                    .predictor(self.predictor()?)
                     .build()
                     .context("build XGBoost tree booster parameters")?;
 
@@ -792,17 +880,15 @@ impl XGBoostExpert {
             // run says which device it trained on instead of leaving it to a
             // deprecated alias. Reported at info because "which device" is the
             // question this file exists to answer.
-            let device = self.device_param();
-            model
-                .set_param("device", device)
-                .map_err(|error| anyhow::anyhow!("set XGBoost device={device}: {error}"))?;
+            let device = self.device_param()?;
+            self.apply_runtime_device(&mut model)?;
             tracing::info!(
                 target: "neoethos_models::tree_models::xgboost",
-                device,
+                device = %device,
                 "XGBoost booster device"
             );
             self.apply_variant_params(&mut model)?;
-            self.feature_columns = feature_columns_from_dataframe(x);
+            self.feature_columns = feature_columns_from_frame(x);
             self.set_runtime_attributes(&mut model)?;
 
             let mut best_loss = f32::INFINITY;
@@ -842,112 +928,75 @@ impl XGBoostExpert {
             }
 
             self.training_summary = Some(default_training_summary(x));
-            self.local_fallback = Some(self.build_local_fallback_artifact(x, y)?);
             self.gpu_only_disabled = false;
             self._model = Some(model);
             Ok(())
         }
         #[cfg(not(feature = "xgboost"))]
         {
-            if x.height() == 0 || y.is_empty() {
-                anyhow::bail!("XGBoost requires non-empty training features and labels");
-            }
-            if x.height() != y.len() {
-                anyhow::bail!(
-                    "XGBoost requires matching feature and label rows: {} features vs {} labels",
-                    x.height(),
-                    y.len()
-                );
-            }
-            if val_x.is_some() && val_y.is_some() {
-                tracing::debug!(
-                    "XGBoost compiled without `xgboost` feature; ignoring supplied val frame"
-                );
-            }
-
-            self.feature_columns = feature_columns_from_dataframe(x);
-            self.training_summary = Some(default_training_summary(x));
-            self.local_fallback = Some(self.build_local_fallback_artifact(x, y)?);
-            self.gpu_only_disabled = false;
-            self._model = None;
-            Ok(())
+            let _ = (x, y, val_x, val_y, lease_width);
+            bail!("XGBoost native backend unavailable: compile with the `xgboost` feature")
         }
     }
 }
 
 impl ExpertModel for XGBoostExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        self.fit_internal(x, y, None, None)
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| self.fit_internal(x, y, None, None, lease.width().get()))
     }
 
     fn fit_with_validation(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        val_x: Option<&DataFrame>,
-        val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+        lease: &CpuLease,
     ) -> Result<()> {
-        self.fit_internal(x, y, val_x, val_y)
+        lease.scope(|| self.fit_internal(x, y, val_x, val_y, lease.width().get()))
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        if self.gpu_only_disabled {
-            anyhow::bail!("XGBoost disabled: gpu-only mode requested without an available GPU");
-        }
-        #[cfg(feature = "xgboost")]
-        {
-            if x.height() == 0 {
-                return Ok(Array2::zeros((0, 3)));
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| {
+            if self.gpu_only_disabled {
+                anyhow::bail!("XGBoost disabled: gpu-only mode requested without an available GPU");
             }
-
-            ensure_feature_columns_match(&self.feature_columns, x)?;
-            if self._model.is_none() {
-                if let Some(fallback) = self.local_fallback.as_ref() {
-                    tracing::warn!(
-                        model = "xgboost",
-                        surrogate_kind = %fallback.surrogate_kind,
-                        surrogate_rows = fallback.training_summary.dataset_rows,
-                        "XGBoost native booster unavailable during predict_proba; using local surrogate fallback"
-                    );
-                    let probabilities = Self::local_predict_proba_from_artifact(fallback, x)?;
-                    let probabilities = self.calibrate_probabilities(probabilities)?;
-                    return Self::normalize_probabilities(probabilities);
+            #[cfg(feature = "xgboost")]
+            {
+                if x.n_samples() == 0 {
+                    return Ok(Array2::zeros((0, 3)));
                 }
-                anyhow::bail!("XGBoost not trained");
+
+                ensure_feature_columns_match(&self.feature_columns, x)?;
+                let model = self._model.as_ref().context("XGBoost not trained")?;
+                let (flat_x, n_rows, _) = feature_frame_to_tree_f32_row_major(x)?;
+                let dtest = xgb::DMatrix::from_dense(&flat_x, n_rows)
+                    .context("create XGBoost prediction matrix from typed feature frame")?;
+                let prediction_config = PredictConfig {
+                    _type: PredictType::Normal,
+                    training: false,
+                    iteration_begin: 0,
+                    iteration_end: 0,
+                    strict_shape: true,
+                };
+                let (probabilities, shape) = model
+                    .predict_matrix(&dtest, &prediction_config.as_json())
+                    .context("predict XGBoost class probabilities")?;
+                let cols = match shape.as_slice() {
+                    [rows, cols] if *rows as usize == n_rows => *cols as usize,
+                    [_cols] => probabilities.len().checked_div(n_rows).unwrap_or(0),
+                    _ => probabilities.len().checked_div(n_rows).unwrap_or(0),
+                };
+                let probabilities = reshape_three_class_probabilities(probabilities, n_rows, cols)?;
+                let probabilities = self.calibrate_probabilities(probabilities)?;
+                Self::normalize_probabilities(probabilities)
             }
-            let model = self._model.as_ref().context("XGBoost not trained")?;
-            let (flat_x, n_rows, _) = dataframe_to_row_major_vec(x)?;
-            let dtest = xgb::DMatrix::from_dense(&flat_x, n_rows)
-                .context("create XGBoost prediction matrix from dataframe")?;
-            let prediction_config = PredictConfig {
-                _type: PredictType::Normal,
-                training: false,
-                iteration_begin: 0,
-                iteration_end: 0,
-                strict_shape: true,
-            };
-            let (probabilities, shape) = model
-                .predict_matrix(&dtest, &prediction_config.as_json())
-                .context("predict XGBoost class probabilities")?;
-            let cols = match shape.as_slice() {
-                [rows, cols] if *rows as usize == n_rows => *cols as usize,
-                [_cols] => probabilities.len().checked_div(n_rows).unwrap_or(0),
-                _ => probabilities.len().checked_div(n_rows).unwrap_or(0),
-            };
-            let probabilities = reshape_three_class_probabilities(probabilities, n_rows, cols)?;
-            let probabilities = self.calibrate_probabilities(probabilities)?;
-            Self::normalize_probabilities(probabilities)
-        }
-        #[cfg(not(feature = "xgboost"))]
-        {
-            let fallback = self
-                .local_fallback
-                .as_ref()
-                .context("XGBoost local fallback not trained")?;
-            let probabilities = Self::local_predict_proba_from_artifact(fallback, x)?;
-            let probabilities = self.calibrate_probabilities(probabilities)?;
-            Self::normalize_probabilities(probabilities)
-        }
+            #[cfg(not(feature = "xgboost"))]
+            {
+                let _ = x;
+                bail!("XGBoost native backend unavailable: compile with the `xgboost` feature")
+            }
+        })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -963,35 +1012,23 @@ impl ExpertModel for XGBoostExpert {
             )?;
             let (model_path, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
-            if let Some(model) = self._model.as_ref() {
-                Self::validate_runtime_artifact(
-                    &self.runtime_artifact(),
-                    &self.feature_columns,
-                    &self.stored_training_summary(),
-                )?;
-                model
-                    .save(&model_path)
-                    .with_context(|| format!("save XGBoost artifact {}", model_path.display()))?;
-                self.persist_runtime_artifact(path)?;
-            } else if self.local_fallback.is_none() {
-                bail!("XGBoost not trained");
-            }
-            self.persist_local_runtime_artifact(path)?;
+            let model = self._model.as_ref().context("XGBoost not trained")?;
+            Self::validate_runtime_artifact(
+                &self.runtime_artifact()?,
+                &self.feature_columns,
+                &self.stored_training_summary(),
+            )?;
+            model
+                .save(&model_path)
+                .with_context(|| format!("save XGBoost artifact {}", model_path.display()))?;
+            self.persist_runtime_artifact(path)?;
+            Ok(())
         }
         #[cfg(not(feature = "xgboost"))]
         {
-            std::fs::create_dir_all(path)
-                .with_context(|| format!("create XGBoost artifact directory {}", path.display()))?;
-            let metadata = tree_runtime_metadata(
-                "xgboost",
-                self.feature_columns.clone(),
-                self.stored_training_summary(),
-            )?;
-            let (_, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
-            write_runtime_metadata(&metadata_path, &metadata)?;
-            self.persist_local_runtime_artifact(path)?;
+            let _ = path;
+            bail!("XGBoost native backend unavailable: compile with the `xgboost` feature")
         }
-        Ok(())
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -999,7 +1036,6 @@ impl ExpertModel for XGBoostExpert {
         {
             let (model_path, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
             let runtime_artifact = Self::read_runtime_artifact(path)?;
-            self.local_fallback = Self::read_local_runtime_artifact(path)?;
             let metadata: RuntimeArtifactMetadata = if metadata_path.exists() {
                 let metadata = read_runtime_metadata(&metadata_path)?;
                 if metadata.model_name != "xgboost" || metadata.family != ModelFamily::Tree {
@@ -1014,24 +1050,18 @@ impl ExpertModel for XGBoostExpert {
                 }
                 metadata
             } else {
-                let (feature_columns, training_summary) = if let Some(artifact) =
-                    runtime_artifact.as_ref()
-                {
-                    (
-                        artifact.feature_columns.clone(),
-                        artifact.training_summary.clone(),
-                    )
-                } else if let Some(fallback) = self.local_fallback.as_ref() {
-                    (
-                        fallback.feature_columns.clone(),
-                        fallback.training_summary.clone(),
-                    )
-                } else {
-                    bail!(
-                        "XGBoost metadata sidecar missing and no runtime/local artifact is available at {}",
-                        path.display()
-                    );
-                };
+                let (feature_columns, training_summary) =
+                    if let Some(artifact) = runtime_artifact.as_ref() {
+                        (
+                            artifact.feature_columns.clone(),
+                            artifact.training_summary.clone(),
+                        )
+                    } else {
+                        bail!(
+                            "XGBoost metadata sidecar and runtime artifact are missing at {}",
+                            path.display()
+                        );
+                    };
                 let metadata = tree_runtime_metadata("xgboost", feature_columns, training_summary)?;
                 tracing::warn!(
                     path = %path.display(),
@@ -1043,9 +1073,6 @@ impl ExpertModel for XGBoostExpert {
             let metadata_training_summary = metadata.training_summary.clone();
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
-            if let Some(fallback) = self.local_fallback.as_ref() {
-                validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-            }
             if let Some(artifact) = runtime_artifact {
                 Self::validate_runtime_artifact(
                     &artifact,
@@ -1057,10 +1084,12 @@ impl ExpertModel for XGBoostExpert {
                     resolved_params,
                     feature_columns,
                     training_summary,
+                    requested_device_policy,
                     device_pref,
                     booster_variant,
                     configured_tree_method,
                     effective_tree_method,
+                    effective_device,
                     objective,
                     predictor,
                     num_parallel_tree,
@@ -1086,6 +1115,7 @@ impl ExpertModel for XGBoostExpert {
                     );
                 }
                 self.config.params = configured_params;
+                self.config.requested_device_policy = requested_device_policy;
                 self.config.device_pref = device_pref;
                 self.config.gpu_only = gpu_only;
                 self.config.cpu_threads = cpu_threads;
@@ -1096,141 +1126,59 @@ impl ExpertModel for XGBoostExpert {
                     ParamValue::Float(probability_temperature),
                 );
 
-                let loaded_resolved_params = self.runtime_params();
+                let loaded_resolved_params = self.runtime_params()?;
                 let resolved_variant = self.booster_variant();
-                let resolved_tree_method = self.effective_tree_method().to_string();
+                let resolved_tree_method = self.effective_tree_method()?.to_string();
+                let resolved_device = self.device_param()?;
                 let resolved_objective =
                     param_string(&self.config.params, "objective", "multi:softprob");
-                let resolved_predictor = self.predictor().to_string();
+                let resolved_predictor = self.predictor()?.to_string();
                 let resolved_num_parallel_tree = self.tree_num_parallel();
+                if gpu_only && resolved_device == "cpu" {
+                    bail!(
+                        "XGBoost gpu-only artifact cannot relocate to CPU because no NVIDIA device is visible"
+                    );
+                }
+                let auto_cpu_relocation = matches!(
+                    parse_tree_cuda_device_policy(&self.config.requested_device_policy)?,
+                    CudaDevicePolicy::Auto
+                ) && effective_device.starts_with("cuda:")
+                    && resolved_device == "cpu"
+                    && !gpu_only;
                 if booster_variant != resolved_variant
                     || configured_tree_method != self.configured_tree_method().to_string()
                     || effective_tree_method != resolved_tree_method
+                    || (!auto_cpu_relocation && effective_device != resolved_device)
                     || objective != resolved_objective
-                    || predictor != resolved_predictor
+                    || (!auto_cpu_relocation && predictor != resolved_predictor)
                     || num_parallel_tree != resolved_num_parallel_tree
                     || (probability_temperature - self.probability_temperature()).abs()
                         > f64::EPSILON
                 {
-                    tracing::warn!(
-                        model = "xgboost",
-                        stored_variant = %booster_variant,
-                        loaded_variant = %resolved_variant,
-                        stored_tree_method = %configured_tree_method,
-                        loaded_tree_method = %self.configured_tree_method().to_string(),
-                        stored_effective_tree_method = %effective_tree_method,
-                        loaded_effective_tree_method = %resolved_tree_method,
-                        stored_objective = %objective,
-                        loaded_objective = %resolved_objective,
-                        stored_predictor = %predictor,
-                        loaded_predictor = %resolved_predictor,
-                        stored_num_parallel_tree = num_parallel_tree,
-                        loaded_num_parallel_tree = resolved_num_parallel_tree,
-                        stored_probability_temperature = probability_temperature,
-                        loaded_probability_temperature = self.probability_temperature(),
-                        stored_resolved_params = ?resolved_params,
-                        loaded_resolved_params = ?loaded_resolved_params,
-                        "XGBoost runtime sidecar did not fully match the restored config"
+                    bail!(
+                        "XGBoost runtime sidecar drift after restore: stored variant={booster_variant} resolved={resolved_variant}; stored tree_method={effective_tree_method} resolved={resolved_tree_method}; stored device={effective_device} resolved={resolved_device}; stored objective={objective} resolved={resolved_objective}; stored predictor={predictor} resolved={resolved_predictor}; stored num_parallel_tree={num_parallel_tree} resolved={resolved_num_parallel_tree}; stored probability_temperature={probability_temperature} resolved={}; stored params={resolved_params:?} resolved params={loaded_resolved_params:?}",
+                        self.probability_temperature()
                     );
                 }
             }
-            if model_path.exists() {
-                match xgb::Booster::load(&model_path)
-                    .with_context(|| format!("load XGBoost artifact {}", model_path.display()))
-                {
-                    Ok(model) => {
-                        self._model = Some(model);
-                        if let Some(fallback) = self.local_fallback.as_ref() {
-                            validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-                        }
-                    }
-                    Err(err) => {
-                        self._model = None;
-                        if let Some(fallback) = self.local_fallback.as_ref() {
-                            tracing::warn!(
-                                model = "xgboost",
-                                path = %path.display(),
-                                surrogate_kind = %fallback.surrogate_kind,
-                                surrogate_rows = fallback.training_summary.dataset_rows,
-                                error = %err,
-                                "failed to restore native XGBoost booster; using local surrogate fallback"
-                            );
-                        } else {
-                            return Err(err);
-                        }
-                    }
-                }
-            } else {
-                self._model = None;
-                if let Some(fallback) = self.local_fallback.as_ref() {
-                    tracing::warn!(
-                        model = "xgboost",
-                        path = %path.display(),
-                        surrogate_kind = %fallback.surrogate_kind,
-                        surrogate_rows = fallback.training_summary.dataset_rows,
-                        "XGBoost artifact missing native booster; using local surrogate fallback"
-                    );
-                }
-            }
-            self.gpu_only_disabled = false;
-            if self._model.is_none() && self.local_fallback.is_none() {
+            if !model_path.exists() {
                 bail!(
-                    "XGBoost artifact {} is missing both native model and local fallback payload",
-                    path.display()
+                    "XGBoost native model artifact is missing at {}",
+                    model_path.display()
                 );
             }
+            let mut model = xgb::Booster::load(&model_path)
+                .with_context(|| format!("load XGBoost artifact {}", model_path.display()))?;
+            self.apply_runtime_device(&mut model)?;
+            self._model = Some(model);
+            self.gpu_only_disabled = false;
+            Ok(())
         }
         #[cfg(not(feature = "xgboost"))]
         {
-            let (_, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
-            self.local_fallback = Self::read_local_runtime_artifact(path)?;
-            let metadata = if metadata_path.exists() {
-                let metadata = read_runtime_metadata(&metadata_path)?;
-                if metadata.model_name != "xgboost" || metadata.family != ModelFamily::Tree {
-                    anyhow::bail!(
-                        "XGBoost runtime metadata mismatch: expected tree/xgboost, got {}/{}",
-                        metadata.family,
-                        metadata.model_name
-                    );
-                }
-                if metadata.feature_columns.is_empty() {
-                    anyhow::bail!(
-                        "XGBoost runtime metadata must contain at least one feature column"
-                    );
-                }
-                metadata
-            } else if let Some(fallback) = self.local_fallback.as_ref() {
-                let metadata = tree_runtime_metadata(
-                    "xgboost",
-                    fallback.feature_columns.clone(),
-                    fallback.training_summary.clone(),
-                )?;
-                tracing::warn!(
-                    path = %path.display(),
-                    "XGBoost metadata sidecar missing; reconstructing from local fallback artifact"
-                );
-                metadata
-            } else {
-                anyhow::bail!(
-                    "XGBoost metadata sidecar missing and local fallback artifact missing at {}",
-                    path.display()
-                );
-            };
-            self.feature_columns = metadata.feature_columns;
-            self.training_summary = Some(metadata.training_summary);
-            if let Some(fallback) = self.local_fallback.as_ref() {
-                validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-            }
-            if self.local_fallback.is_none() {
-                anyhow::bail!(
-                    "XGBoost local fallback artifact missing at {}",
-                    path.display()
-                );
-            }
-            self._model = None;
-            self.gpu_only_disabled = false;
+            let _ = path;
+            bail!("XGBoost native backend unavailable: compile with the `xgboost` feature")
         }
-        Ok(())
     }
 }
 
@@ -1243,17 +1191,13 @@ impl XGBoostExpert {
         &self.feature_columns
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
-        build_tree_runtime_predictions(
-            "xgboost",
-            &probabilities,
-            self._model.is_some(),
-            "xgboost_native",
-            self.local_fallback.as_ref(),
-            "native_xgboost_unavailable",
-            "xgboost_unknown",
-        )
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
+        build_tree_runtime_predictions("xgboost", &probabilities, "xgboost_native")
     }
 }
 
@@ -1261,21 +1205,47 @@ impl XGBoostExpert {
 mod tests {
     use super::{ExpertModel, ParamValue, TrainingSummaryMetadata, XGBoostExpert};
     use ndarray::Array2;
-    use polars::df;
-    use polars::prelude::*;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame};
+    use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn sample_three_class_dataset() -> (DataFrame, Series) {
-        let x = df![
-            "momentum" => &[0.96, 0.93, 0.89, 0.07, 0.03, 0.11, -0.94, -0.91, -0.88],
-            "trend" => &[0.87, 0.91, 0.86, 0.01, -0.02, 0.04, -0.9, -0.86, -0.93],
-            "volatility" => &[0.62, 0.58, 0.6, 0.2, 0.18, 0.23, 0.69, 0.66, 0.64],
+    fn sample_three_class_dataset() -> (FeatureFrame, Vec<i32>) {
+        let rows = 9;
+        let columns = [
+            (
+                "momentum",
+                vec![0.96, 0.93, 0.89, 0.07, 0.03, 0.11, -0.94, -0.91, -0.88],
+            ),
+            (
+                "trend",
+                vec![0.87, 0.91, 0.86, 0.01, -0.02, 0.04, -0.9, -0.86, -0.93],
+            ),
+            (
+                "volatility",
+                vec![0.62, 0.58, 0.6, 0.2, 0.18, 0.23, 0.69, 0.66, 0.64],
+            ),
         ]
-        .expect("build training dataframe");
-        let y = Series::new("label".into(), &[1_i32, 1, 1, 0, 0, 0, -1, -1, -1]);
-        (x, y)
+        .into_iter()
+        .map(|(name, values)| {
+            FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+                .expect("valid typed feature column")
+        })
+        .collect::<Vec<_>>();
+        let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+        .expect("build typed training frame");
+        (frame, vec![1_i32, 1, 1, 0, 0, 0, -1, -1, -1])
+    }
+
+    fn single_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one is a valid worker limit");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("single-worker model test lease")
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -1288,12 +1258,12 @@ mod tests {
         path
     }
 
-    fn assert_rows_are_non_uniform(probabilities: &Array2<f32>) {
+    fn assert_rows_are_non_uniform(probabilities: &Array2<f64>) {
         assert_eq!(probabilities.ncols(), 3);
         assert!(
             probabilities.outer_iter().any(|row| {
                 row.iter()
-                    .any(|value| (value - (1.0_f32 / 3.0_f32)).abs() > 0.05_f32)
+                    .any(|value| (value - (1.0_f64 / 3.0_f64)).abs() > 0.05_f64)
             }),
             "expected at least one non-uniform probability row, got {probabilities:?}"
         );
@@ -1307,7 +1277,7 @@ mod tests {
         params.insert("tree_method".into(), ParamValue::String("hist".into()));
 
         let expert = XGBoostExpert::new(11, Some(params));
-        let runtime_params = expert.runtime_params();
+        let runtime_params = expert.runtime_params().expect("resolve CPU runtime params");
 
         assert_eq!(
             runtime_params.get("variant"),
@@ -1337,13 +1307,21 @@ mod tests {
 
     #[test]
     fn xgboost_probability_rows_are_normalized() {
-        let probabilities = Array2::from_shape_vec((2, 3), vec![2.0_f32, 1.0, 1.0, 0.0, 0.0, 0.0])
+        let probabilities = Array2::from_shape_vec((2, 3), vec![0.8_f64, 0.6, 0.6, 0.1, 0.2, 0.1])
             .expect("build probability matrix");
 
         let normalized = XGBoostExpert::normalize_probabilities(probabilities).expect("normalize");
-        for row in normalized.outer_iter() {
-            let sum = row.iter().copied().sum::<f32>();
-            assert!((sum - 1.0).abs() < 1e-6_f32);
+        for (row_index, row) in normalized.outer_iter().enumerate() {
+            let sum = row.iter().copied().sum::<f64>();
+            assert!((sum - 1.0).abs() < 1e-6_f64);
+            let expected = if row_index == 0 {
+                [0.4_f64, 0.3, 0.3]
+            } else {
+                [0.25_f64, 0.5, 0.25]
+            };
+            for (actual, expected) in row.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-12_f64);
+            }
         }
     }
 
@@ -1353,17 +1331,17 @@ mod tests {
         params.insert("probability_temperature".into(), ParamValue::Float(0.5));
 
         let expert = XGBoostExpert::new(11, Some(params));
-        let probabilities = Array2::from_shape_vec((1, 3), vec![0.6_f32, 0.3, 0.1])
+        let probabilities = Array2::from_shape_vec((1, 3), vec![0.6_f64, 0.3, 0.1])
             .expect("build probability matrix");
         let calibrated = expert
             .calibrate_probabilities(probabilities)
             .expect("calibrate");
 
         let row = calibrated.row(0);
-        let sum = row.iter().copied().sum::<f32>();
-        assert!((sum - 1.0).abs() < 1e-6_f32);
+        let sum = row.iter().copied().sum::<f64>();
+        assert!((sum - 1.0).abs() < 1e-6_f64);
         assert!(
-            row[0] > 0.6_f32,
+            row[0] > 0.6_f64,
             "expected lower temperature to sharpen the dominant class, got {row:?}"
         );
     }
@@ -1378,10 +1356,12 @@ mod tests {
             )]),
             feature_columns: vec!["momentum".to_string()],
             training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            requested_device_policy: "cpu".to_string(),
             device_pref: super::DevicePreference::Cpu,
             booster_variant: "gbtree".to_string(),
             configured_tree_method: "hist".to_string(),
             effective_tree_method: "hist".to_string(),
+            effective_device: "cpu".to_string(),
             objective: "multi:softprob".to_string(),
             predictor: "cpu_predictor".to_string(),
             num_parallel_tree: 1,
@@ -1403,20 +1383,6 @@ mod tests {
     fn xgboost_save_rejects_missing_training_summary() {
         let mut expert = XGBoostExpert::new(11, None);
         expert.feature_columns = vec!["momentum".to_string()];
-        expert.local_fallback = Some(super::TreeLocalFallbackArtifact {
-            surrogate_kind: "gaussian_centroid_surrogate".to_string(),
-            feature_columns: vec!["momentum".to_string()],
-            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
-            class_priors: vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
-            class_support: vec![1.0, 1.0, 1.0],
-            feature_means: vec![0.0],
-            feature_scales: vec![1.0],
-            feature_salience: vec![1.0],
-            class_centroids: vec![vec![0.1], vec![0.2], vec![0.3]],
-            class_variances: vec![vec![1.0], vec![1.0], vec![1.0]],
-            distance_location: vec![0.0, 0.0, 0.0],
-            distance_scale: vec![1.0, 1.0, 1.0],
-        });
         let artifact_dir = unique_temp_dir("xgboost-missing-summary");
 
         let err = expert
@@ -1431,19 +1397,22 @@ mod tests {
     fn xgboost_trains_three_class_probabilities_and_persists_artifacts() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("xgboost-artifact");
+        let lease = single_worker_lease();
 
         let mut expert = XGBoostExpert::new(11, None);
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
 
-        let probabilities = expert.predict_proba(&x).expect("predict should succeed");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
+        let probabilities = expert
+            .predict_proba(&x, &lease)
+            .expect("predict should succeed");
+        assert_eq!(probabilities.dim(), (x.n_samples(), 3));
         assert_rows_are_non_uniform(&probabilities);
 
         expert.save(&artifact_dir).expect("save should succeed");
         assert!(
-            artifact_dir.join("model.bin").exists(),
+            artifact_dir.join("model.ubj").exists(),
             "expected XGBoost model artifact at {}",
-            artifact_dir.join("model.bin").display()
+            artifact_dir.join("model.ubj").display()
         );
         assert!(
             artifact_dir.join("metadata.json").exists(),
@@ -1454,12 +1423,12 @@ mod tests {
         let mut loaded = XGBoostExpert::new(11, None);
         loaded.load(&artifact_dir).expect("load should succeed");
         let reloaded = loaded
-            .predict_proba(&x)
+            .predict_proba(&x, &lease)
             .expect("reloaded predict should succeed");
 
         for (lhs, rhs) in probabilities.iter().zip(reloaded.iter()) {
             assert!(
-                (lhs - rhs).abs() < 1e-3_f32,
+                (lhs - rhs).abs() < 1e-3_f64,
                 "expected persisted probabilities to round-trip, left={lhs}, right={rhs}"
             );
         }
@@ -1469,9 +1438,10 @@ mod tests {
     fn xgboost_load_uses_runtime_artifacts_when_metadata_sidecar_missing() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("xgboost-missing-metadata-sidecar");
+        let lease = single_worker_lease();
 
         let mut expert = XGBoostExpert::new(11, None);
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
         expert.save(&artifact_dir).expect("save should succeed");
         std::fs::remove_file(artifact_dir.join("metadata.json"))
             .expect("remove metadata sidecar to trigger reconstruction");
@@ -1480,7 +1450,9 @@ mod tests {
         loaded
             .load(&artifact_dir)
             .expect("load should reconstruct metadata from persisted runtime artifacts");
-        let probabilities = loaded.predict_proba(&x).expect("prediction should succeed");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
+        let probabilities = loaded
+            .predict_proba(&x, &lease)
+            .expect("prediction should succeed");
+        assert_eq!(probabilities.dim(), (x.n_samples(), 3));
     }
 }

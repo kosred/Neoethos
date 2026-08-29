@@ -483,10 +483,7 @@ fn write_backup(path: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let backup = path.with_extension(format!(
-        "yaml.bak.{}",
-        stamp
-    ));
+    let backup = path.with_extension(format!("yaml.bak.{}", stamp));
     std::fs::copy(path, &backup)?;
     Ok(Some(backup))
 }

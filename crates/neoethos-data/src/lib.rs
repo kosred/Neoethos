@@ -1,29 +1,25 @@
 use anyhow::{Context, Result, bail};
-use ndarray::Array2;
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use vortex_array::IntoArray;
 use vortex_array::ToCanonical;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::dtype::NativePType;
+use vortex_array::dtype::{DType, NativePType, PType};
 
 // ─── Data-layer runtime overrides (config-consolidation S3-data) ───────────
-// Config-driven replacement for the `NEOETHOS_BOT_NORMALIZE_FEATURES` /
-// `NEOETHOS_BOT_REBUILD_STALE_HIGHER_TFS` env vars. The binary installs these
-// from `Settings.models.data_runtime` once at startup (as plain bools, so this
-// foundation crate keeps NOT depending on neoethos-core); the feature builder
-// + resampler read the cached values instead of `std::env`.
+// Config-driven replacement for `NEOETHOS_BOT_NORMALIZE_FEATURES`. The binary
+// installs it from `Settings.models.data_runtime` once at startup (as a plain
+// bool, so this foundation crate keeps NOT depending on neoethos-core).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataRuntimeOverrides {
     pub normalize_features: bool,
-    pub rebuild_stale_higher_tfs: bool,
 }
 
 impl Default for DataRuntimeOverrides {
     fn default() -> Self {
         Self {
             normalize_features: false,
-            rebuild_stale_higher_tfs: false,
         }
     }
 }
@@ -34,17 +30,44 @@ static DATA_RUNTIME_OVERRIDES: std::sync::OnceLock<DataRuntimeOverrides> =
 /// Install process-wide data-layer runtime overrides from config. The
 /// binaries call this once at startup with `settings.models.data_runtime.*`.
 /// Idempotent — the first install wins.
-pub fn install_data_runtime_overrides(normalize_features: bool, rebuild_stale_higher_tfs: bool) {
-    let _ = DATA_RUNTIME_OVERRIDES.set(DataRuntimeOverrides {
-        normalize_features,
-        rebuild_stale_higher_tfs,
-    });
+pub fn install_data_runtime_overrides(normalize_features: bool) {
+    let _ = DATA_RUNTIME_OVERRIDES.set(DataRuntimeOverrides { normalize_features });
 }
 
-/// Current data-layer runtime overrides, or the deterministic defaults (both
-/// OFF — matching the legacy env-unset behavior) when no install has happened.
+/// Current data-layer runtime override, or the deterministic OFF default when
+/// no install has happened.
 pub fn current_data_runtime_overrides() -> DataRuntimeOverrides {
     DATA_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
+}
+
+/// Opaque proof that the process-wide normalization mode came from the
+/// startup-installed Data configuration. Resident GPU planning deliberately
+/// refuses the legacy implicit default: a native workspace must be bound to
+/// the configuration that was actually admitted for this process.
+#[cfg(feature = "gpu-cuda")]
+#[derive(Debug)]
+pub(crate) struct SealedDataRuntimeNormalizationModeV2 {
+    enabled: bool,
+}
+
+#[cfg(feature = "gpu-cuda")]
+impl SealedDataRuntimeNormalizationModeV2 {
+    pub(crate) const fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn sealed_data_runtime_normalization_mode_v2()
+-> Result<SealedDataRuntimeNormalizationModeV2> {
+    let overrides = DATA_RUNTIME_OVERRIDES.get().ok_or_else(|| {
+        anyhow::anyhow!(
+            "resident normalization requires the startup-installed Data runtime configuration"
+        )
+    })?;
+    Ok(SealedDataRuntimeNormalizationModeV2 {
+        enabled: overrides.normalize_features,
+    })
 }
 
 // ─── Feature-cube assembly policy (2026-08-10, env→config wave 2) ──────────
@@ -84,37 +107,69 @@ mod data_runtime_overrides_tests {
 
     #[test]
     fn data_runtime_overrides_default_is_off() {
-        // Behavior-preservation: env-unset defaulted both knobs OFF.
+        // Behavior-preservation: env-unset normalization defaulted OFF.
         let d = DataRuntimeOverrides::default();
         assert!(!d.normalize_features);
-        assert!(!d.rebuild_stale_higher_tfs);
     }
 }
 
 pub mod core;
 pub mod test_fixtures;
+pub use crate::core::{initialize_source_seal_before_runtime, source_seal_slot_limit};
 // Re-export the canonical timeframe list so callers using neoethos-data
 // can grab it without pulling in neoethos-core directly.
+pub use crate::core::canonical_ohlcv::{
+    CanonicalDatasetArtifactV1, CanonicalOhlcvFrame, load_canonical_timeframe,
+    load_exact_canonical_timeframe,
+};
+pub use crate::core::canonical_ohlcv_stream::{
+    CanonicalOhlcvChunk, CanonicalOhlcvReverseSpool, CanonicalOhlcvReverseSpoolIter,
+    CanonicalOhlcvStreamPublishRequest, CanonicalVolumeChunk, publish_canonical_ohlcv_stream,
+};
+pub use crate::core::dataset_manifest::{
+    CanonicalDatasetSeriesReceiptV1, ExactDatasetGenerationConflict, SelectedDatasetGenerationV1,
+    open_exact_dataset_generation,
+};
+pub use crate::core::direct_timeframes::*;
 pub use crate::core::discover::{
-    DataFileEntry, DataFormat, DatasetDiscovery, MAX_FILE_SIZE_BYTES, MAX_WALK_DEPTH, SkipReason,
-    SkippedFile,
+    DataFileEntry, DataFormat, DataVerificationStatus, DatasetDiscovery, MAX_FILE_SIZE_BYTES,
+    MAX_WALK_DEPTH, SkipReason, SkippedFile,
 };
 pub use crate::core::feature_registry::*;
 pub use crate::core::features::*;
+pub use crate::core::footprint_features::*;
+#[cfg(feature = "gpu-cuda")]
+pub use crate::core::gpu_only_feature_workspace_preflight_v3::{
+    CURRENT_PENDING_FEATURE_WORKSPACE_RECEIPTS_V3, CURRENT_PENDING_RESIDENT_PRODUCERS_V3,
+    GpuOnlyFeatureWorkspaceReceiptBacklogV3, PreparedGpuOnlyFeatureWorkspacePreflightV3,
+    preflight_gpu_only_feature_workspace_v3,
+};
+#[cfg(feature = "gpu-cuda")]
+pub use crate::core::gpu_resident_feature_store_v3::{
+    GpuOnlyFeatureMaterializationAdmissionV3, GpuOnlyFeatureMaterializationErrorV3,
+    SealedGpuResidentFeatureStoreV3, materialize_gpu_only_feature_store_v3,
+};
 pub use crate::core::hpc_ta::*;
+pub use crate::core::import_discover::{
+    ImportDiscovery, ImportSkipReason, ImportSourceEntry, MAX_IMPORT_SOURCE_BYTES,
+    MAX_IMPORT_WALK_DEPTH, SkippedImportSource,
+};
 pub use crate::core::indicators::*;
-pub use crate::core::loader::*;
-pub use crate::core::parquet_migration::*;
+pub use crate::core::pinned_canonical_series_v1::{
+    PinnedCanonicalSeriesV1, pin_exact_canonical_series_v1,
+};
 pub use crate::core::quant_features::*;
 pub use crate::core::regime_detection::*;
-pub use crate::core::footprint_features::*;
-pub use crate::core::resample::*;
 pub use crate::core::session_features::*;
 pub use crate::core::slicing::{slice_ohlcv, slice_ohlcv_by_date_range_ms};
 pub use crate::core::smc::*;
 pub use crate::core::timestamps::*;
 pub use crate::core::vortex_io::*;
-pub use neoethos_core::{CANONICAL_TIMEFRAMES, is_canonical_timeframe};
+pub use neoethos_core::is_canonical_timeframe;
+pub use neoethos_dataset_contracts::{
+    BarTimestampConvention, CANONICAL_TIMEFRAMES, CTraderEnvironment, CanonicalDatasetIdentity,
+    CanonicalDatasetScope, CanonicalTimeframe,
+};
 
 #[derive(Debug, Clone)]
 pub struct Ohlcv {
@@ -124,6 +179,99 @@ pub struct Ohlcv {
     pub low: Vec<f64>,
     pub close: Vec<f64>,
     pub volume: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CanonicalVolumeRef<'a> {
+    Absent,
+    Float64(&'a [f64]),
+    UInt64(&'a [u64]),
+    Int64(&'a [i64]),
+}
+
+pub struct CanonicalOhlcvPublishRequest<'a> {
+    pub configured_root: &'a Path,
+    pub identity: &'a CanonicalDatasetIdentity,
+    pub expected_generation: Option<&'a str>,
+    pub provenance: &'a crate::core::dataset_manifest::ProducerProvenanceEnvelopeV1,
+    pub ohlcv: &'a Ohlcv,
+    pub volume: CanonicalVolumeRef<'a>,
+    pub rows_per_chunk: usize,
+}
+
+/// Publish validated OHLCV values into the one canonical immutable-generation
+/// protocol while retaining the physical broker/source volume type.
+pub fn publish_canonical_ohlcv_generation(
+    request: CanonicalOhlcvPublishRequest<'_>,
+) -> Result<crate::core::dataset_manifest::PublishResult> {
+    if request.rows_per_chunk == 0 {
+        bail!("Vortex rows_per_chunk must be greater than zero");
+    }
+    let normalized = normalize_ohlcv(request.ohlcv)?;
+    if normalized.is_empty() {
+        bail!("cannot publish an empty canonical OHLCV generation");
+    }
+    let timestamps = normalized
+        .timestamp
+        .as_deref()
+        .context("canonical OHLCV has no timestamp_ms")?;
+    let timestamp_range = crate::core::dataset_manifest::DatasetTimestampRange::new(
+        timestamps[0],
+        timestamps[timestamps.len() - 1],
+    )?;
+    let row_count = normalized.len();
+    let rows_per_chunk = request.rows_per_chunk;
+    let volume = request.volume;
+
+    crate::core::dataset_manifest::publish_vortex_generation_streaming(
+        crate::core::dataset_manifest::PublishMetadataRequest {
+            configured_root: request.configured_root,
+            identity: request.identity,
+            expected_generation: request.expected_generation,
+            provenance: request.provenance,
+        },
+        move |candidate_path| {
+            let chunks = (0..row_count).step_by(rows_per_chunk).map(|start| {
+                let end = (start + rows_per_chunk).min(row_count);
+                let chunk_volume_values = match volume {
+                    CanonicalVolumeRef::Float64(values) => Some(values[start..end].to_vec()),
+                    CanonicalVolumeRef::Absent
+                    | CanonicalVolumeRef::UInt64(_)
+                    | CanonicalVolumeRef::Int64(_) => None,
+                };
+                let chunk = Ohlcv {
+                    timestamp: Some(timestamps[start..end].to_vec()),
+                    open: normalized.open[start..end].to_vec(),
+                    high: normalized.high[start..end].to_vec(),
+                    low: normalized.low[start..end].to_vec(),
+                    close: normalized.close[start..end].to_vec(),
+                    volume: chunk_volume_values,
+                };
+                let chunk_volume = match volume {
+                    CanonicalVolumeRef::Absent => CanonicalVolumeRef::Absent,
+                    CanonicalVolumeRef::Float64(_) => CanonicalVolumeRef::Float64(
+                        chunk
+                            .volume
+                            .as_deref()
+                            .expect("Float64 volume chunk was constructed"),
+                    ),
+                    CanonicalVolumeRef::UInt64(values) => {
+                        CanonicalVolumeRef::UInt64(&values[start..end])
+                    }
+                    CanonicalVolumeRef::Int64(values) => {
+                        CanonicalVolumeRef::Int64(&values[start..end])
+                    }
+                };
+                ohlcv_to_vortex_array_with_canonical_volume(&chunk, chunk_volume)
+            });
+            let write_stats =
+                crate::core::vortex_io::write_vortex_chunks_fallible(candidate_path, chunks)?;
+            Ok(crate::core::dataset_manifest::CandidateWriteOutcome {
+                write_stats,
+                timestamp_range,
+            })
+        },
+    )
 }
 
 impl Ohlcv {
@@ -139,11 +287,30 @@ impl Ohlcv {
 pub struct SymbolDataset {
     pub symbol: String,
     pub frames: HashMap<String, Ohlcv>,
+    /// Exact immutable source artifact for each materialized timeframe.
+    /// Derived/live frames need their own typed origin and may not fabricate an
+    /// entry here; feature construction fails closed when one is absent.
+    pub source_artifacts: HashMap<String, CanonicalDatasetArtifactV1>,
 }
 
 impl SymbolDataset {
     pub fn timeframe(&self, tf: &str) -> Option<&Ohlcv> {
         self.frames.get(tf)
+    }
+
+    pub fn canonical_frame(&self, tf: &str) -> Result<CanonicalOhlcvFrame> {
+        let ohlcv = self
+            .frames
+            .get(tf)
+            .with_context(|| format!("dataset {} has no timeframe {tf}", self.symbol))?
+            .clone();
+        let artifact = self.source_artifacts.get(tf).cloned().with_context(|| {
+            format!(
+                "dataset {} timeframe {tf} has no verified immutable source artifact",
+                self.symbol
+            )
+        })?;
+        CanonicalOhlcvFrame::from_parts(ohlcv, artifact)
     }
     pub fn timeframes(&self) -> Vec<String> {
         let mut out: Vec<String> = self.frames.keys().cloned().collect();
@@ -153,268 +320,22 @@ impl SymbolDataset {
 }
 
 pub fn discover_symbols(root: impl AsRef<Path>) -> Result<Vec<String>> {
-    let mut symbols = HashSet::new();
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("symbol=") {
-            symbols.insert(name.replace("symbol=", "").to_uppercase());
-        }
-    }
-    let mut out: Vec<String> = symbols.into_iter().collect();
-    out.sort();
-    Ok(out)
-}
-
-/// Dedupe state for `discover_timeframes` warnings — fires the
-/// "non-canonical timeframe folder" warning AT MOST ONCE per
-/// `(symbol, timeframe)` per process lifetime.
-///
-/// Pre-fix: the warning ran inside the per-render scan loop, so a UI
-/// frame rate of 60 Hz × 10 stale folders × N symbols produced
-/// hundreds of identical log lines per second and drowned every other
-/// trace. The dedupe set survives until the process exits — restart
-/// the app to see the warning again (which is also what you'd want
-/// since after a restart the stale folders may have been cleaned up).
-static DISCOVER_TIMEFRAMES_WARNED: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
-> = std::sync::OnceLock::new();
-
-fn warned_once_for(symbol: &str, tf: &str) -> bool {
-    let lock = DISCOVER_TIMEFRAMES_WARNED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
-    let mut set = match lock.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    !set.insert((symbol.to_string(), tf.to_string()))
-}
-
-/// Cache TTL for `discover_timeframes`. Task #79 — the function was being
-/// called once per render frame (60 Hz) from `market_chart_snapshot`, which
-/// translated into 60 `read_dir` syscalls/sec per active symbol panel. Two
-/// seconds is short enough that a new bootstrap shows up almost immediately
-/// in the timeframe dropdown but long enough to fully eliminate the per-
-/// frame syscall load (60 calls → ~0.5/sec).
-const DISCOVER_TIMEFRAMES_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-
-#[derive(Clone)]
-struct DiscoverTimeframesCacheEntry {
-    value: Vec<String>,
-    captured_at: std::time::Instant,
-}
-
-static DISCOVER_TIMEFRAMES_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(PathBuf, String), DiscoverTimeframesCacheEntry>>,
-> = std::sync::OnceLock::new();
-
-fn discover_timeframes_cache_get(root: &Path, symbol: &str) -> Option<Vec<String>> {
-    let lock = DISCOVER_TIMEFRAMES_CACHE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let guard = lock.lock().ok()?;
-    let entry = guard.get(&(root.to_path_buf(), symbol.to_string()))?;
-    if entry.captured_at.elapsed() < DISCOVER_TIMEFRAMES_CACHE_TTL {
-        Some(entry.value.clone())
-    } else {
-        None
-    }
-}
-
-fn discover_timeframes_cache_put(root: &Path, symbol: &str, value: Vec<String>) {
-    let lock = DISCOVER_TIMEFRAMES_CACHE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Ok(mut guard) = lock.lock() {
-        guard.insert(
-            (root.to_path_buf(), symbol.to_string()),
-            DiscoverTimeframesCacheEntry {
-                value,
-                captured_at: std::time::Instant::now(),
-            },
-        );
-    }
-}
-
-/// Integrity status of a single `(symbol, timeframe)` Vortex folder.
-///
-/// F-307 (2026-05-28): the loader used to accept any folder named
-/// `timeframe=XX` that matched a canonical timeframe label, without
-/// checking whether the data inside was actually usable. A half-finished
-/// bootstrap leaves `data.vortex.partial` next to a stale `data.vortex`
-/// from an earlier run, and the loader would happily feed that 12-month-
-/// out-of-date blob into a 24-month sweep — producing NaN-laden features
-/// and zero-trade GA candidates with no diagnostic.
-///
-/// State machine (all four states observed in production data dirs):
-///   - `data.vortex` + `.complete` + no `.partial`  → `Complete`
-///   - `data.vortex` + `.complete` + `.partial`     → `Complete` (new
-///     bootstrap in progress; old data still usable) + WARN
-///   - `data.vortex` + no `.complete` + `.partial`  → `StalePartial`  🚫
-///   - `data.vortex` + no `.complete` + no `.partial` → `LegacyNoMarker`
-///     (pre-marker era data; ACCEPT with one-time WARN so the operator
-///     knows to re-bootstrap if they want full integrity)
-///   - no `data.vortex`                            → `Missing` 🚫
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VortexIntegrity {
-    /// Data is usable — `.complete` marker present.
-    Complete,
-    /// Data dir exists but `.partial` marker is there without `.complete`.
-    /// A previous bootstrap aborted mid-write; the blob is stale and the
-    /// loader MUST reject to avoid feeding half-data to backtests.
-    StalePartial,
-    /// `data.vortex` exists but neither `.complete` nor `.partial` is
-    /// present. Pre-F-307 data files predate the marker convention.
-    /// Accept-with-warn so existing operator data dirs keep working.
-    LegacyNoMarker,
-    /// No `data.vortex` in the folder — folder exists but is empty.
-    Missing,
-    /// `data.vortex` exists but is implausibly small
-    /// (< [`VORTEX_MIN_PLAUSIBLE_BYTES`]) — a truncated or aborted write.
-    /// Rejected even when a stale `.complete` marker is present: the
-    /// 2026-06-01 corruption was an 84 KB EURUSD M1 / 9 KB EURUSD H1 that
-    /// still carried `.complete` and was wrongly classified `Complete`.
-    Truncated,
-}
-
-/// Minimum plausible byte size of a real `data.vortex` file. The
-/// smallest legitimate frame seen in production (W1 / MN1, a few hundred
-/// bars) is ~10 KB, so a 256-byte floor catches near-empty / garbage
-/// stubs with a wide margin against false-positives. It does NOT catch a
-/// file that is structurally valid but semantically short (too few bars
-/// for its timeframe); that case is surfaced as a diagnostic warning in
-/// [`load_symbol_timeframe`] via the `data.parquet` size ratio.
-pub const VORTEX_MIN_PLAUSIBLE_BYTES: u64 = 256;
-
-/// Inspect a `(symbol, timeframe)` directory and classify its load
-/// readiness. See [`VortexIntegrity`] for the state machine.
-pub fn vortex_integrity(dir: impl AsRef<Path>) -> VortexIntegrity {
-    let dir = dir.as_ref();
-    let vortex = dir.join("data.vortex");
-    let Ok(meta) = std::fs::metadata(&vortex) else {
-        return VortexIntegrity::Missing;
-    };
-    // Size-gate BEFORE trusting the markers: a truncated/aborted write can
-    // leave a tiny `data.vortex` next to a stale `.complete` marker, which
-    // the marker-only logic below would mis-classify as `Complete`.
-    if meta.len() < VORTEX_MIN_PLAUSIBLE_BYTES {
-        return VortexIntegrity::Truncated;
-    }
-    let complete = dir.join("data.vortex.complete").exists();
-    let partial = dir.join("data.vortex.partial").exists();
-    match (complete, partial) {
-        (true, _) => VortexIntegrity::Complete,
-        (false, true) => VortexIntegrity::StalePartial,
-        (false, false) => VortexIntegrity::LegacyNoMarker,
-    }
+    let mut symbols = discover_all_canonical_dataset_identities(root)?
+        .into_iter()
+        .map(|identity| identity.symbol_name().to_owned())
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+    Ok(symbols)
 }
 
 pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<String>> {
-    let root_path = root.as_ref();
-    // Task #79 — 60 Hz filesystem read elimination. The chart panel's
-    // `market_chart_snapshot` calls us on every render frame; cache the
-    // result for `DISCOVER_TIMEFRAMES_CACHE_TTL` so we don't hammer the
-    // disk. The cache is keyed on (root, symbol) so different symbols /
-    // different data dirs don't clobber each other.
-    if let Some(cached) = discover_timeframes_cache_get(root_path, symbol) {
-        return Ok(cached);
-    }
-    let path = PathBuf::from(root_path).join(format!("symbol={}", symbol));
-    if !path.exists() {
-        discover_timeframes_cache_put(root_path, symbol, Vec::new());
-        return Ok(Vec::new());
-    }
-    let mut tfs = HashSet::new();
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(raw) = name.strip_prefix("timeframe=") {
-            let tf = raw.to_uppercase();
-            // Note — gate against non-canonical timeframes
-            // and path-traversal segments. Pre-fix, a stray
-            // `timeframe=H2/` folder (cTrader has no H2 — see
-            // `ctrader_api_reference.md` §4) was reported to the UI as
-            // available, and a hostile/buggy `timeframe=../etc/passwd`
-            // would have been accepted at this layer. We now compare
-            // against `neoethos_core::CANONICAL_TIMEFRAMES`, which is the
-            // single source of truth used by every other consumer (chart
-            // panel, bootstrap, training).
-            if neoethos_core::CANONICAL_TIMEFRAMES
-                .iter()
-                .any(|canonical| canonical.eq_ignore_ascii_case(&tf))
-            {
-                // F-307 (2026-05-28): integrity gate. The folder being
-                // named correctly doesn't mean the data inside is
-                // usable. `.partial` without `.complete` means a
-                // half-finished bootstrap left a stale blob; the
-                // discovery pipeline would feed that into the GA and
-                // produce zero-trade candidates with no diagnostic
-                // (root cause for the 4/4-candidate AUDUSD M15 funnel).
-                match vortex_integrity(entry.path()) {
-                    VortexIntegrity::Complete => {
-                        tfs.insert(tf);
-                    }
-                    VortexIntegrity::LegacyNoMarker => {
-                        // Accept (legacy data predates marker convention)
-                        // but warn once so operators know to re-bootstrap
-                        // for full integrity guarantees.
-                        if !warned_once_for(symbol, &format!("{tf}/legacy")) {
-                            tracing::warn!(
-                                target: "neoethos_data::discover_timeframes",
-                                symbol = symbol,
-                                timeframe = %tf,
-                                "legacy vortex file without .complete marker — accepted for backward-compat, re-bootstrap recommended"
-                            );
-                        }
-                        tfs.insert(tf);
-                    }
-                    VortexIntegrity::StalePartial => {
-                        // Reject loudly — the partial marker proves the
-                        // existing data.vortex is from a previous
-                        // never-completed bootstrap. Including this
-                        // timeframe in the discovery pipeline would feed
-                        // stale/half-data into the cost model.
-                        if !warned_once_for(symbol, &format!("{tf}/stale")) {
-                            tracing::warn!(
-                                target: "neoethos_data::discover_timeframes",
-                                symbol = symbol,
-                                timeframe = %tf,
-                                "REJECTED: data.vortex.partial present without .complete marker (half-finished bootstrap). Re-run --bootstrap-data for this timeframe."
-                            );
-                        }
-                    }
-                    VortexIntegrity::Truncated => {
-                        // Truncated/aborted write (tiny data.vortex). Reject
-                        // like StalePartial — the blob can't be trusted even
-                        // if a stale .complete marker is present.
-                        if !warned_once_for(symbol, &format!("{tf}/truncated")) {
-                            tracing::warn!(
-                                target: "neoethos_data::discover_timeframes",
-                                symbol = symbol,
-                                timeframe = %tf,
-                                "REJECTED: data.vortex is implausibly small (truncated or aborted write). Re-run data bootstrap for this timeframe."
-                            );
-                        }
-                    }
-                    VortexIntegrity::Missing => {
-                        // Folder exists but no data.vortex inside — silent
-                        // skip; the bootstrap may be in its very first
-                        // chunk and the file just isn't there yet.
-                    }
-                }
-            } else if !warned_once_for(symbol, &tf) {
-                // First time we see this (symbol, tf) since process start.
-                // Subsequent calls with the same pair stay silent so the
-                // UI's per-frame render loop doesn't flood the log.
-                tracing::warn!(
-                    target: "neoethos_data::discover_timeframes",
-                    symbol = symbol,
-                    timeframe = %tf,
-                    "ignoring non-canonical timeframe folder; not in CANONICAL_TIMEFRAMES (warning is deduplicated; restart process to see again)"
-                );
-            }
-        }
-    }
-    let mut out: Vec<String> = tfs.into_iter().collect();
-    out.sort_by_key(|tf| parse_timeframe_to_minutes(tf).unwrap_or(999999));
-    discover_timeframes_cache_put(root_path, symbol, out.clone());
+    let identities = discover_canonical_dataset_identities(root, symbol)?;
+    let mut out = identities
+        .into_iter()
+        .map(|identity| identity.timeframe().as_str().to_owned())
+        .collect::<Vec<_>>();
+    out.dedup();
     Ok(out)
 }
 
@@ -423,79 +344,20 @@ pub fn load_symbol_timeframe(
     symbol: &str,
     timeframe: &str,
 ) -> Result<Ohlcv> {
-    let path = symbol_timeframe_vortex_path(root, symbol, timeframe);
-    if !path.exists() {
-        bail!(
-            "Vortex dataset not found for {} {} at {}. \
-             Run Data Bootstrap (or `neoethos-cli import`) to download history first.",
-            symbol, timeframe, path.display()
-        );
-    }
-    // F-307 (2026-05-28): belt-and-braces integrity gate. Most callers
-    // arrive here via `discover_timeframes` which already filters out
-    // `StalePartial` folders, but direct callers (`load_symbol_dataset_with_timeframes`,
-    // tail-readers, bridge endpoints) bypass that filter. Guard here too
-    // so a half-finished bootstrap can't poison ANY load path.
-    if let Some(parent) = path.parent() {
-        match vortex_integrity(parent) {
-            VortexIntegrity::Complete | VortexIntegrity::LegacyNoMarker => {
-                // ok — proceed to load
-            }
-            VortexIntegrity::StalePartial => {
-                bail!(
-                    "vortex dataset {} {} REJECTED: data.vortex.partial present without \
-                     .complete marker (half-finished bootstrap left stale data). \
-                     Re-run data bootstrap for this timeframe.",
-                    symbol,
-                    timeframe
-                );
-            }
-            VortexIntegrity::Truncated => {
-                bail!(
-                    "vortex dataset {} {} REJECTED: data.vortex is implausibly small \
-                     (truncated or aborted write left a stale .complete marker). \
-                     Re-run data bootstrap for this timeframe.",
-                    symbol,
-                    timeframe
-                );
-            }
-            VortexIntegrity::Missing => {
-                // Shouldn't happen — path.exists() already checked — but
-                // guard against TOCTOU race where the file vanishes
-                // between the .exists() call above and here.
-                bail!("vortex dataset {} {} disappeared during load", symbol, timeframe);
-            }
-        }
-    }
-
-    // Diagnostic only (never rejects): a structurally-valid but
-    // semantically-short data.vortex (too few bars for its timeframe) can
-    // pass the integrity gate. When a data.parquet source sits beside it,
-    // a vortex that is a tiny fraction of the parquet size is almost
-    // certainly truncated — surface the diagnostic F-307 was meant to
-    // provide, without deleting or rejecting anything.
-    if let Some(parent) = path.parent() {
-        let vortex_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let parquet_bytes = std::fs::metadata(parent.join("data.parquet"))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if parquet_bytes > 0
-            && vortex_bytes > 0
-            && vortex_bytes.saturating_mul(50) < parquet_bytes
-            && !warned_once_for(symbol, &format!("{timeframe}/ratio"))
-        {
-            tracing::warn!(
-                target: "neoethos_data::load_symbol_timeframe",
-                symbol = symbol,
-                timeframe = timeframe,
-                vortex_bytes,
-                parquet_bytes,
-                "data.vortex is <2% of its data.parquet source — likely a truncated/incomplete conversion. Re-run data bootstrap if candles look short."
-            );
-        }
-    }
-
-    load_vortex(path)
+    let canonical_timeframe = timeframe
+        .parse::<CanonicalTimeframe>()
+        .with_context(|| format!("unsupported canonical timeframe {timeframe}"))?;
+    let identities = discover_canonical_dataset_identities(&root, symbol)?;
+    let matching = identities
+        .iter()
+        .filter(|identity| identity.timeframe() == canonical_timeframe)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matching.len() == 1,
+        "expected exactly one verified canonical Vortex generation for {symbol} {timeframe}, found {}; raw source files require explicit import and retired symbol=/timeframe= layouts require explicit offline migration",
+        matching.len()
+    );
+    Ok(load_canonical_timeframe(root, matching[0])?.ohlcv().clone())
 }
 
 /// Load only the trailing `tail_n` rows for a symbol/timeframe.
@@ -539,16 +401,178 @@ pub fn load_symbol_timeframe_tail(
 }
 
 pub fn load_symbol_dataset(root: impl AsRef<Path>, symbol: &str) -> Result<SymbolDataset> {
-    let tfs = discover_timeframes(&root, symbol)?;
+    let identities = discover_canonical_dataset_identities(&root, symbol)?;
     let mut frames = HashMap::new();
-    for tf in tfs {
-        let ohlcv = load_symbol_timeframe(&root, symbol, &tf)
-            .with_context(|| format!("failed to load dataset timeframe {} {}", symbol, tf))?;
-        frames.insert(tf, ohlcv);
+    let mut source_artifacts = HashMap::new();
+    for identity in identities {
+        let tf = identity.timeframe().as_str().to_owned();
+        anyhow::ensure!(
+            !frames.contains_key(&tf),
+            "multiple canonical dataset identities match {symbol} {tf}; select an exact source/account identity"
+        );
+        let loaded = load_canonical_timeframe(&root, &identity)
+            .with_context(|| format!("failed to load canonical dataset timeframe {symbol} {tf}"))?;
+        frames.insert(tf.clone(), loaded.ohlcv().clone());
+        source_artifacts.insert(tf, loaded.artifact().clone());
     }
+    anyhow::ensure!(
+        !frames.is_empty(),
+        "no canonical versioned Vortex datasets found for symbol {symbol}; legacy symbol=/timeframe= layouts require explicit offline migration"
+    );
     Ok(SymbolDataset {
         symbol: symbol.to_string(),
         frames,
+        source_artifacts,
+    })
+}
+
+/// Open one immutable canonical series from the exact generation receipts
+/// selected by the caller.
+///
+/// Every timeframe is reopened through its generation id and manifest-binding
+/// hash. This function never inventories a root, follows a current pointer, or
+/// derives one timeframe from another.
+pub fn load_exact_dataset_series_receipt(
+    root: impl AsRef<Path>,
+    series: &CanonicalDatasetSeriesReceiptV1,
+) -> Result<SymbolDataset> {
+    series.validate()?;
+    let root = root.as_ref();
+    let symbol = series.anchor().identity().symbol_name();
+    let mut frames = HashMap::with_capacity(series.direct_timeframes().len());
+    let mut source_artifacts = HashMap::with_capacity(series.direct_timeframes().len());
+
+    for selected in series.direct_timeframes() {
+        anyhow::ensure!(
+            selected.identity().symbol_name() == symbol,
+            "selected canonical series contains foreign symbol {} under anchor {symbol}",
+            selected.identity().symbol_name()
+        );
+        let timeframe = selected.identity().timeframe().as_str().to_owned();
+        anyhow::ensure!(
+            !frames.contains_key(&timeframe),
+            "selected canonical series repeats timeframe {timeframe}"
+        );
+        let loaded = load_exact_canonical_timeframe(root, selected).with_context(|| {
+            format!(
+                "failed to reopen exact selected generation {} for {symbol} {timeframe}",
+                selected.generation_id()
+            )
+        })?;
+        anyhow::ensure!(
+            loaded.artifact().identity() == selected.identity(),
+            "exact selected generation reopened with a different dataset identity"
+        );
+        frames.insert(timeframe.clone(), loaded.ohlcv().clone());
+        source_artifacts.insert(timeframe, loaded.artifact().clone());
+    }
+
+    anyhow::ensure!(
+        frames.contains_key(series.anchor().identity().timeframe().as_str()),
+        "selected canonical series lost its anchor timeframe"
+    );
+    Ok(SymbolDataset {
+        symbol: symbol.to_owned(),
+        frames,
+        source_artifacts,
+    })
+}
+
+/// Load the exact source/account series selected by one canonical identity.
+///
+/// The selected identity acts as an anchor: every returned timeframe must
+/// have the same scope (external namespace or exact cTrader
+/// environment/server/account/symbol id), exact symbol name, and bar timestamp
+/// convention. This is the production-safe alternative to symbol-only loading
+/// when multiple legitimate datasets exist for the same pair.
+pub fn load_dataset_for_identity(
+    root: impl AsRef<Path>,
+    selected: &CanonicalDatasetIdentity,
+) -> Result<SymbolDataset> {
+    let identities = discover_all_canonical_dataset_identities(&root)?;
+    anyhow::ensure!(
+        identities.iter().any(|identity| identity == selected),
+        "selected canonical dataset identity has no current versioned Vortex generation"
+    );
+    let matching = identities
+        .into_iter()
+        .filter(|identity| same_dataset_series(identity, selected))
+        .collect::<Vec<_>>();
+    load_exact_dataset_identities(root, selected.symbol_name(), matching)
+}
+
+pub fn load_dataset_for_identity_with_timeframes(
+    root: impl AsRef<Path>,
+    selected: &CanonicalDatasetIdentity,
+    target_tfs: &[&str],
+) -> Result<SymbolDataset> {
+    let requested = target_tfs
+        .iter()
+        .map(|timeframe| {
+            timeframe
+                .parse::<CanonicalTimeframe>()
+                .with_context(|| format!("unsupported canonical timeframe {timeframe}"))
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let identities = discover_all_canonical_dataset_identities(&root)?;
+    anyhow::ensure!(
+        identities.iter().any(|identity| identity == selected),
+        "selected canonical dataset identity has no current versioned Vortex generation"
+    );
+    let matching = identities
+        .into_iter()
+        .filter(|identity| {
+            same_dataset_series(identity, selected) && requested.contains(&identity.timeframe())
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matching.len() == requested.len(),
+        "selected canonical dataset series provides {} of {} requested timeframes",
+        matching.len(),
+        requested.len()
+    );
+    load_exact_dataset_identities(root, selected.symbol_name(), matching)
+}
+
+fn same_dataset_series(
+    candidate: &CanonicalDatasetIdentity,
+    selected: &CanonicalDatasetIdentity,
+) -> bool {
+    candidate.scope() == selected.scope()
+        && candidate.symbol_name() == selected.symbol_name()
+        && candidate.bar_timestamp_convention() == selected.bar_timestamp_convention()
+}
+
+fn load_exact_dataset_identities(
+    root: impl AsRef<Path>,
+    symbol: &str,
+    identities: Vec<CanonicalDatasetIdentity>,
+) -> Result<SymbolDataset> {
+    anyhow::ensure!(
+        !identities.is_empty(),
+        "selected canonical dataset series has no loadable timeframes"
+    );
+    let mut frames = HashMap::new();
+    let mut source_artifacts = HashMap::new();
+    for identity in identities {
+        let timeframe = identity.timeframe().as_str().to_owned();
+        anyhow::ensure!(
+            !frames.contains_key(&timeframe),
+            "selected canonical dataset series contains duplicate timeframe {timeframe}"
+        );
+        let loaded = load_canonical_timeframe(&root, &identity).with_context(|| {
+            format!(
+                "failed to load selected canonical dataset {}",
+                identity.to_path_component()
+            )
+        })?;
+        frames.insert(timeframe.clone(), loaded.ohlcv().clone());
+        source_artifacts.insert(timeframe, loaded.artifact().clone());
+    }
+    Ok(SymbolDataset {
+        symbol: symbol.to_owned(),
+        frames,
+        source_artifacts,
     })
 }
 
@@ -557,45 +581,90 @@ pub fn load_symbol_dataset_with_timeframes(
     symbol: &str,
     target_tfs: &[&str],
 ) -> Result<SymbolDataset> {
+    let identities = discover_canonical_dataset_identities(&root, symbol)?;
     let mut frames = HashMap::new();
+    let mut source_artifacts = HashMap::new();
     for tf in target_tfs {
-        let ohlcv = load_symbol_timeframe(&root, symbol, tf).with_context(|| {
-            format!(
-                "failed to load requested dataset timeframe {} {}",
-                symbol, tf
-            )
+        let canonical_tf = tf
+            .parse::<CanonicalTimeframe>()
+            .with_context(|| format!("unsupported canonical timeframe {tf}"))?;
+        let matching = identities
+            .iter()
+            .filter(|identity| identity.timeframe() == canonical_tf)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            matching.len() == 1,
+            "expected exactly one canonical dataset identity for {symbol} {tf}, found {}",
+            matching.len()
+        );
+        let loaded = load_canonical_timeframe(&root, matching[0]).with_context(|| {
+            format!("failed to load requested canonical dataset timeframe {symbol} {tf}")
         })?;
-        frames.insert(tf.to_string(), ohlcv);
+        frames.insert(tf.to_string(), loaded.ohlcv().clone());
+        source_artifacts.insert(tf.to_string(), loaded.artifact().clone());
     }
     Ok(SymbolDataset {
         symbol: symbol.to_string(),
         frames,
+        source_artifacts,
     })
 }
 
-pub fn symbol_timeframe_vortex_path(
+/// Discover versioned canonical identities without interpreting the retired
+/// human `symbol=/timeframe=` layout. Ambiguous identities are retained here
+/// and rejected by callers that failed to request an exact account/source.
+pub fn discover_canonical_dataset_identities(
     root: impl AsRef<Path>,
     symbol: &str,
-    timeframe: &str,
-) -> PathBuf {
-    PathBuf::from(root.as_ref())
-        .join(format!("symbol={}", normalize_symbol_segment(symbol)))
-        .join(format!(
-            "timeframe={}",
-            normalize_timeframe_segment(timeframe)
-        ))
-        .join("data.vortex")
+) -> Result<Vec<CanonicalDatasetIdentity>> {
+    let mut identities = discover_all_canonical_dataset_identities(root)?
+        .into_iter()
+        .filter(|identity| identity.symbol_name().eq_ignore_ascii_case(symbol))
+        .collect::<Vec<_>>();
+    identities.sort_by(|left, right| {
+        left.timeframe()
+            .ctrader_protocol_code()
+            .cmp(&right.timeframe().ctrader_protocol_code())
+            .then_with(|| left.to_path_component().cmp(&right.to_path_component()))
+    });
+    Ok(identities)
 }
 
-pub fn write_symbol_timeframe_vortex(
+fn discover_all_canonical_dataset_identities(
     root: impl AsRef<Path>,
-    symbol: &str,
-    timeframe: &str,
-    ohlcv: &Ohlcv,
-) -> Result<PathBuf> {
-    let path = symbol_timeframe_vortex_path(root, symbol, timeframe);
-    write_ohlcv_vortex(&path, ohlcv)?;
-    Ok(path)
+) -> Result<Vec<CanonicalDatasetIdentity>> {
+    let mut identities = Vec::new();
+    let root = root.as_ref();
+    // Identity selection is metadata-only. The exact selected generation is
+    // fully hashed/decoded by `load_canonical_timeframe`; hashing every other
+    // multi-gigabyte dataset here made one-symbol loads scale with the entire
+    // store and made UI inventory continuously saturate disk.
+    let discovery = crate::core::discover::DatasetDiscovery::scan_metadata(root)?;
+    for entry in discovery.entries {
+        let dataset_root = entry
+            .path
+            .parent()
+            .context("canonical generation has no dataset root")?;
+        let component = dataset_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("canonical dataset identity path is not UTF-8")?;
+        identities.push(
+            CanonicalDatasetIdentity::from_path_component(component)
+                .with_context(|| format!("invalid verified canonical dataset {component:?}"))?,
+        );
+    }
+    identities.sort_by(|left, right| {
+        left.symbol_name()
+            .cmp(right.symbol_name())
+            .then_with(|| {
+                left.timeframe()
+                    .ctrader_protocol_code()
+                    .cmp(&right.timeframe().ctrader_protocol_code())
+            })
+            .then_with(|| left.to_path_component().cmp(&right.to_path_component()))
+    });
+    Ok(identities)
 }
 
 pub fn write_ohlcv_vortex(path: impl AsRef<Path>, ohlcv: &Ohlcv) -> Result<()> {
@@ -604,130 +673,73 @@ pub fn write_ohlcv_vortex(path: impl AsRef<Path>, ohlcv: &Ohlcv) -> Result<()> {
     write_vortex_array(path, array)
 }
 
-pub fn load_vortex(path: impl AsRef<Path>) -> Result<Ohlcv> {
-    let path = path.as_ref();
-    let array = read_vortex_array(path)?;
-    let ohlcv = vortex_array_to_ohlcv(array)?;
-    Ok(drop_impossible_prices(ohlcv, &path.display().to_string()))
+pub fn write_ohlcv_vortex_with_volume(
+    path: impl AsRef<Path>,
+    ohlcv: &Ohlcv,
+    volume: CanonicalVolumeRef<'_>,
+) -> Result<()> {
+    let array = ohlcv_to_vortex_array_with_canonical_volume(ohlcv, volume)?;
+    write_vortex_array(path, array)
 }
 
-/// Share of a series that may be dropped as impossible before the series itself
-/// is considered broken. Well under the ~0.3 % seen in practice; a file past
-/// this is not a few bad ticks, it is the wrong file.
-const MAX_IMPOSSIBLE_PRICE_SHARE: f64 = 0.02;
-
-/// Remove bars whose prices are not positive.
+/// Convert an OHLCV value into bounded same-schema Vortex chunks.
 ///
-/// A price of zero is not a cheap price, it is the absence of one. The row
-/// validator accepts them today because it only checks for NaN/Inf and for
-/// `low ≤ open, close ≤ high` — and `open=0, high=0.837, low=0, close=0.834`
-/// satisfies every one of those. What it does not survive is contact with a
-/// backtest: entering at zero and exiting at the real price booked £77 211 of
-/// profit on a single AUDUSD H4 bar at one lot, about 9 800 pips, on a pair
-/// whose entire ten-year range is 5 500. Several unrelated genes reported that
-/// identical figure, which is what gave the shared bad bar away.
-///
-/// That matters beyond one wrong number. The search ranks candidates on profit,
-/// so the strategies that found these bars outranked every honest one and were
-/// the ones exported. 14 240 such bars sit in this store, across every symbol
-/// and timeframe, all dating from 2014-12-08.
-///
-/// Dropping is the conservative repair: the bar carries no usable information,
-/// and the alternative — refusing to load — would block every run on data that
-/// is otherwise sound. Silence is not an option either, so the count and the
-/// affected range are logged at warn, and a file past
-/// `MAX_IMPOSSIBLE_PRICE_SHARE` is refused rather than quietly rewritten.
-fn drop_impossible_prices(ohlcv: Ohlcv, source: &str) -> Ohlcv {
-    let total = ohlcv.close.len();
-    if total == 0 {
-        return ohlcv;
+/// This is the bridge used by the verified publisher and, later, the shared
+/// streaming importer. It intentionally never creates a full-file encoded
+/// buffer. `normalize_ohlcv` is deliberately validation-only: canonical data
+/// is never unit-inferred, reordered, deduplicated, or otherwise repaired.
+pub fn ohlcv_to_vortex_chunks(
+    ohlcv: &Ohlcv,
+    rows_per_chunk: usize,
+) -> Result<Vec<vortex_array::ArrayRef>> {
+    if rows_per_chunk == 0 {
+        bail!("Vortex rows_per_chunk must be greater than zero");
     }
-    let usable = |index: usize| -> bool {
-        let open = ohlcv.open[index];
-        let high = ohlcv.high[index];
-        let low = ohlcv.low[index];
-        let close = ohlcv.close[index];
-        open > 0.0 && high > 0.0 && low > 0.0 && close > 0.0
-    };
-    let bad = (0..total).filter(|index| !usable(*index)).count();
-    if bad == 0 {
-        return ohlcv;
+    let normalized = normalize_ohlcv(ohlcv)?;
+    if normalized.is_empty() {
+        bail!("cannot encode an empty OHLCV dataset");
     }
-    let share = bad as f64 / total as f64;
-    let first_bad = (0..total).find(|index| !usable(*index));
-    let bad_timestamp = first_bad
-        .and_then(|index| ohlcv.timestamp.as_ref().and_then(|ts| ts.get(index).copied()));
-    if share > MAX_IMPOSSIBLE_PRICE_SHARE {
-        tracing::error!(
-            target: "neoethos_data::integrity",
-            source,
-            bad,
-            total,
-            share_pct = format!("{:.2}", share * 100.0),
-            first_bad_timestamp_ms = bad_timestamp,
-            "more than 2% of this series has non-positive prices — dropping them would              change the series rather than clean it. Re-import this symbol/timeframe."
-        );
-    } else {
-        tracing::warn!(
-            target: "neoethos_data::integrity",
-            source,
-            bad,
-            total,
-            share_pct = format!("{:.3}", share * 100.0),
-            first_bad_timestamp_ms = bad_timestamp,
-            "dropped bars with non-positive prices — a zero price is the absence of a              price, and a backtest that trades one books impossible profit. Re-import              this symbol/timeframe to recover the bars."
-        );
-    }
-
-    let keep: Vec<bool> = (0..total).map(usable).collect();
-    let filter = |values: Vec<f64>| -> Vec<f64> {
-        values
-            .into_iter()
-            .zip(keep.iter())
-            .filter_map(|(value, keep)| keep.then_some(value))
-            .collect()
-    };
-    Ohlcv {
-        timestamp: ohlcv.timestamp.map(|ts| {
-            ts.into_iter()
-                .zip(keep.iter())
-                .filter_map(|(value, keep)| keep.then_some(value))
-                .collect()
-        }),
-        open: filter(ohlcv.open),
-        high: filter(ohlcv.high),
-        low: filter(ohlcv.low),
-        close: filter(ohlcv.close),
-        volume: ohlcv.volume.map(filter),
-    }
-}
-
-pub fn normalize_ohlcv(ohlcv: &Ohlcv) -> Result<Ohlcv> {
-    let raw_timestamps = ohlcv
+    let timestamps = normalized
         .timestamp
         .as_ref()
         .context("OHLCV dataset has no timestamps")?;
-    // Note — write-path timestamp unit normalisation.
-    //
-    // The READ path (`vortex_array_to_ohlcv`) calls
-    // `normalize_timestamps_to_inferred_millis` to detect ns/μs/ms/s by
-    // magnitude and convert to milliseconds. Until v0.4 the WRITE path
-    // did NOT do this, so a caller passing nanoseconds (e.g. the
-    // `BootstrapVortexWriter`, which writes `NormalizedBar.timestamp_ns`
-    // directly) produced files that READ back as milliseconds — losing
-    // the original unit and breaking every consumer that expected the
-    // round-trip to be identity. Symmetric normalisation closes that
-    // hole: ns / μs / s inputs are folded to ms here too, so the
-    // canonical on-disk unit is always milliseconds. (See
-    // `crates/neoethos-app/src/app_services/ctrader_bootstrap.rs` for the
-    // coverage code that depends on this contract.)
-    let normalized_ts = if raw_timestamps.is_empty() {
-        raw_timestamps.clone()
-    } else {
-        crate::core::timestamps::normalize_timestamps_to_inferred_millis(raw_timestamps)
-            .context("normalize OHLCV timestamps to milliseconds on write")?
-    };
-    let timestamps = &normalized_ts;
+    let mut chunks = Vec::with_capacity(normalized.len().div_ceil(rows_per_chunk));
+    for start in (0..normalized.len()).step_by(rows_per_chunk) {
+        let end = (start + rows_per_chunk).min(normalized.len());
+        let chunk = Ohlcv {
+            timestamp: Some(timestamps[start..end].to_vec()),
+            open: normalized.open[start..end].to_vec(),
+            high: normalized.high[start..end].to_vec(),
+            low: normalized.low[start..end].to_vec(),
+            close: normalized.close[start..end].to_vec(),
+            volume: normalized
+                .volume
+                .as_ref()
+                .map(|values| values[start..end].to_vec()),
+        };
+        chunks.push(ohlcv_to_vortex_array(&chunk)?);
+    }
+    Ok(chunks)
+}
+
+pub fn load_vortex(path: impl AsRef<Path>) -> Result<Ohlcv> {
+    let path = path.as_ref();
+    let array = read_vortex_array(path)?;
+    vortex_array_to_ohlcv(array)
+}
+
+pub fn normalize_ohlcv(ohlcv: &Ohlcv) -> Result<Ohlcv> {
+    validate_canonical_ohlcv(ohlcv)?;
+    Ok(ohlcv.clone())
+}
+
+fn validate_canonical_ohlcv(ohlcv: &Ohlcv) -> Result<()> {
+    let timestamps = ohlcv
+        .timestamp
+        .as_ref()
+        .context("OHLCV dataset has no timestamps")?;
+    crate::core::timestamps::validate_canonical_millisecond_timestamps(timestamps)
+        .context("validate canonical OHLCV timestamps")?;
     let volume = ohlcv.volume.as_ref();
     let expected_len = timestamps.len();
 
@@ -748,8 +760,7 @@ pub fn normalize_ohlcv(ohlcv: &Ohlcv) -> Result<Ohlcv> {
         );
     }
 
-    let mut rows = Vec::with_capacity(expected_len);
-    for (idx, &timestamp) in timestamps.iter().enumerate().take(expected_len) {
+    for (idx, &timestamp) in timestamps.iter().enumerate() {
         let volume_value = volume.and_then(|values| values.get(idx).copied());
         let row = OhlcvRow {
             timestamp,
@@ -759,43 +770,63 @@ pub fn normalize_ohlcv(ohlcv: &Ohlcv) -> Result<Ohlcv> {
             close: ohlcv.close[idx],
             volume: volume_value,
         };
-        validate_ohlcv_row(&row)?;
-        rows.push(row);
+        validate_ohlcv_row(&row).with_context(|| format!("validate canonical OHLCV row {idx}"))?;
     }
-
-    rows.sort_by_key(|row| row.timestamp);
-    rows.dedup_by_key(|row| row.timestamp);
-
-    let has_volume = rows.iter().any(|row| row.volume.is_some());
-    let mut out_timestamps = Vec::with_capacity(rows.len());
-    let mut out_open = Vec::with_capacity(rows.len());
-    let mut out_high = Vec::with_capacity(rows.len());
-    let mut out_low = Vec::with_capacity(rows.len());
-    let mut out_close = Vec::with_capacity(rows.len());
-    let mut out_volume = has_volume.then(|| Vec::with_capacity(rows.len()));
-
-    for row in rows {
-        out_timestamps.push(row.timestamp);
-        out_open.push(row.open);
-        out_high.push(row.high);
-        out_low.push(row.low);
-        out_close.push(row.close);
-        if let Some(values) = out_volume.as_mut() {
-            values.push(row.volume.unwrap_or_default());
-        }
-    }
-
-    Ok(Ohlcv {
-        timestamp: Some(out_timestamps),
-        open: out_open,
-        high: out_high,
-        low: out_low,
-        close: out_close,
-        volume: out_volume,
-    })
+    Ok(())
 }
 
 fn ohlcv_to_vortex_array(ohlcv: &Ohlcv) -> Result<vortex_array::ArrayRef> {
+    let volume = ohlcv
+        .volume
+        .as_deref()
+        .map_or(CanonicalVolumeRef::Absent, CanonicalVolumeRef::Float64);
+    ohlcv_to_vortex_array_with_canonical_volume(ohlcv, volume)
+}
+
+pub(crate) fn ohlcv_to_vortex_array_with_canonical_volume(
+    ohlcv: &Ohlcv,
+    volume: CanonicalVolumeRef<'_>,
+) -> Result<vortex_array::ArrayRef> {
+    match volume {
+        CanonicalVolumeRef::Absent => {
+            if ohlcv.volume.is_some() {
+                bail!("canonical volume contract says absent but OHLCV carries Float64 volume");
+            }
+        }
+        CanonicalVolumeRef::Float64(values) => {
+            if ohlcv.volume.as_deref() != Some(values) {
+                bail!("canonical Float64 volume must be the validated OHLCV volume column");
+            }
+        }
+        CanonicalVolumeRef::UInt64(values) => {
+            if ohlcv.volume.is_some() {
+                bail!("canonical UInt64 volume cannot coexist with an OHLCV Float64 column");
+            }
+            if values.len() != ohlcv.len() {
+                bail!(
+                    "canonical UInt64 volume length {} disagrees with {} market rows",
+                    values.len(),
+                    ohlcv.len()
+                );
+            }
+        }
+        CanonicalVolumeRef::Int64(values) => {
+            if ohlcv.volume.is_some() {
+                bail!("canonical Int64 volume cannot coexist with an OHLCV Float64 column");
+            }
+            if values.len() != ohlcv.len() {
+                bail!(
+                    "canonical Int64 volume length {} disagrees with {} market rows",
+                    values.len(),
+                    ohlcv.len()
+                );
+            }
+            if let Some(value) = values.iter().find(|value| **value < 0) {
+                bail!("raw Int64 volume {value} is negative");
+            }
+        }
+    }
+    validate_canonical_ohlcv(ohlcv)?;
     let timestamps = ohlcv
         .timestamp
         .as_ref()
@@ -823,11 +854,20 @@ fn ohlcv_to_vortex_array(ohlcv: &Ohlcv) -> Result<vortex_array::ArrayRef> {
         ),
     ];
 
-    if let Some(volume) = &ohlcv.volume {
-        fields.push((
+    match volume {
+        CanonicalVolumeRef::Absent => {}
+        CanonicalVolumeRef::Float64(values) => fields.push((
             "volume",
-            PrimitiveArray::from_iter(volume.iter().copied()).into_array(),
-        ));
+            PrimitiveArray::from_iter(values.iter().copied()).into_array(),
+        )),
+        CanonicalVolumeRef::UInt64(values) => fields.push((
+            "volume",
+            PrimitiveArray::from_iter(values.iter().copied()).into_array(),
+        )),
+        CanonicalVolumeRef::Int64(values) => fields.push((
+            "volume",
+            PrimitiveArray::from_iter(values.iter().copied()).into_array(),
+        )),
     }
 
     Ok(StructArray::from_fields(&fields)
@@ -835,29 +875,15 @@ fn ohlcv_to_vortex_array(ohlcv: &Ohlcv) -> Result<vortex_array::ArrayRef> {
         .into_array())
 }
 
-fn vortex_array_to_ohlcv(array: vortex_array::ArrayRef) -> Result<Ohlcv> {
+pub(crate) fn vortex_array_to_ohlcv(array: vortex_array::ArrayRef) -> Result<Ohlcv> {
     let struct_array = array.to_struct();
 
-    let raw_ts = extract_non_null_primitive_vec::<i64>(
+    let timestamp = extract_non_null_primitive_vec::<i64>(
         struct_array
             .unmasked_field_by_name("timestamp")
             .context("timestamp field missing")?,
         "timestamp",
     )?;
-    // Normalize timestamps to milliseconds at the load boundary. Older
-    // vortex files store nanoseconds (parquet/arrow default), while the
-    // entire downstream pipeline (discovery prop-firm gate, eval day_key
-    // aggregation, quality screen, regime labels) assumes milliseconds.
-    // Without this conversion, every "day_key" comes out wrong and the
-    // prop-firm window-pass gate degenerates to 5-second windows.
-    let timestamp = if raw_ts.is_empty() {
-        Some(raw_ts)
-    } else {
-        Some(
-            crate::core::timestamps::normalize_timestamps_to_inferred_millis(&raw_ts)
-                .context("normalize timestamps to milliseconds")?,
-        )
-    };
 
     let get_col = |names: &[&str]| -> Result<Vec<f64>> {
         for name in names {
@@ -875,7 +901,14 @@ fn vortex_array_to_ohlcv(array: vortex_array::ArrayRef) -> Result<Ohlcv> {
     let high = get_col(&["high", "h"])?;
     let low = get_col(&["low", "l"])?;
     let close = get_col(&["close", "c"])?;
-    let volume = get_col(&["volume", "vol", "v"]).ok();
+    let volume = ["volume", "vol", "v"]
+        .into_iter()
+        .find_map(|name| {
+            struct_array
+                .unmasked_field_by_name_opt(name)
+                .map(|field| extract_canonical_volume_as_f64(field, name))
+        })
+        .transpose()?;
 
     // Read-path structural check: a corrupt/truncated file can decode into
     // columns of different lengths, after which positional indexing
@@ -884,7 +917,7 @@ fn vortex_array_to_ohlcv(array: vortex_array::ArrayRef) -> Result<Ohlcv> {
     // `normalize_ohlcv`; mirror a cheap length check here so a bad file
     // fails with a clear error instead of a later panic.
     let n = close.len();
-    let ts_len = timestamp.as_ref().map_or(n, |t| t.len());
+    let ts_len = timestamp.len();
     if open.len() != n
         || high.len() != n
         || low.len() != n
@@ -900,14 +933,67 @@ fn vortex_array_to_ohlcv(array: vortex_array::ArrayRef) -> Result<Ohlcv> {
         );
     }
 
-    Ok(Ohlcv {
-        timestamp,
+    let ohlcv = Ohlcv {
+        timestamp: Some(timestamp),
         open,
         high,
         low,
         close,
         volume,
-    })
+    };
+    validate_canonical_ohlcv(&ohlcv).context("validate canonical Vortex OHLCV")?;
+    Ok(ohlcv)
+}
+
+fn extract_canonical_volume_as_f64(
+    array: &vortex_array::ArrayRef,
+    label: &str,
+) -> Result<Vec<f64>> {
+    match array.dtype() {
+        DType::Primitive(PType::F64, _) => extract_non_null_primitive_vec::<f64>(array, label),
+        DType::Primitive(PType::U64, _) => {
+            let raw = extract_non_null_primitive_vec::<u64>(array, label)?;
+            raw.into_iter()
+                .map(|value| {
+                    if !u64_has_exact_f64_mapping(value) {
+                        bail!(
+                            "raw UInt64 volume {value} has no exact f64 mapping; volume-dependent plans are unsupported"
+                        );
+                    }
+                    Ok(value as f64)
+                })
+                .collect()
+        }
+        DType::Primitive(PType::I64, _) => {
+            let raw = extract_non_null_primitive_vec::<i64>(array, label)?;
+            raw.into_iter()
+                .map(|value| {
+                    if value < 0 {
+                        bail!("raw Int64 volume {value} is negative");
+                    }
+                    if !u64_has_exact_f64_mapping(value as u64) {
+                        bail!(
+                            "raw Int64 volume {value} has no exact f64 mapping; volume-dependent plans are unsupported"
+                        );
+                    }
+                    Ok(value as f64)
+                })
+                .collect()
+        }
+        DType::Primitive(PType::F32, _) => bail!(
+            "Vortex volume is Float32 and precision-unrecoverable; implicit widening is forbidden"
+        ),
+        other => bail!("Vortex volume must be non-nullable f64/u64/i64, got {other}"),
+    }
+}
+
+pub(crate) fn u64_has_exact_f64_mapping(value: u64) -> bool {
+    if value == 0 {
+        return true;
+    }
+    let significant_bits = u64::BITS - value.leading_zeros();
+    significant_bits <= f64::MANTISSA_DIGITS
+        || value.trailing_zeros() >= significant_bits - f64::MANTISSA_DIGITS
 }
 
 fn extract_non_null_primitive_vec<T: NativePType>(
@@ -937,18 +1023,25 @@ fn validate_ohlcv_row(row: &OhlcvRow) -> Result<()> {
         bail!(
             "NaN/Inf in OHLCV at timestamp {} (open={} high={} low={} close={}) — \
              re-import and verify the price data is clean.",
-            row.timestamp, row.open, row.high, row.low, row.close
+            row.timestamp,
+            row.open,
+            row.high,
+            row.low,
+            row.close
         );
     }
     // A zero or negative price passes every structural check below —
     // `open=0, high=0.837, low=0, close=0.834` has high ≥ low and both open and
-    // close inside the range — while being economically impossible. Rejecting it
-    // here keeps new imports clean; `drop_impossible_prices` handles the bars
-    // already on disk.
+    // close inside the range — while being economically impossible. Canonical
+    // reads and writes both reject it; no runtime row dropping is permitted.
     if row.open <= 0.0 || row.high <= 0.0 || row.low <= 0.0 || row.close <= 0.0 {
         bail!(
             "non-positive price in OHLCV at timestamp {} (open={} high={} low={} close={})              — a zero price is the absence of a price, not a cheap one; re-import from a              source that has this bar.",
-            row.timestamp, row.open, row.high, row.low, row.close
+            row.timestamp,
+            row.open,
+            row.high,
+            row.low,
+            row.close
         );
     }
     if row.high < row.low
@@ -960,25 +1053,17 @@ fn validate_ohlcv_row(row: &OhlcvRow) -> Result<()> {
         bail!(
             "Invalid OHLC row at timestamp {} (open={} high={} low={} close={}) — \
              source has bad candles; re-import or trim them.",
-            row.timestamp, row.open, row.high, row.low, row.close
+            row.timestamp,
+            row.open,
+            row.high,
+            row.low,
+            row.close
         );
     }
     if row.volume.is_some_and(|value| value < 0.0) {
         bail!("negative volume detected");
     }
     Ok(())
-}
-
-fn normalize_symbol_segment(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_uppercase()
-}
-
-fn normalize_timeframe_segment(raw: &str) -> String {
-    raw.trim().to_ascii_uppercase()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -991,12 +1076,147 @@ struct OhlcvRow {
     volume: Option<f64>,
 }
 
-pub fn compute_hpc_features(ohlcv: &Ohlcv) -> Result<FeatureFrame> {
-    compute_hpc_feature_frame(ohlcv, FeatureProfile::Standard)
+pub fn compute_hpc_features(source: &CanonicalOhlcvFrame) -> Result<FeatureFrame> {
+    compute_hpc_feature_frame(source, FeatureProfile::Standard)
 }
 
-pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, profile: FeatureProfile) -> Result<FeatureFrame> {
-    compute_hpc_feature_frame_sized(ohlcv, profile, ohlcv.len())
+pub fn compute_hpc_feature_frame(
+    source: &CanonicalOhlcvFrame,
+    profile: FeatureProfile,
+) -> Result<FeatureFrame> {
+    compute_hpc_feature_frame_sized(source, profile, source.len())
+}
+
+type ProductionFeatureColumns = Vec<FeatureColumnF64>;
+
+/// Compiler-checked dispatcher for every top-level scalar producer in the
+/// production feature plan. The public manifest and the runtime both use the
+/// same typed ids, so a family cannot remain reachable while being invisible
+/// to provenance/validity review (the previous Footprint defect).
+fn compute_production_feature_columns(
+    producer: ProductionFeatureProducerId,
+    ohlcv: &Ohlcv,
+    budget_rows: usize,
+    classic_run_plan: Option<&crate::core::hpc_ta::ClassicTaRunPlan>,
+) -> Result<ProductionFeatureColumns> {
+    match producer {
+        ProductionFeatureProducerId::SmartMoneyConcept => compute_smc_feature_columns_f64(ohlcv),
+        ProductionFeatureProducerId::ClassicVectorTa => match classic_run_plan {
+            Some(run_plan) => {
+                crate::core::hpc_ta::compute_classic_ta_feature_columns_f64_with_run_plan(
+                    ohlcv, run_plan,
+                )
+            }
+            None => crate::core::hpc_ta::compute_classic_ta_feature_columns_f64(
+                ohlcv,
+                crate::core::hpc_ta::resolved_indicator_compute_policy(),
+                budget_rows,
+            ),
+        },
+        ProductionFeatureProducerId::Quantitative => compute_quant_feature_columns_f64(ohlcv),
+        ProductionFeatureProducerId::Session => compute_session_feature_columns_f64(ohlcv),
+        ProductionFeatureProducerId::Regime => compute_regime_feature_columns_f64(ohlcv),
+        ProductionFeatureProducerId::Footprint => compute_footprint_feature_columns_f64(ohlcv),
+    }
+}
+
+fn production_feature_node_id(producer: ProductionFeatureProducerId) -> &'static str {
+    match producer {
+        ProductionFeatureProducerId::SmartMoneyConcept => "producer:smart-money-concept",
+        ProductionFeatureProducerId::ClassicVectorTa => "producer:classic-vector-ta",
+        ProductionFeatureProducerId::Quantitative => "producer:quantitative",
+        ProductionFeatureProducerId::Session => "producer:session",
+        ProductionFeatureProducerId::Regime => "producer:regime",
+        ProductionFeatureProducerId::Footprint => "producer:footprint",
+    }
+}
+
+fn direct_frame_source_node(
+    source: &CanonicalOhlcvFrame,
+    source_node_id: &str,
+    source_token: &str,
+) -> Result<(String, String)> {
+    let frame_timeframe = source.artifact().frame_timeframe();
+    let frame_token = format!("{source_token}:{}", frame_timeframe.as_str());
+    anyhow::ensure!(
+        source.artifact().identity().timeframe() == frame_timeframe,
+        "direct canonical frame timeframe disagrees with its dataset identity"
+    );
+    Ok((source_node_id.to_owned(), frame_token))
+}
+
+fn build_production_feature_contract(
+    source: &CanonicalOhlcvFrame,
+    groups: &[(ProductionFeatureProducerId, ProductionFeatureColumns)],
+) -> Result<(
+    neoethos_feature_contracts::FeaturePlanV1,
+    neoethos_feature_contracts::DatasetFeatureArtifactProvenanceV1,
+)> {
+    use neoethos_feature_contracts::{
+        DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOperationTagV1, FeatureOutputV1,
+        FeaturePlanV1,
+    };
+
+    const PHYSICAL_SCHEMA_ID: &str = "neoethos.ohlcv.f64-ms.v1";
+    // Formula review is a separate Task-16B gate. A zero formula-evidence hash
+    // is explicit and cannot be mistaken for independently reviewed evidence;
+    // exact implementation semantics are still bound by SemanticSourceSetV1.
+    const UNREVIEWED_FORMULA_EVIDENCE: [u8; 32] = [0; 32];
+
+    let source_node_id = format!(
+        "source:{}",
+        source.artifact().identity().to_path_component()
+    );
+    let source_semantic_hash: [u8; 32] = Sha256::digest(PHYSICAL_SCHEMA_ID.as_bytes()).into();
+    let mut physical_outputs = vec!["open", "high", "low", "close"]
+        .into_iter()
+        .map(|name| FeatureOutputV1::f64(format!("physical:{name}"), 1))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if source.ohlcv().volume.is_some() {
+        physical_outputs.push(FeatureOutputV1::f64("physical:volume", 1)?);
+    }
+    let source_node = FeatureNodeV1::source(
+        source_node_id.clone(),
+        source.artifact().identity().clone(),
+        PHYSICAL_SCHEMA_ID,
+        1,
+        physical_outputs,
+        source_semantic_hash,
+    )?;
+
+    let producer_manifest = production_feature_producer_manifest_v1()?;
+    let mut nodes = Vec::with_capacity(groups.len() + 1);
+    nodes.push(source_node);
+    let (producer_input_node_id, _) = direct_frame_source_node(source, &source_node_id, "single")?;
+    let mut final_outputs = Vec::new();
+    for (producer, columns) in groups {
+        let manifest = producer_manifest
+            .iter()
+            .find(|row| row.producer() == *producer)
+            .ok_or_else(|| anyhow::anyhow!("production producer {producer:?} has no manifest"))?;
+        let outputs = columns
+            .iter()
+            .map(|column| FeatureOutputV1::f64(column.name.clone(), manifest.semantic_version()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        final_outputs.extend(columns.iter().map(|column| column.name.clone()));
+        nodes.push(FeatureNodeV1::transform(
+            production_feature_node_id(*producer),
+            FeatureOperationTagV1::Indicator,
+            manifest.semantic_version(),
+            vec![producer_input_node_id.clone()],
+            outputs,
+            Vec::new(),
+            UNREVIEWED_FORMULA_EVIDENCE,
+            *manifest.semantic_source_set().identity().as_bytes(),
+            None,
+        )?);
+    }
+    let plan = FeaturePlanV1::new(nodes, final_outputs)?;
+    let provenance = DatasetFeatureArtifactProvenanceV1::new(
+        &plan,
+        vec![source.source_binding(source_node_id)?],
+    )?;
+    Ok((plan, provenance))
 }
 
 /// Same as [`compute_hpc_feature_frame`], but with the indicator vocabulary
@@ -1019,12 +1239,29 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, profile: FeatureProfile) -> Resu
 /// construction: the higher timeframes are charged the base frame's per-column
 /// price, so the plan can only over-reserve, never under-reserve.
 pub fn compute_hpc_feature_frame_sized(
-    ohlcv: &Ohlcv,
-    _profile: FeatureProfile,
+    source: &CanonicalOhlcvFrame,
+    profile: FeatureProfile,
     budget_rows: usize,
 ) -> Result<FeatureFrame> {
-    let mut names = Vec::new();
-    let mut columns: Vec<Vec<f64>> = Vec::new();
+    let classic_run_plan = crate::core::hpc_ta::prepare_classic_ta_run_plan(
+        budget_rows.max(source.len()),
+        crate::core::hpc_ta::resolved_indicator_compute_policy(),
+    )?;
+    compute_hpc_feature_frame_sized_with_classic_plan(
+        source,
+        profile,
+        budget_rows,
+        &classic_run_plan,
+    )
+}
+
+fn compute_hpc_feature_frame_sized_with_classic_plan(
+    source: &CanonicalOhlcvFrame,
+    _profile: FeatureProfile,
+    budget_rows: usize,
+    classic_run_plan: &crate::core::hpc_ta::ClassicTaRunPlan,
+) -> Result<FeatureFrame> {
+    let ohlcv = source.ohlcv();
 
     // Perf (2026-07-02, operator: ">24h on dense TFs, one core pinned"): the
     // five indicator families used to run one-after-another and four of them
@@ -1036,34 +1273,71 @@ pub fn compute_hpc_feature_frame_sized(
     //
     // PARITY-CRITICAL: column ORDER feeds effective_feature_names and every
     // discovery artifact — it must stay EXACTLY smc → classic → quant →
-    // session → regime. rayon::join returns results by POSITION (not by
+    // session → regime → footprint. rayon::join returns results by POSITION (not by
     // completion), so the chained collection below is deterministic.
+    let [
+        smc_id,
+        classic_id,
+        quant_id,
+        session_id,
+        regime_id,
+        footprint_id,
+    ] = PRODUCTION_FEATURE_PRODUCER_ORDER;
     let (smc, (classic, (quant, (session, (regime, footprint))))) = rayon::join(
-        || compute_smc_feature_columns(ohlcv),
+        || compute_production_feature_columns(smc_id, ohlcv, budget_rows, Some(classic_run_plan)),
         || {
             rayon::join(
                 || {
-                    crate::core::hpc_ta::compute_classic_ta_columns_sized(
+                    compute_production_feature_columns(
+                        classic_id,
                         ohlcv,
-                        crate::core::hpc_ta::resolved_indicator_compute_policy(),
                         budget_rows,
+                        Some(classic_run_plan),
                     )
                 },
                 || {
                     rayon::join(
-                        || compute_quant_feature_columns(ohlcv),
+                        || {
+                            compute_production_feature_columns(
+                                quant_id,
+                                ohlcv,
+                                budget_rows,
+                                Some(classic_run_plan),
+                            )
+                        },
                         || {
                             rayon::join(
-                                || compute_session_feature_columns(ohlcv),
+                                || {
+                                    compute_production_feature_columns(
+                                        session_id,
+                                        ohlcv,
+                                        budget_rows,
+                                        Some(classic_run_plan),
+                                    )
+                                },
                                 || {
                                     rayon::join(
-                                        || compute_regime_feature_columns(ohlcv),
+                                        || {
+                                            compute_production_feature_columns(
+                                                regime_id,
+                                                ohlcv,
+                                                budget_rows,
+                                                Some(classic_run_plan),
+                                            )
+                                        },
                                         // Footprint family (2026-07-02): bar-level
                                         // effort-vs-result order-flow proxies.
                                         // APPENDED LAST so every pre-existing
                                         // portfolio's column order is unchanged
                                         // (projection matches by name).
-                                        || compute_footprint_feature_columns(ohlcv),
+                                        || {
+                                            compute_production_feature_columns(
+                                                footprint_id,
+                                                ohlcv,
+                                                budget_rows,
+                                                Some(classic_run_plan),
+                                            )
+                                        },
                                     )
                                 },
                             )
@@ -1080,75 +1354,36 @@ pub fn compute_hpc_feature_frame_sized(
     // a feature frame built on 66 of 800 columns is not a degraded frame — it
     // is a different search, and every artifact from it would be labelled as
     // though it were the same.
+    let smc = smc?;
     let classic = classic?;
+    let quant = quant?;
+    let session = session?;
+    let regime = regime?;
+    let footprint = footprint?;
 
-    for (name, col) in smc
+    let groups = vec![
+        (smc_id, smc),
+        (classic_id, classic),
+        (quant_id, quant),
+        (session_id, session),
+        (regime_id, regime),
+        (footprint_id, footprint),
+    ];
+    let (plan, provenance) = build_production_feature_contract(source, &groups)?;
+    let columns = groups
         .into_iter()
-        .chain(classic)
-        .chain(quant)
-        .chain(session)
-        .chain(regime)
-        .chain(footprint)
-    {
-        names.push(name);
-        columns.push(col);
-    }
+        .flat_map(|(_, columns)| columns)
+        .collect::<Vec<_>>();
 
     let n_rows = ohlcv.len();
-    let n_cols = columns.len();
-
-    // NO ZERO-PADDING, EVER. The copy below writes into a pre-zeroed Array2
-    // with no length check: a column shorter than `n_rows` would keep the
-    // allocation's zeros in its tail, and a zero is a REAL VALUE the GA can
-    // threshold against. Today every family emits exactly `n` — but that
-    // invariant is enforced nowhere, and restoring hundreds of indicator
-    // columns is precisely the change that makes it reachable. A short column
-    // is a build defect with no correct silent handling, so it is a hard error
-    // that names the column.
-    for (name, col) in names.iter().zip(columns.iter()) {
+    for column in &columns {
         anyhow::ensure!(
-            col.len() == n_rows,
-            "feature column '{name}' has {} values but the frame has {n_rows} bars — refusing to \
+            column.len() == n_rows,
+            "feature column '{}' has {} values but the frame has {n_rows} bars — refusing to \
              zero-pad a feature (a padded zero is indistinguishable from a real reading)",
-            col.len()
+            column.name,
+            column.len()
         );
-    }
-
-    let mut data = Array2::zeros((n_rows, n_cols));
-    // Note — explicit f64 → f32 narrowing at the feature-cube
-    // boundary. The downstream consumers (neoethos-models tree models, the
-    // genetic backtest kernel via cubecl) all expect f32 to halve memory
-    // (~5 GB of features for a 5-year EURUSD M1 cube doubles to 10 GB if
-    // stored as f64) and to map cleanly onto GPU tensor cores. The loss
-    // is bounded by the source feature engineering: indicators sit in
-    // [-1, 1] after normalisation, and absolute values rarely exceed
-    // 1e6 (price-scaled). f32's mantissa (24 bits) preserves ~7
-    // significant decimals, well above the noise floor of any FX
-    // feature we emit. Acceptable trade-off — DO NOT promote to f64
-    // without auditing the cube memory budget and the cubecl kernel
-    // signatures.
-    //
-    // (We do NOT warn on truncation here because the trade-off was made
-    // intentionally — flooding logs with "f64 → f32 narrowing at
-    // n_rows*n_cols cells" would drown out real diagnostics. A unit
-    // test that asserts feature magnitudes stay below f32::MAX would be
-    // the right regression guard; tracked under follow-up audit.)
-    //
-    // Perf (2026-07-02): parallel per-column copy — on an M1 cube this loop
-    // is ~1.8e9 scalar writes; column-parallel cuts it to seconds. Each rayon
-    // worker owns one output COLUMN (disjoint writes; identical values/order
-    // to the old serial loop — pure data-parallel copy, no parity impact).
-    {
-        use ndarray::Axis;
-        use rayon::prelude::*;
-        data.axis_iter_mut(Axis(1))
-            .into_par_iter()
-            .zip(columns.par_iter())
-            .for_each(|(mut out_col, col)| {
-                for (r, &val) in col.iter().enumerate() {
-                    out_col[r] = val as f32;
-                }
-            });
     }
 
     // HARD FAIL: a FeatureFrame without timestamps cannot be joined with
@@ -1157,11 +1392,13 @@ pub fn compute_hpc_feature_frame_sized(
         .timestamp
         .clone()
         .ok_or_else(|| anyhow::anyhow!("compute_hpc_feature_frame: OHLCV is missing timestamps"))?;
-    Ok(FeatureFrame {
+    FeatureFrame::from_canonical_columns(
         timestamps,
-        names,
-        data: crate::core::features::FeatureData::InMemory(data),
-    })
+        columns,
+        plan,
+        provenance,
+        vec![std::sync::Arc::clone(source.artifact().lease())],
+    )
 }
 
 pub fn prepare_multitimeframe_features(
@@ -1208,6 +1445,12 @@ pub fn with_extended_sweep_working_set<T>(
     }
 }
 
+/// One canonical root for disposable Vortex-backed feature runs. Capacity
+/// accounting and writers must resolve the same path through this API.
+pub fn vortex_feature_run_root() -> PathBuf {
+    std::env::temp_dir().join("neoethos_vortex_feature_runs")
+}
+
 /// [`prepare_multitimeframe_features`] for one streaming batch.
 ///
 /// `batch = None` is byte-identical to `prepare_multitimeframe_features`.
@@ -1226,244 +1469,407 @@ pub fn prepare_multitimeframe_features_batch(
 ///
 /// `batch = None` is byte-identical to `compute_hpc_feature_frame_sized`.
 pub fn compute_hpc_feature_frame_batch(
-    ohlcv: &Ohlcv,
+    source: &CanonicalOhlcvFrame,
     profile: FeatureProfile,
     budget_rows: usize,
     batch: Option<std::sync::Arc<crate::core::hpc_ta::SweepBatch>>,
 ) -> Result<FeatureFrame> {
     with_extended_sweep_working_set(batch, || {
-        compute_hpc_feature_frame_sized(ohlcv, profile, budget_rows)
+        compute_hpc_feature_frame_sized(source, profile, budget_rows)
     })
 }
 
-/// Temp path for a discovery feature-store, unique per (symbol, base_tf,
-/// process). The store auto-deletes when its `FeatureFrame` drops, so this
-/// path collides only if a prior run crashed mid-build (truncate-on-create
-/// reclaims it).
-fn discovery_feature_store_path(symbol: &str, base_tf: &str) -> std::path::PathBuf {
-    let sanitize = |s: &str| -> String {
-        s.chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect()
-    };
-    let mut dir = std::env::temp_dir();
-    dir.push("neoethos_feature_store");
-    let _ = std::fs::create_dir_all(&dir);
-    // Sweep ORPHAN feature stores left by FORCE-KILLED prior runs (Drop's
-    // delete_on_drop only fires on graceful exit; a kill leaks the file — and
-    // the multi-TF M3 cube is ~12 GB each, so a few killed runs fill the disk).
-    // Best-effort: on Windows a file still mmap'd by a LIVE process refuses
-    // deletion, so this only removes genuine orphans from dead processes.
-    sweep_orphan_feature_stores(&dir);
-    dir.push(format!(
-        "{}_{}_{}.fstore",
-        sanitize(symbol),
-        sanitize(base_tf),
-        std::process::id()
-    ));
-    dir
+#[derive(Debug)]
+struct MultiTimeframeFeatureBlock {
+    timeframe: String,
+    source: CanonicalOhlcvFrame,
+    original_names: Vec<String>,
+    columns: Vec<FeatureColumnF64>,
+    higher_timeframe: bool,
+    availability_rule: String,
+    availability_lag_ms: Option<i64>,
+    max_age_ms: Option<i64>,
 }
 
-/// Delete `.fstore` files orphaned by force-killed discovery runs. Runs once per
-/// process (before this process creates any of its own stores). On Windows a
-/// live process's mapped file refuses `remove_file`, so live runs are protected.
-fn sweep_orphan_feature_stores(dir: &std::path::Path) {
-    use std::sync::OnceLock;
-    static SWEPT: OnceLock<()> = OnceLock::new();
-    if SWEPT.set(()).is_err() {
-        return; // already swept this process
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut freed = 0u64;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("fstore") {
-            continue;
-        }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        if std::fs::remove_file(&path).is_ok() {
-            freed += size;
-        }
-    }
-    if freed > 0 {
-        tracing::info!(
-            target: "neoethos_data::feature_store",
-            freed_mb = freed / (1024 * 1024),
-            "swept orphan feature stores from force-killed runs"
+fn retain_columns_with_normalization_training_support(
+    columns: &mut Vec<FeatureColumnF64>,
+    training_rows: std::ops::Range<usize>,
+) -> Result<Vec<String>> {
+    for column in columns.iter() {
+        anyhow::ensure!(
+            training_rows.start < training_rows.end && training_rows.end <= column.len(),
+            "feature column `{}` normalization support range {:?} is outside 0..{}",
+            column.name,
+            training_rows,
+            column.len()
         );
     }
-}
 
-/// Stream one in-RAM `[samples × cols]` feature block to the mmap store, column
-/// by column (each column becomes one feature-major row), normalising each
-/// series in place when enabled, then letting the caller free the block. Keeps
-/// peak RAM at one timeframe's block rather than the whole multi-TF cube.
-fn append_feature_block(
-    writer: &mut crate::core::feature_store::FeatureStoreWriter,
-    block: &Array2<f32>,
-    normalize: bool,
-) -> Result<()> {
-    for c in 0..block.ncols() {
-        let mut series: Vec<f32> = block.column(c).to_vec();
-        if normalize {
-            // D09: fit robust-z stats on the training prefix, not the full
-            // series, so the OOS tail is not leaked into and the values stay
-            // stable under future appends.
-            let fit_rows = crate::core::normalization::norm_fit_rows(series.len());
-            crate::core::normalization::normalize_feature_series_in_place(&mut series, fit_rows);
+    let mut dropped = Vec::new();
+    columns.retain(|column| {
+        let supported = column.validity[training_rows.clone()]
+            .iter()
+            .any(|validity| validity.is_valid());
+        if !supported {
+            dropped.push(column.name.clone());
         }
-        writer.append_feature(&series)?;
-    }
-    Ok(())
+        supported
+    });
+    Ok(dropped)
 }
 
-/// Compute + align ONE higher-timeframe feature block onto the base grid.
-/// Returns `None` when the higher TF equals the base or is absent from the
-/// dataset. Shared by the in-RAM and streaming (mmap) cube builders so the
-/// F-308 stale-data handling and the alignment live in a single place.
+fn take_in_memory_columns(frame: FeatureFrame) -> Result<Vec<FeatureColumnF64>> {
+    match frame.data {
+        FeatureData::InMemory(columns) => Ok(columns),
+        FeatureData::Vortex(_) | FeatureData::VortexWindow(_) | FeatureData::View(_) => {
+            anyhow::bail!("scalar feature computation unexpectedly returned a Vortex-backed frame")
+        }
+    }
+}
+
+/// Compute and causally align one immutable higher-timeframe source onto the
+/// canonical millisecond base grid. No timestamp-unit inference or f32 bridge
+/// exists on this path.
 fn compute_aligned_higher_block(
-    ds: &SymbolDataset,
+    source: CanonicalOhlcvFrame,
     base_tf: &str,
     base_ns: &[i64],
     h_tf: &str,
     profile: FeatureProfile,
-) -> Result<Option<(Vec<String>, Array2<f32>)>> {
+    budget_rows: usize,
+    classic_run_plan: &crate::core::hpc_ta::ClassicTaRunPlan,
+) -> Result<Option<MultiTimeframeFeatureBlock>> {
     if h_tf == base_tf {
         return Ok(None);
     }
-    let Some(h_ohlcv) = ds.frames.get(h_tf) else {
-        return Ok(None);
-    };
-    // The budget is sized from the BASE grid, not from this higher timeframe —
-    // otherwise the admitted indicator set (and therefore this block's width)
-    // would differ from the base block's and the cube could not be assembled.
-    // See `compute_hpc_feature_frame_sized`.
-    let h_feats = compute_hpc_feature_frame_sized(h_ohlcv, profile, base_ns.len())?;
+    let h_ohlcv = source.ohlcv();
+    // Every independently downloaded timeframe uses the same run-wide budget
+    // sized from the widest direct frame. Otherwise the admitted indicator set
+    // (and therefore block width) could vary between timeframes.
+    let h_feats = compute_hpc_feature_frame_sized_with_classic_plan(
+        &source,
+        profile,
+        budget_rows,
+        classic_run_plan,
+    )?;
     let h_ns = h_ohlcv
         .timestamp
         .as_ref()
         .context("higher tf has no timestamps")?;
-    // Audit D02 (2026-07-13): higher-TF bars are OPEN-stamped, so a bar's
-    // final feature values only exist at stamp + period (its close). The
-    // alignment must therefore lag availability by ONE FULL PERIOD —
-    // otherwise every base bar inside a still-forming higher-TF bucket
-    // reads that bucket's FINAL values (up to a period of lookahead: 4h on
-    // H4, a day on D1), and live — which sees a partial forming bar —
-    // silently diverges from the backtest. Refuse to align without a
-    // resolvable period: silent lookahead is worse than a hard error.
-    //
-    // Audit D01 (same day): the period must be expressed in the SAME UNIT
-    // as the timestamps — and this codebase has carried both (datasets are
-    // normalized to MILLISECONDS at the load boundary and the live path
-    // builds ms, while this file's older `*_ns` constants assumed
-    // nanoseconds, which is why the F-308 staleness cap never fired in
-    // production). Instead of guessing the unit, derive the period from
-    // the BASE GRID itself: one higher-TF period = median base spacing ×
-    // (higher minutes / base minutes). Unit-agnostic — correct for ms, ns,
-    // and synthetic test grids alike.
-    let h_mins = parse_timeframe_to_minutes(h_tf)
-        .ok()
-        .filter(|m| *m > 0)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot resolve the bar period for higher timeframe '{h_tf}' — refusing \
+    // Higher-TF bars are OPEN-stamped, so final feature values must remain
+    // hidden until the bar is closed. Fixed frames use the exact typed period.
+    // Calendar frames never invent 24h/7d/30d durations: row N becomes
+    // available only at the observed open of direct broker row N+1, while the
+    // final row remains unavailable because its close is not evidenced.
+    let h_timeframe = h_tf.parse::<CanonicalTimeframe>().map_err(|_| {
+        anyhow::anyhow!(
+            "cannot resolve canonical higher timeframe '{h_tf}' — refusing \
                  to align its features without close-availability (that would reintroduce \
                  up to one period of lookahead into the feature cube)"
-            )
-        })?;
-    let base_mins = parse_timeframe_to_minutes(base_tf)
-        .ok()
-        .filter(|m| *m > 0)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot resolve the bar period for base timeframe '{base_tf}' — needed to \
-                 express the higher-TF availability lag in the timestamp grid's own unit"
-            )
-        })?;
-    let median_base_step = {
-        let mut steps: Vec<i64> = base_ns.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0).collect();
-        if steps.is_empty() {
-            anyhow::bail!(
-                "base timeframe '{base_tf}' has no positive timestamp spacing — cannot \
-                 derive the higher-TF availability lag (dataset looks degenerate)"
-            );
-        }
-        let mid = steps.len() / 2;
-        steps.select_nth_unstable(mid);
-        steps[mid]
-    };
-    let period_units = median_base_step
-        .saturating_mul(h_mins as i64)
-        .checked_div(base_mins as i64)
-        .filter(|p| *p > 0)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "derived a non-positive higher-TF period for '{h_tf}' over base '{base_tf}' \
-                 (median base step {median_base_step}) — refusing to align"
-            )
-        })?;
-    // F-308: cap forward-fill at 2× the higher-TF period so stale higher-TF
-    // data becomes NaN (flagged downstream) instead of a frozen-constant
-    // column that would feed the GA zero / look-alike signals. Measured
-    // from the bar's CLOSE (availability) since D02; expressed in the
-    // grid's own unit since D01 (the old ×1e9 cap could never fire on the
-    // production ms grids).
-    let max_age_units = Some(period_units.saturating_mul(2));
-    let base_last = base_ns.last().copied().unwrap_or(0);
-    let h_last = h_ns.last().copied().unwrap_or(0);
-    if base_last > 0 && h_last > 0 && base_last > h_last {
-        if let Some(max_age) = max_age_units {
+        )
+    })?;
+    let fixed_period_ms = h_timeframe.fixed_duration_ms();
+    let max_age_ms = fixed_period_ms.map(|period_ms| period_ms.saturating_mul(2));
+    if let (Some(base_last), Some(h_last), Some(max_age)) =
+        (base_ns.last().copied(), h_ns.last().copied(), max_age_ms)
+    {
+        if base_last > h_last {
             let staleness = base_last - h_last;
             if staleness > max_age {
                 tracing::warn!(
                     target: "neoethos_data::prepare_multitimeframe_features",
                     base_tf = base_tf,
                     higher_tf = h_tf,
-                    staleness_grid_units = staleness,
-                    max_age_grid_units = max_age,
+                    staleness_ms = staleness,
+                    max_age_ms = max_age,
                     "higher-TF last bar is older than 2× period — feature columns past max_age will be NaN. Re-run --bootstrap-data for this (symbol, timeframe) to refresh."
                 );
             }
         }
     }
-    let h_names: Vec<String> = h_feats
-        .names
-        .iter()
-        .map(|n| format!("{}_{}", h_tf, n))
-        .collect();
-    let h_block = match h_feats.data {
-        crate::core::features::FeatureData::InMemory(a) => a,
-        crate::core::features::FeatureData::Mmap(_)
-        | crate::core::features::FeatureData::MmapWindow { .. } => {
-            anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
-        }
+    let original_names = h_feats.names.clone();
+    let h_columns = take_in_memory_columns(h_feats)?;
+    let (mut aligned, availability_rule, availability_lag_ms) = if let Some(period_ms) =
+        fixed_period_ms
+    {
+        (
+            align_feature_columns_by_ms(base_ns, h_ns, &h_columns, true, max_age_ms, period_ms)?,
+            "fixed_open_plus_period_v1",
+            Some(period_ms),
+        )
+    } else {
+        let mut available_at_ms = h_ns.iter().skip(1).copied().map(Some).collect::<Vec<_>>();
+        available_at_ms.push(None);
+        (
+            align_feature_columns_at_explicit_availability_ms(
+                base_ns,
+                h_ns,
+                &available_at_ms,
+                &h_columns,
+                true,
+                None,
+            )?,
+            "next_direct_bar_open_v1",
+            None,
+        )
     };
-    let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_units, period_units);
-    Ok(Some((h_names, aligned)))
+    for column in &mut aligned {
+        column.name = format!("{}_{}", h_tf, column.name);
+    }
+    Ok(Some(MultiTimeframeFeatureBlock {
+        timeframe: h_tf.to_owned(),
+        source,
+        original_names,
+        columns: aligned,
+        higher_timeframe: true,
+        availability_rule: availability_rule.to_owned(),
+        availability_lag_ms,
+        max_age_ms,
+    }))
 }
 
-/// Normalise each column of an in-RAM feature block in place (robust z-score),
-/// matching the per-series normalisation `append_feature_block` applies on the
-/// streaming path so the two cube layouts stay identical.
-/// Normalize every column in place. Generic over the storage so it works on an
-/// owned block AND on a mutable VIEW into the final cube — the in-RAM assembly
-/// normalizes each timeframe's columns after placing them, avoiding a second
-/// copy of the block.
-fn normalize_block_columns<S>(block: &mut ndarray::ArrayBase<S, ndarray::Ix2>)
-where
-    S: ndarray::DataMut<Elem = f32>,
-{
-    let fit_rows = crate::core::normalization::norm_fit_rows(block.nrows());
-    for mut col in block.columns_mut() {
-        let mut series: Vec<f32> = col.to_vec();
-        // D09: fit stats on the training prefix (see append_feature_block).
-        crate::core::normalization::normalize_feature_series_in_place(&mut series, fit_rows);
-        for (dst, src) in col.iter_mut().zip(series) {
-            *dst = src;
-        }
+fn producer_for_feature(name: &str) -> Result<ProductionFeatureProducerId> {
+    let source = feature_column_metadata(name)
+        .with_context(|| format!("feature `{name}` has no registered production source"))?
+        .source;
+    Ok(match source {
+        FeatureSource::SmartMoneyConcept => ProductionFeatureProducerId::SmartMoneyConcept,
+        FeatureSource::ClassicTechnicalAnalysis => ProductionFeatureProducerId::ClassicVectorTa,
+        FeatureSource::Quantitative => ProductionFeatureProducerId::Quantitative,
+        FeatureSource::Session => ProductionFeatureProducerId::Session,
+        FeatureSource::Regime => ProductionFeatureProducerId::Regime,
+        FeatureSource::Footprint => ProductionFeatureProducerId::Footprint,
+    })
+}
+
+fn semantic_source_hash(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for part in parts {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
     }
+    hash.finalize().into()
+}
+
+fn normalization_fit_hash(
+    columns: &[FeatureColumnF64],
+    fits: &[crate::core::normalization::RobustNormalizationFitF64],
+) -> Result<[u8; 32]> {
+    anyhow::ensure!(
+        columns.len() == fits.len(),
+        "normalization fit count mismatch"
+    );
+    let mut hash = Sha256::new();
+    hash.update(b"neoethos.robust-normalization-fit.f64.v1\0");
+    for (column, fit) in columns.iter().zip(fits) {
+        hash.update((column.name.len() as u64).to_be_bytes());
+        hash.update(column.name.as_bytes());
+        hash.update((fit.training_rows.start as u64).to_be_bytes());
+        hash.update((fit.training_rows.end as u64).to_be_bytes());
+        hash.update(fit.median.to_bits().to_be_bytes());
+        hash.update(fit.scale.to_bits().to_be_bytes());
+        hash.update((fit.valid_training_cells as u64).to_be_bytes());
+        hash.update([u8::from(fit.degenerate)]);
+    }
+    Ok(hash.finalize().into())
+}
+
+fn build_multitimeframe_feature_contract(
+    blocks: &[MultiTimeframeFeatureBlock],
+    normalization_fits: Option<&[crate::core::normalization::RobustNormalizationFitF64]>,
+) -> Result<(
+    neoethos_feature_contracts::FeaturePlanV1,
+    neoethos_feature_contracts::DatasetFeatureArtifactProvenanceV1,
+    Vec<std::sync::Arc<crate::core::dataset_generation_lease::DatasetGenerationLease>>,
+)> {
+    use neoethos_feature_contracts::{
+        DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOperationTagV1, FeatureOutputV1,
+        FeatureParameterV1, FeaturePlanV1,
+    };
+
+    anyhow::ensure!(
+        !blocks.is_empty(),
+        "multi-timeframe plan has no source blocks"
+    );
+    let producer_manifest = production_feature_producer_manifest_v1()?;
+    let physical_schema_hash = semantic_source_hash(&[b"neoethos.ohlcv.f64-ms.v1"]);
+    let projection_source_hash = semantic_source_hash(&[include_bytes!("lib.rs")]);
+    let alignment_source_hash =
+        semantic_source_hash(&[include_bytes!("core/features.rs"), include_bytes!("lib.rs")]);
+    let normalization_source_hash =
+        semantic_source_hash(&[include_bytes!("core/normalization.rs")]);
+    let normalized = normalization_fits.is_some();
+    let mut nodes = Vec::new();
+    let mut bindings = Vec::new();
+    let mut projection_node_ids = Vec::new();
+    let mut final_outputs = Vec::new();
+    let mut source_leases = Vec::new();
+    let mut registered_sources = std::collections::BTreeSet::new();
+
+    for (block_index, block) in blocks.iter().enumerate() {
+        anyhow::ensure!(
+            !block.original_names.is_empty() && !block.columns.is_empty(),
+            "{} feature block is empty",
+            block.timeframe
+        );
+        let source_token = block.source.artifact().identity().to_path_component();
+        let source_node_id = format!("source:{source_token}");
+        if registered_sources.insert(source_node_id.clone()) {
+            let mut physical_outputs = ["open", "high", "low", "close"]
+                .into_iter()
+                .map(|name| FeatureOutputV1::f64(format!("physical:{source_token}:{name}"), 1))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if block.source.ohlcv().volume.is_some() {
+                physical_outputs.push(FeatureOutputV1::f64(
+                    format!("physical:{source_token}:volume"),
+                    1,
+                )?);
+            }
+            nodes.push(FeatureNodeV1::source(
+                source_node_id.clone(),
+                block.source.artifact().identity().clone(),
+                "neoethos.ohlcv.f64-ms.v1",
+                1,
+                physical_outputs,
+                physical_schema_hash,
+            )?);
+            bindings.push(block.source.source_binding(source_node_id.clone())?);
+            source_leases.push(std::sync::Arc::clone(block.source.artifact().lease()));
+        }
+        let (frame_input_node_id, frame_token) =
+            direct_frame_source_node(&block.source, &source_node_id, &source_token)?;
+
+        let mut producer_node_ids = Vec::new();
+        for producer in PRODUCTION_FEATURE_PRODUCER_ORDER {
+            let selected = block
+                .original_names
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| {
+                    producer_for_feature(name)
+                        .map(|actual| (actual == producer).then_some((index, name)))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                !selected.is_empty(),
+                "{} feature block emitted no columns for production producer {producer:?}",
+                block.timeframe
+            );
+            let manifest = producer_manifest
+                .iter()
+                .find(|row| row.producer() == producer)
+                .ok_or_else(|| anyhow::anyhow!("producer {producer:?} has no semantic manifest"))?;
+            let node_id = format!("{}:{frame_token}", production_feature_node_id(producer));
+            let outputs = selected
+                .iter()
+                .map(|(_, name)| {
+                    FeatureOutputV1::f64(
+                        format!("raw:{frame_token}:{name}"),
+                        manifest.semantic_version(),
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            nodes.push(FeatureNodeV1::transform(
+                node_id.clone(),
+                FeatureOperationTagV1::Indicator,
+                manifest.semantic_version(),
+                vec![frame_input_node_id.clone()],
+                outputs,
+                Vec::new(),
+                [0; 32],
+                *manifest.semantic_source_set().identity().as_bytes(),
+                None,
+            )?);
+            producer_node_ids.push(node_id);
+        }
+
+        let projection_node_id = format!("projection:{block_index}:{frame_token}");
+        let projected_outputs = block
+            .columns
+            .iter()
+            .map(|column| {
+                let output_name = if normalized {
+                    format!("pre-normalize:{block_index}:{}", column.name)
+                } else {
+                    column.name.clone()
+                };
+                FeatureOutputV1::f64(
+                    output_name,
+                    if block.higher_timeframe {
+                        HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION
+                    } else {
+                        1
+                    },
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        nodes.push(FeatureNodeV1::transform(
+            projection_node_id.clone(),
+            if block.higher_timeframe {
+                FeatureOperationTagV1::HigherTimeframeAlignment
+            } else {
+                FeatureOperationTagV1::Derived
+            },
+            if block.higher_timeframe {
+                HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION
+            } else {
+                1
+            },
+            producer_node_ids,
+            projected_outputs,
+            vec![
+                FeatureParameterV1::text("timeframe", block.timeframe.clone())?,
+                FeatureParameterV1::bool("higher_timeframe", block.higher_timeframe)?,
+                FeatureParameterV1::text("availability_rule", block.availability_rule.clone())?,
+                FeatureParameterV1::i64(
+                    "availability_lag_ms",
+                    block.availability_lag_ms.unwrap_or(-1),
+                )?,
+                FeatureParameterV1::i64("max_age_ms", block.max_age_ms.unwrap_or(-1))?,
+            ],
+            if block.higher_timeframe {
+                alignment_source_hash
+            } else {
+                projection_source_hash
+            },
+            if block.higher_timeframe {
+                alignment_source_hash
+            } else {
+                projection_source_hash
+            },
+            None,
+        )?);
+        projection_node_ids.push(projection_node_id);
+        final_outputs.extend(block.columns.iter().map(|column| column.name.clone()));
+    }
+
+    if let Some(fits) = normalization_fits {
+        let all_columns = blocks
+            .iter()
+            .flat_map(|block| block.columns.iter().cloned())
+            .collect::<Vec<_>>();
+        let fitted_state_hash = normalization_fit_hash(&all_columns, fits)?;
+        let outputs = final_outputs
+            .iter()
+            .map(|name| FeatureOutputV1::f64(name.clone(), 2))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        nodes.push(FeatureNodeV1::transform(
+            "normalization:robust-f64",
+            FeatureOperationTagV1::Normalization,
+            2,
+            projection_node_ids,
+            outputs,
+            Vec::new(),
+            normalization_source_hash,
+            normalization_source_hash,
+            Some(fitted_state_hash),
+        )?);
+    }
+
+    let plan = FeaturePlanV1::new(nodes, final_outputs)?;
+    let provenance = DatasetFeatureArtifactProvenanceV1::new(&plan, bindings)?;
+    Ok((plan, provenance, source_leases))
 }
 
 /// Decide whether the multi-TF feature cube is assembled in RAM (fast, no disk
@@ -1502,8 +1908,7 @@ where
 /// way to run both paths on the same input, so the seam survives the env
 /// deletion as something a test can reach and a shell cannot.
 #[cfg(test)]
-pub(crate) static TEST_CUBE_MODE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+pub(crate) static TEST_CUBE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Peak RAM the in-memory assembly needs for a cube of `cube_bytes`: the cube
 /// plus ONE timeframe block (~1.1x, demanded as 1.5x for margin) plus a 2 GB
@@ -1621,90 +2026,6 @@ pub fn report_retired_env_vars() {
     });
 }
 
-/// Assemble the multi-timeframe cube directly in RAM, allocating it ONCE and
-/// writing each timeframe into its own column range.
-///
-/// Peak memory is the cube plus a single timeframe block, because each block is
-/// dropped as soon as its columns are copied (the previous `concatenate`
-/// approach held every block AND the result simultaneously — a 2× peak).
-///
-/// Returns `Ok(None)` — never a partial cube — if the real column widths do not
-/// match the estimate the RAM/disk decision was made from. The caller then
-/// takes the streaming disk path, so a width surprise costs time but never
-/// loses features and never grows past the budget that was approved.
-#[allow(clippy::too_many_arguments)]
-fn try_assemble_cube_in_ram(
-    ds: &SymbolDataset,
-    base_tf: &str,
-    base_ns: &[i64],
-    opts: &FeatureBuildOptions,
-    active_higher: &[String],
-    base_block: &Array2<f32>,
-    base_names: &[String],
-    normalize: bool,
-    n_samples: usize,
-    est_features: usize,
-) -> Result<Option<FeatureFrame>> {
-    use ndarray::s;
-
-    let base_cols = base_block.ncols();
-    if base_cols > est_features {
-        return Ok(None);
-    }
-    let mut cube = Array2::<f32>::zeros((n_samples, est_features));
-    let mut names: Vec<String> = Vec::with_capacity(est_features);
-    let mut col = 0usize;
-
-    // Base timeframe: copy in, then normalize the destination view in place.
-    {
-        let mut dst = cube.slice_mut(s![.., col..col + base_cols]);
-        dst.assign(base_block);
-        if normalize {
-            normalize_block_columns(&mut dst);
-        }
-    }
-    names.extend(base_names.iter().cloned());
-    col += base_cols;
-
-    for h_tf in active_higher {
-        let Some((h_names, aligned)) =
-            compute_aligned_higher_block(ds, base_tf, base_ns, h_tf, opts.profile)?
-        else {
-            // Every entry in `active_higher` was filtered to exist in the
-            // dataset, so this is the width-surprise case: bail to disk.
-            return Ok(None);
-        };
-        let w = aligned.ncols();
-        if col + w > est_features {
-            return Ok(None);
-        }
-        cube.slice_mut(s![.., col..col + w]).assign(&aligned);
-        // Free this timeframe BEFORE the next one is computed — this is what
-        // keeps the peak at cube + one block.
-        drop(aligned);
-        if normalize {
-            let mut dst = cube.slice_mut(s![.., col..col + w]);
-            normalize_block_columns(&mut dst);
-        }
-        names.extend(h_names);
-        col += w;
-    }
-
-    if col != est_features || names.len() != est_features {
-        // Fewer columns than the allocation: returning the cube as-is would
-        // append all-zero phantom features. Shrinking here would need a second
-        // full copy (the very peak this function exists to avoid), so hand the
-        // build to the streaming path instead.
-        return Ok(None);
-    }
-
-    Ok(Some(FeatureFrame {
-        timestamps: base_ns.to_vec(),
-        names,
-        data: crate::core::features::FeatureData::InMemory(cube),
-    }))
-}
-
 /// Build the multi-timeframe feature cube.
 ///
 /// This used to take a fourth argument, `_cache: Option<&FeatureCache>`. The
@@ -1718,419 +2039,346 @@ pub fn prepare_multitimeframe_features_with_options(
     base_tf: &str,
     opts: &FeatureBuildOptions,
 ) -> Result<FeatureFrame> {
-    let base_ohlcv = ds
-        .frames
+    prepare_multitimeframe_features_with_optional_cutoff(ds, base_tf, opts, None)
+}
+
+/// Build the multi-timeframe feature cube from the independently downloaded
+/// direct rows strictly before one shared half-open timestamp cutoff.
+///
+/// The cutoff is applied to each canonical timeframe frame before feature
+/// computation. The returned feature provenance therefore keeps every full
+/// immutable generation identity/hash/lease while binding only the exact rows
+/// consumed from that generation. No timeframe is derived from another one.
+pub fn prepare_multitimeframe_features_before_with_options(
+    ds: &SymbolDataset,
+    base_tf: &str,
+    opts: &FeatureBuildOptions,
+    end_exclusive_ms: i64,
+) -> Result<FeatureFrame> {
+    prepare_multitimeframe_features_with_optional_cutoff(ds, base_tf, opts, Some(end_exclusive_ms))
+}
+
+fn prepare_multitimeframe_features_with_optional_cutoff(
+    ds: &SymbolDataset,
+    base_tf: &str,
+    opts: &FeatureBuildOptions,
+    end_exclusive_ms: Option<i64>,
+) -> Result<FeatureFrame> {
+    let base_timeframe = base_tf
+        .parse::<CanonicalTimeframe>()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let selected_identity = ds
+        .source_artifacts
         .get(base_tf)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Base timeframe '{}' is missing from dataset '{}' — resample it first.",
-            base_tf, ds.symbol
-        ))?;
-    let base_ns = base_ohlcv
+        .with_context(|| format!("base timeframe {base_tf} has no direct canonical artifact"))?
+        .identity()
+        .clone();
+    let mut required = vec![base_timeframe];
+    let mut active_higher = Vec::new();
+    for timeframe in &opts.higher_tfs {
+        let parsed = timeframe
+            .parse::<CanonicalTimeframe>()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if parsed == base_timeframe {
+            continue;
+        }
+        anyhow::ensure!(
+            !required.contains(&parsed),
+            "duplicate requested direct timeframe {parsed}"
+        );
+        required.push(parsed);
+        active_higher.push(parsed.as_str().to_owned());
+    }
+    require_direct_timeframes(ds, &selected_identity, &required)?;
+    let mut direct_sources = std::collections::HashMap::with_capacity(required.len());
+    for timeframe in &required {
+        let source = ds.canonical_frame(timeframe.as_str())?;
+        let source = match end_exclusive_ms {
+            Some(cutoff) => source.prefix_before_timestamp_ms(cutoff).with_context(|| {
+                format!(
+                    "clipping direct canonical timeframe {timeframe} before the shared half-open cutoff {cutoff} ms"
+                )
+            })?,
+            None => source,
+        };
+        direct_sources.insert(timeframe.as_str().to_owned(), source);
+    }
+    let budget_rows = direct_sources
+        .values()
+        .map(CanonicalOhlcvFrame::len)
+        .max()
+        .context("direct timeframe request is empty")?;
+
+    // Capture one machine/admission decision for the complete direct-TF cube.
+    // In GpuOnly this also resolves the entire admitted graph before any
+    // producer starts, so a missing CUDA route cannot leave partial CPU/SMC
+    // feature allocations behind. Every frame below borrows this exact plan;
+    // falling available RAM during the build cannot narrow later timeframes.
+    let classic_run_plan = crate::core::hpc_ta::prepare_classic_ta_run_plan(
+        budget_rows,
+        crate::core::hpc_ta::resolved_indicator_compute_policy(),
+    )?;
+
+    let base_source = direct_sources
+        .remove(base_tf)
+        .context("validated base direct timeframe disappeared")?;
+    let base_ns = base_source
+        .ohlcv()
         .timestamp
         .as_ref()
-        .context("base has no timestamps")?;
-
+        .context("base has no timestamps")?
+        .clone();
     let n_samples = base_ns.len();
-
-    // ── RAM-aware multi-resolution feature cube ───────────────────────────
-    //
-    // The dense cube is `n_samples × features × 4 B` (~13 GB for full M1). When
-    // the machine has enough free RAM we assemble it directly in memory (no
-    // disk write, nothing to clean up); otherwise we stream each TF into a
-    // feature-major mmap store so peak RAM stays at ONE timeframe's compute —
-    // the NEVER-OOM fallback that lets discovery run on any hardware. The
-    // sink is chosen per (symbol, TF) from the cube estimate vs free RAM.
     let normalize = current_data_runtime_overrides().normalize_features;
+    if normalize {
+        anyhow::ensure!(
+            opts.normalization_training_rows.is_some(),
+            "normalization is enabled but no explicit in-sample training row range was supplied"
+        );
+    }
 
-    // Base timeframe — native resolution, no alignment. Computed up front
-    // (needed by both sink paths) and used to size the cube.
-    let base_feats = compute_hpc_feature_frame(base_ohlcv, opts.profile)?;
-    let base_names: Vec<String> = base_feats
-        .names
-        .iter()
-        .map(|n| {
-            if opts.prefix_base_features {
-                format!("{}_{}", base_tf, n)
-            } else {
-                n.clone()
-            }
-        })
-        .collect();
-    let base_block = match base_feats.data {
-        crate::core::features::FeatureData::InMemory(a) => a,
-        crate::core::features::FeatureData::Mmap(_)
-        | crate::core::features::FeatureData::MmapWindow { .. } => {
-            anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
+    let base_frame = compute_hpc_feature_frame_sized_with_classic_plan(
+        &base_source,
+        opts.profile,
+        budget_rows,
+        &classic_run_plan,
+    )?;
+    let original_names = base_frame.names.clone();
+    let mut base_columns = take_in_memory_columns(base_frame)?;
+    if opts.prefix_base_features {
+        for column in &mut base_columns {
+            column.name = format!("{}_{}", base_tf, column.name);
         }
-    };
+    }
+    let mut blocks = vec![MultiTimeframeFeatureBlock {
+        timeframe: base_tf.to_owned(),
+        source: base_source,
+        original_names,
+        columns: base_columns,
+        higher_timeframe: false,
+        availability_rule: "base_bar_open_v1".to_owned(),
+        availability_lag_ms: Some(0),
+        max_age_ms: None,
+    }];
 
-    // Active higher TFs (present in the dataset, not the base).
-    let active_higher: Vec<String> = opts
-        .higher_tfs
-        .iter()
-        .filter(|h| h.as_str() != base_tf && ds.frames.contains_key(h.as_str()))
-        .cloned()
-        .collect();
+    for higher_tf in &active_higher {
+        let source = direct_sources
+            .remove(higher_tf)
+            .with_context(|| format!("required direct timeframe {higher_tf} disappeared"))?;
+        let block = compute_aligned_higher_block(
+            source,
+            base_tf,
+            &base_ns,
+            higher_tf,
+            opts.profile,
+            budget_rows,
+            &classic_run_plan,
+        )?
+        .with_context(|| format!("required direct timeframe {higher_tf} disappeared"))?;
+        blocks.push(block);
+    }
 
-    // Per-TF feature count = base block width (same registry for every TF);
-    // estimate the whole cube and pick RAM vs disk-mmap accordingly.
-    let per_tf = base_block.ncols().max(1);
-    let est_features = per_tf.saturating_mul(1 + active_higher.len());
+    let mut normalization_fits = Vec::new();
+    if let Some(training_rows) = opts
+        .normalization_training_rows
+        .clone()
+        .filter(|_| normalize)
+    {
+        anyhow::ensure!(
+            training_rows.start < training_rows.end && training_rows.end <= n_samples,
+            "normalization training rows {:?} are outside 0..{n_samples}",
+            training_rows
+        );
+        if opts.drop_columns_without_normalization_training_support {
+            let mut dropped = Vec::new();
+            for block in &mut blocks {
+                dropped.extend(retain_columns_with_normalization_training_support(
+                    &mut block.columns,
+                    training_rows.clone(),
+                )?);
+            }
+            blocks.retain(|block| !block.columns.is_empty());
+            anyhow::ensure!(
+                !blocks.is_empty(),
+                "normalization training range {:?} supports no feature columns",
+                training_rows
+            );
+            if !dropped.is_empty() {
+                let retained = blocks
+                    .iter()
+                    .map(|block| block.columns.len())
+                    .sum::<usize>();
+                tracing::info!(
+                    target: "neoethos_data::prepare_multitimeframe_features",
+                    dropped_columns = dropped.len(),
+                    retained_columns = retained,
+                    training_start = training_rows.start,
+                    training_end = training_rows.end,
+                    "projected columns without normalization support in the exact training range"
+                );
+            }
+        }
+        for block in &mut blocks {
+            for column in &mut block.columns {
+                normalization_fits.push(crate::core::normalization::normalize_feature_column_f64(
+                    column,
+                    training_rows.clone(),
+                )?);
+            }
+        }
+    }
+
+    let (plan, provenance, source_leases) = build_multitimeframe_feature_contract(
+        &blocks,
+        normalize.then_some(normalization_fits.as_slice()),
+    )?;
+    let columns = blocks
+        .into_iter()
+        .flat_map(|block| block.columns)
+        .collect::<Vec<_>>();
+    let est_features = columns.len();
     let cube_bytes = (n_samples as u64)
         .saturating_mul(est_features as u64)
-        .saturating_mul(4);
+        .saturating_mul(
+            (std::mem::size_of::<f64>() + std::mem::size_of::<FeatureCellValidity>()) as u64,
+        );
     let in_ram = should_build_cube_in_ram(cube_bytes);
     tracing::info!(
         target: "neoethos_data::prepare_multitimeframe_features",
         symbol = %ds.symbol,
         base_tf = base_tf,
         rows = n_samples,
-        per_tf_features = per_tf,
+        features = est_features,
         timeframes = 1 + active_higher.len(),
         est_cube_gb = format!("{:.2}", cube_bytes as f64 / 1e9),
         available_ram_gb = format!("{:.1}", neoethos_core::available_memory_bytes() as f64 / 1e9),
-        sink = if in_ram { "RAM (no disk write)" } else { "disk mmap" },
+        sink = if in_ram { "RAM (f64 + validity)" } else { "Vortex scratch" },
         "feature cube build plan"
     );
-
     if in_ram {
-        // Allocate the cube ONCE and fill it timeframe by timeframe, freeing
-        // each block as it lands (see `try_assemble_cube_in_ram`). `base_block`
-        // stays borrowed so the disk path below can still use it if the
-        // assembly bails.
-        if let Some(frame) = try_assemble_cube_in_ram(
-            ds,
-            base_tf,
-            base_ns,
-            opts,
-            &active_higher,
-            &base_block,
-            &base_names,
-            normalize,
-            n_samples,
-            est_features,
-        )? {
-            return Ok(frame);
-        }
-        tracing::warn!(
-            target: "neoethos_data::prepare_multitimeframe_features",
-            symbol = %ds.symbol,
-            base_tf = base_tf,
-            est_features,
-            "in-RAM cube assembly bailed (per-timeframe feature widths did not match \
-             the estimate the RAM budget was approved from) — streaming to the disk \
-             store instead. No features are lost; this is slower, please report it."
+        return FeatureFrame::from_canonical_columns(
+            base_ns.clone(),
+            columns,
+            plan,
+            provenance,
+            source_leases,
         );
     }
 
-    // ── Streaming disk-mmap path (NEVER-OOM fallback for large cubes) ──────
-    let store_path = discovery_feature_store_path(&ds.symbol, base_tf);
-    let mut writer =
-        crate::core::feature_store::FeatureStoreWriter::create(&store_path, n_samples)?;
-    let mut all_names = base_names;
-    append_feature_block(&mut writer, &base_block, normalize)?;
-    drop(base_block);
-
-    for h_tf in &active_higher {
-        if let Some((h_names, aligned)) =
-            compute_aligned_higher_block(ds, base_tf, base_ns, h_tf, opts.profile)?
-        {
-            all_names.extend(h_names);
-            append_feature_block(&mut writer, &aligned, normalize)?;
-        }
+    static RUN_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let scratch_root = vortex_feature_run_root();
+    let removed = crate::core::feature_run_lease::sweep_orphan_feature_runs(&scratch_root)?;
+    if !removed.is_empty() {
+        tracing::info!(
+            target: "neoethos_data::vortex_feature_store",
+            removed_runs = removed.len(),
+            "removed crashed Vortex feature scratch runs after acquiring their OS leases"
+        );
     }
-
-    // Normalisation (opt-in via `NEOETHOS_BOT_NORMALIZE_FEATURES=1`) is applied
-    // per-series during the streaming append above. Robust z-score is
-    // per-column independent, so normalising each series before it is written
-    // to the store is identical to normalising the assembled matrix (see
-    // `normalize_feature_series_in_place`). Why opt-in: it is correct
-    // architecture (puts every column on the same scale, kills NaN
-    // propagation, fixes the EURJPY/XAUUSD empty-portfolio bug at the root) but
-    // the GA's `random_coarse_threshold = [0.15..0.55]` is calibrated for the
-    // un-normalized magnitude regime; enabling it without re-calibrating
-    // thresholds breaks discovery for symbols that currently work
-    // (EURUSD/GBPUSD/AUDUSD). Threshold re-calibration is a follow-up.
-    let n_features = writer.finish()?;
-    let store = crate::core::feature_store::FeatureStore::open(
-        &store_path,
-        n_features,
-        n_samples,
-        /* delete_on_drop */ true,
+    let sanitize = |value: &str| {
+        value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .take(24)
+            .collect::<String>()
+    };
+    let run_id = format!(
+        "{}-{}-{}-{}",
+        sanitize(&ds.symbol),
+        sanitize(base_tf),
+        std::process::id(),
+        RUN_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let feature_run = std::sync::Arc::new(crate::core::feature_run_lease::FeatureRunLease::create(
+        &scratch_root,
+        &run_id,
+    )?);
+    let store = crate::core::vortex_feature_store::VortexFeatureStore::create(
+        feature_run,
+        &base_ns,
+        &columns,
+        crate::core::vortex_feature_store::VortexFeatureStoreOptions::default(),
     )?;
-
-    Ok(FeatureFrame {
-        timestamps: base_ns.clone(),
-        names: all_names,
-        data: crate::core::features::FeatureData::Mmap(std::sync::Arc::new(store)),
-    })
+    FeatureFrame::from_canonical_vortex(base_ns, store, plan, provenance, source_leases)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unique_temp_root(test_name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "neoethos_data_{}_{}_{}",
-            test_name,
-            std::process::id(),
-            nonce
-        ))
+    #[test]
+    fn normalization_support_projection_never_looks_into_the_holdout_suffix() -> Result<()> {
+        use crate::core::features::{FeatureCellValidity, FeatureColumnF64};
+
+        let late_only = FeatureColumnF64::new(
+            "late_only",
+            vec![f64::NAN, f64::NAN, 7.0, 8.0],
+            vec![
+                FeatureCellValidity::Warmup,
+                FeatureCellValidity::Warmup,
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::Valid,
+            ],
+        )?;
+        let in_sample = FeatureColumnF64::new(
+            "in_sample",
+            vec![f64::NAN, 2.0, 3.0, 4.0],
+            vec![
+                FeatureCellValidity::Warmup,
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::Valid,
+            ],
+        )?;
+
+        let mut columns = vec![late_only, in_sample];
+        let dropped = retain_columns_with_normalization_training_support(&mut columns, 0..2)?;
+
+        assert_eq!(dropped, vec!["late_only"]);
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["in_sample"]
+        );
+        Ok(())
     }
 
-    fn write_valid_ohlcv_vortex(path: &Path) -> Result<()> {
-        // 64 rows so the resulting file is comfortably above
-        // VORTEX_MIN_PLAUSIBLE_BYTES. The integrity tests assert marker
-        // classification, not size, but the size gate runs first — keep
-        // their fixtures clear of it.
-        let n = 64usize;
+    #[test]
+    fn normalize_ohlcv_is_validation_only_and_rejects_noncanonical_order() -> Result<()> {
         let base_ms = 1_700_000_000_000_i64;
-        let mut timestamp = Vec::with_capacity(n);
-        let mut open = Vec::with_capacity(n);
-        let mut high = Vec::with_capacity(n);
-        let mut low = Vec::with_capacity(n);
-        let mut close = Vec::with_capacity(n);
-        for i in 0..n {
-            let base = 1.0 + (i as f64) * 0.001;
-            timestamp.push(base_ms + (i as i64) * 60_000);
-            open.push(base);
-            high.push(base + 0.002);
-            low.push(base - 0.002);
-            close.push(base + 0.001);
-        }
-        write_ohlcv_vortex(
-            path,
-            &Ohlcv {
-                timestamp: Some(timestamp),
-                open,
-                high,
-                low,
-                close,
-                volume: None,
-            },
-        )
-    }
-
-    #[test]
-    fn normalize_ohlcv_sorts_deduplicates_and_validates_rows() -> Result<()> {
-        // Note: `normalize_ohlcv` now folds timestamps to the
-        // canonical milliseconds unit at the write boundary (mirrors the
-        // read-side `vortex_array_to_ohlcv` call). Tiny integers like
-        // `[3, 1, 1, 2]` are inferred as Seconds by magnitude and multiplied
-        // by 1000 → `[1000, 2000, 3000]` ms after sort+dedup.
-        let normalized = normalize_ohlcv(&Ohlcv {
-            timestamp: Some(vec![3, 1, 1, 2]),
-            open: vec![1.3, 1.1, 9.9, 1.2],
-            high: vec![1.4, 1.2, 9.9, 1.3],
-            low: vec![1.2, 1.0, 9.9, 1.1],
-            close: vec![1.35, 1.15, 9.9, 1.25],
-            volume: Some(vec![2.0, 1.0, 9.9, 1.5]),
-        })?;
-
-        assert_eq!(normalized.timestamp, Some(vec![1000, 2000, 3000]));
-        assert_eq!(normalized.open, vec![1.1, 1.2, 1.3]);
-        assert_eq!(normalized.volume, Some(vec![1.0, 1.5, 2.0]));
-        Ok(())
-    }
-
-    #[test]
-    fn load_symbol_dataset_rejects_unreadable_discovered_timeframe() -> Result<()> {
-        let root = unique_temp_root("unreadable_discovered_timeframe");
-        let m1_dir = root.join("symbol=EURUSD").join("timeframe=M1");
-        let m5_dir = root.join("symbol=EURUSD").join("timeframe=M5");
-        fs::create_dir_all(&m1_dir)?;
-        fs::create_dir_all(&m5_dir)?;
-
-        write_valid_ohlcv_vortex(&m1_dir.join("data.vortex"))?;
-        // >= VORTEX_MIN_PLAUSIBLE_BYTES + a .complete marker so the
-        // integrity gate passes and the failure comes from the byte-level
-        // Vortex parser rejecting non-Vortex content (the test's intent),
-        // not from the size/marker gate.
-        fs::write(m5_dir.join("data.vortex"), vec![0u8; 1024])?;
-        fs::write(m5_dir.join("data.vortex.complete"), b"")?;
-
-        let err = load_symbol_dataset(&root, "EURUSD")
-            .expect_err("discovered unreadable timeframe must fail the dataset load");
+        let invalid = Ohlcv {
+            timestamp: Some(vec![base_ms + 60_000, base_ms, base_ms]),
+            open: vec![1.2, 1.1, 1.1],
+            high: vec![1.3, 1.2, 1.2],
+            low: vec![1.1, 1.0, 1.0],
+            close: vec![1.25, 1.15, 1.15],
+            volume: Some(vec![2.0, 1.0, 1.0]),
+        };
+        let err = normalize_ohlcv(&invalid)
+            .expect_err("canonical writer must not sort or deduplicate input rows");
+        let err_chain = format!("{err:#}");
         assert!(
-            err.to_string().contains("M5") || err.to_string().contains("vortex"),
-            "unexpected error: {err}"
+            err_chain.contains("strictly increasing"),
+            "unexpected error: {err_chain}"
         );
 
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn load_symbol_dataset_with_timeframes_rejects_requested_timeframe_failure() -> Result<()> {
-        let root = unique_temp_root("requested_timeframe_failure");
-        let m1_dir = root.join("symbol=EURUSD").join("timeframe=M1");
-        let m5_dir = root.join("symbol=EURUSD").join("timeframe=M5");
-        fs::create_dir_all(&m1_dir)?;
-        fs::create_dir_all(&m5_dir)?;
-
-        write_valid_ohlcv_vortex(&m1_dir.join("data.vortex"))?;
-        // >= VORTEX_MIN_PLAUSIBLE_BYTES + a .complete marker so the
-        // integrity gate passes and the failure comes from the byte-level
-        // Vortex parser rejecting non-Vortex content (the test's intent),
-        // not from the size/marker gate.
-        fs::write(m5_dir.join("data.vortex"), vec![0u8; 1024])?;
-        fs::write(m5_dir.join("data.vortex.complete"), b"")?;
-
-        let err = load_symbol_dataset_with_timeframes(&root, "EURUSD", &["M1", "M5"])
-            .expect_err("requested unreadable timeframe must fail the dataset load");
-        assert!(
-            err.to_string().contains("M5") || err.to_string().contains("vortex"),
-            "unexpected error: {err}"
-        );
-
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    // ─── F-307 vortex integrity gate (2026-05-28) ─────────────────────
-
-    fn make_tf_dir(root: &Path, symbol: &str, tf: &str) -> Result<PathBuf> {
-        let dir = root.join(format!("symbol={symbol}")).join(format!("timeframe={tf}"));
-        fs::create_dir_all(&dir)?;
-        Ok(dir)
-    }
-
-    #[test]
-    fn vortex_integrity_missing_when_no_data_vortex() -> Result<()> {
-        let root = unique_temp_root("integ_missing");
-        let dir = make_tf_dir(&root, "TEST", "M1")?;
-        assert_eq!(vortex_integrity(&dir), VortexIntegrity::Missing);
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn vortex_integrity_complete_when_marker_present() -> Result<()> {
-        let root = unique_temp_root("integ_complete");
-        let dir = make_tf_dir(&root, "TEST", "M1")?;
-        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
-        fs::write(dir.join("data.vortex.complete"), b"")?;
-        assert_eq!(vortex_integrity(&dir), VortexIntegrity::Complete);
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn vortex_integrity_complete_dominates_partial() -> Result<()> {
-        // New bootstrap in progress next to old-but-complete data —
-        // operator should still see Complete (existing data is usable).
-        let root = unique_temp_root("integ_complete_with_partial");
-        let dir = make_tf_dir(&root, "TEST", "M1")?;
-        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
-        fs::write(dir.join("data.vortex.complete"), b"")?;
-        fs::write(dir.join("data.vortex.partial"), b"")?;
-        assert_eq!(vortex_integrity(&dir), VortexIntegrity::Complete);
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn vortex_integrity_stale_partial_without_complete() -> Result<()> {
-        // The AUDUSD M15 production failure mode — partial marker exists
-        // but no complete marker. Loader MUST reject.
-        let root = unique_temp_root("integ_stale_partial");
-        let dir = make_tf_dir(&root, "TEST", "M1")?;
-        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
-        fs::write(dir.join("data.vortex.partial"), b"")?;
-        assert_eq!(vortex_integrity(&dir), VortexIntegrity::StalePartial);
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn vortex_integrity_legacy_no_marker() -> Result<()> {
-        // Pre-marker era data: vortex file but no markers. Accept-with-warn.
-        let root = unique_temp_root("integ_legacy");
-        let dir = make_tf_dir(&root, "TEST", "M1")?;
-        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
-        assert_eq!(vortex_integrity(&dir), VortexIntegrity::LegacyNoMarker);
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn vortex_integrity_truncated_when_below_size_floor() -> Result<()> {
-        // A truncated/aborted write leaves a tiny data.vortex; even WITH a
-        // stale .complete marker it must classify as Truncated, not
-        // Complete (the 2026-06-01 corruption mode).
-        let root = unique_temp_root("integ_truncated");
-        let dir = make_tf_dir(&root, "TEST", "M1")?;
-        fs::write(dir.join("data.vortex"), vec![0u8; 64])?; // < VORTEX_MIN_PLAUSIBLE_BYTES
-        fs::write(dir.join("data.vortex.complete"), b"")?;
-        assert_eq!(vortex_integrity(&dir), VortexIntegrity::Truncated);
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn discover_timeframes_rejects_stale_partial_tf() -> Result<()> {
-        // Mixed dataset: M1 complete, M5 stale-partial, M15 legacy.
-        // Expect M1 + M15 to surface; M5 rejected.
-        let root = unique_temp_root("discover_stale");
-        let symbol = "AUDUSD";
-
-        let m1_dir = make_tf_dir(&root, symbol, "M1")?;
-        write_valid_ohlcv_vortex(&m1_dir.join("data.vortex"))?;
-        fs::write(m1_dir.join("data.vortex.complete"), b"")?;
-
-        let m5_dir = make_tf_dir(&root, symbol, "M5")?;
-        write_valid_ohlcv_vortex(&m5_dir.join("data.vortex"))?;
-        fs::write(m5_dir.join("data.vortex.partial"), b"")?;
-        // No .complete — STALE
-
-        let m15_dir = make_tf_dir(&root, symbol, "M15")?;
-        write_valid_ohlcv_vortex(&m15_dir.join("data.vortex"))?;
-        // No markers — LEGACY
-
-        let tfs = discover_timeframes(&root, symbol)?;
-        assert!(tfs.contains(&"M1".to_string()), "M1 missing: {:?}", tfs);
-        assert!(
-            !tfs.contains(&"M5".to_string()),
-            "M5 (stale partial) should be rejected: {:?}",
-            tfs
-        );
-        assert!(
-            tfs.contains(&"M15".to_string()),
-            "M15 (legacy no marker) should be accepted: {:?}",
-            tfs
-        );
-
-        fs::remove_dir_all(&root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn load_symbol_timeframe_rejects_stale_partial() -> Result<()> {
-        // Belt-and-braces guard: even when discover_timeframes is
-        // bypassed, the loader must reject stale-partial data.
-        let root = unique_temp_root("load_stale");
-        let symbol = "AUDUSD";
-        let dir = make_tf_dir(&root, symbol, "M15")?;
-        write_valid_ohlcv_vortex(&dir.join("data.vortex"))?;
-        fs::write(dir.join("data.vortex.partial"), b"")?;
-        // No .complete
-
-        let err = load_symbol_timeframe(&root, symbol, "M15")
-            .expect_err("load must reject stale-partial vortex");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("partial") || msg.contains("REJECTED"),
-            "unexpected error: {msg}"
-        );
-
-        fs::remove_dir_all(&root)?;
+        let canonical = Ohlcv {
+            timestamp: Some(vec![base_ms, base_ms + 60_000, base_ms + 120_000]),
+            open: vec![1.1, 1.2, 1.3],
+            high: vec![1.2, 1.3, 1.4],
+            low: vec![1.0, 1.1, 1.2],
+            close: vec![1.15, 1.25, 1.35],
+            volume: Some(vec![0.0, 1.5, 2.0]),
+        };
+        let normalized = normalize_ohlcv(&canonical)?;
+        assert_eq!(normalized.timestamp, canonical.timestamp);
+        assert_eq!(normalized.open, canonical.open);
+        assert_eq!(normalized.high, canonical.high);
+        assert_eq!(normalized.low, canonical.low);
+        assert_eq!(normalized.close, canonical.close);
+        assert_eq!(normalized.volume, canonical.volume);
         Ok(())
     }
 }
@@ -2139,11 +2387,33 @@ mod tests {
 mod cube_assembly_tests {
     use super::*;
 
-    /// Build a small multi-timeframe dataset: a base grid plus one higher
-    /// timeframe resampled from it, so `prepare_multitimeframe_features` has
-    /// real work to align.
-    fn tiny_dataset(n: usize) -> SymbolDataset {
-        let base_ms = 1_700_000_000_000_i64;
+    /// Serializes the test-only process-global cube override. The production
+    /// path has no override, but the parity test needs to exercise both sinks.
+    /// Without this guard, Rust's parallel test runner can expose a temporary
+    /// force-RAM value to an unrelated budget test.
+    static TEST_CUBE_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_test_cube_mode<T>(mode: u8, f: impl FnOnce() -> T) -> T {
+        let _lock = TEST_CUBE_MODE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::TEST_CUBE_MODE.store(mode, std::sync::atomic::Ordering::SeqCst);
+
+        struct ResetCubeMode;
+        impl Drop for ResetCubeMode {
+            fn drop(&mut self) {
+                super::TEST_CUBE_MODE.store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let _reset = ResetCubeMode;
+        f()
+    }
+
+    /// Build a small multi-timeframe dataset where M1 and M5 are independent
+    /// direct-source fixtures. Production must never manufacture M5 from M1.
+    fn tiny_dataset(n: usize) -> (tempfile::TempDir, SymbolDataset) {
+        let base_ms = 1_700_000_100_000_i64;
         let mut timestamp = Vec::with_capacity(n);
         let (mut open, mut high, mut low, mut close, mut volume) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -2167,23 +2437,86 @@ mod cube_assembly_tests {
             close,
             volume: Some(volume),
         };
-        let m5 = resample_ohlcv(&m1, "M5").expect("resample M5");
-        let mut frames = std::collections::HashMap::new();
-        frames.insert("M1".to_string(), m1);
-        frames.insert("M5".to_string(), m5);
-        SymbolDataset {
-            symbol: "TESTFX".to_string(),
-            frames,
+        let m5_len = n / 5;
+        let mut m5_timestamp = Vec::with_capacity(m5_len);
+        let (mut m5_open, mut m5_high, mut m5_low, mut m5_close, mut m5_volume) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..m5_len {
+            let source_index = i * 5;
+            let t = source_index as f64;
+            let px = 1.10 + (t * 0.7).sin() * 0.01 + t * 1e-5;
+            m5_timestamp.push(base_ms + (i as i64) * 300_000);
+            m5_open.push(px);
+            m5_high.push(px + 0.0009);
+            m5_low.push(px - 0.0009);
+            m5_close.push(px + (t * 0.3).cos() * 0.0003);
+            m5_volume.push(500.0 + (i % 19) as f64);
         }
+        let m5 = Ohlcv {
+            timestamp: Some(m5_timestamp),
+            open: m5_open,
+            high: m5_high,
+            low: m5_low,
+            close: m5_close,
+            volume: Some(m5_volume),
+        };
+        let root = tempfile::tempdir().expect("canonical multi-timeframe root");
+        let mut frames = std::collections::HashMap::new();
+        let mut source_artifacts = std::collections::HashMap::new();
+        for (timeframe, canonical, frame) in [
+            ("M1", CanonicalTimeframe::M1, m1),
+            ("M5", CanonicalTimeframe::M5, m5),
+        ] {
+            let identity = CanonicalDatasetIdentity::external(
+                "multi-timeframe-parity-test",
+                "TESTFX",
+                canonical,
+                BarTimestampConvention::BarOpen,
+            )
+            .expect("test identity");
+            let timestamps = frame.timestamp.as_ref().expect("test timestamps");
+            let producer = crate::core::dataset_manifest::ProducerProvenanceEnvelopeV1::new(
+                "neoethos.multi-timeframe-parity-test.v1",
+                format!("deterministic-{timeframe}").into_bytes(),
+            )
+            .expect("test producer provenance");
+            crate::core::dataset_manifest::publish_vortex_generation(
+                crate::core::dataset_manifest::PublishRequest {
+                    configured_root: root.path(),
+                    identity: &identity,
+                    expected_generation: None,
+                    timestamp_range: crate::core::dataset_manifest::DatasetTimestampRange::new(
+                        timestamps[0],
+                        timestamps[timestamps.len() - 1],
+                    )
+                    .expect("test timestamp range"),
+                    provenance: &producer,
+                    chunks: ohlcv_to_vortex_chunks(&frame, 512).expect("test Vortex chunks"),
+                },
+            )
+            .expect("publish test generation");
+            let loaded = load_canonical_timeframe(root.path(), &identity)
+                .expect("load pinned test generation");
+            frames.insert(timeframe.to_owned(), loaded.ohlcv().clone());
+            source_artifacts.insert(timeframe.to_owned(), loaded.artifact().clone());
+        }
+        (
+            root,
+            SymbolDataset {
+                symbol: "TESTFX".to_string(),
+                frames,
+                source_artifacts,
+            },
+        )
     }
 
     /// The in-RAM assembly (allocate once, fill per timeframe) must produce a
-    /// cube byte-identical to the streaming disk-mmap path. If these ever
+    /// cube byte-identical to the Vortex scratch path. If these ever
     /// diverge, discovery results depend on how much free RAM the machine
     /// happened to have — the worst kind of non-determinism.
     #[test]
     fn ram_and_disk_cubes_are_identical() {
-        let ds = tiny_dataset(6000);
+        let (_root, ds) = tiny_dataset(6000);
         let opts = FeatureBuildOptions {
             higher_tfs: vec!["M5".to_string()],
             ..Default::default()
@@ -2192,14 +2525,12 @@ mod cube_assembly_tests {
         // 2026-08-10: was `NEOETHOS_FEATURE_CUBE_MODE`, now the `#[cfg(test)]`
         // seam — the forcing this test needs, without a lever production can
         // be handed by a shell.
-        use std::sync::atomic::Ordering;
-        super::TEST_CUBE_MODE.store(1, Ordering::Relaxed);
-        let ram = prepare_multitimeframe_features_with_options(&ds, "M1", &opts)
-            .expect("in-RAM cube");
-        super::TEST_CUBE_MODE.store(2, Ordering::Relaxed);
-        let disk = prepare_multitimeframe_features_with_options(&ds, "M1", &opts)
-            .expect("disk cube");
-        super::TEST_CUBE_MODE.store(0, Ordering::Relaxed);
+        let ram = with_test_cube_mode(1, || {
+            prepare_multitimeframe_features_with_options(&ds, "M1", &opts).expect("in-RAM cube")
+        });
+        let disk = with_test_cube_mode(2, || {
+            prepare_multitimeframe_features_with_options(&ds, "M1", &opts).expect("disk cube")
+        });
 
         assert!(
             matches!(ram.data, crate::core::features::FeatureData::InMemory(_)),
@@ -2213,13 +2544,18 @@ mod cube_assembly_tests {
 
         for r in 0..ram.n_samples() {
             for c in 0..ram.names.len() {
-                let a = ram.feature_at(r, c);
-                let b = disk.feature_at(r, c);
-                match (a.is_nan(), b.is_nan()) {
+                let a = ram.cell(r, c).expect("RAM feature cell");
+                let b = disk.cell(r, c).expect("Vortex feature cell");
+                assert_eq!(
+                    a.validity, b.validity,
+                    "validity mismatch at row {r} col {c} ({})",
+                    ram.names[c]
+                );
+                match (a.value.is_nan(), b.value.is_nan()) {
                     (true, true) => {}
                     _ => assert_eq!(
-                        a.to_bits(),
-                        b.to_bits(),
+                        a.value.to_bits(),
+                        b.value.to_bits(),
                         "cube mismatch at row {r} col {c} ({})",
                         ram.names[c]
                     ),
@@ -2236,47 +2572,49 @@ mod cube_assembly_tests {
     /// derivation is real rather than a constant.
     #[test]
     fn in_ram_budget_tracks_available_memory() {
-        use std::sync::atomic::Ordering;
-        super::TEST_CUBE_MODE.store(0, Ordering::Relaxed);
-        // The decision must scale with the cube AND the machine — not a fixed
-        // fraction. A byte-sized cube always fits; an absurd one never does.
-        assert!(should_build_cube_in_ram(1));
-        assert!(!should_build_cube_in_ram(u64::MAX / 4));
+        with_test_cube_mode(0, || {
+            // The decision must scale with the cube AND the machine — not a fixed
+            // fraction. A byte-sized cube always fits; an absurd one never does.
+            assert!(should_build_cube_in_ram(1));
+            assert!(!should_build_cube_in_ram(u64::MAX / 4));
 
-        // The 1.5x + 2 GB rule, pinned against a FIXED reading.
-        //
-        // 2026-08-10: this used to read `available_memory_bytes()` to pick a
-        // cube size that should just fail, and then call
-        // `should_build_cube_in_ram`, which read the probe a SECOND time. Free
-        // RAM moves between two calls on a machine that is doing anything at
-        // all — it moved during the build that caught this — so the "must not
-        // fit" cube fit, and a correct implementation failed its own test.
-        // The rule is now checked where it is deterministic.
-        for available in [8_000_000_000u64, 32_000_000_000, 128_000_000_000] {
-            let just_fits = (((available as f64) - 2.0e9) / 1.5) as u64;
+            // The 1.5x + 2 GB rule, pinned against a FIXED reading.
+            //
+            // 2026-08-10: this used to read `available_memory_bytes()` to pick a
+            // cube size that should just fail, and then call
+            // `should_build_cube_in_ram`, which read the probe a SECOND time. Free
+            // RAM moves between two calls on a machine that is doing anything at
+            // all — it moved during the build that caught this — so the "must not
+            // fit" cube fit, and a correct implementation failed its own test.
+            // The rule is now checked where it is deterministic.
+            for available in [8_000_000_000u64, 32_000_000_000, 128_000_000_000] {
+                let just_fits = (((available as f64) - 2.0e9) / 1.5) as u64;
+                assert!(
+                    cube_fits_in(just_fits.saturating_sub(1_000_000), available),
+                    "a cube just under the budget must fit at {available} bytes available"
+                );
+                assert!(
+                    !cube_fits_in(just_fits + 1_000_000_000, available),
+                    "a cube 1 GB over the budget must NOT fit at {available} bytes available"
+                );
+            }
+
+            // A failed probe is the safe answer, never 'plenty of room'.
             assert!(
-                cube_fits_in(just_fits.saturating_sub(1_000_000), available),
-                "a cube just under the budget must fit at {available} bytes available"
+                !cube_fits_in(1, 0),
+                "a 0-byte probe must take the disk path"
             );
+
+            // An absurd cube can no longer be forced into RAM by any ambient
+            // value — which is the never-OOM invariant, stated as a test.
+            unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "ram") };
             assert!(
-                !cube_fits_in(just_fits + 1_000_000_000, available),
-                "a cube 1 GB over the budget must NOT fit at {available} bytes available"
+                !should_build_cube_in_ram(u64::MAX / 4),
+                "NEOETHOS_FEATURE_CUBE_MODE is retired; it must not be able to skip the \
+                 free-RAM check"
             );
-        }
-
-        // A failed probe is the safe answer, never 'plenty of room'.
-        assert!(!cube_fits_in(1, 0), "a 0-byte probe must take the disk path");
-
-        // An absurd cube can no longer be forced into RAM by any ambient
-        // value — which is the never-OOM invariant, stated as a test.
-        // SAFETY: single-threaded test; nothing reads this any more.
-        unsafe { std::env::set_var("NEOETHOS_FEATURE_CUBE_MODE", "ram") };
-        assert!(
-            !should_build_cube_in_ram(u64::MAX / 4),
-            "NEOETHOS_FEATURE_CUBE_MODE is retired; it must not be able to skip the \
-             free-RAM check"
-        );
-        unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
+            unsafe { std::env::remove_var("NEOETHOS_FEATURE_CUBE_MODE") };
+        });
     }
 
     /// The config successor must default to the derived answer, so a process
@@ -2297,61 +2635,11 @@ mod cube_assembly_tests {
 }
 
 #[cfg(test)]
-mod impossible_price_tests {
+mod strict_price_tests {
     use super::*;
 
-    fn series(open: Vec<f64>, high: Vec<f64>, low: Vec<f64>, close: Vec<f64>) -> Ohlcv {
-        let n = close.len();
-        Ohlcv {
-            timestamp: Some((0..n as i64).map(|i| 1_700_000_000_000 + i * 60_000).collect()),
-            open,
-            high,
-            low,
-            close,
-            volume: Some(vec![1.0; n]),
-        }
-    }
-
-    /// The exact shape found in the store: open and low at zero, high and close
-    /// real. It satisfies `low ≤ open`, `open ≤ high`, `low ≤ close ≤ high` — so
-    /// every structural check passes and only positivity catches it.
-    #[test]
-    fn a_zero_priced_bar_is_removed_and_the_series_stays_aligned() {
-        let cleaned = drop_impossible_prices(
-            series(
-                vec![0.83, 0.0, 0.84],
-                vec![0.84, 0.83762, 0.85],
-                vec![0.82, 0.0, 0.83],
-                vec![0.835, 0.83417, 0.845],
-            ),
-            "test",
-        );
-        assert_eq!(cleaned.close, vec![0.835, 0.845]);
-        assert_eq!(cleaned.open, vec![0.83, 0.84]);
-        assert_eq!(cleaned.high, vec![0.84, 0.85]);
-        assert_eq!(cleaned.low, vec![0.82, 0.83]);
-        // Timestamps and volume must lose the same row, or every later bar is
-        // attributed to the wrong moment.
-        let ts = cleaned.timestamp.expect("timestamps kept");
-        assert_eq!(ts, vec![1_700_000_000_000, 1_700_000_120_000]);
-        assert_eq!(cleaned.volume.expect("volume kept").len(), 2);
-    }
-
-    #[test]
-    fn a_clean_series_is_returned_untouched() {
-        let original = series(
-            vec![0.83, 0.84],
-            vec![0.84, 0.85],
-            vec![0.82, 0.83],
-            vec![0.835, 0.845],
-        );
-        let cleaned = drop_impossible_prices(original.clone(), "test");
-        assert_eq!(cleaned.close, original.close);
-        assert_eq!(cleaned.timestamp, original.timestamp);
-    }
-
-    /// The write path must refuse what the read path has to clean up, or the
-    /// store keeps refilling with bars that cannot be traded.
+    /// Both read and write paths call this same validator. There is no cleanup
+    /// fallback that can silently change row count or backtest history.
     #[test]
     fn the_row_validator_now_rejects_a_zero_price() {
         let row = OhlcvRow {

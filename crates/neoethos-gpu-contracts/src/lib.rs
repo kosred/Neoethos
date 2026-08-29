@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const ABI_VERSION: u32 = 3;
+pub mod resident_feature_store_v3;
+
+pub const ABI_VERSION: u32 = 4;
 pub const POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING: u32 = 1 << 0;
 pub const POPULATION_PRECEDENCE_STOP_FIRST: u32 = 0;
 pub const POPULATION_DIRECTION_LONG: i32 = 1;
@@ -29,7 +31,7 @@ pub mod host {
         pub close: Vec<f64>,
         pub feature_names: Vec<String>,
         /// Feature-major contiguous values: `[feature][row]`.
-        pub features: Vec<f32>,
+        pub features: Vec<f64>,
         pub months: Vec<i64>,
         pub days: Vec<i64>,
     }
@@ -39,19 +41,19 @@ pub mod host {
         pub candidate_ids: Vec<u64>,
         pub offsets: Vec<u32>,
         pub indices: Vec<u32>,
-        pub weights: Vec<f32>,
-        pub long_thresholds: Vec<f32>,
-        pub short_thresholds: Vec<f32>,
+        pub weights: Vec<f64>,
+        pub long_thresholds: Vec<f64>,
+        pub short_thresholds: Vec<f64>,
         pub stop_ticks: Vec<i64>,
         pub target_ticks: Vec<i64>,
-        pub stop_vol_multipliers: Vec<f32>,
+        pub stop_vol_multipliers: Vec<f64>,
         pub flags: Vec<u32>,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct ScenarioBatchDto {
         pub scenarios: Vec<super::device::ScenarioDescriptor>,
-        pub perturbations: Vec<f32>,
+        pub perturbations: Vec<f64>,
         pub absolute_indices: Vec<u32>,
     }
 
@@ -108,11 +110,11 @@ pub mod device {
         pub candidate_id: u64,
         pub term_offset: u32,
         pub term_count: u32,
-        pub long_threshold: f32,
-        pub short_threshold: f32,
+        pub long_threshold: f64,
+        pub short_threshold: f64,
         pub stop_ticks: i64,
         pub target_ticks: i64,
-        pub stop_vol_multiplier: f32,
+        pub stop_vol_multiplier: f64,
         pub flags: u32,
         pub reserved: u64,
     }
@@ -395,9 +397,9 @@ pub mod device {
         assert!(offset_of!(DatasetHeader, features) == 104);
         assert!(offset_of!(DatasetHeader, days) == 136);
 
-        assert!(size_of::<GeneDescriptor>() == 56);
-        assert!(offset_of!(GeneDescriptor, stop_ticks) == 24);
-        assert!(offset_of!(GeneDescriptor, reserved) == 48);
+        assert!(size_of::<GeneDescriptor>() == 72);
+        assert!(offset_of!(GeneDescriptor, stop_ticks) == 32);
+        assert!(offset_of!(GeneDescriptor, reserved) == 64);
 
         assert!(size_of::<ScenarioDescriptor>() == 72);
         assert!(offset_of!(ScenarioDescriptor, commission_micros) == 48);
@@ -499,17 +501,7 @@ pub mod scenario_rng {
 
 #[cfg(test)]
 mod tests {
-    use super::ABI_VERSION;
     use super::device::*;
-
-    #[test]
-    fn dataset_header_carries_shared_abi_version() {
-        let header = DatasetHeader {
-            abi_version: ABI_VERSION,
-            ..DatasetHeader::default()
-        };
-        assert_eq!(header.abi_version, 3);
-    }
 
     #[test]
     fn handle_token_identity_is_explicit() {

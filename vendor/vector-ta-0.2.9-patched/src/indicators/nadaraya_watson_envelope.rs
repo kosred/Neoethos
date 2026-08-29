@@ -1,143 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-mod nwe_python_cuda_handle {
-    use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-    use cust::context::Context;
-    use cust::memory::DeviceBuffer;
-    use pyo3::exceptions::PyValueError;
-    use pyo3::prelude::*;
-    use pyo3::types::PyDict;
-    use std::ffi::c_void;
-    use std::sync::Arc;
-
-    #[pyclass(module = "vector_ta", unsendable, name = "NweDeviceArrayF32Py")]
-    pub struct NweDeviceArrayF32Py {
-        pub(crate) buf: Option<DeviceBuffer<f32>>,
-        pub(crate) rows: usize,
-        pub(crate) cols: usize,
-        pub(crate) _ctx: Arc<Context>,
-        pub(crate) device_id: u32,
-    }
-
-    #[pymethods]
-    impl NweDeviceArrayF32Py {
-        #[getter]
-        fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-            let d = PyDict::new(py);
-            d.set_item("shape", (self.rows, self.cols))?;
-            d.set_item("typestr", "<f4")?;
-            d.set_item(
-                "strides",
-                (
-                    self.cols * std::mem::size_of::<f32>(),
-                    std::mem::size_of::<f32>(),
-                ),
-            )?;
-            let ptr = self
-                .buf
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-                .as_device_ptr()
-                .as_raw() as usize;
-            d.set_item("data", (ptr, false))?;
-            d.set_item("version", 3)?;
-            Ok(d)
-        }
-
-        fn __dlpack_device__(&self) -> (i32, i32) {
-            let mut device_ordinal: i32 = self.device_id as i32;
-            unsafe {
-                let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-                let mut value = std::mem::MaybeUninit::<i32>::uninit();
-                let ptr = self
-                    .buf
-                    .as_ref()
-                    .map(|b| b.as_device_ptr().as_raw())
-                    .unwrap_or(0);
-                if ptr != 0 {
-                    let rc = cust::sys::cuPointerGetAttribute(
-                        value.as_mut_ptr() as *mut c_void,
-                        attr,
-                        ptr,
-                    );
-                    if rc == cust::sys::CUresult::CUDA_SUCCESS {
-                        device_ordinal = value.assume_init();
-                    }
-                }
-            }
-            (2, device_ordinal)
-        }
-
-        #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-        fn __dlpack__<'py>(
-            &mut self,
-            py: Python<'py>,
-            stream: Option<pyo3::PyObject>,
-            max_version: Option<pyo3::PyObject>,
-            dl_device: Option<pyo3::PyObject>,
-            copy: Option<pyo3::PyObject>,
-        ) -> PyResult<PyObject> {
-            let (kdl, alloc_dev) = self.__dlpack_device__();
-
-            if let Some(dev_obj) = dl_device.as_ref() {
-                if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                    if dev_ty != kdl || dev_id != alloc_dev {
-                        let wants_copy = copy
-                            .as_ref()
-                            .and_then(|c| c.extract::<bool>(py).ok())
-                            .unwrap_or(false);
-                        if wants_copy {
-                            return Err(PyValueError::new_err(
-                                "device copy not implemented for __dlpack__",
-                            ));
-                        } else {
-                            return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                        }
-                    }
-                }
-            }
-
-            let _ = stream;
-
-            let buf = self
-                .buf
-                .take()
-                .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-            let rows = self.rows;
-            let cols = self.cols;
-            let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-            export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-        }
-    }
-
-    pub use NweDeviceArrayF32Py as NweDeviceArrayF32PyAlias;
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use self::nwe_python_cuda_handle::NweDeviceArrayF32PyAlias;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -176,10 +42,6 @@ pub struct NweOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct NweParams {
     pub bandwidth: Option<f64>,
     pub multiplier: Option<f64>,
@@ -692,7 +554,6 @@ pub fn nadaraya_watson_envelope_with_kernel(
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn nadaraya_watson_envelope_into(
     input: &NweInput,
@@ -713,10 +574,10 @@ pub fn nadaraya_watson_envelope_into(
     unsafe {
         match chosen {
             Kernel::Avx512 => {
-                return nadaraya_watson_envelope_into_slices_avx512(input, upper_out, lower_out)
+                return nadaraya_watson_envelope_into_slices_avx512(input, upper_out, lower_out);
             }
             Kernel::Avx2 => {
-                return nadaraya_watson_envelope_into_slices_avx2(input, upper_out, lower_out)
+                return nadaraya_watson_envelope_into_slices_avx2(input, upper_out, lower_out);
             }
             _ => {
                 return nadaraya_watson_envelope_into_slices(input, upper_out, lower_out);
@@ -1635,682 +1496,18 @@ pub fn nwe_batch_slice(
     nwe_batch_with_kernel(data, sweep, k)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "nadaraya_watson_envelope")]
-#[pyo3(signature = (data, bandwidth=8.0, multiplier=3.0, lookback=500, kernel=None))]
-pub fn nadaraya_watson_envelope_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice_in = data.as_slice()?;
-    let _kern = validate_kernel(kernel, false)?;
-
-    let params = NweParams {
-        bandwidth: Some(bandwidth),
-        multiplier: Some(multiplier),
-        lookback: Some(lookback),
-    };
-    let input = NweInput::from_slice(slice_in, params);
-
-    let len = slice_in.len();
-
-    let mut upper = alloc_with_nan_prefix(len, 0);
-    let mut lower = alloc_with_nan_prefix(len, 0);
-
-    py.allow_threads(|| nadaraya_watson_envelope_into_slices(&input, &mut upper, &mut lower))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((upper.into_pyarray(py), lower.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "nadaraya_watson_envelope_batch")]
-#[pyo3(signature = (
-    data,
-    bandwidth_range=(8.0, 8.0, 0.0),
-    multiplier_range=(3.0, 3.0, 0.0),
-    lookback_range=(500, 500, 0),
-    kernel=None
-))]
-pub fn nadaraya_watson_envelope_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    bandwidth_range: (f64, f64, f64),
-    multiplier_range: (f64, f64, f64),
-    lookback_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = NweBatchRange {
-        bandwidth: bandwidth_range,
-        multiplier: multiplier_range,
-        lookback: lookback_range,
-    };
-
-    let result = py
-        .allow_threads(|| nadaraya_watson_envelope_batch_with_kernel(slice_in, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-
-    let bandwidths: Vec<f64> = result
-        .combos
-        .iter()
-        .map(|c| c.bandwidth.unwrap_or(8.0))
-        .collect();
-    let multipliers: Vec<f64> = result
-        .combos
-        .iter()
-        .map(|c| c.multiplier.unwrap_or(3.0))
-        .collect();
-    let lookbacks: Vec<usize> = result
-        .combos
-        .iter()
-        .map(|c| c.lookback.unwrap_or(500))
-        .collect();
-
-    dict.set_item(
-        "upper",
-        result
-            .values_upper
-            .into_pyarray(py)
-            .reshape((result.rows, result.cols))?,
-    )?;
-    dict.set_item(
-        "lower",
-        result
-            .values_lower
-            .into_pyarray(py)
-            .reshape((result.rows, result.cols))?,
-    )?;
-    dict.set_item("bandwidths", bandwidths.into_pyarray(py))?;
-    dict.set_item("multipliers", multipliers.into_pyarray(py))?;
-    dict.set_item("lookbacks", lookbacks.into_pyarray(py))?;
-
-    Ok(dict.into())
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "NweStream")]
-pub struct NweStreamPy {
-    inner: NweStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl NweStreamPy {
-    #[new]
-    #[pyo3(signature = (bandwidth=8.0, multiplier=3.0, lookback=500))]
-    pub fn new(bandwidth: f64, multiplier: f64, lookback: usize) -> PyResult<Self> {
-        let params = NweParams {
-            bandwidth: Some(bandwidth),
-            multiplier: Some(multiplier),
-            lookback: Some(lookback),
-        };
-
-        let inner = NweStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.inner.update(value)
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset()
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_nadaraya_watson_envelope_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(nadaraya_watson_envelope_py, m)?)?;
-    m.add_function(wrap_pyfunction!(nadaraya_watson_envelope_batch_py, m)?)?;
-    m.add_class::<NweStreamPy>()?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(
-            nadaraya_watson_envelope_cuda_batch_dev_py,
-            m
-        )?)?;
-        m.add_function(wrap_pyfunction!(
-            nadaraya_watson_envelope_cuda_many_series_one_param_dev_py,
-            m
-        )?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaNwe};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "nadaraya_watson_envelope_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, bandwidth_range=(8.0,8.0,0.0), multiplier_range=(3.0,3.0,0.0), lookback_range=(500,500,0), device_id=0))]
-pub fn nadaraya_watson_envelope_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    bandwidth_range: (f64, f64, f64),
-    multiplier_range: (f64, f64, f64),
-    lookback_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice = data_f32.as_slice()?;
-    let sweep = NweBatchRange {
-        bandwidth: bandwidth_range,
-        multiplier: multiplier_range,
-        lookback: lookback_range,
-    };
-    let dict = PyDict::new(py);
-    let (pair, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaNwe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let (pair, combos) = cuda
-            .nwe_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((pair, combos, ctx, dev_id))
-    })?;
-    dict.set_item(
-        "upper",
-        Py::new(
-            py,
-            NweDeviceArrayF32PyAlias {
-                buf: Some(pair.upper.buf),
-                rows: pair.upper.rows,
-                cols: pair.upper.cols,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "lower",
-        Py::new(
-            py,
-            NweDeviceArrayF32PyAlias {
-                buf: Some(pair.lower.buf),
-                rows: pair.lower.rows,
-                cols: pair.lower.cols,
-                _ctx: ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-
-    use numpy::IntoPyArray;
-    let bws: Vec<f64> = combos.iter().map(|c| c.bandwidth.unwrap_or(8.0)).collect();
-    let mps: Vec<f64> = combos.iter().map(|c| c.multiplier.unwrap_or(3.0)).collect();
-    let lbs: Vec<usize> = combos.iter().map(|c| c.lookback.unwrap_or(500)).collect();
-    dict.set_item("bandwidths", bws.into_pyarray(py))?;
-    dict.set_item("multipliers", mps.into_pyarray(py))?;
-    dict.set_item("lookbacks", lbs.into_pyarray(py))?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", slice.len())?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "nadaraya_watson_envelope_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, bandwidth, multiplier, lookback, device_id=0))]
-pub fn nadaraya_watson_envelope_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    use numpy::PyUntypedArrayMethods;
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D time-major array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = NweParams {
-        bandwidth: Some(bandwidth),
-        multiplier: Some(multiplier),
-        lookback: Some(lookback),
-    };
-    let (pair, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaNwe::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let pair = cuda
-            .nwe_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((pair, ctx, dev_id))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "upper",
-        Py::new(
-            py,
-            NweDeviceArrayF32PyAlias {
-                buf: Some(pair.upper.buf),
-                rows: pair.upper.rows,
-                cols: pair.upper.cols,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "lower",
-        Py::new(
-            py,
-            NweDeviceArrayF32PyAlias {
-                buf: Some(pair.lower.buf),
-                rows: pair.lower.rows,
-                cols: pair.lower.cols,
-                _ctx: ctx,
-                device_id: dev_id,
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("bandwidth", bandwidth)?;
-    dict.set_item("multiplier", multiplier)?;
-    dict.set_item("lookback", lookback)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NweJsResult {
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NweJsFlat {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = nadaraya_watson_envelope)]
-pub fn nadaraya_watson_envelope_unified_js(
-    data: &[f64],
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-) -> Result<JsValue, JsValue> {
-    let params = NweParams {
-        bandwidth: Some(bandwidth),
-        multiplier: Some(multiplier),
-        lookback: Some(lookback),
-    };
-    let input = NweInput::from_slice(data, params);
-
-    let result = nadaraya_watson_envelope(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_result = NweJsResult {
-        upper: result.upper,
-        lower: result.lower,
-    };
-
-    serde_wasm_bindgen::to_value(&js_result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nadaraya_watson_envelope_js(
-    data: &[f64],
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = NweParams {
-        bandwidth: Some(bandwidth),
-        multiplier: Some(multiplier),
-        lookback: Some(lookback),
-    };
-    let input = NweInput::from_slice(data, params);
-
-    let result = nadaraya_watson_envelope(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut output = Vec::with_capacity(data.len() * 2);
-    output.extend_from_slice(&result.upper);
-    output.extend_from_slice(&result.lower);
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = nadaraya_watson_envelope_flat)]
-pub fn nadaraya_watson_envelope_flat_js(
-    data: &[f64],
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-) -> Result<JsValue, JsValue> {
-    let params = NweParams {
-        bandwidth: Some(bandwidth),
-        multiplier: Some(multiplier),
-        lookback: Some(lookback),
-    };
-    let input = NweInput::from_slice(data, params);
-
-    let mut upper = vec![0.0; data.len()];
-    let mut lower = vec![0.0; data.len()];
-    nadaraya_watson_envelope_into_slices(&input, &mut upper, &mut lower)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(2 * data.len());
-    values.extend_from_slice(&upper);
-    values.extend_from_slice(&lower);
-
-    serde_wasm_bindgen::to_value(&NweJsFlat {
-        values,
-        rows: 2,
-        cols: data.len(),
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = nadaraya_watson_envelope_into_flat)]
-pub fn nadaraya_watson_envelope_into_flat(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(data_ptr, len);
-        let out = core::slice::from_raw_parts_mut(out_ptr, 2 * len);
-        let (upper, lower) = out.split_at_mut(len);
-
-        let params = NweParams {
-            bandwidth: Some(bandwidth),
-            multiplier: Some(multiplier),
-            lookback: Some(lookback),
-        };
-        let input = NweInput::from_slice(data, params);
-        nadaraya_watson_envelope_into_slices(&input, upper, lower)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nadaraya_watson_envelope_into(
-    data_ptr: *const f64,
-    upper_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    len: usize,
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || upper_ptr.is_null() || lower_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to nadaraya_watson_envelope_into",
-        ));
-    }
-
-    unsafe {
-        let data = core::slice::from_raw_parts(data_ptr, len);
-        let upper_out = core::slice::from_raw_parts_mut(upper_ptr, len);
-        let lower_out = core::slice::from_raw_parts_mut(lower_ptr, len);
-
-        let params = NweParams {
-            bandwidth: Some(bandwidth),
-            multiplier: Some(multiplier),
-            lookback: Some(lookback),
-        };
-        let input = NweInput::from_slice(data, params);
-
-        nadaraya_watson_envelope_into_slices(&input, upper_out, lower_out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nadaraya_watson_envelope_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(2 * len);
-    let ptr = v.as_mut_ptr();
-    core::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nadaraya_watson_envelope_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct NweContext {
-    stream: NweStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl NweContext {
-    #[wasm_bindgen(constructor)]
-    pub fn new(bandwidth: f64, multiplier: f64, lookback: usize) -> Result<NweContext, JsValue> {
-        let params = NweParams {
-            bandwidth: Some(bandwidth),
-            multiplier: Some(multiplier),
-            lookback: Some(lookback),
-        };
-
-        let stream = NweStream::try_new(params).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(NweContext { stream })
-    }
-
-    #[wasm_bindgen]
-    pub fn update(&mut self, value: f64) -> Option<Vec<f64>> {
-        self.stream
-            .update(value)
-            .map(|(upper, lower)| vec![upper, lower])
-    }
-
-    #[wasm_bindgen]
-    pub fn update_batch(&mut self, values: &[f64]) -> Vec<f64> {
-        let mut results = Vec::with_capacity(values.len() * 2);
-
-        for &value in values {
-            if let Some((upper, lower)) = self.stream.update(value) {
-                results.push(upper);
-                results.push(lower);
-            } else {
-                results.push(f64::NAN);
-                results.push(f64::NAN);
-            }
-        }
-
-        results
-    }
-
-    #[wasm_bindgen]
-    pub fn reset(&mut self) {
-        self.stream.reset();
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NweBatchJsOutput {
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub bandwidths: Vec<f64>,
-    pub multipliers: Vec<f64>,
-    pub lookbacks: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = nadaraya_watson_envelope_batch)]
-pub fn nadaraya_watson_envelope_batch_unified_js(
-    data: &[f64],
-    bandwidth_range: Vec<f64>,
-    multiplier_range: Vec<f64>,
-    lookback_range: Vec<usize>,
-) -> Result<JsValue, JsValue> {
-    if bandwidth_range.len() != 3 || multiplier_range.len() != 3 || lookback_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "All ranges must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = NweBatchRange {
-        bandwidth: (bandwidth_range[0], bandwidth_range[1], bandwidth_range[2]),
-        multiplier: (
-            multiplier_range[0],
-            multiplier_range[1],
-            multiplier_range[2],
-        ),
-        lookback: (lookback_range[0], lookback_range[1], lookback_range[2]),
-    };
-
-    let result =
-        nadaraya_watson_envelope_batch_with_kernel(data, &sweep, detect_best_batch_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let bandwidths: Vec<f64> = result
-        .combos
-        .iter()
-        .map(|c| c.bandwidth.unwrap_or(8.0))
-        .collect();
-    let multipliers: Vec<f64> = result
-        .combos
-        .iter()
-        .map(|c| c.multiplier.unwrap_or(3.0))
-        .collect();
-    let lookbacks: Vec<usize> = result
-        .combos
-        .iter()
-        .map(|c| c.lookback.unwrap_or(500))
-        .collect();
-
-    let js_output = NweBatchJsOutput {
-        upper: result.values_upper,
-        lower: result.values_lower,
-        rows: result.rows,
-        cols: result.cols,
-        bandwidths,
-        multipliers,
-        lookbacks,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nadaraya_watson_envelope_output_into_js(
-    data: &[f64],
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = nadaraya_watson_envelope_js(data, bandwidth, multiplier, lookback)?;
-    crate::write_wasm_f64_output("nadaraya_watson_envelope_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nadaraya_watson_envelope_flat_output_into_js(
-    data: &[f64],
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = nadaraya_watson_envelope_flat_js(data, bandwidth, multiplier, lookback)?;
-    crate::write_wasm_object_f64_outputs(
-        "nadaraya_watson_envelope_flat_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nadaraya_watson_envelope_batch_unified_output_into_js(
-    data: &[f64],
-    bandwidth_range: Vec<f64>,
-    multiplier_range: Vec<f64>,
-    lookback_range: Vec<usize>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = nadaraya_watson_envelope_batch_unified_js(
-        data,
-        bandwidth_range,
-        multiplier_range,
-        lookback_range,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "nadaraya_watson_envelope_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn nadaraya_watson_envelope_unified_output_into_js(
-    data: &[f64],
-    bandwidth: f64,
-    multiplier: f64,
-    lookback: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = nadaraya_watson_envelope_unified_js(data, bandwidth, multiplier, lookback)?;
-    crate::write_wasm_object_f64_outputs(
-        "nadaraya_watson_envelope_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
     use std::error::Error;
 
     fn check_nwe_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = NweParams {
             bandwidth: None,
@@ -2327,8 +1524,8 @@ mod tests {
 
     fn check_nwe_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = NweInput::from_candles(&candles, "close", NweParams::default());
         let result = nadaraya_watson_envelope_with_kernel(&input, kernel)?;
@@ -2500,8 +1697,8 @@ mod tests {
 
     fn check_nwe_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let input = NweInput::with_default_candles(&candles);
         let result = nadaraya_watson_envelope_with_kernel(&input, kernel)?;
@@ -2664,8 +1861,8 @@ mod tests {
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = NweBatchBuilder::new()
             .kernel(kernel)
@@ -2804,8 +2001,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_nwe_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let res =
             nadaraya_watson_envelope_with_kernel(&NweInput::with_default_candles(&c), kernel)?;
         for (i, &v) in res.upper.iter().chain(res.lower.iter()).enumerate() {
@@ -2826,8 +2023,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let sweep = NweBatchRange {
             bandwidth: (8.0, 10.0, 2.0),
             multiplier: (2.0, 3.0, 1.0),
@@ -2852,8 +2049,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_par_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let sweep = NweBatchRange {
             bandwidth: (8.0, 10.0, 2.0),
             multiplier: (2.0, 3.0, 1.0),
@@ -2939,7 +2136,6 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_sweep);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_nadaraya_watson_envelope_into_matches_api() -> Result<(), Box<dyn Error>> {
         let len = 600usize;

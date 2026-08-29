@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
 use cust::memory::{CopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys::{self as cuda, CUfunction};
@@ -40,27 +40,6 @@ pub struct DevicePatternFeatures {
 impl DevicePatternFeatures {
     pub fn len(&self) -> usize {
         self.body.len()
-    }
-}
-
-pub struct DevicePatternBitmaskU64 {
-    pub buf: DeviceBuffer<u64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub words_per_row: usize,
-    pub ctx: Arc<Context>,
-    pub device_id: u32,
-}
-
-impl DevicePatternBitmaskU64 {
-    #[inline]
-    pub fn device_ptr(&self) -> u64 {
-        self.buf.as_device_ptr().as_raw() as u64
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.buf.len()
     }
 }
 
@@ -235,7 +214,6 @@ impl CudaPatternRecognition {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/pattern_recognition_kernel.ptx"));
         let module = crate::load_cuda_embedded_module!("pattern_recognition_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
@@ -866,51 +844,6 @@ impl CudaPatternRecognition {
         let d_u8 = self.compute_native_matrix_device_from_host_inputs(open, high, low, close)?;
         let rows = Self::native_supported_pattern_ids().len();
         self.matrix_u8_to_f32_device(&d_u8, rows, len)
-    }
-
-    pub fn compute_native_matrix_bitmask_u64_device_from_device_inputs(
-        &self,
-        d_open: &DeviceBuffer<f32>,
-        d_high: &DeviceBuffer<f32>,
-        d_low: &DeviceBuffer<f32>,
-        d_close: &DeviceBuffer<f32>,
-        len: usize,
-    ) -> Result<DevicePatternBitmaskU64, CudaPatternRecognitionError> {
-        let native_ids = Self::native_supported_pattern_ids();
-        let rows = native_ids.len();
-        let d_u8 = self
-            .compute_native_matrix_device_from_device_inputs(d_open, d_high, d_low, d_close, len)?;
-        let words_per_row = len.div_ceil(64);
-        let total_words = rows.checked_mul(words_per_row).ok_or_else(|| {
-            CudaPatternRecognitionError::InvalidInput("rows*words overflow".to_string())
-        })?;
-        let mut d_words = unsafe { DeviceBuffer::<u64>::uninitialized(total_words) }?;
-        self.pack_matrix_u8_device_into(&d_u8, rows, len, &mut d_words)?;
-        Ok(DevicePatternBitmaskU64 {
-            buf: d_words,
-            rows,
-            cols: len,
-            words_per_row,
-            ctx: self.context.clone(),
-            device_id: self.device_id,
-        })
-    }
-
-    pub fn compute_native_matrix_bitmask_u64_device_from_host_inputs(
-        &self,
-        open: &[f32],
-        high: &[f32],
-        low: &[f32],
-        close: &[f32],
-    ) -> Result<DevicePatternBitmaskU64, CudaPatternRecognitionError> {
-        let len = validate_ohlc_len(open, high, low, close)?;
-        let d_open = DeviceBuffer::from_slice(open)?;
-        let d_high = DeviceBuffer::from_slice(high)?;
-        let d_low = DeviceBuffer::from_slice(low)?;
-        let d_close = DeviceBuffer::from_slice(close)?;
-        self.compute_native_matrix_bitmask_u64_device_from_device_inputs(
-            &d_open, &d_high, &d_low, &d_close, len,
-        )
     }
 
     pub fn compute_native_subset_matrix_device(
@@ -4720,102 +4653,6 @@ impl CudaPatternRecognition {
         Ok(())
     }
 
-    pub fn pack_matrix_u8_device_into(
-        &self,
-        d_matrix: &DeviceBuffer<u8>,
-        rows: usize,
-        cols: usize,
-        d_words: &mut DeviceBuffer<u64>,
-    ) -> Result<(), CudaPatternRecognitionError> {
-        if rows == 0 || cols == 0 {
-            return Err(CudaPatternRecognitionError::InvalidInput(
-                "rows and cols must be > 0".to_string(),
-            ));
-        }
-
-        let matrix_len = rows.checked_mul(cols).ok_or_else(|| {
-            CudaPatternRecognitionError::InvalidInput("rows*cols overflow".to_string())
-        })?;
-        if d_matrix.len() < matrix_len {
-            return Err(CudaPatternRecognitionError::InvalidInput(
-                "matrix buffer too small".to_string(),
-            ));
-        }
-
-        let words_per_row = cols.div_ceil(64);
-        let total_words = rows.checked_mul(words_per_row).ok_or_else(|| {
-            CudaPatternRecognitionError::InvalidInput("rows*words overflow".to_string())
-        })?;
-        if d_words.len() < total_words {
-            return Err(CudaPatternRecognitionError::InvalidInput(
-                "words buffer too small".to_string(),
-            ));
-        }
-
-        let func = self.cached_function("pattern_pack_u8_to_u64_kernel")?;
-
-        let block_x: u32 = 256;
-        let (grid, block) = grid_1d_for(total_words, block_x);
-
-        unsafe {
-            let mut matrix_ptr = d_matrix.as_device_ptr().as_raw();
-            let mut rows_i = rows as i32;
-            let mut cols_i = cols as i32;
-            let mut words_per_row_i = words_per_row as i32;
-            let mut words_ptr = d_words.as_device_ptr().as_raw();
-
-            let args: &mut [*mut c_void] = &mut [
-                &mut matrix_ptr as *mut _ as *mut c_void,
-                &mut rows_i as *mut _ as *mut c_void,
-                &mut cols_i as *mut _ as *mut c_void,
-                &mut words_per_row_i as *mut _ as *mut c_void,
-                &mut words_ptr as *mut _ as *mut c_void,
-            ];
-            self.launch_raw_function(func, grid, block, 0, args)?;
-        }
-
-        Ok(())
-    }
-
-    pub fn pack_matrix_u8_host(
-        &self,
-        matrix: &[u8],
-        rows: usize,
-        cols: usize,
-    ) -> Result<Vec<u64>, CudaPatternRecognitionError> {
-        if rows == 0 || cols == 0 {
-            return Err(CudaPatternRecognitionError::InvalidInput(
-                "rows and cols must be > 0".to_string(),
-            ));
-        }
-
-        let matrix_len = rows.checked_mul(cols).ok_or_else(|| {
-            CudaPatternRecognitionError::InvalidInput("rows*cols overflow".to_string())
-        })?;
-        if matrix.len() != matrix_len {
-            return Err(CudaPatternRecognitionError::InvalidInput(format!(
-                "matrix length mismatch: expected {}, got {}",
-                matrix_len,
-                matrix.len()
-            )));
-        }
-
-        let words_per_row = cols.div_ceil(64);
-        let total_words = rows.checked_mul(words_per_row).ok_or_else(|| {
-            CudaPatternRecognitionError::InvalidInput("rows*words overflow".to_string())
-        })?;
-
-        let d_matrix = DeviceBuffer::from_slice(matrix)?;
-        let mut d_words = unsafe { DeviceBuffer::<u64>::uninitialized(total_words) }?;
-
-        self.pack_matrix_u8_device_into(&d_matrix, rows, cols, &mut d_words)?;
-        self.synchronize()?;
-
-        let mut host = vec![0u64; total_words];
-        d_words.copy_to(&mut host)?;
-        Ok(host)
-    }
-
     pub fn matrix_u8_to_f32_device(
         &self,
         d_matrix_u8: &DeviceBuffer<u8>,
@@ -4924,8 +4761,8 @@ fn grid_1d_for(n: usize, block_x: u32) -> (GridSize, BlockSize) {
 mod tests {
     use super::*;
     use crate::indicators::pattern_recognition::{
-        extract_pattern_series, list_patterns, pattern_recognition_with_kernel,
-        PatternRecognitionInput,
+        PatternRecognitionInput, extract_pattern_series, list_patterns,
+        pattern_recognition_with_kernel,
     };
     use crate::utilities::enums::Kernel;
 
@@ -5059,43 +4896,6 @@ mod tests {
     }
 
     #[test]
-    fn bitmask_kernel_matches_cpu_pack_when_available() {
-        if !crate::cuda::cuda_available() {
-            return;
-        }
-
-        let rows = 9usize;
-        let cols = 173usize;
-        let mut matrix = vec![0u8; rows * cols];
-        for r in 0..rows {
-            for c in 0..cols {
-                let v = ((r * 17 + c * 13 + (c >> 2)) % 11) < 3;
-                matrix[r * cols + c] = if v { 1 } else { 0 };
-            }
-        }
-
-        let cuda = CudaPatternRecognition::new(0).unwrap();
-        let got = cuda
-            .pack_matrix_u8_host(matrix.as_slice(), rows, cols)
-            .unwrap();
-
-        let words_per_row = cols.div_ceil(64);
-        let mut expected = vec![0u64; rows * words_per_row];
-        for row in 0..rows {
-            for col in 0..cols {
-                let value = matrix[row * cols + col];
-                if value != 0 {
-                    let word = row * words_per_row + (col / 64);
-                    let bit = col % 64;
-                    expected[word] |= 1u64 << bit;
-                }
-            }
-        }
-
-        assert_eq!(got, expected);
-    }
-
-    #[test]
     fn u8_to_f32_kernel_matches_cpu_when_available() {
         if !crate::cuda::cuda_available() {
             return;
@@ -5168,7 +4968,7 @@ mod tests {
             for i in 0..cols {
                 total += 1;
                 let got = matrix[row * cols + i];
-                if got != cpu_row[i] {
+                if got != u8::from(cpu_row[i] != 0) {
                     mismatches += 1;
                 }
             }

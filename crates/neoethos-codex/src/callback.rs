@@ -28,16 +28,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{Instant, timeout_at};
 
-use crate::error::CodexError;
 use crate::CODEX_CALLBACK_PORT;
+use crate::error::CodexError;
 
 /// What the loopback listener captured. We don't decide validity
 /// here — that's the caller's job (verify `state`, then exchange
 /// `code` for tokens).
 #[derive(Debug, Clone)]
 pub enum CallbackResult {
-    Success { code: String, state: String },
-    Error { error: String, description: Option<String> },
+    Success {
+        code: String,
+        state: String,
+    },
+    Error {
+        error: String,
+        description: Option<String>,
+    },
 }
 
 /// Holds the listener so the caller can drop it explicitly. We
@@ -69,10 +75,7 @@ impl CallbackServer {
     /// The HTTP reply is a small branded page that explains the next
     /// step. The operator's browser shows this; the listener then
     /// shuts down.
-    pub async fn wait_for_callback(
-        &self,
-        timeout_secs: u64,
-    ) -> Result<CallbackResult, CodexError> {
+    pub async fn wait_for_callback(&self, timeout_secs: u64) -> Result<CallbackResult, CodexError> {
         // Audit B15: ONE overall deadline covers BOTH the accept AND the read.
         // Previously only `accept()` was bounded; the subsequent `read()` had
         // no timeout, so a client that connected but sent bytes slowly (or
@@ -256,7 +259,8 @@ mod tests {
 
     #[test]
     fn parses_success_callback() {
-        let req = "GET /auth/callback?code=abc123&state=xyz789 HTTP/1.1\r\nHost: localhost:1455\r\n\r\n";
+        let req =
+            "GET /auth/callback?code=abc123&state=xyz789 HTTP/1.1\r\nHost: localhost:1455\r\n\r\n";
         let parsed = parse_request_line_query(req).unwrap();
         match parsed {
             CallbackResult::Success { code, state } => {

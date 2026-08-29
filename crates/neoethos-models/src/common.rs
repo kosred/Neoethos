@@ -13,8 +13,91 @@
 //! (statistical/runtime/rl/burn). See
 //! `docs/audits/research/gpu_consolidation_audit.md` for the matrix.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ndarray::Array2;
+
+/// Operator intent for an NVIDIA CUDA execution path.
+///
+/// This type is deliberately CUDA-specific. Vendor-neutral labels such as
+/// ROCm, Vulkan, Metal, and WGPU must not be collapsed into this enum: doing
+/// so makes an AMD/Vulkan host look like a usable CUDA device and can silently
+/// bind malformed requests to ordinal zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaDevicePolicy {
+    Auto,
+    Cpu,
+    Gpu { ordinal: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedCudaDevicePolicy {
+    Cpu,
+    Cuda { ordinal: usize },
+}
+
+/// Parse the exact CUDA policy vocabulary without repairing invalid input.
+pub fn parse_cuda_device_policy(policy: &str) -> Result<CudaDevicePolicy> {
+    let normalized = policy.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "auto" => Ok(CudaDevicePolicy::Auto),
+        "cpu" => Ok(CudaDevicePolicy::Cpu),
+        "gpu" | "cuda" | "nvidia" => Ok(CudaDevicePolicy::Gpu { ordinal: 0 }),
+        "rocm" | "metal" | "vulkan" | "wgpu" => {
+            bail!("ROCm device policies cannot select a CUDA backend: `{policy}`")
+        }
+        _ => {
+            for prefix in ["gpu:", "cuda:", "nvidia:"] {
+                if let Some(raw_ordinal) = normalized.strip_prefix(prefix) {
+                    if raw_ordinal.is_empty() {
+                        bail!("CUDA device policy `{policy}` is missing an ordinal");
+                    }
+                    let ordinal = raw_ordinal.parse::<usize>().with_context(|| {
+                        format!("invalid CUDA device ordinal in policy `{policy}`")
+                    })?;
+                    return Ok(CudaDevicePolicy::Gpu { ordinal });
+                }
+            }
+            if ["rocm:", "metal:", "vulkan:", "wgpu:"]
+                .iter()
+                .any(|prefix| normalized.starts_with(prefix))
+            {
+                bail!("ROCm device policies cannot select a CUDA backend: `{policy}`");
+            }
+            bail!(
+                "unsupported CUDA device policy `{policy}`; expected auto, cpu, gpu[:N], cuda[:N], or nvidia[:N]"
+            )
+        }
+    }
+}
+
+/// Resolve Auto against NVIDIA visibility without probing CUDA itself.
+///
+/// A visible NVIDIA card makes CUDA mandatory for Auto. The subsequent
+/// runtime/device constructor therefore gets to report a broken driver or
+/// toolkit instead of this resolver disguising that failure as a CPU host.
+pub fn resolve_cuda_device_policy(
+    policy: &str,
+    visible_nvidia_devices: usize,
+) -> Result<ResolvedCudaDevicePolicy> {
+    match parse_cuda_device_policy(policy)? {
+        CudaDevicePolicy::Auto if visible_nvidia_devices == 0 => Ok(ResolvedCudaDevicePolicy::Cpu),
+        CudaDevicePolicy::Auto => Ok(ResolvedCudaDevicePolicy::Cuda { ordinal: 0 }),
+        CudaDevicePolicy::Cpu => Ok(ResolvedCudaDevicePolicy::Cpu),
+        CudaDevicePolicy::Gpu { ordinal } => {
+            if visible_nvidia_devices == 0 {
+                bail!(
+                    "CUDA device policy `{policy}` requested ordinal {ordinal}, but no NVIDIA device is visible"
+                );
+            }
+            if ordinal >= visible_nvidia_devices {
+                bail!(
+                    "CUDA device policy `{policy}` requested ordinal {ordinal}, but only {visible_nvidia_devices} NVIDIA device(s) are visible"
+                );
+            }
+            Ok(ResolvedCudaDevicePolicy::Cuda { ordinal })
+        }
+    }
+}
 
 /// Validate that `features` has exactly `input_dim` columns and return
 /// the flattened row-major buffer ready for upload to a CUDA kernel.
@@ -56,9 +139,11 @@ pub fn cuda_flatten_features(
 /// caller-supplied policy string for the evolutionary ones), and that
 /// string is what the artifact records. Anyone who wants the CPU path
 /// sets the policy to `cpu`.
-pub fn cuda_kernel_enabled(policy: &str) -> bool {
-    let normalized = policy.trim().to_ascii_lowercase();
-    normalized == "gpu" || normalized.starts_with("gpu:")
+pub fn cuda_kernel_enabled(policy: &str) -> Result<bool> {
+    Ok(matches!(
+        parse_cuda_device_policy(policy)?,
+        CudaDevicePolicy::Gpu { .. }
+    ))
 }
 
 /// Resolve which CUDA ordinal to bind to: parse `gpu:N` out of the
@@ -72,13 +157,16 @@ pub fn cuda_kernel_enabled(policy: &str) -> bool {
 /// two env names outranked the configured value, so a stale export
 /// pinned every kernel to a card the config never named. The policy
 /// carries the ordinal (`gpu:1`); there is no second channel.
-pub fn cuda_device_id_from_policy(policy: &str) -> usize {
-    policy
-        .trim()
-        .to_ascii_lowercase()
-        .strip_prefix("gpu:")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
+pub fn cuda_device_id_from_policy(policy: &str) -> Result<usize> {
+    match parse_cuda_device_policy(policy)? {
+        CudaDevicePolicy::Gpu { ordinal } => Ok(ordinal),
+        CudaDevicePolicy::Auto => {
+            bail!("CUDA device policy `auto` must be resolved before selecting an ordinal")
+        }
+        CudaDevicePolicy::Cpu => {
+            bail!("CPU device policy cannot select a CUDA ordinal")
+        }
+    }
 }
 
 /// The kernel's units-per-cube count: the hardware maximum, floored at 1.
@@ -165,10 +253,10 @@ mod tests {
 
     #[test]
     fn kernel_enabled_requires_gpu_policy() {
-        assert!(cuda_kernel_enabled("gpu"));
-        assert!(cuda_kernel_enabled("gpu:1"));
-        assert!(!cuda_kernel_enabled("cpu"));
-        assert!(!cuda_kernel_enabled("auto"));
+        assert!(cuda_kernel_enabled("gpu").expect("valid gpu policy"));
+        assert!(cuda_kernel_enabled("gpu:1").expect("valid gpu ordinal"));
+        assert!(!cuda_kernel_enabled("cpu").expect("valid cpu policy"));
+        assert!(!cuda_kernel_enabled("auto").expect("valid auto policy"));
     }
 
     /// The kernel decision must depend on NOTHING but the policy string.
@@ -182,8 +270,8 @@ mod tests {
             std::env::set_var("NEOETHOS_BOT_NEAT_CUDA_KERNEL", "off");
             std::env::set_var("NEOETHOS_BOT_NEURO_EVO_CUDA_KERNEL", "disabled");
         }
-        assert!(cuda_kernel_enabled("gpu"));
-        assert!(cuda_kernel_enabled("gpu:2"));
+        assert!(cuda_kernel_enabled("gpu").expect("valid gpu policy"));
+        assert!(cuda_kernel_enabled("gpu:2").expect("valid gpu ordinal"));
         unsafe {
             std::env::remove_var("NEOETHOS_BOT_STATISTICAL_CUDA_KERNEL");
             std::env::remove_var("NEOETHOS_BOT_NEAT_CUDA_KERNEL");
@@ -193,9 +281,13 @@ mod tests {
 
     #[test]
     fn cuda_device_id_parses_policy_suffix() {
-        assert_eq!(cuda_device_id_from_policy("gpu:3"), 3);
-        assert_eq!(cuda_device_id_from_policy("gpu"), 0);
-        assert_eq!(cuda_device_id_from_policy("cpu"), 0);
+        assert_eq!(cuda_device_id_from_policy("gpu:3").expect("ordinal"), 3);
+        assert_eq!(
+            cuda_device_id_from_policy("gpu").expect("default ordinal"),
+            0
+        );
+        assert!(cuda_device_id_from_policy("cpu").is_err());
+        assert!(cuda_device_id_from_policy("gpu:bad").is_err());
     }
 
     /// The retired `NEOETHOS_BOT_*_CUDA_DEVICE` names used to OUTRANK the
@@ -207,7 +299,7 @@ mod tests {
             std::env::set_var("NEOETHOS_BOT_STATISTICAL_CUDA_DEVICE", "5");
             std::env::set_var("NEOETHOS_BOT_NEAT_CUDA_DEVICE", "7");
         }
-        assert_eq!(cuda_device_id_from_policy("gpu:1"), 1);
+        assert_eq!(cuda_device_id_from_policy("gpu:1").expect("ordinal"), 1);
         unsafe {
             std::env::remove_var("NEOETHOS_BOT_STATISTICAL_CUDA_DEVICE");
             std::env::remove_var("NEOETHOS_BOT_NEAT_CUDA_DEVICE");
@@ -240,5 +332,32 @@ mod tests {
     fn normalize_vendor_device_policy_respects_extras() {
         assert_eq!(normalize_vendor_device_policy("wgpu:2", &["wgpu"]), "gpu:2");
         assert_eq!(normalize_vendor_device_policy("wgpu", &["wgpu"]), "gpu");
+    }
+
+    #[test]
+    fn strict_cuda_policy_rejects_non_cuda_vendors_and_malformed_ordinals() {
+        for invalid in ["rocm", "rocm:1", "vulkan:0", "gpu:", "gpu:-1", "gpu:nope"] {
+            assert!(
+                parse_cuda_device_policy(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_cuda_resolution_uses_cpu_only_without_nvidia() {
+        assert_eq!(
+            resolve_cuda_device_policy("auto", 0).expect("no-card auto"),
+            ResolvedCudaDevicePolicy::Cpu
+        );
+        assert_eq!(
+            resolve_cuda_device_policy("auto", 1).expect("one-card auto"),
+            ResolvedCudaDevicePolicy::Cuda { ordinal: 0 }
+        );
+        assert_eq!(
+            resolve_cuda_device_policy("cuda:1", 2).expect("explicit ordinal"),
+            ResolvedCudaDevicePolicy::Cuda { ordinal: 1 }
+        );
+        assert!(resolve_cuda_device_policy("cuda:2", 2).is_err());
     }
 }

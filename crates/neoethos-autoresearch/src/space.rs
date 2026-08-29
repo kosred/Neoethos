@@ -176,15 +176,25 @@ impl RequiredKnob {
     /// The symbol whose absence excludes this knob, named exactly.
     pub fn symbol(self) -> &'static str {
         match self {
-            Self::StreamingStartCursor => "neoethos_search::orchestration::StreamingPlan::start_cursor",
+            Self::StreamingStartCursor => {
+                "neoethos_search::orchestration::StreamingPlan::start_cursor"
+            }
             Self::StampGaSeed => "neoethos_search::run_identity::ResolvedConfigStamp::ga_seed",
-            Self::LabelHorizon => "neoethos_search::discovery::DiscoveryConfig::label_max_hold_bars",
+            Self::LabelHorizon => {
+                "neoethos_search::discovery::DiscoveryConfig::label_max_hold_bars"
+            }
             Self::FitnessTable => "neoethos_search::discovery::DiscoveryConfig::fitness_table",
-            Self::CostEdgeScoring => "neoethos_search::discovery::DiscoveryConfig::score_at_cost_band_edge",
-            Self::ConditioningSet => "neoethos_search::discovery::DiscoveryConfig::conditioning_set",
+            Self::CostEdgeScoring => {
+                "neoethos_search::discovery::DiscoveryConfig::score_at_cost_band_edge"
+            }
+            Self::ConditioningSet => {
+                "neoethos_search::discovery::DiscoveryConfig::conditioning_set"
+            }
             Self::InMarketFitness => "neoethos_search::scoring::FitnessTable::NetPerBarInMarket",
             Self::TStatObjective => "neoethos_search::scoring::FitnessTable::ExpectancyTStat",
-            Self::PortfolioObjective => "neoethos_search::discovery::DiscoveryConfig::score_portfolio_after_pruning",
+            Self::PortfolioObjective => {
+                "neoethos_search::discovery::DiscoveryConfig::score_portfolio_after_pruning"
+            }
         }
     }
 
@@ -354,7 +364,11 @@ pub fn money_path_audit(
         };
     }
 
-    cmp!("evaluation_symbol", reference.evaluation_symbol, proposed.evaluation_symbol);
+    cmp!(
+        "evaluation_symbol",
+        reference.evaluation_symbol,
+        proposed.evaluation_symbol
+    );
     cmp!(
         "evaluation_account_currency",
         reference.evaluation_account_currency,
@@ -377,8 +391,12 @@ pub fn money_path_audit(
     );
     cmp!(
         "cost_band_pips",
-        reference.cost_band_pips.map(|(a, b)| (a.to_bits(), b.to_bits())),
-        proposed.cost_band_pips.map(|(a, b)| (a.to_bits(), b.to_bits()))
+        reference
+            .cost_band_pips
+            .map(|(a, b)| (a.to_bits(), b.to_bits())),
+        proposed
+            .cost_band_pips
+            .map(|(a, b)| (a.to_bits(), b.to_bits()))
     );
     cmpf!(
         "swap_long_pips_per_day",
@@ -390,33 +408,69 @@ pub fn money_path_audit(
         reference.swap_short_pips_per_day,
         proposed.swap_short_pips_per_day
     );
-    cmpf!("initial_balance", reference.initial_balance, proposed.initial_balance);
-    cmpf!("risk_per_trade_min", reference.risk_per_trade_min, proposed.risk_per_trade_min);
-    cmpf!("risk_per_trade_max", reference.risk_per_trade_max, proposed.risk_per_trade_max);
+    cmpf!(
+        "initial_balance",
+        reference.initial_balance,
+        proposed.initial_balance
+    );
+    cmpf!(
+        "risk_per_trade_min",
+        reference.risk_per_trade_min,
+        proposed.risk_per_trade_min
+    );
+    cmpf!(
+        "risk_per_trade_max",
+        reference.risk_per_trade_max,
+        proposed.risk_per_trade_max
+    );
     cmp!(
         "risky_risk_band",
-        reference.risky_risk_band.map(|(a, b)| (a.to_bits(), b.to_bits())),
-        proposed.risky_risk_band.map(|(a, b)| (a.to_bits(), b.to_bits()))
+        reference
+            .risky_risk_band
+            .map(|(a, b)| (a.to_bits(), b.to_bits())),
+        proposed
+            .risky_risk_band
+            .map(|(a, b)| (a.to_bits(), b.to_bits()))
     );
     cmp!(
         "prop_firm_risk_band",
-        reference.prop_firm_risk_band.map(|(a, b)| (a.to_bits(), b.to_bits())),
-        proposed.prop_firm_risk_band.map(|(a, b)| (a.to_bits(), b.to_bits()))
+        reference
+            .prop_firm_risk_band
+            .map(|(a, b)| (a.to_bits(), b.to_bits())),
+        proposed
+            .prop_firm_risk_band
+            .map(|(a, b)| (a.to_bits(), b.to_bits()))
     );
-    cmpf!("risky_start_balance", reference.risky_start_balance, proposed.risky_start_balance);
+    cmpf!(
+        "risky_start_balance",
+        reference.risky_start_balance,
+        proposed.risky_start_balance
+    );
     cmpf!(
         "risky_target_balance",
         reference.risky_target_balance,
         proposed.risky_target_balance
     );
-    cmpf!("risky_horizon_days", reference.risky_horizon_days, proposed.risky_horizon_days);
+    cmpf!(
+        "risky_horizon_days",
+        reference.risky_horizon_days,
+        proposed.risky_horizon_days
+    );
     cmpf!(
         "prop_firm_min_pass_rate",
         reference.prop_firm_min_pass_rate,
         proposed.prop_firm_min_pass_rate
     );
-    cmpf!("max_regime_loss_pct", reference.max_regime_loss_pct, proposed.max_regime_loss_pct);
-    cmp!("mode", format!("{:?}", reference.mode), format!("{:?}", proposed.mode));
+    cmpf!(
+        "max_regime_loss_pct",
+        reference.max_regime_loss_pct,
+        proposed.max_regime_loss_pct
+    );
+    cmp!(
+        "mode",
+        format!("{:?}", reference.mode),
+        format!("{:?}", proposed.mode)
+    );
     cmpf!(
         "target_profile.min_net_expectancy_per_trade",
         reference.target_profile.min_net_expectancy_per_trade,
@@ -424,21 +478,57 @@ pub fn money_path_audit(
     );
 
     cmp!("enable_cpcv", reference.enable_cpcv, proposed.enable_cpcv);
-    cmp!("cpcv_n_splits", reference.cpcv_n_splits, proposed.cpcv_n_splits);
-    cmp!("cpcv_n_test_groups", reference.cpcv_n_test_groups, proposed.cpcv_n_test_groups);
-    cmpf!("cpcv_embargo_pct", reference.cpcv_embargo_pct, proposed.cpcv_embargo_pct);
-    cmpf!("cpcv_purge_pct", reference.cpcv_purge_pct, proposed.cpcv_purge_pct);
-    cmpf!("cpcv_min_phi", reference.cpcv_min_phi, proposed.cpcv_min_phi);
-    cmp!("cpcv_max_rows", reference.cpcv_max_rows, proposed.cpcv_max_rows);
-    cmp!("walkforward_splits", reference.walkforward_splits, proposed.walkforward_splits);
-    cmp!("embargo_minutes", reference.embargo_minutes, proposed.embargo_minutes);
+    cmp!(
+        "cpcv_n_splits",
+        reference.cpcv_n_splits,
+        proposed.cpcv_n_splits
+    );
+    cmp!(
+        "cpcv_n_test_groups",
+        reference.cpcv_n_test_groups,
+        proposed.cpcv_n_test_groups
+    );
+    cmpf!(
+        "cpcv_embargo_pct",
+        reference.cpcv_embargo_pct,
+        proposed.cpcv_embargo_pct
+    );
+    cmpf!(
+        "cpcv_purge_pct",
+        reference.cpcv_purge_pct,
+        proposed.cpcv_purge_pct
+    );
+    cmpf!(
+        "cpcv_min_phi",
+        reference.cpcv_min_phi,
+        proposed.cpcv_min_phi
+    );
+    cmp!(
+        "cpcv_max_rows",
+        reference.cpcv_max_rows,
+        proposed.cpcv_max_rows
+    );
+    cmp!(
+        "walkforward_splits",
+        reference.walkforward_splits,
+        proposed.walkforward_splits
+    );
+    cmp!(
+        "embargo_minutes",
+        reference.embargo_minutes,
+        proposed.embargo_minutes
+    );
     cmp!(
         "require_walkforward_for_export",
         reference.require_walkforward_for_export,
         proposed.require_walkforward_for_export
     );
     cmp!("mc_runs", reference.mc_runs, proposed.mc_runs);
-    cmp!("mc_min_profitable", reference.mc_min_profitable, proposed.mc_min_profitable);
+    cmp!(
+        "mc_min_profitable",
+        reference.mc_min_profitable,
+        proposed.mc_min_profitable
+    );
     cmpf!(
         "sensitivity_spread_pips",
         reference.sensitivity_spread_pips,
@@ -510,8 +600,11 @@ pub const HIGHER_LANE_LEVELS: &[&[&str]] = &[&[], &["H1"], &["H1", "H4"], &["H1"
 /// `0` = a single whole-vocabulary pass; anything else = stream that many
 /// batches. The batch WIDTH is never a level — it comes from free RAM.
 pub const STREAMING_BATCH_LEVELS: &[usize] = &[0, 4, 12, 32];
-pub const CURSOR_LEVELS: &[CursorPolicy] =
-    &[CursorPolicy::Start, CursorPolicy::Resumed, CursorPolicy::RandomOffset];
+pub const CURSOR_LEVELS: &[CursorPolicy] = &[
+    CursorPolicy::Start,
+    CursorPolicy::Resumed,
+    CursorPolicy::RandomOffset,
+];
 pub const CANDIDATE_COUNT_LEVELS: &[usize] = &[64, 256, 1024];
 pub const PORTFOLIO_SHAPE_LEVELS: &[(usize, f64)] = &[(1, 1.0), (5, 0.7), (12, 0.5)];
 
@@ -630,21 +723,29 @@ impl FactorId {
             Self::Generations => GENERATION_LEVELS.get(l).map(|v| v.to_string()),
             Self::GeneWidth => GENE_WIDTH_LEVELS.get(l).map(|v| v.to_string()),
             Self::PrefilterWidth => PREFILTER_WIDTH_LEVELS.get(l).map(|v| v.to_string()),
-            Self::PrefilterInsampleFrac => {
-                PREFILTER_INSAMPLE_FRAC_LEVELS.get(l).map(|v| format!("{v:.2}"))
-            }
+            Self::PrefilterInsampleFrac => PREFILTER_INSAMPLE_FRAC_LEVELS
+                .get(l)
+                .map(|v| format!("{v:.2}")),
             Self::BaseTimeframe => BASE_TIMEFRAME_LEVELS.get(l).map(|v| v.to_string()),
             Self::HigherLanes => HIGHER_LANE_LEVELS.get(l).map(|v| {
-                if v.is_empty() { "none".to_string() } else { v.join("+") }
+                if v.is_empty() {
+                    "none".to_string()
+                } else {
+                    v.join("+")
+                }
             }),
             Self::StreamingBatches => STREAMING_BATCH_LEVELS.get(l).map(|v| {
-                if *v == 0 { "single_pass".to_string() } else { v.to_string() }
+                if *v == 0 {
+                    "single_pass".to_string()
+                } else {
+                    v.to_string()
+                }
             }),
             Self::WorkingSetCursor => CURSOR_LEVELS.get(l).map(|v| format!("{v:?}")),
             Self::CandidateCount => CANDIDATE_COUNT_LEVELS.get(l).map(|v| v.to_string()),
-            Self::PortfolioShape => {
-                PORTFOLIO_SHAPE_LEVELS.get(l).map(|(n, c)| format!("{n}@corr{c:.2}"))
-            }
+            Self::PortfolioShape => PORTFOLIO_SHAPE_LEVELS
+                .get(l)
+                .map(|(n, c)| format!("{n}@corr{c:.2}")),
         }
         .unwrap_or_else(|| format!("<out-of-range:{level}>"))
     }
@@ -678,14 +779,26 @@ impl FactorId {
 pub enum SpaceError {
     /// A level index outside the factor's declared arity. There is no clamping:
     /// a proposal the space cannot express is refused, not rounded into it.
-    LevelOutOfRange { factor: FactorId, level: u8, arity: usize },
+    LevelOutOfRange {
+        factor: FactorId,
+        level: u8,
+        arity: usize,
+    },
     /// A level whose knob the compiled search does not have.
-    LevelUnavailable { factor: FactorId, level: u8, knob: RequiredKnob },
+    LevelUnavailable {
+        factor: FactorId,
+        level: u8,
+        knob: RequiredKnob,
+    },
     /// A timeframe label outside the canonical set.
     UnknownTimeframe { label: String },
     /// A higher lane whose candle is longer than the label horizon: the feature
     /// would be asked to predict an outcome shorter than its own bar.
-    LaneHorizonConflict { lane: String, lane_bars_in_base: u32, horizon_bars: usize },
+    LaneHorizonConflict {
+        lane: String,
+        lane_bars_in_base: u32,
+        horizon_bars: usize,
+    },
     /// **U5.** The reachable space is enumerated: every uniform draw collided
     /// with a configuration already run, so this slot had no unexplored point
     /// left to draw.
@@ -707,12 +820,20 @@ pub enum SpaceError {
 impl std::fmt::Display for SpaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LevelOutOfRange { factor, level, arity } => write!(
+            Self::LevelOutOfRange {
+                factor,
+                level,
+                arity,
+            } => write!(
                 f,
                 "axis-A factor `{}` has {arity} levels; level {level} does not exist",
                 factor.label()
             ),
-            Self::LevelUnavailable { factor, level, knob } => write!(
+            Self::LevelUnavailable {
+                factor,
+                level,
+                knob,
+            } => write!(
                 f,
                 "axis-A factor `{}` level `{}` needs `{}` (cargo feature `{}`, edit in {}), \
                  which the compiled neoethos-search does not provide",
@@ -725,16 +846,28 @@ impl std::fmt::Display for SpaceError {
             Self::UnknownTimeframe { label } => write!(
                 f,
                 "`{label}` is not one of the canonical timeframes {:?}",
-                CANONICAL_TIMEFRAMES.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+                CANONICAL_TIMEFRAMES
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
             ),
-            Self::LaneHorizonConflict { lane, lane_bars_in_base, horizon_bars } => write!(
+            Self::LaneHorizonConflict {
+                lane,
+                lane_bars_in_base,
+                horizon_bars,
+            } => write!(
                 f,
                 "higher lane `{lane}` is {lane_bars_in_base} base bars long but the label \
                  horizon is {horizon_bars} bars: the label resolves inside a single {lane} \
                  candle, so the lane's columns would be ranked on an outcome shorter than \
                  their own bar (docs/higher-timeframe-lane-2026-08-09.md §3-4)"
             ),
-            Self::SpaceEnumerated { slot, drawn, of, consecutive_collisions } => write!(
+            Self::SpaceEnumerated {
+                slot,
+                drawn,
+                of,
+                consecutive_collisions,
+            } => write!(
                 f,
                 "slot {slot} was ABANDONED: {consecutive_collisions} consecutive uniform draws \
                  all collided with configurations this session has already run, so the reachable \
@@ -767,12 +900,20 @@ impl SearchConfigDelta {
         for f in FactorId::ALL {
             let l = levels[f.index()];
             if (l as usize) >= f.arity() {
-                return Err(SpaceError::LevelOutOfRange { factor: f, level: l, arity: f.arity() });
+                return Err(SpaceError::LevelOutOfRange {
+                    factor: f,
+                    level: l,
+                    arity: f.arity(),
+                });
             }
             if let Some(knob) = f.level_requires(l)
                 && !knob.available(caps)
             {
-                return Err(SpaceError::LevelUnavailable { factor: f, level: l, knob });
+                return Err(SpaceError::LevelUnavailable {
+                    factor: f,
+                    level: l,
+                    knob,
+                });
             }
         }
         Ok(Self { levels })
@@ -866,11 +1007,13 @@ impl SearchConfigDelta {
     /// and [`crate::proposal::materialise`] is the only place that runs it.
     pub fn apply_structural(&self, cfg: &mut DiscoveryConfig) -> Result<(), SpaceError> {
         let tf = self.base_timeframe();
-        let tf_min = timeframe_minutes(tf)
-            .ok_or_else(|| SpaceError::UnknownTimeframe { label: tf.to_string() })?;
+        let tf_min = timeframe_minutes(tf).ok_or_else(|| SpaceError::UnknownTimeframe {
+            label: tf.to_string(),
+        })?;
         for lane in self.higher_lanes() {
-            let lane_min = timeframe_minutes(lane)
-                .ok_or_else(|| SpaceError::UnknownTimeframe { label: (*lane).to_string() })?;
+            let lane_min = timeframe_minutes(lane).ok_or_else(|| SpaceError::UnknownTimeframe {
+                label: (*lane).to_string(),
+            })?;
             if lane_min <= tf_min {
                 return Err(SpaceError::UnknownTimeframe {
                     label: format!("{lane} is not HIGHER than the base timeframe {tf}"),
@@ -888,7 +1031,11 @@ impl SearchConfigDelta {
         cfg.runtime_overrides.prefilter_top_k = self.prefilter_width();
         cfg.runtime_overrides.prefilter_insample_frac = self.prefilter_insample_frac();
         cfg.timeframe_label = tf.to_string();
-        cfg.higher_timeframes = self.higher_lanes().iter().map(|s| (*s).to_string()).collect();
+        cfg.higher_timeframes = self
+            .higher_lanes()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         cfg.candidate_count = self.candidate_count();
         let (portfolio_size, corr_threshold) = self.portfolio_shape();
         cfg.portfolio_size = portfolio_size;
@@ -912,11 +1059,14 @@ pub fn lane_horizon_conflict(
     lanes: &[&str],
     horizon_bars: usize,
 ) -> Result<(), SpaceError> {
-    let base_min = timeframe_minutes(base_timeframe)
-        .ok_or_else(|| SpaceError::UnknownTimeframe { label: base_timeframe.to_string() })?;
+    let base_min =
+        timeframe_minutes(base_timeframe).ok_or_else(|| SpaceError::UnknownTimeframe {
+            label: base_timeframe.to_string(),
+        })?;
     for lane in lanes {
-        let lane_min = timeframe_minutes(lane)
-            .ok_or_else(|| SpaceError::UnknownTimeframe { label: (*lane).to_string() })?;
+        let lane_min = timeframe_minutes(lane).ok_or_else(|| SpaceError::UnknownTimeframe {
+            label: (*lane).to_string(),
+        })?;
         let lane_bars_in_base = lane_min.div_ceil(base_min.max(1));
         if (horizon_bars as u32) < lane_bars_in_base {
             return Err(SpaceError::LaneHorizonConflict {
@@ -1024,7 +1174,11 @@ pub fn axis_a_report(caps: &Capabilities) -> (Vec<FactorReport>, Vec<ExcludedLev
             }
         }
         cells = cells.saturating_mul(drawable.len().max(1) as u128);
-        factors.push(FactorReport { factor: f.label().to_string(), levels: all, drawable });
+        factors.push(FactorReport {
+            factor: f.label().to_string(),
+            levels: all,
+            drawable,
+        });
     }
     (factors, excluded, cells)
 }
@@ -1069,7 +1223,10 @@ mod tests {
     #[test]
     fn money_path_and_validation_geometry_are_both_inside_the_frozen_wall() {
         for field in MONEY_PATH_FIELDS.iter().chain(VALIDATION_GEOMETRY_FIELDS) {
-            assert!(FROZEN_FIELDS.contains(field), "`{field}` is not in FROZEN_FIELDS");
+            assert!(
+                FROZEN_FIELDS.contains(field),
+                "`{field}` is not in FROZEN_FIELDS"
+            );
         }
     }
 
@@ -1089,7 +1246,11 @@ mod tests {
         let err = SearchConfigDelta::new(levels, &caps()).unwrap_err();
         assert!(matches!(
             err,
-            SpaceError::LevelOutOfRange { factor: FactorId::Population, level: 99, .. }
+            SpaceError::LevelOutOfRange {
+                factor: FactorId::Population,
+                level: 99,
+                ..
+            }
         ));
     }
 
@@ -1113,8 +1274,16 @@ mod tests {
         let mut none = caps();
         none.streaming_start_cursor = false;
         let (_, excluded, _) = axis_a_report(&none);
-        assert_eq!(excluded.len(), 2, "Resumed and RandomOffset should both be excluded");
-        assert!(excluded.iter().all(|e| e.knob == Some(RequiredKnob::StreamingStartCursor)));
+        assert_eq!(
+            excluded.len(),
+            2,
+            "Resumed and RandomOffset should both be excluded"
+        );
+        assert!(
+            excluded
+                .iter()
+                .all(|e| e.knob == Some(RequiredKnob::StreamingStartCursor))
+        );
         assert!(excluded.iter().all(|e| e.required_elsewhere.is_some()));
     }
 
@@ -1125,7 +1294,11 @@ mod tests {
         let err = lane_horizon_conflict("M5", &["H1", "H4"], 35).unwrap_err();
         assert!(matches!(
             err,
-            SpaceError::LaneHorizonConflict { lane_bars_in_base: 48, horizon_bars: 35, .. }
+            SpaceError::LaneHorizonConflict {
+                lane_bars_in_base: 48,
+                horizon_bars: 35,
+                ..
+            }
         ));
         // 120 bars (10 hours) spans it.
         assert!(lane_horizon_conflict("M5", &["H1", "H4"], 120).is_ok());
@@ -1156,7 +1329,10 @@ mod tests {
         };
         let text = e.to_string();
         assert!(text.contains("slot 12 was ABANDONED"), "{text}");
-        assert!(text.contains(&format!("{PROPOSER_RETRIES} consecutive")), "{text}");
+        assert!(
+            text.contains(&format!("{PROPOSER_RETRIES} consecutive")),
+            "{text}"
+        );
         assert!(text.contains(&format!("12 of {SWEEP_SEARCHES}")), "{text}");
         assert!(text.contains("enumerated"), "{text}");
     }

@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
@@ -48,10 +32,6 @@ pub struct MarketStructureTrailingStopOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MarketStructureTrailingStopParams {
     pub length: Option<usize>,
     pub increment_factor: Option<f64>,
@@ -248,9 +228,7 @@ pub enum MarketStructureTrailingStopError {
         "market_structure_trailing_stop: Output length mismatch: dst = {dst_len}, expected = {expected_len}"
     )]
     MismatchedOutputLen { dst_len: usize, expected_len: usize },
-    #[error(
-        "market_structure_trailing_stop: Invalid range: start={start}, end={end}, step={step}"
-    )]
+    #[error("market_structure_trailing_stop: Invalid range: start={start}, end={end}, step={step}")]
     InvalidRange {
         start: String,
         end: String,
@@ -803,7 +781,6 @@ pub fn market_structure_trailing_stop_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn market_structure_trailing_stop_into(
     input: &MarketStructureTrailingStopInput,
     out_trailing_stop: &mut [f64],
@@ -1127,7 +1104,7 @@ fn market_structure_trailing_stop_batch_inner(
         other => {
             return Err(MarketStructureTrailingStopError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     }
 
@@ -1202,7 +1179,7 @@ fn market_structure_trailing_stop_batch_inner_into(
         other => {
             return Err(MarketStructureTrailingStopError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     }
 
@@ -1309,481 +1286,12 @@ fn market_structure_trailing_stop_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(
-    name = "market_structure_trailing_stop",
-    signature = (open, high, low, close, length=14, increment_factor=100.0, reset_on=RESET_ON_CHOCH, kernel=None)
-)]
-pub fn market_structure_trailing_stop_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    increment_factor: f64,
-    reset_on: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = MarketStructureTrailingStopInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        MarketStructureTrailingStopParams {
-            length: Some(length),
-            increment_factor: Some(increment_factor),
-            reset_on: Some(reset_on.to_string()),
-        },
-    );
-    let out = py
-        .allow_threads(|| market_structure_trailing_stop_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.trailing_stop.into_pyarray(py),
-        out.state.into_pyarray(py),
-        out.structure.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(
-    name = "market_structure_trailing_stop_batch",
-    signature = (open, high, low, close, length_range=(14, 14, 0), increment_factor_range=(100.0, 100.0, 0.0), reset_on=RESET_ON_CHOCH, kernel=None)
-)]
-pub fn market_structure_trailing_stop_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    increment_factor_range: (f64, f64, f64),
-    reset_on: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let output = py
-        .allow_threads(|| {
-            market_structure_trailing_stop_batch_with_kernel(
-                open,
-                high,
-                low,
-                close,
-                &MarketStructureTrailingStopBatchRange {
-                    length: length_range,
-                    increment_factor: increment_factor_range,
-                },
-                reset_on,
-                kern,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "trailing_stop",
-        output
-            .trailing_stop
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "state",
-        output
-            .state
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "structure",
-        output
-            .structure
-            .into_pyarray(py)
-            .reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "lengths",
-        output
-            .combos
-            .iter()
-            .map(|params| params.length.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "increment_factors",
-        output
-            .combos
-            .iter()
-            .map(|params| params.increment_factor.unwrap_or(100.0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "reset_ons",
-        output
-            .combos
-            .iter()
-            .map(|params| {
-                params
-                    .reset_on
-                    .clone()
-                    .unwrap_or_else(|| RESET_ON_CHOCH.to_string())
-            })
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_market_structure_trailing_stop_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(market_structure_trailing_stop_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        market_structure_trailing_stop_batch_py,
-        m
-    )?)?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MarketStructureTrailingStopBatchConfig {
-    pub length_range: Vec<usize>,
-    pub increment_factor_range: Vec<f64>,
-    pub reset_on: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = market_structure_trailing_stop_js)]
-pub fn market_structure_trailing_stop_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    increment_factor: f64,
-    reset_on: &str,
-) -> Result<JsValue, JsValue> {
-    let input = MarketStructureTrailingStopInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        MarketStructureTrailingStopParams {
-            length: Some(length),
-            increment_factor: Some(increment_factor),
-            reset_on: Some(reset_on.to_string()),
-        },
-    );
-    let out = market_structure_trailing_stop_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("trailing_stop"),
-        &serde_wasm_bindgen::to_value(&out.trailing_stop).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("state"),
-        &serde_wasm_bindgen::to_value(&out.state).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("structure"),
-        &serde_wasm_bindgen::to_value(&out.structure).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = market_structure_trailing_stop_batch_js)]
-pub fn market_structure_trailing_stop_batch_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: MarketStructureTrailingStopBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 || config.increment_factor_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: every range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let out = market_structure_trailing_stop_batch_with_kernel(
-        open,
-        high,
-        low,
-        close,
-        &MarketStructureTrailingStopBatchRange {
-            length: (
-                config.length_range[0],
-                config.length_range[1],
-                config.length_range[2],
-            ),
-            increment_factor: (
-                config.increment_factor_range[0],
-                config.increment_factor_range[1],
-                config.increment_factor_range[2],
-            ),
-        },
-        config.reset_on.as_deref().unwrap_or(RESET_ON_CHOCH),
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("trailing_stop"),
-        &serde_wasm_bindgen::to_value(&out.trailing_stop).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("state"),
-        &serde_wasm_bindgen::to_value(&out.state).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("structure"),
-        &serde_wasm_bindgen::to_value(&out.structure).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&out.combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn market_structure_trailing_stop_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(3 * len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn market_structure_trailing_stop_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, 3 * len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn market_structure_trailing_stop_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    increment_factor: f64,
-    reset_on: &str,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to market_structure_trailing_stop_into",
-        ));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 3 * len);
-        let (dst_trailing_stop, tail) = out.split_at_mut(len);
-        let (dst_state, dst_structure) = tail.split_at_mut(len);
-        let input = MarketStructureTrailingStopInput::from_slices(
-            open,
-            high,
-            low,
-            close,
-            MarketStructureTrailingStopParams {
-                length: Some(length),
-                increment_factor: Some(increment_factor),
-                reset_on: Some(reset_on.to_string()),
-            },
-        );
-        market_structure_trailing_stop_into_slice(
-            dst_trailing_stop,
-            dst_state,
-            dst_structure,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn market_structure_trailing_stop_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    increment_factor_start: f64,
-    increment_factor_end: f64,
-    increment_factor_step: f64,
-    reset_on: &str,
-) -> Result<usize, JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to market_structure_trailing_stop_batch_into",
-        ));
-    }
-
-    let sweep = MarketStructureTrailingStopBatchRange {
-        length: (length_start, length_end, length_step),
-        increment_factor: (
-            increment_factor_start,
-            increment_factor_end,
-            increment_factor_step,
-        ),
-    };
-    let combos =
-        expand_grid_checked(&sweep, reset_on).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let split = rows.checked_mul(len).ok_or_else(|| {
-        JsValue::from_str("rows*cols overflow in market_structure_trailing_stop_batch_into")
-    })?;
-    let total = split.checked_mul(3).ok_or_else(|| {
-        JsValue::from_str("3*rows*cols overflow in market_structure_trailing_stop_batch_into")
-    })?;
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let (dst_trailing_stop, tail) = out.split_at_mut(split);
-        let (dst_state, dst_structure) = tail.split_at_mut(split);
-        market_structure_trailing_stop_batch_inner_into(
-            open,
-            high,
-            low,
-            close,
-            &sweep,
-            reset_on,
-            Kernel::Auto,
-            false,
-            dst_trailing_stop,
-            dst_state,
-            dst_structure,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn market_structure_trailing_stop_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    increment_factor: f64,
-    reset_on: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = market_structure_trailing_stop_js(
-        open,
-        high,
-        low,
-        close,
-        length,
-        increment_factor,
-        reset_on,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "market_structure_trailing_stop_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn market_structure_trailing_stop_batch_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = market_structure_trailing_stop_batch_js(open, high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "market_structure_trailing_stop_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu, IndicatorComputeRequest, IndicatorDataRef, IndicatorSeries, ParamKV,
-        ParamValue,
+        IndicatorComputeRequest, IndicatorDataRef, IndicatorSeries, ParamKV, ParamValue,
+        compute_cpu,
     };
 
     fn sample_ohlc(len: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -1841,14 +1349,16 @@ mod tests {
         assert_eq!(out.state.len(), close.len());
         assert_eq!(out.structure.len(), close.len());
         assert!(out.trailing_stop.iter().any(|v| v.is_finite()));
-        assert!(out
-            .state
-            .iter()
-            .all(|&v| v.is_nan() || v == -1.0 || v == 0.0 || v == 1.0));
-        assert!(out
-            .structure
-            .iter()
-            .all(|&v| v.is_nan() || v == -1.0 || v == 0.0 || v == 1.0));
+        assert!(
+            out.state
+                .iter()
+                .all(|&v| v.is_nan() || v == -1.0 || v == 0.0 || v == 1.0)
+        );
+        assert!(
+            out.structure
+                .iter()
+                .all(|&v| v.is_nan() || v == -1.0 || v == 0.0 || v == 1.0)
+        );
         Ok(())
     }
 
@@ -2033,8 +1543,8 @@ mod tests {
     }
 
     #[test]
-    fn market_structure_trailing_stop_dispatch_compute_returns_expected_outputs(
-    ) -> Result<(), Box<dyn Error>> {
+    fn market_structure_trailing_stop_dispatch_compute_returns_expected_outputs()
+    -> Result<(), Box<dyn Error>> {
         let (open, high, low, close) = sample_ohlc(220);
         let params = [
             ParamKV {

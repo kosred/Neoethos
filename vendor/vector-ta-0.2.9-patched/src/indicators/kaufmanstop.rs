@@ -1,4 +1,4 @@
-use crate::indicators::moving_averages::ma::{ma, MaData, MaError};
+use crate::indicators::moving_averages::ma::{MaData, MaError, ma};
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
@@ -14,24 +14,6 @@ use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 #[derive(Debug, Clone)]
 pub enum KaufmanstopData<'a> {
     Candles { candles: &'a Candles },
@@ -44,10 +26,6 @@ pub struct KaufmanstopOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct KaufmanstopParams {
     pub period: Option<usize>,
     pub mult: Option<f64>,
@@ -231,13 +209,6 @@ pub enum KaufmanstopError {
     InvalidKernelForBatch(Kernel),
     #[error("kaufmanstop: invalid MA type: {ma_type}")]
     InvalidMaType { ma_type: String },
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-impl From<KaufmanstopError> for JsValue {
-    fn from(err: KaufmanstopError) -> Self {
-        JsValue::from_str(&err.to_string())
-    }
 }
 
 #[inline]
@@ -452,7 +423,6 @@ fn kaufmanstop_compute_prepared_into(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn kaufmanstop_into(input: &KaufmanstopInput, out: &mut [f64]) -> Result<(), KaufmanstopError> {
     let (high, low, period, first_valid_idx, mult, direction, ma_type) =
@@ -1420,253 +1390,6 @@ pub fn expand_grid_wrapper(
     expand_grid(r)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "kaufmanstop")]
-#[pyo3(signature = (high, low, period=22, mult=2.0, direction="long", ma_type="sma", kernel=None))]
-pub fn kaufmanstop_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    mult: f64,
-    direction: &str,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-
-    if high_slice.len() != low_slice.len() {
-        return Err(PyValueError::new_err(
-            "High and low arrays must have the same length",
-        ));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = KaufmanstopParams {
-        period: Some(period),
-        mult: Some(mult),
-        direction: Some(direction.to_string()),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = KaufmanstopInput::from_slices(high_slice, low_slice, params);
-
-    let result = py.allow_threads(|| kaufmanstop_with_kernel(&input, kern));
-
-    match result {
-        Ok(output) => Ok(output.values.into_pyarray(py)),
-        Err(e) => Err(PyValueError::new_err(e.to_string())),
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "KaufmanstopStream")]
-pub struct KaufmanstopStreamPy {
-    stream: KaufmanstopStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl KaufmanstopStreamPy {
-    #[new]
-    fn new(period: usize, mult: f64, direction: &str, ma_type: &str) -> PyResult<Self> {
-        let params = KaufmanstopParams {
-            period: Some(period),
-            mult: Some(mult),
-            direction: Some(direction.to_string()),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let stream =
-            KaufmanstopStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(KaufmanstopStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<f64> {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "kaufmanstop_batch")]
-#[pyo3(signature = (high, low, period_range, mult_range=(2.0, 2.0, 0.0), direction="long", ma_type="sma", kernel=None))]
-pub fn kaufmanstop_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    direction: &str,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err(
-            "High and low arrays must have the same length",
-        ));
-    }
-
-    let sweep = KaufmanstopBatchRange {
-        period: period_range,
-        mult: mult_range,
-        direction: (direction.to_string(), direction.to_string(), 0.0),
-        ma_type: (ma_type.to_string(), ma_type.to_string(), 0.0),
-    };
-
-    let combos_preview = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos_preview.len();
-    let cols = h.len();
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in kaufmanstop_batch_py"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [expected], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    let combos = py
-        .allow_threads(|| {
-            let simd = match match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            } {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            kaufmanstop_batch_inner_into(h, l, &sweep, simd, true, out_slice)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|c| c.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "mults",
-        combos
-            .iter()
-            .map(|c| c.mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    dict.set_item(
-        "directions",
-        combos
-            .iter()
-            .map(|c| c.direction.as_deref().unwrap())
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item(
-        "ma_types",
-        combos
-            .iter()
-            .map(|c| c.ma_type.as_deref().unwrap())
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kaufmanstop_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, period_range, mult_range=(2.0, 2.0, 0.0), direction="long", ma_type="sma", device_id=0))]
-pub fn kaufmanstop_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    direction: &str,
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaKaufmanstop;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err(
-            "High and low arrays must have same length",
-        ));
-    }
-    let sweep = KaufmanstopBatchRange {
-        period: period_range,
-        mult: mult_range,
-        direction: (direction.to_string(), direction.to_string(), 0.0),
-        ma_type: (ma_type.to_string(), ma_type.to_string(), 0.0),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda =
-            CudaKaufmanstop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (dev, _combos) = cuda
-            .kaufmanstop_batch_dev(h, l, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>(dev)
-    })?;
-    make_device_array_py(device_id, inner)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "kaufmanstop_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, period, mult=2.0, direction="long", ma_type="sma", device_id=0))]
-pub fn kaufmanstop_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    mult: f64,
-    direction: &str,
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaKaufmanstop;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let rows = high_tm_f32.shape()[0];
-    let cols = high_tm_f32.shape()[1];
-    if low_tm_f32.shape()[0] != rows || low_tm_f32.shape()[1] != cols {
-        return Err(PyValueError::new_err("high/low shapes must match"));
-    }
-    let params = KaufmanstopParams {
-        period: Some(period),
-        mult: Some(mult),
-        direction: Some(direction.to_string()),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let inner = py.allow_threads(|| {
-        let cuda =
-            CudaKaufmanstop::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.kaufmanstop_many_series_one_param_time_major_dev(h, l, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    make_device_array_py(device_id, inner)
-}
-
 pub fn kaufmanstop_into_slice(
     dst: &mut [f64],
     input: &KaufmanstopInput,
@@ -1793,300 +1516,6 @@ pub fn kaufmanstop_into_slice(
     }
 
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-
-pub fn kaufmanstop_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    mult: f64,
-    direction: &str,
-    ma_type: &str,
-) -> Result<Vec<f64>, JsError> {
-    let params = KaufmanstopParams {
-        period: Some(period),
-        mult: Some(mult),
-        direction: Some(direction.to_string()),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = KaufmanstopInput::from_slices(high, low, params);
-
-    match kaufmanstop(&input) {
-        Ok(output) => Ok(output.values),
-        Err(e) => Err(JsError::new(&e.to_string())),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-
-pub fn kaufmanstop_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    mult: f64,
-    direction: &str,
-    ma_type: &str,
-) -> Result<(), JsError> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsError::new("Null pointer passed to kaufmanstop_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-        let high_start = high_ptr as usize;
-        let high_end = high_start + len * std::mem::size_of::<f64>();
-        let low_start = low_ptr as usize;
-        let low_end = low_start + len * std::mem::size_of::<f64>();
-        let out_start = out_ptr as usize;
-        let out_end = out_start + len * std::mem::size_of::<f64>();
-
-        let overlaps_high = (out_start < high_end) && (high_start < out_end);
-
-        let overlaps_low = (out_start < low_end) && (low_start < out_end);
-
-        if overlaps_high || overlaps_low {
-            let params = KaufmanstopParams {
-                period: Some(period),
-                mult: Some(mult),
-                direction: Some(direction.to_string()),
-                ma_type: Some(ma_type.to_string()),
-            };
-            let input = KaufmanstopInput::from_slices(high, low, params);
-            let result = kaufmanstop(&input).map_err(|e| JsError::new(&e.to_string()))?;
-            out.copy_from_slice(&result.values);
-        } else {
-            let params = KaufmanstopParams {
-                period: Some(period),
-                mult: Some(mult),
-                direction: Some(direction.to_string()),
-                ma_type: Some(ma_type.to_string()),
-            };
-            let input = KaufmanstopInput::from_slices(high, low, params);
-            kaufmanstop_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsError::new(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-
-pub fn kaufmanstop_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-
-pub unsafe fn kaufmanstop_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    Vec::from_raw_parts(ptr, 0, len);
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KaufmanstopBatchMeta {
-    pub combos: Vec<KaufmanstopParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-
-pub fn kaufmanstop_batch_js(
-    high: &[f64],
-    low: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-    direction: &str,
-    ma_type: &str,
-) -> Result<JsValue, JsError> {
-    let sweep = KaufmanstopBatchRange {
-        period: (period_start, period_end, period_step),
-        mult: (mult_start, mult_end, mult_step),
-        direction: (direction.to_string(), direction.to_string(), 0.0),
-        ma_type: (ma_type.to_string(), ma_type.to_string(), 0.0),
-    };
-
-    match kaufmanstop_batch_slice(high, low, &sweep, Kernel::Auto) {
-        Ok(output) => {
-            let meta = KaufmanstopBatchMeta {
-                combos: output.combos,
-                rows: output.rows,
-                cols: output.cols,
-            };
-
-            let js_object = js_sys::Object::new();
-
-            let values_array = js_sys::Float64Array::from(&output.values[..]);
-            js_sys::Reflect::set(&js_object, &"values".into(), &values_array.into())
-                .map_err(|e| JsError::new(&format!("Failed to set values: {:?}", e)))?;
-
-            let meta_value = serde_wasm_bindgen::to_value(&meta)?;
-            let combos = js_sys::Reflect::get(&meta_value, &"combos".into())
-                .map_err(|e| JsError::new(&format!("Failed to get combos: {:?}", e)))?;
-            js_sys::Reflect::set(&js_object, &"combos".into(), &combos)
-                .map_err(|e| JsError::new(&format!("Failed to set combos: {:?}", e)))?;
-
-            let rows = js_sys::Reflect::get(&meta_value, &"rows".into())
-                .map_err(|e| JsError::new(&format!("Failed to get rows: {:?}", e)))?;
-            js_sys::Reflect::set(&js_object, &"rows".into(), &rows)
-                .map_err(|e| JsError::new(&format!("Failed to set rows: {:?}", e)))?;
-
-            let cols = js_sys::Reflect::get(&meta_value, &"cols".into())
-                .map_err(|e| JsError::new(&format!("Failed to get cols: {:?}", e)))?;
-            js_sys::Reflect::set(&js_object, &"cols".into(), &cols)
-                .map_err(|e| JsError::new(&format!("Failed to set cols: {:?}", e)))?;
-
-            Ok(js_object.into())
-        }
-        Err(e) => Err(JsError::new(&e.to_string())),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-
-pub fn kaufmanstop_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsError> {
-    #[derive(Deserialize)]
-    struct BatchConfig {
-        period_range: Option<(usize, usize, usize)>,
-        mult_range: Option<(f64, f64, f64)>,
-        direction: Option<String>,
-        ma_type: Option<String>,
-    }
-
-    let config: BatchConfig = serde_wasm_bindgen::from_value(config)?;
-
-    let sweep = KaufmanstopBatchRange {
-        period: config.period_range.unwrap_or((22, 22, 0)),
-        mult: config.mult_range.unwrap_or((2.0, 2.0, 0.0)),
-        direction: config.direction.map(|d| (d.clone(), d, 0.0)).unwrap_or((
-            "long".to_string(),
-            "long".to_string(),
-            0.0,
-        )),
-        ma_type: config.ma_type.map(|t| (t.clone(), t, 0.0)).unwrap_or((
-            "sma".to_string(),
-            "sma".to_string(),
-            0.0,
-        )),
-    };
-
-    match kaufmanstop_batch_slice(high, low, &sweep, Kernel::Auto) {
-        Ok(output) => {
-            let meta = KaufmanstopBatchMeta {
-                combos: output.combos,
-                rows: output.rows,
-                cols: output.cols,
-            };
-
-            let js_object = js_sys::Object::new();
-
-            let values_array = js_sys::Float64Array::from(&output.values[..]);
-            js_sys::Reflect::set(&js_object, &"values".into(), &values_array.into())
-                .map_err(|e| JsError::new(&format!("Failed to set values: {:?}", e)))?;
-
-            let meta_value = serde_wasm_bindgen::to_value(&meta)?;
-            let combos = js_sys::Reflect::get(&meta_value, &"combos".into())
-                .map_err(|e| JsError::new(&format!("Failed to get combos: {:?}", e)))?;
-            js_sys::Reflect::set(&js_object, &"combos".into(), &combos)
-                .map_err(|e| JsError::new(&format!("Failed to set combos: {:?}", e)))?;
-
-            let rows = js_sys::Reflect::get(&meta_value, &"rows".into())
-                .map_err(|e| JsError::new(&format!("Failed to get rows: {:?}", e)))?;
-            js_sys::Reflect::set(&js_object, &"rows".into(), &rows)
-                .map_err(|e| JsError::new(&format!("Failed to set rows: {:?}", e)))?;
-
-            let cols = js_sys::Reflect::get(&meta_value, &"cols".into())
-                .map_err(|e| JsError::new(&format!("Failed to get cols: {:?}", e)))?;
-            js_sys::Reflect::set(&js_object, &"cols".into(), &cols)
-                .map_err(|e| JsError::new(&format!("Failed to set cols: {:?}", e)))?;
-
-            Ok(js_object.into())
-        }
-        Err(e) => Err(JsError::new(&e.to_string())),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-
-pub fn kaufmanstop_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-    direction: &str,
-    ma_type: &str,
-) -> Result<JsValue, JsError> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsError::new(
-            "Null pointer passed to kaufmanstop_batch_into",
-        ));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let sweep = KaufmanstopBatchRange {
-            period: (period_start, period_end, period_step),
-            mult: (mult_start, mult_end, mult_step),
-            direction: (direction.to_string(), direction.to_string(), 0.0),
-            ma_type: (ma_type.to_string(), ma_type.to_string(), 0.0),
-        };
-
-        let combos_preview = expand_grid(&sweep).map_err(|e| JsError::new(&e.to_string()))?;
-        let rows = combos_preview.len();
-        let cols = len;
-        let expected = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsError::new("rows*cols overflow in kaufmanstop_batch_into"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, expected);
-
-        let _ =
-            kaufmanstop_batch_inner_into(high, low, &sweep, detect_best_batch_kernel(), false, out)
-                .map_err(|e| JsError::new(&e.to_string()))?;
-
-        let meta = KaufmanstopBatchMeta {
-            combos: combos_preview,
-            rows,
-            cols,
-        };
-        serde_wasm_bindgen::to_value(&meta).map_err(Into::into)
-    }
 }
 
 #[inline]
@@ -2286,74 +1715,11 @@ pub unsafe fn kaufmanstop_scalar_classic_ema(
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kaufmanstop_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    mult: f64,
-    direction: &str,
-    ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = kaufmanstop_js(high, low, period, mult, direction, ma_type)
-        .map_err(|e| JsValue::from(e))?;
-    crate::write_wasm_f64_output("kaufmanstop_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kaufmanstop_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-    direction: &str,
-    ma_type: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kaufmanstop_batch_js(
-        high,
-        low,
-        period_start,
-        period_end,
-        period_step,
-        mult_start,
-        mult_end,
-        mult_step,
-        direction,
-        ma_type,
-    )
-    .map_err(|e| JsValue::from(e))?;
-    crate::write_wasm_selected_object_f64_outputs("kaufmanstop_batch_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn kaufmanstop_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = kaufmanstop_batch_unified_js(high, low, config).map_err(|e| JsValue::from(e))?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "kaufmanstop_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
@@ -2362,8 +1728,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KaufmanstopInput::with_default_candles(&candles);
         let output = kaufmanstop_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -2371,8 +1737,8 @@ mod tests {
     }
     fn check_kaufmanstop_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KaufmanstopInput::with_default_candles(&candles);
         let result = kaufmanstop_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -2468,8 +1834,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = KaufmanstopInput::with_default_candles(&candles);
         let res = kaufmanstop_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -2487,8 +1853,8 @@ mod tests {
     }
     fn check_kaufmanstop_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let high = candles.select_candle_field("high").unwrap();
         let low = candles.select_candle_field("low").unwrap();
 
@@ -2534,8 +1900,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             KaufmanstopParams::default(),
@@ -2785,8 +2151,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = KaufmanstopBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c)?;
@@ -2837,8 +2203,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 2.0, 2.0, 0.0, "long", "sma"),

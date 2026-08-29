@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -38,11 +20,6 @@ const DEFAULT_RAW_THRESHOLD_PERCENTILE: f64 = 95.0;
 const DEFAULT_THRESHOLD_LEVEL: f64 = 80.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "snake_case")
-)]
 pub enum BullsVBearsMaType {
     Ema,
     Sma,
@@ -88,11 +65,6 @@ impl FromStr for BullsVBearsMaType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "snake_case")
-)]
 pub enum BullsVBearsCalculationMethod {
     Normalized,
     Raw,
@@ -167,10 +139,6 @@ pub enum BullsVBearsOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct BullsVBearsParams {
     pub period: Option<usize>,
     pub ma_type: Option<BullsVBearsMaType>,
@@ -371,7 +339,9 @@ pub enum BullsVBearsError {
     EmptyInputData,
     #[error("bulls_v_bears: All values are NaN.")]
     AllValuesNaN,
-    #[error("bulls_v_bears: Inconsistent slice lengths: high={high_len}, low={low_len}, close={close_len}")]
+    #[error(
+        "bulls_v_bears: Inconsistent slice lengths: high={high_len}, low={low_len}, close={close_len}"
+    )]
     InconsistentSliceLengths {
         high_len: usize,
         low_len: usize,
@@ -692,6 +662,7 @@ fn compute_signals(
             out_bearish_signal[i] = f64::NAN;
             out_zero_cross_up[i] = f64::NAN;
             out_zero_cross_down[i] = f64::NAN;
+            prev_total = f64::NAN;
         }
     }
     Ok(())
@@ -750,6 +721,20 @@ fn bulls_v_bears_compute_into(
             let mut bear_max = VecDeque::new();
 
             for i in 0..len {
+                out_upper[i] = params.threshold_level;
+                out_lower[i] = -params.threshold_level;
+
+                let bull = out_bull[i];
+                let bear = out_bear[i];
+                if !(bull.is_finite() && bear.is_finite()) {
+                    bull_min.clear();
+                    bull_max.clear();
+                    bear_min.clear();
+                    bear_max.clear();
+                    out_value[i] = f64::NAN;
+                    continue;
+                }
+
                 let min_index = i
                     .saturating_add(1)
                     .saturating_sub(params.normalized_bars_back);
@@ -758,24 +743,10 @@ fn bulls_v_bears_compute_into(
                 expire_queue(&mut bear_min, min_index);
                 expire_queue(&mut bear_max, min_index);
 
-                let bull = out_bull[i];
-                let bear = out_bear[i];
-                if bull.is_finite() {
-                    push_min_queue(&mut bull_min, i, bull);
-                    push_max_queue(&mut bull_max, i, bull);
-                }
-                if bear.is_finite() {
-                    push_min_queue(&mut bear_min, i, bear);
-                    push_max_queue(&mut bear_max, i, bear);
-                }
-
-                out_upper[i] = params.threshold_level;
-                out_lower[i] = -params.threshold_level;
-
-                if !(bull.is_finite() && bear.is_finite()) {
-                    out_value[i] = f64::NAN;
-                    continue;
-                }
+                push_min_queue(&mut bull_min, i, bull);
+                push_max_queue(&mut bull_max, i, bull);
+                push_min_queue(&mut bear_min, i, bear);
+                push_max_queue(&mut bear_max, i, bear);
 
                 let bull_min_value = bull_min.front().map(|(_, v)| *v).unwrap_or(f64::NAN);
                 let bull_max_value = bull_max.front().map(|(_, v)| *v).unwrap_or(f64::NAN);
@@ -810,17 +781,23 @@ fn bulls_v_bears_compute_into(
             }
 
             for i in 0..len {
+                let total = out_value[i];
+                if !total.is_finite() {
+                    raw_min.clear();
+                    raw_max.clear();
+                    out_upper[i] = f64::NAN;
+                    out_lower[i] = f64::NAN;
+                    continue;
+                }
+
                 let min_index = i
                     .saturating_add(1)
                     .saturating_sub(params.raw_rolling_period);
                 expire_queue(&mut raw_min, min_index);
                 expire_queue(&mut raw_max, min_index);
 
-                let total = out_value[i];
-                if total.is_finite() {
-                    push_min_queue(&mut raw_min, i, total);
-                    push_max_queue(&mut raw_max, i, total);
-                }
+                push_min_queue(&mut raw_min, i, total);
+                push_max_queue(&mut raw_max, i, total);
 
                 let lowest = raw_min.front().map(|(_, v)| *v).unwrap_or(f64::NAN);
                 let highest = raw_max.front().map(|(_, v)| *v).unwrap_or(f64::NAN);
@@ -904,7 +881,6 @@ pub fn bulls_v_bears_with_kernel(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn bulls_v_bears_into(
     out_value: &mut [f64],
     out_bull: &mut [f64],
@@ -1175,6 +1151,17 @@ impl BullsVBearsStream {
         })
     }
 
+    #[inline]
+    fn reset_derived_segment(&mut self) {
+        self.bull_min.clear();
+        self.bull_max.clear();
+        self.bear_min.clear();
+        self.bear_max.clear();
+        self.raw_min.clear();
+        self.raw_max.clear();
+        self.prev_total = f64::NAN;
+    }
+
     pub fn update(
         &mut self,
         high: f64,
@@ -1186,13 +1173,20 @@ impl BullsVBearsStream {
 
         let ma = self.ma_state.update(close);
         if !(high.is_finite() && low.is_finite() && ma.is_finite()) {
+            self.reset_derived_segment();
+            let (upper, lower) = match self.params.calculation_method {
+                BullsVBearsCalculationMethod::Normalized => {
+                    (self.params.threshold_level, -self.params.threshold_level)
+                }
+                BullsVBearsCalculationMethod::Raw => (f64::NAN, f64::NAN),
+            };
             return (
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
                 ma,
-                f64::NAN,
-                f64::NAN,
+                upper,
+                lower,
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
@@ -1253,6 +1247,7 @@ impl BullsVBearsStream {
         };
 
         if !(value.is_finite() && upper.is_finite() && lower.is_finite()) {
+            self.prev_total = f64::NAN;
             return (
                 f64::NAN,
                 bull,
@@ -1957,808 +1952,12 @@ fn bulls_v_bears_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "bulls_v_bears")]
-#[pyo3(signature = (
-    high,
-    low,
-    close,
-    period=14,
-    ma_type="ema",
-    calculation_method="normalized",
-    normalized_bars_back=120,
-    raw_rolling_period=50,
-    raw_threshold_percentile=95.0,
-    threshold_level=80.0,
-    kernel=None
-))]
-pub fn bulls_v_bears_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    ma_type: &str,
-    calculation_method: &str,
-    normalized_bars_back: usize,
-    raw_rolling_period: usize,
-    raw_threshold_percentile: f64,
-    threshold_level: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let input = BullsVBearsInput::from_slices(
-        high,
-        low,
-        close,
-        BullsVBearsParams {
-            period: Some(period),
-            ma_type: Some(
-                BullsVBearsMaType::from_str(ma_type)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            ),
-            calculation_method: Some(
-                BullsVBearsCalculationMethod::from_str(calculation_method)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            ),
-            normalized_bars_back: Some(normalized_bars_back),
-            raw_rolling_period: Some(raw_rolling_period),
-            raw_threshold_percentile: Some(raw_threshold_percentile),
-            threshold_level: Some(threshold_level),
-        },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| bulls_v_bears_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("value", out.value.into_pyarray(py))?;
-    dict.set_item("bull", out.bull.into_pyarray(py))?;
-    dict.set_item("bear", out.bear.into_pyarray(py))?;
-    dict.set_item("ma", out.ma.into_pyarray(py))?;
-    dict.set_item("upper", out.upper.into_pyarray(py))?;
-    dict.set_item("lower", out.lower.into_pyarray(py))?;
-    dict.set_item("bullish_signal", out.bullish_signal.into_pyarray(py))?;
-    dict.set_item("bearish_signal", out.bearish_signal.into_pyarray(py))?;
-    dict.set_item("zero_cross_up", out.zero_cross_up.into_pyarray(py))?;
-    dict.set_item("zero_cross_down", out.zero_cross_down.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "BullsVBearsStream")]
-pub struct BullsVBearsStreamPy {
-    stream: BullsVBearsStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl BullsVBearsStreamPy {
-    #[new]
-    #[pyo3(signature = (
-        period=14,
-        ma_type="ema",
-        calculation_method="normalized",
-        normalized_bars_back=120,
-        raw_rolling_period=50,
-        raw_threshold_percentile=95.0,
-        threshold_level=80.0
-    ))]
-    fn new(
-        period: usize,
-        ma_type: &str,
-        calculation_method: &str,
-        normalized_bars_back: usize,
-        raw_rolling_period: usize,
-        raw_threshold_percentile: f64,
-        threshold_level: f64,
-    ) -> PyResult<Self> {
-        let stream = BullsVBearsStream::try_new(BullsVBearsParams {
-            period: Some(period),
-            ma_type: Some(
-                BullsVBearsMaType::from_str(ma_type)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            ),
-            calculation_method: Some(
-                BullsVBearsCalculationMethod::from_str(calculation_method)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            ),
-            normalized_bars_back: Some(normalized_bars_back),
-            raw_rolling_period: Some(raw_rolling_period),
-            raw_threshold_percentile: Some(raw_threshold_percentile),
-            threshold_level: Some(threshold_level),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(
-        &mut self,
-        high: f64,
-        low: f64,
-        close: f64,
-    ) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "bulls_v_bears_batch")]
-#[pyo3(signature = (
-    high,
-    low,
-    close,
-    period_range=(14,14,0),
-    normalized_bars_back_range=(120,120,0),
-    raw_rolling_period_range=(50,50,0),
-    raw_threshold_percentile_range=(95.0,95.0,0.0),
-    threshold_level_range=(80.0,80.0,0.0),
-    ma_type="ema",
-    calculation_method="normalized",
-    kernel=None
-))]
-pub fn bulls_v_bears_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    normalized_bars_back_range: (usize, usize, usize),
-    raw_rolling_period_range: (usize, usize, usize),
-    raw_threshold_percentile_range: (f64, f64, f64),
-    threshold_level_range: (f64, f64, f64),
-    ma_type: &str,
-    calculation_method: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let sweep = BullsVBearsBatchRange {
-        period: period_range,
-        normalized_bars_back: normalized_bars_back_range,
-        raw_rolling_period: raw_rolling_period_range,
-        raw_threshold_percentile: raw_threshold_percentile_range,
-        threshold_level: threshold_level_range,
-        ma_type: BullsVBearsMaType::from_str(ma_type)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        calculation_method: BullsVBearsCalculationMethod::from_str(calculation_method)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-    };
-    let combos =
-        bulls_v_bears_expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_value = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_bull = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_bear = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_ma = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_upper = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_lower = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_bullish_signal = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_bearish_signal = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_zero_cross_up = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_zero_cross_down = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let value_slice = unsafe { out_value.as_slice_mut()? };
-    let bull_slice = unsafe { out_bull.as_slice_mut()? };
-    let bear_slice = unsafe { out_bear.as_slice_mut()? };
-    let ma_slice = unsafe { out_ma.as_slice_mut()? };
-    let upper_slice = unsafe { out_upper.as_slice_mut()? };
-    let lower_slice = unsafe { out_lower.as_slice_mut()? };
-    let bullish_signal_slice = unsafe { out_bullish_signal.as_slice_mut()? };
-    let bearish_signal_slice = unsafe { out_bearish_signal.as_slice_mut()? };
-    let zero_cross_up_slice = unsafe { out_zero_cross_up.as_slice_mut()? };
-    let zero_cross_down_slice = unsafe { out_zero_cross_down.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        bulls_v_bears_batch_inner_into(
-            high,
-            low,
-            close,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            value_slice,
-            bull_slice,
-            bear_slice,
-            ma_slice,
-            upper_slice,
-            lower_slice,
-            bullish_signal_slice,
-            bearish_signal_slice,
-            zero_cross_up_slice,
-            zero_cross_down_slice,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("value", out_value.reshape((rows, cols))?)?;
-    dict.set_item("bull", out_bull.reshape((rows, cols))?)?;
-    dict.set_item("bear", out_bear.reshape((rows, cols))?)?;
-    dict.set_item("ma", out_ma.reshape((rows, cols))?)?;
-    dict.set_item("upper", out_upper.reshape((rows, cols))?)?;
-    dict.set_item("lower", out_lower.reshape((rows, cols))?)?;
-    dict.set_item("bullish_signal", out_bullish_signal.reshape((rows, cols))?)?;
-    dict.set_item("bearish_signal", out_bearish_signal.reshape((rows, cols))?)?;
-    dict.set_item("zero_cross_up", out_zero_cross_up.reshape((rows, cols))?)?;
-    dict.set_item(
-        "zero_cross_down",
-        out_zero_cross_down.reshape((rows, cols))?,
-    )?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|combo| combo.period.unwrap_or(DEFAULT_PERIOD))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "normalized_bars_backs",
-        combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .normalized_bars_back
-                    .unwrap_or(DEFAULT_NORMALIZED_BARS_BACK)
-            })
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "raw_rolling_periods",
-        combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .raw_rolling_period
-                    .unwrap_or(DEFAULT_RAW_ROLLING_PERIOD)
-            })
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "raw_threshold_percentiles",
-        combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .raw_threshold_percentile
-                    .unwrap_or(DEFAULT_RAW_THRESHOLD_PERCENTILE)
-            })
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "threshold_levels",
-        combos
-            .iter()
-            .map(|combo| combo.threshold_level.unwrap_or(DEFAULT_THRESHOLD_LEVEL))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_bulls_v_bears_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(bulls_v_bears_py, m)?)?;
-    m.add_function(wrap_pyfunction!(bulls_v_bears_batch_py, m)?)?;
-    m.add_class::<BullsVBearsStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BullsVBearsJsOutput {
-    pub value: Vec<f64>,
-    pub bull: Vec<f64>,
-    pub bear: Vec<f64>,
-    pub ma: Vec<f64>,
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub bullish_signal: Vec<f64>,
-    pub bearish_signal: Vec<f64>,
-    pub zero_cross_up: Vec<f64>,
-    pub zero_cross_down: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn parse_ma_type(value: &str) -> Result<BullsVBearsMaType, JsValue> {
-    BullsVBearsMaType::from_str(value).map_err(|e| JsValue::from_str(&e))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn parse_calculation_method(value: &str) -> Result<BullsVBearsCalculationMethod, JsValue> {
-    BullsVBearsCalculationMethod::from_str(value).map_err(|e| JsValue::from_str(&e))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "bulls_v_bears_js")]
-pub fn bulls_v_bears_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    ma_type: String,
-    calculation_method: String,
-    normalized_bars_back: usize,
-    raw_rolling_period: usize,
-    raw_threshold_percentile: f64,
-    threshold_level: f64,
-) -> Result<JsValue, JsValue> {
-    let input = BullsVBearsInput::from_slices(
-        high,
-        low,
-        close,
-        BullsVBearsParams {
-            period: Some(period),
-            ma_type: Some(parse_ma_type(&ma_type)?),
-            calculation_method: Some(parse_calculation_method(&calculation_method)?),
-            normalized_bars_back: Some(normalized_bars_back),
-            raw_rolling_period: Some(raw_rolling_period),
-            raw_threshold_percentile: Some(raw_threshold_percentile),
-            threshold_level: Some(threshold_level),
-        },
-    );
-    let out = bulls_v_bears_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&BullsVBearsJsOutput {
-        value: out.value,
-        bull: out.bull,
-        bear: out.bear,
-        ma: out.ma,
-        upper: out.upper,
-        lower: out.lower,
-        bullish_signal: out.bullish_signal,
-        bearish_signal: out.bearish_signal,
-        zero_cross_up: out.zero_cross_up,
-        zero_cross_down: out.zero_cross_down,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BullsVBearsBatchConfig {
-    pub period_range: Vec<usize>,
-    pub normalized_bars_back_range: Vec<usize>,
-    pub raw_rolling_period_range: Vec<usize>,
-    pub raw_threshold_percentile_range: Vec<f64>,
-    pub threshold_level_range: Vec<f64>,
-    pub ma_type: Option<String>,
-    pub calculation_method: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct BullsVBearsBatchJsOutput {
-    pub value: Vec<f64>,
-    pub bull: Vec<f64>,
-    pub bear: Vec<f64>,
-    pub ma: Vec<f64>,
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub bullish_signal: Vec<f64>,
-    pub bearish_signal: Vec<f64>,
-    pub zero_cross_up: Vec<f64>,
-    pub zero_cross_down: Vec<f64>,
-    pub periods: Vec<usize>,
-    pub normalized_bars_backs: Vec<usize>,
-    pub raw_rolling_periods: Vec<usize>,
-    pub raw_threshold_percentiles: Vec<f64>,
-    pub threshold_levels: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_usize(name: &str, values: &[usize]) -> Result<(usize, usize, usize), JsValue> {
-    if values.len() != 3 {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 elements [start, end, step]"
-        )));
-    }
-    Ok((values[0], values[1], values[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_f64(name: &str, values: &[f64]) -> Result<(f64, f64, f64), JsValue> {
-    if values.len() != 3 {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 elements [start, end, step]"
-        )));
-    }
-    if !values.iter().all(|v| v.is_finite()) {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} entries must be finite numbers"
-        )));
-    }
-    Ok((values[0], values[1], values[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "bulls_v_bears_batch_js")]
-pub fn bulls_v_bears_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: BullsVBearsBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = BullsVBearsBatchRange {
-        period: js_vec3_to_usize("period_range", &config.period_range)?,
-        normalized_bars_back: js_vec3_to_usize(
-            "normalized_bars_back_range",
-            &config.normalized_bars_back_range,
-        )?,
-        raw_rolling_period: js_vec3_to_usize(
-            "raw_rolling_period_range",
-            &config.raw_rolling_period_range,
-        )?,
-        raw_threshold_percentile: js_vec3_to_f64(
-            "raw_threshold_percentile_range",
-            &config.raw_threshold_percentile_range,
-        )?,
-        threshold_level: js_vec3_to_f64("threshold_level_range", &config.threshold_level_range)?,
-        ma_type: parse_ma_type(config.ma_type.as_deref().unwrap_or("ema"))?,
-        calculation_method: parse_calculation_method(
-            config.calculation_method.as_deref().unwrap_or("normalized"),
-        )?,
-    };
-    let out = bulls_v_bears_batch_with_kernel(high, low, close, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let periods = out
-        .combos
-        .iter()
-        .map(|combo| combo.period.unwrap_or(DEFAULT_PERIOD))
-        .collect::<Vec<_>>();
-    let normalized_bars_backs = out
-        .combos
-        .iter()
-        .map(|combo| {
-            combo
-                .normalized_bars_back
-                .unwrap_or(DEFAULT_NORMALIZED_BARS_BACK)
-        })
-        .collect::<Vec<_>>();
-    let raw_rolling_periods = out
-        .combos
-        .iter()
-        .map(|combo| {
-            combo
-                .raw_rolling_period
-                .unwrap_or(DEFAULT_RAW_ROLLING_PERIOD)
-        })
-        .collect::<Vec<_>>();
-    let raw_threshold_percentiles = out
-        .combos
-        .iter()
-        .map(|combo| {
-            combo
-                .raw_threshold_percentile
-                .unwrap_or(DEFAULT_RAW_THRESHOLD_PERCENTILE)
-        })
-        .collect::<Vec<_>>();
-    let threshold_levels = out
-        .combos
-        .iter()
-        .map(|combo| combo.threshold_level.unwrap_or(DEFAULT_THRESHOLD_LEVEL))
-        .collect::<Vec<_>>();
-    serde_wasm_bindgen::to_value(&BullsVBearsBatchJsOutput {
-        value: out.value,
-        bull: out.bull,
-        bear: out.bear,
-        ma: out.ma,
-        upper: out.upper,
-        lower: out.lower,
-        bullish_signal: out.bullish_signal,
-        bearish_signal: out.bearish_signal,
-        zero_cross_up: out.zero_cross_up,
-        zero_cross_down: out.zero_cross_down,
-        periods,
-        normalized_bars_backs,
-        raw_rolling_periods,
-        raw_threshold_percentiles,
-        threshold_levels,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bulls_v_bears_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bulls_v_bears_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[allow(clippy::too_many_arguments)]
-#[wasm_bindgen]
-pub fn bulls_v_bears_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_value_ptr: *mut f64,
-    out_bull_ptr: *mut f64,
-    out_bear_ptr: *mut f64,
-    out_ma_ptr: *mut f64,
-    out_upper_ptr: *mut f64,
-    out_lower_ptr: *mut f64,
-    out_bullish_signal_ptr: *mut f64,
-    out_bearish_signal_ptr: *mut f64,
-    out_zero_cross_up_ptr: *mut f64,
-    out_zero_cross_down_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    ma_type: String,
-    calculation_method: String,
-    normalized_bars_back: usize,
-    raw_rolling_period: usize,
-    raw_threshold_percentile: f64,
-    threshold_level: f64,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_value_ptr.is_null()
-        || out_bull_ptr.is_null()
-        || out_bear_ptr.is_null()
-        || out_ma_ptr.is_null()
-        || out_upper_ptr.is_null()
-        || out_lower_ptr.is_null()
-        || out_bullish_signal_ptr.is_null()
-        || out_bearish_signal_ptr.is_null()
-        || out_zero_cross_up_ptr.is_null()
-        || out_zero_cross_down_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to bulls_v_bears_into",
-        ));
-    }
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out_value = std::slice::from_raw_parts_mut(out_value_ptr, len);
-        let out_bull = std::slice::from_raw_parts_mut(out_bull_ptr, len);
-        let out_bear = std::slice::from_raw_parts_mut(out_bear_ptr, len);
-        let out_ma = std::slice::from_raw_parts_mut(out_ma_ptr, len);
-        let out_upper = std::slice::from_raw_parts_mut(out_upper_ptr, len);
-        let out_lower = std::slice::from_raw_parts_mut(out_lower_ptr, len);
-        let out_bullish_signal = std::slice::from_raw_parts_mut(out_bullish_signal_ptr, len);
-        let out_bearish_signal = std::slice::from_raw_parts_mut(out_bearish_signal_ptr, len);
-        let out_zero_cross_up = std::slice::from_raw_parts_mut(out_zero_cross_up_ptr, len);
-        let out_zero_cross_down = std::slice::from_raw_parts_mut(out_zero_cross_down_ptr, len);
-        bulls_v_bears_into_slice(
-            out_value,
-            out_bull,
-            out_bear,
-            out_ma,
-            out_upper,
-            out_lower,
-            out_bullish_signal,
-            out_bearish_signal,
-            out_zero_cross_up,
-            out_zero_cross_down,
-            high,
-            low,
-            close,
-            BullsVBearsParams {
-                period: Some(period),
-                ma_type: Some(parse_ma_type(&ma_type)?),
-                calculation_method: Some(parse_calculation_method(&calculation_method)?),
-                normalized_bars_back: Some(normalized_bars_back),
-                raw_rolling_period: Some(raw_rolling_period),
-                raw_threshold_percentile: Some(raw_threshold_percentile),
-                threshold_level: Some(threshold_level),
-            },
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[allow(clippy::too_many_arguments)]
-#[wasm_bindgen]
-pub fn bulls_v_bears_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_value_ptr: *mut f64,
-    out_bull_ptr: *mut f64,
-    out_bear_ptr: *mut f64,
-    out_ma_ptr: *mut f64,
-    out_upper_ptr: *mut f64,
-    out_lower_ptr: *mut f64,
-    out_bullish_signal_ptr: *mut f64,
-    out_bearish_signal_ptr: *mut f64,
-    out_zero_cross_up_ptr: *mut f64,
-    out_zero_cross_down_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    normalized_bars_back_start: usize,
-    normalized_bars_back_end: usize,
-    normalized_bars_back_step: usize,
-    raw_rolling_period_start: usize,
-    raw_rolling_period_end: usize,
-    raw_rolling_period_step: usize,
-    raw_threshold_percentile_start: f64,
-    raw_threshold_percentile_end: f64,
-    raw_threshold_percentile_step: f64,
-    threshold_level_start: f64,
-    threshold_level_end: f64,
-    threshold_level_step: f64,
-    ma_type: String,
-    calculation_method: String,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_value_ptr.is_null()
-        || out_bull_ptr.is_null()
-        || out_bear_ptr.is_null()
-        || out_ma_ptr.is_null()
-        || out_upper_ptr.is_null()
-        || out_lower_ptr.is_null()
-        || out_bullish_signal_ptr.is_null()
-        || out_bearish_signal_ptr.is_null()
-        || out_zero_cross_up_ptr.is_null()
-        || out_zero_cross_down_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to bulls_v_bears_batch_into",
-        ));
-    }
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let sweep = BullsVBearsBatchRange {
-            period: (period_start, period_end, period_step),
-            normalized_bars_back: (
-                normalized_bars_back_start,
-                normalized_bars_back_end,
-                normalized_bars_back_step,
-            ),
-            raw_rolling_period: (
-                raw_rolling_period_start,
-                raw_rolling_period_end,
-                raw_rolling_period_step,
-            ),
-            raw_threshold_percentile: (
-                raw_threshold_percentile_start,
-                raw_threshold_percentile_end,
-                raw_threshold_percentile_step,
-            ),
-            threshold_level: (
-                threshold_level_start,
-                threshold_level_end,
-                threshold_level_step,
-            ),
-            ma_type: parse_ma_type(&ma_type)?,
-            calculation_method: parse_calculation_method(&calculation_method)?,
-        };
-        let combos =
-            bulls_v_bears_expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in bulls_v_bears_batch_into"))?;
-        let out_value = std::slice::from_raw_parts_mut(out_value_ptr, total);
-        let out_bull = std::slice::from_raw_parts_mut(out_bull_ptr, total);
-        let out_bear = std::slice::from_raw_parts_mut(out_bear_ptr, total);
-        let out_ma = std::slice::from_raw_parts_mut(out_ma_ptr, total);
-        let out_upper = std::slice::from_raw_parts_mut(out_upper_ptr, total);
-        let out_lower = std::slice::from_raw_parts_mut(out_lower_ptr, total);
-        let out_bullish_signal = std::slice::from_raw_parts_mut(out_bullish_signal_ptr, total);
-        let out_bearish_signal = std::slice::from_raw_parts_mut(out_bearish_signal_ptr, total);
-        let out_zero_cross_up = std::slice::from_raw_parts_mut(out_zero_cross_up_ptr, total);
-        let out_zero_cross_down = std::slice::from_raw_parts_mut(out_zero_cross_down_ptr, total);
-        bulls_v_bears_batch_into_slice(
-            out_value,
-            out_bull,
-            out_bear,
-            out_ma,
-            out_upper,
-            out_lower,
-            out_bullish_signal,
-            out_bearish_signal,
-            out_zero_cross_up,
-            out_zero_cross_down,
-            high,
-            low,
-            close,
-            &sweep,
-            Kernel::Auto.to_non_batch(),
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bulls_v_bears_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    ma_type: String,
-    calculation_method: String,
-    normalized_bars_back: usize,
-    raw_rolling_period: usize,
-    raw_threshold_percentile: f64,
-    threshold_level: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = bulls_v_bears_js(
-        high,
-        low,
-        close,
-        period,
-        ma_type,
-        calculation_method,
-        normalized_bars_back,
-        raw_rolling_period,
-        raw_threshold_percentile,
-        threshold_level,
-    )?;
-    crate::write_wasm_object_f64_outputs("bulls_v_bears_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn bulls_v_bears_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = bulls_v_bears_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("bulls_v_bears_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-        ParamValue,
+        IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+        compute_cpu_batch,
     };
 
     fn sample_hlc() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -2778,6 +1977,238 @@ mod tests {
             }
             let diff = (a - b).abs();
             assert!(diff <= 1e-10, "mismatch at {idx}: {a} vs {b}");
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        if expected.is_nan() {
+            assert!(actual.is_nan(), "expected NaN, got {actual}");
+            return;
+        }
+        assert!(actual.is_finite(), "expected {expected}, got {actual}");
+        let tolerance = 1e-12_f64.max(expected.abs() * 1e-12);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn params(
+        ma_type: BullsVBearsMaType,
+        calculation_method: BullsVBearsCalculationMethod,
+    ) -> BullsVBearsParams {
+        BullsVBearsParams {
+            period: Some(2),
+            ma_type: Some(ma_type),
+            calculation_method: Some(calculation_method),
+            normalized_bars_back: Some(3),
+            raw_rolling_period: Some(3),
+            raw_threshold_percentile: Some(80.0),
+            threshold_level: Some(30.0),
+        }
+    }
+
+    #[test]
+    fn normalized_formula_matches_hand_derived_reference() {
+        // Official definition: bull = high - MA, bear = MA - low, then subtract
+        // their independently min/max-normalized values over `bars back`.
+        let high = [11.0, 15.0, 12.0, 18.0];
+        let low = [8.0, 9.0, 7.0, 10.0];
+        let close = [10.0, 12.0, 11.0, 14.0];
+        let out = bulls_v_bears(&BullsVBearsInput::from_slices(
+            &high,
+            &low,
+            &close,
+            params(
+                BullsVBearsMaType::Ema,
+                BullsVBearsCalculationMethod::Normalized,
+            ),
+        ))
+        .unwrap();
+
+        let expected_ma = [10.0, 34.0 / 3.0, 100.0 / 9.0, 352.0 / 27.0];
+        let expected_bull = [1.0, 11.0 / 3.0, 8.0 / 9.0, 134.0 / 27.0];
+        let expected_bear = [2.0, 7.0 / 3.0, 37.0 / 9.0, 82.0 / 27.0];
+        let expected_value = [f64::NAN, 0.0, -100.0, 725.0 / 12.0];
+        let expected_bullish = [f64::NAN, 0.0, 0.0, 1.0];
+        let expected_bearish = [f64::NAN, 0.0, 1.0, 0.0];
+        let expected_cross_up = [f64::NAN, 0.0, 0.0, 1.0];
+        let expected_cross_down = [f64::NAN, 0.0, 1.0, 0.0];
+
+        for i in 0..close.len() {
+            assert_close(out.ma[i], expected_ma[i]);
+            assert_close(out.bull[i], expected_bull[i]);
+            assert_close(out.bear[i], expected_bear[i]);
+            assert_close(out.value[i], expected_value[i]);
+            assert_close(out.upper[i], 30.0);
+            assert_close(out.lower[i], -30.0);
+            assert_close(out.bullish_signal[i], expected_bullish[i]);
+            assert_close(out.bearish_signal[i], expected_bearish[i]);
+            assert_close(out.zero_cross_up[i], expected_cross_up[i]);
+            assert_close(out.zero_cross_down[i], expected_cross_down[i]);
+        }
+    }
+
+    #[test]
+    fn raw_formula_and_signals_match_hand_derived_reference() {
+        let high = [11.0, 15.0, 12.0, 18.0];
+        let low = [8.0, 9.0, 7.0, 10.0];
+        let close = [10.0, 12.0, 11.0, 14.0];
+        let out = bulls_v_bears(&BullsVBearsInput::from_slices(
+            &high,
+            &low,
+            &close,
+            params(BullsVBearsMaType::Ema, BullsVBearsCalculationMethod::Raw),
+        ))
+        .unwrap();
+
+        let expected_value = [-1.0, 4.0 / 3.0, -29.0 / 9.0, 52.0 / 27.0];
+        let expected_upper = [-1.0, 13.0 / 15.0, 19.0 / 45.0, 121.0 / 135.0];
+        let expected_lower = [-1.0, -8.0 / 15.0, -104.0 / 45.0, -296.0 / 135.0];
+        let expected_bullish = [0.0, 1.0, 0.0, 1.0];
+        let expected_bearish = [0.0, 0.0, 1.0, 0.0];
+        let expected_cross_up = [0.0, 1.0, 0.0, 1.0];
+        let expected_cross_down = [0.0, 0.0, 1.0, 0.0];
+
+        for i in 0..close.len() {
+            assert_close(out.value[i], expected_value[i]);
+            assert_close(out.upper[i], expected_upper[i]);
+            assert_close(out.lower[i], expected_lower[i]);
+            assert_close(out.bullish_signal[i], expected_bullish[i]);
+            assert_close(out.bearish_signal[i], expected_bearish[i]);
+            assert_close(out.zero_cross_up[i], expected_cross_up[i]);
+            assert_close(out.zero_cross_down[i], expected_cross_down[i]);
+        }
+    }
+
+    #[test]
+    fn sma_and_wma_match_hand_derived_reference() {
+        let close = [1.0, 2.0, 4.0, 8.0];
+        let high = [2.0, 3.0, 5.0, 9.0];
+        let low = [0.0, 1.0, 3.0, 7.0];
+
+        for (ma_type, expected) in [
+            (
+                BullsVBearsMaType::Sma,
+                [f64::NAN, f64::NAN, 7.0 / 3.0, 14.0 / 3.0],
+            ),
+            (
+                BullsVBearsMaType::Wma,
+                [f64::NAN, f64::NAN, 17.0 / 6.0, 34.0 / 6.0],
+            ),
+        ] {
+            let mut p = params(ma_type, BullsVBearsCalculationMethod::Raw);
+            p.period = Some(3);
+            let out =
+                bulls_v_bears(&BullsVBearsInput::from_slices(&high, &low, &close, p)).unwrap();
+            for (actual, expected) in out.ma.iter().zip(expected) {
+                assert_close(*actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_gap_starts_a_new_segment_without_crossing_history() {
+        let high = [11.0, 13.0, f64::NAN, 12.0, 14.0];
+        let low = [8.0, 9.0, f64::NAN, 7.0, 8.0];
+        let close = [10.0, 10.0, f64::NAN, 10.0, 10.0];
+        let params = params(
+            BullsVBearsMaType::Ema,
+            BullsVBearsCalculationMethod::Normalized,
+        );
+        let input = BullsVBearsInput::from_slices(&high, &low, &close, params.clone());
+        let batch = bulls_v_bears(&input).unwrap();
+
+        assert_close(batch.value[1], 100.0);
+        assert!(batch.value[2].is_nan());
+        assert!(batch.value[3].is_nan());
+        assert_close(batch.value[4], 100.0);
+        assert_close(batch.zero_cross_up[4], 0.0);
+        assert_close(batch.zero_cross_down[4], 0.0);
+
+        let mut stream = BullsVBearsStream::try_new(params).unwrap();
+        let streamed = (0..close.len())
+            .map(|i| stream.update(high[i], low[i], close[i]))
+            .collect::<Vec<_>>();
+        for i in 0..close.len() {
+            assert_close(streamed[i].0, batch.value[i]);
+            assert_close(streamed[i].4, batch.upper[i]);
+            assert_close(streamed[i].5, batch.lower[i]);
+            assert_close(streamed[i].8, batch.zero_cross_up[i]);
+            assert_close(streamed[i].9, batch.zero_cross_down[i]);
+        }
+    }
+
+    #[test]
+    fn raw_gap_resets_dynamic_thresholds_and_crossing_history() {
+        let high = [10.0, 10.0, f64::NAN, 12.0];
+        let low = [8.0, 9.0, f64::NAN, 10.0];
+        let close = [10.0, 10.0, f64::NAN, 10.0];
+        let params = params(BullsVBearsMaType::Ema, BullsVBearsCalculationMethod::Raw);
+        let input = BullsVBearsInput::from_slices(&high, &low, &close, params.clone());
+        let batch = bulls_v_bears(&input).unwrap();
+
+        assert!(batch.value[2].is_nan());
+        assert!(batch.upper[2].is_nan());
+        assert!(batch.lower[2].is_nan());
+        assert_close(batch.value[3], 2.0);
+        assert_close(batch.upper[3], 2.0);
+        assert_close(batch.lower[3], 2.0);
+        assert_close(batch.bullish_signal[3], 0.0);
+        assert_close(batch.bearish_signal[3], 0.0);
+        assert_close(batch.zero_cross_up[3], 0.0);
+        assert_close(batch.zero_cross_down[3], 0.0);
+
+        let mut stream = BullsVBearsStream::try_new(params).unwrap();
+        let streamed = (0..close.len())
+            .map(|i| stream.update(high[i], low[i], close[i]))
+            .collect::<Vec<_>>();
+        for i in 0..close.len() {
+            assert_close(streamed[i].0, batch.value[i]);
+            assert_close(streamed[i].4, batch.upper[i]);
+            assert_close(streamed[i].5, batch.lower[i]);
+            assert_close(streamed[i].6, batch.bullish_signal[i]);
+            assert_close(streamed[i].7, batch.bearish_signal[i]);
+            assert_close(streamed[i].8, batch.zero_cross_up[i]);
+            assert_close(streamed[i].9, batch.zero_cross_down[i]);
+        }
+    }
+
+    #[test]
+    fn every_selected_output_matches_the_full_family() {
+        let (high, low, close) = sample_hlc();
+        let params = params(BullsVBearsMaType::Wma, BullsVBearsCalculationMethod::Raw);
+        let input = BullsVBearsInput::from_slices(&high, &low, &close, params);
+        let full = bulls_v_bears(&input).unwrap();
+        let fields = [
+            (BullsVBearsOutputField::Value, full.value.as_slice()),
+            (BullsVBearsOutputField::Bull, full.bull.as_slice()),
+            (BullsVBearsOutputField::Bear, full.bear.as_slice()),
+            (BullsVBearsOutputField::Ma, full.ma.as_slice()),
+            (BullsVBearsOutputField::Upper, full.upper.as_slice()),
+            (BullsVBearsOutputField::Lower, full.lower.as_slice()),
+            (
+                BullsVBearsOutputField::BullishSignal,
+                full.bullish_signal.as_slice(),
+            ),
+            (
+                BullsVBearsOutputField::BearishSignal,
+                full.bearish_signal.as_slice(),
+            ),
+            (
+                BullsVBearsOutputField::ZeroCrossUp,
+                full.zero_cross_up.as_slice(),
+            ),
+            (
+                BullsVBearsOutputField::ZeroCrossDown,
+                full.zero_cross_down.as_slice(),
+            ),
+        ];
+
+        for (field, expected) in fields {
+            let mut selected = vec![f64::NAN; close.len()];
+            bulls_v_bears_output_into_slice(&mut selected, &input, Kernel::Auto, field).unwrap();
+            assert_vec_close(&selected, expected);
         }
     }
 

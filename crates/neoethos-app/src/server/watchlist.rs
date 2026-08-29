@@ -128,11 +128,10 @@ pub async fn post(
     // blocking pool. It bumps the stream generation unconditionally — so
     // even if the new streamer can't spawn, the old one stops rather than
     // keep streaming the stale symbol set.
-    let restarted = tokio::task::spawn_blocking(
-        crate::app_services::live_spots_streamer::restart_streamer,
-    )
-    .await
-    .unwrap_or(false);
+    let restarted =
+        tokio::task::spawn_blocking(crate::app_services::live_spots_streamer::restart_streamer)
+            .await
+            .unwrap_or(false);
 
     tracing::info!(
         target: "neoethos_app::server::watchlist",

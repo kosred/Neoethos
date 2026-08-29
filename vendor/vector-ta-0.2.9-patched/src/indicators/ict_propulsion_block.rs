@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 use std::collections::VecDeque;
 use std::mem::{ManuallyDrop, MaybeUninit};
@@ -27,14 +11,6 @@ use thiserror::Error;
 const DEFAULT_SWING_LENGTH: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    serde(rename_all = "snake_case")
-)]
 pub enum IctPropulsionBlockMitigationPrice {
     Close,
     Wick,
@@ -84,10 +60,6 @@ pub struct IctPropulsionBlockOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct IctPropulsionBlockParams {
     pub swing_length: Option<usize>,
     pub mitigation_price: Option<IctPropulsionBlockMitigationPrice>,
@@ -351,11 +323,7 @@ impl BlockState {
 
     #[inline]
     fn kind_value(self) -> f64 {
-        if self.is_propulsion {
-            2.0
-        } else {
-            1.0
-        }
+        if self.is_propulsion { 2.0 } else { 1.0 }
     }
 }
 
@@ -1124,7 +1092,6 @@ pub fn ict_propulsion_block_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ict_propulsion_block_into(
     input: &IctPropulsionBlockInput,
@@ -1870,682 +1837,20 @@ fn parse_mitigation_price(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ict_propulsion_block")]
-#[pyo3(signature = (open, high, low, close, swing_length=DEFAULT_SWING_LENGTH, mitigation_price="close", kernel=None))]
-pub fn ict_propulsion_block_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    swing_length: usize,
-    mitigation_price: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let input = IctPropulsionBlockInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        IctPropulsionBlockParams {
-            swing_length: Some(swing_length),
-            mitigation_price: Some(
-                parse_mitigation_price(mitigation_price)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            ),
-        },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| ict_propulsion_block_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.bullish_high.into_pyarray(py),
-        out.bullish_low.into_pyarray(py),
-        out.bullish_kind.into_pyarray(py),
-        out.bullish_active.into_pyarray(py),
-        out.bullish_mitigated.into_pyarray(py),
-        out.bullish_new.into_pyarray(py),
-        out.bearish_high.into_pyarray(py),
-        out.bearish_low.into_pyarray(py),
-        out.bearish_kind.into_pyarray(py),
-        out.bearish_active.into_pyarray(py),
-        out.bearish_mitigated.into_pyarray(py),
-        out.bearish_new.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "IctPropulsionBlockStream")]
-pub struct IctPropulsionBlockStreamPy {
-    stream: IctPropulsionBlockStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl IctPropulsionBlockStreamPy {
-    #[new]
-    #[pyo3(signature = (swing_length=DEFAULT_SWING_LENGTH, mitigation_price="close"))]
-    fn new(swing_length: usize, mitigation_price: &str) -> PyResult<Self> {
-        let stream = IctPropulsionBlockStream::try_new(IctPropulsionBlockParams {
-            swing_length: Some(swing_length),
-            mitigation_price: Some(
-                parse_mitigation_price(mitigation_price)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            ),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(
-        &mut self,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-    ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
-        self.stream.update(open, high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ict_propulsion_block_batch")]
-#[pyo3(signature = (open, high, low, close, swing_length_range, mitigation_price_toggle=(true, false), kernel=None))]
-pub fn ict_propulsion_block_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    swing_length_range: (usize, usize, usize),
-    mitigation_price_toggle: (bool, bool),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let open = open.as_slice()?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let sweep = IctPropulsionBlockBatchRange {
-        swing_length: swing_length_range,
-        mitigation_price: mitigation_price_toggle,
-    };
-    let combos = expand_grid_ict_propulsion_block(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let bullish_high_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bullish_low_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bullish_kind_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bullish_active_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bullish_mitigated_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bullish_new_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bearish_high_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bearish_low_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bearish_kind_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bearish_active_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bearish_mitigated_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bearish_new_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let out_bullish_high = unsafe { bullish_high_arr.as_slice_mut()? };
-    let out_bullish_low = unsafe { bullish_low_arr.as_slice_mut()? };
-    let out_bullish_kind = unsafe { bullish_kind_arr.as_slice_mut()? };
-    let out_bullish_active = unsafe { bullish_active_arr.as_slice_mut()? };
-    let out_bullish_mitigated = unsafe { bullish_mitigated_arr.as_slice_mut()? };
-    let out_bullish_new = unsafe { bullish_new_arr.as_slice_mut()? };
-    let out_bearish_high = unsafe { bearish_high_arr.as_slice_mut()? };
-    let out_bearish_low = unsafe { bearish_low_arr.as_slice_mut()? };
-    let out_bearish_kind = unsafe { bearish_kind_arr.as_slice_mut()? };
-    let out_bearish_active = unsafe { bearish_active_arr.as_slice_mut()? };
-    let out_bearish_mitigated = unsafe { bearish_mitigated_arr.as_slice_mut()? };
-    let out_bearish_new = unsafe { bearish_new_arr.as_slice_mut()? };
-
-    let kernel = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        ict_propulsion_block_batch_inner_into(
-            open,
-            high,
-            low,
-            close,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            out_bullish_high,
-            out_bullish_low,
-            out_bullish_kind,
-            out_bullish_active,
-            out_bullish_mitigated,
-            out_bullish_new,
-            out_bearish_high,
-            out_bearish_low,
-            out_bearish_kind,
-            out_bearish_active,
-            out_bearish_mitigated,
-            out_bearish_new,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let swing_lengths: Vec<u64> = combos
-        .iter()
-        .map(|params| params.swing_length.unwrap_or(DEFAULT_SWING_LENGTH) as u64)
-        .collect();
-    let mitigation_prices: Vec<&str> = combos
-        .iter()
-        .map(|params| {
-            params
-                .mitigation_price
-                .unwrap_or(IctPropulsionBlockMitigationPrice::Close)
-                .as_str()
-        })
-        .collect();
-
-    let dict = PyDict::new(py);
-    dict.set_item("bullish_high", bullish_high_arr.reshape((rows, cols))?)?;
-    dict.set_item("bullish_low", bullish_low_arr.reshape((rows, cols))?)?;
-    dict.set_item("bullish_kind", bullish_kind_arr.reshape((rows, cols))?)?;
-    dict.set_item("bullish_active", bullish_active_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "bullish_mitigated",
-        bullish_mitigated_arr.reshape((rows, cols))?,
-    )?;
-    dict.set_item("bullish_new", bullish_new_arr.reshape((rows, cols))?)?;
-    dict.set_item("bearish_high", bearish_high_arr.reshape((rows, cols))?)?;
-    dict.set_item("bearish_low", bearish_low_arr.reshape((rows, cols))?)?;
-    dict.set_item("bearish_kind", bearish_kind_arr.reshape((rows, cols))?)?;
-    dict.set_item("bearish_active", bearish_active_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "bearish_mitigated",
-        bearish_mitigated_arr.reshape((rows, cols))?,
-    )?;
-    dict.set_item("bearish_new", bearish_new_arr.reshape((rows, cols))?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("swing_lengths", swing_lengths.into_pyarray(py))?;
-    dict.set_item("mitigation_prices", PyList::new(py, mitigation_prices)?)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_ict_propulsion_block_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(ict_propulsion_block_py, m)?)?;
-    m.add_function(wrap_pyfunction!(ict_propulsion_block_batch_py, m)?)?;
-    m.add_class::<IctPropulsionBlockStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IctPropulsionBlockJsOutput {
-    bullish_high: Vec<f64>,
-    bullish_low: Vec<f64>,
-    bullish_kind: Vec<f64>,
-    bullish_active: Vec<f64>,
-    bullish_mitigated: Vec<f64>,
-    bullish_new: Vec<f64>,
-    bearish_high: Vec<f64>,
-    bearish_low: Vec<f64>,
-    bearish_kind: Vec<f64>,
-    bearish_active: Vec<f64>,
-    bearish_mitigated: Vec<f64>,
-    bearish_new: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IctPropulsionBlockBatchConfig {
-    swing_length_range: Vec<usize>,
-    mitigation_price_toggle: Vec<bool>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IctPropulsionBlockBatchJsOutput {
-    bullish_high: Vec<f64>,
-    bullish_low: Vec<f64>,
-    bullish_kind: Vec<f64>,
-    bullish_active: Vec<f64>,
-    bullish_mitigated: Vec<f64>,
-    bullish_new: Vec<f64>,
-    bearish_high: Vec<f64>,
-    bearish_low: Vec<f64>,
-    bearish_kind: Vec<f64>,
-    bearish_active: Vec<f64>,
-    bearish_mitigated: Vec<f64>,
-    bearish_new: Vec<f64>,
-    rows: usize,
-    cols: usize,
-    combos: Vec<IctPropulsionBlockParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ict_propulsion_block")]
-pub fn ict_propulsion_block_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    swing_length: usize,
-    mitigation_price: &str,
-) -> Result<JsValue, JsValue> {
-    let input = IctPropulsionBlockInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        IctPropulsionBlockParams {
-            swing_length: Some(swing_length),
-            mitigation_price: Some(
-                parse_mitigation_price(mitigation_price)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
-            ),
-        },
-    );
-    let out = ict_propulsion_block_with_kernel(&input, Kernel::Scalar)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&IctPropulsionBlockJsOutput {
-        bullish_high: out.bullish_high,
-        bullish_low: out.bullish_low,
-        bullish_kind: out.bullish_kind,
-        bullish_active: out.bullish_active,
-        bullish_mitigated: out.bullish_mitigated,
-        bullish_new: out.bullish_new,
-        bearish_high: out.bearish_high,
-        bearish_low: out.bearish_low,
-        bearish_kind: out.bearish_kind,
-        bearish_active: out.bearish_active,
-        bearish_mitigated: out.bearish_mitigated,
-        bearish_new: out.bearish_new,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ict_propulsion_block_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    swing_length: usize,
-    mitigation_price: &str,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to ict_propulsion_block_into",
-        ));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len * 12);
-        let (out_bullish_high, rest) = out.split_at_mut(len);
-        let (out_bullish_low, rest) = rest.split_at_mut(len);
-        let (out_bullish_kind, rest) = rest.split_at_mut(len);
-        let (out_bullish_active, rest) = rest.split_at_mut(len);
-        let (out_bullish_mitigated, rest) = rest.split_at_mut(len);
-        let (out_bullish_new, rest) = rest.split_at_mut(len);
-        let (out_bearish_high, rest) = rest.split_at_mut(len);
-        let (out_bearish_low, rest) = rest.split_at_mut(len);
-        let (out_bearish_kind, rest) = rest.split_at_mut(len);
-        let (out_bearish_active, rest) = rest.split_at_mut(len);
-        let (out_bearish_mitigated, out_bearish_new) = rest.split_at_mut(len);
-        let input = IctPropulsionBlockInput::from_slices(
-            open,
-            high,
-            low,
-            close,
-            IctPropulsionBlockParams {
-                swing_length: Some(swing_length),
-                mitigation_price: Some(
-                    parse_mitigation_price(mitigation_price)
-                        .map_err(|e| JsValue::from_str(&e.to_string()))?,
-                ),
-            },
-        );
-        ict_propulsion_block_into_slice(
-            out_bullish_high,
-            out_bullish_low,
-            out_bullish_kind,
-            out_bullish_active,
-            out_bullish_mitigated,
-            out_bullish_new,
-            out_bearish_high,
-            out_bearish_low,
-            out_bearish_kind,
-            out_bearish_active,
-            out_bearish_mitigated,
-            out_bearish_new,
-            &input,
-            Kernel::Scalar,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ict_propulsion_block_into_host")]
-pub fn ict_propulsion_block_into_host(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    out_ptr: *mut f64,
-    swing_length: usize,
-    mitigation_price: &str,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ict_propulsion_block_into_host",
-        ));
-    }
-
-    unsafe {
-        let len = close.len();
-        let out = std::slice::from_raw_parts_mut(out_ptr, len * 12);
-        let (out_bullish_high, rest) = out.split_at_mut(len);
-        let (out_bullish_low, rest) = rest.split_at_mut(len);
-        let (out_bullish_kind, rest) = rest.split_at_mut(len);
-        let (out_bullish_active, rest) = rest.split_at_mut(len);
-        let (out_bullish_mitigated, rest) = rest.split_at_mut(len);
-        let (out_bullish_new, rest) = rest.split_at_mut(len);
-        let (out_bearish_high, rest) = rest.split_at_mut(len);
-        let (out_bearish_low, rest) = rest.split_at_mut(len);
-        let (out_bearish_kind, rest) = rest.split_at_mut(len);
-        let (out_bearish_active, rest) = rest.split_at_mut(len);
-        let (out_bearish_mitigated, out_bearish_new) = rest.split_at_mut(len);
-        let input = IctPropulsionBlockInput::from_slices(
-            open,
-            high,
-            low,
-            close,
-            IctPropulsionBlockParams {
-                swing_length: Some(swing_length),
-                mitigation_price: Some(
-                    parse_mitigation_price(mitigation_price)
-                        .map_err(|e| JsValue::from_str(&e.to_string()))?,
-                ),
-            },
-        );
-        ict_propulsion_block_into_slice(
-            out_bullish_high,
-            out_bullish_low,
-            out_bullish_kind,
-            out_bullish_active,
-            out_bullish_mitigated,
-            out_bullish_new,
-            out_bearish_high,
-            out_bearish_low,
-            out_bearish_kind,
-            out_bearish_active,
-            out_bearish_mitigated,
-            out_bearish_new,
-            &input,
-            Kernel::Scalar,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ict_propulsion_block_alloc(len: usize) -> *mut f64 {
-    let mut buf = vec![0.0_f64; len * 12];
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ict_propulsion_block_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len * 12);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ict_propulsion_block_batch")]
-pub fn ict_propulsion_block_batch_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: IctPropulsionBlockBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.swing_length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: swing_length_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    if config.mitigation_price_toggle.len() != 2 {
-        return Err(JsValue::from_str(
-            "Invalid config: mitigation_price_toggle must have exactly 2 booleans [include_close, include_wick]",
-        ));
-    }
-
-    let sweep = IctPropulsionBlockBatchRange {
-        swing_length: (
-            config.swing_length_range[0],
-            config.swing_length_range[1],
-            config.swing_length_range[2],
-        ),
-        mitigation_price: (
-            config.mitigation_price_toggle[0],
-            config.mitigation_price_toggle[1],
-        ),
-    };
-    let out =
-        ict_propulsion_block_batch_with_kernel(open, high, low, close, &sweep, Kernel::ScalarBatch)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&IctPropulsionBlockBatchJsOutput {
-        bullish_high: out.bullish_high,
-        bullish_low: out.bullish_low,
-        bullish_kind: out.bullish_kind,
-        bullish_active: out.bullish_active,
-        bullish_mitigated: out.bullish_mitigated,
-        bullish_new: out.bullish_new,
-        bearish_high: out.bearish_high,
-        bearish_low: out.bearish_low,
-        bearish_kind: out.bearish_kind,
-        bearish_active: out.bearish_active,
-        bearish_mitigated: out.bearish_mitigated,
-        bearish_new: out.bearish_new,
-        rows: out.rows,
-        cols: out.cols,
-        combos: out.combos,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn ict_propulsion_block_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    bullish_high_ptr: *mut f64,
-    bullish_low_ptr: *mut f64,
-    bullish_kind_ptr: *mut f64,
-    bullish_active_ptr: *mut f64,
-    bullish_mitigated_ptr: *mut f64,
-    bullish_new_ptr: *mut f64,
-    bearish_high_ptr: *mut f64,
-    bearish_low_ptr: *mut f64,
-    bearish_kind_ptr: *mut f64,
-    bearish_active_ptr: *mut f64,
-    bearish_mitigated_ptr: *mut f64,
-    bearish_new_ptr: *mut f64,
-    len: usize,
-    swing_start: usize,
-    swing_end: usize,
-    swing_step: usize,
-    include_close: bool,
-    include_wick: bool,
-) -> Result<usize, JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || bullish_high_ptr.is_null()
-        || bullish_low_ptr.is_null()
-        || bullish_kind_ptr.is_null()
-        || bullish_active_ptr.is_null()
-        || bullish_mitigated_ptr.is_null()
-        || bullish_new_ptr.is_null()
-        || bearish_high_ptr.is_null()
-        || bearish_low_ptr.is_null()
-        || bearish_kind_ptr.is_null()
-        || bearish_active_ptr.is_null()
-        || bearish_mitigated_ptr.is_null()
-        || bearish_new_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to ict_propulsion_block_batch_into",
-        ));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let sweep = IctPropulsionBlockBatchRange {
-            swing_length: (swing_start, swing_end, swing_step),
-            mitigation_price: (include_close, include_wick),
-        };
-        let combos = expand_grid_ict_propulsion_block(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let total = combos.len().checked_mul(len).ok_or_else(|| {
-            JsValue::from_str("rows*cols overflow in ict_propulsion_block_batch_into")
-        })?;
-
-        let out_bullish_high = std::slice::from_raw_parts_mut(bullish_high_ptr, total);
-        let out_bullish_low = std::slice::from_raw_parts_mut(bullish_low_ptr, total);
-        let out_bullish_kind = std::slice::from_raw_parts_mut(bullish_kind_ptr, total);
-        let out_bullish_active = std::slice::from_raw_parts_mut(bullish_active_ptr, total);
-        let out_bullish_mitigated = std::slice::from_raw_parts_mut(bullish_mitigated_ptr, total);
-        let out_bullish_new = std::slice::from_raw_parts_mut(bullish_new_ptr, total);
-        let out_bearish_high = std::slice::from_raw_parts_mut(bearish_high_ptr, total);
-        let out_bearish_low = std::slice::from_raw_parts_mut(bearish_low_ptr, total);
-        let out_bearish_kind = std::slice::from_raw_parts_mut(bearish_kind_ptr, total);
-        let out_bearish_active = std::slice::from_raw_parts_mut(bearish_active_ptr, total);
-        let out_bearish_mitigated = std::slice::from_raw_parts_mut(bearish_mitigated_ptr, total);
-        let out_bearish_new = std::slice::from_raw_parts_mut(bearish_new_ptr, total);
-
-        ict_propulsion_block_batch_inner_into(
-            open,
-            high,
-            low,
-            close,
-            &sweep,
-            Kernel::Scalar,
-            out_bullish_high,
-            out_bullish_low,
-            out_bullish_kind,
-            out_bullish_active,
-            out_bullish_mitigated,
-            out_bullish_new,
-            out_bearish_high,
-            out_bearish_low,
-            out_bearish_kind,
-            out_bearish_active,
-            out_bearish_mitigated,
-            out_bearish_new,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(combos.len())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ict_propulsion_block_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    swing_length: usize,
-    mitigation_price: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ict_propulsion_block_js(open, high, low, close, swing_length, mitigation_price)?;
-    crate::write_wasm_object_f64_outputs("ict_propulsion_block_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ict_propulsion_block_batch_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ict_propulsion_block_batch_js(open, high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ict_propulsion_block_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::indicators::dispatch::{
-        compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-        ParamValue,
+        IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+        compute_cpu_batch,
     };
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     fn load_candles() -> Candles {
-        read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")
-            .expect("test candles")
+        (*read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")
+            .expect("test candles"))
+        .clone()
     }
 
     fn eq_or_both_nan(lhs: &[f64], rhs: &[f64]) -> bool {
@@ -2567,13 +1872,64 @@ mod tests {
         let out = ict_propulsion_block(&input).expect("ict_propulsion_block");
         assert_eq!(out.bullish_high.len(), 320);
         assert_eq!(out.bearish_high.len(), 320);
-        assert!(out
-            .bullish_kind
-            .iter()
-            .any(|v| v.is_finite() && (*v == 1.0 || *v == 2.0)));
+        assert!(
+            out.bullish_kind
+                .iter()
+                .any(|v| v.is_finite() && (*v == 1.0 || *v == 2.0))
+        );
         for &kind in out.bullish_kind.iter().chain(out.bearish_kind.iter()) {
             assert!(kind.is_nan() || kind == 0.0 || kind == 1.0 || kind == 2.0);
         }
+    }
+
+    /// Independent five-bar state oracle derived from the published
+    /// swing-break/order-block rules. With swing length one, bar 1 establishes
+    /// a swing low, bar 2 establishes the swing high at bar 1, and bar 3 closes
+    /// above it. The bearish bar 2 is therefore the bullish order-block seed.
+    /// Bar 4 wicks below the seed low without closing below it, so only Wick
+    /// mitigation invalidates the block.
+    #[test]
+    fn hand_derived_bullish_order_block_respects_close_vs_wick_mitigation() {
+        let open = [7.0, 8.0, 8.0, 10.0, 7.0];
+        let high = [10.0, 11.0, 9.0, 12.0, 8.0];
+        let low = [5.0, 6.0, 6.0, 9.0, 5.5];
+        let close = [8.0, 9.0, 7.0, 11.5, 6.5];
+
+        let run = |mitigation_price| {
+            ict_propulsion_block(&IctPropulsionBlockInput::from_slices(
+                &open,
+                &high,
+                &low,
+                &close,
+                IctPropulsionBlockParams {
+                    swing_length: Some(1),
+                    mitigation_price: Some(mitigation_price),
+                },
+            ))
+            .expect("the hand-derived OHLC sequence is valid")
+        };
+        let close_mode = run(IctPropulsionBlockMitigationPrice::Close);
+        let wick_mode = run(IctPropulsionBlockMitigationPrice::Wick);
+
+        for output in [&close_mode, &wick_mode] {
+            assert_eq!(output.bullish_high[3].to_bits(), 9.0_f64.to_bits());
+            assert_eq!(output.bullish_low[3].to_bits(), 6.0_f64.to_bits());
+            assert_eq!(output.bullish_kind[3].to_bits(), 1.0_f64.to_bits());
+            assert_eq!(output.bullish_active[3].to_bits(), 1.0_f64.to_bits());
+            assert_eq!(output.bullish_mitigated[3].to_bits(), 0.0_f64.to_bits());
+            assert_eq!(output.bullish_new[3].to_bits(), 1.0_f64.to_bits());
+            assert_eq!(output.bullish_new[4].to_bits(), 0.0_f64.to_bits());
+        }
+        assert_eq!(
+            close_mode.bullish_mitigated[4].to_bits(),
+            0.0_f64.to_bits(),
+            "a wick-only excursion must not satisfy close mitigation"
+        );
+        assert_eq!(
+            wick_mode.bullish_mitigated[4].to_bits(),
+            1.0_f64.to_bits(),
+            "a low below the block must satisfy wick mitigation"
+        );
     }
 
     #[test]

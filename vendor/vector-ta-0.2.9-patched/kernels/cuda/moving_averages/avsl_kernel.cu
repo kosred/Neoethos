@@ -341,19 +341,17 @@ extern "C" __global__ void avsl_many_series_one_param_f32(
  *   launch arm hands over four pointers in (high, low, close, volume) order;
  *   `high` is bound and left unread here, exactly as the CPU does.
  *
- * FIRST-VALID IGNORED, AND DERIVED HERE: `first_valid_max3` (:272-278) is the
- *   MAX of THREE INDEPENDENT first-non-NaN scans -- over close, low and volume
- *   separately. No declared `F64FirstValidRule` expresses that: it is not
- *   "the first index at which all three are non-NaN" (which is later whenever
- *   one series has a hole after another has started), and it is not any of the
- *   high/low pair rules. Rather than add a variant one indicator would use,
- *   the kernel derives it and declares the caller's value unused -- keeping
- *   both halves of one rule in one place.
+ * FIRST-VALID: `first_valid_max3` (:272-278) is the MAX of THREE INDEPENDENT
+ *   first-non-NaN scans -- over close, low and volume separately. The primary
+ *   ABI derives that value locally; the production ABI receives the same
+ *   once-computed resident-frame fact. It is not the first bar where all three
+ *   happen to be non-NaN simultaneously.
  *
- * PERIOD-INVARIANT: the CPU batch reads `fast_period`, `slow_period` and
- *   `multiplier` (cpu_batch.rs:14126-14128) and never `period`. All three are
- *   pinned at the CPU defaults (12 / 26 / 2.0), so every row of a sweep is
- *   byte-identical.
+ * PERIOD ROUTING: the production timescale is `slow_period`. The primary ABI
+ *   keeps its existing `periods` array and treats each element as that slow
+ *   anchor, deriving fast by exact positive half-up scaling of the canonical
+ *   12:26 ratio. The explicit production ABI carries fast, slow and multiplier
+ *   arrays directly. Both entries call the same per-row arithmetic below.
  *
  * SHAPE: ONE THREAD PER COLUMN, bars ascending. Six sliding sums are
  *   maintained by subtract-then-add, a 200-deep history of (vpc, vpr) is
@@ -391,47 +389,43 @@ extern "C" __global__ void avsl_many_series_one_param_f32(
 #endif
 
 /* cpu_batch.rs:14126-14128 */
-#define NEO_AVSL_FAST_PERIOD 12
-#define NEO_AVSL_SLOW_PERIOD 26
-#define NEO_AVSL_MULTIPLIER  2.0
+#define NEO_AVSL_FAST_DEFAULT 12
+#define NEO_AVSL_SLOW_DEFAULT 26
+#define NEO_AVSL_MULTIPLIER_DEFAULT 2.0
 /* avsl.rs:545 */
 #define NEO_AVSL_MAX_WIN 200
 
-extern "C" __global__
-void avsl_neo_batch_f64(const double* __restrict__ high,
-                        const double* __restrict__ low,
-                        const double* __restrict__ close,
-                        const double* __restrict__ volume,
-                        int n,
-                        const int* __restrict__ periods,
-                        int n_combos,
-                        int first_valid,
-                        double* __restrict__ out)
+__device__ __forceinline__
+int neo_avsl_fast_from_slow(const int slow_period)
 {
-    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (combo >= n_combos || n <= 0) return;
-    (void)high;        /* bound and unread -- see header */
-    (void)periods;     /* period-invariant -- see header */
-    (void)first_valid; /* derived here -- see header */
+    const long long scaled =
+        (long long)NEO_AVSL_FAST_DEFAULT * (long long)slow_period +
+        (long long)NEO_AVSL_SLOW_DEFAULT / 2LL;
+    const int fast_period = (int)(scaled / (long long)NEO_AVSL_SLOW_DEFAULT);
+    return fast_period > 0 ? fast_period : 1;
+}
 
-    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+__device__ __forceinline__
+void neo_avsl_row_f64(const double* __restrict__ close,
+                      const double* __restrict__ low,
+                      const double* __restrict__ volume,
+                      const int n,
+                      const int first_val,
+                      const int fast_period,
+                      const int slow_period,
+                      const double multiplier,
+                      double* pre_ring,
+                      double* o)
+{
+    if (n <= 0) return;
     for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
 
-    const int fast_period = NEO_AVSL_FAST_PERIOD;
-    const int slow_period = NEO_AVSL_SLOW_PERIOD;
-    const double multiplier = NEO_AVSL_MULTIPLIER;
-
     /* avsl_prepare (:385-396) */
-    if (fast_period > n || slow_period > n) return;
-
-    /* first_valid_max3 (:272) -- three INDEPENDENT scans, then the max. */
-    int fc = -1, fl = -1, fv = -1;
-    for (int i = 0; i < n; ++i) { if (!isnan(close[i]))  { fc = i; break; } }
-    for (int i = 0; i < n; ++i) { if (!isnan(low[i]))    { fl = i; break; } }
-    for (int i = 0; i < n; ++i) { if (!isnan(volume[i])) { fv = i; break; } }
-    if (fc < 0 || fl < 0 || fv < 0) return;             /* AllValuesNaN */
-    int first_val = fc; if (fl > first_val) first_val = fl; if (fv > first_val) first_val = fv;
-    if (n - first_val < slow_period) return;            /* NotEnoughValidData */
+    if (first_val < 0 || first_val >= n ||
+        fast_period <= 0 || fast_period > n ||
+        slow_period <= 0 || slow_period > n ||
+        n - first_val < slow_period ||
+        !(multiplier > 0.0) || !isfinite(multiplier)) return;
 
     const int base    = first_val + slow_period - 1;
     const int warmup2 = base + slow_period - 1;
@@ -449,8 +443,6 @@ void avsl_neo_batch_f64(const double* __restrict__ high,
     for (int k = 0; k < NEO_AVSL_MAX_WIN; ++k) { ring_vpc[k] = 0.0; ring_vpr[k] = 1.0; }
     int ring_pos = 0;
 
-    double pre_ring[NEO_AVSL_SLOW_PERIOD];
-    for (int k = 0; k < slow_period; ++k) pre_ring[k] = 0.0;
     int    pre_pos = 0, pre_cnt = 0;
     double pre_sum = 0.0;
 
@@ -495,7 +487,8 @@ void avsl_neo_batch_f64(const double* __restrict__ high,
         double t = (vpc < 0.0) ? round(fabs(vpci - 3.0)) : round(vpci + 3.0);
         double m = (t < 1.0) ? 1.0 : t;
         if (m > (double)NEO_AVSL_MAX_WIN) m = (double)NEO_AVSL_MAX_WIN;
-        const int len_v = (int)m;
+        /* Rust's saturating float-to-usize cast maps NaN to zero. */
+        const int len_v = isnan(m) ? 0 : (int)m;
 
         ring_vpc[ring_pos] = vpc;
         ring_vpr[ring_pos] = vpr;
@@ -562,4 +555,75 @@ void avsl_neo_batch_f64(const double* __restrict__ high,
             o[i] = pre_sum * inv_slow;
         }
     }
+
+    /* The primary ABI aliases `pre_ring` to the unused output prefix. */
+    const int upto = (warmup2 < n) ? warmup2 : n;
+    for (int i = 0; i < upto; ++i) o[i] = NEO_F64_NAN;
+}
+
+extern "C" __global__
+void avsl_neo_batch_f64(const double* __restrict__ high,
+                        const double* __restrict__ low,
+                        const double* __restrict__ close,
+                        const double* __restrict__ volume,
+                        int n,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    (void)high;        /* bound and unread -- see header */
+    (void)first_valid; /* primary derives the exact independent-scan max */
+
+    double* __restrict__ o = out + (size_t)combo * (size_t)n;
+    const int slow_period = periods[combo];
+    const int fast_period = neo_avsl_fast_from_slow(slow_period);
+
+    /* first_valid_max3 (:272) -- three INDEPENDENT scans, then the max. */
+    int fc = -1, fl = -1, fv = -1;
+    for (int i = 0; i < n; ++i) { if (!isnan(close[i]))  { fc = i; break; } }
+    for (int i = 0; i < n; ++i) { if (!isnan(low[i]))    { fl = i; break; } }
+    for (int i = 0; i < n; ++i) { if (!isnan(volume[i])) { fv = i; break; } }
+    int first_val = -1;
+    if (fc >= 0 && fl >= 0 && fv >= 0) {
+        first_val = fc;
+        if (fl > first_val) first_val = fl;
+        if (fv > first_val) first_val = fv;
+    }
+
+    /* The prefix stays unavailable until after the slow-sized ring is full. */
+    neo_avsl_row_f64(close, low, volume, n, first_val, fast_period, slow_period,
+                     NEO_AVSL_MULTIPLIER_DEFAULT, o, o);
+}
+
+extern "C" __global__
+void avsl_production_f64(const double* __restrict__ close,
+                         const double* __restrict__ low,
+                         const double* __restrict__ volume,
+                         int n,
+                         int first_valid,
+                         const int* __restrict__ fast_periods,
+                         const int* __restrict__ slow_periods,
+                         const double* __restrict__ multipliers,
+                         int rows,
+                         double* __restrict__ scratch_final_sma,
+                         int scratch_stride,
+                         double* __restrict__ out_value)
+{
+    const int row = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows || n <= 0) return;
+
+    const int fast_period = fast_periods[row];
+    const int slow_period = slow_periods[row];
+    double* const o = out_value + (size_t)row * (size_t)n;
+    if (scratch_stride < slow_period || scratch_stride <= 0) {
+        for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+    double* const pre_ring =
+        scratch_final_sma + (size_t)row * (size_t)scratch_stride;
+    neo_avsl_row_f64(close, low, volume, n, first_valid, fast_period, slow_period,
+                     multipliers[row], pre_ring, o);
 }

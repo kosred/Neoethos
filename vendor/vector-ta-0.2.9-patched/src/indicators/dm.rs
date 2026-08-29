@@ -1,15 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::dm_wrapper::CudaDm;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -765,16 +759,11 @@ fn dm_selected_with_kernel<const PLUS: bool>(
             let mut plus = alloc_with_nan_prefix(high.len(), warm);
             let mut minus = alloc_with_nan_prefix(high.len(), warm);
             dm_compute_into(high, low, period, first, chosen, &mut plus, &mut minus);
-            if PLUS {
-                Ok(plus)
-            } else {
-                Ok(minus)
-            }
+            if PLUS { Ok(plus) } else { Ok(minus) }
         }
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn dm_into(
     input: &DmInput,
@@ -1448,43 +1437,19 @@ unsafe fn dm_row_avx512_long(
     dm_row_avx512(high, low, first, period, plus, minus)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dm_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dm_js(high, low, period)?;
-    crate::write_wasm_object_f64_outputs("dm_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dm_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = dm_batch_unified_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs("dm_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_dm_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = DmParams { period: None };
         let input_default = DmInput::from_candles(&candles, default_params);
         let output_default = dm_with_kernel(&input_default, kernel)?;
@@ -1504,8 +1469,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DmInput::with_default_candles(&candles);
         let result = dm_with_kernel(&input, kernel)?;
         assert_eq!(result.plus.len(), candles.high.len());
@@ -1611,8 +1576,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = DmParams { period: Some(14) };
         let input = DmInput::from_candles(&candles, params);
         let output = dm_with_kernel(&input, kernel)?;
@@ -1676,8 +1641,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DmParams::default(),
@@ -1708,29 +1673,41 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in plus array \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in plus array \
 						 with params: period={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(14), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in plus array \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in plus array \
 						 with params: period={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(14), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in plus array \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in plus array \
 						 with params: period={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(14), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
             }
 
@@ -1743,29 +1720,41 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in minus array \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} in minus array \
 						 with params: period={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(14), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in minus array \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} in minus array \
 						 with params: period={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(14), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in minus array \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} in minus array \
 						 with params: period={} (param set {})",
-						test_name, val, bits, i,
-						params.period.unwrap_or(14), param_idx
-					);
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap_or(14),
+                        param_idx
+                    );
                 }
             }
         }
@@ -1999,7 +1988,6 @@ mod tests {
 
         let mut plus = vec![0.0; n];
         let mut minus = vec![0.0; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         dm_into(&input, &mut plus, &mut minus)?;
 
         fn eq_or_both_nan(a: f64, b: f64) -> bool {
@@ -2029,8 +2017,8 @@ mod tests {
 
     #[test]
     fn test_dm_selected_outputs_match_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = DmInput::with_default_candles(&candles);
         let baseline = dm(&input)?;
         let plus = dm_plus_with_kernel(&input, Kernel::Scalar)?;
@@ -2066,8 +2054,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = DmBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -2105,8 +2093,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2136,29 +2124,47 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in plus \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in plus \
 						 at row {} col {} (flat index {}) with params: period={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(14)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(14)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in plus \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in plus \
 						 at row {} col {} (flat index {}) with params: period={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(14)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(14)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in plus \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in plus \
 						 at row {} col {} (flat index {}) with params: period={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(14)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(14)
+                    );
                 }
             }
 
@@ -2174,29 +2180,47 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in minus \
+                        "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) in minus \
 						 at row {} col {} (flat index {}) with params: period={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(14)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(14)
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in minus \
+                        "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) in minus \
 						 at row {} col {} (flat index {}) with params: period={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(14)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(14)
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in minus \
+                        "[{}] Config {}: Found make_uninit_matrix poison value {} (0x{:016X}) in minus \
 						 at row {} col {} (flat index {}) with params: period={}",
-						test, cfg_idx, val, bits, row, col, idx,
-						combo.period.unwrap_or(14)
-					);
+                        test,
+                        cfg_idx,
+                        val,
+                        bits,
+                        row,
+                        col,
+                        idx,
+                        combo.period.unwrap_or(14)
+                    );
                 }
             }
         }
@@ -2234,333 +2258,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dm")]
-#[pyo3(signature = (high, low, period, kernel=None))]
-pub fn dm_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err("high/low length mismatch"));
-    }
-
-    let params = DmParams {
-        period: Some(period),
-    };
-    let input = DmInput::from_slices(h, l, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    let out_plus = unsafe { PyArray1::<f64>::new(py, [h.len()], false) };
-    let out_minus = unsafe { PyArray1::<f64>::new(py, [h.len()], false) };
-    let plus_slice = unsafe { out_plus.as_slice_mut()? };
-    let minus_slice = unsafe { out_minus.as_slice_mut()? };
-
-    py.allow_threads(|| dm_into_slice(plus_slice, minus_slice, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((out_plus, out_minus))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "dm_batch")]
-#[pyo3(signature = (high, low, period_range, kernel=None))]
-pub fn dm_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err("high/low length mismatch"));
-    }
-
-    let sweep = DmBatchRange {
-        period: period_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let output = py
-        .allow_threads(|| dm_batch_with_kernel(h, l, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let plus = unsafe { PyArray1::from_vec(py, output.plus).reshape((output.rows, output.cols))? };
-    let minus =
-        unsafe { PyArray1::from_vec(py, output.minus).reshape((output.rows, output.cols))? };
-
-    let dict = PyDict::new(py);
-    dict.set_item("plus", plus)?;
-    dict.set_item("minus", minus)?;
-    dict.set_item(
-        "periods",
-        output
-            .combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dm_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, period_range, device_id=0))]
-pub fn dm_cuda_batch_dev_py(
-    py: Python<'_>,
-    high_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let sweep = DmBatchRange {
-        period: period_range,
-    };
-    let (pair, ctx, dev) = py.allow_threads(|| {
-        let cuda = CudaDm::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        cuda.dm_batch_dev(h, l, &sweep)
-            .map(|(pair, _)| (pair, ctx, dev))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: pair.plus,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev),
-        },
-        DeviceArrayF32Py {
-            inner: pair.minus,
-            _ctx: Some(ctx),
-            device_id: Some(dev),
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "dm_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, cols, rows, period, device_id=0))]
-pub fn dm_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let (pair, ctx, dev) = py.allow_threads(|| {
-        let cuda = CudaDm::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev = cuda.device_id();
-        cuda.dm_many_series_one_param_time_major_dev(h, l, cols, rows, period)
-            .map(|pair| (pair, ctx, dev))
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok((
-        DeviceArrayF32Py {
-            inner: pair.plus,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev),
-        },
-        DeviceArrayF32Py {
-            inner: pair.minus,
-            _ctx: Some(ctx),
-            device_id: Some(dev),
-        },
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DmStream")]
-pub struct DmStreamPy {
-    stream: DmStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DmStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let s = DmStream::try_new(DmParams {
-            period: Some(period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream: s })
-    }
-    fn update(&mut self, high: f64, low: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DmJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dm)]
-pub fn dm_js(high: &[f64], low: &[f64], period: usize) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str("length mismatch"));
-    }
-    let input = DmInput::from_slices(
-        high,
-        low,
-        DmParams {
-            period: Some(period),
-        },
-    );
-
-    let mut plus = vec![0.0; high.len()];
-    let mut minus = vec![0.0; high.len()];
-    dm_into_slice(&mut plus, &mut minus, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = plus;
-    values.extend_from_slice(&minus);
-
-    let output = DmJsOutput {
-        values,
-        rows: 2,
-        cols: high.len(),
-    };
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DmBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DmBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub periods: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dm_batch)]
-pub fn dm_batch_unified_js(high: &[f64], low: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() {
-        return Err(JsValue::from_str("length mismatch"));
-    }
-    let cfg: DmBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = DmBatchRange {
-        period: cfg.period_range,
-    };
-    let out = dm_batch_inner(high, low, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(out.plus.len() + out.minus.len());
-    values.extend_from_slice(&out.plus);
-    values.extend_from_slice(&out.minus);
-
-    let periods = out
-        .combos
-        .iter()
-        .map(|p| p.period.unwrap())
-        .collect::<Vec<_>>();
-
-    let js = DmBatchJsOutput {
-        values,
-        rows: out.rows * 2,
-        cols: out.cols,
-        periods,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dm_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn dm_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = dm_into)]
-pub fn dm_into_js(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    plus_ptr: *mut f64,
-    minus_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || plus_ptr.is_null() || minus_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let input = DmInput::from_slices(
-            h,
-            l,
-            DmParams {
-                period: Some(period),
-            },
-        );
-        let plus = std::slice::from_raw_parts_mut(plus_ptr, len);
-        let minus = std::slice::from_raw_parts_mut(minus_ptr, len);
-        dm_into_slice(plus, minus, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
 }

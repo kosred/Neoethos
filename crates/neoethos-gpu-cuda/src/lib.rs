@@ -7,11 +7,60 @@ use neoethos_gpu_contracts::device::{
 };
 use thiserror::Error;
 
+#[cfg(feature = "cuda")]
+pub mod resident_classic_ta_v3;
+#[cfg(feature = "cuda")]
+pub mod resident_feature_store_v3;
+#[cfg(feature = "cuda-device-fixtures")]
+pub mod resident_feature_store_v3_device_fixture;
+#[cfg(feature = "cuda")]
+pub mod resident_footprint_v2;
+#[cfg(feature = "cuda")]
+pub mod resident_higher_timeframe_alignment_v3;
+#[cfg(feature = "cuda-device-fixtures")]
+pub mod resident_higher_timeframe_alignment_v3_device_fixture;
+#[cfg(feature = "cuda")]
+pub mod resident_quant_v3;
+#[cfg(feature = "cuda")]
+pub mod resident_regime_v3;
+#[cfg(feature = "cuda")]
+pub mod resident_robust_normalization_v2;
+#[cfg(feature = "cuda")]
+pub mod resident_session_v2;
+#[cfg(feature = "cuda-device-fixtures")]
+pub mod resident_session_v2_device_fixture;
+#[cfg(feature = "cuda")]
+pub mod resident_smc_v3;
+#[cfg(feature = "cuda")]
+pub mod resident_trim_prefilter_v1;
+
+pub mod full_discovery_workspace_plan_v1;
+pub mod physical_gpu_inventory_v1;
+pub mod run_device_admission_v1;
+
 mod population;
 
+pub use full_discovery_workspace_plan_v1::{
+    AdmittedFullDiscoveryGpuRunV1, FullDiscoveryGpuRunReceiptV1,
+    FullDiscoveryWorkspacePlanErrorCodeV1, FullDiscoveryWorkspacePlanErrorV1,
+    SealedFullDiscoveryGpuWorkspacePlanV1, bind_full_discovery_workspace_plan_v1,
+};
+pub use physical_gpu_inventory_v1::{
+    PhysicalGpuInventoryErrorCodeV1, PhysicalGpuInventoryErrorV1, PhysicalGpuInventoryPlatformV1,
+    PhysicalGpuInventoryRecordV1, SealedNoPhysicalGpuReceiptV1,
+    SealedPhysicalGpuInventoryReceiptV1, probe_physical_gpu_inventory_v1,
+};
+pub use run_device_admission_v1::{
+    DiscoveryRunDeviceAdmissionErrorCodeV1, DiscoveryRunDeviceAdmissionErrorV1,
+    SealedDiscoveryRunDeviceAdmissionV1, acquire_discovery_run_device_admission_v1,
+};
+
 pub use population::{
-    CudaPopulationError, PopulationDatasetView, PopulationDiagnostics, PopulationGeneView,
-    PopulationSession, population_status_message,
+    CudaPopulationDeviceIdentityV1, CudaPopulationError, PopulationDatasetView,
+    PopulationDiagnostics, PopulationEvaluationViewV1, PopulationGeneView,
+    PopulationParentDatasetInputV1, PopulationParentDatasetV1, PopulationResidencyCountersV1,
+    PopulationSession, PopulationTimestampModeV1, PopulationViewKindV1,
+    TerminalCompactPopulationResultReceiptV1, population_status_message,
 };
 // Callers that decide what to do about a failure need to name the failure.
 // Without these, the only handle on a status was its rendered message, and a
@@ -32,8 +81,8 @@ pub struct CudaFirstHitEvent {
     pub direction: i32,
     /// `0` for stop-first, `1` for target-first.
     pub precedence: i32,
-    pub stop_price: f32,
-    pub target_price: f32,
+    pub stop_price: f64,
+    pub target_price: f64,
 }
 
 #[repr(C)]
@@ -48,17 +97,49 @@ pub struct CudaFirstHitResult {
 unsafe extern "C" {
     fn neoethos_gpu_cuda_abi_version() -> u32;
     fn neoethos_gpu_cuda_runtime_available() -> i32;
+    fn neoethos_gpu_cuda_probe_device_count_v1(out_count: *mut u32) -> i32;
     fn neoethos_gpu_cuda_device_count() -> i32;
     fn neoethos_gpu_cuda_device_free_memory(device: i32) -> u64;
     fn neoethos_gpu_cuda_smoke(input: *const u32, output: *mut u32, len: usize) -> i32;
     fn neoethos_gpu_cuda_warp_first_hit(
-        highs: *const f32,
-        lows: *const f32,
+        highs: *const f64,
+        lows: *const f64,
         rows: usize,
         events: *const CudaFirstHitEvent,
         results: *mut CudaFirstHitResult,
         event_count: usize,
     ) -> i32;
+}
+
+const NEO_CUDA_DEVICE_PROBE_OK: i32 = 0;
+const NEO_CUDA_DEVICE_PROBE_INVALID_OUTPUT: i32 = -50;
+const NEO_CUDA_DEVICE_PROBE_ADAPTER_UNAVAILABLE: i32 = -51;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CudaDeviceEnumerationErrorV1 {
+    #[error("native CUDA adapter is not compiled into this binary")]
+    NativeAdapterUnavailable,
+    #[error("CUDA device enumeration failed with runtime status {0}")]
+    RuntimeFailure(i32),
+    #[error("native CUDA device enumeration returned invalid output")]
+    InvalidNativeOutput,
+}
+
+pub fn probe_cuda_device_count_v1() -> Result<u32, CudaDeviceEnumerationErrorV1> {
+    let mut count = u32::MAX;
+    // SAFETY: `count` is a valid exclusive output pointer for the duration of
+    // the call. The native contract writes it only after CUDA success.
+    let status = unsafe { neoethos_gpu_cuda_probe_device_count_v1(&mut count) };
+    match status {
+        NEO_CUDA_DEVICE_PROBE_OK if count != u32::MAX => Ok(count),
+        NEO_CUDA_DEVICE_PROBE_OK | NEO_CUDA_DEVICE_PROBE_INVALID_OUTPUT => {
+            Err(CudaDeviceEnumerationErrorV1::InvalidNativeOutput)
+        }
+        NEO_CUDA_DEVICE_PROBE_ADAPTER_UNAVAILABLE => {
+            Err(CudaDeviceEnumerationErrorV1::NativeAdapterUnavailable)
+        }
+        runtime_status => Err(CudaDeviceEnumerationErrorV1::RuntimeFailure(runtime_status)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -78,6 +159,12 @@ pub enum CudaSmokeError {
 pub fn native_abi_version() -> u32 {
     // SAFETY: no arguments, no memory access, stable C ABI.
     unsafe { neoethos_gpu_cuda_abi_version() }
+}
+
+/// Reviewed build manifest embedded by `build.rs` for a real CUDA build.
+/// Honest no-CUDA adapter builds return `None`; they cannot emit native success.
+pub const fn cuda_build_manifest_v1() -> Option<&'static str> {
+    option_env!("NEOETHOS_CUDA_BUILD_MANIFEST_V1")
 }
 
 pub fn validate_abi() -> Result<(), CudaSmokeError> {
@@ -141,8 +228,8 @@ pub fn smoke_add_one(input: &[u32]) -> Result<Vec<u32>, CudaSmokeError> {
 }
 
 pub fn warp_first_hit(
-    highs: &[f32],
-    lows: &[f32],
+    highs: &[f64],
+    lows: &[f64],
     events: &[CudaFirstHitEvent],
 ) -> Result<Vec<CudaFirstHitResult>, CudaSmokeError> {
     validate_abi()?;
@@ -205,10 +292,77 @@ mod tests {
     }
 
     #[test]
-    fn first_hit_layout_is_stable() {
-        assert_eq!(core::mem::size_of::<CudaFirstHitEvent>(), 24);
-        assert_eq!(core::mem::align_of::<CudaFirstHitEvent>(), 4);
+    fn first_hit_f64_abi_contract_is_stable() {
+        use core::mem::{align_of, offset_of, size_of};
+
+        type WarpFirstHitFn = fn(
+            &[f64],
+            &[f64],
+            &[CudaFirstHitEvent],
+        ) -> Result<Vec<CudaFirstHitResult>, CudaSmokeError>;
+
+        let _: WarpFirstHitFn = warp_first_hit;
+        let _: unsafe extern "C" fn(
+            *const f64,
+            *const f64,
+            usize,
+            *const CudaFirstHitEvent,
+            *mut CudaFirstHitResult,
+            usize,
+        ) -> i32 = neoethos_gpu_cuda_warp_first_hit;
+
+        assert_eq!(size_of::<CudaFirstHitEvent>(), 32);
+        assert_eq!(align_of::<CudaFirstHitEvent>(), 8);
+        assert_eq!(offset_of!(CudaFirstHitEvent, stop_price), 16);
+        assert_eq!(offset_of!(CudaFirstHitEvent, target_price), 24);
         assert_eq!(core::mem::size_of::<CudaFirstHitResult>(), 8);
+
+        let header = include_str!("../native/neoethos_gpu_cuda.h");
+        let kernel = include_str!("../native/prototype_b.cu");
+        let stub = include_str!("../native/stub.cpp");
+        let layout_asserts = include_str!("../native/layout_asserts.cpp");
+        for required in [
+            "double stop_price;",
+            "double target_price;",
+            "const double* highs",
+            "const double* lows",
+        ] {
+            assert!(
+                header.contains(required),
+                "native header is missing f64 first-hit contract `{required}`"
+            );
+        }
+        for required in [
+            "__device__ std::int32_t first_hit_reason(double high,",
+            "double low,",
+            "__global__ void warp_first_hit_kernel(const double* highs,",
+            "double* device_highs = nullptr;",
+            "double* device_lows = nullptr;",
+            "rows * sizeof(double)",
+        ] {
+            assert!(
+                kernel.contains(required),
+                "native kernel is missing f64 first-hit contract `{required}`"
+            );
+        }
+        assert!(stub.contains("const double*"));
+        assert!(layout_asserts.contains("sizeof(NeoFirstHitEvent) == 32"));
+        assert!(layout_asserts.contains("alignof(NeoFirstHitEvent) == 8"));
+        assert!(
+            layout_asserts.contains(
+                "using NeoWarpFirstHitFn = std::int32_t (*)(const double*, const double*"
+            )
+        );
+
+        for source in [header, kernel, stub, layout_asserts] {
+            assert!(
+                !source.contains("const float* highs")
+                    && !source.contains("const float* lows")
+                    && !source.contains("float stop_price")
+                    && !source.contains("float target_price"),
+                "first-hit ABI still contains a narrowing f32 surface"
+            );
+        }
     }
 
     #[test]
@@ -251,11 +405,11 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn real_cuda_smoke_is_explicitly_gpu_gated() {
-        if std::env::var("NEOETHOS_RUN_CUDA_SMOKE").as_deref() != Ok("1") {
-            eprintln!("CUDA smoke skipped; set NEOETHOS_RUN_CUDA_SMOKE=1 on a GPU runner");
-            return;
-        }
+    fn real_cuda_smoke_executes_f64_first_hit_without_narrowing() {
+        assert!(
+            runtime_available(),
+            "the cuda feature's real-device gate requires a visible CUDA device"
+        );
         let output = smoke_add_one(&[1, 2, 41]).unwrap();
         assert_eq!(output, vec![2, 3, 42]);
 
@@ -274,6 +428,29 @@ mod tests {
                 exit_bar: 1,
                 exit_reason: 1,
             }]
+        );
+
+        let lower = f64::from_bits(1.0_f64.to_bits() - 1);
+        let upper = f64::from_bits(1.0_f64.to_bits() + 1);
+        let nearest_f32_boundary = f64::from(1.0_f32);
+        assert!(lower < nearest_f32_boundary && nearest_f32_boundary < upper);
+        let precision_event = [CudaFirstHitEvent {
+            entry_bar: 0,
+            last_bar: 2,
+            direction: 1,
+            precedence: 0,
+            stop_price: 0.0,
+            target_price: 1.0,
+        }];
+        let precision_result =
+            warp_first_hit(&[0.5_f64, lower, upper], &[0.5_f64; 3], &precision_event).unwrap();
+        assert_eq!(
+            precision_result,
+            vec![CudaFirstHitResult {
+                exit_bar: 2,
+                exit_reason: 2,
+            }],
+            "bar 1 must remain below the f64 target; an f32 boundary would exit early"
         );
     }
 }

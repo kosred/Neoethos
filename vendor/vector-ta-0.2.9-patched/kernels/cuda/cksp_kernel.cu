@@ -487,15 +487,16 @@ void cksp_many_series_one_param_f32(const float* __restrict__ high_tm,
  *   `cksp_scalar`      (:608) — the RMA recurrence and the four monotonic
  *                               deques, verbatim
  *
- * WHICH SERIES THIS EMITS. `compute_cksp_batch` (cpu_batch.rs:14308) maps
- * output_id "value" -> `long_values`. One matrix, so this is the LONG stop.
+ * OUTPUT CONTRACT. The canonical registry owns `long_values` and
+ * `short_values`. The preserved generic primary entry emits the first one for
+ * the admitted default `(p=10,x=1,q=9)`. `cksp_outputs_f64` emits the complete
+ * pair from explicit p/x/q rows and runtime-sized resident deque scratch.
  *
- * PERIOD-INVARIANT, AND THAT IS FAITHFUL. The CPU batch reads `p` (10),
- * `x` (1.0) and `q` (9) — cpu_batch.rs:14285-14287. None of them is named
- * `period`, so a period sweep produces identical CPU columns and this kernel
- * produces identical rows. Declared through `is_period_invariant`, not hidden.
- * Because q is fixed at 9 the deque capacity is a literal 10 (`q + 1`), which
- * is why this kernel needs no per-thread ring bound and no `max_period`.
+ * DEFAULT-ONLY FEATURE ADMISSION. NeoEthos currently classifies p/q outside
+ * its generic `period` vocabulary, so only the exact registry default tuple is
+ * admitted. The primary ABI remains period-invariant for that reason; the
+ * typed pair ABI is nevertheless fully parameterized and never pretends an
+ * inert synthetic period changed the formula.
  *
  * FIRST-VALID IS CLOSE-ONLY. cksp.rs:281 is
  * `close.iter().position(|v| !v.is_nan())`; high and low are never scanned.
@@ -537,48 +538,54 @@ void cksp_many_series_one_param_f32(const float* __restrict__ high_tm,
 #define NEO_CKSP_X 1.0
 #define NEO_CKSP_CAP (NEO_CKSP_Q + 1)
 
-__device__ __forceinline__ int neo_cksp_rb_dec(int idx) {
-    return (idx == 0) ? (NEO_CKSP_CAP - 1) : (idx - 1);
+__device__ __forceinline__ int neo_cksp_rb_dec(int idx, int cap) {
+    return (idx == 0) ? (cap - 1) : (idx - 1);
 }
-__device__ __forceinline__ int neo_cksp_rb_inc(int idx) {
+__device__ __forceinline__ int neo_cksp_rb_inc(int idx, int cap) {
     int t = idx + 1;
-    return (t == NEO_CKSP_CAP) ? 0 : t;
+    return (t == cap) ? 0 : t;
 }
 
-extern "C" __global__
-void cksp_neo_batch_f64(const double* __restrict__ high,
-                        const double* __restrict__ low,
-                        const double* __restrict__ close,
-                        int series_len,
-                        const int* __restrict__ periods,
-                        int n_combos,
-                        int first_valid,
-                        double* __restrict__ out)
+__device__ __forceinline__ void cksp_row_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int len,
+    int p,
+    double x,
+    int q,
+    int first_valid,
+    int* __restrict__ h_idx,
+    int* __restrict__ l_idx,
+    int* __restrict__ ls_idx,
+    int* __restrict__ ss_idx,
+    double* __restrict__ ls_val,
+    double* __restrict__ ss_val,
+    int scratch_cap,
+    double* __restrict__ row_long_values,
+    double* __restrict__ row_short_values)
 {
-    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (combo >= n_combos) return;
+    const bool emit_short = row_short_values != nullptr;
+    for (int i = 0; i < len; ++i) {
+        row_long_values[i] = NEO_F64_NAN;
+        if (emit_short) row_short_values[i] = NEO_F64_NAN;
+    }
 
-    const int len = series_len;
-    double* __restrict__ o = out + (size_t)combo * (size_t)len;
-    (void)periods;   /* period-invariant — see the header. */
-
-    const int p = NEO_CKSP_P;
-    const int q = NEO_CKSP_Q;
-    const double x = NEO_CKSP_X;
-
-    if (len <= 0 || first_valid < 0 || first_valid >= len ||
-        (len - first_valid) <= (p + q - 1)) {
-        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    const long long warm_span = (long long)p + (long long)q - 1LL;
+    if (len <= 0 || p <= 0 || q <= 0 || first_valid < 0 || first_valid >= len ||
+        warm_span < 0LL || warm_span >= (long long)(len - first_valid) ||
+        scratch_cap < q + 1 || h_idx == nullptr || l_idx == nullptr ||
+        ls_idx == nullptr || ls_val == nullptr ||
+        (emit_short && (ss_idx == nullptr || ss_val == nullptr))) {
         return;
     }
 
-    const int warmup = first_valid + p + q - 1;
-    for (int i = 0; i < len && i < warmup; ++i) o[i] = NEO_F64_NAN;
-
-    int    h_idx[NEO_CKSP_CAP];  int h_head = 0,  h_tail = 0;
-    int    l_idx[NEO_CKSP_CAP];  int l_head = 0,  l_tail = 0;
-    int   ls_idx[NEO_CKSP_CAP];  double ls_val[NEO_CKSP_CAP];
-    int   ls_head = 0, ls_tail = 0;
+    const int cap = q + 1;
+    const int warmup = first_valid + (int)warm_span;
+    int h_head = 0, h_tail = 0;
+    int l_head = 0, l_tail = 0;
+    int ls_head = 0, ls_tail = 0;
+    int ss_head = 0, ss_tail = 0;
 
     double sum_tr = 0.0;
     double rma = 0.0;
@@ -611,58 +618,157 @@ void cksp_neo_batch_f64(const double* __restrict__ high,
 
         /* --- max-high deque over the last q bars ------------------------- */
         while (h_head != h_tail) {
-            const int last = neo_cksp_rb_dec(h_tail);
+            const int last = neo_cksp_rb_dec(h_tail, cap);
             if (high[h_idx[last]] <= hi) h_tail = last; else break;
         }
         {
-            int next_tail = neo_cksp_rb_inc(h_tail);
-            if (next_tail == h_head) h_head = neo_cksp_rb_inc(h_head);
+            int next_tail = neo_cksp_rb_inc(h_tail, cap);
+            if (next_tail == h_head) h_head = neo_cksp_rb_inc(h_head, cap);
             h_idx[h_tail] = i;
             h_tail = next_tail;
         }
         while (h_head != h_tail) {
-            if (h_idx[h_head] + q <= i) h_head = neo_cksp_rb_inc(h_head); else break;
+            if (h_idx[h_head] + q <= i) h_head = neo_cksp_rb_inc(h_head, cap); else break;
         }
         const double mh = high[h_idx[h_head]];
 
-        /* --- min-low deque over the last q bars --------------------------
-         * Only the SHORT stop reads its value, and this matrix is the LONG
-         * stop. The deque still RUNS: it is cheap, it keeps this kernel a
-         * line-for-line mirror of the reference, and it is what the short
-         * entry point will read the day this file gains one. */
+        /* --- min-low deque over the last q bars -------------------------- */
         while (l_head != l_tail) {
-            const int last = neo_cksp_rb_dec(l_tail);
+            const int last = neo_cksp_rb_dec(l_tail, cap);
             if (low[l_idx[last]] >= lo) l_tail = last; else break;
         }
         {
-            int next_tail = neo_cksp_rb_inc(l_tail);
-            if (next_tail == l_head) l_head = neo_cksp_rb_inc(l_head);
+            int next_tail = neo_cksp_rb_inc(l_tail, cap);
+            if (next_tail == l_head) l_head = neo_cksp_rb_inc(l_head, cap);
             l_idx[l_tail] = i;
             l_tail = next_tail;
         }
         while (l_head != l_tail) {
-            if (l_idx[l_head] + q <= i) l_head = neo_cksp_rb_inc(l_head); else break;
+            if (l_idx[l_head] + q <= i) l_head = neo_cksp_rb_inc(l_head, cap); else break;
         }
+        const double ml = low[l_idx[l_head]];
 
         if (i >= warmup) {
             /* cksp.rs:785 — `(-x).mul_add(rma, mh)`, one rounding. */
             const double ls0 = fma(-x, rma, mh);
+            const double ss0 = fma(x, rma, ml);
 
             while (ls_head != ls_tail) {
-                const int last = neo_cksp_rb_dec(ls_tail);
+                const int last = neo_cksp_rb_dec(ls_tail, cap);
                 if (ls_val[last] <= ls0) ls_tail = last; else break;
             }
             {
-                int next_tail = neo_cksp_rb_inc(ls_tail);
-                if (next_tail == ls_head) ls_head = neo_cksp_rb_inc(ls_head);
+                int next_tail = neo_cksp_rb_inc(ls_tail, cap);
+                if (next_tail == ls_head) ls_head = neo_cksp_rb_inc(ls_head, cap);
                 ls_idx[ls_tail] = i;
                 ls_val[ls_tail] = ls0;
                 ls_tail = next_tail;
             }
             while (ls_head != ls_tail) {
-                if (ls_idx[ls_head] + q <= i) ls_head = neo_cksp_rb_inc(ls_head); else break;
+                if (ls_idx[ls_head] + q <= i) ls_head = neo_cksp_rb_inc(ls_head, cap); else break;
             }
-            o[i] = ls_val[ls_head];
+            row_long_values[i] = ls_val[ls_head];
+
+            if (emit_short) {
+                while (ss_head != ss_tail) {
+                    const int last = neo_cksp_rb_dec(ss_tail, cap);
+                    if (ss_val[last] >= ss0) ss_tail = last; else break;
+                }
+                {
+                    int next_tail = neo_cksp_rb_inc(ss_tail, cap);
+                    if (next_tail == ss_head) ss_head = neo_cksp_rb_inc(ss_head, cap);
+                    ss_idx[ss_tail] = i;
+                    ss_val[ss_tail] = ss0;
+                    ss_tail = next_tail;
+                }
+                while (ss_head != ss_tail) {
+                    if (ss_idx[ss_head] + q <= i) ss_head = neo_cksp_rb_inc(ss_head, cap); else break;
+                }
+                row_short_values[i] = ss_val[ss_head];
+            }
         }
     }
+}
+
+extern "C" __global__ void cksp_outputs_f64(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int series_len,
+    const int* __restrict__ p_values,
+    const double* __restrict__ x_values,
+    const int* __restrict__ q_values,
+    int rows,
+    int first_valid,
+    int deque_scratch_cap,
+    int* __restrict__ h_index_scratch,
+    int* __restrict__ l_index_scratch,
+    int* __restrict__ long_index_scratch,
+    int* __restrict__ short_index_scratch,
+    double* __restrict__ long_value_scratch,
+    double* __restrict__ short_value_scratch,
+    double* __restrict__ out_long_values,
+    double* __restrict__ out_short_values)
+{
+    const int row = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows || series_len <= 0) return;
+
+    const size_t output_offset = (size_t)row * (size_t)series_len;
+    const size_t scratch_offset = (size_t)row * (size_t)deque_scratch_cap;
+    cksp_row_f64(
+        high,
+        low,
+        close,
+        series_len,
+        p_values[row],
+        x_values[row],
+        q_values[row],
+        first_valid,
+        h_index_scratch + scratch_offset,
+        l_index_scratch + scratch_offset,
+        long_index_scratch + scratch_offset,
+        short_index_scratch + scratch_offset,
+        long_value_scratch + scratch_offset,
+        short_value_scratch + scratch_offset,
+        deque_scratch_cap,
+        out_long_values + output_offset,
+        out_short_values + output_offset);
+}
+
+extern "C" __global__
+void cksp_neo_batch_f64(const double* __restrict__ high,
+                        const double* __restrict__ low,
+                        const double* __restrict__ close,
+                        int series_len,
+                        const int* __restrict__ periods,
+                        int n_combos,
+                        int first_valid,
+                        double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+    (void)periods;   /* exact default-only primary ABI — see the header. */
+
+    int h_idx[NEO_CKSP_CAP];
+    int l_idx[NEO_CKSP_CAP];
+    int ls_idx[NEO_CKSP_CAP];
+    double ls_val[NEO_CKSP_CAP];
+    cksp_row_f64(
+        high,
+        low,
+        close,
+        series_len,
+        NEO_CKSP_P,
+        NEO_CKSP_X,
+        NEO_CKSP_Q,
+        first_valid,
+        h_idx,
+        l_idx,
+        ls_idx,
+        nullptr,
+        ls_val,
+        nullptr,
+        NEO_CKSP_CAP,
+        out + (size_t)combo * (size_t)series_len,
+        nullptr);
 }

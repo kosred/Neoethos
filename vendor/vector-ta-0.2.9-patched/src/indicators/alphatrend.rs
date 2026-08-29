@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, CandleFieldFlags, Candles};
+use crate::utilities::data_loader::{CandleFieldFlags, Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
-    make_uninit_matrix,
+    make_uninit_matrix, runtime_supports_kernel,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -33,18 +17,8 @@ use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::alphatrend_wrapper::CudaAlphaTrend;
-use crate::indicators::mfi::{mfi_with_kernel, MfiInput, MfiParams};
-use crate::indicators::rsi::{rsi_with_kernel, RsiInput, RsiParams};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
+use crate::indicators::mfi::{MfiInput, MfiParams, mfi_with_kernel};
+use crate::indicators::rsi::{RsiInput, RsiParams, rsi_with_kernel};
 
 impl<'a> AsRef<[f64]> for AlphaTrendInput<'a> {
     #[inline(always)]
@@ -83,10 +57,6 @@ pub enum AlphaTrendOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AlphaTrendParams {
     pub coeff: Option<f64>,
     pub period: Option<usize>,
@@ -291,6 +261,9 @@ pub enum AlphaTrendError {
     #[error("alphatrend: Invalid kernel for batch path: {0:?}")]
     InvalidKernelForBatch(Kernel),
 
+    #[error("alphatrend: requested kernel is unsupported by this CPU: {0:?}")]
+    UnsupportedKernel(Kernel),
+
     #[error("alphatrend: invalid input: {0}")]
     InvalidInput(String),
 }
@@ -320,7 +293,6 @@ pub fn alphatrend_with_kernel(
     Ok(AlphaTrendOutput { k1, k2 })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn alphatrend_into(
     input: &AlphaTrendInput,
@@ -521,6 +493,9 @@ fn alphatrend_prepare<'a>(
         Kernel::Auto => Kernel::Scalar,
         k => k,
     };
+    if !runtime_supports_kernel(chosen) {
+        return Err(AlphaTrendError::UnsupportedKernel(chosen));
+    }
 
     Ok((
         open, high, low, close, volume, coeff, period, no_volume, first, chosen,
@@ -648,17 +623,9 @@ pub fn alphatrend_scalar(
             let m_check = momentum_values[i] >= 50.0;
 
             let cur = if i == warmup {
-                if m_check {
-                    up_t
-                } else {
-                    down_t
-                }
+                if m_check { up_t } else { down_t }
             } else if m_check {
-                if up_t < prev_alpha {
-                    prev_alpha
-                } else {
-                    up_t
-                }
+                if up_t < prev_alpha { prev_alpha } else { up_t }
             } else {
                 if down_t > prev_alpha {
                     prev_alpha
@@ -765,17 +732,9 @@ fn alphatrend_scalar_output_selected(
             let m_check = momentum_values[i] >= 50.0;
 
             let cur = if i == warmup {
-                if m_check {
-                    up_t
-                } else {
-                    down_t
-                }
+                if m_check { up_t } else { down_t }
             } else if m_check {
-                if up_t < prev_alpha {
-                    prev_alpha
-                } else {
-                    up_t
-                }
+                if up_t < prev_alpha { prev_alpha } else { up_t }
             } else if down_t > prev_alpha {
                 prev_alpha
             } else {
@@ -926,19 +885,11 @@ unsafe fn alphatrend_avx2(
 
     #[inline(always)]
     fn fast_max(a: f64, b: f64) -> f64 {
-        if a >= b {
-            a
-        } else {
-            b
-        }
+        if a >= b { a } else { b }
     }
     #[inline(always)]
     fn fast_min(a: f64, b: f64) -> f64 {
-        if a <= b {
-            a
-        } else {
-            b
-        }
+        if a <= b { a } else { b }
     }
 
     let mut prev2 = f64::NAN;
@@ -955,11 +906,7 @@ unsafe fn alphatrend_avx2(
         let m_ge_50 = *momentum_values.get_unchecked(k) >= 50.0;
 
         let alpha = if k == warmup {
-            if m_ge_50 {
-                up
-            } else {
-                dn
-            }
+            if m_ge_50 { up } else { dn }
         } else if m_ge_50 {
             fast_max(up, prev_alpha)
         } else {
@@ -1105,19 +1052,11 @@ unsafe fn alphatrend_avx512(
 
     #[inline(always)]
     fn fast_max(a: f64, b: f64) -> f64 {
-        if a >= b {
-            a
-        } else {
-            b
-        }
+        if a >= b { a } else { b }
     }
     #[inline(always)]
     fn fast_min(a: f64, b: f64) -> f64 {
-        if a <= b {
-            a
-        } else {
-            b
-        }
+        if a <= b { a } else { b }
     }
 
     let mut prev2 = f64::NAN;
@@ -1134,11 +1073,7 @@ unsafe fn alphatrend_avx512(
         let m_ge_50 = *momentum_values.get_unchecked(k) >= 50.0;
 
         let alpha = if k == warmup {
-            if m_ge_50 {
-                up
-            } else {
-                dn
-            }
+            if m_ge_50 { up } else { dn }
         } else if m_ge_50 {
             fast_max(up, prev_alpha)
         } else {
@@ -1295,17 +1230,9 @@ impl AlphaTrendStream {
             let hc = (high - self.prev_close).abs();
             let lc = (low - self.prev_close).abs();
             if hl >= hc {
-                if hl >= lc {
-                    hl
-                } else {
-                    lc
-                }
+                if hl >= lc { hl } else { lc }
             } else {
-                if hc >= lc {
-                    hc
-                } else {
-                    lc
-                }
+                if hc >= lc { hc } else { lc }
             }
         } else {
             high - low
@@ -1334,11 +1261,7 @@ impl AlphaTrendStream {
         if self.no_volume {
             let (gain, loss) = if self.have_prev {
                 let d = close - self.prev_close;
-                if d >= 0.0 {
-                    (d, 0.0)
-                } else {
-                    (0.0, -d)
-                }
+                if d >= 0.0 { (d, 0.0) } else { (0.0, -d) }
             } else {
                 (0.0, 0.0)
             };
@@ -1422,11 +1345,7 @@ impl AlphaTrendStream {
             let dn = self.coeff.mul_add(atr, high);
 
             cur = if self.alpha_count == 0 {
-                if m_ge_50 {
-                    up
-                } else {
-                    dn
-                }
+                if m_ge_50 { up } else { dn }
             } else if m_ge_50 {
                 if up < self.prev_alpha {
                     self.prev_alpha
@@ -1463,213 +1382,6 @@ impl AlphaTrendStream {
     #[inline(always)]
     pub fn get_warmup_period(&self) -> usize {
         self.period - 1
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "alphatrend")]
-#[pyo3(signature = (open, high, low, close, volume, coeff=1.0, period=14, no_volume=false, kernel=None))]
-pub fn alphatrend_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    coeff: f64,
-    period: usize,
-    no_volume: bool,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let open_slice = open.as_slice()?;
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = AlphaTrendParams {
-        coeff: Some(coeff),
-        period: Some(period),
-        no_volume: Some(no_volume),
-    };
-    let input = AlphaTrendInput::from_slices(
-        open_slice,
-        high_slice,
-        low_slice,
-        close_slice,
-        volume_slice,
-        params,
-    );
-
-    let result = py
-        .allow_threads(|| alphatrend_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((result.k1.into_pyarray(py), result.k2.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AlphaTrendStream")]
-pub struct AlphaTrendStreamPy {
-    stream: AlphaTrendStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AlphaTrendStreamPy {
-    #[new]
-    fn new(coeff: f64, period: usize, no_volume: bool) -> PyResult<Self> {
-        let params = AlphaTrendParams {
-            coeff: Some(coeff),
-            period: Some(period),
-            no_volume: Some(no_volume),
-        };
-        let stream =
-            AlphaTrendStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AlphaTrendStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64, volume: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low, close, volume)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AlphaTrendJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    coeff: f64,
-    period: usize,
-    no_volume: bool,
-) -> Result<JsValue, JsValue> {
-    let params = AlphaTrendParams {
-        coeff: Some(coeff),
-        period: Some(period),
-        no_volume: Some(no_volume),
-    };
-    let input = AlphaTrendInput::from_slices(open, high, low, close, volume, params);
-
-    let mut k1 = vec![0.0; close.len()];
-    let mut k2 = vec![0.0; close.len()];
-
-    alphatrend_into_slices(&mut k1, &mut k2, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(k1.len() * 2);
-    values.extend_from_slice(&k1);
-    values.extend_from_slice(&k2);
-
-    let out = AlphaTrendJsOutput {
-        values,
-        rows: 2,
-        cols: close.len(),
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_alloc_flat(n: usize) -> *mut f64 {
-    let Some(total) = n.checked_mul(2) else {
-        return core::ptr::null_mut();
-    };
-    let mut v = Vec::<f64>::with_capacity(total);
-    let p = v.as_mut_ptr();
-    core::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_free_flat(ptr: *mut f64, n: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    let Some(total) = n.checked_mul(2) else {
-        return;
-    };
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, total);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_into_flat(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_flat_ptr: *mut f64,
-    len: usize,
-    coeff: f64,
-    period: usize,
-    no_volume: bool,
-) -> Result<(), JsValue> {
-    if [open_ptr, high_ptr, low_ptr, close_ptr, volume_ptr]
-        .iter()
-        .any(|&p| p.is_null())
-        || out_flat_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let (open, high, low, close, volume) = (
-            core::slice::from_raw_parts(open_ptr, len),
-            core::slice::from_raw_parts(high_ptr, len),
-            core::slice::from_raw_parts(low_ptr, len),
-            core::slice::from_raw_parts(close_ptr, len),
-            core::slice::from_raw_parts(volume_ptr, len),
-        );
-        let (k1, k2) = (
-            core::slice::from_raw_parts_mut(out_flat_ptr, len),
-            core::slice::from_raw_parts_mut(out_flat_ptr.add(len), len),
-        );
-        let params = AlphaTrendParams {
-            coeff: Some(coeff),
-            period: Some(period),
-            no_volume: Some(no_volume),
-        };
-        let input = AlphaTrendInput::from_slices(open, high, low, close, volume, params);
-        alphatrend_into_slices(k1, k2, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(note = "Use alphatrend_alloc_flat/alphatrend_into_flat")]
-pub fn alphatrend_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    core::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(note = "Use alphatrend_free_flat")]
-pub fn alphatrend_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
     }
 }
 
@@ -1917,6 +1629,9 @@ pub fn alphatrend_batch_with_kernel(
         other if other.is_batch() => other,
         other => return Err(AlphaTrendError::InvalidKernelForBatch(other)),
     };
+    if !runtime_supports_kernel(kernel) {
+        return Err(AlphaTrendError::UnsupportedKernel(kernel));
+    }
 
     let simd = match kernel {
         Kernel::Avx512Batch => Kernel::Avx512,
@@ -2185,6 +1900,9 @@ pub fn alphatrend_batch_inner_into_slices(
         Kernel::Auto => detect_best_batch_kernel(),
         k => k,
     };
+    if !runtime_supports_kernel(actual) {
+        return Err(AlphaTrendError::UnsupportedKernel(actual));
+    }
     let simd_kernel = match actual {
         Kernel::Avx512Batch => Kernel::Avx512,
         Kernel::Avx2Batch => Kernel::Avx2,
@@ -2321,23 +2039,11 @@ pub fn alphatrend_batch_inner_into_slices(
                 let m_ge_50 = mom[i] >= 50.0;
 
                 let cur = if i == warmup {
-                    if m_ge_50 {
-                        up
-                    } else {
-                        dn
-                    }
+                    if m_ge_50 { up } else { dn }
                 } else if m_ge_50 {
-                    if up < prev_alpha {
-                        prev_alpha
-                    } else {
-                        up
-                    }
+                    if up < prev_alpha { prev_alpha } else { up }
                 } else {
-                    if dn > prev_alpha {
-                        prev_alpha
-                    } else {
-                        dn
-                    }
+                    if dn > prev_alpha { prev_alpha } else { dn }
                 };
 
                 k1_row[i] = cur;
@@ -2386,733 +2092,122 @@ pub fn alphatrend_batch_inner_into_slices(
     Ok(())
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "alphatrend_batch")]
-#[pyo3(signature = (open, high, low, close, volume, coeff_range, period_range, no_volume=false, kernel=None))]
-pub fn alphatrend_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    coeff_range: (f64, f64, f64),
-    period_range: (usize, usize, usize),
-    no_volume: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArray1;
-
-    let (o, h, l, c, v) = (
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        volume.as_slice()?,
-    );
-    let len = c.len();
-    if o.len() != len || h.len() != len || l.len() != len || v.len() != len {
-        return Err(PyValueError::new_err("Inconsistent data lengths"));
-    }
-
-    let sweep = AlphaTrendBatchRange {
-        coeff: coeff_range,
-        period: period_range,
-        no_volume,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let rows = {
-        fn axis_usize((s, e, st): (usize, usize, usize)) -> usize {
-            if st == 0 || s == e {
-                1
-            } else {
-                (e - s) / st + 1
-            }
-        }
-        fn axis_f64((s, e, st): (f64, f64, f64)) -> usize {
-            if st.abs() < 1e-12 || (s - e).abs() < 1e-12 {
-                1
-            } else {
-                ((e - s) / st).floor() as usize + 1
-            }
-        }
-        axis_f64(coeff_range) * axis_usize(period_range)
-    };
-
-    let out_k1 = unsafe { PyArray1::<f64>::new(py, [rows * len], false) };
-    let out_k2 = unsafe { PyArray1::<f64>::new(py, [rows * len], false) };
-    let k1_slice = unsafe { out_k1.as_slice_mut()? };
-    let k2_slice = unsafe { out_k2.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        alphatrend_batch_inner_into_slices(o, h, l, c, v, &sweep, kern, true, k1_slice, k2_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("k1", out_k1.reshape([rows, len])?)?;
-    dict.set_item("k2", out_k2.reshape([rows, len])?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", len)?;
-
-    let combos =
-        expand_grid_alphatrend(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let combo_list = PyList::new(
-        py,
-        combos.iter().map(|c| {
-            let d = PyDict::new(py);
-            d.set_item("coeff", c.coeff.unwrap_or(1.0)).unwrap();
-            d.set_item("period", c.period.unwrap_or(14)).unwrap();
-            d.set_item("no_volume", c.no_volume.unwrap_or(false))
-                .unwrap();
-            d
-        }),
-    )?;
-    dict.set_item("combos", combo_list)?;
-
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "alphatrend_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, volume_f32, coeff_range, period_range, no_volume=false, device_id=0))]
-pub fn alphatrend_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: PyReadonlyArray1<'py, f32>,
-    low_f32: PyReadonlyArray1<'py, f32>,
-    close_f32: PyReadonlyArray1<'py, f32>,
-    volume_f32: PyReadonlyArray1<'py, f32>,
-    coeff_range: (f64, f64, f64),
-    period_range: (usize, usize, usize),
-    no_volume: bool,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use crate::cuda::cuda_available;
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let (h, l, c, v) = (
-        high_f32.as_slice()?,
-        low_f32.as_slice()?,
-        close_f32.as_slice()?,
-        volume_f32.as_slice()?,
-    );
-    if h.len() != l.len() || h.len() != c.len() || h.len() != v.len() {
-        return Err(PyValueError::new_err("Inconsistent data lengths"));
-    }
-    let sweep = AlphaTrendBatchRange {
-        coeff: coeff_range,
-        period: period_range,
-        no_volume,
-    };
-    let (batch, coeffs_vec, periods_vec, ctx_guard, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaAlphaTrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .alphatrend_batch_dev(h, l, c, v, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let coeffs: Vec<f64> = out.combos.iter().map(|p| p.coeff.unwrap_or(1.0)).collect();
-        let periods: Vec<u64> = out
-            .combos
-            .iter()
-            .map(|p| p.period.unwrap_or(14) as u64)
-            .collect();
-        Ok::<_, PyErr>((out, coeffs, periods, cuda.context_arc(), cuda.device_id()))
-    })?;
-
-    let rows = batch.k1.rows;
-    let cols = batch.k1.cols;
-    let dict = PyDict::new(py);
-
-    let k1_py = AtDeviceArrayF32Py {
-        buf: Some(batch.k1.buf),
-        rows,
-        cols,
-        _ctx: ctx_guard.clone(),
-        device_id: dev_id,
-    };
-    let k2_py = AtDeviceArrayF32Py {
-        buf: Some(batch.k2.buf),
-        rows,
-        cols,
-        _ctx: ctx_guard,
-        device_id: dev_id,
-    };
-    dict.set_item("k1", Py::new(py, k1_py)?)?;
-    dict.set_item("k2", Py::new(py, k2_py)?)?;
-    dict.set_item("coeffs", coeffs_vec.into_pyarray(py))?;
-    dict.set_item("periods", periods_vec.into_pyarray(py))?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "alphatrend_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, volume_tm_f32, cols, rows, coeff=1.0, period=14, no_volume=false, device_id=0))]
-pub fn alphatrend_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: PyReadonlyArray1<'py, f32>,
-    low_tm_f32: PyReadonlyArray1<'py, f32>,
-    close_tm_f32: PyReadonlyArray1<'py, f32>,
-    volume_tm_f32: PyReadonlyArray1<'py, f32>,
-    cols: usize,
-    rows: usize,
-    coeff: f64,
-    period: usize,
-    no_volume: bool,
-    device_id: usize,
-) -> PyResult<(AtDeviceArrayF32Py, AtDeviceArrayF32Py)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let (h, l, c, v) = (
-        high_tm_f32.as_slice()?,
-        low_tm_f32.as_slice()?,
-        close_tm_f32.as_slice()?,
-        volume_tm_f32.as_slice()?,
-    );
-    if h.len() != cols * rows
-        || l.len() != cols * rows
-        || c.len() != cols * rows
-        || v.len() != cols * rows
-    {
-        return Err(PyValueError::new_err("Inconsistent time-major shapes"));
-    }
-    let (k1, k2, ctx_guard, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaAlphaTrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out = cuda
-            .alphatrend_many_series_one_param_time_major_dev(
-                h, l, c, v, cols, rows, coeff, period, no_volume,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((out.0, out.1, cuda.context_arc(), cuda.device_id()))
-    })?;
-    Ok((
-        AtDeviceArrayF32Py {
-            buf: Some(k1.buf),
-            rows: k1.rows,
-            cols: k1.cols,
-            _ctx: ctx_guard.clone(),
-            device_id: dev_id,
-        },
-        AtDeviceArrayF32Py {
-            buf: Some(k2.buf),
-            rows: k2.rows,
-            cols: k2.cols,
-            _ctx: ctx_guard,
-            device_id: dev_id,
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct AtDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl AtDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AlphaTrendBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AlphaTrendParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = alphatrend_batch)]
-pub fn alphatrend_batch_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    coeff_start: f64,
-    coeff_end: f64,
-    coeff_step: f64,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    no_volume: bool,
-) -> Result<JsValue, JsValue> {
-    let sweep = AlphaTrendBatchRange {
-        coeff: (coeff_start, coeff_end, coeff_step),
-        period: (period_start, period_end, period_step),
-        no_volume,
-    };
-    let combos = expand_grid_alphatrend(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let mut k1 = vec![f64::NAN; total];
-    let mut k2 = vec![f64::NAN; total];
-
-    alphatrend_batch_inner_into_slices(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        &sweep,
-        detect_best_batch_kernel(),
-        true,
-        &mut k1,
-        &mut k2,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let total_values = rows
-        .checked_mul(2)
-        .and_then(|r2| r2.checked_mul(cols))
-        .ok_or_else(|| JsValue::from_str("rows*2*cols overflow"))?;
-    let mut values = Vec::with_capacity(total_values);
-    for r in 0..rows {
-        let base = r * cols;
-        values.extend_from_slice(&k1[base..base + cols]);
-        values.extend_from_slice(&k2[base..base + cols]);
-    }
-
-    let js = AlphaTrendBatchJsOutput {
-        values,
-        combos,
-        rows: rows * 2,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_batch_into_flat(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    coeff_start: f64,
-    coeff_end: f64,
-    coeff_step: f64,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    no_volume: bool,
-) -> Result<usize, JsValue> {
-    if [open_ptr, high_ptr, low_ptr, close_ptr, volume_ptr]
-        .iter()
-        .any(|&p| p.is_null())
-        || out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let (open, high, low, close, volume) = (
-            core::slice::from_raw_parts(open_ptr, len),
-            core::slice::from_raw_parts(high_ptr, len),
-            core::slice::from_raw_parts(low_ptr, len),
-            core::slice::from_raw_parts(close_ptr, len),
-            core::slice::from_raw_parts(volume_ptr, len),
-        );
-        let sweep = AlphaTrendBatchRange {
-            coeff: (coeff_start, coeff_end, coeff_step),
-            period: (period_start, period_end, period_step),
-            no_volume,
-        };
-        let combos =
-            expand_grid_alphatrend(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-        let k1 = core::slice::from_raw_parts_mut(out_ptr, total);
-        let k2 = core::slice::from_raw_parts_mut(out_ptr.add(total), total);
-
-        alphatrend_batch_inner_into_slices(
-            open,
-            high,
-            low,
-            close,
-            volume,
-            &sweep,
-            detect_best_batch_kernel(),
-            false,
-            k1,
-            k2,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AlphaTrendBatchConfig {
-    pub coeff_range: (f64, f64, f64),
-    pub period_range: (usize, usize, usize),
-    pub no_volume: bool,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = alphatrend_batch_unified)]
-pub fn alphatrend_batch_unified_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: AlphaTrendBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AlphaTrendBatchRange {
-        coeff: config.coeff_range,
-        period: config.period_range,
-        no_volume: config.no_volume,
-    };
-
-    let output =
-        alphatrend_batch_slice(open, high, low, close, volume, &sweep, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let rows2 = output.rows * 2;
-    let cols = output.cols;
-    let total_values = rows2
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows2*cols overflow"))?;
-    let mut values = Vec::with_capacity(total_values);
-    for r in 0..output.rows {
-        let base = r * cols;
-        values.extend_from_slice(&output.values_k1[base..base + cols]);
-        values.extend_from_slice(&output.values_k2[base..base + cols]);
-    }
-
-    let js_output = AlphaTrendBatchJsOutput {
-        values,
-        combos: output.combos,
-        rows: rows2,
-        cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_into(
-    in_ptr: *const f64,
-    out_k1_ptr: *mut f64,
-    out_k2_ptr: *mut f64,
-    len: usize,
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    volume_ptr: *const f64,
-    coeff: f64,
-    period: usize,
-    no_volume: bool,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null()
-        || out_k1_ptr.is_null()
-        || out_k2_ptr.is_null()
-        || open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || volume_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer passed to alphatrend_into"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(in_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-
-        let params = AlphaTrendParams {
-            coeff: Some(coeff),
-            period: Some(period),
-            no_volume: Some(no_volume),
-        };
-        let input = AlphaTrendInput::from_slices(open, high, low, close, volume, params);
-
-        let out_k1 = std::slice::from_raw_parts_mut(out_k1_ptr, len);
-        let out_k2 = std::slice::from_raw_parts_mut(out_k2_ptr, len);
-
-        alphatrend_into_slices(out_k1, out_k2, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-)]
-pub struct AlphaTrendContext {
-    coeff: f64,
-    period: usize,
-    no_volume: bool,
-    kernel: Kernel,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(deprecated)]
-impl AlphaTrendContext {
-    #[wasm_bindgen(constructor)]
-    #[deprecated(
-        since = "1.0.0",
-        note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-    )]
-    pub fn new(coeff: f64, period: usize, no_volume: bool) -> Result<AlphaTrendContext, JsValue> {
-        if period == 0 {
-            return Err(JsValue::from_str("Invalid period: 0"));
-        }
-        if coeff <= 0.0 || !coeff.is_finite() {
-            return Err(JsValue::from_str(&format!(
-                "Invalid coefficient: {}",
-                coeff
-            )));
-        }
-
-        Ok(AlphaTrendContext {
-            coeff,
-            period,
-            no_volume,
-            kernel: Kernel::Auto,
-        })
-    }
-
-    pub fn update_into(
-        &self,
-        open_ptr: *const f64,
-        high_ptr: *const f64,
-        low_ptr: *const f64,
-        close_ptr: *const f64,
-        volume_ptr: *const f64,
-        out_k1_ptr: *mut f64,
-        out_k2_ptr: *mut f64,
-        len: usize,
-    ) -> Result<(), JsValue> {
-        if len < self.period {
-            return Err(JsValue::from_str("Data length less than period"));
-        }
-
-        unsafe {
-            let open = std::slice::from_raw_parts(open_ptr, len);
-            let high = std::slice::from_raw_parts(high_ptr, len);
-            let low = std::slice::from_raw_parts(low_ptr, len);
-            let close = std::slice::from_raw_parts(close_ptr, len);
-            let volume = std::slice::from_raw_parts(volume_ptr, len);
-            let out_k1 = std::slice::from_raw_parts_mut(out_k1_ptr, len);
-            let out_k2 = std::slice::from_raw_parts_mut(out_k2_ptr, len);
-
-            let params = AlphaTrendParams {
-                coeff: Some(self.coeff),
-                period: Some(self.period),
-                no_volume: Some(self.no_volume),
-            };
-            let input = AlphaTrendInput::from_slices(open, high, low, close, volume, params);
-
-            if close_ptr == out_k1_ptr || close_ptr == out_k2_ptr {
-                let mut temp_k1 = vec![0.0; len];
-                let mut temp_k2 = vec![0.0; len];
-
-                alphatrend_into_slices(&mut temp_k1, &mut temp_k2, &input, self.kernel)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-                out_k1.copy_from_slice(&temp_k1);
-                out_k2.copy_from_slice(&temp_k2);
-            } else {
-                alphatrend_into_slices(out_k1, out_k2, &input, self.kernel)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn get_warmup_period(&self) -> usize {
-        self.period - 1
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    coeff: f64,
-    period: usize,
-    no_volume: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = alphatrend_js(open, high, low, close, volume, coeff, period, no_volume)?;
-    crate::write_wasm_object_f64_outputs("alphatrend_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_batch_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    coeff_start: f64,
-    coeff_end: f64,
-    coeff_step: f64,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    no_volume: bool,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = alphatrend_batch_js(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        coeff_start,
-        coeff_end,
-        coeff_step,
-        period_start,
-        period_end,
-        period_step,
-        no_volume,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs("alphatrend_batch_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn alphatrend_batch_unified_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = alphatrend_batch_unified_js(open, high, low, close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "alphatrend_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::skip_if_unsupported;
+    use crate::utilities::data_loader::read_candles_from_vortex;
+    use crate::utilities::helpers::runtime_supports_kernel;
     use std::error::Error;
 
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    #[test]
+    fn explicit_unsupported_avx512_is_refused_before_target_feature_execution() {
+        if runtime_supports_kernel(Kernel::Avx512) {
+            return;
+        }
+
+        let close: Vec<f64> = (1..=32).map(|value| value as f64).collect();
+        let open = close.clone();
+        let high: Vec<f64> = close.iter().map(|value| value + 1.0).collect();
+        let low: Vec<f64> = close.iter().map(|value| value - 1.0).collect();
+        let volume = vec![1_000.0; close.len()];
+        let input = AlphaTrendInput::from_slices(
+            &open,
+            &high,
+            &low,
+            &close,
+            &volume,
+            AlphaTrendParams::default(),
+        );
+
+        let error = alphatrend_with_kernel(&input, Kernel::Avx512)
+            .expect_err("unsupported explicit AVX-512 must fail before executing instructions");
+        assert!(matches!(
+            error,
+            AlphaTrendError::UnsupportedKernel(Kernel::Avx512)
+        ));
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    #[test]
+    fn explicit_unsupported_avx512_batch_is_refused_before_target_feature_execution()
+    -> Result<(), Box<dyn Error>> {
+        if runtime_supports_kernel(Kernel::Avx512Batch) {
+            return Ok(());
+        }
+
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
+        let sweep = AlphaTrendBatchRange {
+            coeff: (1.0, 1.0, 0.0),
+            period: (14, 14, 0),
+            no_volume: false,
+        };
+        let error = alphatrend_batch_with_kernel(&candles, &sweep, Kernel::Avx512Batch)
+            .expect_err("unsupported explicit AVX-512 batch must fail before execution");
+        assert!(
+            matches!(
+                &error,
+                AlphaTrendError::UnsupportedKernel(Kernel::Avx512Batch)
+            ),
+            "unexpected batch refusal: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
+    #[test]
+    fn explicit_unsupported_avx512_slice_batches_are_refused_before_target_feature_execution() {
+        if runtime_supports_kernel(Kernel::Avx512Batch) {
+            return;
+        }
+
+        let close: Vec<f64> = (1..=32).map(|value| value as f64).collect();
+        let open = close.clone();
+        let high: Vec<f64> = close.iter().map(|value| value + 1.0).collect();
+        let low: Vec<f64> = close.iter().map(|value| value - 1.0).collect();
+        let volume = vec![1_000.0; close.len()];
+        let sweep = AlphaTrendBatchRange {
+            coeff: (1.0, 1.0, 0.0),
+            period: (14, 14, 0),
+            no_volume: false,
+        };
+
+        for result in [
+            alphatrend_batch_slice(
+                &open,
+                &high,
+                &low,
+                &close,
+                &volume,
+                &sweep,
+                Kernel::Avx512Batch,
+            ),
+            alphatrend_batch_par_slice(
+                &open,
+                &high,
+                &low,
+                &close,
+                &volume,
+                &sweep,
+                Kernel::Avx512Batch,
+            ),
+        ] {
+            let error = result
+                .expect_err("unsupported explicit AVX-512 slice batch must fail before execution");
+            assert!(
+                matches!(
+                    &error,
+                    AlphaTrendError::UnsupportedKernel(Kernel::Avx512Batch)
+                ),
+                "unexpected slice-batch refusal: {error:?}"
+            );
+        }
+    }
+
     fn check_alphatrend_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AlphaTrendInput::from_candles(&candles, AlphaTrendParams::default());
         let result = alphatrend_with_kernel(&input, kernel)?;
@@ -3170,8 +2265,8 @@ mod tests {
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = AlphaTrendParams {
             coeff: None,
@@ -3190,8 +2285,8 @@ mod tests {
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AlphaTrendInput::with_default_candles(&candles);
         let output = alphatrend_with_kernel(&input, kernel)?;
@@ -3347,8 +2442,8 @@ mod tests {
     }
 
     fn check_alphatrend_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = AlphaTrendParams {
             coeff: Some(1.0),
@@ -3395,8 +2490,8 @@ mod tests {
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AlphaTrendInput::from_candles(
             &candles,
@@ -3462,8 +2557,8 @@ mod tests {
 
     #[cfg(debug_assertions)]
     fn check_alphatrend_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             AlphaTrendParams::default(),
@@ -3635,26 +2730,33 @@ mod tests {
             paste::paste! {
                 $(
                     #[test]
-                    fn [<$test_fn _scalar_f64>]() {
-                        let _ = $test_fn(stringify!([<$test_fn _scalar_f64>]), Kernel::Scalar);
+                    fn [<$test_fn _scalar_f64>]() -> Result<(), Box<dyn Error>> {
+                        let test_name = stringify!([<$test_fn _scalar_f64>]);
+                        skip_if_unsupported!(Kernel::Scalar, test_name);
+                        $test_fn(test_name, Kernel::Scalar)
                     }
                 )*
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
                 $(
                     #[test]
-                    fn [<$test_fn _avx2_f64>]() {
-                        let _ = $test_fn(stringify!([<$test_fn _avx2_f64>]), Kernel::Avx2);
+                    fn [<$test_fn _avx2_f64>]() -> Result<(), Box<dyn Error>> {
+                        let test_name = stringify!([<$test_fn _avx2_f64>]);
+                        skip_if_unsupported!(Kernel::Avx2, test_name);
+                        $test_fn(test_name, Kernel::Avx2)
                     }
                     #[test]
-                    fn [<$test_fn _avx512_f64>]() {
-                        let _ = $test_fn(stringify!([<$test_fn _avx512_f64>]), Kernel::Avx512);
+                    fn [<$test_fn _avx512_f64>]() -> Result<(), Box<dyn Error>> {
+                        let test_name = stringify!([<$test_fn _avx512_f64>]);
+                        skip_if_unsupported!(Kernel::Avx512, test_name);
+                        $test_fn(test_name, Kernel::Avx512)
                     }
                 )*
                 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
                 $(
                     #[test]
-                    fn [<$test_fn _simd128_f64>]() {
-                        let _ = $test_fn(stringify!([<$test_fn _simd128_f64>]), Kernel::Scalar);
+                    fn [<$test_fn _simd128_f64>]() -> Result<(), Box<dyn Error>> {
+                        let test_name = stringify!([<$test_fn _simd128_f64>]);
+                        $test_fn(test_name, Kernel::Scalar)
                     }
                 )*
             }
@@ -3681,11 +2783,10 @@ mod tests {
     #[cfg(feature = "proptest")]
     generate_all_alphatrend_tests!(check_alphatrend_property);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_alphatrend_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AlphaTrendInput::from_candles(&candles, AlphaTrendParams::default());
 
@@ -3693,7 +2794,6 @@ mod tests {
 
         let mut out_k1 = vec![0.0; candles.close.len()];
         let mut out_k2 = vec![0.0; candles.close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             alphatrend_into(&input, &mut out_k1, &mut out_k2)?;
         }
@@ -3728,8 +2828,8 @@ mod tests {
     }
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let sweep = AlphaTrendBatchRange::default();
         let output = alphatrend_batch_with_kernel(&c, &sweep, kernel)?;
@@ -3762,8 +2862,8 @@ mod tests {
     }
 
     fn check_batch_sweep(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let sweep = AlphaTrendBatchRange {
             coeff: (1.0, 2.0, 0.5),
@@ -3786,8 +2886,8 @@ mod tests {
 
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (1.0, 1.0, 0.0, 10, 15, 5, false),
@@ -3860,18 +2960,24 @@ mod tests {
         ($fn_name:ident) => {
             paste::paste! {
                 #[test] fn [<$fn_name _scalar>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _scalar>]), Kernel::ScalarBatch);
+                    let test_name = stringify!([<$fn_name _scalar>]);
+                    $fn_name(test_name, Kernel::ScalarBatch).expect(test_name);
                 }
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                #[test] fn [<$fn_name _avx2>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _avx2>]), Kernel::Avx2Batch);
+                #[test] fn [<$fn_name _avx2>]() -> Result<(), Box<dyn Error>> {
+                    let test_name = stringify!([<$fn_name _avx2>]);
+                    skip_if_unsupported!(Kernel::Avx2Batch, test_name);
+                    $fn_name(test_name, Kernel::Avx2Batch)
                 }
                 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                #[test] fn [<$fn_name _avx512>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _avx512>]), Kernel::Avx512Batch);
+                #[test] fn [<$fn_name _avx512>]() -> Result<(), Box<dyn Error>> {
+                    let test_name = stringify!([<$fn_name _avx512>]);
+                    skip_if_unsupported!(Kernel::Avx512Batch, test_name);
+                    $fn_name(test_name, Kernel::Avx512Batch)
                 }
                 #[test] fn [<$fn_name _auto_detect>]() {
-                    let _ = $fn_name(stringify!([<$fn_name _auto_detect>]), Kernel::Auto);
+                    let test_name = stringify!([<$fn_name _auto_detect>]);
+                    $fn_name(test_name, Kernel::Auto).expect(test_name);
                 }
             }
         };

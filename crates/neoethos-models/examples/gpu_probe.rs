@@ -31,9 +31,7 @@
 use std::time::Instant;
 
 use burn::tensor::{Distribution, Tensor};
-use neoethos_models::burn_models::{
-    InferBackend, active_burn_backend_name, default_infer_device,
-};
+use neoethos_models::burn_models::{InferBackend, active_burn_backend_name, default_infer_device};
 
 fn main() {
     // Backend identity — the easy half. Either "vulkan_wgpu" (or

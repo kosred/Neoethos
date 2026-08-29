@@ -328,9 +328,7 @@ pub const RETIRED_ENV_VARS: &[(&str, &str)] = &[
 pub fn inert_overrides_present() -> Vec<&'static str> {
     RETIRED_ENV_VARS
         .iter()
-        .filter(|(name, _)| {
-            std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
-        })
+        .filter(|(name, _)| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
         .map(|(name, _)| *name)
         .collect()
 }

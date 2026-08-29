@@ -94,7 +94,11 @@ pub fn set_jobs(jobs: Vec<FedJob>, token: Option<String>) -> usize {
             FedJob {
                 symbol: j.symbol.trim().to_uppercase(),
                 base_tf: j.base_tf.trim().to_uppercase(),
-                work_type: if wt == "training" { "training".into() } else { "discovery".into() },
+                work_type: if wt == "training" {
+                    "training".into()
+                } else {
+                    "discovery".into()
+                },
             }
         })
         .collect();
@@ -161,9 +165,10 @@ pub fn submit(
         anyhow::bail!("submitted portfolio has no genes — rejected");
     }
 
-    let cache_dir = neoethos_core::Settings::from_yaml(&crate::server::state::current_config_path())
-        .map(|s| s.system.cache_dir)
-        .unwrap_or_else(|_| PathBuf::from("cache"));
+    let cache_dir =
+        neoethos_core::Settings::from_yaml(&crate::server::state::current_config_path())
+            .map(|s| s.system.cache_dir)
+            .unwrap_or_else(|_| PathBuf::from("cache"));
     let inbox = cache_dir.join("federation_inbox");
     std::fs::create_dir_all(&inbox).context("create federation_inbox")?;
 
@@ -280,7 +285,12 @@ pub fn worker_stop() {
 /// Start the worker loop: fetch a job from `coordinator_url`, run the normal
 /// local Discovery for it (same handler, same gates), submit the produced
 /// artifacts back, repeat. Fail-soft on everything; `worker_stop()` exits.
-pub fn worker_start(state: AppApiState, coordinator_url: String, worker_id: String, token: Option<String>) -> Result<()> {
+pub fn worker_start(
+    state: AppApiState,
+    coordinator_url: String,
+    worker_id: String,
+    token: Option<String>,
+) -> Result<()> {
     let url = coordinator_url.trim().trim_end_matches('/').to_string();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!("coordinator URL must start with http:// or https://");
@@ -317,7 +327,10 @@ pub fn worker_start(state: AppApiState, coordinator_url: String, worker_id: Stri
                 Ok(r) if r.status().is_success() => r.json().await.ok(),
                 Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => None,
                 Ok(r) => {
-                    set_worker_status(format!("coordinator refused ({}) — retrying in 10m", r.status()));
+                    set_worker_status(format!(
+                        "coordinator refused ({}) — retrying in 10m",
+                        r.status()
+                    ));
                     None
                 }
                 Err(e) => {
@@ -336,18 +349,44 @@ pub fn worker_start(state: AppApiState, coordinator_url: String, worker_id: Stri
             };
 
             // 2. Run the local discovery for it (same path as the UI button).
-            set_worker_status(format!("job {} {} — starting discovery", job.symbol, job.base_tf));
+            set_worker_status(format!(
+                "job {} {} — starting discovery",
+                job.symbol, job.base_tf
+            ));
+            let dataset_identity = match neoethos_core::Settings::from_yaml(
+                &crate::server::state::current_config_path(),
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .and_then(|settings| {
+                crate::app_services::discovery::resolve_unique_background_dataset_identity(
+                    &settings.system.data_dir,
+                    &job.symbol,
+                    &job.base_tf,
+                )
+            }) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    set_worker_status(format!(
+                        "job {} {} — exact dataset selection failed: {error}; skipping job",
+                        job.symbol, job.base_tf
+                    ));
+                    continue 'outer;
+                }
+            };
             let started_ms = chrono::Utc::now().timestamp_millis();
             loop {
                 if !WORKER_RUNNING.load(Ordering::SeqCst) {
                     break 'outer;
                 }
-                let body: engines_control::StartJobBody = match serde_json::from_value(
-                    serde_json::json!({ "symbol": job.symbol, "base_tf": job.base_tf }),
-                ) {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
+                let body: engines_control::StartJobBody =
+                    match serde_json::from_value(serde_json::json!({
+                        "dataset_identity": dataset_identity.to_path_component(),
+                        "symbol": job.symbol,
+                        "base_tf": job.base_tf,
+                    })) {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
                 let resp =
                     engines_control::discovery_start(State(state.clone()), Some(Json(body))).await;
                 let status = resp.status();
@@ -384,14 +423,15 @@ pub fn worker_start(state: AppApiState, coordinator_url: String, worker_id: Stri
             }
 
             // 4. Submit every artifact this run produced for the combo.
-            let cache_dir = neoethos_core::Settings::from_yaml(
-                &crate::server::state::current_config_path(),
-            )
-            .map(|s| s.system.cache_dir)
-            .unwrap_or_else(|_| PathBuf::from("cache"));
+            let cache_dir =
+                neoethos_core::Settings::from_yaml(&crate::server::state::current_config_path())
+                    .map(|s| s.system.cache_dir)
+                    .unwrap_or_else(|_| PathBuf::from("cache"));
             let mut submitted = 0usize;
             for pf in find_new_artifacts(&cache_dir, &job.symbol, &job.base_tf, started_ms) {
-                let Ok(pf_json) = std::fs::read_to_string(&pf) else { continue };
+                let Ok(pf_json) = std::fs::read_to_string(&pf) else {
+                    continue;
+                };
                 let trades_json = std::fs::read_to_string(
                     pf.display()
                         .to_string()
@@ -400,15 +440,16 @@ pub fn worker_start(state: AppApiState, coordinator_url: String, worker_id: Stri
                         + ".trades.json",
                 )
                 .ok();
-                let mut req = client.post(format!("{url}/federation/submit")).json(
-                    &serde_json::json!({
-                        "worker": worker_id,
-                        "symbol": job.symbol,
-                        "baseTf": job.base_tf,
-                        "portfolioJson": pf_json,
-                        "tradesJson": trades_json,
-                    }),
-                );
+                let mut req =
+                    client
+                        .post(format!("{url}/federation/submit"))
+                        .json(&serde_json::json!({
+                            "worker": worker_id,
+                            "symbol": job.symbol,
+                            "baseTf": job.base_tf,
+                            "portfolioJson": pf_json,
+                            "tradesJson": trades_json,
+                        }));
                 if let Some(t) = &token {
                     req = req.header("x-fed-token", t);
                 }
@@ -437,7 +478,9 @@ fn find_new_artifacts(root: &PathBuf, symbol: &str, base_tf: &str, since_ms: i64
     let tf = base_tf.to_uppercase();
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for ent in rd.flatten() {
             visited += 1;
             if visited > 200_000 {
@@ -452,10 +495,11 @@ fn find_new_artifacts(root: &PathBuf, symbol: &str, base_tf: &str, since_ms: i64
                 stack.push(p);
                 continue;
             }
-            let name = p.file_name().map(|f| f.to_string_lossy().to_uppercase()).unwrap_or_default();
-            if !name.ends_with("LIVE_PORTFOLIO.JSON")
-                || !name.contains(&sym)
-                || !name.contains(&tf)
+            let name = p
+                .file_name()
+                .map(|f| f.to_string_lossy().to_uppercase())
+                .unwrap_or_default();
+            if !name.ends_with("LIVE_PORTFOLIO.JSON") || !name.contains(&sym) || !name.contains(&tf)
             {
                 continue;
             }
@@ -481,8 +525,16 @@ mod tests {
     fn queue_lease_and_submit_close_the_loop() {
         set_jobs(
             vec![
-                FedJob { symbol: "eurusd".into(), base_tf: "m15".into(), work_type: "discovery".into() },
-                FedJob { symbol: "GBPUSD".into(), base_tf: "H1".into(), work_type: "training".into() },
+                FedJob {
+                    symbol: "eurusd".into(),
+                    base_tf: "m15".into(),
+                    work_type: "discovery".into(),
+                },
+                FedJob {
+                    symbol: "GBPUSD".into(),
+                    base_tf: "H1".into(),
+                    work_type: "training".into(),
+                },
             ],
             Some("secret".into()),
         );

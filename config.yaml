@@ -136,6 +136,9 @@ models:
   max_epochs_by_model:
     tabnet: 200
     tide: 200
+  model_param_overrides:
+    bayes_logit:
+      device: cpu
   ml_models:
   - lightgbm
   - xgboost
@@ -162,12 +165,10 @@ models:
   prop_search_population: 200
   prop_search_portfolio_size: 50
   prop_search_tournament_size: 10
-  prop_search_train_years: 8
   prop_search_val_log_trades: true
   prop_search_val_min_trades_per_day: 1.0
   prop_search_val_min_trades_per_month: 15
   prop_search_val_trade_log_max: 50
-  prop_search_val_years: 1
   ray_tune_max_concurrency: 8
   regime_router_enabled: true
   require_walkforward_for_export: false
@@ -181,6 +182,11 @@ models:
     smc_gate_stagnation_step: 0.03
   transformer_dropout: 0.1
   tree_device_preference: gpu
+  statistical_device: gpu:0
+  tree_runtime:
+    device: gpu:0
+    gpu_only: true
+    lightgbm_gpu: true
   walkforward_splits: 15
 risk:
   challenge_mode: true
@@ -192,13 +198,16 @@ risk:
   total_drawdown_limit: 0.14
 system:
   account_currency: GBP
+  device: gpu:0
+  enable_gpu: true
+  enable_gpu_preference: gpu
   higher_timeframes:
   - M3
   - M5
   - M15
   - M30
   - H1
-  - H2
+  - H12
   - H4
   - D1
   - W1
@@ -211,7 +220,7 @@ system:
   - M15
   - M30
   - H1
-  - H2
+  - H12
   - H4
   - D1
   - W1

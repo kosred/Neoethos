@@ -22,6 +22,9 @@
 #include <math.h>
 #include <stdint.h>
 
+// Official TA-Lib authority for the strictly-positive range guard:
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_AD.c
+
 #if AD_USE_FAST_DIV
   #define AD_DIV(x,y) __fdividef((x),(y))
 #else
@@ -32,7 +35,7 @@
 __device__ __forceinline__ float ad_mfv_f32(float h, float l, float c, float v)
 {
     float hl  = h - l;
-    if (hl == 0.0f) return 0.0f;
+    if (!(hl > 0.0f)) return 0.0f;
 
 
     float num = fmaf(2.0f, c, -(h + l));
@@ -78,7 +81,7 @@ struct TwoSum32 {
 __device__ __forceinline__ double ad_mfv_f64(float h, float l, float c, float v)
 {
     double hl = (double)h - (double)l;
-    if (hl == 0.0) return 0.0;
+    if (!(hl > 0.0)) return 0.0;
 
     double num = (double)2.0 * (double)c - (double)h - (double)l;
     return (num / hl) * (double)v;
@@ -219,7 +222,7 @@ extern "C" __global__ void ad_series_f32(
     double sum = 0.0;
     for (int i = 0; i < len; ++i) {
         double hl = (double)h[i] - (double)l[i];
-        if (hl != 0.0) {
+        if (hl > 0.0) {
             double num = (double)2.0 * (double)c[i] - (double)h[i] - (double)l[i];
             double mfv = (num / hl) * (double)v[i];
             sum += mfv;
@@ -246,7 +249,7 @@ extern "C" __global__ void ad_many_series_one_param_time_major_f32(
     for (int t = 0; t < series_len; ++t) {
         int idx = t * num_series + series;
         double hl = (double)high_tm[idx] - (double)low_tm[idx];
-        if (hl != 0.0) {
+        if (hl > 0.0) {
             double num = (double)2.0 * (double)close_tm[idx]
                        - (double)high_tm[idx] - (double)low_tm[idx];
             sum += (num / hl) * (double)volume_tm[idx];
@@ -296,9 +299,8 @@ extern "C" __global__ void ad_many_series_one_param_time_major_f32(
  *      `ad_add_block_offsets_f32`). A block scan re-associates the running
  *      sum. The CPU adds one bar at a time; so does this.
  *
- * `hl != 0.0` is the CPU's exact guard: when high == low the bar contributes
- * NOTHING and `sum` is carried unchanged — it is not a divide-by-zero guarded
- * by an epsilon, and inventing an epsilon here would drop real bars.
+ * TA-Lib's exact guard is `hl > 0.0`: when high <= low the bar contributes
+ * NOTHING and `sum` is carried unchanged. It is not an epsilon guard.
  * `__fdividef` in the f32 file is the fast approximate divide; the exact
  * `/` is used here.
  * =========================================================================== */
@@ -333,7 +335,7 @@ void ad_neo_batch_f64(const double* __restrict__ high,
         const double v = volume[i];
 
         const double hl = h - l;
-        if (hl != 0.0) {
+        if (hl > 0.0) {
             const double num = (c - l) - (h - c);
             sum += (num / hl) * v;
         }

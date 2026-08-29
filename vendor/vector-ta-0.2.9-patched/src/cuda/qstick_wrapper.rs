@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::qstick::{QstickBatchRange, QstickParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -103,18 +103,6 @@ impl CudaQstick {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/qstick_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(match env::var("QS_JIT_OPT").ok().as_deref() {
-                Some("O0") => OptLevel::O0,
-                Some("O1") => OptLevel::O1,
-                Some("O3") => OptLevel::O3,
-                Some("O4") => OptLevel::O4,
-                _ => OptLevel::O2,
-            }),
-        ];
         let module = crate::load_cuda_embedded_module!("qstick_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -262,11 +250,7 @@ impl CudaQstick {
                 return b;
             }
         }
-        if len < 8192 {
-            128
-        } else {
-            256
-        }
+        if len < 8192 { 128 } else { 256 }
     }
 
     pub fn build_diff_prefix_f32(open: &[f32], close: &[f32]) -> (Vec<f32>, usize, usize) {

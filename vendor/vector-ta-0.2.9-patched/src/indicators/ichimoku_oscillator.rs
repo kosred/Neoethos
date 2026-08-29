@@ -1,22 +1,6 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::detect_best_batch_kernel;
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -36,10 +20,6 @@ const DEFAULT_TOP_BAND: f64 = 2.0;
 const DEFAULT_MID_BAND: f64 = 1.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub enum IchimokuOscillatorNormalizeMode {
     All,
     Window,
@@ -97,10 +77,6 @@ pub struct IchimokuOscillatorOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct IchimokuOscillatorParams {
     pub conversion_periods: Option<usize>,
     pub base_periods: Option<usize>,
@@ -472,7 +448,9 @@ pub enum IchimokuOscillatorError {
     EmptyInputData,
     #[error("ichimoku_oscillator: All values are NaN.")]
     AllValuesNaN,
-    #[error("ichimoku_oscillator: Inconsistent slice lengths: high={high_len}, low={low_len}, close={close_len}, source={source_len}")]
+    #[error(
+        "ichimoku_oscillator: Inconsistent slice lengths: high={high_len}, low={low_len}, close={close_len}, source={source_len}"
+    )]
     InconsistentSliceLengths {
         high_len: usize,
         low_len: usize,
@@ -586,6 +564,26 @@ fn gaussian_value(x: f64, bandwidth: f64) -> f64 {
     (-((x / bandwidth).powi(2)) * 0.5).exp() / (2.0 * std::f64::consts::PI).sqrt()
 }
 
+/// Exact scalar coefficients used by the Chebyshev recurrence.
+///
+/// CUDA libdevice's transcendental implementations are not bit-identical to
+/// the Rust scalar runtime. The resident f64 lane therefore prepares these
+/// two parameter values once on the host and leaves every bar-dependent
+/// recurrence operation on the device.
+pub(crate) fn ichimoku_chebyshev_coefficients(len: usize, ripple: f64) -> (f64, f64) {
+    let a = ((1.0 / len as f64) * ((1.0 / (1.0 - ripple)).acosh())).cosh();
+    let b = ((1.0 / len as f64) * ((1.0 / ripple).asinh())).sinh();
+    let c = (a - b) / (a + b);
+    (c, 1.0 - c)
+}
+
+/// Exact scalar weights used by the optional Gaussian post-smoother.
+pub(crate) fn ichimoku_gaussian_weights(size: usize, h: f64, r: f64) -> Vec<f64> {
+    (0..=size)
+        .map(|i| gaussian_value((i * i) as f64 / (h * h * r), r))
+        .collect()
+}
+
 fn rolling_midpoint(high: &[f64], low: &[f64], length: usize, first: usize) -> Vec<f64> {
     let mut out = vec![f64::NAN; high.len()];
     let mut maxq: VecDeque<usize> = VecDeque::with_capacity(length + 1);
@@ -636,10 +634,7 @@ fn rolling_midpoint(high: &[f64], low: &[f64], length: usize, first: usize) -> V
 }
 
 fn chebyshev_series(data: &[f64], len: usize, ripple: f64) -> Vec<f64> {
-    let a = ((1.0 / len as f64) * ((1.0 / (1.0 - ripple)).acosh())).cosh();
-    let b = ((1.0 / len as f64) * ((1.0 / ripple).asinh())).sinh();
-    let c = (a - b) / (a + b);
-    let one_minus_c = 1.0 - c;
+    let (c, one_minus_c) = ichimoku_chebyshev_coefficients(len, ripple);
     let mut out = vec![f64::NAN; data.len()];
     for i in 0..data.len() {
         if data[i].is_finite() {
@@ -655,9 +650,7 @@ fn chebyshev_series(data: &[f64], len: usize, ripple: f64) -> Vec<f64> {
 }
 
 fn gaussian_kernel_series(data: &[f64], size: usize, h: f64, r: f64) -> Vec<f64> {
-    let weights: Vec<f64> = (0..=size)
-        .map(|i| gaussian_value((i * i) as f64 / (h * h * r), r))
-        .collect();
+    let weights = ichimoku_gaussian_weights(size, h, r);
     let mut out = vec![f64::NAN; data.len()];
     for i in size..data.len() {
         let mut sum = 0.0;
@@ -1065,7 +1058,6 @@ pub fn ichimoku_oscillator_with_kernel(
     ))
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[allow(clippy::too_many_arguments)]
 pub fn ichimoku_oscillator_into(
     input: &IchimokuOscillatorInput,
@@ -1960,758 +1952,6 @@ fn ichimoku_oscillator_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-fn set_output_dict<'py>(
-    py: Python<'py>,
-    dict: &Bound<'py, PyDict>,
-    out: IchimokuOscillatorOutput,
-) -> PyResult<()> {
-    dict.set_item("signal", out.signal.into_pyarray(py))?;
-    dict.set_item("ma", out.ma.into_pyarray(py))?;
-    dict.set_item("conversion", out.conversion.into_pyarray(py))?;
-    dict.set_item("base", out.base.into_pyarray(py))?;
-    dict.set_item("chikou", out.chikou.into_pyarray(py))?;
-    dict.set_item("current_kumo_a", out.current_kumo_a.into_pyarray(py))?;
-    dict.set_item("current_kumo_b", out.current_kumo_b.into_pyarray(py))?;
-    dict.set_item("future_kumo_a", out.future_kumo_a.into_pyarray(py))?;
-    dict.set_item("future_kumo_b", out.future_kumo_b.into_pyarray(py))?;
-    dict.set_item("max_level", out.max_level.into_pyarray(py))?;
-    dict.set_item("high_level", out.high_level.into_pyarray(py))?;
-    dict.set_item("low_level", out.low_level.into_pyarray(py))?;
-    dict.set_item("min_level", out.min_level.into_pyarray(py))?;
-    Ok(())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ichimoku_oscillator")]
-#[pyo3(signature = (high, low, close, source=None, conversion_periods=9, base_periods=26, lagging_span_periods=52, displacement=26, ma_length=12, smoothing_length=3, extra_smoothing=true, normalize="window", window_size=20, clamp=true, top_band=2.0, mid_band=1.5, kernel=None))]
-pub fn ichimoku_oscillator_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    source: Option<PyReadonlyArray1<'py, f64>>,
-    conversion_periods: usize,
-    base_periods: usize,
-    lagging_span_periods: usize,
-    displacement: usize,
-    ma_length: usize,
-    smoothing_length: usize,
-    extra_smoothing: bool,
-    normalize: &str,
-    window_size: usize,
-    clamp: bool,
-    top_band: f64,
-    mid_band: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let normalize = normalize
-        .parse::<IchimokuOscillatorNormalizeMode>()
-        .map_err(PyValueError::new_err)?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let source_holder = source;
-    let source = if let Some(ref source) = source_holder {
-        source.as_slice()?
-    } else {
-        close
-    };
-    let input = IchimokuOscillatorInput::from_slices(
-        high,
-        low,
-        close,
-        source,
-        IchimokuOscillatorParams {
-            conversion_periods: Some(conversion_periods),
-            base_periods: Some(base_periods),
-            lagging_span_periods: Some(lagging_span_periods),
-            displacement: Some(displacement),
-            ma_length: Some(ma_length),
-            smoothing_length: Some(smoothing_length),
-            extra_smoothing: Some(extra_smoothing),
-            normalize: Some(normalize),
-            window_size: Some(window_size),
-            clamp: Some(clamp),
-            top_band: Some(top_band),
-            mid_band: Some(mid_band),
-        },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| ichimoku_oscillator_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    set_output_dict(py, &dict, out)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "IchimokuOscillatorStream")]
-pub struct IchimokuOscillatorStreamPy {
-    stream: IchimokuOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl IchimokuOscillatorStreamPy {
-    #[new]
-    #[pyo3(signature = (conversion_periods=9, base_periods=26, lagging_span_periods=52, displacement=26, ma_length=12, smoothing_length=3, extra_smoothing=true, normalize="window", window_size=20, clamp=true, top_band=2.0, mid_band=1.5))]
-    fn new(
-        conversion_periods: usize,
-        base_periods: usize,
-        lagging_span_periods: usize,
-        displacement: usize,
-        ma_length: usize,
-        smoothing_length: usize,
-        extra_smoothing: bool,
-        normalize: &str,
-        window_size: usize,
-        clamp: bool,
-        top_band: f64,
-        mid_band: f64,
-    ) -> PyResult<Self> {
-        let normalize = normalize
-            .parse::<IchimokuOscillatorNormalizeMode>()
-            .map_err(PyValueError::new_err)?;
-        let stream = IchimokuOscillatorStream::try_new(IchimokuOscillatorParams {
-            conversion_periods: Some(conversion_periods),
-            base_periods: Some(base_periods),
-            lagging_span_periods: Some(lagging_span_periods),
-            displacement: Some(displacement),
-            ma_length: Some(ma_length),
-            smoothing_length: Some(smoothing_length),
-            extra_smoothing: Some(extra_smoothing),
-            normalize: Some(normalize),
-            window_size: Some(window_size),
-            clamp: Some(clamp),
-            top_band: Some(top_band),
-            mid_band: Some(mid_band),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    #[pyo3(signature = (high, low, close, source=None))]
-    fn update(
-        &mut self,
-        py: Python<'_>,
-        high: f64,
-        low: f64,
-        close: f64,
-        source: Option<f64>,
-    ) -> PyResult<Py<PyDict>> {
-        let got = self
-            .stream
-            .update(high, low, close, source.unwrap_or(close));
-        let dict = PyDict::new(py);
-        dict.set_item("signal", got.0)?;
-        dict.set_item("ma", got.1)?;
-        dict.set_item("conversion", got.2)?;
-        dict.set_item("base", got.3)?;
-        dict.set_item("chikou", got.4)?;
-        dict.set_item("current_kumo_a", got.5)?;
-        dict.set_item("current_kumo_b", got.6)?;
-        dict.set_item("future_kumo_a", got.7)?;
-        dict.set_item("future_kumo_b", got.8)?;
-        dict.set_item("max_level", got.9)?;
-        dict.set_item("high_level", got.10)?;
-        dict.set_item("low_level", got.11)?;
-        dict.set_item("min_level", got.12)?;
-        Ok(dict.unbind())
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ichimoku_oscillator_batch")]
-#[pyo3(signature = (high, low, close, source=None, conversion_periods_range=(9,9,0), base_periods_range=(26,26,0), lagging_span_periods_range=(52,52,0), displacement_range=(26,26,0), ma_length_range=(12,12,0), smoothing_length_range=(3,3,0), window_size_range=(20,20,0), top_band_range=(2.0,2.0,0.0), mid_band_range=(1.5,1.5,0.0), extra_smoothing=true, normalize="window", clamp=true, kernel=None))]
-pub fn ichimoku_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    source: Option<PyReadonlyArray1<'py, f64>>,
-    conversion_periods_range: (usize, usize, usize),
-    base_periods_range: (usize, usize, usize),
-    lagging_span_periods_range: (usize, usize, usize),
-    displacement_range: (usize, usize, usize),
-    ma_length_range: (usize, usize, usize),
-    smoothing_length_range: (usize, usize, usize),
-    window_size_range: (usize, usize, usize),
-    top_band_range: (f64, f64, f64),
-    mid_band_range: (f64, f64, f64),
-    extra_smoothing: bool,
-    normalize: &str,
-    clamp: bool,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let normalize = normalize
-        .parse::<IchimokuOscillatorNormalizeMode>()
-        .map_err(PyValueError::new_err)?;
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let source_holder = source;
-    let source = if let Some(ref source) = source_holder {
-        source.as_slice()?
-    } else {
-        close
-    };
-    let sweep = IchimokuOscillatorBatchRange {
-        conversion_periods: conversion_periods_range,
-        base_periods: base_periods_range,
-        lagging_span_periods: lagging_span_periods_range,
-        displacement: displacement_range,
-        ma_length: ma_length_range,
-        smoothing_length: smoothing_length_range,
-        window_size: window_size_range,
-        top_band: top_band_range,
-        mid_band: mid_band_range,
-        extra_smoothing,
-        normalize,
-        clamp,
-    };
-    let kernel = validate_kernel(kernel, true)?;
-    let out = py
-        .allow_threads(|| {
-            ichimoku_oscillator_batch_with_kernel(high, low, close, source, &sweep, kernel)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = out.rows;
-    let cols = out.cols;
-    let dict = PyDict::new(py);
-    macro_rules! set_matrix {
-        ($name:literal, $values:expr) => {{
-            let arr = PyArray1::from_vec(py, $values);
-            dict.set_item($name, arr.reshape((rows, cols))?)?;
-        }};
-    }
-    set_matrix!("signal", out.signal);
-    set_matrix!("ma", out.ma);
-    set_matrix!("conversion", out.conversion);
-    set_matrix!("base", out.base);
-    set_matrix!("chikou", out.chikou);
-    set_matrix!("current_kumo_a", out.current_kumo_a);
-    set_matrix!("current_kumo_b", out.current_kumo_b);
-    set_matrix!("future_kumo_a", out.future_kumo_a);
-    set_matrix!("future_kumo_b", out.future_kumo_b);
-    set_matrix!("max_level", out.max_level);
-    set_matrix!("high_level", out.high_level);
-    set_matrix!("low_level", out.low_level);
-    set_matrix!("min_level", out.min_level);
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_ichimoku_oscillator_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(ichimoku_oscillator_py, m)?)?;
-    m.add_function(wrap_pyfunction!(ichimoku_oscillator_batch_py, m)?)?;
-    m.add_class::<IchimokuOscillatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct IchimokuOscillatorJsOutput {
-    pub signal: Vec<f64>,
-    pub ma: Vec<f64>,
-    pub conversion: Vec<f64>,
-    pub base: Vec<f64>,
-    pub chikou: Vec<f64>,
-    pub current_kumo_a: Vec<f64>,
-    pub current_kumo_b: Vec<f64>,
-    pub future_kumo_a: Vec<f64>,
-    pub future_kumo_b: Vec<f64>,
-    pub max_level: Vec<f64>,
-    pub high_level: Vec<f64>,
-    pub low_level: Vec<f64>,
-    pub min_level: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ichimoku_oscillator_js")]
-#[allow(clippy::too_many_arguments)]
-pub fn ichimoku_oscillator_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &[f64],
-    conversion_periods: usize,
-    base_periods: usize,
-    lagging_span_periods: usize,
-    displacement: usize,
-    ma_length: usize,
-    smoothing_length: usize,
-    extra_smoothing: bool,
-    normalize: &str,
-    window_size: usize,
-    clamp: bool,
-    top_band: f64,
-    mid_band: f64,
-) -> Result<JsValue, JsValue> {
-    let normalize = normalize
-        .parse::<IchimokuOscillatorNormalizeMode>()
-        .map_err(|e| JsValue::from_str(&e))?;
-    let input = IchimokuOscillatorInput::from_slices(
-        high,
-        low,
-        close,
-        source,
-        IchimokuOscillatorParams {
-            conversion_periods: Some(conversion_periods),
-            base_periods: Some(base_periods),
-            lagging_span_periods: Some(lagging_span_periods),
-            displacement: Some(displacement),
-            ma_length: Some(ma_length),
-            smoothing_length: Some(smoothing_length),
-            extra_smoothing: Some(extra_smoothing),
-            normalize: Some(normalize),
-            window_size: Some(window_size),
-            clamp: Some(clamp),
-            top_band: Some(top_band),
-            mid_band: Some(mid_band),
-        },
-    );
-    let out = ichimoku_oscillator_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&IchimokuOscillatorJsOutput {
-        signal: out.signal,
-        ma: out.ma,
-        conversion: out.conversion,
-        base: out.base,
-        chikou: out.chikou,
-        current_kumo_a: out.current_kumo_a,
-        current_kumo_b: out.current_kumo_b,
-        future_kumo_a: out.future_kumo_a,
-        future_kumo_b: out.future_kumo_b,
-        max_level: out.max_level,
-        high_level: out.high_level,
-        low_level: out.low_level,
-        min_level: out.min_level,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ichimoku_oscillator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ichimoku_oscillator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn ichimoku_oscillator_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    source_ptr: *const f64,
-    signal_ptr: *mut f64,
-    ma_ptr: *mut f64,
-    conversion_ptr: *mut f64,
-    base_ptr: *mut f64,
-    chikou_ptr: *mut f64,
-    current_kumo_a_ptr: *mut f64,
-    current_kumo_b_ptr: *mut f64,
-    future_kumo_a_ptr: *mut f64,
-    future_kumo_b_ptr: *mut f64,
-    max_level_ptr: *mut f64,
-    high_level_ptr: *mut f64,
-    low_level_ptr: *mut f64,
-    min_level_ptr: *mut f64,
-    len: usize,
-    conversion_periods: usize,
-    base_periods: usize,
-    lagging_span_periods: usize,
-    displacement: usize,
-    ma_length: usize,
-    smoothing_length: usize,
-    extra_smoothing: bool,
-    normalize: &str,
-    window_size: usize,
-    clamp: bool,
-    top_band: f64,
-    mid_band: f64,
-) -> Result<(), JsValue> {
-    if [
-        high_ptr as *const (),
-        low_ptr as *const (),
-        close_ptr as *const (),
-        source_ptr as *const (),
-        signal_ptr as *const (),
-        ma_ptr as *const (),
-        conversion_ptr as *const (),
-        base_ptr as *const (),
-        chikou_ptr as *const (),
-        current_kumo_a_ptr as *const (),
-        current_kumo_b_ptr as *const (),
-        future_kumo_a_ptr as *const (),
-        future_kumo_b_ptr as *const (),
-        max_level_ptr as *const (),
-        high_level_ptr as *const (),
-        low_level_ptr as *const (),
-        min_level_ptr as *const (),
-    ]
-    .iter()
-    .any(|ptr| ptr.is_null())
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    let normalize = normalize
-        .parse::<IchimokuOscillatorNormalizeMode>()
-        .map_err(|e| JsValue::from_str(&e))?;
-    unsafe {
-        let input = IchimokuOscillatorInput::from_slices(
-            std::slice::from_raw_parts(high_ptr, len),
-            std::slice::from_raw_parts(low_ptr, len),
-            std::slice::from_raw_parts(close_ptr, len),
-            std::slice::from_raw_parts(source_ptr, len),
-            IchimokuOscillatorParams {
-                conversion_periods: Some(conversion_periods),
-                base_periods: Some(base_periods),
-                lagging_span_periods: Some(lagging_span_periods),
-                displacement: Some(displacement),
-                ma_length: Some(ma_length),
-                smoothing_length: Some(smoothing_length),
-                extra_smoothing: Some(extra_smoothing),
-                normalize: Some(normalize),
-                window_size: Some(window_size),
-                clamp: Some(clamp),
-                top_band: Some(top_band),
-                mid_band: Some(mid_band),
-            },
-        );
-        ichimoku_oscillator_into_slice(
-            std::slice::from_raw_parts_mut(signal_ptr, len),
-            std::slice::from_raw_parts_mut(ma_ptr, len),
-            std::slice::from_raw_parts_mut(conversion_ptr, len),
-            std::slice::from_raw_parts_mut(base_ptr, len),
-            std::slice::from_raw_parts_mut(chikou_ptr, len),
-            std::slice::from_raw_parts_mut(current_kumo_a_ptr, len),
-            std::slice::from_raw_parts_mut(current_kumo_b_ptr, len),
-            std::slice::from_raw_parts_mut(future_kumo_a_ptr, len),
-            std::slice::from_raw_parts_mut(future_kumo_b_ptr, len),
-            std::slice::from_raw_parts_mut(max_level_ptr, len),
-            std::slice::from_raw_parts_mut(high_level_ptr, len),
-            std::slice::from_raw_parts_mut(low_level_ptr, len),
-            std::slice::from_raw_parts_mut(min_level_ptr, len),
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct IchimokuOscillatorBatchConfig {
-    pub conversion_periods_range: Vec<f64>,
-    pub base_periods_range: Vec<f64>,
-    pub lagging_span_periods_range: Vec<f64>,
-    pub displacement_range: Vec<f64>,
-    pub ma_length_range: Vec<f64>,
-    pub smoothing_length_range: Vec<f64>,
-    pub window_size_range: Vec<f64>,
-    pub top_band_range: Vec<f64>,
-    pub mid_band_range: Vec<f64>,
-    pub extra_smoothing: bool,
-    pub normalize: String,
-    pub clamp: bool,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct IchimokuOscillatorBatchJsOutput {
-    pub signal: Vec<f64>,
-    pub ma: Vec<f64>,
-    pub conversion: Vec<f64>,
-    pub base: Vec<f64>,
-    pub chikou: Vec<f64>,
-    pub current_kumo_a: Vec<f64>,
-    pub current_kumo_b: Vec<f64>,
-    pub future_kumo_a: Vec<f64>,
-    pub future_kumo_b: Vec<f64>,
-    pub max_level: Vec<f64>,
-    pub high_level: Vec<f64>,
-    pub low_level: Vec<f64>,
-    pub min_level: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_usize(name: &str, values: &[f64]) -> Result<(usize, usize, usize), JsValue> {
-    if values.len() != 3 {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 elements [start, end, step]"
-        )));
-    }
-    let mut out = [0usize; 3];
-    for (i, value) in values.iter().copied().enumerate() {
-        if !value.is_finite() || value < 0.0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid config: {name}[{i}] must be a finite non-negative whole number"
-            )));
-        }
-        let rounded = value.round();
-        if (value - rounded).abs() > 1e-9 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid config: {name}[{i}] must be a whole number"
-            )));
-        }
-        out[i] = rounded as usize;
-    }
-    Ok((out[0], out[1], out[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_f64(name: &str, values: &[f64]) -> Result<(f64, f64, f64), JsValue> {
-    if values.len() != 3 || values.iter().any(|value| !value.is_finite()) {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 finite elements [start, end, step]"
-        )));
-    }
-    Ok((values[0], values[1], values[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ichimoku_oscillator_batch_js")]
-pub fn ichimoku_oscillator_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: IchimokuOscillatorBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let normalize = config
-        .normalize
-        .parse::<IchimokuOscillatorNormalizeMode>()
-        .map_err(|e| JsValue::from_str(&e))?;
-    let sweep = IchimokuOscillatorBatchRange {
-        conversion_periods: js_vec3_to_usize(
-            "conversion_periods_range",
-            &config.conversion_periods_range,
-        )?,
-        base_periods: js_vec3_to_usize("base_periods_range", &config.base_periods_range)?,
-        lagging_span_periods: js_vec3_to_usize(
-            "lagging_span_periods_range",
-            &config.lagging_span_periods_range,
-        )?,
-        displacement: js_vec3_to_usize("displacement_range", &config.displacement_range)?,
-        ma_length: js_vec3_to_usize("ma_length_range", &config.ma_length_range)?,
-        smoothing_length: js_vec3_to_usize(
-            "smoothing_length_range",
-            &config.smoothing_length_range,
-        )?,
-        window_size: js_vec3_to_usize("window_size_range", &config.window_size_range)?,
-        top_band: js_vec3_to_f64("top_band_range", &config.top_band_range)?,
-        mid_band: js_vec3_to_f64("mid_band_range", &config.mid_band_range)?,
-        extra_smoothing: config.extra_smoothing,
-        normalize,
-        clamp: config.clamp,
-    };
-    let out = ichimoku_oscillator_batch_with_kernel(high, low, close, source, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&IchimokuOscillatorBatchJsOutput {
-        signal: out.signal,
-        ma: out.ma,
-        conversion: out.conversion,
-        base: out.base,
-        chikou: out.chikou,
-        current_kumo_a: out.current_kumo_a,
-        current_kumo_b: out.current_kumo_b,
-        future_kumo_a: out.future_kumo_a,
-        future_kumo_b: out.future_kumo_b,
-        max_level: out.max_level,
-        high_level: out.high_level,
-        low_level: out.low_level,
-        min_level: out.min_level,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn ichimoku_oscillator_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    source_ptr: *const f64,
-    signal_ptr: *mut f64,
-    ma_ptr: *mut f64,
-    conversion_ptr: *mut f64,
-    base_ptr: *mut f64,
-    chikou_ptr: *mut f64,
-    current_kumo_a_ptr: *mut f64,
-    current_kumo_b_ptr: *mut f64,
-    future_kumo_a_ptr: *mut f64,
-    future_kumo_b_ptr: *mut f64,
-    max_level_ptr: *mut f64,
-    high_level_ptr: *mut f64,
-    low_level_ptr: *mut f64,
-    min_level_ptr: *mut f64,
-    len: usize,
-    conversion_start: usize,
-    conversion_end: usize,
-    conversion_step: usize,
-    base_start: usize,
-    base_end: usize,
-    base_step: usize,
-    lagging_start: usize,
-    lagging_end: usize,
-    lagging_step: usize,
-    displacement_start: usize,
-    displacement_end: usize,
-    displacement_step: usize,
-    ma_start: usize,
-    ma_end: usize,
-    ma_step: usize,
-    smoothing_start: usize,
-    smoothing_end: usize,
-    smoothing_step: usize,
-    window_start: usize,
-    window_end: usize,
-    window_step: usize,
-    top_start: f64,
-    top_end: f64,
-    top_step: f64,
-    mid_start: f64,
-    mid_end: f64,
-    mid_step: f64,
-    extra_smoothing: bool,
-    normalize: &str,
-    clamp: bool,
-) -> Result<usize, JsValue> {
-    let normalize = normalize
-        .parse::<IchimokuOscillatorNormalizeMode>()
-        .map_err(|e| JsValue::from_str(&e))?;
-    let sweep = IchimokuOscillatorBatchRange {
-        conversion_periods: (conversion_start, conversion_end, conversion_step),
-        base_periods: (base_start, base_end, base_step),
-        lagging_span_periods: (lagging_start, lagging_end, lagging_step),
-        displacement: (displacement_start, displacement_end, displacement_step),
-        ma_length: (ma_start, ma_end, ma_step),
-        smoothing_length: (smoothing_start, smoothing_end, smoothing_step),
-        window_size: (window_start, window_end, window_step),
-        top_band: (top_start, top_end, top_step),
-        mid_band: (mid_start, mid_end, mid_step),
-        extra_smoothing,
-        normalize,
-        clamp,
-    };
-    let rows = expand_grid(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow in ichimoku_oscillator_batch_into"))?;
-    unsafe {
-        ichimoku_oscillator_batch_into_slice(
-            std::slice::from_raw_parts_mut(signal_ptr, total),
-            std::slice::from_raw_parts_mut(ma_ptr, total),
-            std::slice::from_raw_parts_mut(conversion_ptr, total),
-            std::slice::from_raw_parts_mut(base_ptr, total),
-            std::slice::from_raw_parts_mut(chikou_ptr, total),
-            std::slice::from_raw_parts_mut(current_kumo_a_ptr, total),
-            std::slice::from_raw_parts_mut(current_kumo_b_ptr, total),
-            std::slice::from_raw_parts_mut(future_kumo_a_ptr, total),
-            std::slice::from_raw_parts_mut(future_kumo_b_ptr, total),
-            std::slice::from_raw_parts_mut(max_level_ptr, total),
-            std::slice::from_raw_parts_mut(high_level_ptr, total),
-            std::slice::from_raw_parts_mut(low_level_ptr, total),
-            std::slice::from_raw_parts_mut(min_level_ptr, total),
-            std::slice::from_raw_parts(high_ptr, len),
-            std::slice::from_raw_parts(low_ptr, len),
-            std::slice::from_raw_parts(close_ptr, len),
-            std::slice::from_raw_parts(source_ptr, len),
-            &sweep,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ichimoku_oscillator_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &[f64],
-    conversion_periods: usize,
-    base_periods: usize,
-    lagging_span_periods: usize,
-    displacement: usize,
-    ma_length: usize,
-    smoothing_length: usize,
-    extra_smoothing: bool,
-    normalize: &str,
-    window_size: usize,
-    clamp: bool,
-    top_band: f64,
-    mid_band: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ichimoku_oscillator_js(
-        high,
-        low,
-        close,
-        source,
-        conversion_periods,
-        base_periods,
-        lagging_span_periods,
-        displacement,
-        ma_length,
-        smoothing_length,
-        extra_smoothing,
-        normalize,
-        window_size,
-        clamp,
-        top_band,
-        mid_band,
-    )?;
-    crate::write_wasm_object_f64_outputs("ichimoku_oscillator_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ichimoku_oscillator_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ichimoku_oscillator_batch_js(high, low, close, source, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ichimoku_oscillator_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2745,6 +1985,89 @@ mod tests {
                 continue;
             }
             assert!((a - b).abs() <= 1e-12, "mismatch at {idx}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn ichimoku_oscillator_matches_hand_derived_unit_windows_and_validity() {
+        // With all three midpoint windows, displacement, smoothing and MA set
+        // to one, extra smoothing disabled and normalization disabled:
+        //   midpoint = (high + low) / 2
+        //   signal = source - midpoint
+        //   ma = signal
+        //   conversion/base/current/future cloud = 0
+        //   chikou = source[i] - source[i - 2]
+        // The length-one Chebyshev coefficient is mathematically zero; a
+        // 1e-12 bound admits only the platform libm's final rounding.
+        let source = vec![10.0, 11.0, 9.0, 12.0, 8.0, 13.0, 7.0, 14.0];
+        let close = source.clone();
+        let mut high: Vec<f64> = source.iter().map(|value| value + 2.0).collect();
+        let low: Vec<f64> = source.iter().map(|value| value - 1.0).collect();
+        high[4] = f64::NAN;
+
+        let out = ichimoku_oscillator(&IchimokuOscillatorInput::from_slices(
+            &high,
+            &low,
+            &close,
+            &source,
+            IchimokuOscillatorParams {
+                conversion_periods: Some(1),
+                base_periods: Some(1),
+                lagging_span_periods: Some(1),
+                displacement: Some(1),
+                ma_length: Some(1),
+                smoothing_length: Some(1),
+                extra_smoothing: Some(false),
+                normalize: Some(IchimokuOscillatorNormalizeMode::Disabled),
+                window_size: Some(5),
+                clamp: Some(false),
+                top_band: Some(2.0),
+                mid_band: Some(1.5),
+            },
+        ))
+        .unwrap();
+
+        let close_enough = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() <= 1.0e-12,
+                "actual={actual:.17} expected={expected:.17}"
+            );
+        };
+        let chikou_expected = [f64::NAN, f64::NAN, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0];
+
+        for index in 0..source.len() {
+            if index == 4 {
+                assert!(out.signal[index].is_nan());
+                assert!(out.ma[index].is_nan());
+                assert!(out.conversion[index].is_nan());
+                assert!(out.base[index].is_nan());
+                assert!(out.current_kumo_a[index].is_nan());
+                assert!(out.current_kumo_b[index].is_nan());
+                assert!(out.future_kumo_a[index].is_nan());
+                assert!(out.future_kumo_b[index].is_nan());
+            } else {
+                close_enough(out.signal[index], -0.5);
+                close_enough(out.ma[index], -0.5);
+                close_enough(out.conversion[index], 0.0);
+                close_enough(out.base[index], 0.0);
+                close_enough(out.current_kumo_a[index], 0.0);
+                close_enough(out.current_kumo_b[index], 0.0);
+                close_enough(out.future_kumo_a[index], 0.0);
+                close_enough(out.future_kumo_b[index], 0.0);
+            }
+
+            if chikou_expected[index].is_nan() {
+                assert!(out.chikou[index].is_nan());
+            } else {
+                close_enough(out.chikou[index], chikou_expected[index]);
+            }
+            // Disabled normalization deliberately leaves the level inputs at
+            // dev=0, including on the high/low gap; validity is per output,
+            // not a fabricated all-column zero/NaN policy.
+            assert_eq!(out.max_level[index].to_bits(), 0.0f64.to_bits());
+            assert_eq!(out.high_level[index].to_bits(), 0.0f64.to_bits());
+            assert_eq!(out.low_level[index].to_bits(), (-0.0f64).to_bits());
+            assert_eq!(out.min_level[index].to_bits(), (-0.0f64).to_bits());
         }
     }
 

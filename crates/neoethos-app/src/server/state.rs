@@ -37,15 +37,12 @@ static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// Same pattern as `current_config_path()` — process-global,
 /// install-once, accessed via a free function so deep call sites
 /// don't depend on the axum router state.
-static ACCOUNT_REFRESH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<()>> =
-    OnceLock::new();
+static ACCOUNT_REFRESH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<()>> = OnceLock::new();
 
 /// Install the global account-refresh trigger. Called from `main.rs`
 /// exactly once, right after `AppApiState::new()`. Subsequent calls
 /// are silent no-ops.
-pub fn install_account_refresh_trigger(
-    tx: tokio::sync::mpsc::UnboundedSender<()>,
-) {
+pub fn install_account_refresh_trigger(tx: tokio::sync::mpsc::UnboundedSender<()>) {
     let _ = ACCOUNT_REFRESH_TX.set(tx);
 }
 
@@ -159,6 +156,11 @@ pub struct PositionPayload {
 #[derive(Clone)]
 pub struct AppApiState {
     inner: Arc<RwLock<AppApiInner>>,
+    /// The only async admission coordinator for CPU-heavy app work. Production
+    /// startup installs the process budget before constructing this state; a
+    /// state built without that preflight (small router tests) keeps this
+    /// `None`, and heavy routes fail closed instead of inventing a broker.
+    execution: Option<Arc<crate::app_state::AppExecutionState>>,
     /// In-flight OAuth state for the Codex (ChatGPT) fallback. Kept
     /// as a separate `Mutex<Option<...>>` rather than inside the main
     /// RwLock because:
@@ -205,8 +207,7 @@ pub struct AppApiState {
     /// One-shot ownership: the bridge takes it once via
     /// `take_account_refresh_rx`; subsequent calls panic in debug
     /// (deliberate — a second taker is a bug).
-    account_refresh_rx:
-        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>>,
+    account_refresh_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>>>,
     /// Live autonomous trading engines — one per running portfolio so several
     /// discovered strategies can trade concurrently (each is internally
     /// multi-timeframe). Empty when idle.
@@ -270,10 +271,24 @@ impl AppApiState {
     /// don't install ahead of time get the default `"config.yaml"`.
     pub fn new() -> Self {
         let (account_broadcast, _) = broadcast::channel(64);
-        let (account_refresh_tx, account_refresh_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+        let (account_refresh_tx, account_refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        let execution =
+            neoethos_core::execution_budget::installed_process_budget().map(|installed| {
+                Arc::new(
+                    crate::app_state::AppExecutionState::new(
+                        installed.broker().clone(),
+                        installed.resolved().effective_worker_limit,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "failed to start the process execution admission coordinator: {error}"
+                        )
+                    }),
+                )
+            });
         Self {
             inner: Arc::new(RwLock::new(AppApiInner::default())),
+            execution,
             codex: Arc::new(Mutex::new(None)),
             config_path: Arc::new(current_config_path()),
             account_broadcast,
@@ -283,12 +298,17 @@ impl AppApiState {
         }
     }
 
+    /// Clone the process-lifetime admission owner. `None` means construction
+    /// happened before the immutable process budget was installed; callers
+    /// must return a startup/admission error instead of creating capacity.
+    pub fn execution_state(&self) -> Option<Arc<crate::app_state::AppExecutionState>> {
+        self.execution.clone()
+    }
+
     /// Clone of the account-refresh sender, suitable for installing
     /// as the process-wide handle via `install_account_refresh_trigger`.
     /// Called by `main.rs` exactly once at startup.
-    pub fn account_refresh_tx_clone(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<()> {
+    pub fn account_refresh_tx_clone(&self) -> tokio::sync::mpsc::UnboundedSender<()> {
         self.account_refresh_tx.clone()
     }
 
@@ -315,9 +335,7 @@ impl AppApiState {
     /// Bridge calls this exactly once at startup to take ownership of
     /// the receiver side. Returns `None` on a second call so a future
     /// regression doesn't silently spawn two consumers.
-    pub fn take_account_refresh_rx(
-        &self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    pub fn take_account_refresh_rx(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
         self.account_refresh_rx
             .lock()
             .ok()

@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde_wasm_bindgen;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,19 +12,6 @@ use std::convert::AsRef;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::mfi_wrapper::CudaMfi;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum MfiData<'a> {
@@ -62,10 +31,6 @@ pub struct MfiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MfiParams {
     pub period: Option<usize>,
 }
@@ -1153,275 +1118,6 @@ pub unsafe fn mfi_row_avx512_long(
     mfi_scalar(typical_price, volume, period, first, out)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "mfi")]
-#[pyo3(signature = (typical_price, volume, period, kernel=None))]
-pub fn mfi_py<'py>(
-    py: Python<'py>,
-    typical_price: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let typical_slice = typical_price.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = MfiParams {
-        period: Some(period),
-    };
-    let input = MfiInput::from_slices(typical_slice, volume_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| mfi_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MfiStream")]
-pub struct MfiStreamPy {
-    inner: MfiStream,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct MfiDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32>,
-    pub(crate) ctx: Arc<Context>,
-    pub(crate) device_id: i32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl MfiDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MfiStreamPy {
-    #[new]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let params = MfiParams {
-            period: Some(period),
-        };
-        let inner = MfiStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(MfiStreamPy { inner })
-    }
-
-    pub fn update(&mut self, typical_price: f64, volume: f64) -> Option<f64> {
-        self.inner.update(typical_price, volume)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "mfi_batch")]
-#[pyo3(signature = (typical_price, volume, period_range, kernel=None))]
-pub fn mfi_batch_py<'py>(
-    py: Python<'py>,
-    typical_price: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let tp = typical_price.as_slice()?;
-    let vol = volume.as_slice()?;
-    if tp.len() != vol.len() {
-        return Err(PyValueError::new_err(
-            "mfi_batch: typical_price and volume length mismatch",
-        ));
-    }
-
-    let sweep = MfiBatchRange {
-        period: period_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = tp.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match k {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => k,
-            };
-            mfi_batch_inner_into(tp, vol, &sweep, simd, true, out_slice)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "mfi_cuda_batch_dev")]
-#[pyo3(signature = (typical_price, volume, period_range, device_id=0))]
-pub fn mfi_cuda_batch_dev_py(
-    py: Python<'_>,
-    typical_price: PyReadonlyArray1<'_, f32>,
-    volume: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<MfiDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let tp = typical_price.as_slice()?;
-    let vol = volume.as_slice()?;
-    if tp.len() != vol.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-    let sweep = MfiBatchRange {
-        period: period_range,
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaMfi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id() as i32;
-        let (arr, _combos) = cuda
-            .mfi_batch_dev(tp, vol, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(MfiDeviceArrayF32Py {
-        inner: Some(inner),
-        ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "mfi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (typical_price_tm, volume_tm, cols, rows, period, device_id=0))]
-pub fn mfi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    typical_price_tm: PyReadonlyArray1<'_, f32>,
-    volume_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<MfiDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let tp = typical_price_tm.as_slice()?;
-    let vol = volume_tm.as_slice()?;
-    if tp.len() != vol.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-    if tp.len() != cols * rows {
-        return Err(PyValueError::new_err("unexpected matrix size"));
-    }
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaMfi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id() as i32;
-        let arr = cuda
-            .mfi_many_series_one_param_time_major_dev(tp, vol, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(MfiDeviceArrayF32Py {
-        inner: Some(inner),
-        ctx,
-        device_id: dev_id,
-    })
-}
-
 #[inline]
 pub fn mfi_into_slice(dst: &mut [f64], input: &MfiInput, kern: Kernel) -> Result<(), MfiError> {
     let (typical_price, volume, period, first_valid_idx, chosen) = mfi_prepare(input, kern)?;
@@ -1445,188 +1141,15 @@ pub fn mfi_into_slice(dst: &mut [f64], input: &MfiInput, kern: Kernel) -> Result
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn mfi_into(input: &MfiInput, out: &mut [f64]) -> Result<(), MfiError> {
     mfi_into_slice(out, input, Kernel::Auto)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mfi_js(typical_price: &[f64], volume: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = MfiParams {
-        period: Some(period),
-    };
-    let input = MfiInput::from_slices(typical_price, volume, params);
-
-    let result = mfi_with_kernel(&input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(result.values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mfi_into(
-    typical_price_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if typical_price_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let typical_price = std::slice::from_raw_parts(typical_price_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let params = MfiParams {
-            period: Some(period),
-        };
-        let input = MfiInput::from_slices(typical_price, volume, params);
-
-        if typical_price_ptr == out_ptr || volume_ptr == out_ptr {
-            let result = mfi_with_kernel(&input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&result.values);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            mfi_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mfi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mfi_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MfiBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MfiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<MfiParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = mfi_batch)]
-pub fn mfi_batch_unified_js(
-    typical_price: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: MfiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = MfiBatchRange {
-        period: config.period_range,
-    };
-
-    let output = mfi_batch_inner(typical_price, volume, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = MfiBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mfi_batch_into(
-    typical_price_ptr: *const f64,
-    volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if typical_price_ptr.is_null() || volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to mfi_batch_into"));
-    }
-    unsafe {
-        let tp = std::slice::from_raw_parts(typical_price_ptr, len);
-        let vol = std::slice::from_raw_parts(volume_ptr, len);
-
-        let sweep = MfiBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("mfi_batch_into: rows*cols overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        mfi_batch_inner_into(tp, vol, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mfi_output_into_js(
-    typical_price: &[f64],
-    volume: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = mfi_js(typical_price, volume, period)?;
-    crate::write_wasm_f64_output("mfi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mfi_batch_unified_output_into_js(
-    typical_price: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = mfi_batch_unified_js(typical_price, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs("mfi_batch_unified_output_into_js", &value, out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
     use std::error::Error;
 
@@ -1649,13 +1172,8 @@ mod tests {
         let baseline = mfi(&input)?.values;
 
         let mut out = vec![0.0f64; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             mfi_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            mfi_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -1678,8 +1196,8 @@ mod tests {
 
     fn check_mfi_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = MfiParams { period: None };
         let input = MfiInput::from_candles(&candles, "hlc3", default_params);
         let output = mfi_with_kernel(&input, kernel)?;
@@ -1689,8 +1207,8 @@ mod tests {
 
     fn check_mfi_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MfiParams { period: Some(14) };
         let input = MfiInput::from_candles(&candles, "hlc3", params);
         let mfi_result = mfi_with_kernel(&input, kernel)?;
@@ -1718,8 +1236,8 @@ mod tests {
 
     fn check_mfi_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MfiInput::with_default_candles(&candles);
         let output = mfi_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -1728,8 +1246,8 @@ mod tests {
 
     fn check_mfi_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MfiParams { period: Some(0) };
         let input = MfiInput::from_candles(&candles, "hlc3", params);
         let result = mfi_with_kernel(&input, kernel);
@@ -1777,8 +1295,8 @@ mod tests {
 
     fn check_mfi_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = MfiParams { period: Some(7) };
         let first_input = MfiInput::from_candles(&candles, "hlc3", first_params);
         let first_result = mfi_with_kernel(&first_input, kernel)?;
@@ -1797,8 +1315,8 @@ mod tests {
     fn check_mfi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             MfiParams::default(),
@@ -2249,8 +1767,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = MfiBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -2280,8 +1798,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::cuda::oscillators::CudaWillr;
@@ -8,8 +8,8 @@ use cust::context::{CacheConfig, Context};
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -125,15 +125,7 @@ impl CudaAso {
         cust::init(CudaFlags::empty()).map_err(CudaAsoError::Cuda)?;
         let device = Device::get_device(device_id as u32).map_err(CudaAsoError::Cuda)?;
         let context = Arc::new(Context::new(device).map_err(CudaAsoError::Cuda)?);
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/aso_kernel.ptx"));
-        let jit = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
-        let module = Module::from_ptx(ptx, jit)
-            .or_else(|_| Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]))
-            .or_else(|_| Module::from_ptx(ptx, &[]))
-            .map_err(CudaAsoError::Cuda)?;
+        let module = crate::load_cuda_embedded_module!("aso_kernel").map_err(CudaAsoError::Cuda)?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(CudaAsoError::Cuda)?;
         Ok(Self {
             module,
@@ -907,14 +899,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "aso",
-            "one_series_many_params",
-            "aso_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "aso",
+                "one_series_many_params",
+                "aso_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }

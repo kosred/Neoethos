@@ -27,8 +27,8 @@ fn data_dir() -> Option<PathBuf> {
 }
 
 /// Build a [`ClosedTrade`] from a deal — but only for REALIZED (closing)
-/// deals, which are the ones that carry `net_profit`. Opening fills
-/// (`net_profit == None`) are not closed trades and are skipped.
+/// deals, which are the ones that carry a checked signed component sum. Opening
+/// fills have no closing-money component sum and are skipped.
 /// When each position was opened, from the data already in hand.
 ///
 /// A closing deal reports the exit and the entry *price*, never the entry
@@ -79,7 +79,7 @@ fn closed_trade_from_deal(
     environment: &str,
     opened_at: &HashMap<i64, i64>,
 ) -> Option<ClosedTrade> {
-    let net = d.net_profit?;
+    let net = d.component_sum_account_currency?;
     let gross_profit = d.gross_profit?;
     let commission = d.fee?;
     let swap = d.swap?;
@@ -173,7 +173,7 @@ pub fn reconcile_best_effort(
     let mut incomplete_broker_financials = 0usize;
     let mut deferred_cold_catalog = 0usize;
     for deal in &runtime.recent_deals {
-        if deal.net_profit.is_none() {
+        if deal.component_sum_account_currency.is_none() {
             // An opening fill is not a closed trade; nothing is lost.
             opening_fills += 1;
             continue;
@@ -267,6 +267,7 @@ mod entry_time_tests {
 
     fn deal(position_id: i64, ts: i64) -> CTraderDealSnapshot {
         CTraderDealSnapshot {
+            account_id: 1,
             deal_id: ts,
             order_id: ts,
             position_id,
@@ -275,6 +276,7 @@ mod entry_time_tests {
             deal_status: "FILLED".to_string(),
             volume: 100_000.0,
             filled_volume: 100_000.0,
+            filled_volume_raw_centi_units: 10_000_000,
             execution_timestamp_ms: ts,
             execution_price: Some(1.1),
             entry_price: Some(1.1),
@@ -282,7 +284,16 @@ mod entry_time_tests {
             fee: Some(0.0),
             swap: Some(0.0),
             pnl_conversion_fee: Some(0.0),
-            net_profit: Some(1.0),
+            money_digits: Some(2),
+            gross_profit_raw_scaled: Some(100),
+            commission_raw_scaled_signed: Some(0),
+            swap_raw_scaled_signed: Some(0),
+            pnl_conversion_fee_state: Some(
+                crate::app_services::broker_deal_economics::BrokerPnlConversionFeeV1::Charged {
+                    raw_scaled_signed: 0,
+                },
+            ),
+            component_sum_account_currency: Some(1.0),
         }
     }
 
@@ -335,14 +346,8 @@ mod entry_time_tests {
                 _ => unreachable!(),
             }
             assert!(
-                closed_trade_from_deal(
-                    &closing,
-                    &catalog(),
-                    "acct",
-                    "Demo",
-                    &HashMap::new(),
-                )
-                .is_none(),
+                closed_trade_from_deal(&closing, &catalog(), "acct", "Demo", &HashMap::new(),)
+                    .is_none(),
                 "journal accepted a closing deal missing {missing}"
             );
         }

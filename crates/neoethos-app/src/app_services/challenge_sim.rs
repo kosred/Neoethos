@@ -144,7 +144,11 @@ pub fn run_challenge_sim(portfolio_path: &str, iterations: usize) -> Result<Chal
     let mut entries: Vec<(i64, f64)> = Vec::new(); // (entry_time_ms, r_multiple)
     if let Some(arr) = logged.as_array() {
         for strat in arr {
-            for t in strat.get("trades").and_then(|v| v.as_array()).unwrap_or(&Vec::new()) {
+            for t in strat
+                .get("trades")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&Vec::new())
+            {
                 let entry_time = t.get("entry_time").and_then(|v| v.as_i64()).unwrap_or(0);
                 let r = t.get("r_multiple").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 entries.push((entry_time, r));
@@ -199,8 +203,14 @@ pub fn run_challenge_sim(portfolio_path: &str, iterations: usize) -> Result<Chal
         let mut p2_runs = 0usize;
         for _ in 0..iterations {
             let (ok, busted, days) = run_attempt(
-                &r_multiples, risk, TARGET_P1, DAILY_LOSS, MAX_LOSS,
-                trades_per_day, DAY_LIMIT_P1, &mut rng,
+                &r_multiples,
+                risk,
+                TARGET_P1,
+                DAILY_LOSS,
+                MAX_LOSS,
+                trades_per_day,
+                DAY_LIMIT_P1,
+                &mut rng,
             );
             if ok {
                 pass1 += 1;
@@ -215,8 +225,14 @@ pub fn run_challenge_sim(portfolio_path: &str, iterations: usize) -> Result<Chal
         // window) — funded probability = P(phase1) × P(phase2).
         for _ in 0..iterations {
             let (ok, _, _) = run_attempt(
-                &r_multiples, risk, TARGET_P2, DAILY_LOSS, MAX_LOSS,
-                trades_per_day, DAY_LIMIT_P2, &mut rng,
+                &r_multiples,
+                risk,
+                TARGET_P2,
+                DAILY_LOSS,
+                MAX_LOSS,
+                trades_per_day,
+                DAY_LIMIT_P2,
+                &mut rng,
             );
             p2_runs += 1;
             if ok {
@@ -225,17 +241,18 @@ pub fn run_challenge_sim(portfolio_path: &str, iterations: usize) -> Result<Chal
         }
         days_pass.sort_unstable();
         let p1 = pass1 as f64 / iterations as f64;
-        let p2 = if p2_runs > 0 { pass2 as f64 / p2_runs as f64 } else { 0.0 };
+        let p2 = if p2_runs > 0 {
+            pass2 as f64 / p2_runs as f64
+        } else {
+            0.0
+        };
         sweep.push(ChallengeSweepPoint {
             risk_pct: risk * 100.0,
             pass_phase1_pct: p1 * 100.0,
             funded_pct: p1 * p2 * 100.0,
             bust_pct: bust as f64 / iterations as f64 * 100.0,
             timeout_pct: timeout as f64 / iterations as f64 * 100.0,
-            median_days_phase1: days_pass
-                .get(days_pass.len() / 2)
-                .copied()
-                .unwrap_or(0) as f64,
+            median_days_phase1: days_pass.get(days_pass.len() / 2).copied().unwrap_or(0) as f64,
         });
     }
 
@@ -266,7 +283,9 @@ pub fn run_challenge_sim(portfolio_path: &str, iterations: usize) -> Result<Chal
              attempt ({} attempts budgets ≥90%). NOTE: this is the CHALLENGE-optimal size, \
              not the long-run Kelly size — drop back to normal sizing once funded. \
              Bootstrap assumes iid trades; treat as an upper bound.",
-            best.risk_pct, best.funded_pct, attempts_for_90pct.max(1)
+            best.risk_pct,
+            best.funded_pct,
+            attempts_for_90pct.max(1)
         )
     };
 
@@ -301,25 +320,29 @@ mod tests {
         let good: Vec<f64> = (0..100).map(|i| if i < 70 { 2.0 } else { -1.0 }).collect();
         let mut passes = 0;
         for _ in 0..200 {
-            let (ok, _, _) =
-                run_attempt(&good, 0.01, 0.10, 0.05, 0.10, 10.0, 30, &mut rng);
+            let (ok, _, _) = run_attempt(&good, 0.01, 0.10, 0.05, 0.10, 10.0, 30, &mut rng);
             if ok {
                 passes += 1;
             }
         }
-        assert!(passes > 150, "strong edge must usually pass, got {passes}/200");
+        assert!(
+            passes > 150,
+            "strong edge must usually pass, got {passes}/200"
+        );
 
         // Pure negative edge: 30% +1R / 70% −1R must essentially never pass.
         let bad: Vec<f64> = (0..100).map(|i| if i < 30 { 1.0 } else { -1.0 }).collect();
         let mut bad_passes = 0;
         for _ in 0..200 {
-            let (ok, _, _) =
-                run_attempt(&bad, 0.01, 0.10, 0.05, 0.10, 10.0, 30, &mut rng);
+            let (ok, _, _) = run_attempt(&bad, 0.01, 0.10, 0.05, 0.10, 10.0, 30, &mut rng);
             if ok {
                 bad_passes += 1;
             }
         }
-        assert!(bad_passes < 10, "negative edge must almost never pass, got {bad_passes}/200");
+        assert!(
+            bad_passes < 10,
+            "negative edge must almost never pass, got {bad_passes}/200"
+        );
     }
 
     #[test]
@@ -328,10 +351,12 @@ mod tests {
         // Every trade loses 1R. At 3% risk, two same-day losses breach the 5%
         // daily barrier long before the 10% total barrier at 10 trades/day.
         let all_loss = vec![-1.0_f64; 10];
-        let (ok, busted, days) =
-            run_attempt(&all_loss, 0.03, 0.10, 0.05, 0.10, 10.0, 30, &mut rng);
+        let (ok, busted, days) = run_attempt(&all_loss, 0.03, 0.10, 0.05, 0.10, 10.0, 30, &mut rng);
         assert!(!ok && busted, "all-loss walk must bust");
-        assert_eq!(days, 1, "3% risk × all-loss must breach the DAILY barrier on day 1");
+        assert_eq!(
+            days, 1,
+            "3% risk × all-loss must breach the DAILY barrier on day 1"
+        );
     }
 
     #[test]

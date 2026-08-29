@@ -1,15 +1,15 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::parkinson_volatility::{
-    expand_grid_parkinson, ParkinsonVolatilityBatchRange, ParkinsonVolatilityParams,
+    ParkinsonVolatilityBatchRange, ParkinsonVolatilityParams, expand_grid_parkinson,
 };
 use cust::context::Context;
 use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -77,7 +77,6 @@ impl CudaParkinsonVolatility {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/parkinson_volatility_kernel.ptx"));
         let module = crate::load_cuda_embedded_module!("parkinson_volatility_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

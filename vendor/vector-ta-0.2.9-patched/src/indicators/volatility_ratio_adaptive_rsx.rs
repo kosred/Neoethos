@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -75,10 +59,6 @@ pub struct VolatilityRatioAdaptiveRsxOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VolatilityRatioAdaptiveRsxParams {
     pub period: Option<usize>,
     pub speed: Option<f64>,
@@ -225,7 +205,9 @@ pub enum VolatilityRatioAdaptiveRsxError {
     EmptyInputData,
     #[error("volatility_ratio_adaptive_rsx: All source values are invalid.")]
     AllValuesNaN,
-    #[error("volatility_ratio_adaptive_rsx: Invalid period: period = {period}, data length = {data_len}")]
+    #[error(
+        "volatility_ratio_adaptive_rsx: Invalid period: period = {period}, data length = {data_len}"
+    )]
     InvalidPeriod { period: usize, data_len: usize },
     #[error("volatility_ratio_adaptive_rsx: Invalid speed: {speed}")]
     InvalidSpeed { speed: f64 },
@@ -278,11 +260,7 @@ fn biased_std_from_sums(sum: f64, sum_sq: f64, period: usize) -> f64 {
 
 #[inline(always)]
 fn nz(v: f64) -> f64 {
-    if v.is_finite() {
-        v
-    } else {
-        0.0
-    }
+    if v.is_finite() { v } else { 0.0 }
 }
 
 #[inline(always)]
@@ -692,7 +670,6 @@ pub fn volatility_ratio_adaptive_rsx_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn volatility_ratio_adaptive_rsx_into(
     input: &VolatilityRatioAdaptiveRsxInput,
@@ -819,13 +796,6 @@ impl VolatilityRatioAdaptiveRsxBatchBuilder {
             self.kernel,
         )
     }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VolatilityRatioAdaptiveRsxBatchConfig {
-    pub period_range: Vec<usize>,
-    pub speed_range: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -981,7 +951,7 @@ pub fn volatility_ratio_adaptive_rsx_batch_with_kernel(
         other => {
             return Err(VolatilityRatioAdaptiveRsxError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
     volatility_ratio_adaptive_rsx_batch_par_slice(data, sweep, batch.to_non_batch())
@@ -1184,392 +1154,6 @@ fn volatility_ratio_adaptive_rsx_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "volatility_ratio_adaptive_rsx")]
-#[pyo3(signature = (data, period=14, speed=0.5, kernel=None))]
-pub fn volatility_ratio_adaptive_rsx_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    speed: f64,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = VolatilityRatioAdaptiveRsxInput::from_slice(
-        data,
-        VolatilityRatioAdaptiveRsxParams {
-            period: Some(period),
-            speed: Some(speed),
-        },
-    );
-    let output = py
-        .allow_threads(|| volatility_ratio_adaptive_rsx_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((output.line.into_pyarray(py), output.signal.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VolatilityRatioAdaptiveRsxStream")]
-pub struct VolatilityRatioAdaptiveRsxStreamPy {
-    stream: VolatilityRatioAdaptiveRsxStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VolatilityRatioAdaptiveRsxStreamPy {
-    #[new]
-    #[pyo3(signature = (period=14, speed=0.5))]
-    fn new(period: usize, speed: f64) -> PyResult<Self> {
-        let stream = VolatilityRatioAdaptiveRsxStream::try_new(VolatilityRatioAdaptiveRsxParams {
-            period: Some(period),
-            speed: Some(speed),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "volatility_ratio_adaptive_rsx_batch")]
-#[pyo3(signature = (data, period_range, speed_range, kernel=None))]
-pub fn volatility_ratio_adaptive_rsx_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    speed_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let sweep = VolatilityRatioAdaptiveRsxBatchRange {
-        period: period_range,
-        speed: speed_range,
-    };
-    let combos = expand_grid_volatility_ratio_adaptive_rsx(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let line_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let line_out = unsafe { line_arr.as_slice_mut()? };
-    let signal_out = unsafe { signal_arr.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        volatility_ratio_adaptive_rsx_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            line_out,
-            signal_out,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("line", line_arr.reshape((rows, cols))?)?;
-    dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap_or(14) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "speeds",
-        combos
-            .iter()
-            .map(|p| p.speed.unwrap_or(0.5))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_volatility_ratio_adaptive_rsx_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(volatility_ratio_adaptive_rsx_py, m)?)?;
-    m.add_function(wrap_pyfunction!(volatility_ratio_adaptive_rsx_batch_py, m)?)?;
-    m.add_class::<VolatilityRatioAdaptiveRsxStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "volatility_ratio_adaptive_rsx_js")]
-pub fn volatility_ratio_adaptive_rsx_js(
-    data: &[f64],
-    period: usize,
-    speed: f64,
-) -> Result<JsValue, JsValue> {
-    let input = VolatilityRatioAdaptiveRsxInput::from_slice(
-        data,
-        VolatilityRatioAdaptiveRsxParams {
-            period: Some(period),
-            speed: Some(speed),
-        },
-    );
-    let mut line = vec![0.0; data.len()];
-    let mut signal = vec![0.0; data.len()];
-    volatility_ratio_adaptive_rsx_into_slice(&mut line, &mut signal, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("line"),
-        &serde_wasm_bindgen::to_value(&line).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("signal"),
-        &serde_wasm_bindgen::to_value(&signal).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "volatility_ratio_adaptive_rsx_batch_js")]
-pub fn volatility_ratio_adaptive_rsx_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: VolatilityRatioAdaptiveRsxBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.period_range.len() != 3 || config.speed_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: ranges must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = VolatilityRatioAdaptiveRsxBatchRange {
-        period: (
-            config.period_range[0],
-            config.period_range[1],
-            config.period_range[2],
-        ),
-        speed: (
-            config.speed_range[0],
-            config.speed_range[1],
-            config.speed_range[2],
-        ),
-    };
-    let combos = expand_grid_volatility_ratio_adaptive_rsx(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let mut line = vec![0.0; total];
-    let mut signal = vec![0.0; total];
-    volatility_ratio_adaptive_rsx_batch_inner_into(
-        data,
-        &sweep,
-        Kernel::Scalar,
-        false,
-        &mut line,
-        &mut signal,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("line"),
-        &serde_wasm_bindgen::to_value(&line).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("signal"),
-        &serde_wasm_bindgen::to_value(&signal).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volatility_ratio_adaptive_rsx_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(2 * len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volatility_ratio_adaptive_rsx_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volatility_ratio_adaptive_rsx_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    speed: f64,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to volatility_ratio_adaptive_rsx_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * len);
-        let (line, signal) = out.split_at_mut(len);
-        let input = VolatilityRatioAdaptiveRsxInput::from_slice(
-            data,
-            VolatilityRatioAdaptiveRsxParams {
-                period: Some(period),
-                speed: Some(speed),
-            },
-        );
-        volatility_ratio_adaptive_rsx_into_slice(line, signal, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "volatility_ratio_adaptive_rsx_into_host")]
-pub fn volatility_ratio_adaptive_rsx_into_host(
-    data: &[f64],
-    out_ptr: *mut f64,
-    period: usize,
-    speed: f64,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to volatility_ratio_adaptive_rsx_into_host",
-        ));
-    }
-    unsafe {
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * data.len());
-        let (line, signal) = out.split_at_mut(data.len());
-        let input = VolatilityRatioAdaptiveRsxInput::from_slice(
-            data,
-            VolatilityRatioAdaptiveRsxParams {
-                period: Some(period),
-                speed: Some(speed),
-            },
-        );
-        volatility_ratio_adaptive_rsx_into_slice(line, signal, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volatility_ratio_adaptive_rsx_batch_into(
-    data_ptr: *const f64,
-    line_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    speed_start: f64,
-    speed_end: f64,
-    speed_step: f64,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || line_ptr.is_null() || signal_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to volatility_ratio_adaptive_rsx_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let sweep = VolatilityRatioAdaptiveRsxBatchRange {
-            period: (period_start, period_end, period_step),
-            speed: (speed_start, speed_end, speed_step),
-        };
-        let combos = expand_grid_volatility_ratio_adaptive_rsx(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let line = std::slice::from_raw_parts_mut(line_ptr, total);
-        let signal = std::slice::from_raw_parts_mut(signal_ptr, total);
-        volatility_ratio_adaptive_rsx_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Scalar,
-            false,
-            line,
-            signal,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volatility_ratio_adaptive_rsx_output_into_js(
-    data: &[f64],
-    period: usize,
-    speed: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = volatility_ratio_adaptive_rsx_js(data, period, speed)?;
-    crate::write_wasm_object_f64_outputs(
-        "volatility_ratio_adaptive_rsx_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volatility_ratio_adaptive_rsx_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = volatility_ratio_adaptive_rsx_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "volatility_ratio_adaptive_rsx_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]
@@ -1810,7 +1394,6 @@ mod tests {
         assert!(series_close(&out.signal, &exp_signal, 1e-12));
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn volatility_ratio_adaptive_rsx_into_matches_api() -> Result<(), Box<dyn Error>> {
         let data = sample_data();

@@ -1,12 +1,9 @@
-//! GET /indicators?symbol=&timeframe=&indicator=&period=&limit=
+//! GET /indicators?datasetIdentity=&expectedGeneration=&indicator=&period=&limit=
 //!
-//! Compute a single technical indicator on the local OHLCV slice
-//! and return the series so the Flutter chart can overlay it on
-//! the candlestick canvas. Backed by `vector_ta` via the
-//! `neoethos_data::compute_single_indicator` helper — no manual
-//! indicator math here. Add a new indicator by extending
-//! `ALLOWED_INDICATORS` once the upstream id appears in
-//! `crates/neoethos-data/src/core/all_indicators.rs::ALL_INDICATORS`.
+//! Compute a single technical indicator from one exact, fully verified and
+//! pinned local Vortex generation. The canonical identity determines symbol,
+//! source/account and timeframe; the generation receipt prevents silent drift
+//! after inventory selection. This route never contacts the broker.
 //!
 //! Wire shape — single-output indicator:
 //! ```json
@@ -24,8 +21,9 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
-use neoethos_data::{IndicatorLine, compute_single_indicator, load_symbol_dataset};
+use neoethos_data::{CanonicalDatasetIdentity, IndicatorLine, compute_single_indicator};
 
+use super::chart::ExactDatasetReceipt;
 use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
 
@@ -47,9 +45,16 @@ pub const ALLOWED_INDICATORS: &[&str] = &[
 ];
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IndicatorQuery {
     pub symbol: Option<String>,
     pub timeframe: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "super::chart::deserialize_optional_dataset_identity"
+    )]
+    pub dataset_identity: Option<CanonicalDatasetIdentity>,
+    pub expected_generation: Option<String>,
     pub indicator: Option<String>,
     /// Optional period for indicators that take one
     /// (sma/ema/rsi/atr/adx). Library default when missing.
@@ -92,19 +97,65 @@ const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 2000;
 
 pub async fn indicators(
-    State(_state): State<AppApiState>,
+    State(state): State<AppApiState>,
     Query(q): Query<IndicatorQuery>,
 ) -> Response {
-    let symbol = q
+    let receipt = match ExactDatasetReceipt::from_optional(
+        q.dataset_identity,
+        q.expected_generation,
+    ) {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => {
+            return actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Indicators require an exact local datasetIdentity and expectedGeneration receipt.",
+                &anyhow::anyhow!("no exact dataset receipt was provided"),
+            );
+        }
+        Err(error) => {
+            return actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Indicator dataset selection is incomplete or invalid.",
+                &error,
+            );
+        }
+    };
+    if let Some(asserted) = q
         .symbol
-        .unwrap_or_else(|| "EURUSD".to_string())
-        .trim()
-        .to_uppercase();
-    let timeframe = q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !asserted.eq_ignore_ascii_case(receipt.identity().symbol_name()) {
+            return actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Indicator symbol assertion disagrees with the exact dataset identity.",
+                &anyhow::anyhow!(
+                    "symbol assertion {asserted:?} does not match {:?}",
+                    receipt.identity().symbol_name()
+                ),
+            );
+        }
+    }
+    if let Some(asserted) = q
         .timeframe
-        .unwrap_or_else(|| "M1".to_string())
-        .trim()
-        .to_uppercase();
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !asserted.eq_ignore_ascii_case(receipt.identity().timeframe().as_str()) {
+            return actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Indicator timeframe assertion disagrees with the exact dataset identity.",
+                &anyhow::anyhow!(
+                    "timeframe assertion {asserted:?} does not match {:?}",
+                    receipt.identity().timeframe().as_str()
+                ),
+            );
+        }
+    }
+    let symbol = receipt.identity().symbol_name().to_owned();
+    let timeframe = receipt.identity().timeframe().as_str().to_owned();
     let indicator = q
         .indicator
         .unwrap_or_else(|| "sma".to_string())
@@ -154,17 +205,10 @@ pub async fn indicators(
         params.insert("d_period".to_string(), d);
     }
 
-    let symbol_clone = symbol.clone();
-    let timeframe_clone = timeframe.clone();
     let indicator_clone = indicator.clone();
+    let config_path = state.config_path().to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        load_and_compute(
-            symbol_clone,
-            timeframe_clone,
-            indicator_clone,
-            params,
-            limit,
-        )
+        load_and_compute(&config_path, receipt, indicator_clone, params, limit)
     })
     .await;
 
@@ -184,10 +228,8 @@ pub async fn indicators(
         })
         .into_response(),
         Ok(Err(err)) => actionable_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Could not compute this indicator. If the chart shows candles for this \
-             symbol/timeframe, try a different period; otherwise the data window may \
-             be too short — scroll the chart to load more history, then retry.",
+            StatusCode::CONFLICT,
+            "Could not fully verify the exact dataset generation and compute this indicator.",
             &err,
         ),
         Err(join_err) => internal_panic("Computing the indicator", join_err),
@@ -195,81 +237,21 @@ pub async fn indicators(
 }
 
 fn load_and_compute(
-    symbol: String,
-    timeframe: String,
+    config_path: &std::path::Path,
+    receipt: ExactDatasetReceipt,
     indicator: String,
     params: HashMap<String, f64>,
     limit: usize,
 ) -> anyhow::Result<(usize, Vec<IndicatorLine>)> {
-    // F-553/F-576 closure (2026-05-25): resolved via the process-wide
-    // install so a non-default `--config` flag still works.
-    // Broker-passthrough (mirrors /chart): compute on LIVE broker bars so
-    // indicators work on every timeframe even when the local cache is
-    // short — EURUSD H1 had only 25 disk bars, too few for MACD's 26+9
-    // warm-up, so it 500'd. Fetch extra bars for the warm-up, then trim to
-    // `limit`. Falls back to the local Vortex cache when the broker is
-    // unreachable.
-    let fetch_count = (limit + 300).min(MAX_LIMIT);
-    let broker_ohlcv: Option<neoethos_data::Ohlcv> =
-        crate::app_services::broker_api::fetch_recent_chart_bars_blocking(
-            &symbol,
-            &timeframe,
-            fetch_count,
-        )
-        .ok()
-        .filter(|bars| !bars.is_empty())
-        .map(|bars| {
-            let n = bars.len();
-            let mut timestamp = Vec::with_capacity(n);
-            let mut open = Vec::with_capacity(n);
-            let mut high = Vec::with_capacity(n);
-            let mut low = Vec::with_capacity(n);
-            let mut close = Vec::with_capacity(n);
-            let mut volume = Vec::with_capacity(n);
-            for b in &bars {
-                timestamp.push(b.timestamp_ms);
-                open.push(b.open);
-                high.push(b.high);
-                low.push(b.low);
-                close.push(b.close);
-                volume.push(b.volume.unwrap_or(0) as f64);
-            }
-            neoethos_data::Ohlcv {
-                timestamp: Some(timestamp),
-                open,
-                high,
-                low,
-                close,
-                volume: Some(volume),
-            }
-        });
-
-    let ohlcv: neoethos_data::Ohlcv = match broker_ohlcv {
-        Some(b) => b,
-        None => {
-            let config_path = super::state::current_config_path();
-            let settings = Settings::from_yaml(&config_path)
-                .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
-            let dataset = load_symbol_dataset(&settings.system.data_dir, &symbol)
-                .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol}: {e}"))?;
-            dataset.frames.get(&timeframe).cloned().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "timeframe '{timeframe}' not in dataset for {symbol} (available: {})",
-                    dataset
-                        .frames
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?
-        }
-    };
+    let settings = Settings::from_yaml(config_path)
+        .map_err(|error| anyhow::anyhow!("{} not loadable: {error}", config_path.display()))?;
+    let frame = super::chart::load_exact_current_frame(&settings.system.data_dir, &receipt)?;
+    let ohlcv = frame.ohlcv();
 
     // Compute on the full series, then trim to the trailing `limit`
     // candles to match `/chart` semantics — trimming after compute avoids
     // edge effects at the window start (indicators need warm-up bars).
-    let lines_full = compute_single_indicator(&ohlcv, &indicator, &params)?;
+    let lines_full = compute_single_indicator(ohlcv, &indicator, &params)?;
     let total = ohlcv.len();
     let start = total.saturating_sub(limit);
     let trimmed: Vec<IndicatorLine> = lines_full

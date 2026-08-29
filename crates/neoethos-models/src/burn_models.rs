@@ -1,6 +1,6 @@
 // Production Burn Neural Network Models
 //
-// Pure-Rust deep learning models using Burn 0.20.
+// Pure-Rust deep learning models using Burn 0.21.
 // Default backend is NdArray CPU, with an optional pure-Rust WGPU lane.
 // Replaces legacy models (deep.py, mlp.py) — no legacy, no GIL.
 //
@@ -23,9 +23,9 @@ use burn::tensor::{DType, FloatDType, TensorData};
 use burn_ndarray::NdArray;
 #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
 use burn_wgpu::{Wgpu, WgpuDevice, graphics, init_setup};
-// Native CUDA backend takes priority over wgpu when both are enabled (the
-// `gpu-cuda` build pulls in burn-cuda); neural training then runs on the card
-// in f32, which Ampere supports natively (no BF16 matmul hazard).
+// Native CUDA takes priority over wgpu only when `burn-cuda-backend` is
+// explicitly enabled. That feature is separate from `gpu-cuda`; CUDA-enabled
+// Burn training runs on the selected card in f32 (no BF16 matmul hazard).
 #[cfg(feature = "burn-cuda-backend")]
 use burn_cuda::{Cuda, CudaDevice};
 
@@ -55,6 +55,52 @@ pub type InferBackend = Wgpu;
 pub type TrainBackend = Autodiff<NdArray>;
 #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
 pub type InferBackend = NdArray;
+
+/// Keeps the exact Burn CUDA stream's device and pinned-host allocator pools
+/// resident for a complete model lifecycle, then releases both pools.
+///
+/// Create this scope before any Burn tensors or models so their handles drop
+/// before the final synchronize-cleanup-synchronize sequence runs.
+#[cfg(feature = "burn-cuda-backend")]
+#[must_use = "the Burn CUDA residency scope must outlive all CUDA handles"]
+pub struct BurnCudaResidencyScope {
+    cuda_ordinal: usize,
+    cubecl_residency: Option<crate::cubecl_lifecycle::CubeClResidencyScope>,
+}
+
+#[cfg(feature = "burn-cuda-backend")]
+pub fn burn_cuda_residency_scope(cuda_ordinal: usize) -> BurnCudaResidencyScope {
+    let cubecl_residency = crate::cubecl_lifecycle::cubecl_residency_scope();
+    drop(crate::cubecl_lifecycle::cubecl_cuda_client(cuda_ordinal));
+    BurnCudaResidencyScope {
+        cuda_ordinal,
+        cubecl_residency: Some(cubecl_residency),
+    }
+}
+
+#[cfg(feature = "burn-cuda-backend")]
+impl Drop for BurnCudaResidencyScope {
+    fn drop(&mut self) {
+        // Burn CUDA enables Fusion by default. Dropping a FusionTensor only
+        // queues a DropOp in Burn's global fusion server; a raw CubeCL sync
+        // cannot see it, so the server's handle container would keep the GPU
+        // allocation live through pool cleanup. Backend::sync drains that
+        // exact stream and then synchronizes CubeCL before the shared scope
+        // releases the device and pinned-host pools.
+        let sync_failure =
+            <InferBackend as Backend>::sync(&CudaDevice::new(self.cuda_ordinal)).err();
+        let unwinding = std::thread::panicking();
+        if unwinding && let Some(error) = sync_failure.as_ref() {
+            eprintln!("Burn CUDA fusion drain also failed during unwind: {error:?}");
+        }
+
+        drop(self.cubecl_residency.take());
+
+        if !unwinding && let Some(error) = sync_failure {
+            panic!("Burn CUDA fusion drain failed: {error:?}");
+        }
+    }
+}
 
 #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
 fn initialize_wgpu_runtime(device: &<InferBackend as BackendTypes>::Device, policy_key: &str) {
@@ -107,6 +153,27 @@ fn backend_name_for_type<B: Backend>() -> String {
 
 fn external_execution_backend_for<B: Backend>() -> String {
     format!("external:{}", backend_name_for_type::<B>())
+}
+
+#[cfg(feature = "burn-cuda-backend")]
+fn ensure_burn_cuda_backend_type<B: Backend>() -> anyhow::Result<()> {
+    let backend_type = std::any::type_name::<B>().to_ascii_lowercase();
+    if backend_type.contains("burn_cuda")
+        || backend_type.contains("cubecl_cuda")
+        || backend_type.contains("cudaruntime")
+    {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "Burn CUDA backend requires native CUDA execution; backend type `{}` is not CUDA",
+        std::any::type_name::<B>()
+    ))
+}
+
+#[cfg(not(feature = "burn-cuda-backend"))]
+fn ensure_burn_cuda_backend_type<B: Backend>() -> anyhow::Result<()> {
+    let _ = std::marker::PhantomData::<B>;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +261,16 @@ pub(crate) fn validate_burn_device_selection(
         ));
     }
 
+    #[cfg(feature = "burn-cuda-backend")]
+    if !matches!(
+        execution_backend.as_str(),
+        "cuda" | "cuda_default" | "cuda_discrete_gpu" | "external:cuda"
+    ) {
+        return Err(anyhow::anyhow!(
+            "Burn CUDA backend requires native CUDA execution, got `{execution_backend}`"
+        ));
+    }
+
     match execution_backend.as_str() {
         "ndarray_cpu" => {
             if effective != "cpu" && effective != "external_device" {
@@ -234,8 +311,8 @@ pub(crate) fn validate_burn_device_selection(
             }
         }
         "cuda" | "cuda_default" | "cuda_discrete_gpu" => {
-            // Native Burn CUDA backend (gpu-cuda build): the A6000 is exposed as
-            // the canonical gpu:0 effective policy.
+            // Native Burn CUDA backend (`burn-cuda-backend` build): the effective
+            // policy preserves the exact selected CUDA ordinal as `gpu:N`.
             if effective != "gpu" && effective != "default" && !effective.starts_with("gpu:") {
                 return Err(anyhow::anyhow!(
                     "Burn runtime CUDA backend {execution_backend} is incompatible with effective policy {effective}"
@@ -259,24 +336,87 @@ pub(crate) fn validate_burn_device_selection(
     Ok(())
 }
 
-// CUDA device resolution for the Burn neural models. The VPS has a single
-// A6000 and the discovery stack already pins CUDA device 0, so every
-// accelerator request maps to the default CUDA device; a `cpu` request is
-// surfaced honestly in the effective policy (the Burn CUDA backend has no CPU
-// device — the genuinely-CPU build is the `burn-ndarray` fallback).
+pub(crate) fn validate_loaded_burn_device_identity(
+    surface: &str,
+    persisted_requested_policy: Option<&str>,
+    persisted_effective_policy: Option<&str>,
+    persisted_execution_backend: Option<&str>,
+    live: &BurnDeviceSelection,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "burn-cuda-backend")]
+    {
+        let persisted_requested_policy = persisted_requested_policy.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{surface} Burn CUDA artifact runtime identity is missing requested_device_policy"
+            )
+        })?;
+        let persisted_effective_policy = persisted_effective_policy.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{surface} Burn CUDA artifact runtime identity is missing effective_device_policy"
+            )
+        })?;
+        let persisted_execution_backend = persisted_execution_backend.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{surface} Burn CUDA artifact runtime identity is missing execution_backend"
+            )
+        })?;
+        let persisted = BurnDeviceSelection {
+            requested_policy: normalize_burn_device_policy(persisted_requested_policy),
+            effective_policy: normalize_effective_burn_device_policy(persisted_effective_policy),
+            execution_backend: persisted_execution_backend.trim().to_ascii_lowercase(),
+        };
+        validate_burn_device_selection(&persisted).context(format!(
+            "{surface} Burn CUDA artifact runtime identity is invalid"
+        ))?;
+        if persisted != *live {
+            return Err(anyhow::anyhow!(
+                "{surface} Burn CUDA artifact runtime identity drift: persisted {:?}, live {:?}",
+                persisted,
+                live
+            ));
+        }
+    }
+    #[cfg(not(feature = "burn-cuda-backend"))]
+    {
+        let _ = (
+            surface,
+            persisted_requested_policy,
+            persisted_effective_policy,
+            persisted_execution_backend,
+            live,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(feature = "burn-cuda-backend")]
-fn resolve_cuda_device_policy(_normalized: &str) -> (CudaDevice, String, String) {
-    // Single A6000: map every accelerator request to CUDA device 0 (discovery
-    // already pins device 0). The effective policy uses the canonical `gpu:0`
-    // form so it passes BOTH `validate_burn_device_selection` (effective must be
-    // gpu/gpu:N) AND the deep-model param validator (`is_supported_device_policy`
-    // accepts the `gpu:` prefix). Execution backend "cuda" is whitelisted in
-    // both validators.
-    (
-        CudaDevice::default(),
-        "gpu:0".to_string(),
+fn resolve_cuda_device_policy(normalized: &str) -> anyhow::Result<(CudaDevice, String, String)> {
+    let device_index = match normalized {
+        "auto" | "gpu" => 0,
+        "cpu" => {
+            return Err(anyhow::anyhow!(
+                "Burn CUDA backend cannot honor explicit CPU policy; use the ndarray CPU build"
+            ));
+        }
+        "external_device" => {
+            return Err(anyhow::anyhow!(
+                "Burn CUDA external_device policy requires an explicit on-device API"
+            ));
+        }
+        value if value.starts_with("gpu:") => value[4..].parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("invalid explicit Burn CUDA device policy `{normalized}`")
+        })?,
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported Burn CUDA device policy `{other}`"
+            ));
+        }
+    };
+    Ok((
+        CudaDevice::new(device_index),
+        format!("gpu:{device_index}"),
         "cuda".to_string(),
-    )
+    ))
 }
 
 #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
@@ -349,98 +489,102 @@ fn resolve_wgpu_device_policy(normalized: &str) -> (WgpuDevice, String, String) 
 
 pub fn resolve_infer_device(
     policy: &str,
-) -> (<InferBackend as BackendTypes>::Device, BurnDeviceSelection) {
+) -> anyhow::Result<(<InferBackend as BackendTypes>::Device, BurnDeviceSelection)> {
     let requested_policy = normalize_burn_device_policy(policy);
     #[cfg(feature = "burn-cuda-backend")]
     {
         let (device, effective_policy, execution_backend) =
-            resolve_cuda_device_policy(&requested_policy);
-        return (
+            resolve_cuda_device_policy(&requested_policy)?;
+        return Ok((
             device,
             BurnDeviceSelection {
                 requested_policy,
                 effective_policy,
                 execution_backend,
             },
-        );
+        ));
     }
     #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
     {
         let (device, effective_policy, execution_backend) =
             resolve_wgpu_device_policy(&requested_policy);
         initialize_wgpu_runtime(&device, &effective_policy);
-        return (
+        return Ok((
             device,
             BurnDeviceSelection {
                 requested_policy,
                 effective_policy,
                 execution_backend,
             },
-        );
+        ));
     }
     #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
     {
-        (
+        Ok((
             <InferBackend as BackendTypes>::Device::default(),
             BurnDeviceSelection {
                 requested_policy,
                 effective_policy: "cpu".to_string(),
                 execution_backend: "ndarray_cpu".to_string(),
             },
-        )
+        ))
     }
 }
 
 pub fn resolve_train_device(
     policy: &str,
-) -> (<TrainBackend as BackendTypes>::Device, BurnDeviceSelection) {
+) -> anyhow::Result<(<TrainBackend as BackendTypes>::Device, BurnDeviceSelection)> {
     let requested_policy = normalize_burn_device_policy(policy);
     #[cfg(feature = "burn-cuda-backend")]
     {
         let (device, effective_policy, execution_backend) =
-            resolve_cuda_device_policy(&requested_policy);
-        return (
+            resolve_cuda_device_policy(&requested_policy)?;
+        return Ok((
             device,
             BurnDeviceSelection {
                 requested_policy,
                 effective_policy,
                 execution_backend,
             },
-        );
+        ));
     }
     #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
     {
         let (device, effective_policy, execution_backend) =
             resolve_wgpu_device_policy(&requested_policy);
         initialize_wgpu_runtime(&device, &effective_policy);
-        return (
+        return Ok((
             device,
             BurnDeviceSelection {
                 requested_policy,
                 effective_policy,
                 execution_backend,
             },
-        );
+        ));
     }
     #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
     {
-        (
+        Ok((
             <TrainBackend as BackendTypes>::Device::default(),
             BurnDeviceSelection {
                 requested_policy,
                 effective_policy: "cpu".to_string(),
                 execution_backend: "ndarray_cpu".to_string(),
             },
-        )
+        ))
     }
 }
 
 pub fn default_infer_device() -> <InferBackend as BackendTypes>::Device {
-    resolve_infer_device("auto").0
+    resolve_infer_device("auto")
+        .expect("canonical Burn auto inference policy must resolve")
+        .0
 }
 
 pub fn default_train_device() -> <TrainBackend as BackendTypes>::Device {
-    resolve_train_device("auto").0
+    resolve_train_device("auto")
+        .expect("canonical Burn auto training policy must resolve")
+        .0
 }
 
 fn parse_accelerator_index(policy: &str) -> Option<usize> {
@@ -448,25 +592,25 @@ fn parse_accelerator_index(policy: &str) -> Option<usize> {
 }
 
 pub trait ManagedBurnBackend: Backend {
-    fn managed_device_and_selection() -> (Self::Device, BurnDeviceSelection);
+    fn managed_device_and_selection() -> anyhow::Result<(Self::Device, BurnDeviceSelection)>;
 
-    fn managed_device() -> Self::Device {
-        Self::managed_device_and_selection().0
+    fn managed_device() -> anyhow::Result<Self::Device> {
+        Ok(Self::managed_device_and_selection()?.0)
     }
 
-    fn managed_selection() -> BurnDeviceSelection {
-        Self::managed_device_and_selection().1
+    fn managed_selection() -> anyhow::Result<BurnDeviceSelection> {
+        Ok(Self::managed_device_and_selection()?.1)
     }
 }
 
 impl ManagedBurnBackend for TrainBackend {
-    fn managed_device_and_selection() -> (Self::Device, BurnDeviceSelection) {
+    fn managed_device_and_selection() -> anyhow::Result<(Self::Device, BurnDeviceSelection)> {
         resolve_train_device("auto")
     }
 }
 
 impl ManagedBurnBackend for InferBackend {
-    fn managed_device_and_selection() -> (Self::Device, BurnDeviceSelection) {
+    fn managed_device_and_selection() -> anyhow::Result<(Self::Device, BurnDeviceSelection)> {
         resolve_infer_device("auto")
     }
 }
@@ -2054,9 +2198,34 @@ fn resolve_burn_training_precision_for_backend<B: Backend>(
     // supported dtype OFF, with no config field and no artifact record, is a
     // second answer to a question the hardware already answers. Deleted
     // 2026-08-10; reported at startup if still exported.
-    let bf16_supported = supports_bf16;
+    // Burn 0.21 can report BF16 tensor support on native CUDA while its full
+    // training graph is still not mixed-dtype safe.  On the production
+    // 1768-feature MLP, all forward/backward/AdamW batches complete, but
+    // releasing an older best-model snapshot after the third validation makes
+    // Burn Fusion reject a deferred BF16/F32 binary op with DTypeMismatch.
+    // Keep native CUDA training honestly on FP32 until that complete lifecycle,
+    // rather than the primitive dtype probe alone, is supported.
+    let native_cuda_training = matches!(
+        selection.execution_backend.as_str(),
+        "cuda" | "cuda_default" | "cuda_discrete_gpu" | "external:cuda"
+    );
+    let bf16_supported = supports_bf16 && !native_cuda_training;
 
     match requested.as_str() {
+        "bf16" if native_cuda_training => (
+            BurnExecutionPrecision::Fp32,
+            Some(
+                "requested precision `bf16`; native Burn CUDA 0.21 BF16 optimizer/fusion graph is not production-safe across the complete model lifecycle; using `fp32`"
+                    .to_string(),
+            ),
+        ),
+        "auto" if native_cuda_training => (
+            BurnExecutionPrecision::Fp32,
+            Some(
+                "auto precision selects `fp32` for native Burn CUDA 0.21 because its BF16 optimizer/fusion graph is not production-safe across the complete model lifecycle"
+                    .to_string(),
+            ),
+        ),
         "bf16" if bf16_supported => (BurnExecutionPrecision::Bf16, None),
         "auto" if bf16_supported => (BurnExecutionPrecision::Bf16, None),
         "fp8" | "bf4" => {
@@ -2186,6 +2355,7 @@ pub fn train_model<B, M>(
 where
     B: AutodiffBackend + ManagedBurnBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
 {
     let (model, report) = train_model_with_report::<B, M>(model, x_data, y_raw, config)?;
     Ok((model, report.best_observed_loss()))
@@ -2201,8 +2371,9 @@ pub fn train_model_with_report<B, M>(
 where
     B: AutodiffBackend + ManagedBurnBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
 {
-    let (device, selection) = B::managed_device_and_selection();
+    let (device, selection) = B::managed_device_and_selection()?;
     train_model_with_report_with_selection::<B, M>(
         model, x_data, y_raw, config, &device, &selection,
     )
@@ -2219,6 +2390,7 @@ pub fn train_model_with_report_on_device<B, M>(
 where
     B: AutodiffBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
 {
     train_model_with_report_with_selection::<B, M>(model, x_data, y_raw, config, device, selection)
 }
@@ -2234,6 +2406,7 @@ pub fn train_model_with_report_with_selection<B, M>(
 where
     B: AutodiffBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
 {
     train_model_with_report_with_selection_and_precision::<B, M>(
         model, x_data, y_raw, config, device, selection, None,
@@ -2252,6 +2425,7 @@ pub fn train_model_with_report_with_selection_and_precision<B, M>(
 where
     B: AutodiffBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
 {
     train_model_with_report_with_external_val::<B, M>(
         model,
@@ -2288,7 +2462,9 @@ pub fn train_model_with_report_with_external_val<B, M>(
 where
     B: AutodiffBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
 {
+    ensure_burn_cuda_backend_type::<B>()?;
     validate_train_config(config)?;
     validate_burn_device_selection(selection)?;
     let n_samples = x_data.nrows();
@@ -2427,12 +2603,9 @@ where
 
                 let logits = BurnForward::forward_pass(&model, x_batch);
                 let loss = cross_entropy_loss(logits, y_batch, &class_weights, device);
-                // Cast the loss to f32 BEFORE reading it back: on the CUDA
-                // backend `training_dtype` resolves to bf16 (Ampere supports it),
-                // so the loss tensor is bf16 and `to_vec::<f32>()` would fail with
-                // a dtype mismatch ("extract Burn training loss"). The cast is a
-                // no-op when already f32. bf16 training (forward/backward) is
-                // unaffected — only the scalar readback is normalized.
+                // Normalize the scalar readback to f32. This is a no-op for the
+                // native CUDA path, whose complete training lifecycle is FP32;
+                // another backend may still select BF16 when it is safe there.
                 let loss_val = scalar_loss_value(
                     cast_tensor_to_dtype(loss.clone(), DType::F32).into_data(),
                     "extract Burn training loss",
@@ -2480,10 +2653,17 @@ where
                 );
                 continue;
             };
-            let x_val = array2_to_tensor_with_dtype::<B>(x_val, device, training_dtype);
-            let y_val = labels_to_tensor::<B>(y_val, device);
-            let val_logits = BurnForward::forward_pass(&model, x_val);
-            let val_loss = cross_entropy_loss(val_logits, y_val, &class_weights, device);
+            // Burn's official validation boundary converts an autodiff module to
+            // its inner backend. Running this pass on `B` would register a graph
+            // with no subsequent backward call, leaving its Fusion bindings live
+            // after the final epoch.
+            let valid_model = model.valid();
+            let x_val =
+                array2_to_tensor_with_dtype::<B::InnerBackend>(x_val, device, training_dtype);
+            let y_val = labels_to_tensor::<B::InnerBackend>(y_val, device);
+            let val_logits = BurnForward::forward_pass(&valid_model, x_val);
+            let val_loss =
+                cross_entropy_loss::<B::InnerBackend>(val_logits, y_val, &class_weights, device);
             let vl = scalar_loss_value(
                 cast_tensor_to_dtype(val_loss, DType::F32).into_data(),
                 "extract Burn validation loss",
@@ -2595,7 +2775,7 @@ pub fn predict_proba_checked_with_selection<B: ManagedBurnBackend, M: BurnForwar
     x_data: &Array2<f32>,
     batch_size: usize,
 ) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
-    let (device, selection) = B::managed_device_and_selection();
+    let (device, selection) = B::managed_device_and_selection()?;
     predict_proba_checked_on_device_with_selection::<B, M>(
         model, x_data, batch_size, &device, &selection,
     )
@@ -2624,6 +2804,7 @@ pub fn predict_proba_checked_on_device_with_selection<B: Backend, M: BurnForward
     device: &B::Device,
     selection: &BurnDeviceSelection,
 ) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    ensure_burn_cuda_backend_type::<B>()?;
     validate_burn_device_selection(selection)?;
     if batch_size == 0 {
         return Err(anyhow::anyhow!(
@@ -2667,6 +2848,345 @@ pub fn predict_proba_checked_on_device_with_selection<B: Backend, M: BurnForward
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "burn-cuda-backend")]
+    #[test]
+    fn burn_cuda_auto_precision_runs_three_epoch_real_kernels_in_fp32() -> anyhow::Result<()> {
+        use burn_fusion::{inspect::FusionInspector, stream::StreamId};
+
+        const ROWS: usize = 128;
+
+        let _cuda_residency = burn_cuda_residency_scope(0);
+
+        let fusion_inspector = FusionInspector::install(StreamId::current());
+        <InferBackend as Backend>::sync(&CudaDevice::new(0))
+            .context("synchronize Burn Fusion before the low-level CUDA handle baseline")?;
+        fusion_inspector.set_baseline();
+
+        let kernel_result = (|| -> anyhow::Result<()> {
+            let (train_device, train_selection) = resolve_train_device("gpu:0")?;
+            assert_eq!(train_device.index, 0);
+            assert_eq!(train_selection.effective_policy, "gpu:0");
+            assert_eq!(train_selection.execution_backend, "cuda");
+
+            let model = BurnMLPConfig::new(2).init::<TrainBackend>(&train_device);
+            let features = Array2::from_shape_vec(
+                (ROWS, 2),
+                (0..ROWS * 2).map(|index| index as f32 * 0.005).collect(),
+            )?;
+            let labels = (0..ROWS)
+                .map(|index| match index % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>();
+            let config = TrainConfig {
+                batch_size: 16,
+                max_epochs: 3,
+                patience: 3,
+                ..TrainConfig::default()
+            };
+            let (_trained, report) = train_model_with_report_on_device::<TrainBackend, _>(
+                model,
+                &features,
+                &labels,
+                &config,
+                &train_device,
+                &train_selection,
+            )?;
+            assert_eq!(report.execution_backend, "cuda");
+            assert_eq!(report.dataset_rows, ROWS);
+            assert!(report.train_rows > 0);
+            assert!(report.val_rows > 0);
+            assert_eq!(report.epochs_ran, 3);
+            assert_eq!(report.training_precision, "fp32");
+            assert!(
+                report
+                    .training_precision_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("BF16 optimizer/fusion graph")
+            );
+
+            let (infer_device, infer_selection) = resolve_infer_device("gpu:0")?;
+            let infer_model = BurnMLPConfig::new(2).init::<InferBackend>(&infer_device);
+            let (probabilities, returned_selection) =
+                predict_proba_checked_on_device_with_selection::<InferBackend, _>(
+                    &infer_model,
+                    &features.slice(ndarray::s![..4, ..]).to_owned(),
+                    4,
+                    &infer_device,
+                    &infer_selection,
+                )?;
+            assert_eq!(returned_selection, infer_selection);
+            assert_eq!(probabilities.dim(), (4, 3));
+            assert!(probabilities.iter().all(|value| value.is_finite()));
+            Ok(())
+        })();
+
+        <InferBackend as Backend>::sync(&CudaDevice::new(0))
+            .context("drain Burn Fusion after the low-level CUDA work scope")?;
+        let leaked_handles = fusion_inspector.new_handles_since_baseline();
+        assert!(
+            leaked_handles.is_empty(),
+            "Burn Fusion retained CUDA handles after lexical scope teardown: {leaked_handles:?}"
+        );
+        kernel_result?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "deliberate production-shape CPU/GPU performance benchmark"]
+    fn burn_production_shape_cpu_gpu_benchmark() -> anyhow::Result<()> {
+        const BASE_ROWS: usize = 4_692;
+        const BASE_HPO_ROWS: usize = 3_734;
+        const FEATURES: usize = 1_768;
+        const HIDDEN_DIM: usize = 256;
+        const LAYERS: usize = 3;
+        const DEFAULT_BATCH_SIZE: usize = 1_024;
+        const EPOCHS: usize = 3;
+        const MAX_ROW_MULTIPLIER: usize = 16;
+        const MAX_PARALLEL_JOBS: usize = 16;
+
+        let positive_env = |name: &str, default: usize| -> anyhow::Result<usize> {
+            let Some(raw) = std::env::var_os(name) else {
+                return Ok(default);
+            };
+            let raw = raw
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("{name} must be valid UTF-8"))?;
+            let value = raw
+                .parse::<usize>()
+                .with_context(|| format!("parse positive integer from {name}={raw:?}"))?;
+            if value == 0 {
+                anyhow::bail!("{name} must be greater than zero");
+            }
+            Ok(value)
+        };
+        let row_multiplier = positive_env("NEOETHOS_BURN_BENCH_ROW_MULTIPLIER", 1)?;
+        if row_multiplier > MAX_ROW_MULTIPLIER {
+            anyhow::bail!("NEOETHOS_BURN_BENCH_ROW_MULTIPLIER must be <= {MAX_ROW_MULTIPLIER}");
+        }
+        let rows = BASE_ROWS
+            .checked_mul(row_multiplier)
+            .context("scale benchmark rows without overflow")?;
+        let hpo_rows = BASE_HPO_ROWS
+            .checked_mul(row_multiplier)
+            .context("scale benchmark HPO rows without overflow")?;
+        let batch_size = positive_env("NEOETHOS_BURN_BENCH_BATCH_SIZE", DEFAULT_BATCH_SIZE)?;
+        let parallel_jobs = positive_env("NEOETHOS_BURN_BENCH_PARALLEL_JOBS", 1)?;
+        if parallel_jobs > MAX_PARALLEL_JOBS {
+            anyhow::bail!("NEOETHOS_BURN_BENCH_PARALLEL_JOBS must be <= {MAX_PARALLEL_JOBS}");
+        }
+
+        #[cfg(feature = "burn-cuda-backend")]
+        let _cuda_residency = burn_cuda_residency_scope(0);
+
+        let run_job = |job_index: usize| -> anyhow::Result<serde_json::Value> {
+            let requested_device = if cfg!(feature = "burn-cuda-backend") {
+                "gpu:0"
+            } else {
+                "cpu"
+            };
+            let (train_device, train_selection) = resolve_train_device(requested_device)?;
+            let features = Array2::from_shape_fn((rows, FEATURES), |(row, column)| {
+                let mixed = (row.wrapping_mul(131) + column.wrapping_mul(17)) % 2_048;
+                let centered = mixed as f32 / 1_024.0 - 1.0;
+                let trend = (row % 97) as f32 / 512.0 - 0.09375;
+                centered + trend
+            });
+            let labels = (0..rows)
+                .map(|row| match row % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>();
+            let hpo_features = features.slice(ndarray::s![..hpo_rows, ..]).to_owned();
+            let train_config = TrainConfig {
+                batch_size,
+                max_epochs: EPOCHS,
+                patience: 8,
+                seed: 42 + job_index as u64,
+                ..TrainConfig::default()
+            };
+
+            let run_phase = |phase: &str,
+                             frame: &Array2<f32>,
+                             phase_labels: &[i32]|
+             -> anyhow::Result<(f64, BurnTrainingReport)> {
+                <TrainBackend as Backend>::sync(&train_device)
+                    .with_context(|| format!("synchronize Burn backend before {phase}"))?;
+                let started = std::time::Instant::now();
+                let model = BurnMLPConfig::new(FEATURES)
+                    .with_hidden_dim(HIDDEN_DIM)
+                    .with_n_layers(LAYERS)
+                    .with_n_classes(3)
+                    .with_dropout(0.1)
+                    .init::<TrainBackend>(&train_device);
+                let (trained, report) =
+                    train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                        model,
+                        frame,
+                        phase_labels,
+                        &train_config,
+                        &train_device,
+                        &train_selection,
+                        Some("fp32"),
+                    )?;
+                drop(trained);
+                <TrainBackend as Backend>::sync(&train_device)
+                    .with_context(|| format!("synchronize Burn backend after {phase}"))?;
+                Ok((started.elapsed().as_secs_f64(), report))
+            };
+
+            let (hpo_seconds, hpo_report) = run_phase("hpo", &hpo_features, &labels[..hpo_rows])?;
+            let (refit_seconds, refit_report) = run_phase("full_refit", &features, &labels)?;
+            let total_seconds = hpo_seconds + refit_seconds;
+
+            assert_eq!(hpo_report.dataset_rows, hpo_rows);
+            assert_eq!(refit_report.dataset_rows, rows);
+            assert_eq!(hpo_report.epochs_ran, EPOCHS);
+            assert_eq!(refit_report.epochs_ran, EPOCHS);
+            assert_eq!(hpo_report.batch_size, batch_size);
+            assert_eq!(refit_report.batch_size, batch_size);
+            assert_eq!(hpo_report.training_precision, "fp32");
+            assert_eq!(refit_report.training_precision, "fp32");
+            Ok(serde_json::json!({
+                "job_index": job_index,
+                "execution_backend": train_selection.execution_backend,
+                "effective_device_policy": train_selection.effective_policy,
+                "hpo_seconds": hpo_seconds,
+                "full_refit_seconds": refit_seconds,
+                "total_training_seconds": total_seconds,
+                "hpo_best_loss": hpo_report.best_loss,
+                "refit_best_loss": refit_report.best_loss,
+            }))
+        };
+
+        let wall_started = std::time::Instant::now();
+        let job_results = std::thread::scope(|scope| -> anyhow::Result<Vec<serde_json::Value>> {
+            let mut handles = Vec::with_capacity(parallel_jobs);
+            for job_index in 0..parallel_jobs {
+                let run_job = &run_job;
+                handles.push(scope.spawn(move || run_job(job_index)));
+            }
+            let mut results = Vec::with_capacity(parallel_jobs);
+            for handle in handles {
+                results.push(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("parallel Burn benchmark job panicked"))??,
+                );
+            }
+            Ok(results)
+        })?;
+        let wall_seconds = wall_started.elapsed().as_secs_f64();
+        let mut job_seconds = job_results
+            .iter()
+            .map(|result| {
+                result["total_training_seconds"]
+                    .as_f64()
+                    .context("benchmark job must report total_training_seconds")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let total_training_seconds_sum = job_seconds.iter().sum::<f64>();
+        job_seconds.sort_by(f64::total_cmp);
+        let median_job_seconds = if job_seconds.len() % 2 == 0 {
+            let upper = job_seconds.len() / 2;
+            (job_seconds[upper - 1] + job_seconds[upper]) * 0.5
+        } else {
+            job_seconds[job_seconds.len() / 2]
+        };
+        for result in &job_results {
+            println!("NEOETHOS_CPU_GPU_BENCHMARK_JOB={result}");
+        }
+        println!(
+            "NEOETHOS_CPU_GPU_BENCHMARK={}",
+            serde_json::json!({
+                "schema": "neoethos.burn-cpu-gpu-production-shape-benchmark.v3",
+                "compiled_backend": active_burn_backend_name(),
+                "rows": rows,
+                "hpo_rows": hpo_rows,
+                "row_multiplier": row_multiplier,
+                "features": FEATURES,
+                "hidden_dim": HIDDEN_DIM,
+                "layers": LAYERS,
+                "batch_size": batch_size,
+                "epochs_per_phase": EPOCHS,
+                "parallel_jobs": parallel_jobs,
+                "feature_matrix_bytes_per_job": rows * FEATURES * std::mem::size_of::<f32>(),
+                "wall_seconds": wall_seconds,
+                "total_training_seconds_sum": total_training_seconds_sum,
+                "median_job_seconds": median_job_seconds,
+                "concurrency_overlap_factor": total_training_seconds_sum / wall_seconds,
+                "jobs_per_second": parallel_jobs as f64 / wall_seconds,
+                "job_results": job_results,
+            })
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "burn-cuda-backend")]
+    #[test]
+    fn burn_cuda_rejects_cpu_and_malformed_device_policies() {
+        assert!(resolve_train_device("cpu").is_err());
+        assert!(resolve_infer_device("gpu:not-an-index").is_err());
+        let (device, selection) =
+            resolve_train_device("gpu:7").expect("syntactically valid exact CUDA ordinal");
+        assert_eq!(device.index, 7);
+        assert_eq!(selection.effective_policy, "gpu:7");
+    }
+
+    #[cfg(feature = "burn-cuda-backend")]
+    #[test]
+    fn burn_cuda_rejects_non_cuda_backend_types_and_runtime_selections() {
+        let backend_error = ensure_burn_cuda_backend_type::<burn_ndarray::NdArray>()
+            .expect_err("Burn CUDA build must reject an NdArray backend type");
+        assert!(backend_error.to_string().contains("requires native CUDA"));
+
+        let selection = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "ndarray_cpu".to_string(),
+        };
+        let selection_error = validate_burn_device_selection(&selection)
+            .expect_err("Burn CUDA build must reject a CPU runtime selection");
+        assert!(selection_error.to_string().contains("requires native CUDA"));
+    }
+
+    #[cfg(feature = "burn-cuda-backend")]
+    #[test]
+    fn burn_cuda_loaded_artifact_identity_is_complete_and_exact() {
+        let live = BurnDeviceSelection {
+            requested_policy: "gpu:0".to_string(),
+            effective_policy: "gpu:0".to_string(),
+            execution_backend: "cuda".to_string(),
+        };
+        validate_loaded_burn_device_identity(
+            "test",
+            Some("gpu:0"),
+            Some("gpu:0"),
+            Some("cuda"),
+            &live,
+        )
+        .expect("exact CUDA artifact identity must pass");
+        assert!(
+            validate_loaded_burn_device_identity(
+                "test",
+                Some("gpu:0"),
+                Some("cpu"),
+                Some("ndarray_cpu"),
+                &live,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_loaded_burn_device_identity("test", Some("gpu:0"), None, Some("cuda"), &live,)
+                .is_err()
+        );
+    }
 
     #[test]
     fn sparsemax_is_normalized_and_sparse() {
@@ -3117,7 +3637,7 @@ mod tests {
                 _ => 1,
             })
             .collect::<Vec<_>>();
-        let selection = resolve_train_device("cpu").1;
+        let selection = resolve_train_device("auto")?.1;
 
         let (_trained, report) = train_model_with_report_on_device::<TrainBackend, _>(
             model,
@@ -3137,19 +3657,32 @@ mod tests {
 
     #[test]
     fn resolve_train_device_cpu_policy_reports_consistent_backend() {
-        let (_device, selection) = resolve_train_device("cpu");
+        #[cfg(feature = "burn-cuda-backend")]
+        {
+            let err = resolve_train_device("cpu")
+                .expect_err("CUDA-only Burn build must reject explicit CPU policy");
+            assert!(err.to_string().contains("cannot honor explicit CPU policy"));
+            return;
+        }
+
+        #[cfg(not(feature = "burn-cuda-backend"))]
+        let (_device, selection) =
+            resolve_train_device("cpu").expect("CPU-capable Burn backend must resolve CPU");
+        #[cfg(not(feature = "burn-cuda-backend"))]
         assert_eq!(selection.requested_policy, "cpu");
+        #[cfg(not(feature = "burn-cuda-backend"))]
         assert_eq!(selection.effective_policy, "cpu");
-        #[cfg(feature = "burn-wgpu-backend")]
+        #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
         assert_eq!(selection.execution_backend, "wgpu_cpu");
-        #[cfg(not(feature = "burn-wgpu-backend"))]
+        #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
         assert_eq!(selection.execution_backend, "ndarray_cpu");
     }
 
     #[cfg(feature = "burn-wgpu-backend")]
     #[test]
     fn resolve_train_device_cuda_alias_reports_wgpu_runtime_truthfully() {
-        let (_device, selection) = resolve_train_device("cuda:2");
+        let (_device, selection) =
+            resolve_train_device("cuda:2").expect("wgpu CUDA alias must resolve");
         assert_eq!(selection.requested_policy, "gpu:2");
         assert_eq!(selection.effective_policy, "gpu:2");
         assert_eq!(selection.execution_backend, "wgpu_discrete_gpu");
@@ -3158,7 +3691,8 @@ mod tests {
     #[cfg(feature = "burn-wgpu-backend")]
     #[test]
     fn resolve_infer_device_default_gpu_reports_wgpu_default_backend() {
-        let (_device, selection) = resolve_infer_device("gpu");
+        let (_device, selection) =
+            resolve_infer_device("gpu").expect("wgpu default GPU must resolve");
         assert_eq!(selection.requested_policy, "gpu");
         assert_eq!(selection.effective_policy, "default");
         assert_eq!(selection.execution_backend, "wgpu_default");
@@ -3187,7 +3721,7 @@ mod tests {
         let selection = BurnDeviceSelection {
             requested_policy: "external_device".to_string(),
             effective_policy: "external_device".to_string(),
-            execution_backend: active_burn_backend_name().to_string(),
+            execution_backend: external_execution_backend_for::<InferBackend>(),
         };
 
         let (_probabilities, returned_selection) = predict_proba_on_device_with_selection::<
@@ -3239,6 +3773,12 @@ mod tests {
             &selection,
         )
         .expect_err("incoherent runtime provenance must fail");
+        #[cfg(feature = "burn-cuda-backend")]
+        assert!(
+            err.to_string().contains("requires native CUDA"),
+            "unexpected error: {err}"
+        );
+        #[cfg(not(feature = "burn-cuda-backend"))]
         assert!(
             err.to_string()
                 .contains("incompatible with effective policy cpu"),
@@ -3261,6 +3801,12 @@ mod tests {
             &model, &x, 16, &device, &selection,
         )
         .expect_err("incoherent runtime provenance must fail");
+        #[cfg(feature = "burn-cuda-backend")]
+        assert!(
+            err.to_string().contains("requires native CUDA"),
+            "unexpected error: {err}"
+        );
+        #[cfg(not(feature = "burn-cuda-backend"))]
         assert!(
             err.to_string()
                 .contains("incompatible with effective policy cpu"),

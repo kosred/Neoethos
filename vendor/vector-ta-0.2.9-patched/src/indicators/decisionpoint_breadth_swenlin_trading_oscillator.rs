@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use std::mem::ManuallyDrop;
 use thiserror::Error;
 
@@ -45,10 +27,6 @@ pub struct DecisionPointBreadthSwenlinTradingOscillatorOutput {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct DecisionPointBreadthSwenlinTradingOscillatorParams;
 
 #[derive(Debug, Clone)]
@@ -380,7 +358,6 @@ pub fn decisionpoint_breadth_swenlin_trading_oscillator_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn decisionpoint_breadth_swenlin_trading_oscillator_into(
     input: &DecisionPointBreadthSwenlinTradingOscillatorInput,
@@ -481,7 +458,7 @@ pub fn decisionpoint_breadth_swenlin_trading_oscillator_batch_with_kernel(
         other => {
             return Err(
                 DecisionPointBreadthSwenlinTradingOscillatorError::InvalidKernelForBatch(other),
-            )
+            );
         }
     };
     decisionpoint_breadth_swenlin_trading_oscillator_batch_par_slices(
@@ -643,299 +620,6 @@ pub fn decisionpoint_breadth_swenlin_trading_oscillator_batch_inner_into(
     out[..cols].fill(f64::NAN);
     decisionpoint_breadth_swenlin_trading_oscillator_row(advancing, declining, &mut out[..cols]);
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "decisionpoint_breadth_swenlin_trading_oscillator")]
-#[pyo3(signature = (advancing, declining, kernel=None))]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_py<'py>(
-    py: Python<'py>,
-    advancing: PyReadonlyArray1<'py, f64>,
-    declining: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let advancing = advancing.as_slice()?;
-    let declining = declining.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = DecisionPointBreadthSwenlinTradingOscillatorInput::from_slices(
-        advancing,
-        declining,
-        DecisionPointBreadthSwenlinTradingOscillatorParams,
-    );
-    let values = py
-        .allow_threads(|| {
-            decisionpoint_breadth_swenlin_trading_oscillator_with_kernel(&input, kern)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?
-        .values;
-    Ok(values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DecisionPointBreadthSwenlinTradingOscillatorStream")]
-pub struct DecisionPointBreadthSwenlinTradingOscillatorStreamPy {
-    inner: DecisionPointBreadthSwenlinTradingOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DecisionPointBreadthSwenlinTradingOscillatorStreamPy {
-    #[new]
-    fn new() -> PyResult<Self> {
-        Ok(Self {
-            inner: DecisionPointBreadthSwenlinTradingOscillatorStream::try_new(
-                DecisionPointBreadthSwenlinTradingOscillatorParams,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-
-    fn update(&mut self, advancing: f64, declining: f64) -> Option<f64> {
-        self.inner.update(advancing, declining)
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.inner.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "decisionpoint_breadth_swenlin_trading_oscillator_batch")]
-#[pyo3(signature = (advancing, declining, kernel=None))]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    advancing: PyReadonlyArray1<'py, f64>,
-    declining: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let advancing = advancing.as_slice()?;
-    let declining = declining.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    if advancing.len() != declining.len() {
-        return Err(PyValueError::new_err(
-            "Advancing/declining slice length mismatch",
-        ));
-    }
-
-    let rows = 1usize;
-    let cols = advancing.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        let batch = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        decisionpoint_breadth_swenlin_trading_oscillator_batch_inner_into(
-            advancing,
-            declining,
-            &DecisionPointBreadthSwenlinTradingOscillatorBatchRange,
-            batch,
-            true,
-            out_slice,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item("params", Vec::<f64>::new().into_pyarray(py))?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_decisionpoint_breadth_swenlin_trading_oscillator_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(
-        decisionpoint_breadth_swenlin_trading_oscillator_py,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        decisionpoint_breadth_swenlin_trading_oscillator_batch_py,
-        module
-    )?)?;
-    module.add_class::<DecisionPointBreadthSwenlinTradingOscillatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "decisionpoint_breadth_swenlin_trading_oscillator_js")]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_js(
-    advancing: &[f64],
-    declining: &[f64],
-) -> Result<Vec<f64>, JsValue> {
-    let input = DecisionPointBreadthSwenlinTradingOscillatorInput::from_slices(
-        advancing,
-        declining,
-        DecisionPointBreadthSwenlinTradingOscillatorParams,
-    );
-    decisionpoint_breadth_swenlin_trading_oscillator(&input)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_into(
-    advancing_ptr: *const f64,
-    declining_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if advancing_ptr.is_null() || declining_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    unsafe {
-        let advancing = std::slice::from_raw_parts(advancing_ptr, len);
-        let declining = std::slice::from_raw_parts(declining_ptr, len);
-        let input = DecisionPointBreadthSwenlinTradingOscillatorInput::from_slices(
-            advancing,
-            declining,
-            DecisionPointBreadthSwenlinTradingOscillatorParams,
-        );
-        if advancing_ptr == out_ptr || declining_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            decisionpoint_breadth_swenlin_trading_oscillator_into_slice(
-                &mut temp,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            decisionpoint_breadth_swenlin_trading_oscillator_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DecisionPointBreadthSwenlinTradingOscillatorBatchConfig {}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DecisionPointBreadthSwenlinTradingOscillatorBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<DecisionPointBreadthSwenlinTradingOscillatorParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "decisionpoint_breadth_swenlin_trading_oscillator_batch_js")]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_batch_js(
-    advancing: &[f64],
-    declining: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let _: DecisionPointBreadthSwenlinTradingOscillatorBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let output = decisionpoint_breadth_swenlin_trading_oscillator_batch_with_kernel(
-        advancing,
-        declining,
-        &DecisionPointBreadthSwenlinTradingOscillatorBatchRange,
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&DecisionPointBreadthSwenlinTradingOscillatorBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_batch_into(
-    advancing_ptr: *const f64,
-    declining_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<usize, JsValue> {
-    if advancing_ptr.is_null() || declining_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    unsafe {
-        let advancing = std::slice::from_raw_parts(advancing_ptr, len);
-        let declining = std::slice::from_raw_parts(declining_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        decisionpoint_breadth_swenlin_trading_oscillator_batch_inner_into(
-            advancing,
-            declining,
-            &DecisionPointBreadthSwenlinTradingOscillatorBatchRange,
-            Kernel::Auto,
-            false,
-            out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(1)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_output_into_js(
-    advancing: &[f64],
-    declining: &[f64],
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = decisionpoint_breadth_swenlin_trading_oscillator_js(advancing, declining)?;
-    crate::write_wasm_f64_output(
-        "decisionpoint_breadth_swenlin_trading_oscillator_output_into_js",
-        &values,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn decisionpoint_breadth_swenlin_trading_oscillator_batch_output_into_js(
-    advancing: &[f64],
-    declining: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value =
-        decisionpoint_breadth_swenlin_trading_oscillator_batch_js(advancing, declining, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "decisionpoint_breadth_swenlin_trading_oscillator_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

@@ -1,27 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -47,10 +29,6 @@ pub struct MacdOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MacdParams {
     pub fast_period: Option<usize>,
     pub slow_period: Option<usize>,
@@ -224,7 +202,9 @@ pub enum MacdError {
     EmptyInputData,
     #[error("macd: All values are NaN.")]
     AllValuesNaN,
-    #[error("macd: Invalid period: fast = {fast}, slow = {slow}, signal = {signal}, data length = {data_len}")]
+    #[error(
+        "macd: Invalid period: fast = {fast}, slow = {slow}, signal = {signal}, data length = {data_len}"
+    )]
     InvalidPeriod {
         fast: usize,
         slow: usize,
@@ -882,7 +862,7 @@ fn macd_compute_into(
         );
     }
 
-    use crate::indicators::moving_averages::ma::{ma, MaData};
+    use crate::indicators::moving_averages::ma::{MaData, ma};
 
     debug_assert_eq!(macd_out.len(), data.len());
     debug_assert_eq!(signal_out.len(), data.len());
@@ -1024,7 +1004,6 @@ pub fn macd_with_kernel(input: &MacdInput, kernel: Kernel) -> Result<MacdOutput,
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn macd_into(
     input: &MacdInput,
     macd_out: &mut [f64],
@@ -1128,7 +1107,7 @@ pub unsafe fn macd_scalar(
         return macd_scalar_classic_ema(data, fast, slow, signal, first);
     }
 
-    use crate::indicators::moving_averages::ma::{ma, MaData};
+    use crate::indicators::moving_averages::ma::{MaData, ma};
     let len = data.len();
     let fast_ma = ma(ma_type, MaData::Slice(data), fast).map_err(|_| MacdError::AllValuesNaN)?;
     let slow_ma = ma(ma_type, MaData::Slice(data), slow).map_err(|_| MacdError::AllValuesNaN)?;
@@ -1770,899 +1749,11 @@ pub fn macd_batch_par_slice(
     })
 }
 
-#[cfg(any(feature = "python", feature = "wasm"))]
-pub fn macd_batch_inner_into(
-    data: &[f64],
-    sweep: &MacdBatchRange,
-    _simd: Kernel,
-    _fill_invalid: bool,
-    macd_out: &mut [f64],
-    signal_out: &mut [f64],
-    hist_out: &mut [f64],
-) -> Result<Vec<MacdParams>, MacdError> {
-    let combos = expand_grid(sweep)?;
-    let rows = combos.len();
-    let cols = data.len();
-    if let Some(expected) = rows.checked_mul(cols) {
-        if macd_out.len() != expected || signal_out.len() != expected || hist_out.len() != expected
-        {
-            let got = macd_out.len().max(signal_out.len()).max(hist_out.len());
-            return Err(MacdError::OutputLengthMismatch { expected, got });
-        }
-    } else {
-        return Err(MacdError::InvalidRange {
-            start: sweep.fast_period.0,
-            end: sweep.fast_period.1,
-            step: sweep.fast_period.2,
-        });
-    }
-    let first = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
-
-    for (row, prm) in combos.iter().enumerate() {
-        let r0 = row * cols;
-        let r1 = r0 + cols;
-
-        let fast_period = prm.fast_period.unwrap_or(12);
-        let slow_period = prm.slow_period.unwrap_or(26);
-        let signal_period = prm.signal_period.unwrap_or(9);
-        let macd_warmup = first + slow_period - 1;
-        let signal_warmup = first + slow_period + signal_period - 2;
-
-        for i in 0..macd_warmup.min(cols) {
-            macd_out[r0 + i] = f64::NAN;
-        }
-        for i in 0..signal_warmup.min(cols) {
-            signal_out[r0 + i] = f64::NAN;
-            hist_out[r0 + i] = f64::NAN;
-        }
-
-        let _ = macd_compute_into(
-            data,
-            fast_period,
-            slow_period,
-            signal_period,
-            prm.ma_type.as_deref().unwrap_or("ema"),
-            first,
-            &mut macd_out[r0..r1],
-            &mut signal_out[r0..r1],
-            &mut hist_out[r0..r1],
-        );
-    }
-    Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "macd")]
-#[pyo3(signature = (data, fast_period, slow_period, signal_period, ma_type, kernel=None))]
-pub fn macd_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    use numpy::PyArray1;
-
-    let slice_in = data.as_slice()?;
-    let len = slice_in.len();
-
-    let first = slice_in.iter().position(|x| !x.is_nan()).unwrap_or(0);
-    let macd_warmup = first + slow_period - 1;
-    let signal_warmup = first + slow_period + signal_period - 2;
-
-    let macd_arr = unsafe { PyArray1::<f64>::new(py, [len], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [len], false) };
-    let hist_arr = unsafe { PyArray1::<f64>::new(py, [len], false) };
-
-    let macd_slice = unsafe { macd_arr.as_slice_mut()? };
-    let signal_slice = unsafe { signal_arr.as_slice_mut()? };
-    let hist_slice = unsafe { hist_arr.as_slice_mut()? };
-
-    if macd_warmup <= len {
-        macd_slice[..macd_warmup].fill(f64::from_bits(0x7ff8_0000_0000_0000));
-    } else {
-        macd_slice.fill(f64::from_bits(0x7ff8_0000_0000_0000));
-    }
-    if signal_warmup <= len {
-        signal_slice[..signal_warmup].fill(f64::from_bits(0x7ff8_0000_0000_0000));
-        hist_slice[..signal_warmup].fill(f64::from_bits(0x7ff8_0000_0000_0000));
-    } else {
-        signal_slice.fill(f64::from_bits(0x7ff8_0000_0000_0000));
-        hist_slice.fill(f64::from_bits(0x7ff8_0000_0000_0000));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = MacdParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        signal_period: Some(signal_period),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = MacdInput::from_slice(slice_in, params);
-
-    let result = py
-        .allow_threads(|| macd_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    macd_slice.copy_from_slice(&result.macd);
-    signal_slice.copy_from_slice(&result.signal);
-    hist_slice.copy_from_slice(&result.hist);
-
-    Ok((macd_arr, signal_arr, hist_arr))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MacdStream")]
-pub struct MacdStreamPy {
-    stream: MacdStream,
-    data_buffer: Vec<f64>,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    ma_type: String,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MacdStreamPy {
-    #[new]
-    fn new(
-        fast_period: usize,
-        slow_period: usize,
-        signal_period: usize,
-        ma_type: &str,
-    ) -> PyResult<Self> {
-        Ok(MacdStreamPy {
-            stream: MacdStream::new(fast_period, slow_period, signal_period, ma_type),
-            data_buffer: Vec::new(),
-            fast_period,
-            slow_period,
-            signal_period,
-            ma_type: ma_type.to_string(),
-        })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64)> {
-        if let Some(result) = self.stream.update(value) {
-            return Some(result);
-        }
-
-        if !self.ma_type.eq_ignore_ascii_case("ema") {
-            self.data_buffer.push(value);
-
-            let min_needed = self.slow_period + self.signal_period - 1;
-            if self.data_buffer.len() < min_needed {
-                return None;
-            }
-
-            let params = MacdParams {
-                fast_period: Some(self.fast_period),
-                slow_period: Some(self.slow_period),
-                signal_period: Some(self.signal_period),
-                ma_type: Some(self.ma_type.clone()),
-            };
-            let input = MacdInput::from_slice(&self.data_buffer, params);
-
-            match macd(&input) {
-                Ok(output) => {
-                    let last_idx = output.macd.len() - 1;
-                    Some((
-                        output.macd[last_idx],
-                        output.signal[last_idx],
-                        output.hist[last_idx],
-                    ))
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "macd_batch")]
-#[pyo3(signature = (data, fast_period_range, slow_period_range, signal_period_range, ma_type, kernel=None))]
-pub fn macd_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    signal_period_range: (usize, usize, usize),
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-
-    if slice_in.is_empty() {
-        return Err(PyValueError::new_err("macd: Input data slice is empty"));
-    }
-
-    if slice_in.iter().all(|x| x.is_nan()) {
-        return Err(PyValueError::new_err("macd: All values are NaN"));
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = MacdBatchRange {
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        signal_period: signal_period_range,
-        ma_type: (ma_type.to_string(), ma_type.to_string(), String::new()),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let macd_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let hist_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-
-    let macd_slice = unsafe { macd_arr.as_slice_mut()? };
-    let signal_slice = unsafe { signal_arr.as_slice_mut()? };
-    let hist_slice = unsafe { hist_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            macd_batch_inner_into(
-                slice_in,
-                &sweep,
-                simd,
-                true,
-                macd_slice,
-                signal_slice,
-                hist_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("macd", macd_arr.reshape((rows, cols))?)?;
-    dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    dict.set_item("hist", hist_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signal_periods",
-        combos
-            .iter()
-            .map(|p| p.signal_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_macd_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(macd_py, m)?)?;
-    m.add_function(wrap_pyfunction!(macd_batch_py, m)?)?;
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32MacdPy {
-    pub(crate) inner: crate::cuda::oscillators::macd_wrapper::DeviceArrayF32Macd,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32MacdPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = if self.inner.rows == 0 || self.inner.cols == 0 {
-            0usize
-        } else {
-            self.inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        if let Some(obj) = &stream {
-            if let Ok(i) = obj.extract::<i64>(py) {
-                if i == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__: stream 0 is disallowed for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let dummy = cust::memory::DeviceBuffer::from_slice(&[])
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_clone = self.inner.ctx.clone();
-        let dev_id = self.inner.device_id;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            crate::cuda::oscillators::macd_wrapper::DeviceArrayF32Macd {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx: ctx_clone,
-                device_id: dev_id,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "macd_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, fast_range, slow_range, signal_range, ma_type="ema", device_id=0))]
-pub fn macd_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    fast_range: (usize, usize, usize),
-    slow_range: (usize, usize, usize),
-    signal_range: (usize, usize, usize),
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::macd_wrapper::DeviceMacdTriplet;
-    use crate::cuda::oscillators::CudaMacd;
-    use numpy::IntoPyArray;
-    use pyo3::types::PyList;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if !ma_type.eq_ignore_ascii_case("ema") {
-        return Err(PyValueError::new_err(
-            "macd_cuda: only ma_type=\"ema\" is supported on CUDA",
-        ));
-    }
-    let slice = data_f32.as_slice()?;
-    let sweep = MacdBatchRange {
-        fast_period: fast_range,
-        slow_period: slow_range,
-        signal_period: signal_range,
-        ma_type: (ma_type.to_string(), ma_type.to_string(), String::new()),
-    };
-
-    let (outputs, combos) = py.allow_threads(|| {
-        let cuda = CudaMacd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.macd_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let DeviceMacdTriplet { macd, signal, hist } = outputs;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item("macd", Py::new(py, DeviceArrayF32MacdPy { inner: macd })?)?;
-    dict.set_item(
-        "signal",
-        Py::new(py, DeviceArrayF32MacdPy { inner: signal })?,
-    )?;
-    dict.set_item("hist", Py::new(py, DeviceArrayF32MacdPy { inner: hist })?)?;
-
-    let fasts: Vec<u64> = combos
-        .iter()
-        .map(|p| p.fast_period.unwrap() as u64)
-        .collect();
-    let slows: Vec<u64> = combos
-        .iter()
-        .map(|p| p.slow_period.unwrap() as u64)
-        .collect();
-    let signals: Vec<u64> = combos
-        .iter()
-        .map(|p| p.signal_period.unwrap() as u64)
-        .collect();
-    let ma_types = PyList::new(py, vec![ma_type; combos.len()])?;
-    dict.set_item("fast_periods", fasts.into_pyarray(py))?;
-    dict.set_item("slow_periods", slows.into_pyarray(py))?;
-    dict.set_item("signal_periods", signals.into_pyarray(py))?;
-    dict.set_item("ma_types", ma_types)?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", slice.len())?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "macd_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, fast_period, slow_period, signal_period, ma_type="ema", device_id=0))]
-pub fn macd_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::macd_wrapper::DeviceMacdTriplet;
-    use crate::cuda::oscillators::CudaMacd;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if !ma_type.eq_ignore_ascii_case("ema") {
-        return Err(PyValueError::new_err(
-            "macd_cuda: only ma_type=\"ema\" is supported on CUDA",
-        ));
-    }
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = MacdParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        signal_period: Some(signal_period),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let DeviceMacdTriplet { macd, signal, hist } = py.allow_threads(|| {
-        let cuda = CudaMacd::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.macd_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item("macd", Py::new(py, DeviceArrayF32MacdPy { inner: macd })?)?;
-    dict.set_item(
-        "signal",
-        Py::new(py, DeviceArrayF32MacdPy { inner: signal })?,
-    )?;
-    dict.set_item("hist", Py::new(py, DeviceArrayF32MacdPy { inner: hist })?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("fast_period", fast_period)?;
-    dict.set_item("slow_period", slow_period)?;
-    dict.set_item("signal_period", signal_period)?;
-    dict.set_item("ma_type", ma_type)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[derive(Serialize, Deserialize)]
-pub struct MacdResult {
-    values: Vec<f64>,
-    rows: usize,
-    cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl MacdResult {
-    #[wasm_bindgen(getter)]
-    pub fn values(&self) -> Vec<f64> {
-        self.values.clone()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn cols(&self) -> usize {
-        self.cols
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macd_js(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    ma_type: &str,
-) -> Result<MacdResult, JsValue> {
-    let len = data.len();
-    if len == 0 {
-        return Err(JsValue::from_str(&MacdError::EmptyInputData.to_string()));
-    }
-    let first = data
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or(MacdError::AllValuesNaN)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    if fast_period == 0
-        || slow_period == 0
-        || signal_period == 0
-        || fast_period > len
-        || slow_period > len
-        || signal_period > len
-    {
-        return Err(JsValue::from_str(
-            &MacdError::InvalidPeriod {
-                fast: fast_period,
-                slow: slow_period,
-                signal: signal_period,
-                data_len: len,
-            }
-            .to_string(),
-        ));
-    }
-    if len - first < slow_period {
-        return Err(JsValue::from_str(
-            &MacdError::NotEnoughValidData {
-                needed: slow_period,
-                valid: len - first,
-            }
-            .to_string(),
-        ));
-    }
-    let macd_warmup = first + slow_period - 1;
-    let signal_warmup = first + slow_period + signal_period - 2;
-
-    let mut macd = alloc_with_nan_prefix(len, macd_warmup);
-    let mut signal = alloc_with_nan_prefix(len, signal_warmup);
-    let mut hist = alloc_with_nan_prefix(len, signal_warmup);
-
-    macd_compute_into(
-        data,
-        fast_period,
-        slow_period,
-        signal_period,
-        ma_type,
-        first,
-        &mut macd,
-        &mut signal,
-        &mut hist,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(3 * len);
-    values.extend_from_slice(&macd);
-    values.extend_from_slice(&signal);
-    values.extend_from_slice(&hist);
-
-    Ok(MacdResult {
-        values,
-        rows: 3,
-        cols: len,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macd_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macd_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macd_into(
-    in_ptr: *const f64,
-    macd_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    hist_ptr: *mut f64,
-    len: usize,
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || macd_ptr.is_null() || signal_ptr.is_null() || hist_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = MacdParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            signal_period: Some(signal_period),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let input = MacdInput::from_slice(data, params);
-
-        let needs_temp = in_ptr == macd_ptr as *const f64
-            || in_ptr == signal_ptr as *const f64
-            || in_ptr == hist_ptr as *const f64;
-
-        if needs_temp {
-            let first = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
-            let macd_warmup = first + slow_period - 1;
-            let signal_warmup = first + slow_period + signal_period - 2;
-
-            let mut temp_macd = alloc_with_nan_prefix(len, macd_warmup);
-            let mut temp_signal = alloc_with_nan_prefix(len, signal_warmup);
-            let mut temp_hist = alloc_with_nan_prefix(len, signal_warmup);
-
-            macd_compute_into(
-                data,
-                fast_period,
-                slow_period,
-                signal_period,
-                ma_type,
-                first,
-                &mut temp_macd,
-                &mut temp_signal,
-                &mut temp_hist,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let macd_out = std::slice::from_raw_parts_mut(macd_ptr, len);
-            let signal_out = std::slice::from_raw_parts_mut(signal_ptr, len);
-            let hist_out = std::slice::from_raw_parts_mut(hist_ptr, len);
-
-            macd_out.copy_from_slice(&temp_macd);
-            signal_out.copy_from_slice(&temp_signal);
-            hist_out.copy_from_slice(&temp_hist);
-        } else {
-            let result = macd(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let macd_out = std::slice::from_raw_parts_mut(macd_ptr, len);
-            let signal_out = std::slice::from_raw_parts_mut(signal_ptr, len);
-            let hist_out = std::slice::from_raw_parts_mut(hist_ptr, len);
-
-            macd_out.copy_from_slice(&result.macd);
-            signal_out.copy_from_slice(&result.signal);
-            hist_out.copy_from_slice(&result.hist);
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MacdBatchConfig {
-    pub fast_period_range: (usize, usize, usize),
-    pub slow_period_range: (usize, usize, usize),
-    pub signal_period_range: (usize, usize, usize),
-    pub ma_type: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MacdBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub fast_periods: Vec<usize>,
-    pub slow_periods: Vec<usize>,
-    pub signal_periods: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = macd_batch)]
-pub fn macd_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    if data.is_empty() {
-        return Err(JsValue::from_str("macd: Input data slice is empty"));
-    }
-
-    if data.iter().all(|x| x.is_nan()) {
-        return Err(JsValue::from_str("macd: All values are NaN"));
-    }
-
-    let config: MacdBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = MacdBatchRange {
-        fast_period: config.fast_period_range,
-        slow_period: config.slow_period_range,
-        signal_period: config.signal_period_range,
-        ma_type: (
-            config.ma_type.clone(),
-            config.ma_type.clone(),
-            String::new(),
-        ),
-    };
-    let combos =
-        expand_grid(&sweep).map_err(|e| JsValue::from_str(&format!("Invalid range: {}", e)))?;
-    let rows = combos.len();
-    let cols = data.len();
-
-    let first = data.iter().position(|x| !x.is_nan()).unwrap_or(0);
-    let macd_warm: Vec<usize> = combos
-        .iter()
-        .map(|p| first + p.slow_period.unwrap_or(26) - 1)
-        .collect();
-    let sig_warm: Vec<usize> = combos
-        .iter()
-        .map(|p| first + p.slow_period.unwrap_or(26) + p.signal_period.unwrap_or(9) - 2)
-        .collect();
-
-    let mut macd_mu = make_uninit_matrix(rows, cols);
-    let mut sig_mu = make_uninit_matrix(rows, cols);
-    let mut hist_mu = make_uninit_matrix(rows, cols);
-
-    init_matrix_prefixes(&mut macd_mu, cols, &macd_warm);
-    init_matrix_prefixes(&mut sig_mu, cols, &sig_warm);
-    init_matrix_prefixes(&mut hist_mu, cols, &sig_warm);
-
-    let mut macd_guard = core::mem::ManuallyDrop::new(macd_mu);
-    let mut sig_guard = core::mem::ManuallyDrop::new(sig_mu);
-    let mut hist_guard = core::mem::ManuallyDrop::new(hist_mu);
-
-    let macd_out: &mut [f64] = unsafe {
-        core::slice::from_raw_parts_mut(macd_guard.as_mut_ptr() as *mut f64, macd_guard.len())
-    };
-    let sig_out: &mut [f64] = unsafe {
-        core::slice::from_raw_parts_mut(sig_guard.as_mut_ptr() as *mut f64, sig_guard.len())
-    };
-    let hist_out: &mut [f64] = unsafe {
-        core::slice::from_raw_parts_mut(hist_guard.as_mut_ptr() as *mut f64, hist_guard.len())
-    };
-
-    macd_batch_inner_into(
-        data,
-        &sweep,
-        detect_best_kernel(),
-        true,
-        macd_out,
-        sig_out,
-        hist_out,
-    )
-    .map_err(|e| JsValue::from_str(&format!("Batch computation error: {}", e)))?;
-
-    let macd = unsafe {
-        Vec::from_raw_parts(
-            macd_guard.as_mut_ptr() as *mut f64,
-            macd_guard.len(),
-            macd_guard.capacity(),
-        )
-    };
-    let sig = unsafe {
-        Vec::from_raw_parts(
-            sig_guard.as_mut_ptr() as *mut f64,
-            sig_guard.len(),
-            sig_guard.capacity(),
-        )
-    };
-    let hist = unsafe {
-        Vec::from_raw_parts(
-            hist_guard.as_mut_ptr() as *mut f64,
-            hist_guard.len(),
-            hist_guard.capacity(),
-        )
-    };
-
-    let mut values = Vec::with_capacity(3 * rows * cols);
-    values.extend_from_slice(&macd);
-    values.extend_from_slice(&sig);
-    values.extend_from_slice(&hist);
-
-    let out = MacdBatchJsOutput {
-        values,
-        rows,
-        cols,
-        fast_periods: combos.iter().map(|p| p.fast_period.unwrap()).collect(),
-        slow_periods: combos.iter().map(|p| p.slow_period.unwrap()).collect(),
-        signal_periods: combos.iter().map(|p| p.signal_period.unwrap()).collect(),
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macd_output_into_js(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    signal_period: usize,
-    ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let result = macd_js(data, fast_period, slow_period, signal_period, ma_type)?;
-    crate::write_wasm_f64_output("macd_output_into_js", &result.values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn macd_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = macd_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("macd_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     #[inline]
@@ -2687,7 +1778,6 @@ mod tests {
         let mut macd_out = vec![0.0f64; len];
         let mut signal_out = vec![0.0f64; len];
         let mut hist_out = vec![0.0f64; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         macd_into(&input, &mut macd_out, &mut signal_out, &mut hist_out)?;
 
         assert_eq!(baseline.macd.len(), len);
@@ -2723,8 +1813,8 @@ mod tests {
 
     fn check_macd_partial_params(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let default_params = MacdParams {
             fast_period: None,
@@ -2742,8 +1832,8 @@ mod tests {
 
     fn check_macd_accuracy(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let params = MacdParams::default();
         let input = MacdInput::from_candles(&candles, "close", params);
@@ -2839,8 +1929,8 @@ mod tests {
 
     fn check_macd_reinput(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let params = MacdParams::default();
         let input = MacdInput::from_candles(&candles, "close", params.clone());
@@ -2858,8 +1948,8 @@ mod tests {
 
     fn check_macd_nan_handling(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let params = MacdParams::default();
         let input = MacdInput::from_candles(&candles, "close", params);
@@ -2879,8 +1969,8 @@ mod tests {
     fn check_macd_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             MacdParams::default(),
@@ -3366,8 +2456,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = MacdBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -3405,8 +2495,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 10, 20, 2, 2, 6, 2),

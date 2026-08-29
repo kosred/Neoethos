@@ -1,37 +1,11 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linear_correlation_oscillator_output_into_js(
-    data: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = linear_correlation_oscillator_js(data, period)?;
-    crate::write_wasm_f64_output("linear_correlation_oscillator_output_into_js", &values, out)
-}
 
 #[cfg(test)]
 use std::error::Error as StdError;
@@ -81,10 +55,6 @@ pub struct LinearCorrelationOscillatorOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct LinearCorrelationOscillatorParams {
     pub period: Option<usize>,
 }
@@ -436,7 +406,6 @@ pub fn linear_correlation_oscillator_with_kernel(
     Ok(LinearCorrelationOscillatorOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn linear_correlation_oscillator_into(
     input: &LinearCorrelationOscillatorInput,
@@ -671,7 +640,7 @@ pub fn linear_correlation_oscillator_batch_with_kernel(
         other => {
             return Err(LinearCorrelationOscillatorError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
 
@@ -872,214 +841,10 @@ fn linear_correlation_oscillator_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "linear_correlation_oscillator")]
-#[pyo3(signature = (data, period, kernel=None))]
-pub fn linear_correlation_oscillator_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = LinearCorrelationOscillatorInput::from_slice(
-        slice_in,
-        LinearCorrelationOscillatorParams {
-            period: Some(period),
-        },
-    );
-    let values = py
-        .allow_threads(|| linear_correlation_oscillator_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "linear_correlation_oscillator_batch")]
-#[pyo3(signature = (data, period_range, kernel=None))]
-pub fn linear_correlation_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = LinearCorrelationOscillatorBatchRange {
-        period: period_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            let simd = match kernel {
-                Kernel::ScalarBatch | Kernel::Avx2Batch | Kernel::Avx512Batch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            linear_correlation_oscillator_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|params| params.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "LinearCorrelationOscillatorStream")]
-pub struct LinearCorrelationOscillatorStreamPy {
-    inner: LinearCorrelationOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl LinearCorrelationOscillatorStreamPy {
-    #[new]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let inner = LinearCorrelationOscillatorStream::try_new(LinearCorrelationOscillatorParams {
-            period: Some(period),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.inner.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LinearCorrelationOscillatorBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LinearCorrelationOscillatorBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<LinearCorrelationOscillatorParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linear_correlation_oscillator_js(data: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let input = LinearCorrelationOscillatorInput::from_slice(
-        data,
-        LinearCorrelationOscillatorParams {
-            period: Some(period),
-        },
-    );
-    let mut out = vec![0.0; data.len()];
-    linear_correlation_oscillator_into_slice(&mut out, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linear_correlation_oscillator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linear_correlation_oscillator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linear_correlation_oscillator_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = LinearCorrelationOscillatorInput::from_slice(
-            data,
-            LinearCorrelationOscillatorParams {
-                period: Some(period),
-            },
-        );
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            linear_correlation_oscillator_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            linear_correlation_oscillator_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn linear_correlation_oscillator_batch(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: LinearCorrelationOscillatorBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = LinearCorrelationOscillatorBatchRange {
-        period: config.period_range,
-    };
-    let result = linear_correlation_oscillator_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let output = LinearCorrelationOscillatorBatchJsOutput {
-        values: result.values,
-        combos: result.combos,
-        rows: result.rows,
-        cols: result.cols,
-    };
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
 
     fn pine_literal_reference(data: &[f64], period: usize) -> Vec<f64> {
@@ -1367,7 +1132,7 @@ mod tests {
 
     #[test]
     fn linear_correlation_oscillator_default_candles_smoke() -> Result<(), Box<dyn StdError>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let input = LinearCorrelationOscillatorInput::with_default_candles(&candles);
         let output = linear_correlation_oscillator(&input)?;
         assert_eq!(output.values.len(), candles.close.len());

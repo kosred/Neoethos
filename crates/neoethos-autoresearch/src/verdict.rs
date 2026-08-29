@@ -23,11 +23,11 @@ use serde::{Deserialize, Serialize};
 use crate::goals::{GoalSet, Scenario};
 use crate::journal::{OosWindow, RiskOutcomeRecord};
 use crate::judge::{JudgeThresholds, PromotionOutcome, ScreenResult};
-use crate::session::{AbandonCensus, BestEver, Session, SweepId};
+use crate::session::{AbandonCensus, BestEver, DatasetReceiptV1, Session, SweepId};
 use crate::shuffle::{ShuffleNull, ShuffleSummary};
 
 /// Schema tag on every emitted verdict. Bump only with the struct.
-pub const VERDICT_SCHEMA: &str = "neoethos.autoresearch.verdict.v1";
+pub const VERDICT_SCHEMA: &str = "neoethos.autoresearch.verdict.v2";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Coverage — the evidence behind U4
@@ -547,6 +547,7 @@ impl Verdict {
 pub struct VerdictContext {
     pub session_id: String,
     pub symbol: String,
+    pub dataset_receipt: DatasetReceiptV1,
     pub cost_hash: String,
     pub judge_hash: String,
     pub oos_window: OosWindow,
@@ -559,6 +560,9 @@ pub struct SessionVerdict {
     pub verdict: Verdict,
     pub session_id: String,
     pub symbol: String,
+    /// Exact immutable direct-timeframe generations and IS/OOS split used by
+    /// this verdict. The symbol is display metadata, never reproduction input.
+    pub dataset_receipt: DatasetReceiptV1,
     /// Resume invalidation, and the proof that the goals were not edited
     /// mid-session.
     pub goal_hash: String,
@@ -591,6 +595,14 @@ pub struct SessionVerdict {
     pub reproduction: String,
 }
 
+fn exact_reproduction_command(ctx: &VerdictContext) -> String {
+    format!(
+        "neoethos autoresearch --dataset-identity {} --session {}",
+        ctx.dataset_receipt.anchor_identity.to_path_component(),
+        ctx.session_id
+    )
+}
+
 /// Build the report from the stopped session.
 pub fn build(
     session: &Session,
@@ -605,11 +617,7 @@ pub fn build(
     // Built BEFORE `ctx` is destructured into the report, so the command that
     // re-derives this verdict is composed from the same values the report
     // carries rather than from whatever is left after a partial move.
-    let reproduction = format!(
-        "neoethos autoresearch --symbol {} --session {}",
-        ctx.symbol_for_reproduction(),
-        ctx.session_id
-    );
+    let reproduction = exact_reproduction_command(&ctx);
 
     let (verdict, oos) = match reason {
         StopReason::GoalReached(candidate) => {
@@ -705,6 +713,7 @@ pub fn build(
         verdict,
         session_id: ctx.session_id.clone(),
         symbol: ctx.symbol,
+        dataset_receipt: ctx.dataset_receipt,
         goal_hash: goals.goal_hash().to_string(),
         judge_hash: ctx.judge_hash,
         cost_hash: ctx.cost_hash,
@@ -731,12 +740,6 @@ pub fn build(
         census: session.census.clone(),
         oos,
         reproduction,
-    }
-}
-
-impl VerdictContext {
-    fn symbol_for_reproduction(&self) -> &str {
-        &self.symbol
     }
 }
 
@@ -1115,12 +1118,74 @@ mod tests {
         assert!(h.contains("3 of the R2 conditions"));
     }
 
+    fn dataset_receipt() -> crate::session::DatasetReceiptV1 {
+        let identity = neoethos_data::CanonicalDatasetIdentity::external(
+            "autoresearch-verdict-test",
+            "EURUSD",
+            neoethos_data::CanonicalTimeframe::M5,
+            neoethos_data::BarTimestampConvention::BarOpen,
+        )
+        .expect("test dataset identity");
+        crate::session::DatasetReceiptV1::new(
+            identity.clone(),
+            vec![crate::session::DirectTimeframeReceiptV1 {
+                dataset_identity: identity,
+                manifest_schema_id: "neoethos.dataset-manifest.v1".to_owned(),
+                manifest_sha256: [3; 32],
+                generation_id: "generation-a".to_owned(),
+                vortex_sha256: [4; 32],
+                row_count: 1_001,
+                timestamp_start_ms: 0,
+                timestamp_end_ms: 1_000,
+            }],
+            crate::session::InSampleWindowV1 {
+                start_ms: 0,
+                end_exclusive_ms: 801,
+            },
+            OosWindow {
+                start_ms: 801,
+                end_ms: 1_000,
+            },
+        )
+        .expect("test dataset receipt")
+    }
+
+    #[test]
+    fn verdict_reproduction_uses_the_exact_encoded_dataset_identity_never_symbol_only() {
+        let receipt = dataset_receipt();
+        let ctx = VerdictContext {
+            session_id: "ar-test".to_owned(),
+            symbol: "EURUSD".to_owned(),
+            dataset_receipt: receipt.clone(),
+            cost_hash: "fnv64:cccc".to_owned(),
+            judge_hash: "fnv64:bbbb".to_owned(),
+            oos_window: receipt.oos_window,
+        };
+
+        let command = exact_reproduction_command(&ctx);
+        assert!(
+            command.contains(&format!(
+                "--dataset-identity {}",
+                receipt.anchor_identity.to_path_component()
+            )),
+            "got: {command}"
+        );
+        assert!(command.contains("--session ar-test"), "got: {command}");
+        assert!(!command.contains("--symbol"), "got: {command}");
+    }
+
     fn sample(verdict: Verdict) -> SessionVerdict {
+        let dataset_receipt = dataset_receipt();
+        let reproduction = format!(
+            "neoethos autoresearch --dataset-identity {} --session ar-test",
+            dataset_receipt.anchor_identity.to_path_component()
+        );
         SessionVerdict {
             schema: VERDICT_SCHEMA.to_string(),
             verdict,
             session_id: "ar-test".to_string(),
             symbol: "EURUSD".to_string(),
+            dataset_receipt,
             goal_hash: "fnv64:aaaa".to_string(),
             judge_hash: "fnv64:bbbb".to_string(),
             cost_hash: "fnv64:cccc".to_string(),
@@ -1144,7 +1209,7 @@ mod tests {
             coverage: Vec::new(),
             census: AbandonCensus::default(),
             oos: None,
-            reproduction: "neoethos autoresearch --symbol EURUSD --session ar-test".to_string(),
+            reproduction,
         }
     }
 

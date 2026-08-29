@@ -1,14 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::moving_average_cross_probability::{
-    moving_average_cross_probability_expand_grid, MovingAverageCrossProbabilityBatchRange,
-    MovingAverageCrossProbabilityMaType, MovingAverageCrossProbabilityParams,
+    MovingAverageCrossProbabilityBatchRange, MovingAverageCrossProbabilityMaType,
+    MovingAverageCrossProbabilityParams, moving_average_cross_probability_expand_grid,
 };
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
+use cust::memory::{DeviceBuffer, mem_get_info};
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
@@ -241,8 +241,8 @@ impl CudaMovingAverageCrossProbability {
             if slow_length <= fast_length {
                 return Err(CudaMovingAverageCrossProbabilityError::InvalidInput(
                     format!(
-                    "invalid length order: fast_length={fast_length}, slow_length={slow_length}"
-                ),
+                        "invalid length order: fast_length={fast_length}, slow_length={slow_length}"
+                    ),
                 ));
             }
             if resolution < 2 {

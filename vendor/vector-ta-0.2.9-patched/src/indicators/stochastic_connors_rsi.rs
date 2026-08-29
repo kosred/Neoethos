@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -60,10 +44,6 @@ pub struct StochasticConnorsRsiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct StochasticConnorsRsiParams {
     pub stoch_length: Option<usize>,
     pub smooth_k: Option<usize>,
@@ -288,7 +268,9 @@ pub enum StochasticConnorsRsiError {
     EmptyInputData,
     #[error("stochastic_connors_rsi: All input data values are NaN.")]
     AllValuesNaN,
-    #[error("stochastic_connors_rsi: Invalid stoch_length: stoch_length = {stoch_length}, data length = {data_len}")]
+    #[error(
+        "stochastic_connors_rsi: Invalid stoch_length: stoch_length = {stoch_length}, data length = {data_len}"
+    )]
     InvalidStochLength {
         stoch_length: usize,
         data_len: usize,
@@ -301,18 +283,26 @@ pub enum StochasticConnorsRsiError {
         "stochastic_connors_rsi: Invalid smooth_d: smooth_d = {smooth_d}, data length = {data_len}"
     )]
     InvalidSmoothD { smooth_d: usize, data_len: usize },
-    #[error("stochastic_connors_rsi: Invalid rsi_length: rsi_length = {rsi_length}, data length = {data_len}")]
+    #[error(
+        "stochastic_connors_rsi: Invalid rsi_length: rsi_length = {rsi_length}, data length = {data_len}"
+    )]
     InvalidRsiLength { rsi_length: usize, data_len: usize },
-    #[error("stochastic_connors_rsi: Invalid updown_length: updown_length = {updown_length}, data length = {data_len}")]
+    #[error(
+        "stochastic_connors_rsi: Invalid updown_length: updown_length = {updown_length}, data length = {data_len}"
+    )]
     InvalidUpdownLength {
         updown_length: usize,
         data_len: usize,
     },
-    #[error("stochastic_connors_rsi: Invalid roc_length: roc_length = {roc_length}, data length = {data_len}")]
+    #[error(
+        "stochastic_connors_rsi: Invalid roc_length: roc_length = {roc_length}, data length = {data_len}"
+    )]
     InvalidRocLength { roc_length: usize, data_len: usize },
     #[error("stochastic_connors_rsi: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("stochastic_connors_rsi: Output length mismatch: expected {expected}, got k={k_len}, d={d_len}")]
+    #[error(
+        "stochastic_connors_rsi: Output length mismatch: expected {expected}, got k={k_len}, d={d_len}"
+    )]
     OutputLengthMismatch {
         expected: usize,
         k_len: usize,
@@ -776,7 +766,6 @@ pub fn stochastic_connors_rsi_with_kernel(
     Ok(StochasticConnorsRsiOutput { k, d })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn stochastic_connors_rsi_into(
     input: &StochasticConnorsRsiInput<'_>,
     out_k: &mut [f64],
@@ -1322,496 +1311,6 @@ fn stochastic_connors_rsi_batch_inner_into(
         }
     }
     Ok(())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "stochastic_connors_rsi")]
-#[pyo3(signature = (source, stoch_length=3, smooth_k=3, smooth_d=3, rsi_length=3, updown_length=2, roc_length=100, kernel=None))]
-pub fn stochastic_connors_rsi_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    stoch_length: usize,
-    smooth_k: usize,
-    smooth_d: usize,
-    rsi_length: usize,
-    updown_length: usize,
-    roc_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let source = source.as_slice()?;
-    let input = StochasticConnorsRsiInput::from_slice(
-        source,
-        StochasticConnorsRsiParams {
-            stoch_length: Some(stoch_length),
-            smooth_k: Some(smooth_k),
-            smooth_d: Some(smooth_d),
-            rsi_length: Some(rsi_length),
-            updown_length: Some(updown_length),
-            roc_length: Some(roc_length),
-        },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| stochastic_connors_rsi_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((out.k.into_pyarray(py), out.d.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "StochasticConnorsRsiStream")]
-pub struct StochasticConnorsRsiStreamPy {
-    stream: StochasticConnorsRsiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl StochasticConnorsRsiStreamPy {
-    #[new]
-    #[pyo3(signature = (stoch_length=3, smooth_k=3, smooth_d=3, rsi_length=3, updown_length=2, roc_length=100))]
-    fn new(
-        stoch_length: usize,
-        smooth_k: usize,
-        smooth_d: usize,
-        rsi_length: usize,
-        updown_length: usize,
-        roc_length: usize,
-    ) -> PyResult<Self> {
-        let stream = StochasticConnorsRsiStream::try_new(StochasticConnorsRsiParams {
-            stoch_length: Some(stoch_length),
-            smooth_k: Some(smooth_k),
-            smooth_d: Some(smooth_d),
-            rsi_length: Some(rsi_length),
-            updown_length: Some(updown_length),
-            roc_length: Some(roc_length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update_reset_on_nan(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "stochastic_connors_rsi_batch")]
-#[pyo3(signature = (source, stoch_length_range, smooth_k_range, smooth_d_range, rsi_length_range, updown_length_range, roc_length_range, kernel=None))]
-pub fn stochastic_connors_rsi_batch_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    stoch_length_range: (usize, usize, usize),
-    smooth_k_range: (usize, usize, usize),
-    smooth_d_range: (usize, usize, usize),
-    rsi_length_range: (usize, usize, usize),
-    updown_length_range: (usize, usize, usize),
-    roc_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let source = source.as_slice()?;
-    let sweep = StochasticConnorsRsiBatchRange {
-        stoch_length: stoch_length_range,
-        smooth_k: smooth_k_range,
-        smooth_d: smooth_d_range,
-        rsi_length: rsi_length_range,
-        updown_length: updown_length_range,
-        roc_length: roc_length_range,
-    };
-    let combos = expand_grid_stochastic_connors_rsi(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = source.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let arr_k = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let arr_d = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_k = unsafe { arr_k.as_slice_mut()? };
-    let out_d = unsafe { arr_d.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        stochastic_connors_rsi_batch_inner_into(
-            source,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            out_k,
-            out_d,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("k", arr_k.reshape((rows, cols))?)?;
-    dict.set_item("d", arr_d.reshape((rows, cols))?)?;
-    dict.set_item(
-        "stoch_lengths",
-        combos
-            .iter()
-            .map(|params| params.stoch_length.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_ks",
-        combos
-            .iter()
-            .map(|params| params.smooth_k.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "smooth_ds",
-        combos
-            .iter()
-            .map(|params| params.smooth_d.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "rsi_lengths",
-        combos
-            .iter()
-            .map(|params| params.rsi_length.unwrap_or(3) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "updown_lengths",
-        combos
-            .iter()
-            .map(|params| params.updown_length.unwrap_or(2) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "roc_lengths",
-        combos
-            .iter()
-            .map(|params| params.roc_length.unwrap_or(100) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_stochastic_connors_rsi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(stochastic_connors_rsi_py, m)?)?;
-    m.add_function(wrap_pyfunction!(stochastic_connors_rsi_batch_py, m)?)?;
-    m.add_class::<StochasticConnorsRsiStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StochasticConnorsRsiJsOutput {
-    k: Vec<f64>,
-    d: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StochasticConnorsRsiBatchConfig {
-    stoch_length_range: Vec<usize>,
-    smooth_k_range: Vec<usize>,
-    smooth_d_range: Vec<usize>,
-    rsi_length_range: Vec<usize>,
-    updown_length_range: Vec<usize>,
-    roc_length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StochasticConnorsRsiBatchJsOutput {
-    k: Vec<f64>,
-    d: Vec<f64>,
-    rows: usize,
-    cols: usize,
-    combos: Vec<StochasticConnorsRsiParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "stochastic_connors_rsi_js")]
-pub fn stochastic_connors_rsi_js(
-    source: &[f64],
-    stoch_length: usize,
-    smooth_k: usize,
-    smooth_d: usize,
-    rsi_length: usize,
-    updown_length: usize,
-    roc_length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = StochasticConnorsRsiInput::from_slice(
-        source,
-        StochasticConnorsRsiParams {
-            stoch_length: Some(stoch_length),
-            smooth_k: Some(smooth_k),
-            smooth_d: Some(smooth_d),
-            rsi_length: Some(rsi_length),
-            updown_length: Some(updown_length),
-            roc_length: Some(roc_length),
-        },
-    );
-    let out = stochastic_connors_rsi_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&StochasticConnorsRsiJsOutput { k: out.k, d: out.d })
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "stochastic_connors_rsi_batch_js")]
-pub fn stochastic_connors_rsi_batch_js(
-    source: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: StochasticConnorsRsiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.stoch_length_range.len() != 3
-        || config.smooth_k_range.len() != 3
-        || config.smooth_d_range.len() != 3
-        || config.rsi_length_range.len() != 3
-        || config.updown_length_range.len() != 3
-        || config.roc_length_range.len() != 3
-    {
-        return Err(JsValue::from_str(
-            "Invalid config: each range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let sweep = StochasticConnorsRsiBatchRange {
-        stoch_length: (
-            config.stoch_length_range[0],
-            config.stoch_length_range[1],
-            config.stoch_length_range[2],
-        ),
-        smooth_k: (
-            config.smooth_k_range[0],
-            config.smooth_k_range[1],
-            config.smooth_k_range[2],
-        ),
-        smooth_d: (
-            config.smooth_d_range[0],
-            config.smooth_d_range[1],
-            config.smooth_d_range[2],
-        ),
-        rsi_length: (
-            config.rsi_length_range[0],
-            config.rsi_length_range[1],
-            config.rsi_length_range[2],
-        ),
-        updown_length: (
-            config.updown_length_range[0],
-            config.updown_length_range[1],
-            config.updown_length_range[2],
-        ),
-        roc_length: (
-            config.roc_length_range[0],
-            config.roc_length_range[1],
-            config.roc_length_range[2],
-        ),
-    };
-    let out = stochastic_connors_rsi_batch_with_kernel(source, &sweep, Kernel::ScalarBatch)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&StochasticConnorsRsiBatchJsOutput {
-        k: out.k,
-        d: out.d,
-        rows: out.rows,
-        cols: out.cols,
-        combos: out.combos,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochastic_connors_rsi_alloc(len: usize) -> *mut f64 {
-    let mut buf = Vec::<f64>::with_capacity(len * 2);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochastic_connors_rsi_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Vec::<f64>::from_raw_parts(ptr, 0, len * 2);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochastic_connors_rsi_into(
-    source: &[f64],
-    out_ptr: *mut f64,
-    stoch_length: usize,
-    smooth_k: usize,
-    smooth_d: usize,
-    rsi_length: usize,
-    updown_length: usize,
-    roc_length: usize,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to stochastic_connors_rsi_into",
-        ));
-    }
-    let len = source.len();
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, len * 2) };
-    let (out_k, out_d) = out.split_at_mut(len);
-    let input = StochasticConnorsRsiInput::from_slice(
-        source,
-        StochasticConnorsRsiParams {
-            stoch_length: Some(stoch_length),
-            smooth_k: Some(smooth_k),
-            smooth_d: Some(smooth_d),
-            rsi_length: Some(rsi_length),
-            updown_length: Some(updown_length),
-            roc_length: Some(roc_length),
-        },
-    );
-    stochastic_connors_rsi_into_slice(out_k, out_d, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "stochastic_connors_rsi_into_host")]
-pub fn stochastic_connors_rsi_into_host(
-    source: &[f64],
-    out_ptr: *mut f64,
-    stoch_length: usize,
-    smooth_k: usize,
-    smooth_d: usize,
-    rsi_length: usize,
-    updown_length: usize,
-    roc_length: usize,
-) -> Result<(), JsValue> {
-    stochastic_connors_rsi_into(
-        source,
-        out_ptr,
-        stoch_length,
-        smooth_k,
-        smooth_d,
-        rsi_length,
-        updown_length,
-        roc_length,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochastic_connors_rsi_batch_into(
-    source: &[f64],
-    out_ptr: *mut f64,
-    config: JsValue,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to stochastic_connors_rsi_batch_into",
-        ));
-    }
-    let config: StochasticConnorsRsiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.stoch_length_range.len() != 3
-        || config.smooth_k_range.len() != 3
-        || config.smooth_d_range.len() != 3
-        || config.rsi_length_range.len() != 3
-        || config.updown_length_range.len() != 3
-        || config.roc_length_range.len() != 3
-    {
-        return Err(JsValue::from_str(
-            "Invalid config: each range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-    let sweep = StochasticConnorsRsiBatchRange {
-        stoch_length: (
-            config.stoch_length_range[0],
-            config.stoch_length_range[1],
-            config.stoch_length_range[2],
-        ),
-        smooth_k: (
-            config.smooth_k_range[0],
-            config.smooth_k_range[1],
-            config.smooth_k_range[2],
-        ),
-        smooth_d: (
-            config.smooth_d_range[0],
-            config.smooth_d_range[1],
-            config.smooth_d_range[2],
-        ),
-        rsi_length: (
-            config.rsi_length_range[0],
-            config.rsi_length_range[1],
-            config.rsi_length_range[2],
-        ),
-        updown_length: (
-            config.updown_length_range[0],
-            config.updown_length_range[1],
-            config.updown_length_range[2],
-        ),
-        roc_length: (
-            config.roc_length_range[0],
-            config.roc_length_range[1],
-            config.roc_length_range[2],
-        ),
-    };
-    let combos = expand_grid_stochastic_connors_rsi(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = source.len();
-    let expected = rows * cols * 2;
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, expected) };
-    let (out_k, out_d) = out.split_at_mut(rows * cols);
-    stochastic_connors_rsi_batch_inner_into(source, &sweep, Kernel::Scalar, false, out_k, out_d)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochastic_connors_rsi_output_into_js(
-    source: &[f64],
-    stoch_length: usize,
-    smooth_k: usize,
-    smooth_d: usize,
-    rsi_length: usize,
-    updown_length: usize,
-    roc_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = stochastic_connors_rsi_js(
-        source,
-        stoch_length,
-        smooth_k,
-        smooth_d,
-        rsi_length,
-        updown_length,
-        roc_length,
-    )?;
-    crate::write_wasm_object_f64_outputs("stochastic_connors_rsi_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn stochastic_connors_rsi_batch_output_into_js(
-    source: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = stochastic_connors_rsi_batch_js(source, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "stochastic_connors_rsi_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

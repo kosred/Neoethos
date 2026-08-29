@@ -109,11 +109,10 @@ pub fn compare_metric_matrices(
 mod tests {
     use super::*;
     use crate::eval::{BacktestSettings, fast_evaluate_strategy_core};
-    use crate::genetic::{
-        EvaluationConfig, Gene, month_day_indices,
-        signals_and_confidence_for_gene_with_config,
-    };
     use crate::genetic::search_engine::evaluate_genes_test_oracle;
+    use crate::genetic::{
+        EvaluationConfig, Gene, month_day_indices, signals_and_confidence_for_gene_with_config,
+    };
     use ndarray::arr2;
     use neoethos_data::{FeatureFrame, Ohlcv};
 
@@ -125,10 +124,10 @@ mod tests {
         let timestamps = (0..12)
             .map(|idx| 1_700_000_000_000_i64 + (idx as i64) * 60_000)
             .collect();
-        FeatureFrame {
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
             timestamps,
-            names: vec!["momentum".to_string(), "reversion".to_string()],
-            data: neoethos_data::FeatureData::InMemory(arr2(&[
+            vec!["momentum".to_string(), "reversion".to_string()],
+            arr2(&[
                 [0.10, -0.10],
                 [0.35, -0.20],
                 [0.60, -0.30],
@@ -141,8 +140,9 @@ mod tests {
                 [0.05, -0.05],
                 [-0.50, 0.55],
                 [-0.65, 0.70],
-            ])),
-        }
+            ]),
+        )
+        .expect("valid f64 parity fixture")
     }
 
     fn fixture_ohlcv(frame: &FeatureFrame) -> Ohlcv {
@@ -242,7 +242,8 @@ mod tests {
                 // identically from combined-score vs thresholds) or it would
                 // diverge from `evaluate_genes`.
                 let (signals, confidences) =
-                    signals_and_confidence_for_gene_with_config(&frame, gene, &config);
+                    signals_and_confidence_for_gene_with_config(&frame, gene, &config)
+                        .expect("valid parity signal inputs");
                 fast_evaluate_strategy_core(
                     &ohlcv.close,
                     &ohlcv.high,

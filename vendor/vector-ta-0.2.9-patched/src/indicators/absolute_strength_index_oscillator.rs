@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -68,10 +50,6 @@ pub enum AbsoluteStrengthIndexOscillatorOutputField {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AbsoluteStrengthIndexOscillatorParams {
     pub ema_length: Option<usize>,
     pub signal_length: Option<usize>,
@@ -227,7 +205,9 @@ pub enum AbsoluteStrengthIndexOscillatorError {
     InvalidEmaLength { ema_length: usize },
     #[error("absolute_strength_index_oscillator: Invalid signal_length: {signal_length}")]
     InvalidSignalLength { signal_length: usize },
-    #[error("absolute_strength_index_oscillator: Output length mismatch: expected = {expected}, oscillator = {oscillator_got}, signal = {signal_got}, histogram = {histogram_got}")]
+    #[error(
+        "absolute_strength_index_oscillator: Output length mismatch: expected = {expected}, oscillator = {oscillator_got}, signal = {signal_got}, histogram = {histogram_got}"
+    )]
     OutputLengthMismatch {
         expected: usize,
         oscillator_got: usize,
@@ -348,10 +328,6 @@ impl AbsoluteStrengthIndexOscillatorStream {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AbsoluteStrengthIndexOscillatorBatchRange {
     pub ema_length: (usize, usize, usize),
     pub signal_length: (usize, usize, usize),
@@ -618,7 +594,6 @@ pub fn absolute_strength_index_oscillator_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn absolute_strength_index_oscillator_into(
     input: &AbsoluteStrengthIndexOscillatorInput,
     oscillator_out: &mut [f64],
@@ -726,7 +701,7 @@ pub fn absolute_strength_index_oscillator_batch_with_kernel(
         other => {
             return Err(AbsoluteStrengthIndexOscillatorError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
     absolute_strength_index_oscillator_batch_par_slice(data, sweep, batch_kernel.to_non_batch())
@@ -898,418 +873,6 @@ pub fn absolute_strength_index_oscillator_batch_inner_into(
     Ok(out.combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "absolute_strength_index_oscillator")]
-#[pyo3(signature = (data, ema_length=None, signal_length=None, kernel=None))]
-pub fn absolute_strength_index_oscillator_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    ema_length: Option<usize>,
-    signal_length: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = AbsoluteStrengthIndexOscillatorInput::from_slice(
-        data,
-        AbsoluteStrengthIndexOscillatorParams {
-            ema_length,
-            signal_length,
-        },
-    );
-    let out = py
-        .allow_threads(|| absolute_strength_index_oscillator_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.oscillator.into_pyarray(py),
-        out.signal.into_pyarray(py),
-        out.histogram.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AbsoluteStrengthIndexOscillatorStream")]
-pub struct AbsoluteStrengthIndexOscillatorStreamPy {
-    inner: AbsoluteStrengthIndexOscillatorStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AbsoluteStrengthIndexOscillatorStreamPy {
-    #[new]
-    #[pyo3(signature = (ema_length=DEFAULT_EMA_LENGTH, signal_length=DEFAULT_SIGNAL_LENGTH))]
-    fn new(ema_length: usize, signal_length: usize) -> PyResult<Self> {
-        let inner =
-            AbsoluteStrengthIndexOscillatorStream::try_new(AbsoluteStrengthIndexOscillatorParams {
-                ema_length: Some(ema_length),
-                signal_length: Some(signal_length),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64, f64)> {
-        self.inner.update(value)
-    }
-
-    #[getter]
-    fn warmup_period(&self) -> usize {
-        self.inner.get_warmup_period()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "absolute_strength_index_oscillator_batch")]
-#[pyo3(signature = (data, ema_length_range=(DEFAULT_EMA_LENGTH, DEFAULT_EMA_LENGTH, 0), signal_length_range=(DEFAULT_SIGNAL_LENGTH, DEFAULT_SIGNAL_LENGTH, 0), kernel=None))]
-pub fn absolute_strength_index_oscillator_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    ema_length_range: (usize, usize, usize),
-    signal_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = AbsoluteStrengthIndexOscillatorBatchRange {
-        ema_length: ema_length_range,
-        signal_length: signal_length_range,
-    };
-    let combos = expand_grid_absolute_strength_index_oscillator(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let oscillator_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let signal_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let histogram_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let oscillator_slice = unsafe { oscillator_arr.as_slice_mut()? };
-    let signal_slice = unsafe { signal_arr.as_slice_mut()? };
-    let histogram_slice = unsafe { histogram_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            absolute_strength_index_oscillator_batch_inner_into(
-                data,
-                &sweep,
-                batch.to_non_batch(),
-                oscillator_slice,
-                signal_slice,
-                histogram_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("oscillator", oscillator_arr.reshape((rows, cols))?)?;
-    dict.set_item("signal", signal_arr.reshape((rows, cols))?)?;
-    dict.set_item("histogram", histogram_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "ema_lengths",
-        combos
-            .iter()
-            .map(|p| p.ema_length.unwrap_or(DEFAULT_EMA_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "signal_lengths",
-        combos
-            .iter()
-            .map(|p| p.signal_length.unwrap_or(DEFAULT_SIGNAL_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_absolute_strength_index_oscillator_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(
-        absolute_strength_index_oscillator_py,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        absolute_strength_index_oscillator_batch_py,
-        module
-    )?)?;
-    module.add_class::<AbsoluteStrengthIndexOscillatorStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "absolute_strength_index_oscillator_js")]
-pub fn absolute_strength_index_oscillator_js(
-    data: &[f64],
-    ema_length: usize,
-    signal_length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = AbsoluteStrengthIndexOscillatorInput::from_slice(
-        data,
-        AbsoluteStrengthIndexOscillatorParams {
-            ema_length: Some(ema_length),
-            signal_length: Some(signal_length),
-        },
-    );
-    let out = absolute_strength_index_oscillator(&input)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let result = js_sys::Object::new();
-
-    let oscillator = js_sys::Float64Array::new_with_length(out.oscillator.len() as u32);
-    oscillator.copy_from(&out.oscillator);
-    js_sys::Reflect::set(&result, &JsValue::from_str("oscillator"), &oscillator)?;
-
-    let signal = js_sys::Float64Array::new_with_length(out.signal.len() as u32);
-    signal.copy_from(&out.signal);
-    js_sys::Reflect::set(&result, &JsValue::from_str("signal"), &signal)?;
-
-    let histogram = js_sys::Float64Array::new_with_length(out.histogram.len() as u32);
-    histogram.copy_from(&out.histogram);
-    js_sys::Reflect::set(&result, &JsValue::from_str("histogram"), &histogram)?;
-
-    Ok(result.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn absolute_strength_index_oscillator_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn absolute_strength_index_oscillator_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn absolute_strength_index_oscillator_into(
-    data_ptr: *const f64,
-    oscillator_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    histogram_ptr: *mut f64,
-    len: usize,
-    ema_length: usize,
-    signal_length: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null()
-        || oscillator_ptr.is_null()
-        || signal_ptr.is_null()
-        || histogram_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let input = AbsoluteStrengthIndexOscillatorInput::from_slice(
-            data,
-            AbsoluteStrengthIndexOscillatorParams {
-                ema_length: Some(ema_length),
-                signal_length: Some(signal_length),
-            },
-        );
-        let alias =
-            data_ptr == oscillator_ptr || data_ptr == signal_ptr || data_ptr == histogram_ptr;
-        if alias {
-            let mut oscillator_tmp = vec![0.0; len];
-            let mut signal_tmp = vec![0.0; len];
-            let mut histogram_tmp = vec![0.0; len];
-            absolute_strength_index_oscillator_into_slices(
-                &mut oscillator_tmp,
-                &mut signal_tmp,
-                &mut histogram_tmp,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(oscillator_ptr, len).copy_from_slice(&oscillator_tmp);
-            std::slice::from_raw_parts_mut(signal_ptr, len).copy_from_slice(&signal_tmp);
-            std::slice::from_raw_parts_mut(histogram_ptr, len).copy_from_slice(&histogram_tmp);
-        } else {
-            absolute_strength_index_oscillator_into_slices(
-                std::slice::from_raw_parts_mut(oscillator_ptr, len),
-                std::slice::from_raw_parts_mut(signal_ptr, len),
-                std::slice::from_raw_parts_mut(histogram_ptr, len),
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AbsoluteStrengthIndexOscillatorBatchConfig {
-    pub ema_length_range: (usize, usize, usize),
-    pub signal_length_range: Option<(usize, usize, usize)>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AbsoluteStrengthIndexOscillatorBatchJsOutput {
-    pub oscillator: Vec<f64>,
-    pub signal: Vec<f64>,
-    pub histogram: Vec<f64>,
-    pub combos: Vec<AbsoluteStrengthIndexOscillatorParams>,
-    pub ema_lengths: Vec<usize>,
-    pub signal_lengths: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "absolute_strength_index_oscillator_batch_js")]
-pub fn absolute_strength_index_oscillator_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: AbsoluteStrengthIndexOscillatorBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = AbsoluteStrengthIndexOscillatorBatchRange {
-        ema_length: config.ema_length_range,
-        signal_length: config.signal_length_range.unwrap_or((
-            DEFAULT_SIGNAL_LENGTH,
-            DEFAULT_SIGNAL_LENGTH,
-            0,
-        )),
-    };
-    let out = absolute_strength_index_oscillator_batch_inner(
-        data,
-        &sweep,
-        detect_best_batch_kernel().to_non_batch(),
-        false,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&AbsoluteStrengthIndexOscillatorBatchJsOutput {
-        ema_lengths: out
-            .combos
-            .iter()
-            .map(|p| p.ema_length.unwrap_or(DEFAULT_EMA_LENGTH))
-            .collect(),
-        signal_lengths: out
-            .combos
-            .iter()
-            .map(|p| p.signal_length.unwrap_or(DEFAULT_SIGNAL_LENGTH))
-            .collect(),
-        oscillator: out.oscillator,
-        signal: out.signal,
-        histogram: out.histogram,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn absolute_strength_index_oscillator_batch_into(
-    data_ptr: *const f64,
-    oscillator_ptr: *mut f64,
-    signal_ptr: *mut f64,
-    histogram_ptr: *mut f64,
-    len: usize,
-    ema_start: usize,
-    ema_end: usize,
-    ema_step: usize,
-    signal_start: usize,
-    signal_end: usize,
-    signal_step: usize,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null()
-        || oscillator_ptr.is_null()
-        || signal_ptr.is_null()
-        || histogram_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = AbsoluteStrengthIndexOscillatorBatchRange {
-        ema_length: (ema_start, ema_end, ema_step),
-        signal_length: (signal_start, signal_end, signal_step),
-    };
-    let combos = expand_grid_absolute_strength_index_oscillator(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let oscillator_out = std::slice::from_raw_parts_mut(oscillator_ptr, total);
-        let signal_out = std::slice::from_raw_parts_mut(signal_ptr, total);
-        let histogram_out = std::slice::from_raw_parts_mut(histogram_ptr, total);
-        absolute_strength_index_oscillator_batch_inner_into(
-            data,
-            &sweep,
-            detect_best_batch_kernel().to_non_batch(),
-            oscillator_out,
-            signal_out,
-            histogram_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn absolute_strength_index_oscillator_output_into_js(
-    data: &[f64],
-    ema_length: usize,
-    signal_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = absolute_strength_index_oscillator_js(data, ema_length, signal_length)?;
-    crate::write_wasm_object_f64_outputs(
-        "absolute_strength_index_oscillator_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn absolute_strength_index_oscillator_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = absolute_strength_index_oscillator_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "absolute_strength_index_oscillator_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1355,8 +918,8 @@ mod tests {
     }
 
     #[test]
-    fn absolute_strength_index_oscillator_stream_matches_batch_with_reset(
-    ) -> Result<(), Box<dyn Error>> {
+    fn absolute_strength_index_oscillator_stream_matches_batch_with_reset()
+    -> Result<(), Box<dyn Error>> {
         let data = [10.0, 10.0, 9.0, f64::NAN, 10.0, 10.0];
         let input = AbsoluteStrengthIndexOscillatorInput::from_slice(
             &data,

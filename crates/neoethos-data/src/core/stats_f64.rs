@@ -279,7 +279,10 @@ mod tests {
         );
 
         let new = pearson_pairwise(&feature, &target);
-        assert_eq!(new.skipped, 40, "the skipped rows must be COUNTED, not hidden");
+        assert_eq!(
+            new.skipped, 40,
+            "the skipped rows must be COUNTED, not hidden"
+        );
         assert_eq!(new.used, n - 40);
         assert!(
             (new.corr - 1.0).abs() < 1e-12,
@@ -362,7 +365,10 @@ mod tests {
             y[i] = 2.0 * i as f64;
         }
         let c = pearson_pairwise(&x, &y);
-        assert!((c.corr - 1.0).abs() < 1e-12, "the arithmetic is still right");
+        assert!(
+            (c.corr - 1.0).abs() < 1e-12,
+            "the arithmetic is still right"
+        );
         assert_eq!(c.used, 10);
         assert!(
             !c.is_rankable(),

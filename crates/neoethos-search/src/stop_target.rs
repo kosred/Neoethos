@@ -147,7 +147,10 @@ pub fn install_stop_target_runtime_overrides_from_settings(s: &neoethos_core::Se
 
 /// The installed caps, or the deterministic defaults when nothing installed.
 pub fn current_stop_target_runtime_overrides() -> StopTargetRuntimeOverrides {
-    STOP_TARGET_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
+    STOP_TARGET_RUNTIME_OVERRIDES
+        .get()
+        .copied()
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1373,14 +1376,16 @@ mod adaptive_stop_tests {
             low.push(c - amp);
         }
         let s = StopTargetSettings::default();
-        let (sl, tp) =
-            adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, 1.0, 2.0)
-                .expect("series builds on a long-enough dataset");
+        let (sl, tp) = adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, 1.0, 2.0)
+            .expect("series builds on a long-enough dataset");
         assert_eq!(sl.len(), n);
         assert_eq!(tp.len(), n);
         // Reward:risk held exactly, per bar.
         for i in 0..n {
-            assert!((tp[i] - 2.0 * sl[i]).abs() < 1e-9, "TP must be exactly rr*SL");
+            assert!(
+                (tp[i] - 2.0 * sl[i]).abs() < 1e-9,
+                "TP must be exactly rr*SL"
+            );
             assert!(sl[i] > 0.0);
         }
         // The volatile half's median stop must exceed the calm half's.
@@ -1398,7 +1403,10 @@ mod adaptive_stop_tests {
         // vol_mult scales the stop linearly.
         let (sl2, _) =
             adaptive_sl_tp_pips_series(&open, &high, &low, &close, &s, 0.0001, 2.0, 2.0).unwrap();
-        assert!((sl2[300] - 2.0 * sl[300]).abs() < 1e-6, "2x vol_mult => 2x stop");
+        assert!(
+            (sl2[300] - 2.0 * sl[300]).abs() < 1e-6,
+            "2x vol_mult => 2x stop"
+        );
         // Bad scalars → a NAMED error, so the caller can tell "no stop here"
         // apart from "I declined to compute the stop".
         assert_eq!(
@@ -1508,13 +1516,9 @@ mod adaptive_stop_tests {
 
         let long_base = adaptive_base_pips_series(&high, &low, &close, pip)
             .expect("301 000-bar base series must build");
-        let short_base = adaptive_base_pips_series(
-            &high[OFFSET..],
-            &low[OFFSET..],
-            &close[OFFSET..],
-            pip,
-        )
-        .expect("299 000-bar base series must build");
+        let short_base =
+            adaptive_base_pips_series(&high[OFFSET..], &low[OFFSET..], &close[OFFSET..], pip)
+                .expect("299 000-bar base series must build");
 
         assert_eq!(long_base.len(), LONG);
         assert_eq!(short_base.len(), SHORT);
@@ -1566,9 +1570,14 @@ mod adaptive_stop_tests {
             "the old cap must now REFUSE the long series rather than silently \
              dropping the tail term"
         );
-        let capped_short =
-            base_pips_with_cap(&high[OFFSET..], &low[OFFSET..], &close[OFFSET..], pip, 300_000)
-                .expect("299 000 bars sit under the old cap");
+        let capped_short = base_pips_with_cap(
+            &high[OFFSET..],
+            &low[OFFSET..],
+            &close[OFFSET..],
+            pip,
+            300_000,
+        )
+        .expect("299 000 bars sit under the old cap");
         let m_capped_short = median_of(&capped_short[warmup..]);
         assert!(
             (m_capped_short - m_short).abs() / m_short < 1e-9,
@@ -1703,6 +1712,9 @@ mod adaptive_stop_tests {
         // A `0` stride is meaningless; it must not reach the estimator.
         let mut zeroed = neoethos_core::Settings::default();
         zeroed.models.stop_target_runtime.tail_step = 0;
-        assert_eq!(StopTargetRuntimeOverrides::from_settings(&zeroed).tail_step, 1);
+        assert_eq!(
+            StopTargetRuntimeOverrides::from_settings(&zeroed).tail_step,
+            1
+        );
     }
 }

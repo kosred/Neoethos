@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::bollinger_bands::BollingerBandsBatchRange;
@@ -6,8 +6,8 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer, DevicePointer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, DevicePointer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::collections::HashSet;
@@ -92,11 +92,6 @@ impl CudaBollingerBands {
             .map(|v| v as u32)
             .unwrap_or(64);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/bollinger_bands_kernel.ptx"));
-        let jit = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O3),
-        ];
         let module = crate::load_cuda_embedded_module!("bollinger_bands_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -241,11 +236,7 @@ impl CudaBollingerBands {
             Ok(out)
         }
         fn axis_str((s, e, _): (String, String, usize)) -> Vec<String> {
-            if s == e {
-                vec![s]
-            } else {
-                vec![s, e]
-            }
+            if s == e { vec![s] } else { vec![s, e] }
         }
         let periods = axis_usize(range.period)?;
         let devups = axis_f64(range.devup)?;

@@ -1,24 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -46,10 +30,6 @@ pub struct RandomWalkIndexOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct RandomWalkIndexParams {
     pub length: Option<usize>,
 }
@@ -177,7 +157,9 @@ pub enum RandomWalkIndexError {
     EmptyInputData,
     #[error("random_walk_index: All values are NaN.")]
     AllValuesNaN,
-    #[error("random_walk_index: Inconsistent slice lengths: high={high_len}, low={low_len}, close={close_len}")]
+    #[error(
+        "random_walk_index: Inconsistent slice lengths: high={high_len}, low={low_len}, close={close_len}"
+    )]
     InconsistentSliceLengths {
         high_len: usize,
         low_len: usize,
@@ -259,11 +241,7 @@ fn prepare<'a>(
 fn nz_history(src: &[f64], idx: usize, offset: usize) -> f64 {
     if idx >= offset {
         let value = src[idx - offset];
-        if value.is_finite() {
-            value
-        } else {
-            0.0
-        }
+        if value.is_finite() { value } else { 0.0 }
     } else {
         0.0
     }
@@ -273,11 +251,7 @@ fn nz_history(src: &[f64], idx: usize, offset: usize) -> f64 {
 unsafe fn nz_history_14_ptr(src: *const f64, idx: usize) -> f64 {
     if idx >= DEFAULT_LENGTH {
         let value = unsafe { *src.add(idx - DEFAULT_LENGTH) };
-        if value.is_finite() {
-            value
-        } else {
-            0.0
-        }
+        if value.is_finite() { value } else { 0.0 }
     } else {
         0.0
     }
@@ -476,7 +450,6 @@ pub fn random_walk_index_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn random_walk_index_into(
     out_high: &mut [f64],
     out_low: &mut [f64],
@@ -944,375 +917,6 @@ fn random_walk_index_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "random_walk_index")]
-#[pyo3(signature = (high, low, close, length=14, kernel=None))]
-pub fn random_walk_index_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let input = RandomWalkIndexInput::from_slices(
-        high,
-        low,
-        close,
-        RandomWalkIndexParams {
-            length: Some(length),
-        },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| random_walk_index_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("high", out.high.into_pyarray(py))?;
-    dict.set_item("low", out.low.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "RandomWalkIndexStream")]
-pub struct RandomWalkIndexStreamPy {
-    stream: RandomWalkIndexStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl RandomWalkIndexStreamPy {
-    #[new]
-    #[pyo3(signature = (length=14))]
-    fn new(length: usize) -> PyResult<Self> {
-        let stream = RandomWalkIndexStream::try_new(RandomWalkIndexParams {
-            length: Some(length),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> (f64, f64) {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "random_walk_index_batch")]
-#[pyo3(signature = (high, low, close, length_range=(14,14,0), kernel=None))]
-pub fn random_walk_index_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high = high.as_slice()?;
-    let low = low.as_slice()?;
-    let close = close.as_slice()?;
-    let sweep = RandomWalkIndexBatchRange {
-        length: length_range,
-    };
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = close.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_high = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_low = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let high_slice = unsafe { out_high.as_slice_mut()? };
-    let low_slice = unsafe { out_low.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        random_walk_index_batch_inner_into(
-            high,
-            low,
-            close,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            high_slice,
-            low_slice,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("high", out_high.reshape((rows, cols))?)?;
-    dict.set_item("low", out_low.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_random_walk_index_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(random_walk_index_py, m)?)?;
-    m.add_function(wrap_pyfunction!(random_walk_index_batch_py, m)?)?;
-    m.add_class::<RandomWalkIndexStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RandomWalkIndexJsOutput {
-    pub high: Vec<f64>,
-    pub low: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "random_walk_index_js")]
-pub fn random_walk_index_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-) -> Result<JsValue, JsValue> {
-    let input = RandomWalkIndexInput::from_slices(
-        high,
-        low,
-        close,
-        RandomWalkIndexParams {
-            length: Some(length),
-        },
-    );
-    let out = random_walk_index_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&RandomWalkIndexJsOutput {
-        high: out.high,
-        low: out.low,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RandomWalkIndexBatchConfig {
-    pub length_range: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct RandomWalkIndexBatchJsOutput {
-    pub high: Vec<f64>,
-    pub low: Vec<f64>,
-    pub lengths: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_usize(name: &str, values: &[f64]) -> Result<(usize, usize, usize), JsValue> {
-    if values.len() != 3 {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 elements [start, end, step]"
-        )));
-    }
-    let mut out = [0usize; 3];
-    for (i, value) in values.iter().copied().enumerate() {
-        if !value.is_finite() || value < 0.0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid config: {name}[{i}] must be a finite non-negative whole number"
-            )));
-        }
-        let rounded = value.round();
-        if (value - rounded).abs() > 1e-9 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid config: {name}[{i}] must be a whole number"
-            )));
-        }
-        out[i] = rounded as usize;
-    }
-    Ok((out[0], out[1], out[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "random_walk_index_batch_js")]
-pub fn random_walk_index_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: RandomWalkIndexBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = RandomWalkIndexBatchRange {
-        length: js_vec3_to_usize("length_range", &config.length_range)?,
-    };
-    let out = random_walk_index_batch_with_kernel(high, low, close, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let lengths = out
-        .combos
-        .iter()
-        .map(|combo| combo.length.unwrap_or(DEFAULT_LENGTH))
-        .collect();
-    serde_wasm_bindgen::to_value(&RandomWalkIndexBatchJsOutput {
-        high: out.high,
-        low: out.low,
-        lengths,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn random_walk_index_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn random_walk_index_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn random_walk_index_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_high_ptr: *mut f64,
-    out_low_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_high_ptr.is_null()
-        || out_low_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let out_high = std::slice::from_raw_parts_mut(out_high_ptr, len);
-        let out_low = std::slice::from_raw_parts_mut(out_low_ptr, len);
-        let input = RandomWalkIndexInput::from_slices(
-            high,
-            low,
-            close,
-            RandomWalkIndexParams {
-                length: Some(length),
-            },
-        );
-        random_walk_index_into_slice(out_high, out_low, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn random_walk_index_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_high_ptr: *mut f64,
-    out_low_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || out_high_ptr.is_null()
-        || out_low_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to random_walk_index_batch_into",
-        ));
-    }
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let sweep = RandomWalkIndexBatchRange {
-            length: (length_start, length_end, length_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows.checked_mul(len).ok_or_else(|| {
-            JsValue::from_str("rows*cols overflow in random_walk_index_batch_into")
-        })?;
-        let out_high = std::slice::from_raw_parts_mut(out_high_ptr, total);
-        let out_low = std::slice::from_raw_parts_mut(out_low_ptr, total);
-        random_walk_index_batch_into_slice(
-            out_high,
-            out_low,
-            high,
-            low,
-            close,
-            &sweep,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn random_walk_index_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = random_walk_index_js(high, low, close, length)?;
-    crate::write_wasm_object_f64_outputs("random_walk_index_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn random_walk_index_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = random_walk_index_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "random_walk_index_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

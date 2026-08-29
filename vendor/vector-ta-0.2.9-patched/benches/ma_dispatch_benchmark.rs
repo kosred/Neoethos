@@ -1,12 +1,12 @@
 extern crate vector_ta;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use std::time::Duration;
 use vector_ta::indicators::moving_averages::ma::MaData;
 use vector_ta::indicators::moving_averages::ma_batch::{
-    ma_batch_with_kernel, ma_batch_with_kernel_and_typed_params, MaBatchParamKV,
+    MaBatchParamKV, ma_batch_with_kernel, ma_batch_with_kernel_and_typed_params,
 };
-use vector_ta::indicators::moving_averages::sma::{sma_batch_with_kernel, SmaBatchRange};
+use vector_ta::indicators::moving_averages::sma::{SmaBatchRange, sma_batch_with_kernel};
 use vector_ta::utilities::enums::Kernel;
 
 fn env_usize(name: &str, default_v: usize) -> usize {
@@ -100,7 +100,7 @@ fn bench_cpu_sma_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 fn bench_cuda_sma_dispatch(c: &mut Criterion) {
     use vector_ta::cuda::moving_averages::{CudaMaData, CudaMaSelector, CudaSma};
 
@@ -170,7 +170,7 @@ fn bench_cuda_sma_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "cuda-build-native"))]
 fn bench_cuda_sma_dispatch(_c: &mut Criterion) {}
 
 criterion_group!(

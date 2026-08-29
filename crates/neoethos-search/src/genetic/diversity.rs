@@ -119,6 +119,9 @@ mod tests {
         two.weights.push(0.25);
         let metrics_a = test_metrics(1_000.0, 1.5, 0.03, 50.0);
         let metrics_b = test_metrics(1_000.0, 1.5, 0.03, 50.0);
-        assert_ne!(diversity_key(&one, &metrics_a), diversity_key(&two, &metrics_b));
+        assert_ne!(
+            diversity_key(&one, &metrics_a),
+            diversity_key(&two, &metrics_b)
+        );
     }
 }

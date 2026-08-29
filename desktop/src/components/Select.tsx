@@ -1,11 +1,10 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { dataBootstrap, brokerTimeframes } from "../api";
+import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
 
 // Module-level caches so every dropdown on every screen shares one fetch.
 let symbolsCache: string[] | null = null;
 let tfsCache: string[] | null = null;
-
-const CANON_TFS = ["M1", "M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"];
 
 /** Force a re-fetch of the symbol list (call after a data download adds pairs). */
 export function invalidateSymbolCache() {
@@ -32,7 +31,9 @@ export function useSymbolOptions(): string[] {
 }
 
 export function useTimeframeOptions(): string[] {
-  const [opts, setOpts] = useState<string[]>(tfsCache ?? CANON_TFS);
+  const [opts, setOpts] = useState<string[]>(
+    tfsCache ?? [...CANONICAL_BROKER_TIMEFRAMES],
+  );
   useEffect(() => {
     if (tfsCache) {
       setOpts(tfsCache);
@@ -40,10 +41,13 @@ export function useTimeframeOptions(): string[] {
     }
     brokerTimeframes()
       .then((d) => {
-        tfsCache = d.timeframes?.length ? d.timeframes : CANON_TFS;
-        setOpts(tfsCache);
+        const options = d.timeframes?.length
+          ? d.timeframes
+          : [...CANONICAL_BROKER_TIMEFRAMES];
+        tfsCache = options;
+        setOpts(options);
       })
-      .catch(() => setOpts(CANON_TFS));
+      .catch(() => setOpts([...CANONICAL_BROKER_TIMEFRAMES]));
   }, []);
   return opts;
 }
@@ -87,7 +91,9 @@ export function SymbolSelect({ value, onChange, style, allowConfig, className, t
 
 /** Scrollable dropdown of the broker's canonical timeframes. */
 export function TimeframeSelect({ value, onChange, style, allowConfig, className, title }: Common) {
-  const [opts, setOpts] = useState<string[]>(tfsCache ?? CANON_TFS);
+  const [opts, setOpts] = useState<string[]>(
+    tfsCache ?? [...CANONICAL_BROKER_TIMEFRAMES],
+  );
   useEffect(() => {
     if (tfsCache) {
       setOpts(tfsCache);
@@ -95,10 +101,13 @@ export function TimeframeSelect({ value, onChange, style, allowConfig, className
     }
     brokerTimeframes()
       .then((d) => {
-        tfsCache = d.timeframes?.length ? d.timeframes : CANON_TFS;
-        setOpts(tfsCache);
+        const options = d.timeframes?.length
+          ? d.timeframes
+          : [...CANONICAL_BROKER_TIMEFRAMES];
+        tfsCache = options;
+        setOpts(options);
       })
-      .catch(() => setOpts(CANON_TFS));
+      .catch(() => setOpts([...CANONICAL_BROKER_TIMEFRAMES]));
   }, []);
   return (
     <select className={className} title={title} value={value} onChange={(e) => onChange(e.target.value)} style={style}>

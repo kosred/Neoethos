@@ -1,18 +1,18 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::sgf::{
-    build_endpoint_sgf_weights, effective_period, expand_grid, SgfBatchRange, SgfParams,
+    SgfBatchRange, SgfParams, build_endpoint_sgf_weights, effective_period, expand_grid,
 };
 use cust::context::Context;
 use cust::device::Device;
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -46,15 +46,7 @@ impl CudaSgf {
         cust::init(CudaFlags::empty()).map_err(CudaSgfError::Cuda)?;
         let device = Device::get_device(device_id as u32).map_err(CudaSgfError::Cuda)?;
         let context = Arc::new(Context::new(device).map_err(CudaSgfError::Cuda)?);
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/sgf_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
-        let module = Module::from_ptx(ptx, jit_opts)
-            .or_else(|_| Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]))
-            .or_else(|_| Module::from_ptx(ptx, &[]))
-            .map_err(CudaSgfError::Cuda)?;
+        let module = crate::load_cuda_embedded_module!("sgf_kernel").map_err(CudaSgfError::Cuda)?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(CudaSgfError::Cuda)?;
 
         const SGF_MAX_PERIOD_RS: usize = 4096;

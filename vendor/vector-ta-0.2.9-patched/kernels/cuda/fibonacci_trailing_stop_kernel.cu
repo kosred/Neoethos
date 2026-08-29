@@ -133,44 +133,32 @@ __device__ inline void apply_pivot_low(
     pivots[0] = {value, -1};
     *pivot_count = 1;
 }
-}
 
-extern "C" __global__ void fibonacci_trailing_stop_batch_f64(
+__device__ inline void fibonacci_trailing_stop_row_f64(
     const double* high,
     const double* low,
     const double* close,
     int len,
-    const int* left_bars,
-    const int* right_bars,
-    const double* levels,
-    const int* trigger_modes,
-    int rows,
-    double* out_trailing_stop,
-    double* out_long_stop,
-    double* out_short_stop,
-    double* out_direction
+    int left,
+    int right,
+    double level,
+    int trigger,
+    double* row_trailing_stop,
+    double* row_long_stop,
+    double* row_short_stop,
+    double* row_direction
 ) {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= rows) {
-        return;
-    }
-
-    const int left = left_bars[row];
-    const int right = right_bars[row];
-    const double level = levels[row];
-    const int trigger = trigger_modes[row];
-
-    double* row_trailing_stop =
-        out_trailing_stop + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_long_stop = out_long_stop + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_short_stop = out_short_stop + static_cast<size_t>(row) * static_cast<size_t>(len);
-    double* row_direction = out_direction + static_cast<size_t>(row) * static_cast<size_t>(len);
-
     for (int i = 0; i < len; ++i) {
         row_trailing_stop[i] = NAN;
-        row_long_stop[i] = NAN;
-        row_short_stop[i] = NAN;
-        row_direction[i] = NAN;
+        if (row_long_stop != nullptr) {
+            row_long_stop[i] = NAN;
+        }
+        if (row_short_stop != nullptr) {
+            row_short_stop[i] = NAN;
+        }
+        if (row_direction != nullptr) {
+            row_direction[i] = NAN;
+        }
     }
 
     if (left <= 0 || right <= 0 || !isfinite(level)
@@ -226,10 +214,10 @@ extern "C" __global__ void fibonacci_trailing_stop_batch_f64(
         if (pivot_count >= 2) {
             const double p0 = pivots[0].price;
             const double p1 = pivots[1].price;
-            double max_value = p0 > p1 ? p0 : p1;
-            double min_value = p0 < p1 ? p0 : p1;
+            double max_value = fmax(p0, p1);
+            double min_value = fmin(p0, p1);
             if (pivot_count == 2) {
-                st = 0.5 * (max_value + min_value);
+                st = (max_value + min_value) * 0.5;
             }
             const double dif = max_value - min_value;
             max_value += dif * level;
@@ -238,8 +226,7 @@ extern "C" __global__ void fibonacci_trailing_stop_batch_f64(
             min_level = min_value;
         }
 
-        const double price =
-            trigger == TRIGGER_CLOSE ? c : ((dir < 1) ? h : l);
+        const double price = trigger == TRIGGER_CLOSE ? c : ((dir < 1) ? h : l);
 
         if (dir < 1) {
             if (price > st) {
@@ -260,19 +247,72 @@ extern "C" __global__ void fibonacci_trailing_stop_batch_f64(
         }
 
         row_trailing_stop[i] = st;
-        row_long_stop[i] = dir == 1 ? st : NAN;
-        row_short_stop[i] = dir == -1 ? st : NAN;
-        row_direction[i] = static_cast<double>(dir);
+        if (row_long_stop != nullptr) {
+            row_long_stop[i] = dir == 1 ? st : NAN;
+        }
+        if (row_short_stop != nullptr) {
+            row_short_stop[i] = dir == -1 ? st : NAN;
+        }
+        if (row_direction != nullptr) {
+            row_direction[i] = static_cast<double>(dir);
+        }
     }
+}
+}
+
+extern "C" __global__ void fibonacci_trailing_stop_batch_f64(
+    const double* high,
+    const double* low,
+    const double* close,
+    int len,
+    const int* left_bars,
+    const int* right_bars,
+    const double* levels,
+    const int* trigger_modes,
+    int rows,
+    double* out_trailing_stop,
+    double* out_long_stop,
+    double* out_short_stop,
+    double* out_direction
+) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows) {
+        return;
+    }
+
+    const int left = left_bars[row];
+    const int right = right_bars[row];
+    const double level = levels[row];
+    const int trigger = trigger_modes[row];
+
+    double* row_trailing_stop =
+        out_trailing_stop + static_cast<size_t>(row) * static_cast<size_t>(len);
+    double* row_long_stop = out_long_stop + static_cast<size_t>(row) * static_cast<size_t>(len);
+    double* row_short_stop = out_short_stop + static_cast<size_t>(row) * static_cast<size_t>(len);
+    double* row_direction = out_direction + static_cast<size_t>(row) * static_cast<size_t>(len);
+
+    fibonacci_trailing_stop_row_f64(
+        high,
+        low,
+        close,
+        len,
+        left,
+        right,
+        level,
+        trigger,
+        row_trailing_stop,
+        row_long_stop,
+        row_short_stop,
+        row_direction
+    );
 }
 
 // ---------------------------------------------------------------------------
 // NEOETHOS f64 LANE  --  closer 3
 //
-// CPU reference: src/indicators/fibonacci_trailing_stop.rs:773
-// (fibonacci_trailing_stop_with_kernel). The column this emits is
-// trailing_stop, which is what output_id == "value" resolves to
-// (dispatch/cpu_batch.rs:8828-8830).
+// CPU reference: src/indicators/fibonacci_trailing_stop.rs
+// (fibonacci_trailing_stop_with_kernel). The canonical primary is
+// trailing_stop; unversioned output aliases are rejected at dispatch.
 //
 // SHAPE: one thread per combo, bars ascending. FORCED sequential -- a ratchet:
 // the stop st is carried, tightened with fmin/fmax against the Fibonacci
@@ -280,11 +320,9 @@ extern "C" __global__ void fibonacci_trailing_stop_batch_f64(
 // machine. Every bar reads the previous bar's stop and direction, and the CPU
 // clears the whole state on a non-finite bar.
 //
-// PERIOD-INVARIANT. compute_fibonacci_trailing_stop_batch
-// (cpu_batch.rs:8807-8810) reads left_bars, right_bars, level and trigger and
-// NEVER period, so five swept periods give five identical CPU columns and this
-// kernel emits five identical rows. All four CPU defaults are pinned below,
-// including trigger "close".
+// The compatibility primary ABI has no formula-parameter arrays, so it stays
+// pinned to the four CPU defaults below. Production uses the dynamic full ABI;
+// no fabricated generic period is admitted as a left/right-bars search.
 //
 // THE PIVOT STORE IS THREE ENTRIES, NOT A GROWING LIST: the CPU keeps at most
 // the three most recent alternating pivots and only ever reads the first two,
@@ -327,99 +365,22 @@ extern "C" __global__ void fibonacci_trailing_stop_neo_batch_f64(
     (void)first_valid;
 
     double* row = out + static_cast<size_t>(row_idx) * static_cast<size_t>(n);
-    for (int i = 0; i < n; ++i) {
-        row[i] = NAN;
-    }
-
     const int left = NEO_FTS_LEFT_BARS;
     const int right = NEO_FTS_RIGHT_BARS;
     const double level = NEO_FTS_LEVEL;
     const int trigger = NEO_FTS_TRIGGER;
-
-    if (left <= 0 || right <= 0 || !isfinite(level) ||
-        (trigger != TRIGGER_CLOSE && trigger != TRIGGER_WICK) || left + right + 1 > n) {
-        return;
-    }
-
-    bool state_active = false;
-    int dir = 0;
-    double st = NAN;
-    double max_level = NAN;
-    double min_level = NAN;
-    PivotPoint pivots[3];
-    int pivot_count = 0;
-
-    for (int i = 0; i < n; ++i) {
-        const double h = high[i];
-        const double l = low[i];
-        const double c = close[i];
-
-        if (!isfinite(h) || !isfinite(l) || !isfinite(c)) {
-            state_active = false;
-            dir = 0;
-            st = NAN;
-            max_level = NAN;
-            min_level = NAN;
-            pivot_count = 0;
-            continue;
-        }
-
-        double ph_value = NAN;
-        double pl_value = NAN;
-        const bool has_ph = confirmed_pivot_high_at(high, n, i, left, right, &ph_value);
-        const bool has_pl = confirmed_pivot_low_at(low, n, i, left, right, &pl_value);
-
-        if (!state_active) {
-            state_active = true;
-            dir = 0;
-            st = c;
-            max_level = h;
-            min_level = l;
-            pivot_count = 0;
-        }
-
-        if (has_ph) {
-            apply_pivot_high(pivots, &pivot_count, ph_value);
-        }
-        if (has_pl) {
-            apply_pivot_low(pivots, &pivot_count, pl_value);
-        }
-
-        if (pivot_count >= 2) {
-            const double p0 = pivots[0].price;
-            const double p1 = pivots[1].price;
-            double max_value = p0 > p1 ? p0 : p1;
-            double min_value = p0 < p1 ? p0 : p1;
-            if (pivot_count == 2) {
-                st = 0.5 * (max_value + min_value);
-            }
-            const double dif = max_value - min_value;
-            max_value += dif * level;
-            min_value -= dif * level;
-            max_level = max_value;
-            min_level = min_value;
-        }
-
-        const double price = trigger == TRIGGER_CLOSE ? c : ((dir < 1) ? h : l);
-
-        if (dir < 1) {
-            if (price > st) {
-                st = min_level;
-                dir = 1;
-            } else {
-                st = fmin(st, max_level);
-            }
-        }
-
-        if (dir > -1) {
-            if (price < st) {
-                st = max_level;
-                dir = -1;
-            } else {
-                st = fmax(st, min_level);
-            }
-        }
-
-        row[i] = st;
-    }
+    fibonacci_trailing_stop_row_f64(
+        high,
+        low,
+        close,
+        n,
+        left,
+        right,
+        level,
+        trigger,
+        row,
+        nullptr,
+        nullptr,
+        nullptr
+    );
 }

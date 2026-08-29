@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::cg::{CgBatchRange, CgParams};
@@ -6,13 +6,13 @@ use cust::context::Context;
 use cust::context::{CacheConfig, CurrentContext};
 use cust::device::Device;
 use cust::function::{BlockSize, FunctionAttribute, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 const H2D_PIN_THRESHOLD_BYTES: usize = 256 * 1024;
@@ -105,12 +105,6 @@ impl CudaCg {
 
         let _ = CurrentContext::set_cache_config(CacheConfig::PreferL1);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/cg_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("cg_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

@@ -100,13 +100,9 @@ pub fn make_config_form() -> FormState {
         Field::new(
             "Data dir",
             s.system.data_dir.display().to_string(),
-            "Absolute path to the data/ root (symbol=*/timeframe=*/)",
+            "Absolute root containing canonical manifest-backed Vortex generations",
         ),
-        Field::new(
-            "Discovery mode",
-            discovery_mode_value,
-            discovery_mode_hint,
-        ),
+        Field::new("Discovery mode", discovery_mode_value, discovery_mode_hint),
         Field::new(
             "Population",
             s.models.prop_search_population.to_string(),

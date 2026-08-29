@@ -4,6 +4,13 @@ use std::env;
 use std::process::Command;
 use std::sync::OnceLock;
 
+use anyhow::Result;
+
+use crate::common::{
+    CudaDevicePolicy, ResolvedCudaDevicePolicy, parse_cuda_device_policy,
+    resolve_cuda_device_policy,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DevicePreference {
     Auto,
@@ -23,9 +30,20 @@ pub enum ParamValue {
 pub struct TreeModelConfig {
     pub idx: usize,
     pub params: HashMap<String, ParamValue>,
+    pub requested_device_policy: String,
     pub device_pref: DevicePreference,
     pub gpu_only: bool,
     pub cpu_threads: Option<usize>,
+}
+
+impl TreeModelConfig {
+    pub fn resolved_cuda_device(&self) -> Result<ResolvedCudaDevicePolicy> {
+        resolve_tree_cuda_device_policy(&self.requested_device_policy)
+    }
+
+    pub fn cuda_ordinal(&self) -> Result<Option<usize>> {
+        cuda_ordinal_from_tree_policy(&self.requested_device_policy)
+    }
 }
 
 /// Process-wide tree-model runtime config, installed once from the operator's
@@ -154,6 +172,45 @@ pub fn tree_device_preference_for(_model_name: &str) -> DevicePreference {
     // Per-model overrides are folded into the single global `device` knob;
     // `parse_device_preference` applies the same string vocabulary as before.
     parse_device_preference(&current_tree_runtime().device)
+}
+
+/// Raw tree-device request, preserving an exact CUDA ordinal and invalid input
+/// until the fallible execution boundary validates it.
+pub fn tree_device_policy_from_params(
+    params: &HashMap<String, ParamValue>,
+    _model_name: &str,
+) -> String {
+    for key in ["device", "device_preference", "device_pref"] {
+        if let Some(ParamValue::String(value)) = params.get(key) {
+            let trimmed = value.trim();
+            return if trimmed.is_empty() {
+                "auto".to_string()
+            } else {
+                trimmed.to_ascii_lowercase()
+            };
+        }
+    }
+    let configured = current_tree_runtime().device.trim();
+    if configured.is_empty() {
+        "auto".to_string()
+    } else {
+        configured.to_ascii_lowercase()
+    }
+}
+
+pub fn parse_tree_cuda_device_policy(value: &str) -> Result<CudaDevicePolicy> {
+    parse_cuda_device_policy(value)
+}
+
+pub fn resolve_tree_cuda_device_policy(value: &str) -> Result<ResolvedCudaDevicePolicy> {
+    resolve_cuda_device_policy(value, nvidia_gpu_count())
+}
+
+pub fn cuda_ordinal_from_tree_policy(value: &str) -> Result<Option<usize>> {
+    Ok(match resolve_tree_cuda_device_policy(value)? {
+        ResolvedCudaDevicePolicy::Cpu => None,
+        ResolvedCudaDevicePolicy::Cuda { ordinal } => Some(ordinal),
+    })
 }
 
 pub fn parse_device_preference(value: &str) -> DevicePreference {
@@ -463,6 +520,63 @@ pub fn gpu_count() -> usize {
     0
 }
 
+/// Count only NVIDIA devices visible to CUDA.
+///
+/// The general [`gpu_count`] intentionally recognises ROCm for cross-vendor
+/// model backends. CUDA model routing must not use that answer: an AMD card is
+/// not evidence that CubeCL/Candle/XGBoost CUDA can initialize.
+pub fn nvidia_gpu_count() -> usize {
+    fn parse_visible_devices(devices: &str) -> Option<usize> {
+        let trimmed = devices.trim();
+        if trimmed.is_empty()
+            || trimmed == "-1"
+            || trimmed.eq_ignore_ascii_case("void")
+            || trimmed.eq_ignore_ascii_case("none")
+        {
+            return Some(0);
+        }
+        if trimmed.eq_ignore_ascii_case("all") {
+            return None;
+        }
+        let count = trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "-1")
+            .count();
+        Some(count)
+    }
+
+    for key in ["CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"] {
+        if let Ok(devices) = env::var(key)
+            && let Some(count) = parse_visible_devices(&devices)
+        {
+            return count;
+        }
+    }
+
+    const NVIDIA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut command = Command::new("nvidia-smi");
+    command.args(["--query-gpu=name", "--format=csv,noheader"]);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(command.output());
+    });
+    let Ok(Ok(output)) = receiver.recv_timeout(NVIDIA_PROBE_TIMEOUT) else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return 0;
+    };
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .count()
+}
+
 pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) -> (usize, f64) {
     let rt = current_tree_runtime();
     let p = rt
@@ -602,5 +716,15 @@ mod tests {
             parse_device_preference("cpu"),
             super::DevicePreference::Cpu
         ));
+    }
+
+    #[test]
+    fn strict_tree_cuda_parser_preserves_exact_ordinals_and_rejects_other_vendors() {
+        assert_eq!(
+            super::parse_tree_cuda_device_policy("cuda:3").expect("valid CUDA ordinal"),
+            crate::common::CudaDevicePolicy::Gpu { ordinal: 3 }
+        );
+        assert!(super::parse_tree_cuda_device_policy("gpu:bad").is_err());
+        assert!(super::parse_tree_cuda_device_policy("rocm:0").is_err());
     }
 }

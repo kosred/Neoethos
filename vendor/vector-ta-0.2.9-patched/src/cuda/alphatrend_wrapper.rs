@@ -1,16 +1,16 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::alphatrend::{AlphaTrendBatchRange, AlphaTrendParams};
-use crate::indicators::mfi::{mfi_with_kernel, MfiInput, MfiParams};
-use crate::indicators::rsi::{rsi_with_kernel, RsiInput, RsiParams};
+use crate::indicators::mfi::{MfiInput, MfiParams, mfi_with_kernel};
+use crate::indicators::rsi::{RsiInput, RsiParams, rsi_with_kernel};
 use crate::utilities::enums::Kernel;
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, CopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{CopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::collections::HashMap;
@@ -145,17 +145,10 @@ impl CudaAlphaTrend {
         let device = Device::get_device(device_id as u32).map_err(CudaAlphaTrendError::Cuda)?;
         let context = Arc::new(Context::new(device).map_err(CudaAlphaTrendError::Cuda)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/alphatrend_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("alphatrend_kernel")
             .map_err(CudaAlphaTrendError::Cuda)?;
-        let rsi_ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/rsi_kernel.ptx"));
         let rsi_module =
             crate::load_cuda_embedded_module!("rsi_kernel").map_err(CudaAlphaTrendError::Cuda)?;
-        let mfi_ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/mfi_kernel.ptx"));
         let mfi_module =
             crate::load_cuda_embedded_module!("mfi_kernel").map_err(CudaAlphaTrendError::Cuda)?;
         let stream =
@@ -1514,14 +1507,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "alphatrend",
-            "one_series_many_params",
-            "alphatrend_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(1)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "alphatrend",
+                "one_series_many_params",
+                "alphatrend_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(1)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }

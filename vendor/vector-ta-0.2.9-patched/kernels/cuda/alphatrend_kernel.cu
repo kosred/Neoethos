@@ -426,15 +426,16 @@ extern "C" __global__ void alphatrend_batch_from_precomputed_f32(
  * NEOETHOS f64 LANE  --  closer 3, round 3
  *
  * Every other entry point in this file is f32. This section adds the f64 lane
- * entry point beside them; the f32 wrappers are untouched, and listing this
+ * entry points beside them; the f32 wrappers are untouched, and listing this
  * file in build.rs opts the WHOLE translation unit out of `--use_fast_math`.
  *
  * CPU REFERENCE: src/indicators/alphatrend.rs `alphatrend_scalar` (:578-690),
  *   with `alphatrend_prepare` (:448-528) for the warmup, and
  *   src/indicators/mfi.rs `mfi_scalar` (:235) / `mfi_prepare` (:144) for the
  *   momentum series.
- *   Batch dispatcher: cpu_batch.rs:13969 -- output "value" is an ALIAS OF
- *   "k1" (:13975), so this kernel emits `k1`, never `k2`.
+ *   Batch dispatcher accepts the canonical registry identities `k1` and `k2`
+ *   only. Both entry points below share the same per-row state authority; the
+ *   source-stable primary ABI emits k1 and the full ABI emits k1 plus k2.
  *
  * INPUT: (high, low, close, volume) -- F64InputKind::Hlcv. The CPU batch calls
  *   `extract_ohlcv_full_input` (:13973) but `alphatrend_scalar` binds open as
@@ -498,24 +499,23 @@ extern "C" __global__ void alphatrend_batch_from_precomputed_f32(
 /* mfi.rs:291 -- already f64-sized. */
 #define NEO_AT_MFI_TOL 1e-14
 
-extern "C" __global__
-void alphatrend_neo_batch_f64(const double* __restrict__ high,
-                              const double* __restrict__ low,
-                              const double* __restrict__ close,
-                              const double* __restrict__ volume,
-                              int n,
-                              const int* __restrict__ periods,
-                              int n_combos,
-                              int first_valid,
-                              double* __restrict__ out)
+__device__ __forceinline__
+void alphatrend_row_f64(const double* __restrict__ high,
+                        const double* __restrict__ low,
+                        const double* __restrict__ close,
+                        const double* __restrict__ volume,
+                        int n,
+                        int period,
+                        int first_valid,
+                        double* __restrict__ out_k1,
+                        double* __restrict__ out_k2)
 {
-    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (combo >= n_combos || n <= 0) return;
+    if (n <= 0) return;
+    for (int i = 0; i < n; ++i) {
+        out_k1[i] = NEO_F64_NAN;
+        if (out_k2 != nullptr) out_k2[i] = NEO_F64_NAN;
+    }
 
-    double* __restrict__ o = out + (size_t)combo * (size_t)n;
-    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
-
-    const int period = periods[combo];
     if (period <= 0 || period > n || period > NEO_AT_MAX_PERIOD) return;
 
     /* alphatrend_prepare (:493) -- CLOSE ALONE, `!is_nan`. The caller's index
@@ -566,6 +566,8 @@ void alphatrend_neo_batch_f64(const double* __restrict__ high,
 
     double tr_sum = 0.0;
     double prev_alpha = NEO_F64_NAN;
+    double prev1 = NEO_F64_NAN;
+    double prev2 = NEO_F64_NAN;
 
     for (int i = 0; i < n; ++i) {
         /* ---- true range (:600-606) ---- */
@@ -636,8 +638,53 @@ void alphatrend_neo_batch_f64(const double* __restrict__ high,
                 cur = (down_t > prev_alpha) ? prev_alpha : down_t;
             }
 
-            o[i] = cur;
+            out_k1[i] = cur;
+            if (out_k2 != nullptr && i >= warmup + 2) out_k2[i] = prev2;
+            prev2 = prev1;
+            prev1 = cur;
             prev_alpha = cur;
         }
     }
+}
+
+/* Preserve the primary entry point's exact ABI for every existing generic
+ * f64 dispatcher consumer. It shares the full state machine and requests k1
+ * only; no auxiliary allocation or host discard is introduced. */
+extern "C" __global__
+void alphatrend_neo_batch_f64(const double* __restrict__ high,
+                              const double* __restrict__ low,
+                              const double* __restrict__ close,
+                              const double* __restrict__ volume,
+                              int n,
+                              const int* __restrict__ periods,
+                              int n_combos,
+                              int first_valid,
+                              double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    double* __restrict__ out_k1 = out + (size_t)combo * (size_t)n;
+    alphatrend_row_f64(high, low, close, volume, n, periods[combo], first_valid,
+                       out_k1, nullptr);
+}
+
+/* Canonical full-output ABI: one parameter-row thread, one launch, exact k1
+ * plus the CPU's two-bar-lagged k2. */
+extern "C" __global__
+void alphatrend_outputs_f64(const double* __restrict__ high,
+                            const double* __restrict__ low,
+                            const double* __restrict__ close,
+                            const double* __restrict__ volume,
+                            int n,
+                            const int* __restrict__ periods,
+                            int n_combos,
+                            int first_valid,
+                            double* __restrict__ out_k1,
+                            double* __restrict__ out_k2)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    const size_t offset = (size_t)combo * (size_t)n;
+    alphatrend_row_f64(high, low, close, volume, n, periods[combo], first_valid,
+                       out_k1 + offset, out_k2 + offset);
 }

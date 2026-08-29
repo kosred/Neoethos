@@ -1,27 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -57,10 +39,6 @@ pub struct LpcOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct LpcParams {
     pub cutoff_type: Option<String>,
     pub fixed_period: Option<usize>,
@@ -1203,7 +1181,6 @@ pub fn lpc_with_kernel(input: &LpcInput, kernel: Kernel) -> Result<LpcOutput, Lp
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn lpc_into(
     input: &LpcInput,
     filter_out: &mut [f64],
@@ -1586,736 +1563,6 @@ impl LpcStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "lpc")]
-#[pyo3(signature = (high, low, close, src, cutoff_type=None, fixed_period=None, max_cycle_limit=None, cycle_mult=None, tr_mult=None, kernel=None))]
-pub fn lpc_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    src: PyReadonlyArray1<'py, f64>,
-    cutoff_type: Option<String>,
-    fixed_period: Option<usize>,
-    max_cycle_limit: Option<usize>,
-    cycle_mult: Option<f64>,
-    tr_mult: Option<f64>,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let s = src.as_slice()?;
-
-    if h.len() != s.len() || l.len() != s.len() || c.len() != s.len() {
-        return Err(PyValueError::new_err(
-            "All arrays must have the same length",
-        ));
-    }
-
-    let params = LpcParams {
-        cutoff_type,
-        fixed_period,
-        max_cycle_limit,
-        cycle_mult,
-        tr_mult,
-    };
-
-    let input = LpcInput::from_slices(h, l, c, s, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    match lpc_with_kernel(&input, kern) {
-        Ok(output) => Ok((
-            output.filter.into_pyarray(py),
-            output.high_band.into_pyarray(py),
-            output.low_band.into_pyarray(py),
-        )),
-        Err(e) => Err(PyValueError::new_err(e.to_string())),
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "LpcStream")]
-pub struct LpcStreamPy {
-    inner: LpcStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl LpcStreamPy {
-    #[new]
-    #[pyo3(signature = (cutoff_type=None, fixed_period=None, max_cycle_limit=None, cycle_mult=None, tr_mult=None))]
-    pub fn new(
-        cutoff_type: Option<String>,
-        fixed_period: Option<usize>,
-        max_cycle_limit: Option<usize>,
-        cycle_mult: Option<f64>,
-        tr_mult: Option<f64>,
-    ) -> PyResult<Self> {
-        let params = LpcParams {
-            cutoff_type,
-            fixed_period,
-            max_cycle_limit,
-            cycle_mult,
-            tr_mult,
-        };
-
-        match LpcStream::try_new(params) {
-            Ok(stream) => Ok(Self { inner: stream }),
-            Err(e) => Err(PyValueError::new_err(e.to_string())),
-        }
-    }
-
-    pub fn update(&mut self, high: f64, low: f64, close: f64, src: f64) -> Option<(f64, f64, f64)> {
-        self.inner.update(high, low, close, src)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "lpc_batch")]
-#[pyo3(signature = (
-    high, low, close, src,
-    fixed_period_range, cycle_mult_range, tr_mult_range,
-    cutoff_type="fixed", max_cycle_limit=60, kernel=None
-))]
-pub fn lpc_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    src: numpy::PyReadonlyArray1<'py, f64>,
-    fixed_period_range: (usize, usize, usize),
-    cycle_mult_range: (f64, f64, f64),
-    tr_mult_range: (f64, f64, f64),
-    cutoff_type: &str,
-    max_cycle_limit: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let s = src.as_slice()?;
-    if h.len() != s.len() || l.len() != s.len() || c.len() != s.len() {
-        return Err(PyValueError::new_err(
-            "All arrays must have the same length",
-        ));
-    }
-
-    let sweep = LpcBatchRange {
-        fixed_period: fixed_period_range,
-        cycle_mult: cycle_mult_range,
-        tr_mult: tr_mult_range,
-        cutoff_type: cutoff_type.to_string(),
-        max_cycle_limit,
-    };
-    let combos = expand_grid_lpc(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len() * 3;
-    let cols = s.len();
-
-    let kern = validate_kernel(kernel, true)?;
-    let first = (0..s.len())
-        .find(|&i| !s[i].is_nan() && !h[i].is_nan() && !l[i].is_nan() && !c[i].is_nan())
-        .unwrap_or(0);
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    for row in 0..rows {
-        for col in 0..first {
-            slice_out[row * cols + col] = f64::NAN;
-        }
-    }
-
-    py.allow_threads(|| {
-        lpc_batch_inner_into(h, l, c, s, &sweep, kern, first, slice_out)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let dict = pyo3::types::PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fixed_periods",
-        combos
-            .iter()
-            .map(|p| p.fixed_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "cycle_mults",
-        combos
-            .iter()
-            .map(|p| p.cycle_mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "tr_mults",
-        combos
-            .iter()
-            .map(|p| p.tr_mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    let order_list = PyList::new(py, vec!["filter", "high", "low"])?;
-    dict.set_item("order", order_list)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_lpc_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(lpc_py, m)?)?;
-    m.add_function(wrap_pyfunction!(lpc_batch_py, m)?)?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(lpc_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(lpc_cuda_many_series_one_param_dev_py, m)?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available as cuda_is_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::lpc_wrapper::CudaLpc;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::indicators::moving_averages::alma::DeviceArrayF32Py;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "lpc_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, src_f32, fixed_period_range, cycle_mult_range, tr_mult_range, cutoff_type="fixed", max_cycle_limit=60, device_id=0))]
-pub fn lpc_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    src_f32: numpy::PyReadonlyArray1<'py, f32>,
-    fixed_period_range: (usize, usize, usize),
-    cycle_mult_range: (f64, f64, f64),
-    tr_mult_range: (f64, f64, f64),
-    cutoff_type: &str,
-    max_cycle_limit: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_is_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let s = src_f32.as_slice()?;
-    if h.len() != s.len() || l.len() != s.len() || c.len() != s.len() {
-        return Err(PyValueError::new_err(
-            "All arrays must have the same length",
-        ));
-    }
-    let sweep = LpcBatchRange {
-        fixed_period: fixed_period_range,
-        cycle_mult: cycle_mult_range,
-        tr_mult: tr_mult_range,
-        cutoff_type: cutoff_type.to_string(),
-        max_cycle_limit,
-    };
-    let (triplet, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaLpc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let (triplet, combos) = cuda
-            .lpc_batch_dev(h, l, c, s, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.synchronize()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((triplet, combos, ctx, dev_id))
-    })?;
-    let d = pyo3::types::PyDict::new(py);
-    d.set_item(
-        "filter",
-        DeviceArrayF32Py {
-            inner: triplet.wt1,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-    )?;
-    d.set_item(
-        "high",
-        DeviceArrayF32Py {
-            inner: triplet.wt2,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-    )?;
-    d.set_item(
-        "low",
-        DeviceArrayF32Py {
-            inner: triplet.hist,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-    )?;
-    d.set_item(
-        "fixed_periods",
-        combos
-            .iter()
-            .map(|p| p.fixed_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "cycle_mults",
-        combos
-            .iter()
-            .map(|p| p.cycle_mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item(
-        "tr_mults",
-        combos
-            .iter()
-            .map(|p| p.tr_mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item("rows", combos.len())?;
-    d.set_item("cols", s.len())?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "lpc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, src_tm_f32, cutoff_type="fixed", fixed_period=20, tr_mult=1.0, device_id=0))]
-pub fn lpc_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    close_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    src_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    cutoff_type: &str,
-    fixed_period: usize,
-    tr_mult: f64,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    if !cuda_is_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if !cutoff_type.eq_ignore_ascii_case("fixed") {
-        return Err(PyValueError::new_err(
-            "many-series CUDA supports fixed cutoff only",
-        ));
-    }
-    let sh = high_tm_f32.shape();
-    let sl = low_tm_f32.shape();
-    let sc = close_tm_f32.shape();
-    let ss = src_tm_f32.shape();
-    if sh != sl || sh != sc || sh != ss || sh.len() != 2 {
-        return Err(PyValueError::new_err(
-            "expected matching 2D arrays [rows, cols]",
-        ));
-    }
-    let rows = sh[0];
-    let cols = sh[1];
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let s = src_tm_f32.as_slice()?;
-    let params = LpcParams {
-        cutoff_type: Some(cutoff_type.to_string()),
-        fixed_period: Some(fixed_period),
-        max_cycle_limit: Some(60),
-        cycle_mult: Some(1.0),
-        tr_mult: Some(tr_mult),
-    };
-    let (triplet, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaLpc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let triplet = cuda
-            .lpc_many_series_one_param_time_major_dev(h, l, c, s, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.synchronize()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((triplet, ctx, dev_id))
-    })?;
-    let d = pyo3::types::PyDict::new(py);
-    d.set_item(
-        "filter",
-        DeviceArrayF32Py {
-            inner: triplet.wt1,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-    )?;
-    d.set_item(
-        "high",
-        DeviceArrayF32Py {
-            inner: triplet.wt2,
-            _ctx: Some(ctx.clone()),
-            device_id: Some(dev_id),
-        },
-    )?;
-    d.set_item(
-        "low",
-        DeviceArrayF32Py {
-            inner: triplet.hist,
-            _ctx: Some(ctx),
-            device_id: Some(dev_id),
-        },
-    )?;
-    d.set_item("rows", rows)?;
-    d.set_item("cols", cols)?;
-    d.set_item("fixed_period", fixed_period)?;
-    d.set_item("tr_mult", tr_mult)?;
-    Ok(d)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct LpcResult {
-    filter: Vec<f64>,
-    high_band: Vec<f64>,
-    low_band: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lpc_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lpc_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lpc_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    src_ptr: *const f64,
-    filter_out_ptr: *mut f64,
-    high_out_ptr: *mut f64,
-    low_out_ptr: *mut f64,
-    len: usize,
-    cutoff_type: &str,
-    fixed_period: usize,
-    max_cycle_limit: usize,
-    cycle_mult: f64,
-    tr_mult: f64,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || src_ptr.is_null()
-        || filter_out_ptr.is_null()
-        || high_out_ptr.is_null()
-        || low_out_ptr.is_null()
-    {
-        return Err(JsValue::from_str("null pointer passed to lpc_into"));
-    }
-
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let s = std::slice::from_raw_parts(src_ptr, len);
-
-        let params = LpcParams {
-            cutoff_type: Some(cutoff_type.to_string()),
-            fixed_period: Some(fixed_period),
-            max_cycle_limit: Some(max_cycle_limit),
-            cycle_mult: Some(cycle_mult),
-            tr_mult: Some(tr_mult),
-        };
-        let input = LpcInput::from_slices(h, l, c, s, params);
-
-        let alias = filter_out_ptr as *const f64 == high_ptr
-            || filter_out_ptr as *const f64 == low_ptr
-            || filter_out_ptr as *const f64 == close_ptr
-            || filter_out_ptr as *const f64 == src_ptr
-            || high_out_ptr as *const f64 == high_ptr
-            || high_out_ptr as *const f64 == low_ptr
-            || high_out_ptr as *const f64 == close_ptr
-            || high_out_ptr as *const f64 == src_ptr
-            || low_out_ptr as *const f64 == high_ptr
-            || low_out_ptr as *const f64 == low_ptr
-            || low_out_ptr as *const f64 == close_ptr
-            || low_out_ptr as *const f64 == src_ptr;
-
-        if alias {
-            let mut f = vec![0.0; len];
-            let mut hb = vec![0.0; len];
-            let mut lb = vec![0.0; len];
-            lpc_into_slices(&mut f, &mut hb, &mut lb, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(filter_out_ptr, len).copy_from_slice(&f);
-            std::slice::from_raw_parts_mut(high_out_ptr, len).copy_from_slice(&hb);
-            std::slice::from_raw_parts_mut(low_out_ptr, len).copy_from_slice(&lb);
-        } else {
-            let f = std::slice::from_raw_parts_mut(filter_out_ptr, len);
-            let hb = std::slice::from_raw_parts_mut(high_out_ptr, len);
-            let lb = std::slice::from_raw_parts_mut(low_out_ptr, len);
-            lpc_into_slices(f, hb, lb, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lpc_wasm(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    src: &[f64],
-    cutoff_type: &str,
-    fixed_period: usize,
-    max_cycle_limit: usize,
-    cycle_mult: f64,
-    tr_mult: f64,
-) -> Result<JsValue, JsValue> {
-    let params = LpcParams {
-        cutoff_type: Some(cutoff_type.to_string()),
-        fixed_period: Some(fixed_period),
-        max_cycle_limit: Some(max_cycle_limit),
-        cycle_mult: Some(cycle_mult),
-        tr_mult: Some(tr_mult),
-    };
-
-    let input = LpcInput::from_slices(high, low, close, src, params);
-
-    match lpc(&input) {
-        Ok(output) => {
-            let result = LpcResult {
-                filter: output.filter,
-                high_band: output.high_band,
-                low_band: output.low_band,
-            };
-            serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-        }
-        Err(e) => Err(JsValue::from_str(&e.to_string())),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LpcJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = lpc)]
-pub fn lpc_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    src: &[f64],
-    cutoff_type: &str,
-    fixed_period: usize,
-    max_cycle_limit: usize,
-    cycle_mult: f64,
-    tr_mult: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let params = LpcParams {
-        cutoff_type: Some(cutoff_type.to_string()),
-        fixed_period: Some(fixed_period),
-        max_cycle_limit: Some(max_cycle_limit),
-        cycle_mult: Some(cycle_mult),
-        tr_mult: Some(tr_mult),
-    };
-    let input = LpcInput::from_slices(high, low, close, src, params);
-    let out = lpc(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let len = src.len();
-    let mut values = Vec::with_capacity(3 * len);
-    values.extend_from_slice(&out.filter);
-    values.extend_from_slice(&out.high_band);
-    values.extend_from_slice(&out.low_band);
-    Ok(values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LpcBatchConfig {
-    pub fixed_period_range: (usize, usize, usize),
-    pub cycle_mult_range: (f64, f64, f64),
-    pub tr_mult_range: (f64, f64, f64),
-    pub cutoff_type: String,
-    pub max_cycle_limit: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct LpcBatchJsOutput {
-    pub values: Vec<Vec<f64>>,
-    pub fixed_periods: Vec<usize>,
-    pub cycle_mults: Vec<f64>,
-    pub tr_mults: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub order: Vec<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = lpc_batch)]
-pub fn lpc_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    src: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: LpcBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = LpcBatchRange {
-        fixed_period: cfg.fixed_period_range,
-        cycle_mult: cfg.cycle_mult_range,
-        tr_mult: cfg.tr_mult_range,
-        cutoff_type: cfg.cutoff_type,
-        max_cycle_limit: cfg.max_cycle_limit,
-    };
-    let out = lpc_batch_with_kernel(high, low, close, src, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values_2d = Vec::with_capacity(out.rows);
-    for i in 0..out.rows {
-        let start = i * out.cols;
-        let end = start + out.cols;
-        values_2d.push(out.values[start..end].to_vec());
-    }
-
-    let num_combos = out.combos.len();
-    let mut fixed_periods = Vec::with_capacity(num_combos);
-    let mut cycle_mults = Vec::with_capacity(num_combos);
-    let mut tr_mults = Vec::with_capacity(num_combos);
-
-    for combo in &out.combos {
-        fixed_periods.push(combo.fixed_period.unwrap());
-        cycle_mults.push(combo.cycle_mult.unwrap());
-        tr_mults.push(combo.tr_mult.unwrap());
-    }
-
-    let js = LpcBatchJsOutput {
-        values: values_2d,
-        fixed_periods,
-        cycle_mults,
-        tr_mults,
-        rows: out.rows,
-        cols: out.cols,
-        order: vec!["filter".to_string(), "high".to_string(), "low".to_string()],
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lpc_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    src_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fixed_start: usize,
-    fixed_end: usize,
-    fixed_step: usize,
-    cm_start: f64,
-    cm_end: f64,
-    cm_step: f64,
-    tm_start: f64,
-    tm_end: f64,
-    tm_step: f64,
-    cutoff_type: &str,
-    max_cycle_limit: usize,
-) -> Result<usize, JsValue> {
-    if [high_ptr, low_ptr, close_ptr, src_ptr, out_ptr]
-        .iter()
-        .any(|&p| p.is_null())
-    {
-        return Err(JsValue::from_str("null pointer passed to lpc_batch_into"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let s = std::slice::from_raw_parts(src_ptr, len);
-
-        let sweep = LpcBatchRange {
-            fixed_period: (fixed_start, fixed_end, fixed_step),
-            cycle_mult: (cm_start, cm_end, cm_step),
-            tr_mult: (tm_start, tm_end, tm_step),
-            cutoff_type: cutoff_type.to_string(),
-            max_cycle_limit,
-        };
-        let combos = expand_grid_lpc(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len().checked_mul(3).ok_or_else(|| {
-            JsValue::from_str(
-                &LpcError::InvalidRange {
-                    start: fixed_start,
-                    end: fixed_end,
-                    step: fixed_step,
-                }
-                .to_string(),
-            )
-        })?;
-        let cols = len;
-
-        let total = rows.checked_mul(cols).ok_or_else(|| {
-            JsValue::from_str(
-                &LpcError::InvalidRange {
-                    start: fixed_start,
-                    end: fixed_end,
-                    step: fixed_step,
-                }
-                .to_string(),
-            )
-        })?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        let first = (0..len)
-            .find(|&i| !s[i].is_nan() && !h[i].is_nan() && !l[i].is_nan() && !c[i].is_nan())
-            .unwrap_or(0);
-
-        for row in 0..rows {
-            for col in 0..first {
-                out[row * cols + col] = f64::NAN;
-            }
-        }
-
-        lpc_batch_inner_into(
-            h,
-            l,
-            c,
-            s,
-            &sweep,
-            crate::utilities::enums::Kernel::Auto,
-            first,
-            out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
 #[inline]
 pub fn lpc_into_slices(
     filter_dst: &mut [f64],
@@ -2639,53 +1886,11 @@ pub fn lpc_batch_par_slice(
     lpc_batch_with_kernel(high, low, close, src, sweep, detect_best_batch_kernel())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lpc_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    src: &[f64],
-    cutoff_type: &str,
-    fixed_period: usize,
-    max_cycle_limit: usize,
-    cycle_mult: f64,
-    tr_mult: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = lpc_js(
-        high,
-        low,
-        close,
-        src,
-        cutoff_type,
-        fixed_period,
-        max_cycle_limit,
-        cycle_mult,
-        tr_mult,
-    )?;
-    crate::write_wasm_f64_output("lpc_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn lpc_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    src: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = lpc_batch_unified_js(high, low, close, src, config)?;
-    crate::write_wasm_selected_object_f64_outputs("lpc_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
@@ -2733,13 +1938,8 @@ mod tests {
         let mut hb = vec![0.0; n];
         let mut lb = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             lpc_into(&input, &mut f, &mut hb, &mut lb)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            lpc_into_slices(&mut f, &mut hb, &mut lb, &input, Kernel::Auto)?;
         }
 
         assert_eq!(f.len(), baseline.filter.len());
@@ -2778,8 +1978,8 @@ mod tests {
 
     fn check_lpc_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = LpcParams::default();
         let input = LpcInput::from_candles(&candles, "close", params);
@@ -2851,8 +2051,8 @@ mod tests {
 
     fn check_lpc_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = LpcParams {
             cutoff_type: None,
@@ -2870,8 +2070,8 @@ mod tests {
 
     fn check_lpc_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = LpcInput::with_default_candles(&candles);
         match input.data {
@@ -3009,8 +2209,8 @@ mod tests {
 
     fn check_lpc_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = LpcParams {
             cutoff_type: Some("fixed".to_string()),
@@ -3044,8 +2244,8 @@ mod tests {
 
     fn check_lpc_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = LpcInput::from_candles(
             &candles,
@@ -3076,8 +2276,8 @@ mod tests {
     fn check_lpc_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let cutoff_type = "fixed".to_string();
         let fixed_period = 20;
@@ -3149,8 +2349,8 @@ mod tests {
     fn check_lpc_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             LpcParams::default(),
@@ -3283,8 +2483,8 @@ mod tests {
 
     fn check_lpc_fixed_mode(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = LpcParams {
             cutoff_type: Some("fixed".to_string()),
@@ -3392,8 +2592,8 @@ mod tests {
 
     fn check_batch_shapes(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let sweep = LpcBatchRange {
             fixed_period: (10, 12, 1),
@@ -3413,8 +2613,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let sweep = LpcBatchRange::default();
         let out = lpc_batch_with_kernel(&c.high, &c.low, &c.close, &c.close, &sweep, kernel)?;
         for &v in &out.values {

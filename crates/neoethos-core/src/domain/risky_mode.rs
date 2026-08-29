@@ -1689,8 +1689,7 @@ mod tests {
         );
         // Sanity: default still inside the operator-signed §7.1 band.
         assert!(
-            (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION
-                ..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
+            (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
                 .contains(&RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION),
             "default must be inside [{}, {}] band",
             RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION,
@@ -1895,11 +1894,11 @@ mod tests {
         // Tolerance ~1e-4 matches the approximation's stated accuracy.
         let cases = [
             (0.5, 0.0),
-            (0.975, 1.96),     // canonical 95% two-sided z
-            (0.95, 1.6449),    // 90% two-sided
-            (0.90, 1.2816),    // 80% two-sided / top-10% one-sided
-            (0.75, 0.6745),    // upper quartile
-            (0.025, -1.96),    // lower 2.5%
+            (0.975, 1.96),  // canonical 95% two-sided z
+            (0.95, 1.6449), // 90% two-sided
+            (0.90, 1.2816), // 80% two-sided / top-10% one-sided
+            (0.75, 0.6745), // upper quartile
+            (0.025, -1.96), // lower 2.5%
         ];
         for (p, expected_z) in cases {
             let z = inverse_standard_normal_cdf(p);
@@ -2076,7 +2075,10 @@ mod tests {
         let mut m = RiskyModeManager::new(cfg, 100.0).expect("manager");
         m.sync_bankroll(1_700.0);
         let peak = m.high_water_stage_idx();
-        assert!(peak >= 4, "1700 should sit on stage 4 of the 100->50k ladder");
+        assert!(
+            peak >= 4,
+            "1700 should sit on stage 4 of the 100->50k ladder"
+        );
         m.record_trade_outcome(-1_600.0);
         assert_eq!(m.high_water_stage_idx(), peak);
         assert!(m.current_stage().stage_idx < peak);

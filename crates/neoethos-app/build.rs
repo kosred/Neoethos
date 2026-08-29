@@ -19,7 +19,20 @@ use std::path::PathBuf;
 fn main() {
     assert_at_most_one_gpu_feature();
     assert_gpu_toolkit_available();
+    emit_linux_native_runtime_runpaths();
     emit_embedded_credentials();
+}
+
+/// Linux release packages keep each binary's selected native tree-model
+/// runtimes in a private `/usr/lib` directory. Portable bundles keep them
+/// adjacent to the executable. Encode both deterministic locations in the
+/// binary so no environment-variable or build-tree fallback is required.
+fn emit_linux_native_runtime_runpaths() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg-bin=neoethos-app=-Wl,-rpath,$ORIGIN");
+        println!("cargo:rustc-link-arg-bin=neoethos-app=-Wl,-rpath,$ORIGIN/lib");
+        println!("cargo:rustc-link-arg-bin=neoethos-app=-Wl,-rpath,$ORIGIN/../lib/neoethos-app");
+    }
 }
 
 /// Generates `$OUT_DIR/embedded_credentials.rs` with compile-time cTrader
@@ -205,7 +218,8 @@ fn assert_gpu_toolkit_available() {
     let rocm = std::env::var("CARGO_FEATURE_GPU_ROCM").is_ok();
     let apple = std::env::var("CARGO_FEATURE_GPU_APPLE").is_ok();
 
-    if nvidia && std::env::var("CUDA_PATH").is_err()
+    if nvidia
+        && std::env::var("CUDA_PATH").is_err()
         && !std::path::Path::new("/usr/local/cuda").exists()
     {
         panic!(
@@ -225,10 +239,7 @@ fn assert_gpu_toolkit_available() {
              the wgpu path needs no SDK at build time (runtime uses the driver's ICD)."
         );
     }
-    if rocm
-        && std::env::var("HIP_PATH").is_err()
-        && std::env::var("ROCM_PATH").is_err()
-    {
+    if rocm && std::env::var("HIP_PATH").is_err() && std::env::var("ROCM_PATH").is_err() {
         panic!(
             "neoethos-app: gpu-rocm selected but the ROCm toolkit is not on this \
              machine. Install from https://rocm.docs.amd.com/projects/install-on-linux/ \

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::emd::{EmdBatchRange, EmdParams};
@@ -6,12 +6,12 @@ use cust::context::{CacheConfig, Context, SharedMemoryConfig};
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use cust::sys::{
-    cuDeviceGetAttribute, cuFuncSetAttribute, CUdevice_attribute, CUfunction_attribute,
+    CUdevice_attribute, CUfunction_attribute, cuDeviceGetAttribute, cuFuncSetAttribute,
 };
 use std::env;
 use std::ffi::c_void;
@@ -214,12 +214,6 @@ impl CudaEmd {
         let device = Device::get_device(device_id as u32).map_err(CudaEmdError::Cuda)?;
         let context = Arc::new(Context::new(device).map_err(CudaEmdError::Cuda)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/emd_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
         let module = crate::load_cuda_embedded_module!("emd_kernel").map_err(CudaEmdError::Cuda)?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None).map_err(CudaEmdError::Cuda)?;
 

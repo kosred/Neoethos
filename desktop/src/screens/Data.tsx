@@ -1,10 +1,32 @@
-import { useEffect, useState } from "react";
-import { dataBootstrap, dataFetch, dataFetchBody, refreshBrokerCosts, serverSymbols, spreadStats, type BrokerSymbol, type SpreadStats } from "../api";
+import { useEffect, useRef, useState } from "react";
+import {
+  ApiResponseError,
+  dataBootstrap,
+  dataFetch,
+  dataFetchBody,
+  dataFetchStatus,
+  refreshBrokerCosts,
+  serverSymbols,
+  spreadStats,
+  stopActiveDataFetch,
+  type BrokerSymbol,
+  type SpreadStats,
+} from "../api";
 import { usePoll } from "../hooks";
 import { useSymbolOptions, useTimeframeOptions, invalidateSymbolCache } from "../components/Select";
 import { HelpPanel, HelpStep } from "../components/Help";
+import {
+  brokerFetchSelectionKey,
+  dataBatchResultText,
+  brokerBlockedRetryAfterSeconds,
+  dataOperationErrorText,
+  selectedDatasetGenerationForBrokerFetch,
+  type CanonicalDatasetIdentity,
+  type DataFetchStopOutcome,
+} from "../apiContracts";
+import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
 
-const TF_SPEED = ["MN1", "W1", "D1", "H12", "H4", "H1", "M30", "M15", "M5", "M3", "M1"];
+const TF_SPEED: string[] = [...CANONICAL_BROKER_TIMEFRAMES].reverse();
 const tfRank = (t: string) => {
   const i = TF_SPEED.indexOf(t);
   return i < 0 ? 99 : i;
@@ -72,9 +94,17 @@ export default function Data() {
   const symOpts = groups.flatMap(([, list]) => list);
   const [selSyms, setSelSyms] = useState<string[]>([]);
   const [selTfs, setSelTfs] = useState<string[]>([]);
+  const [selectedBrokerDatasetIds, setSelectedBrokerDatasetIds] = useState<
+    Record<string, CanonicalDatasetIdentity>
+  >({});
   const [from, setFrom] = useState("2015-01-01");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const stopRequested = useRef(false);
+  const {
+    data: fetchStatus,
+    reload: reloadFetchStatus,
+  } = usePoll(dataFetchStatus, busy ? 250 : 0, [busy]);
   const [costBusy, setCostBusy] = useState(false);
   const [costMsg, setCostMsg] = useState("");
 
@@ -105,27 +135,99 @@ export default function Data() {
     }
     const tfs = [...selTfs].sort((a, b) => tfRank(a) - tfRank(b));
     const combos = selSyms.flatMap((s) => tfs.map((t) => ({ s, t })));
+    stopRequested.current = false;
     setBusy(true);
     let done = 0;
     let failed = 0;
+    const acknowledgements: string[] = [];
     const fails: string[] = [];
     for (const { s, t } of combos) {
+      if (stopRequested.current) break;
       setMsg(`Downloading ${done + failed + 1}/${combos.length}: ${s} ${t}…`);
+      const symbol = s.toUpperCase();
+      const timeframe = t.toUpperCase();
       try {
-        await dataFetch(dataFetchBody(s.toUpperCase(), t.toUpperCase(), fromMs));
+        const selectedDatasetIdentity =
+          selectedBrokerDatasetIds[brokerFetchSelectionKey(symbol, timeframe)] ?? null;
+        const datasetSelection = selectedDatasetGenerationForBrokerFetch(
+          data?.datasets ?? [],
+          symbol,
+          timeframe,
+          selectedDatasetIdentity,
+        );
+        const outcome = await dataFetch(
+          dataFetchBody(
+            symbol,
+            timeframe,
+            fromMs,
+            undefined,
+            datasetSelection,
+          ),
+        );
+        acknowledgements.push(`${outcome.datasetIdentity} @ ${outcome.generation}`);
         done++;
       } catch (e) {
         failed++;
-        fails.push(`${s} ${t}`);
+        fails.push(`${symbol} ${timeframe}: ${dataOperationErrorText(e)}`);
+        if (stopRequested.current) break;
+        const retryAfter = brokerBlockedRetryAfterSeconds(
+          e instanceof ApiResponseError ? e.payload : null,
+        );
+        if (retryAfter !== undefined) {
+          stopRequested.current = true;
+          const wait = retryAfter === null
+            ? "the broker supplied no retryAfter"
+            : `wait at least ${retryAfter}s`;
+          fails.push(`Batch stopped after broker BLOCKED_PAYLOAD_TYPE; ${wait}.`);
+          break;
+        }
       }
     }
     invalidateSymbolCache();
     await reload();
-    setMsg(`✓ Downloaded ${done}/${combos.length}${failed ? ` · ${failed} failed (${fails.slice(0, 4).join(", ")}${fails.length > 4 ? "…" : ""})` : ""}.`);
+    setMsg(dataBatchResultText(combos.length, acknowledgements, fails));
     setBusy(false);
   };
 
+  const stopFetch = async () => {
+    if (!fetchStatus?.active) return;
+    stopRequested.current = true;
+    const renderOutcome = (outcome: DataFetchStopOutcome) => {
+      switch (outcome.outcome) {
+        case "cancelled":
+          setMsg(`Cancellation requested for exact download run ${outcome.runId}.`);
+          break;
+        case "publication_in_progress":
+          setMsg(`Run ${outcome.runId} is already committing atomically and cannot be cancelled.`);
+          break;
+        case "stale_run":
+          setMsg(
+            `Run ${outcome.requestedRunId} is stale; active run is ${outcome.activeRunId}.`,
+          );
+          break;
+        case "no_active_fetch":
+          setMsg("There is no active broker download to stop.");
+          break;
+      }
+    };
+    try {
+      renderOutcome(await stopActiveDataFetch(fetchStatus.runId));
+    } catch (error) {
+      setMsg(`Stop failed: ${dataOperationErrorText(error)}`);
+    } finally {
+      await reloadFetchStatus();
+    }
+  };
+
   const nCombos = selSyms.length * selTfs.length;
+  const brokerDatasetCounts = new Map<string, number>();
+  for (const entry of data?.datasets ?? []) {
+    if (entry.sourceKind !== "ctrader" || entry.symbol === null || entry.timeframe === null) {
+      continue;
+    }
+    const key = brokerFetchSelectionKey(entry.symbol, entry.timeframe);
+    brokerDatasetCounts.set(key, (brokerDatasetCounts.get(key) ?? 0) + 1);
+  }
 
   return (
     <div className="screen">
@@ -134,10 +236,10 @@ export default function Data() {
 
       <HelpPanel id="data">
         <p>This screen manages the <b>price history</b> the engine searches and trains on. Everything is stored locally under your data folder (see <b>Files &amp; Storage</b>).</p>
-        <HelpStep n={1}><b>Download bars:</b> the symbol list shows the broker's <b>full universe</b> (forex, metals, indices — grouped by class), so you can bring in <b>brand-new pairs</b>, not just re-download existing ones (✓ marks pairs that already have local data). Tick Symbols + Timeframes, pick a <b>From</b> date, press <b>Fetch</b>. Each download replaces that symbol+timeframe file with the fetched range.</HelpStep>
+        <HelpStep n={1}><b>Download bars:</b> the symbol list shows the broker's <b>full universe</b> (forex, metals, indices — grouped by class), so you can bring in <b>brand-new pairs</b>, not just refresh existing ones (✓ marks pairs with canonical data). Tick Symbols + Timeframes, pick a <b>From</b> date, press <b>Fetch</b>. Every timeframe is downloaded directly and published as its own canonical Vortex generation.</HelpStep>
         <HelpStep n={2}><b>Broker costs:</b> press <b>Refresh broker costs</b> once so backtests use your account's real commission/swap/spread instead of a generic table.</HelpStep>
         <HelpStep n={3}><b>Local symbols:</b> the chips at the bottom show what data you already have — available in every dropdown across the app.</HelpStep>
-        <p className="muted small">Tip: Discovery searches a base timeframe plus higher ones, so download the same From date across the timeframes you plan to use.</p>
+        <p className="muted small">Discovery requires direct data for its base and every selected higher timeframe. Download or import each one explicitly; missing data fails visibly.</p>
       </HelpPanel>
 
       {error && <div className="banner warn">{error}</div>}
@@ -145,11 +247,75 @@ export default function Data() {
       {data && (
         <div className="cards">
           <div className="card"><div className="card-label">SYMBOLS</div><div className="card-value">{data.symbols.length}</div></div>
-          <div className="card"><div className="card-label">FILES</div><div className="card-value">{data.fileCount}</div></div>
+          <div className="card"><div className="card-label">DATASETS</div><div className="card-value">{data.datasetCount}</div></div>
           <div className="card" style={{ gridColumn: "span 2" }}>
             <div className="card-label">DATA DIR</div>
             <div className="card-value" style={{ fontSize: 12 }}>{data.dataDir} {data.dataDirExists ? "" : "(missing)"}</div>
           </div>
+        </div>
+      )}
+
+      {data && data.datasets.length > 0 && (
+        <>
+          <h2>Canonical dataset inventory</h2>
+          <p className="muted small">
+            When several cTrader identities publish the same symbol/timeframe, choose the exact
+            identity that a broker refresh must advance. Its current generation and manifest binding
+            are read from this inventory at the moment Fetch is pressed.
+          </p>
+          <table className="tbl">
+            <thead>
+              <tr><th>Symbol</th><th>TF</th><th>Current generation</th><th>Exact identity</th><th>Verification</th><th>Broker refresh</th></tr>
+            </thead>
+            <tbody>
+              {data.datasets.map((entry) => {
+                const selectionKey = entry.symbol !== null && entry.timeframe !== null
+                  ? brokerFetchSelectionKey(entry.symbol, entry.timeframe)
+                  : null;
+                const multipleBrokerIdentities = entry.sourceKind === "ctrader" &&
+                  selectionKey !== null &&
+                  (brokerDatasetCounts.get(selectionKey) ?? 0) > 1;
+                return (
+                  <tr key={entry.datasetIdentity}>
+                    <td>{entry.symbol ?? "missing"}</td>
+                    <td>{entry.timeframe ?? "missing"}</td>
+                    <td><code>{entry.generation}</code></td>
+                    <td><code style={{ overflowWrap: "anywhere" }}>{entry.datasetIdentity}</code></td>
+                    <td>{entry.verification}</td>
+                    <td>
+                      {multipleBrokerIdentities && selectionKey !== null ? (
+                        <label>
+                          <input
+                            type="radio"
+                            name={`broker-refresh-${selectionKey}`}
+                            checked={selectedBrokerDatasetIds[selectionKey] === entry.datasetIdentity}
+                            onChange={() => setSelectedBrokerDatasetIds((current) => ({
+                              ...current,
+                              [selectionKey]: entry.datasetIdentity,
+                            }))}
+                          />
+                          use this identity
+                        </label>
+                      ) : entry.sourceKind === "ctrader" ? "automatic" : "not broker data"}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {data && data.skipped.length > 0 && (
+        <div className="banner warn">
+          <b>Import/download required or rejected data:</b>
+          <ul>
+            {data.skipped.map((item) => (
+              <li key={`${item.path}:${item.category}:${item.detail}`}>
+                <code>{item.path}</code> — {item.category}: {item.detail}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 
@@ -188,6 +354,20 @@ export default function Data() {
           <button className="primary" disabled={busy || nCombos === 0} onClick={fetchAll}>
             {busy ? "Downloading…" : `Fetch ${nCombos || ""} from broker`}
           </button>
+          {fetchStatus?.active && (
+            <button
+              type="button"
+              className="danger"
+              disabled={fetchStatus.phase !== "capturing"}
+              onClick={stopFetch}
+            >
+              {fetchStatus.phase === "publication_in_progress"
+                ? "Atomic publication in progress"
+                : fetchStatus.phase === "cancellation_requested"
+                  ? "Cancellation requested"
+                  : `Stop run ${fetchStatus.runId}`}
+            </button>
+          )}
           <span className="muted small">{selSyms.length} × {selTfs.length} = {nCombos} download{nCombos === 1 ? "" : "s"}</span>
         </div>
         {msg && <div className="banner info">{msg}</div>}

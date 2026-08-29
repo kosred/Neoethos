@@ -11,12 +11,8 @@ use aligned_vec::{AVec, CACHELINE_ALIGN};
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum DonchianData<'a> {
@@ -770,7 +766,6 @@ pub fn donchian_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn donchian_into(
     input: &DonchianInput,
@@ -1451,43 +1446,19 @@ impl DonchianStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn donchian_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let result = donchian_js(high, low, period)?;
-    crate::write_wasm_f64_output("donchian_output_into_js", &result.values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn donchian_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = donchian_batch_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs("donchian_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_donchian_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = DonchianParams { period: None };
         let input = DonchianInput::from_candles(&candles, default_params);
         let output = donchian_with_kernel(&input, kernel)?;
@@ -1500,8 +1471,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = DonchianParams { period: Some(20) };
         let input = DonchianInput::from_candles(&candles, params);
         let result = donchian_with_kernel(&input, kernel)?;
@@ -1610,8 +1581,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             DonchianParams::default(),
@@ -1647,29 +1618,44 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
 							 in {} with params: period={} (param set {})",
-							test_name, val, bits, i, band_name,
-							params.period.unwrap_or(20), param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            band_name,
+                            params.period.unwrap_or(20),
+                            param_idx
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
 							 in {} with params: period={} (param set {})",
-							test_name, val, bits, i, band_name,
-							params.period.unwrap_or(20), param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            band_name,
+                            params.period.unwrap_or(20),
+                            param_idx
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
 							 in {} with params: period={} (param set {})",
-							test_name, val, bits, i, band_name,
-							params.period.unwrap_or(20), param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            band_name,
+                            params.period.unwrap_or(20),
+                            param_idx
+                        );
                     }
                 }
             }
@@ -1735,7 +1721,6 @@ mod tests {
         let mut mid = vec![0.0; n];
         let mut lo = vec![0.0; n];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             donchian_into(&input, &mut up, &mut mid, &mut lo).expect("donchian_into failed");
         }
@@ -1758,8 +1743,8 @@ mod tests {
 
     #[test]
     fn test_donchian_selected_outputs_match_api() {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path).expect("failed to load candles");
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path).expect("failed to load candles");
         let input = DonchianInput::with_default_candles(&candles);
         let expected = donchian(&input).expect("baseline donchian failed");
         let upper = donchian_upper_with_kernel(&input, Kernel::Scalar).expect("upper failed");
@@ -2128,8 +2113,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = DonchianBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c)?;
@@ -2166,8 +2151,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2205,20 +2190,34 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 							 in {} at row {} col {} (flat index {}) with params: period={}",
-							test, cfg_idx, val, bits, band_name, row, col, idx,
-							combo.period.unwrap_or(20)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            band_name,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 							 in {} at row {} col {} (flat index {}) with params: period={}",
-							test, cfg_idx, val, bits, band_name, row, col, idx,
-							combo.period.unwrap_or(20)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            band_name,
+                            row,
+                            col,
+                            idx,
+                            combo.period.unwrap_or(20)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
@@ -2249,81 +2248,6 @@ mod tests {
         _kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "donchian")]
-#[pyo3(signature = (high, low, period, kernel=None))]
-pub fn donchian_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = DonchianParams {
-        period: Some(period),
-    };
-    let input = DonchianInput::from_slices(high_slice, low_slice, params);
-
-    let (upper_vec, middle_vec, lower_vec) = py
-        .allow_threads(|| {
-            donchian_with_kernel(&input, kern).map(|o| (o.upperband, o.middleband, o.lowerband))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        upper_vec.into_pyarray(py),
-        middle_vec.into_pyarray(py),
-        lower_vec.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "DonchianStream")]
-pub struct DonchianStreamPy {
-    stream: DonchianStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl DonchianStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = DonchianParams {
-            period: Some(period),
-        };
-        let stream =
-            DonchianStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(DonchianStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(high, low)
     }
 }
 
@@ -2435,560 +2359,4 @@ fn donchian_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "donchian_batch")]
-#[pyo3(signature = (high, low, period_range, kernel=None))]
-pub fn donchian_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = DonchianBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = high_slice.len();
-
-    let upper_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let middle_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let lower_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-
-    let upper_slice = unsafe { upper_arr.as_slice_mut()? };
-    let middle_slice = unsafe { middle_arr.as_slice_mut()? };
-    let lower_slice = unsafe { lower_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            donchian_batch_inner_into(
-                high_slice,
-                low_slice,
-                &sweep,
-                simd,
-                true,
-                upper_slice,
-                middle_slice,
-                lower_slice,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("upper", upper_arr.reshape((rows, cols))?)?;
-    dict.set_item("middle", middle_arr.reshape((rows, cols))?)?;
-    dict.set_item("lower", lower_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct DonchianResult {
-    values: Vec<f64>,
-    rows: usize,
-    cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl DonchianResult {
-    #[wasm_bindgen(getter)]
-    pub fn values(&self) -> Vec<f64> {
-        self.values.clone()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn cols(&self) -> usize {
-        self.cols
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn donchian_js(high: &[f64], low: &[f64], period: usize) -> Result<DonchianResult, JsValue> {
-    let params = DonchianParams {
-        period: Some(period),
-    };
-    let input = DonchianInput::from_slices(high, low, params);
-
-    let len = high.len();
-    let mut upper = vec![0.0; len];
-    let mut middle = vec![0.0; len];
-    let mut lower = vec![0.0; len];
-
-    donchian_into_slice(&mut upper, &mut middle, &mut lower, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = Vec::with_capacity(len * 3);
-    values.extend_from_slice(&upper);
-    values.extend_from_slice(&middle);
-    values.extend_from_slice(&lower);
-
-    Ok(DonchianResult {
-        values,
-        rows: 3,
-        cols: len,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn donchian_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    upper_ptr: *mut f64,
-    middle_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || upper_ptr.is_null()
-        || middle_ptr.is_null()
-        || lower_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let params = DonchianParams {
-            period: Some(period),
-        };
-        let input = DonchianInput::from_slices(high, low, params);
-
-        let need_temp = high_ptr == upper_ptr as *const f64
-            || high_ptr == middle_ptr as *const f64
-            || high_ptr == lower_ptr as *const f64
-            || low_ptr == upper_ptr as *const f64
-            || low_ptr == middle_ptr as *const f64
-            || low_ptr == lower_ptr as *const f64
-            || upper_ptr == middle_ptr
-            || upper_ptr == lower_ptr
-            || middle_ptr == lower_ptr;
-
-        if need_temp {
-            let mut temp_upper = vec![0.0; len];
-            let mut temp_middle = vec![0.0; len];
-            let mut temp_lower = vec![0.0; len];
-
-            donchian_into_slice(
-                &mut temp_upper,
-                &mut temp_middle,
-                &mut temp_lower,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let upper_out = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let middle_out = std::slice::from_raw_parts_mut(middle_ptr, len);
-            let lower_out = std::slice::from_raw_parts_mut(lower_ptr, len);
-
-            upper_out.copy_from_slice(&temp_upper);
-            middle_out.copy_from_slice(&temp_middle);
-            lower_out.copy_from_slice(&temp_lower);
-        } else {
-            let upper_out = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let middle_out = std::slice::from_raw_parts_mut(middle_ptr, len);
-            let lower_out = std::slice::from_raw_parts_mut(lower_ptr, len);
-
-            donchian_into_slice(upper_out, middle_out, lower_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn donchian_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn donchian_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DonchianBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct DonchianBatchJsOutput {
-    pub upper: Vec<f64>,
-    pub middle: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub periods: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = donchian_batch)]
-pub fn donchian_batch_js(high: &[f64], low: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: DonchianBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = DonchianBatchRange {
-        period: config.period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = high.len();
-
-    let mut upper = vec![0.0; rows * cols];
-    let mut middle = vec![0.0; rows * cols];
-    let mut lower = vec![0.0; rows * cols];
-
-    donchian_batch_inner_into(
-        high,
-        low,
-        &sweep,
-        detect_best_kernel(),
-        false,
-        &mut upper,
-        &mut middle,
-        &mut lower,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = DonchianBatchJsOutput {
-        upper,
-        middle,
-        lower,
-        periods: combos.iter().map(|p| p.period.unwrap()).collect(),
-        rows,
-        cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn donchian_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    upper_ptr: *mut f64,
-    middle_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || upper_ptr.is_null()
-        || middle_ptr.is_null()
-        || lower_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-
-        let sweep = DonchianBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let upper_out = std::slice::from_raw_parts_mut(upper_ptr, rows * cols);
-        let middle_out = std::slice::from_raw_parts_mut(middle_ptr, rows * cols);
-        let lower_out = std::slice::from_raw_parts_mut(lower_ptr, rows * cols);
-
-        donchian_batch_inner_into(
-            high,
-            low,
-            &sweep,
-            detect_best_kernel(),
-            false,
-            upper_out,
-            middle_out,
-            lower_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::donchian_wrapper::CudaDonchian;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::donchian_wrapper::DeviceArrayF32 as DeviceArrayF32Donch;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32DonchPy {
-    pub(crate) inner: Option<DeviceArrayF32Donch>,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32DonchPy {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        let itemsize = std::mem::size_of::<f32>();
-        let row_stride = inner
-            .cols
-            .checked_mul(itemsize)
-            .ok_or_else(|| PyValueError::new_err("byte stride overflow"))?;
-        d.set_item("strides", (row_stride, itemsize))?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        Ok((2, inner.device_id as i32))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        if copy.as_ref().and_then(|c| c.extract::<bool>(py).ok()) == Some(true) {
-            return Err(PyValueError::new_err(
-                "copy=True is not supported for donchian CUDA buffers",
-            ));
-        }
-
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    return Err(PyValueError::new_err(
-                        "dl_device mismatch for donchian CUDA buffer",
-                    ));
-                }
-            }
-        }
-        let _ = stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "donchian_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, period_range, device_id=0))]
-pub fn donchian_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::IntoPyArray;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let sweep = DonchianBatchRange {
-        period: period_range,
-    };
-    let (triplet, combos) = py.allow_threads(|| {
-        let cuda =
-            CudaDonchian::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.donchian_batch_dev(h, l, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    let d = PyDict::new(py);
-    d.set_item(
-        "upper",
-        Py::new(
-            py,
-            DeviceArrayF32DonchPy {
-                inner: Some(triplet.wt1),
-            },
-        )?,
-    )?;
-    d.set_item(
-        "middle",
-        Py::new(
-            py,
-            DeviceArrayF32DonchPy {
-                inner: Some(triplet.wt2),
-            },
-        )?,
-    )?;
-    d.set_item(
-        "lower",
-        Py::new(
-            py,
-            DeviceArrayF32DonchPy {
-                inner: Some(triplet.hist),
-            },
-        )?,
-    )?;
-    d.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    d.set_item("rows", combos.len())?;
-    d.set_item("cols", h.len())?;
-    Ok(d)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "donchian_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, period, device_id=0))]
-pub fn donchian_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = high_tm_f32.shape();
-    if shape.len() != 2 || low_tm_f32.shape() != shape {
-        return Err(PyValueError::new_err(
-            "expected matching 2D arrays [rows, cols]",
-        ));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let high_tm = high_tm_f32.as_slice()?;
-    let low_tm = low_tm_f32.as_slice()?;
-    let params = DonchianParams {
-        period: Some(period),
-    };
-    let triplet = py.allow_threads(|| {
-        let cuda =
-            CudaDonchian::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.donchian_many_series_one_param_time_major_dev(high_tm, low_tm, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    let d = PyDict::new(py);
-    d.set_item(
-        "upper",
-        Py::new(
-            py,
-            DeviceArrayF32DonchPy {
-                inner: Some(triplet.wt1),
-            },
-        )?,
-    )?;
-    d.set_item(
-        "middle",
-        Py::new(
-            py,
-            DeviceArrayF32DonchPy {
-                inner: Some(triplet.wt2),
-            },
-        )?,
-    )?;
-    d.set_item(
-        "lower",
-        Py::new(
-            py,
-            DeviceArrayF32DonchPy {
-                inner: Some(triplet.hist),
-            },
-        )?,
-    )?;
-    d.set_item("rows", rows)?;
-    d.set_item("cols", cols)?;
-    d.set_item("period", period)?;
-    Ok(d)
 }

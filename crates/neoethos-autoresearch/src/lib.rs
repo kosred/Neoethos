@@ -63,6 +63,7 @@
 pub mod contracts;
 pub mod goals;
 pub mod journal;
+mod quote_validated_oos_touch_v1;
 pub mod runner;
 pub mod session;
 
@@ -79,6 +80,12 @@ pub mod verdict;
 
 pub use goals::{GoalRefusal, GoalSet, Scenario, ScenarioKind};
 pub use journal::{Journal, Record, SweepKind};
+pub use quote_validated_oos_touch_v1::{
+    QUOTE_VALIDATED_OOS_TOUCH_SCHEMA_VERSION_V1, QuoteValidatedOosArtifactClassV1,
+    QuoteValidatedOosPromotionEligibilityV1, QuoteValidatedOosTouchErrorCodeV1,
+    QuoteValidatedOosTouchErrorV1, QuoteValidatedOosTouchEvidenceV1,
+    QuoteValidatedOosTouchReceiptV1, evaluate_quote_validated_oos_touch_v1,
+};
 pub use runner::{RunArgs, SearchOutcome, SweepExecutor, run};
 pub use session::{
     AbandonCensus, BestEver, BlockId, ChampionRow, CoverageCounters, Session, SessionHeader,
@@ -128,10 +135,10 @@ pub const DEFAULT_MAX_SWEEPS: usize = 200;
 
 /// Schema tag on every journal record. Bumping it starts a new session: two
 /// journals with different schemas are not one history.
-pub const JOURNAL_SCHEMA: &str = "neoethos.autoresearch.journal.v1";
+pub const JOURNAL_SCHEMA: &str = "neoethos.autoresearch.journal.v2";
 
 /// Schema tag on `session.json`.
-pub const SESSION_SCHEMA: &str = "neoethos.autoresearch.session.v1";
+pub const SESSION_SCHEMA: &str = "neoethos.autoresearch.session.v2";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The one hash function this crate uses for its own identity values.

@@ -1,10 +1,10 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -85,11 +85,6 @@ impl CudaChandelierExit {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/chandelier_exit_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("chandelier_exit_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {
@@ -157,7 +152,7 @@ impl CudaChandelierExit {
                     x = match x.checked_add(step) {
                         Some(nx) => nx,
                         None => {
-                            return Err(CudaCeError::InvalidInput("period range overflow".into()))
+                            return Err(CudaCeError::InvalidInput("period range overflow".into()));
                         }
                     };
                 }
@@ -182,11 +177,7 @@ impl CudaChandelierExit {
             }
             let (start, end, step) = (t.0, t.1, t.2);
             let s = if step > 0.0 {
-                if start <= end {
-                    step
-                } else {
-                    -step
-                }
+                if start <= end { step } else { -step }
             } else {
                 step
             };

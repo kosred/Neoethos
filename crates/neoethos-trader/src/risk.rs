@@ -29,7 +29,11 @@ use crate::contracts::{AccountSnapshot, KillSwitchTier, RiskGate, TradeIntent};
 pub struct PermissiveRiskGate;
 
 impl RiskGate for PermissiveRiskGate {
-    fn check(&self, _intent: &TradeIntent, _account: &AccountSnapshot) -> Result<(), KillSwitchTier> {
+    fn check(
+        &self,
+        _intent: &TradeIntent,
+        _account: &AccountSnapshot,
+    ) -> Result<(), KillSwitchTier> {
         Ok(())
     }
 }

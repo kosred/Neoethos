@@ -1,5 +1,17 @@
 use super::super::Ohlcv;
+use super::features::{FeatureCellValidity, FeatureColumnF64};
+use super::smc_log1p_exact_v1::smc_log1p_exact_v1;
+use super::timestamps::validate_canonical_millisecond_timestamps;
+use anyhow::{Result, ensure};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
+use std::collections::HashMap;
+
+/// Semantic v3 replaces the platform-dependent FVG-age `ln_1p` call with the
+/// shared fixed-order CPU/CUDA authority. Semantic-v2 feature/search artifacts
+/// are migration inputs only and must be refused until regenerated under v3.
+pub const SMC_SEMANTIC_VERSION: u32 = 3;
+pub const SMC_V2_ARTIFACT_MIGRATION_POLICY: &str =
+    "refuse semantic-v2 SMC artifacts; require a new content-addressed v3 generation";
 
 pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
     let n = ohlcv.len();
@@ -551,21 +563,26 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
                 if dist < best_dist_atr {
                     best_dist_atr = dist;
                     best_signed = signed.clamp(-10.0, 10.0);
-                    best_age = ((i - born) as f64).ln_1p() / 9.21; // ~ln(10k) → [0,1]
+                    best_age = smc_log1p_exact_v1((i - born) as u64) / 9.21; // ~ln(10k) → [0,1]
                 }
             }
             // Inside-gap flags, signed by gap side.
-            if active_buy_fvgs.iter().any(|&(top, bot, _)| close <= top && close >= bot) {
+            if active_buy_fvgs
+                .iter()
+                .any(|&(top, bot, _)| close <= top && close >= bot)
+            {
                 fvg_inside[i] = 1.0;
-            } else if active_sell_fvgs.iter().any(|&(top, bot, _)| close <= top && close >= bot) {
+            } else if active_sell_fvgs
+                .iter()
+                .any(|&(top, bot, _)| close <= top && close >= bot)
+            {
                 fvg_inside[i] = -1.0;
             }
             if best_dist_atr.is_finite() {
                 fvg_magnet_dist[i] = best_signed;
                 fvg_magnet_age[i] = best_age.clamp(0.0, 1.0);
             }
-            fvg_open_count[i] =
-                (active_buy_fvgs.len() + active_sell_fvgs.len()) as f64 / 20.0;
+            fvg_open_count[i] = (active_buy_fvgs.len() + active_sell_fvgs.len()) as f64 / 20.0;
         }
 
         // FVG Strength: Gap size as a fraction of ATR (normalized significance)
@@ -914,4 +931,414 @@ fn build_smc_return_vec(
         ("smc_fvg_inside".to_string(), fvg_inside),
         ("smc_fvg_open_count".to_string(), fvg_open_count),
     ]
+}
+
+fn smc_validity_mut<'a>(
+    validity_by_name: &'a mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+) -> Result<&'a mut Vec<FeatureCellValidity>> {
+    validity_by_name
+        .get_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("missing SMC validity plan for `{name}`"))
+}
+
+fn smc_mark_after_warmup(
+    validity_by_name: &mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+    warmup: usize,
+) -> Result<()> {
+    let validity = smc_validity_mut(validity_by_name, name)?;
+    validity.fill(FeatureCellValidity::Valid);
+    let warmup = warmup.min(validity.len());
+    validity[..warmup].fill(FeatureCellValidity::Warmup);
+    Ok(())
+}
+
+fn smc_mark_all(
+    validity_by_name: &mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+    reason: FeatureCellValidity,
+) -> Result<()> {
+    smc_validity_mut(validity_by_name, name)?.fill(reason);
+    Ok(())
+}
+
+fn smc_values<'a>(legacy: &'a [(String, Vec<f64>)], name: &str) -> Result<&'a [f64]> {
+    legacy
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .map(|(_, values)| values.as_slice())
+        .ok_or_else(|| anyhow::anyhow!("missing SMC values for `{name}`"))
+}
+
+/// Explicit-validity f64 SMC lane used by the atomic Tasks 5B-9 migration.
+///
+/// Sparse event flags keep a valid numeric zero once their required history
+/// exists. Calendar/session outputs require canonical millisecond timestamps;
+/// magnitudes such as FVG distance/age and OB strength remain invalid until
+/// the referenced structure actually exists. This prevents `0.0` from
+/// simultaneously meaning false, warmup, absent structure, and division by
+/// zero.
+pub fn compute_smc_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureColumnF64>> {
+    const EPS: f64 = 1e-12;
+    const IPDA_LOOKBACK: usize = 40;
+    const SWING_FRACTAL: usize = 5;
+    const DISPLACEMENT_LOOKBACK: usize = 20;
+
+    let n = ohlcv.len();
+    ensure!(n > 0, "SMC features require at least one OHLC row");
+    ensure!(
+        ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
+        "SMC OHLC lengths do not match close length {n}"
+    );
+    for row in 0..n {
+        let open = ohlcv.open[row];
+        let high = ohlcv.high[row];
+        let low = ohlcv.low[row];
+        let close = ohlcv.close[row];
+        ensure!(
+            open.is_finite() && high.is_finite() && low.is_finite() && close.is_finite(),
+            "SMC OHLC row {row} contains a non-finite price"
+        );
+        ensure!(
+            open > 0.0 && high > 0.0 && low > 0.0 && close > 0.0,
+            "SMC OHLC row {row} contains a non-positive price"
+        );
+        ensure!(
+            low <= open.min(close) && high >= open.max(close),
+            "SMC OHLC row {row} violates low <= open/close <= high"
+        );
+    }
+    if let Some(volume) = ohlcv.volume.as_deref() {
+        ensure!(
+            volume.len() == n,
+            "SMC volume length {} does not match OHLC length {n}",
+            volume.len()
+        );
+        if let Some((row, value)) = volume
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            anyhow::bail!("SMC volume row {row} is invalid: {value}");
+        }
+    }
+
+    let timestamps = if let Some(timestamps) = ohlcv.timestamp.as_deref() {
+        ensure!(
+            timestamps.len() == n,
+            "SMC timestamp length {} does not match OHLC length {n}",
+            timestamps.len()
+        );
+        validate_canonical_millisecond_timestamps(timestamps)?;
+        Some(timestamps)
+    } else {
+        None
+    };
+
+    let legacy = compute_smc_feature_columns(ohlcv);
+    let mut validity_by_name: HashMap<String, Vec<FeatureCellValidity>> = legacy
+        .iter()
+        .map(|(name, _)| (name.clone(), vec![FeatureCellValidity::ComputeFailure; n]))
+        .collect();
+
+    let mut running_atr = vec![0.0; n];
+    let mut atr_sum = 0.0;
+    let mut atr_count = 0_usize;
+    for row in 0..n {
+        if row > 0 {
+            let true_range = (ohlcv.high[row] - ohlcv.low[row])
+                .max((ohlcv.high[row] - ohlcv.close[row - 1]).abs())
+                .max((ohlcv.low[row] - ohlcv.close[row - 1]).abs());
+            atr_sum += true_range;
+            atr_count += 1;
+        }
+        running_atr[row] = if atr_count > 0 {
+            atr_sum / atr_count as f64
+        } else {
+            ohlcv.high[row] - ohlcv.low[row]
+        };
+    }
+
+    for (name, warmup) in [
+        ("smc_ob", DISPLACEMENT_LOOKBACK),
+        ("smc_fvg", 2),
+        ("smc_ifvg", 2),
+        ("smc_liq_sweep", SWING_FRACTAL * 2),
+        ("smc_breaker_block", DISPLACEMENT_LOOKBACK),
+        ("smc_mitigation_block", DISPLACEMENT_LOOKBACK),
+        ("smc_mss", DISPLACEMENT_LOOKBACK),
+        ("smc_volume_imbalance", 1),
+        ("smc_bos", SWING_FRACTAL * 2),
+        ("smc_eqh", SWING_FRACTAL * 2),
+        ("smc_eql", SWING_FRACTAL * 2),
+        ("smc_inducement", SWING_FRACTAL * 2),
+        ("smc_unicorn_model", 5),
+        ("smc_fib_time_ratio", SWING_FRACTAL * 2),
+        ("smc_fvg_inside", 2),
+        ("smc_fvg_open_count", 0),
+    ] {
+        smc_mark_after_warmup(&mut validity_by_name, name, warmup)?;
+    }
+
+    smc_mark_after_warmup(
+        &mut validity_by_name,
+        "smc_displacement",
+        DISPLACEMENT_LOOKBACK,
+    )?;
+    for row in DISPLACEMENT_LOOKBACK..n {
+        let average_body: f64 = ((row - DISPLACEMENT_LOOKBACK)..row)
+            .map(|index| (ohlcv.close[index] - ohlcv.open[index]).abs())
+            .sum::<f64>()
+            / DISPLACEMENT_LOOKBACK as f64;
+        if average_body <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_displacement")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_after_warmup(&mut validity_by_name, "smc_pd_array", IPDA_LOOKBACK)?;
+    smc_mark_after_warmup(
+        &mut validity_by_name,
+        "smc_dealing_range_width",
+        IPDA_LOOKBACK,
+    )?;
+    let fibonacci_names = [
+        "smc_fib_236",
+        "smc_fib_382",
+        "smc_fib_500",
+        "smc_fib_618",
+        "smc_fib_705",
+        "smc_fib_786",
+        "smc_fib_886",
+        "smc_fib_1272",
+        "smc_fib_1414",
+        "smc_fib_1618",
+        "smc_fib_2000",
+        "smc_fib_2618",
+    ];
+    for name in fibonacci_names {
+        smc_mark_after_warmup(&mut validity_by_name, name, IPDA_LOOKBACK)?;
+    }
+    for row in IPDA_LOOKBACK..n {
+        let highest = ohlcv.high[(row - IPDA_LOOKBACK)..row]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let lowest = ohlcv.low[(row - IPDA_LOOKBACK)..row]
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        if highest - lowest <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_pd_array")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+            for name in fibonacci_names {
+                smc_validity_mut(&mut validity_by_name, name)?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    }
+
+    smc_mark_after_warmup(&mut validity_by_name, "smc_fvg_strength", 2)?;
+    let fvg_values = smc_values(&legacy, "smc_fvg")?;
+    for row in 2..n {
+        if fvg_values[row] != 0.0 && running_atr[row] <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_fvg_strength")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_after_warmup(&mut validity_by_name, "smc_rejection_block", 0)?;
+    for row in 0..n {
+        if ohlcv.high[row] - ohlcv.low[row] <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_rejection_block")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_after_warmup(&mut validity_by_name, "smc_trend_bias", 50)?;
+    for row in 50..n {
+        if running_atr[row] <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_trend_bias")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_after_warmup(
+        &mut validity_by_name,
+        "smc_propulsion_block",
+        DISPLACEMENT_LOOKBACK,
+    )?;
+    for row in DISPLACEMENT_LOOKBACK..n {
+        if running_atr[row] <= EPS {
+            smc_validity_mut(&mut validity_by_name, "smc_propulsion_block")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    smc_mark_all(
+        &mut validity_by_name,
+        "smc_ob_strength",
+        FeatureCellValidity::AlignmentMissing,
+    )?;
+    let ob_values = smc_values(&legacy, "smc_ob")?;
+    for row in 1..n {
+        if ob_values[row] != 0.0 {
+            smc_validity_mut(&mut validity_by_name, "smc_ob_strength")?[row] =
+                if ohlcv.high[row - 1] - ohlcv.low[row - 1] > EPS {
+                    FeatureCellValidity::Valid
+                } else {
+                    FeatureCellValidity::ZeroDenominator
+                };
+        }
+    }
+
+    smc_mark_all(
+        &mut validity_by_name,
+        "smc_swing_range_pct",
+        FeatureCellValidity::AlignmentMissing,
+    )?;
+    let swing_validity = smc_validity_mut(&mut validity_by_name, "smc_swing_range_pct")?;
+    swing_validity[..(SWING_FRACTAL * 2).min(n)].fill(FeatureCellValidity::Warmup);
+    let mut has_swing_high = false;
+    let mut has_swing_low = false;
+    for row in (SWING_FRACTAL * 2)..n {
+        let center = row - SWING_FRACTAL;
+        let center_high = ohlcv.high[center];
+        let center_low = ohlcv.low[center];
+        let mut is_high = true;
+        let mut is_low = true;
+        for index in (center - SWING_FRACTAL)..=(center + SWING_FRACTAL) {
+            if index == center {
+                continue;
+            }
+            if ohlcv.high[index] >= center_high {
+                is_high = false;
+            }
+            if ohlcv.low[index] <= center_low {
+                is_low = false;
+            }
+        }
+        has_swing_high |= is_high;
+        has_swing_low |= is_low;
+        if has_swing_high && has_swing_low {
+            swing_validity[row] = FeatureCellValidity::Valid;
+        }
+    }
+
+    smc_mark_all(
+        &mut validity_by_name,
+        "smc_fvg_magnet_dist",
+        FeatureCellValidity::AlignmentMissing,
+    )?;
+    smc_mark_all(
+        &mut validity_by_name,
+        "smc_fvg_magnet_age",
+        FeatureCellValidity::AlignmentMissing,
+    )?;
+    let open_count = smc_values(&legacy, "smc_fvg_open_count")?;
+    for row in 0..n {
+        if open_count[row] > 0.0 {
+            let reason = if running_atr[row] > EPS {
+                FeatureCellValidity::Valid
+            } else {
+                FeatureCellValidity::ZeroDenominator
+            };
+            smc_validity_mut(&mut validity_by_name, "smc_fvg_magnet_dist")?[row] = reason;
+            smc_validity_mut(&mut validity_by_name, "smc_fvg_magnet_age")?[row] = reason;
+        }
+    }
+
+    let calendar_names = [
+        "smc_killzone",
+        "smc_asian_range",
+        "smc_silver_bullet",
+        "smc_judas_swing",
+        "smc_nwog",
+        "smc_ndog",
+        "smc_ict_macro",
+    ];
+    if let Some(timestamps) = timestamps {
+        for name in calendar_names {
+            smc_mark_after_warmup(&mut validity_by_name, name, 0)?;
+        }
+        smc_validity_mut(&mut validity_by_name, "smc_judas_swing")?[0] =
+            FeatureCellValidity::Warmup;
+        smc_validity_mut(&mut validity_by_name, "smc_nwog")?[0] = FeatureCellValidity::Warmup;
+        smc_validity_mut(&mut validity_by_name, "smc_ndog")?[0] = FeatureCellValidity::Warmup;
+
+        let mut asian_high = f64::NEG_INFINITY;
+        let mut asian_low = f64::INFINITY;
+        let mut asian_set = false;
+        let mut last_day = None;
+        let mut last_week = None;
+        for row in 0..n {
+            let date = Utc
+                .timestamp_millis_opt(timestamps[row])
+                .single()
+                .ok_or_else(|| anyhow::anyhow!("SMC timestamp row {row} is not a UTC instant"))?;
+            let hour = date.hour();
+            let minute = date.minute();
+            if hour < 8 {
+                asian_high = asian_high.max(ohlcv.high[row]);
+                asian_low = asian_low.min(ohlcv.low[row]);
+                asian_set = true;
+            } else if hour == 8 && minute == 0 {
+                asian_set = true;
+            }
+            smc_validity_mut(&mut validity_by_name, "smc_asian_range")?[row] = if !asian_set {
+                FeatureCellValidity::Warmup
+            } else if asian_high - asian_low > EPS {
+                FeatureCellValidity::Valid
+            } else {
+                FeatureCellValidity::ZeroDenominator
+            };
+            if hour == 0 && minute == 0 {
+                asian_high = f64::NEG_INFINITY;
+                asian_low = f64::INFINITY;
+                asian_set = false;
+            }
+
+            let day = (date.year(), date.ordinal());
+            let week = (date.year(), date.iso_week().week());
+            if last_day.is_some_and(|previous| previous != day) && running_atr[row] <= EPS {
+                smc_validity_mut(&mut validity_by_name, "smc_ndog")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+            if last_week.is_some_and(|previous| previous != week) && running_atr[row] <= EPS {
+                smc_validity_mut(&mut validity_by_name, "smc_nwog")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+            last_day = Some(day);
+            last_week = Some(week);
+        }
+    } else {
+        for name in calendar_names {
+            smc_mark_all(
+                &mut validity_by_name,
+                name,
+                FeatureCellValidity::MissingInput,
+            )?;
+        }
+    }
+
+    if let Some((name, row)) = validity_by_name.iter().find_map(|(name, validity)| {
+        validity
+            .iter()
+            .position(|reason| *reason == FeatureCellValidity::ComputeFailure)
+            .map(|row| (name.clone(), row))
+    }) {
+        anyhow::bail!("unclassified SMC validity for `{name}` row {row}");
+    }
+
+    legacy
+        .into_iter()
+        .map(|(name, values)| {
+            let validity = validity_by_name
+                .remove(&name)
+                .ok_or_else(|| anyhow::anyhow!("missing SMC validity for `{name}`"))?;
+            FeatureColumnF64::new(name, values, validity)
+        })
+        .collect()
 }

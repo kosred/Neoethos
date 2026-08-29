@@ -161,7 +161,11 @@ pub const B1_MAX_IN_MARKET_LEVELS: &[f64] = &[0.10, 0.05, 0.02];
 /// cannot write would be the same silent substitution this module exists to
 /// prevent, one level up.
 pub const B1_WRITES: &[&str] = if cfg!(feature = "search-in-market-fitness") {
-    &["min_trades_per_day", "target_profile.max_in_market", "fitness_table"]
+    &[
+        "min_trades_per_day",
+        "target_profile.max_in_market",
+        "fitness_table",
+    ]
 } else {
     &["min_trades_per_day", "target_profile.max_in_market"]
 };
@@ -181,7 +185,12 @@ pub const B2_CONDITIONING_LEVELS: &[(&str, usize)] = &[
 /// only from `120` upward on an M5 base.
 pub const B4_HORIZON_LEVELS: &[usize] = &[35, 120, 480, 1440];
 /// B0's four scoring tables (`neoethos_search::scoring::named`).
-pub const B0_TABLE_LEVELS: &[&str] = &["ga_fitness", "archive_score", "window_score", "quality_score"];
+pub const B0_TABLE_LEVELS: &[&str] = &[
+    "ga_fitness",
+    "archive_score",
+    "window_score",
+    "quality_score",
+];
 
 /// The declared set. **Read-only.**
 pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
@@ -198,8 +207,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         // One sweep, as a control. A family of monotone re-summaries of one
         // per-trade distribution is not a family of objectives.
         max_draws_per_session: Some(1),
-        why_not_a_reparameterisation:
-            "IT IS ONE — carried only as the named control the other eight are compared against.",
+        why_not_a_reparameterisation: "IT IS ONE — carried only as the named control the other eight are compared against.",
     },
     VariantSpec {
         id: ObjectiveVariant::B1Selectivity,
@@ -235,8 +243,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         writes: B1_WRITES,
         params: 3,
         max_draws_per_session: None,
-        why_not_a_reparameterisation:
-            "the average trade loses 4.15 pips, so the only exit is FEWER, DIFFERENT trades: the \
+        why_not_a_reparameterisation: "the average trade loses 4.15 pips, so the only exit is FEWER, DIFFERENT trades: the \
              volume floor is removed and a hard exposure budget is imposed, both of which change \
              WHICH trades are eligible rather than how the same population is summarised. (The \
              third clause of the exact form — scoring net per BAR IN MARKET so that being flat is \
@@ -254,8 +261,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         writes: &["conditioning_set"],
         params: 5,
         max_draws_per_session: None,
-        why_not_a_reparameterisation:
-            "expectancy is estimated WITHIN a conditioning set declared before the run; the \
+        why_not_a_reparameterisation: "expectancy is estimated WITHIN a conditioning set declared before the run; the \
              complement is reported alongside always and the family's bucket count multiplies into \
              the trial count N the DSR deflates against.",
     },
@@ -270,8 +276,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         writes: &["score_at_cost_band_edge"],
         params: 1,
         max_draws_per_session: None,
-        why_not_a_reparameterisation:
-            "cost scales with trade COUNT, so scoring at the pessimistic band edge systematically \
+        why_not_a_reparameterisation: "cost scales with trade COUNT, so scoring at the pessimistic band edge systematically \
              re-ranks a high-frequency candidate below a low-frequency one with the same \
              point-estimate net. It is not a monotone transform of the point-estimate ranking.",
     },
@@ -286,8 +291,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         writes: &["label_max_hold_bars"],
         params: 4,
         max_draws_per_session: None,
-        why_not_a_reparameterisation:
-            "the triple-barrier horizon is the TARGET VARIABLE the prefilter ranks against and the \
+        why_not_a_reparameterisation: "the triple-barrier horizon is the TARGET VARIABLE the prefilter ranks against and the \
              GA is scored on — not an exit rule. It is the only honest route to the H4 lane: a \
              35-bar label resolves inside a single H4 candle.",
     },
@@ -307,8 +311,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         writes: &[],
         params: 1,
         max_draws_per_session: None,
-        why_not_a_reparameterisation:
-            "the unit is a PATH: two candidates with identical per-trade expectancy have different \
+        why_not_a_reparameterisation: "the unit is a PATH: two candidates with identical per-trade expectancy have different \
              P(reach target) through variance, compounding and serial structure. It cannot \
              manufacture edge — goal_report's own test shows a negative-edge system reaches a 500x \
              target with probability < 0.05 at EVERY risk level.",
@@ -327,8 +330,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         writes: &[],
         params: 1,
         max_draws_per_session: None,
-        why_not_a_reparameterisation:
-            "the unit is a MONTH under path constraints. A drawdown-path constraint is not a \
+        why_not_a_reparameterisation: "the unit is a MONTH under path constraints. A drawdown-path constraint is not a \
              function of the per-trade mean: two candidates with identical expectancy can be \
              either inside or outside the rule.",
     },
@@ -343,8 +345,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         writes: &["fitness_table"],
         params: 1,
         max_draws_per_session: None,
-        why_not_a_reparameterisation:
-            "maximising the expectancy t-STATISTIC rather than the expectancy penalises the \
+        why_not_a_reparameterisation: "maximising the expectancy t-STATISTIC rather than the expectancy penalises the \
              high-variance low-count candidates that dominate an expectancy ranking, and attacks \
              selection bias at the candidate level where it is cheapest to fight.",
     },
@@ -359,8 +360,7 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
         writes: &["score_portfolio_after_pruning"],
         params: 1,
         max_draws_per_session: None,
-        why_not_a_reparameterisation:
-            "the selection unit is the PORTFOLIO after correlation pruning, not the best single \
+        why_not_a_reparameterisation: "the selection unit is the PORTFOLIO after correlation pruning, not the best single \
              gene. Diversification is a real, non-redistributive effect on path statistics, and the \
              live artifact is a portfolio anyway.",
     },
@@ -385,7 +385,10 @@ impl ObjectiveVariant {
     }
 
     pub fn index(self) -> usize {
-        Self::ALL.iter().position(|v| *v == self).expect("ALL covers the enum")
+        Self::ALL
+            .iter()
+            .position(|v| *v == self)
+            .expect("ALL covers the enum")
     }
 
     pub fn spec(self) -> &'static VariantSpec {
@@ -399,7 +402,9 @@ impl ObjectiveVariant {
     /// The variants U4 requires coverage of: everything except the B0 control,
     /// which is capped at one draw and so could never reach `B_MIN_DRAWS`.
     pub fn coverage_set() -> impl Iterator<Item = ObjectiveVariant> {
-        Self::ALL.into_iter().filter(|v| v.spec().max_draws_per_session.is_none())
+        Self::ALL
+            .into_iter()
+            .filter(|v| v.spec().max_draws_per_session.is_none())
     }
 
     /// Drawable iff every required knob is compiled in and the scenario matches.
@@ -423,7 +428,10 @@ impl ObjectiveVariant {
         if let Some(s) = spec.scenario
             && s != scenario
         {
-            return Some(VariantExclusion::WrongScenario { requires: s, session: scenario });
+            return Some(VariantExclusion::WrongScenario {
+                requires: s,
+                session: scenario,
+            });
         }
         for k in spec.requires {
             if !k.available(caps) {
@@ -441,12 +449,12 @@ impl ObjectiveVariant {
         let p = param as usize;
         match self {
             Self::B0ScoringTable => B0_TABLE_LEVELS.get(p).map(|s| (*s).to_string()),
-            Self::B1Selectivity => {
-                B1_MAX_IN_MARKET_LEVELS.get(p).map(|v| format!("max_in_market={v:.2}"))
-            }
-            Self::B2Conditional => {
-                B2_CONDITIONING_LEVELS.get(p).map(|(n, b)| format!("{n}({b} buckets)"))
-            }
+            Self::B1Selectivity => B1_MAX_IN_MARKET_LEVELS
+                .get(p)
+                .map(|v| format!("max_in_market={v:.2}")),
+            Self::B2Conditional => B2_CONDITIONING_LEVELS
+                .get(p)
+                .map(|(n, b)| format!("{n}({b} buckets)")),
             Self::B4LabelHorizon => B4_HORIZON_LEVELS.get(p).map(|v| format!("{v} bars")),
             _ => (p == 0).then(|| "-".to_string()),
         }
@@ -460,9 +468,10 @@ impl ObjectiveVariant {
     /// Every other variant contributes 1.
     pub fn hypothesis_multiplier(self, param: u8) -> usize {
         match self {
-            Self::B2Conditional => {
-                B2_CONDITIONING_LEVELS.get(param as usize).map(|(_, b)| *b).unwrap_or(1)
-            }
+            Self::B2Conditional => B2_CONDITIONING_LEVELS
+                .get(param as usize)
+                .map(|(_, b)| *b)
+                .unwrap_or(1),
             _ => 1,
         }
     }
@@ -472,7 +481,10 @@ impl ObjectiveVariant {
 #[serde(rename_all = "snake_case")]
 pub enum VariantExclusion {
     MissingKnob(RequiredKnob),
-    WrongScenario { requires: ScenarioKind, session: ScenarioKind },
+    WrongScenario {
+        requires: ScenarioKind,
+        session: ScenarioKind,
+    },
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -585,7 +597,9 @@ impl RefusalLevels {
     /// The permissive corner: every optional floor off. The baseline of the
     /// refusal vector, not a preference.
     pub fn permissive() -> Self {
-        Self { levels: [0; REFUSAL_DIM_COUNT] }
+        Self {
+            levels: [0; REFUSAL_DIM_COUNT],
+        }
     }
 
     pub fn level(&self, dim: RefusalDim) -> u8 {
@@ -616,9 +630,20 @@ impl RefusalLevels {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveError {
-    RefusalLevelOutOfRange { dim: RefusalDim, level: u8, arity: usize },
-    ParamOutOfRange { variant: ObjectiveVariant, param: u8, arity: usize },
-    VariantNotDrawable { variant: ObjectiveVariant, reason: VariantExclusion },
+    RefusalLevelOutOfRange {
+        dim: RefusalDim,
+        level: u8,
+        arity: usize,
+    },
+    ParamOutOfRange {
+        variant: ObjectiveVariant,
+        param: u8,
+        arity: usize,
+    },
+    VariantNotDrawable {
+        variant: ObjectiveVariant,
+        reason: VariantExclusion,
+    },
     /// Every drawable variant has spent its `max_draws_per_session`.
     ///
     /// The proposer used to handle this by falling back to the full drawable
@@ -636,7 +661,11 @@ impl std::fmt::Display for ObjectiveError {
                 "refusal dimension `{}` has {arity} levels; level {level} does not exist",
                 dim.label()
             ),
-            Self::ParamOutOfRange { variant, param, arity } => write!(
+            Self::ParamOutOfRange {
+                variant,
+                param,
+                arity,
+            } => write!(
                 f,
                 "objective `{}` has {arity} parameter levels; level {param} does not exist",
                 variant.label()
@@ -701,7 +730,11 @@ impl ObjectiveChoice {
                 arity: variant.param_count(),
             });
         }
-        Ok(Self { variant, param, refusals })
+        Ok(Self {
+            variant,
+            param,
+            refusals,
+        })
     }
 
     pub fn variant(&self) -> ObjectiveVariant {
@@ -764,10 +797,9 @@ impl ObjectiveChoice {
             ObjectiveVariant::B0ScoringTable => {
                 #[cfg(feature = "search-fitness-table")]
                 {
-                    cfg.fitness_table =
-                        neoethos_search::scoring::FitnessTable::from_name(
-                            B0_TABLE_LEVELS[self.param as usize],
-                        );
+                    cfg.fitness_table = neoethos_search::scoring::FitnessTable::from_name(
+                        B0_TABLE_LEVELS[self.param as usize],
+                    );
                 }
             }
             ObjectiveVariant::B2Conditional => {
@@ -835,10 +867,16 @@ pub fn axis_b_report(caps: &Capabilities, scenario: ScenarioKind) -> Vec<Variant
                 variant: v.label().to_string(),
                 changes: spec.changes,
                 expression: spec.expression,
-                params: (0..v.param_count() as u8).map(|p| v.param_label(p)).collect(),
+                params: (0..v.param_count() as u8)
+                    .map(|p| v.param_label(p))
+                    .collect(),
                 drawable: reason.is_none(),
                 excluded_because: reason.map(|r| {
-                    ObjectiveError::VariantNotDrawable { variant: v, reason: r }.to_string()
+                    ObjectiveError::VariantNotDrawable {
+                        variant: v,
+                        reason: r,
+                    }
+                    .to_string()
                 }),
                 exact_form_requires: spec.exact_form_requires.map(|k| {
                     // The sentence must name what ACTUALLY runs, and that
@@ -939,8 +977,10 @@ pub fn axis_b_live_check(
     caps: &Capabilities,
     scenario: ScenarioKind,
 ) -> Result<Vec<ObjectiveVariant>, AxisBInert> {
-    let drawable: Vec<ObjectiveVariant> =
-        ObjectiveVariant::ALL.into_iter().filter(|v| v.drawable(caps, scenario)).collect();
+    let drawable: Vec<ObjectiveVariant> = ObjectiveVariant::ALL
+        .into_iter()
+        .filter(|v| v.drawable(caps, scenario))
+        .collect();
 
     if carries_the_axis(&drawable) {
         return Ok(drawable);
@@ -950,8 +990,13 @@ pub fn axis_b_live_check(
         .into_iter()
         .filter(|v| carries_the_axis(std::slice::from_ref(v)))
         .filter_map(|v| {
-            v.exclusion_reason(caps, scenario)
-                .map(|r| ObjectiveError::VariantNotDrawable { variant: v, reason: r }.to_string())
+            v.exclusion_reason(caps, scenario).map(|r| {
+                ObjectiveError::VariantNotDrawable {
+                    variant: v,
+                    reason: r,
+                }
+                .to_string()
+            })
         })
         .collect();
 
@@ -1055,7 +1100,9 @@ pub fn axis_b_coverage(
     min_draws: usize,
     sweeps_of: &dyn Fn(&str) -> usize,
 ) -> AxisBCoverage {
-    let axis_ran = ObjectiveVariant::ALL.into_iter().any(|v| sweeps_of(v.label()) > 0);
+    let axis_ran = ObjectiveVariant::ALL
+        .into_iter()
+        .any(|v| sweeps_of(v.label()) > 0);
 
     let expressible = |v: ObjectiveVariant| v.spec().requires.iter().all(|k| k.available(caps));
 
@@ -1079,8 +1126,8 @@ pub fn axis_b_coverage(
                 (n < min_draws).then_some((v.label(), n))
             })
             .collect();
-        let group_exists =
-            ObjectiveVariant::coverage_set().any(|v| v.spec().scenario == Some(k) && expressible(v));
+        let group_exists = ObjectiveVariant::coverage_set()
+            .any(|v| v.spec().scenario == Some(k) && expressible(v));
         if !group_exists {
             continue;
         }
@@ -1097,7 +1144,11 @@ pub fn axis_b_coverage(
     under_drawn.sort_unstable();
     under_drawn.dedup();
 
-    AxisBCoverage { axis_ran, scenario, under_drawn }
+    AxisBCoverage {
+        axis_ran,
+        scenario,
+        under_drawn,
+    }
 }
 
 #[cfg(test)]
@@ -1109,8 +1160,15 @@ mod tests {
     fn the_declared_set_is_ordered_and_complete() {
         for (i, v) in ObjectiveVariant::ALL.into_iter().enumerate() {
             assert_eq!(v.index(), i);
-            assert_eq!(VARIANTS[i].id, v, "VARIANTS row {i} does not match the enum order");
-            assert!(VARIANTS[i].params >= 1, "{} declares zero parameter levels", v.label());
+            assert_eq!(
+                VARIANTS[i].id, v,
+                "VARIANTS row {i} does not match the enum order"
+            );
+            assert!(
+                VARIANTS[i].params >= 1,
+                "{} declares zero parameter levels",
+                v.label()
+            );
         }
     }
 
@@ -1247,7 +1305,11 @@ mod tests {
         // …and every scenario-specific variant names one of them.
         for spec in VARIANTS {
             if let Some(k) = spec.scenario {
-                assert!(SCENARIOS.contains(&k), "{} names a scenario not in SCENARIOS", spec.label);
+                assert!(
+                    SCENARIOS.contains(&k),
+                    "{} names a scenario not in SCENARIOS",
+                    spec.label
+                );
             }
         }
     }
@@ -1274,7 +1336,9 @@ mod tests {
             );
             // …and it is not merely the capped control doing the work.
             assert!(
-                drawable.iter().any(|v| *v == ObjectiveVariant::B1Selectivity),
+                drawable
+                    .iter()
+                    .any(|v| *v == ObjectiveVariant::B1Selectivity),
                 "{scenario:?}: B1 is the variant whose levers the compiled search actually has"
             );
         }
@@ -1295,16 +1359,25 @@ mod tests {
             ScenarioKind::Risky,
         )
         .expect("B1 must be drawable with no pending knob compiled in");
-        let mut cfg = DiscoveryConfig { min_trades_per_day: 7.5, ..Default::default() };
+        let mut cfg = DiscoveryConfig {
+            min_trades_per_day: 7.5,
+            ..Default::default()
+        };
         choice.apply(&mut cfg).unwrap();
-        assert_eq!(cfg.min_trades_per_day, 0.0, "the volume floor must be REMOVED, not lowered");
+        assert_eq!(
+            cfg.min_trades_per_day, 0.0,
+            "the volume floor must be REMOVED, not lowered"
+        );
         assert_eq!(cfg.target_profile.max_in_market, B1_MAX_IN_MARKET_LEVELS[1]);
         // And the term that is NOT expressible is declared rather than dropped.
         assert_eq!(
             ObjectiveVariant::B1Selectivity.spec().exact_form_requires,
             Some(RequiredKnob::InMarketFitness)
         );
-        assert!(!B1_WRITES.contains(&"fitness_table"), "writes must not name a field it cannot write");
+        assert!(
+            !B1_WRITES.contains(&"fitness_table"),
+            "writes must not name a field it cannot write"
+        );
     }
 
     #[test]
@@ -1360,7 +1433,10 @@ mod tests {
         let caps = Capabilities::compiled();
         let nothing_ran = axis_b_coverage(&caps, crate::space::B_MIN_DRAWS, &|_: &str| 0);
         assert!(!nothing_ran.axis_ran);
-        assert!(!nothing_ran.satisfied(), "U4 certified an axis that produced no runs");
+        assert!(
+            !nothing_ran.satisfied(),
+            "U4 certified an axis that produced no runs"
+        );
         assert!(!nothing_ran.under_drawn.is_empty());
         let detail = nothing_ran.detail(crate::space::B_MIN_DRAWS);
         assert!(detail.contains("produced no runs"), "{detail}");
@@ -1396,7 +1472,11 @@ mod tests {
         // One variant a single sweep short: NOT satisfied, and named with its
         // count so the report says which question to ask next.
         let short = axis_b_coverage(&caps, min, &|label: &str| {
-            if label == ObjectiveVariant::B1Selectivity.label() { min - 1 } else { min }
+            if label == ObjectiveVariant::B1Selectivity.label() {
+                min - 1
+            } else {
+                min
+            }
         });
         assert!(!short.satisfied());
         assert!(
@@ -1406,7 +1486,11 @@ mod tests {
             "{:?}",
             short.under_drawn
         );
-        assert!(short.detail(min).contains("B1_selectivity (2)"), "{}", short.detail(min));
+        assert!(
+            short.detail(min).contains("B1_selectivity (2)"),
+            "{}",
+            short.detail(min)
+        );
     }
 
     #[test]
@@ -1417,7 +1501,9 @@ mod tests {
         // forever — the loop could then never say "unreachable", which is the
         // one thing this project has never been able to say.
         let caps = Capabilities::compiled();
-        let cov = axis_b_coverage(&caps, crate::space::B_MIN_DRAWS, &|_: &str| crate::space::B_MIN_DRAWS);
+        let cov = axis_b_coverage(&caps, crate::space::B_MIN_DRAWS, &|_: &str| {
+            crate::space::B_MIN_DRAWS
+        });
         assert!(cov.satisfied());
         for v in ObjectiveVariant::ALL {
             if v.exclusion_reason(&caps, ScenarioKind::Risky).is_some()

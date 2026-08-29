@@ -12,41 +12,6 @@ pub(super) fn try_dispatch_non_ma_cuda(
     device_id: usize,
 ) -> Option<Result<IndicatorCudaOutput, IndicatorDispatchError>> {
     match indicator {
-        "acosc" => Some((|| {
-            let indicator = "acosc";
-            let fallback_outputs: &[&str] = &["osc", "change"];
-            let (output_id, output_index) =
-                resolve_output_with_fallback(indicator, info, req.output_id, fallback_outputs)?;
-            let high_f32 = required_high_f32(req.data, indicator)?;
-            let low_f32 = required_low_f32(req.data, indicator)?;
-            let mut cuda = crate::cuda::oscillators::CudaAcosc::new(device_id).map_err(|e| {
-                IndicatorDispatchError::KernelUnavailable {
-                    details: e.to_string(),
-                }
-            })?;
-            let result = cuda
-                .acosc_batch_dev(high_f32.as_slice(), low_f32.as_slice())
-                .map_err(|e| map_non_ma_compute_error(indicator, e.to_string()))?;
-            let owner = match output_index {
-                0 => crate::cuda::moving_averages::DeviceArrayF32 {
-                    buf: result.osc.buf,
-                    rows: result.osc.rows,
-                    cols: result.osc.cols,
-                },
-                1 => crate::cuda::moving_averages::DeviceArrayF32 {
-                    buf: result.change.buf,
-                    rows: result.change.rows,
-                    cols: result.change.cols,
-                },
-                _ => {
-                    return Err(IndicatorDispatchError::UnknownOutput {
-                        indicator: indicator.to_string(),
-                        output: output_id.clone(),
-                    });
-                }
-            };
-            finalize_cuda_matrix_output(output_id, owner, req.target, device_id as u32, None)
-        })()),
         "adosc" => Some((|| {
             let indicator = "adosc";
             let fallback_outputs: &[&str] = &["value"];
@@ -354,7 +319,7 @@ pub(super) fn try_dispatch_non_ma_cuda(
         })()),
         "aroon" => Some((|| {
             let indicator = "aroon";
-            let fallback_outputs: &[&str] = &["first", "second"];
+            let fallback_outputs: &[&str] = &[];
             let (output_id, output_index) =
                 resolve_output_with_fallback(indicator, info, req.output_id, fallback_outputs)?;
             let high_f32 = required_high_f32(req.data, indicator)?;
@@ -425,7 +390,7 @@ pub(super) fn try_dispatch_non_ma_cuda(
         })()),
         "aso" => Some((|| {
             let indicator = "aso";
-            let fallback_outputs: &[&str] = &["output_0", "output_1"];
+            let fallback_outputs: &[&str] = &[];
             let (output_id, output_index) =
                 resolve_output_with_fallback(indicator, info, req.output_id, fallback_outputs)?;
             let open_f32 = required_open_f32(req.data, indicator)?;
@@ -1921,14 +1886,14 @@ pub(super) fn try_dispatch_non_ma_cuda(
                 .map_err(|e| map_non_ma_compute_error(indicator, e.to_string()))?;
             let owner = match output_index {
                 0 => crate::cuda::moving_averages::DeviceArrayF32 {
-                    buf: result.0 .0.buf,
-                    rows: result.0 .0.rows,
-                    cols: result.0 .0.cols,
+                    buf: result.0.0.buf,
+                    rows: result.0.0.rows,
+                    cols: result.0.0.cols,
                 },
                 1 => crate::cuda::moving_averages::DeviceArrayF32 {
-                    buf: result.0 .1.buf,
-                    rows: result.0 .1.rows,
-                    cols: result.0 .1.cols,
+                    buf: result.0.1.buf,
+                    rows: result.0.1.rows,
+                    cols: result.0.1.cols,
                 },
                 _ => {
                     return Err(IndicatorDispatchError::UnknownOutput {
@@ -3565,46 +3530,6 @@ pub(super) fn try_dispatch_non_ma_cuda(
             };
             finalize_cuda_matrix_output(output_id, owner, req.target, device_id as u32, None)
         })()),
-        "pivot" => Some((|| {
-            let indicator = "pivot";
-            let fallback_outputs: &[&str] = &["value"];
-            let (output_id, output_index) =
-                resolve_output_with_fallback(indicator, info, req.output_id, fallback_outputs)?;
-            let open_f32 = required_open_f32(req.data, indicator)?;
-            let high_f32 = required_high_f32(req.data, indicator)?;
-            let low_f32 = required_low_f32(req.data, indicator)?;
-            let close_f32 = required_close_f32(req.data, indicator)?;
-            let mut sweep: crate::indicators::pivot::PivotBatchRange = Default::default();
-            sweep.mode = resolve_usize_range_param(req.params, "mode", sweep.mode, indicator)?;
-            let mut cuda = crate::cuda::CudaPivot::new(device_id).map_err(|e| {
-                IndicatorDispatchError::KernelUnavailable {
-                    details: e.to_string(),
-                }
-            })?;
-            let result = cuda
-                .pivot_batch_dev(
-                    high_f32.as_slice(),
-                    low_f32.as_slice(),
-                    close_f32.as_slice(),
-                    open_f32.as_slice(),
-                    &sweep,
-                )
-                .map_err(|e| map_non_ma_compute_error(indicator, e.to_string()))?;
-            let owner = match output_index {
-                0 => crate::cuda::moving_averages::DeviceArrayF32 {
-                    buf: result.0.buf,
-                    rows: result.0.rows,
-                    cols: result.0.cols,
-                },
-                _ => {
-                    return Err(IndicatorDispatchError::UnknownOutput {
-                        indicator: indicator.to_string(),
-                        output: output_id.clone(),
-                    });
-                }
-            };
-            finalize_cuda_matrix_output(output_id, owner, req.target, device_id as u32, None)
-        })()),
         "pma" => Some((|| {
             let indicator = "pma";
             let fallback_outputs: &[&str] = &["predict", "trigger"];
@@ -3665,65 +3590,6 @@ pub(super) fn try_dispatch_non_ma_cuda(
                     buf: result.0.buf,
                     rows: result.0.rows,
                     cols: result.0.cols,
-                },
-                _ => {
-                    return Err(IndicatorDispatchError::UnknownOutput {
-                        indicator: indicator.to_string(),
-                        output: output_id.clone(),
-                    });
-                }
-            };
-            finalize_cuda_matrix_output(output_id, owner, req.target, device_id as u32, None)
-        })()),
-        "prb" => Some((|| {
-            let indicator = "prb";
-            let fallback_outputs: &[&str] = &["output_0", "output_1", "output_2"];
-            let (output_id, output_index) =
-                resolve_output_with_fallback(indicator, info, req.output_id, fallback_outputs)?;
-            let primary_f32 = primary_f32_from_data(req.data, indicator)?;
-            let smooth_data = get_bool_param(req.params, "smooth_data", indicator)?.unwrap_or(true);
-            let mut sweep: crate::indicators::prb::PrbBatchRange = Default::default();
-            sweep.smooth_period = resolve_usize_range_param(
-                req.params,
-                "smooth_period",
-                sweep.smooth_period,
-                indicator,
-            )?;
-            sweep.regression_period = resolve_usize_range_param(
-                req.params,
-                "regression_period",
-                sweep.regression_period,
-                indicator,
-            )?;
-            sweep.polynomial_order = resolve_usize_range_param(
-                req.params,
-                "polynomial_order",
-                sweep.polynomial_order,
-                indicator,
-            )?;
-            let mut cuda = crate::cuda::CudaPrb::new(device_id).map_err(|e| {
-                IndicatorDispatchError::KernelUnavailable {
-                    details: e.to_string(),
-                }
-            })?;
-            let result = cuda
-                .prb_batch_dev(primary_f32.as_slice(), &sweep, smooth_data)
-                .map_err(|e| map_non_ma_compute_error(indicator, e.to_string()))?;
-            let owner = match output_index {
-                0 => crate::cuda::moving_averages::DeviceArrayF32 {
-                    buf: result.0.buf,
-                    rows: result.0.rows,
-                    cols: result.0.cols,
-                },
-                1 => crate::cuda::moving_averages::DeviceArrayF32 {
-                    buf: result.1.buf,
-                    rows: result.1.rows,
-                    cols: result.1.cols,
-                },
-                2 => crate::cuda::moving_averages::DeviceArrayF32 {
-                    buf: result.2.buf,
-                    rows: result.2.rows,
-                    cols: result.2.cols,
                 },
                 _ => {
                     return Err(IndicatorDispatchError::UnknownOutput {

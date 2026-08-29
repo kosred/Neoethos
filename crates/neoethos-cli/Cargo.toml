@@ -25,6 +25,16 @@ gpu-nvidia = [
     "neoethos-data/gpu-cuda",
     "neoethos-models/gpu-cuda",
     "neoethos-search/gpu-cuda",
+    "neoethos-autoresearch/gpu-cuda",
+]
+# Exact full research/training build for NVIDIA hosts. `gpu-nvidia` covers the
+# search, indicator, tree, RL, evolution and statistical CUDA surfaces; Burn's
+# deep/Exit/SAC backend is intentionally independent in neoethos-models and is
+# included here explicitly so the full-run command cannot leave those models on
+# CPU while a card is present.
+gpu-nvidia-full = [
+    "gpu-nvidia",
+    "neoethos-models/burn-cuda-backend",
 ]
 # Minimal native-CUDA build: Prototype B only, no CubeCL and no libtorch. Used
 # by the rented-GPU kit to prove the B kernel before provisioning anything else.
@@ -40,6 +50,7 @@ gpu-apple = ["gpu-vulkan"]
 
 [dependencies]
 neoethos-core = { path = "../neoethos-core" }
+neoethos-broker-history = { path = "../neoethos-broker-history" }
 neoethos-data = { path = "../neoethos-data" }
 neoethos-models = { path = "../neoethos-models", features = ["tree-models", "pure-rust-ml"] }
 neoethos-search = { path = "../neoethos-search" }
@@ -106,6 +117,8 @@ section = "finance"
 priority = "optional"
 assets = [
     ["target/release/neoethos-cli", "usr/bin/", "755"],
+    ["target/release/libxgboost.so", "usr/lib/neoethos-cli/", "644"],
+    ["target/release/libcatboostmodel.so", "usr/lib/neoethos-cli/", "644"],
     ["../../assets/symbol_metadata/defaults.json", "usr/share/neoethos/symbol_metadata/", "644"],
     ["../../LICENSE", "usr/share/doc/neoethos/", "644"],
     ["../../README.md", "usr/share/doc/neoethos/", "644"],
@@ -123,8 +136,9 @@ name = "neoethos-cli"
 license = "AGPL-3.0-or-later"
 assets = [
     { source = "target/release/neoethos-cli", dest = "/usr/bin/neoethos-cli", mode = "0755" },
+    { source = "target/release/libxgboost.so", dest = "/usr/lib/neoethos-cli/libxgboost.so", mode = "0644" },
+    { source = "target/release/libcatboostmodel.so", dest = "/usr/lib/neoethos-cli/libcatboostmodel.so", mode = "0644" },
     { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/neoethos/symbol_metadata/defaults.json", mode = "0644" },
     { source = "LICENSE", dest = "/usr/share/doc/neoethos/LICENSE", mode = "0644" },
     { source = "README.md", dest = "/usr/share/doc/neoethos/README.md", mode = "0644" },
 ]
-

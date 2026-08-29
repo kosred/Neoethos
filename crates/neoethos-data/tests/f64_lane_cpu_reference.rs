@@ -95,10 +95,10 @@ fn production_vocabulary_excludes_the_unbounded_exponential_trend_recurrence() {
 /// actually true and actually load-bearing — see that test.
 ///
 /// What this list is FOR: `cuda_f64::F64_KERNELS` lives behind vector-ta's
-/// `cuda` feature, and the whole value of the tests in this file is that they
-/// run on a machine with no CUDA at all. So the ids this crate actually
-/// launches are named here in plain text, and the containments below tie them
-/// back to the real table whenever the feature IS enabled.
+/// `cuda-build-native` feature, and the whole value of the tests in this file
+/// is that they run on a machine with no CUDA at all. So the ids this crate
+/// actually launches are named here in plain text, and the containments below
+/// tie them back to the real table whenever the feature IS enabled.
 const CLAIMED: &[&str] = &[
     // batch 1
     "sma", "ema", "rsi", "roc", "mom", "atr", "adx", "willr", "cci", "mfi",

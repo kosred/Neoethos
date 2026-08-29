@@ -180,7 +180,11 @@ impl Proposal {
             self.axis_b.variant().param_label(self.axis_b.param())
         ));
         for d in RefusalDim::ALL {
-            parts.push(format!("{}={}", d.label(), d.level_label(self.axis_b.refusals().level(d))));
+            parts.push(format!(
+                "{}={}",
+                d.label(),
+                d.level_label(self.axis_b.refusals().level(d))
+            ));
         }
         parts.push(format!("replicate_seed={}", self.replicate_seed));
         parts.join(" ")
@@ -224,7 +228,11 @@ pub enum ProposalRefused {
     MoneyPath { violations: Vec<MoneyPathViolation> },
     /// The produced config does not carry a value the proposal declared —
     /// something downstream overwrote it. The run would not be the proposal.
-    AppliedValueMismatch { field: String, expected: String, actual: String },
+    AppliedValueMismatch {
+        field: String,
+        expected: String,
+        actual: String,
+    },
     /// The same semantic key has already been run in this session.
     Duplicate { first_seen: SweepId },
     /// The cell has already been drawn `MAX_REPLICATES_PER_CELL` times. Not a
@@ -262,7 +270,11 @@ impl std::fmt::Display for ProposalRefused {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Self::AppliedValueMismatch { field, expected, actual } => write!(
+            Self::AppliedValueMismatch {
+                field,
+                expected,
+                actual,
+            } => write!(
                 f,
                 "`{field}` was proposed as {expected} but the resolved config carries {actual}: \
                  the run would not be the proposal"
@@ -353,7 +365,8 @@ impl Proposal {
     /// the payoff ceiling that proves the proposal's own floor is reachable.
     pub fn resolve_spec(&self, base: &DiscoveryConfig) -> anyhow::Result<ProposedRunSpec> {
         let pip_value_per_lot = base.try_evaluation_config(None)?.pip_value_per_lot;
-        let inputs = neoethos_search::run_identity::payoff_inputs_for_config(base, pip_value_per_lot);
+        let inputs =
+            neoethos_search::run_identity::payoff_inputs_for_config(base, pip_value_per_lot);
         materialise(base, self, &inputs).map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
@@ -387,7 +400,10 @@ pub fn materialise(
     let reference = baseline.clone().apply_mode_overrides();
 
     let mut cfg = baseline.clone();
-    proposal.axis_a.apply_structural(&mut cfg).map_err(ProposalRefused::Space)?;
+    proposal
+        .axis_a
+        .apply_structural(&mut cfg)
+        .map_err(ProposalRefused::Space)?;
 
     // The lane/horizon pairing rule, checked against the horizon this proposal
     // actually implies. An H4 lane under a 35-bar label is refused here, by
@@ -398,7 +414,9 @@ pub fn materialise(
         proposal.axis_a.higher_lanes(),
         horizon,
     )
-    .map_err(|e| ProposalRefused::LaneHorizon { detail: e.to_string() })?;
+    .map_err(|e| ProposalRefused::LaneHorizon {
+        detail: e.to_string(),
+    })?;
 
     let before_mode = (cfg.min_trades_per_day, cfg.filtering.min_trades_per_month);
     let mut cfg = cfg.apply_mode_overrides();
@@ -417,7 +435,10 @@ pub fn materialise(
         ));
     }
 
-    proposal.axis_b.apply(&mut cfg).map_err(ProposalRefused::Objective)?;
+    proposal
+        .axis_b
+        .apply(&mut cfg)
+        .map_err(ProposalRefused::Objective)?;
 
     money_path_audit(&reference, &cfg)
         .map_err(|violations| ProposalRefused::MoneyPath { violations })?;
@@ -493,7 +514,11 @@ fn verify_applied(proposal: &Proposal, cfg: &DiscoveryConfig) -> Result<(), Prop
         a.prefilter_insample_frac(),
         cfg.runtime_overrides.prefilter_insample_frac
     );
-    want!("timeframe_label", a.base_timeframe(), cfg.timeframe_label.as_str());
+    want!(
+        "timeframe_label",
+        a.base_timeframe(),
+        cfg.timeframe_label.as_str()
+    );
     let lanes: Vec<String> = a.higher_lanes().iter().map(|s| (*s).to_string()).collect();
     want!("higher_timeframes", lanes, cfg.higher_timeframes);
     want!("candidate_count", a.candidate_count(), cfg.candidate_count);
@@ -539,13 +564,18 @@ fn verify_applied(proposal: &Proposal, cfg: &DiscoveryConfig) -> Result<(), Prop
 pub enum IdentityOutcome {
     New,
     /// The same semantic key was already run. Refuse and redraw.
-    DuplicateKey { first_seen: SweepId },
+    DuplicateKey {
+        first_seen: SweepId,
+    },
     /// Two DIFFERENT proposals produced the same `config_hash`: the stamp
     /// cannot tell them apart. The proposal still runs — the proposer's key is
     /// the authoritative identity — but the artifact is not attributable by
     /// hash alone and the gap is named here so it gets fixed rather than
     /// absorbed.
-    StampCollision { first_seen: SweepId, differing: Vec<String> },
+    StampCollision {
+        first_seen: SweepId,
+        differing: Vec<String>,
+    },
 }
 
 /// Session-wide identity bookkeeping, rebuildable by replaying the journal.
@@ -592,8 +622,10 @@ impl IdentityLedger {
             && let Some((other, first)) = self.by_hash.get(hash)
             && *other != key
         {
-            outcome =
-                IdentityOutcome::StampCollision { first_seen: *first, differing: differing(other, &key) };
+            outcome = IdentityOutcome::StampCollision {
+                first_seen: *first,
+                differing: differing(other, &key),
+            };
         }
         self.by_key.insert(key, sweep);
         if let Some(hash) = config_hash {
@@ -617,7 +649,11 @@ fn differing(a: &ProposalKey, b: &ProposalKey) -> Vec<String> {
         }
     }
     if a.variant != b.variant {
-        out.push(format!("objective: {} vs {}", a.variant.label(), b.variant.label()));
+        out.push(format!(
+            "objective: {} vs {}",
+            a.variant.label(),
+            b.variant.label()
+        ));
     } else if a.param != b.param {
         out.push(format!(
             "objective_param: {} vs {}",
@@ -636,7 +672,10 @@ fn differing(a: &ProposalKey, b: &ProposalKey) -> Vec<String> {
         }
     }
     if a.replicate_seed != b.replicate_seed {
-        out.push(format!("replicate_seed: {} vs {}", a.replicate_seed, b.replicate_seed));
+        out.push(format!(
+            "replicate_seed: {} vs {}",
+            a.replicate_seed, b.replicate_seed
+        ));
     }
     out
 }
@@ -687,9 +726,7 @@ impl ProposerCensus {
             ProposalRefused::MoneyPath { .. } => self.money_path_refused += 1,
             ProposalRefused::AppliedValueMismatch { .. } => self.applied_value_mismatch += 1,
             ProposalRefused::Duplicate { .. } => self.duplicates_refused += 1,
-            ProposalRefused::CellReplicatesExhausted { .. } => {
-                self.cell_replicates_exhausted += 1
-            }
+            ProposalRefused::CellReplicatesExhausted { .. } => self.cell_replicates_exhausted += 1,
         }
         if self.examples.len() < CENSUS_EXAMPLES_MAX {
             self.examples.push((
@@ -822,12 +859,13 @@ mod tests {
         let p = proposal([0; FACTOR_COUNT], [0, 0, 2, 0]);
         let inputs = shipped_inputs();
         let ceiling = neoethos_search::run_identity::max_achievable_payoff(&inputs).unwrap();
-        assert!(ceiling.enforced_ceiling < 2.0, "test fixture no longer exercises the gate");
-        let err = assert_payoff_floor_reachable(
-            p.refusals().value(RefusalDim::PayoffFloor),
-            &inputs,
-        )
-        .unwrap_err();
+        assert!(
+            ceiling.enforced_ceiling < 2.0,
+            "test fixture no longer exercises the gate"
+        );
+        let err =
+            assert_payoff_floor_reachable(p.refusals().value(RefusalDim::PayoffFloor), &inputs)
+                .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("payoff"));
         // …and a floor at or below the ceiling is accepted.
         assert!(assert_payoff_floor_reachable(0.0, &inputs).is_ok());
@@ -840,14 +878,22 @@ mod tests {
         let mut b = a.clone();
         b.replicate_seed = 8;
 
-        assert_eq!(ledger.observe(a.key(), None, SweepId(1)), IdentityOutcome::New);
+        assert_eq!(
+            ledger.observe(a.key(), None, SweepId(1)),
+            IdentityOutcome::New
+        );
         assert_eq!(
             ledger.observe(a.key(), None, SweepId(2)),
-            IdentityOutcome::DuplicateKey { first_seen: SweepId(1) }
+            IdentityOutcome::DuplicateKey {
+                first_seen: SweepId(1)
+            }
         );
         // The replicate is a DIFFERENT experiment — deduping it away would
         // delete the within-cell variance the judge needs.
-        assert_eq!(ledger.observe(b.key(), None, SweepId(2)), IdentityOutcome::New);
+        assert_eq!(
+            ledger.observe(b.key(), None, SweepId(2)),
+            IdentityOutcome::New
+        );
     }
 
     #[test]
@@ -860,11 +906,20 @@ mod tests {
         levels[FactorId::GeneWidth.index()] = 2;
         let b = proposal(levels, [0; 4]);
 
-        assert_eq!(ledger.observe(a.key(), Some("fnv64:same"), SweepId(1)), IdentityOutcome::New);
+        assert_eq!(
+            ledger.observe(a.key(), Some("fnv64:same"), SweepId(1)),
+            IdentityOutcome::New
+        );
         match ledger.observe(b.key(), Some("fnv64:same"), SweepId(2)) {
-            IdentityOutcome::StampCollision { first_seen, differing } => {
+            IdentityOutcome::StampCollision {
+                first_seen,
+                differing,
+            } => {
                 assert_eq!(first_seen, SweepId(1));
-                assert!(differing.iter().any(|d| d.starts_with("gene_width")), "{differing:?}");
+                assert!(
+                    differing.iter().any(|d| d.starts_with("gene_width")),
+                    "{differing:?}"
+                );
             }
             other => panic!("expected a named stamp collision, got {other:?}"),
         }
@@ -874,7 +929,12 @@ mod tests {
     fn the_census_names_every_refusal_and_never_just_counts_it() {
         let mut census = ProposerCensus::default();
         let p = proposal([0; FACTOR_COUNT], [0; 4]);
-        census.record_refusal(&ProposalRefused::Duplicate { first_seen: SweepId(3) }, &p.describe());
+        census.record_refusal(
+            &ProposalRefused::Duplicate {
+                first_seen: SweepId(3),
+            },
+            &p.describe(),
+        );
         census.record_refusal(
             &ProposalRefused::PayoffFloorUnreachable {
                 configured_floor: 2.0,
@@ -901,13 +961,23 @@ mod tests {
             let mut levels = [0u8; FACTOR_COUNT];
             levels[f.index()] = 1;
             let other = proposal(levels, [0; 4]);
-            assert_ne!(base.key(), other.key(), "{} is invisible to ProposalKey", f.label());
+            assert_ne!(
+                base.key(),
+                other.key(),
+                "{} is invisible to ProposalKey",
+                f.label()
+            );
         }
         for d in RefusalDim::ALL {
             let mut refusals = [0u8; 4];
             refusals[d.index()] = 1;
             let other = proposal([0; FACTOR_COUNT], refusals);
-            assert_ne!(base.key(), other.key(), "{} is invisible to ProposalKey", d.label());
+            assert_ne!(
+                base.key(),
+                other.key(),
+                "{} is invisible to ProposalKey",
+                d.label()
+            );
         }
     }
 }

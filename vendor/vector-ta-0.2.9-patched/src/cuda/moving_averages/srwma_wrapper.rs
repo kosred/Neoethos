@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::cwma_wrapper::{BatchKernelPolicy, ManySeriesKernelPolicy};
 use crate::indicators::moving_averages::srwma::{SrwmaBatchRange, SrwmaParams};
@@ -6,16 +6,16 @@ use cust::context::{CacheConfig, Context, SharedMemoryConfig};
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, CopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
-use std::ffi::c_void;
 use std::ffi::CString;
+use std::ffi::c_void;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -138,7 +138,7 @@ impl CudaSrwma {
 
     fn opt_in_dynamic_smem(func: &Function, bytes: u32) -> Result<(), CudaSrwmaError> {
         let res = unsafe {
-            use cust::sys::{cuFuncSetAttribute, CUfunction_attribute_enum as Attr};
+            use cust::sys::{CUfunction_attribute_enum as Attr, cuFuncSetAttribute};
             cuFuncSetAttribute(
                 func.to_raw(),
                 Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -180,20 +180,8 @@ impl CudaSrwma {
         let context =
             Arc::new(Context::new(device).map_err(|e| CudaSrwmaError::Cuda(e.to_string()))?);
 
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/srwma_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
-        let module = match Module::from_ptx(ptx, jit_opts) {
-            Ok(m) => m,
-            Err(_) => match Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]) {
-                Ok(m) => m,
-                Err(_) => {
-                    Module::from_ptx(ptx, &[]).map_err(|e| CudaSrwmaError::Cuda(e.to_string()))?
-                }
-            },
-        };
+        let module = crate::load_cuda_embedded_module!("srwma_kernel")
+            .map_err(|error| CudaSrwmaError::Cuda(error.to_string()))?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)
             .map_err(|e| CudaSrwmaError::Cuda(e.to_string()))?;
 
@@ -669,7 +657,7 @@ impl CudaSrwma {
             Err(_) => {
                 return Err(CudaSrwmaError::MissingKernelSymbol {
                     name: "srwma_batch_f32",
-                })
+                });
             }
         };
 
@@ -784,7 +772,7 @@ impl CudaSrwma {
             Err(_) => {
                 return Err(CudaSrwmaError::MissingKernelSymbol {
                     name: "srwma_many_series_one_param_f32",
-                })
+                });
             }
         };
         let wlen = period.saturating_sub(1);

@@ -68,7 +68,7 @@ Forbidden this wave: `crates/neoethos-app/**`, `crates/neoethos-core/src/domain/
 | W2-11 💰 | **PENDING — wire or delete, not both** | `crates/neoethos-core/src/domain/risky_mode.rs:149`, `:155`, `:160`; validator `:531-540` | `correlation_cap`, `volatility_sigma_pause`, `require_swarm_confidence_min` are declared, documented as active defences, **validated at startup**, and enforced nowhere. Their sibling on the same struct (`presend_sanity_ceiling_fraction`) **is** enforced, which is what makes the absence conclusive. E's recommendation: **delete the three validations now** (costs nothing, removes the false signal immediately) and mark the fields `⚠ UNWIRED`. Wiring three risky-mode safety gates is a money-path behaviour change that needs its own measurement. | Startup validation of a value nothing uses is the strongest possible false signal: affirmative evidence that the number was checked. |
 | W2-12 💰 | **PENDING — blocks four deletions** | `crates/neoethos-models/src/training_orchestrator.rs:878-884`, `:886-892`, `:894-900`, `:2316-2321`, `:2481-2487`, `:902-911` | Six silent arithmetic merges: `transformer_hidden_dim`/`_d_model`, `transformer_heads`/`_n_heads`, `transformer_layers`/`_n_layers` (`.max()`); `label_stop_atr_multiplier`/`risk.atr_stop_multiplier` (`.max()`) 💰; `label_take_profit_rr`/`risk.min_risk_reward` (mode-gated `.max()`) 💰; the three row caps `global_max_rows`/`_per_symbol`/`max_training_rows_per_tf` (`.min()`). A silent `.max()` means **raising EITHER raises the effective value** — an operator who lowered one has not lowered the setting. The transformer trio agree at 256 today *by luck*. | **Blocks A** from deleting any of them. E confirms no caller update this wave, so A MARKS rather than deletes. |
 | W2-13 | **PENDING** | `crates/neoethos-models/src/training_orchestrator.rs` — `apply_hardware_plan_params` | Drop the `if canonical_model_name(name) == "genetic"` condition from **both** match arms so every `ModelFamily::Evolutionary` model takes `WorkloadKind::StrategySearch`; delete the three `("device", settings.system.device)` entries in the `neuro_evo`/`neat` param maps; point `preferred_burn_device_policy` at the `DeepTraining` workload device or delete it. **No new `WorkloadKind` variant is needed** — C deliberately did not add one, because a variant no consumer maps to is a second dead surface. ⚠ **Behaviour change to declare:** `neuro_evo` and `neat` currently run on `system.device` (shipped `"cpu"`); afterwards they run on the planner's search device, which on a CUDA box is `"cuda:all"`. Log old and new. | **Blocks A** deleting `system.device`. C reports the `WorkloadKind` precondition **did not land and cannot** from `system.rs` — the mapping site is here. Until then `system.device` and `system.enable_gpu` stay settable, unskipped, undeleted. |
-| W2-14 | **PENDING** | `crates/neoethos-models/src/training_orchestrator.rs:1900` | The `rllib_auto` branch — `system.enable_gpu`'s single reader — immediately degrades to native `rlkit` and warns. Branch and field die together. | Pairs with W2-13. |
+| W2-14 | **MODEL HALF DONE 2026-08-25** | `crates/neoethos-models/src/training_orchestrator.rs` | The `rllib_auto` branch and RLlib-to-rlkit warning/substitution are gone. Shipped RLlib defaults are false, and any legacy RLlib flag/worker request now fails at the versioned migration boundary before dispatch; rlkit is explicit native DQN. | `system.enable_gpu` now has no production reader. Retire that config field through the sealed-loader tombstone path in its own config cleanup; do not restore this branch to give it a reader. |
 | W2-15 | **PENDING — same change or neither** | `crates/neoethos-models/src/training_orchestrator.rs:1994-1997` | `models.train_batch_size` has 13 readers, all overwritten by `apply_hardware_plan_params` except the DQN replay-buffer sizing, which falls back to it when `rl_buffer_capacity == 0`. Deleting or `#[serde(skip)]`-ing the field without giving the replay buffer its own hardware-derived default silently shrinks or grows an RL buffer. `neoethos_core::system::training_batch_size(gpu, min_vram_gb)` is now public for exactly this. | — |
 | W2-16 | **PENDING** | `crates/neoethos-models/**` | The absolute memory sizers: `swarm_memory_limit_mb` (fixed 256.0 on a 16 GB laptop and a 192 GB box alike), `exit_agent_memory_capacity`, `rl_buffer_capacity`, and the three row budgets collapsed by `.min()`. All are capacity, all should derive from the probe. `WorkloadExecutionPlan::memory_budget_gb` is already computed and already handed to these models under a different key — they ignore it. | Never-OOM invariant: peak memory is a function of available hardware, never of a user parameter. |
 | W2-17 | **PENDING — its own commit, with its own measurement** | thread clamp, formerly `system.rs:1343-1350` | `apply_thread_env_defaults` was the **only** code in the workspace that set `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS`, and its only caller was the dead `AutoTuner::apply`. **So those variables have never been set in any run** — LightGBM's OpenMP wrapper and every XGBoost/BLAS pool have been sizing themselves unclamped, in the subsystem already identified as the thread-oversubscription bottleneck. Real opportunity, **not** a config item. Must land alone with a before/after wall-clock on a real training run, because clamping for the first time changes run times in both directions depending on the model. | Do **not** fold into a config commit claiming to be a no-op. (Note: `set_var` is the process telling a native library what to do — legitimate. The "no env vars" ban is on *reading* configuration out of the environment.) |
@@ -79,7 +79,7 @@ Forbidden this wave: `crates/neoethos-app/**`, `crates/neoethos-core/src/domain/
 | W2-22 💰 | **FILED ELSEWHERE IN THIS DOCUMENT — see [`models.blend_*`](#modelsblend_--the-live-blend-multipliers-need-a-config-recipient) at the end** | `crates/neoethos-core/src/config.rs` (`ModelsConfig`, beside `live_ml_gate` at `:1031` / `:2425`) | Pointer row only, so a reader of this TABLE finds it. The `models.blend.*` recipient was the fourth un-filed item in the 2026-08-10 record; the app/CLI/trader shard filed it in full while this reconciliation was running, and its version is better than mine — it names `blend_gate_floor` / `blend_veto_below` (flat, not nested), the exact `Default` sites, the full six-point drag, and the two waiting readers. **CLOSED 2026-08-10 (audit #232): the fields landed and the readers are wired.** `ModelsConfig::blend_gate_floor` / `blend_veto_below` exist, the desktop seed carries them, `settings.rs` + `knob_catalog.rs` + the MCP params/ops mirror them, and `operator_blend_gate_floor`/`_veto_below` now return the operator's number instead of `None`. See the closed section at the end of this document for the exact drag and the regression test. | — |
 | W2-23 💰 | **PENDING — filed 2026-08-10, two starting balances, neither reads the account** | `crates/neoethos-core/src/config.rs:586` and `:1910` | **Current values: `risk.initial_balance = 10_000.0` (`:586`) and `models.backtest_runtime.initial_equity = 100_000.0` (`:1910`) — a factor of ten apart, in one file, both shipped, neither documented as answering a different question.** Target: see §W2-23 below. Non-negotiable #1 applies — where two numbers conflict the SAFER wins, and the safer starting balance is the SMALLER one, because every percentage-of-equity limit converts to a smaller absolute loss against it. | Nothing compiles against the disagreement, which is why it survived. It reaches the objective through the monthly-PnL buckets. |
 | W2-24 | **PENDING — filed 2026-08-10, §6.3 of `docs/audit-status-2026-08-09.md`, one line** | `crates/neoethos-search/src/gpu_native/prototype_a_engine.rs:170` and `:172` | **Current values: `&& scenario.spread_ticks == 0` and `&& scenario.commission_micros == 0`. Target values: `== NO_TICK_OVERRIDE` and `== NO_MICRO_OVERRIDE` (both `-1`).** Confirmed present 2026-08-10 and confirmed still wrong: `scenario.rs:366`/`:368` write `NO_TICK_OVERRIDE`/`NO_MICRO_OVERRIDE` into every base scenario, so `validate_supported_scenarios` REJECTS every descriptor the base path produces — and would WAVE THROUGH a literal-zero, i.e. free-trading, one. | `bench` on Prototype A is broken. No live money (A is bench-only), but the bench cluster is five registered CLI subcommands. These are the LAST two zero-sentinel comparisons in the tree — `prototype_population.rs`, `prototype_b_population.cu:133-134` and `eval.rs:2663` all agree on `-1`. |
-| W2-25 | **PENDING — filed 2026-08-10, stale build guidance pointing at a loaded gun** | `crates/neoethos-app/Cargo.toml:33`, `crates/neoethos-data/Cargo.toml:110`, `crates/neoethos-data/src/core/hpc_ta.rs:1539` | Three sites still tell the operator to set the **singular** `CUDA_ARCH`, which `vendor/vector-ta-.../build.rs::target_archs` takes as the single-value branch and turns into a **SINGLE-architecture fatbin that will not load on any other card**. `crates/neoethos-data/build.rs:30-32` names this exact trap in its own header. The build logic was NOT narrowed and is correct — only the guidance is stale. Exact replacements in §W2-25 below. | Zero behaviour change in the tree; it changes what the operator is told to type on the card. |
+| W2-25 | **CLOSED — superseded by the exact native-SASS replacement** | `docs/vector-ta-cuda-wiring.md`; `vendor/vector-ta-0.2.9-patched/src/cuda/module_loader.rs` | vector-ta emits and embeds one verified ELF cubin per kernel and exact requested/visible architecture, loads only the current device's exact entry through the central `Module::from_cubin`, and exposes no PTX, fatbin, JIT, prebuilt-artifact, or singular-architecture alias. `CUDA_ARCHS=<exact set>` is the only explicit architecture input; otherwise the build detects every visible NVIDIA device. | Historical recipes remain in Git history and frozen audit evidence, not in this active handoff. |
 | W2-26 | **DONE — 2026-08-10, audit #206 (D5 landed)** | `crates/neoethos-core/src/config.rs` (`RiskConfig`), `crates/neoethos-search/src/discovery.rs` (`resolve_and_log_duplicate_knobs`) | The four `risk.trailing_*` fields are DELETED, together with their `Default` seeds, both shipped YAMLs, the `resolve_and_log_duplicate_knobs` trailing pair, the `NO_QUALIFIED_READER` ledger rows and the `ROOT_REGISTERED` / `ROOT_NOTES` / `PINNED` entries. The precondition W2-1 required is met: live execution reads `models.exit_policy` (`live_trading.rs:747-782` resolves and logs the policy, `:1479-1493` applies the geometry). All four old keys are in `RETIRED_KEYS`, so the operator's live store — which sets `trailing_enabled: true`, `trailing_atr_multiplier: 0.4`, `trailing_be_trigger_r: 0.1` — still loads, with each key NAMED at WARN and the rename `trailing_atr_multiplier` → `models.exit_policy.trailing_stop_multiplier` spelled out. | The comment and the struct moved in one change, as this row required. |
 
 ## The four items the 2026-08-10 record says were never written down
@@ -202,98 +202,13 @@ matches the account this system actually trades. Raising `initial_balance` to
 100,000 to match the backtest would silently multiply every absolute risk figure
 the operator reads by ten.
 
-### §W2-25 — three sites still tell the operator to set the singular `CUDA_ARCH`
+### §W2-25 — closed by the exact native-SASS replacement
 
-The build is correct and was not narrowed. `vendor/vector-ta-0.2.9-patched/build.rs::target_archs`
-resolves, in order: `CUDA_ARCHS` (list) → `CUDA_ARCH` (**singular, yields
-`vec![a]`, i.e. one architecture**) → `DEFAULT_TARGET_ARCHS = [80, 86, 89, 90]`,
-intersected with `nvcc --list-gpu-arch`, plus `-gencode arch=compute_90,code=compute_90`
-so a newer card JITs instead of failing. So **the correct instruction is to set
-NOTHING**, and to narrow with the list form only.
-
-`crates/neoethos-data/build.rs:28-32` already states the trap in its own header:
-the old panic's remedy *"told the operator to export `CUDA_ARCH=sm_86` — which in
-vector-ta's `target_archs()` takes the single-value branch and builds a
-SINGLE-ARCHITECTURE fatbin that will not load on an A100. The error message
-recreated the exact trap it existed to prevent."* `docs/vector-ta-cuda-wiring.md:75-85`
-says **NEVER set `CUDA_ARCH=`** and is correct as written — it is not one of the
-three.
-
-These three are, with exact current text and exact replacement:
-
-**1. `crates/neoethos-app/Cargo.toml:33-34`**
-
-```toml
-# CURRENT
-    # in the build. Requires nvcc AND `CUDA_ARCH` set to the card's compute
-    # capability (see crates/neoethos-data/Cargo.toml for the arch trap).
-```
-```toml
-# REPLACEMENT
-    # in the build. Requires nvcc. Do NOT set an arch: vector-ta builds ONE
-    # fatbin covering sm_80/86/89/90 plus compute_90 PTX for forward JIT, so
-    # the default artifact runs on every card we target. `CUDA_ARCH=` (the
-    # SINGULAR form) narrows it to ONE architecture and the binary then fails
-    # to load anywhere else — see crates/neoethos-data/build.rs:28-32. To
-    # narrow deliberately for a faster iteration loop, use the LIST form,
-    # e.g. `CUDA_ARCHS=86`.
-```
-
-**2. `crates/neoethos-data/Cargo.toml:107-111`**
-
-```toml
-# CURRENT (:110)
-#   CUDA_ARCH=sm_86 CUDA_FAST_MATH=0 cargo build -p neoethos-data --features gpu-cuda
-```
-```toml
-# REPLACEMENT
-#   CUDA_FAST_MATH=0 cargo build -p neoethos-data --features gpu-cuda
-#
-# No arch variable. vector-ta compiles the multi-arch fatbin [80, 86, 89, 90]
-# + compute_90 PTX by default, which covers the 3090 (sm_86) and every other
-# card we target from ONE artifact. To narrow for a faster loop use the LIST
-# form — `CUDA_ARCHS=86` — never `CUDA_ARCH=`, which builds a
-# single-architecture fatbin that loads on nothing else.
-```
-
-The surrounding lines `:107-108` also need correcting: they say the build
-*"[resolves] the target arch from the card that is actually present rather than
-defaulting to a hardcoded `compute_89`"*. `neoethos-data/build.rs` **no longer
-resolves an arch at all** — that probe was deleted precisely because it made the
-build require a card on the build host. The sentence describes code that is gone.
-
-**3. `crates/neoethos-data/src/core/hpc_ta.rs:1536-1541`** — an operator-facing
-assert message, which is the worst of the three because it is read at the moment
-the operator is about to type the command:
-
-```rust
-// CURRENT
-        "IndicatorComputePolicy::RequireGpu was requested but this binary has no CUDA indicator \
-         lane compiled in. Rebuild with `--features gpu-cuda` (and CUDA_ARCH set to the card's \
-         compute capability), or use IndicatorComputePolicy::Auto/Cpu."
-```
-```rust
-// REPLACEMENT
-        "IndicatorComputePolicy::RequireGpu was requested but this binary has no CUDA indicator \
-         lane compiled in. Rebuild with `--features gpu-cuda` — set NO arch variable, the \
-         default fatbin covers sm_80/86/89/90 plus compute_90 PTX. (Never `CUDA_ARCH=`: the \
-         singular form builds a single-architecture fatbin that will not load on another card. \
-         To narrow deliberately, `CUDA_ARCHS=<list>`.) Or use IndicatorComputePolicy::Auto/Cpu."
-```
-
-#### Two lookalikes that are NOT defects — do not "fix" them
-
-* `crates/neoethos-data/src/core/indicator_telemetry.rs:124` and `:296` mention
-  `CUDA_ARCH`, but both are **historical**: `:124` explains that the constant
-  used to be recomputed from it and is now re-exported from
-  `vector_ta::cuda::module_loader::COMPILED_PTX_ARCH`, and `:296` is a test
-  asserting a card-less build never reports a resolved arch. Neither instructs
-  anyone to set anything.
-* `crates/neoethos-gpu-cuda/build.rs:19`, `:63-65` uses **`NEOETHOS_CUDA_ARCH`**,
-  a different variable in a different crate, defaulting to
-  `compute_70,code=compute_70` — virtual PTX that the driver JITs for whatever
-  card is present. That is the portable default, not the trap. It is a fourth
-  hit on a `CUDA_ARCH` grep and it is fine.
+The active contract is `docs/vector-ta-cuda-wiring.md`: vector-ta accepts only
+`CUDA_ARCHS=<one-or-more exact targets>` or visible-device auto-detection,
+produces verified native cubins only, and fails closed when the current device
+has no exact artifact. The superseded PTX/fatbin/JIT recipes were removed from
+this active handoff; the dated audit baseline remains unchanged as evidence.
 
 ## Corrections to the decision documents that this wave established
 
@@ -1167,75 +1082,6 @@ Also worth knowing before starting: the CPU emits **62** pattern columns
 (`PATTERN_RUNNERS.len()`, `pattern_recognition.rs:1146`) and the device native
 set is **61** (`NATIVE_SUPPORTED_PATTERN_IDS`). A device path therefore covers
 61 of 62 and the 62nd must stay on the CPU, named — not dropped.
-
----
-
-# `docs/vector-ta-cuda-wiring.md` is stale about the device table — exact edits
-
-Written 2026-08-10 by the `crates/neoethos-data` owner, who does not own `docs/`
-beyond this handoff file. The code changed today; these lines still describe the
-old behaviour, which makes them claims rather than prose.
-
-## Edit 1 — the heading and the table membership (around line 188)
-
-REPLACE:
-
-```
-### Ten indicators on the device, eight on the CPU — and why two were nearly wrong
-
-`hpc_ta::MULTI_PERIOD_IDS` has eighteen entries.
-`gpu_indicators::GPU_SWEEP_SPECS` has ten: `sma`, `ema`, `rsi`, `roc`, `mom`,
-`atr`, `adx`, `willr`, `cci`, `mfi`. The other eight (`stoch`, `macd`,
-`bollinger_bands`, `keltner`, `supertrend`, `tsi`, `obv`, `vwap`) have a
-multi-output or non-period device contract and stay on the CPU — enumerated up
-front and reported as `CpuIndicatorNotPortable`, never discovered by a failed
-launch mid-run.
-
-The ten share one parameter contract.
-```
-
-WITH:
-
-```
-### Every reachable indicator on the device, the multi-output five on the CPU — and why two were nearly wrong
-
-`hpc_ta::MULTI_PERIOD_IDS` has eighteen entries. `gpu_indicators::GPU_SWEEP_SPECS`
-now holds every one of them that is SINGLE-OUTPUT: `sma`, `ema`, `rsi`, `roc`,
-`mom`, `atr`, `adx`, `willr`, `cci`, `mfi`, `tsi`, `obv`, `vwap`.
-
-The remaining five — `stoch`, `macd`, `bollinger_bands`, `keltner`,
-`supertrend` — stay on the CPU and are reported as `CpuIndicatorNotPortable`,
-enumerated up front, never discovered by a failed launch mid-run. Note what that
-label does NOT mean: all five HAVE rows in `cuda_f64::F64_KERNELS`. They emit
-ZERO columns on EITHER lane because `hpc_ta` calls `compute_cpu` with
-`output_id: None`, which returns `Err(InvalidParam)` for a multi-output
-indicator (`cpu_batch.rs:2185`) and is swallowed at `hpc_ta.rs:291`. The device
-kernel is not the missing piece; the CPU call is.
-
-`vwap` was the last id to move (2026-08-10). It had been withheld because
-vector-ta carried a second CPU implementation, `vwap_row_scalar_pv`, reachable
-only from the `Kernel::Scalar` arm and accumulating `price * volume` with two
-roundings where `vwap_scalar` uses one `mul_add` — so there was no single CPU
-answer for a device result to match. vector-ta deleted it; both batch arms now
-call `vwap_row_scalar`, and `WITHHELD_PENDING_CPU_SELF_CONSISTENCY` is `&[]`.
-
-Do not restate the size of this table here again. It is asserted by
-`gpu_indicators::tests::every_reachable_multi_period_id_with_an_f64_kernel_is_claimed`,
-which fails in both directions.
-
-They share one parameter contract.
-```
-
-## Edit 2 — the launch count (the "One launch per period" section)
-
-That heading and its body describe a lane that no longer exists. The f64 lane
-takes the period LIST directly (`GpuIndicatorEngine::sweep_periods`), so the
-five periods cost ONE launch, the output is exactly `rows × n × 8` bytes, and
-nothing computed is thrown away. Retitle to "One launch for the whole period
-list" and rewrite the body from `gpu_indicators.rs::sweep_periods`, whose doc
-comment already states the current design and the measurement that motivated it.
-
----
 
 # Wave 3 — close the sub-struct bypass: the last unsealed section (2026-08-10)
 

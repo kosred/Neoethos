@@ -15,6 +15,7 @@ use crate::gpu_native::prototype_a::{
     PrototypeADatasetUpload, PrototypeAGeneUpload, PrototypeARebatchPlan, PrototypeAScenarioUpload,
     prototype_a_capabilities,
 };
+use crate::gpu_native::scenario::{NO_MICRO_OVERRIDE, NO_TICK_OVERRIDE, SCENARIO_BASE};
 use cubecl::prelude::{ComputeClient, Runtime};
 
 #[cfg(feature = "gpu-cuda")]
@@ -66,6 +67,10 @@ pub struct PrototypeAResources<R: Runtime> {
 pub struct PrototypeABacktestEngine<R: Runtime> {
     session: GpuDiscoverySession<PrototypeAResources<R>>,
     max_gene_batch: usize,
+    // Keep this field last: Rust drops struct fields in declaration order, so
+    // all resident handles in `session` are gone before the final scope drains
+    // CubeCL's device and pinned-host pools.
+    _residency_scope: crate::cubecl_eval::CubeClResidencyScope,
 }
 
 pub fn create_prototype_a_engine(
@@ -78,6 +83,7 @@ pub fn create_prototype_a_engine(
             "Prototype A max gene batch must be non-zero".into(),
         ));
     }
+    let residency_scope = crate::cubecl_eval::cubecl_residency_scope();
     let client = create_gpu_client(device_override).map_err(|error| {
         let message = error.to_string();
         if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
@@ -108,6 +114,7 @@ pub fn create_prototype_a_engine(
             },
         ),
         max_gene_batch,
+        _residency_scope: residency_scope,
     })
 }
 
@@ -166,10 +173,10 @@ impl<R: Runtime> PrototypeABacktestEngine<R> {
         for (index, scenario) in scenarios.upload.scenarios.iter().enumerate() {
             let full_window = scenario.window_offset == 0
                 && scenario.window_len as usize == dataset.resident.n_samples;
-            let base_scenario = scenario.scenario_type == 0
-                && scenario.spread_ticks == 0
+            let base_scenario = scenario.scenario_type == SCENARIO_BASE
+                && scenario.spread_ticks == NO_TICK_OVERRIDE
                 && scenario.slippage_ticks == 0
-                && scenario.commission_micros == 0
+                && scenario.commission_micros == NO_MICRO_OVERRIDE
                 && scenario.perturbation_count == 0;
             if !full_window || !base_scenario {
                 return Err(EngineError::UnsupportedCapability {

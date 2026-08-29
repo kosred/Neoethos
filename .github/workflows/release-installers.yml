@@ -59,9 +59,14 @@ jobs:
           # pin the repo nightly explicitly (stable can't build the crate graph).
           toolchain: nightly-2026-04-07
 
-      - name: Install mold linker
-        # .cargo/config.toml forces -fuse-ld=mold for x86_64-unknown-linux-gnu.
-        run: sudo apt-get update && sudo apt-get install -y mold libwayland-dev libdbus-1-dev
+      - name: Install Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config clang libclang-dev libstdc++-12-dev libgomp1 \
+            libwayland-dev libdbus-1-dev python3-pip cpio rpm2cpio
+          pip3 install --user 'cmake>=3.28'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install Linux packaging tooling
         # cargo-deb writes Debian binary packages from `[package.metadata.deb]`.
@@ -70,6 +75,12 @@ jobs:
 
       - name: Build release binaries
         run: cargo build --release -p neoethos-app -p neoethos-cli
+
+      - name: Verify selected profile-root native runtimes
+        run: |
+          set -euo pipefail
+          test -s target/release/libxgboost.so
+          test -s target/release/libcatboostmodel.so
 
       - name: Build .deb packages
         run: |
@@ -81,8 +92,62 @@ jobs:
           cargo generate-rpm -p crates/neoethos-app
           cargo generate-rpm -p crates/neoethos-cli
 
+      - name: Verify Linux package runtime layouts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(target/debian/*.deb)
+          rpms=(target/generate-rpm/*.rpm)
+          ((${#debs[@]} >= 2)) || { echo "expected app and CLI deb packages" >&2; exit 1; }
+          ((${#rpms[@]} >= 2)) || { echo "expected app and CLI rpm packages" >&2; exit 1; }
+
+          verify_listing() {
+            local listing="$1"
+            local runtime_dir
+            if grep -Fq 'usr/lib/neoethos-app/libxgboost.so' "$listing"; then
+              runtime_dir='neoethos-app'
+            elif grep -Fq 'usr/lib/neoethos-cli/libxgboost.so' "$listing"; then
+              runtime_dir='neoethos-cli'
+            else
+              echo "package has no selected XGBoost runtime" >&2
+              cat "$listing"
+              return 1
+            fi
+            grep -Fq "usr/lib/$runtime_dir/libcatboostmodel.so" "$listing"
+          }
+
+          for package in "${debs[@]}"; do
+            listing="$(mktemp)"
+            dpkg-deb -c "$package" > "$listing"
+            verify_listing "$listing"
+            rm -f -- "$listing"
+          done
+          for package in "${rpms[@]}"; do
+            listing="$(mktemp)"
+            rpm2cpio "$package" | cpio -t --quiet > "$listing"
+            verify_listing "$listing"
+            rm -f -- "$listing"
+          done
+
       - name: Build AppImage
         run: bash packaging/appimage/build.sh
+
+      - name: Verify AppImage native runtime layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(neoethos-app-*.AppImage)
+          ((${#appimages[@]} == 1)) || { echo "expected exactly one AppImage" >&2; exit 1; }
+          extract_root="$(mktemp -d)"
+          (
+            cd "$extract_root"
+            "$GITHUB_WORKSPACE/${appimages[0]}" --appimage-extract >/dev/null
+            test -s squashfs-root/usr/bin/libxgboost.so
+            test -s squashfs-root/usr/bin/libcatboostmodel.so
+          )
+          rm -rf -- "$extract_root"
 
       - name: Install Sigstore cosign
         uses: sigstore/cosign-installer@v3
@@ -222,6 +287,19 @@ jobs:
       - name: Build release binaries
         run: cargo build --release -p neoethos-app -p neoethos-cli
 
+      - name: Build Windows x86-64 v3 launch pairs
+        shell: pwsh
+        run: |
+          $env:CARGO_TARGET_DIR = "target\x86-64-v3-payload"
+          $env:RUSTFLAGS = "-C target-cpu=x86-64-v3"
+          cargo build --release -p neoethos-app -p neoethos-cli
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $env:CARGO_TARGET_DIR = "target\x86-64-baseline-launcher"
+          $env:RUSTFLAGS = "-C target-cpu=x86-64"
+          cargo build --release -p neoethos-x86-64-v3-launcher
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Stage and archive binaries
         # PowerShell — the default Windows runner shell. We avoid embedding
         # signtool here because the operator does not have an Authenticode
@@ -231,8 +309,20 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path out -Force | Out-Null
-          Copy-Item target\release\neoethos-app.exe out\
-          Copy-Item target\release\neoethos-cli.exe out\
+          $payloadRelease = "target\x86-64-v3-payload\release"
+          $xgboostPayload = Join-Path $payloadRelease "xgboost.dll"
+          $catboostPayload = Join-Path $payloadRelease "catboostmodel.dll"
+          foreach ($runtime in @($xgboostPayload, $catboostPayload)) {
+            if (-not (Test-Path -LiteralPath $runtime -PathType Leaf) -or (Get-Item -LiteralPath $runtime).Length -le 0) {
+              throw "Required selected native runtime is missing or empty: $runtime"
+            }
+          }
+          Copy-Item target\x86-64-baseline-launcher\release\neoethos-x86-64-v3-launcher.exe out\neoethos-app.exe
+          Copy-Item target\x86-64-v3-payload\release\neoethos-app.exe out\neoethos-app.x86-64-v3.exe
+          Copy-Item target\x86-64-baseline-launcher\release\neoethos-x86-64-v3-launcher.exe out\neoethos-cli.exe
+          Copy-Item target\x86-64-v3-payload\release\neoethos-cli.exe out\neoethos-cli.x86-64-v3.exe
+          Copy-Item -LiteralPath $xgboostPayload -Destination out\xgboost.dll
+          Copy-Item -LiteralPath $catboostPayload -Destination out\catboostmodel.dll
           Compress-Archive -Path out -DestinationPath "neoethos-${env:GITHUB_REF_NAME}-windows-x86_64.zip" -Force
           tar -czf "neoethos-${env:GITHUB_REF_NAME}-windows-x86_64.tar.gz" out
 

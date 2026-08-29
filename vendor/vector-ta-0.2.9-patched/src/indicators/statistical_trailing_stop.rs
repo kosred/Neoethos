@@ -1,62 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{alloc_uninit_f64, detect_best_batch_kernel, make_uninit_matrix};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn statistical_trailing_stop_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    data_length: usize,
-    normalization_length: usize,
-    base_level: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = statistical_trailing_stop_js(
-        high,
-        low,
-        close,
-        data_length,
-        normalization_length,
-        base_level,
-    )?;
-    crate::write_wasm_object_f64_outputs("statistical_trailing_stop_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn statistical_trailing_stop_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = statistical_trailing_stop_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "statistical_trailing_stop_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
 
 #[cfg(test)]
 use std::error::Error as StdError;
@@ -113,10 +59,6 @@ pub enum StatisticalTrailingStopData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct StatisticalTrailingStopOutput {
     pub level: Vec<f64>,
     pub anchor: Vec<f64>,
@@ -125,10 +67,6 @@ pub struct StatisticalTrailingStopOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct StatisticalTrailingStopParams {
     pub data_length: Option<usize>,
     pub normalization_length: Option<usize>,
@@ -338,9 +276,7 @@ pub enum StatisticalTrailingStopError {
         "statistical_trailing_stop: invalid base level: {base_level}. expected one of level0, level1, level2, level3"
     )]
     InvalidBaseLevel { base_level: String },
-    #[error(
-        "statistical_trailing_stop: not enough valid data: needed = {needed}, valid = {valid}"
-    )]
+    #[error("statistical_trailing_stop: not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
     #[error(
         "statistical_trailing_stop: output length mismatch: expected = {expected}, got = {got}"
@@ -1049,7 +985,6 @@ pub fn statistical_trailing_stop_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn statistical_trailing_stop_into(
     level_out: &mut [f64],
     anchor_out: &mut [f64],
@@ -1473,432 +1408,10 @@ fn statistical_trailing_stop_batch_impl(
     })
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "statistical_trailing_stop")]
-#[pyo3(signature = (high, low, close, data_length=DEFAULT_DATA_LENGTH, normalization_length=DEFAULT_NORMALIZATION_LENGTH, base_level=DEFAULT_BASE_LEVEL, kernel=None))]
-pub fn statistical_trailing_stop_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    data_length: usize,
-    normalization_length: usize,
-    base_level: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = StatisticalTrailingStopInput::from_slices(
-        high_slice,
-        low_slice,
-        close_slice,
-        StatisticalTrailingStopParams {
-            data_length: Some(data_length),
-            normalization_length: Some(normalization_length),
-            base_level: Some(base_level.to_string()),
-        },
-    );
-    let output = py
-        .allow_threads(|| statistical_trailing_stop_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        output.level.into_pyarray(py),
-        output.anchor.into_pyarray(py),
-        output.bias.into_pyarray(py),
-        output.changed.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "statistical_trailing_stop_batch")]
-#[pyo3(signature = (high, low, close, data_length_range=(DEFAULT_DATA_LENGTH, DEFAULT_DATA_LENGTH, 0), normalization_length_range=(DEFAULT_NORMALIZATION_LENGTH, DEFAULT_NORMALIZATION_LENGTH, 0), base_level_range=(DEFAULT_BASE_LEVEL.to_string(), DEFAULT_BASE_LEVEL.to_string(), 0usize), kernel=None))]
-pub fn statistical_trailing_stop_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    data_length_range: (usize, usize, usize),
-    normalization_length_range: (usize, usize, usize),
-    base_level_range: (String, String, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = StatisticalTrailingStopBatchRange {
-        data_length: data_length_range,
-        normalization_length: normalization_length_range,
-        base_level: base_level_range,
-    };
-
-    let rows = expand_grid(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?
-        .len();
-    let cols = close_slice.len();
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        PyValueError::new_err("rows*cols overflow in statistical_trailing_stop_batch")
-    })?;
-
-    let level_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let anchor_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let bias_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let changed_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let level_out = unsafe { level_arr.as_slice_mut()? };
-    let anchor_out = unsafe { anchor_arr.as_slice_mut()? };
-    let bias_out = unsafe { bias_arr.as_slice_mut()? };
-    let changed_out = unsafe { changed_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            statistical_trailing_stop_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &sweep,
-                !matches!(kernel, Kernel::Scalar | Kernel::ScalarBatch),
-                level_out,
-                anchor_out,
-                bias_out,
-                changed_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("level", level_arr.reshape((rows, cols))?)?;
-    dict.set_item("anchor", anchor_arr.reshape((rows, cols))?)?;
-    dict.set_item("bias", bias_arr.reshape((rows, cols))?)?;
-    dict.set_item("changed", changed_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "data_lengths",
-        combos
-            .iter()
-            .map(|c| c.data_length.unwrap_or(DEFAULT_DATA_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "normalization_lengths",
-        combos
-            .iter()
-            .map(|c| {
-                c.normalization_length
-                    .unwrap_or(DEFAULT_NORMALIZATION_LENGTH) as u64
-            })
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    let base_levels = PyList::empty(py);
-    for combo in &combos {
-        base_levels.append(combo.base_level.as_deref().unwrap_or(DEFAULT_BASE_LEVEL))?;
-    }
-    dict.set_item("base_levels", base_levels)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "StatisticalTrailingStopStream")]
-pub struct StatisticalTrailingStopStreamPy {
-    stream: StatisticalTrailingStopStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl StatisticalTrailingStopStreamPy {
-    #[new]
-    #[pyo3(signature = (data_length=DEFAULT_DATA_LENGTH, normalization_length=DEFAULT_NORMALIZATION_LENGTH, base_level=DEFAULT_BASE_LEVEL))]
-    fn new(data_length: usize, normalization_length: usize, base_level: &str) -> PyResult<Self> {
-        let stream = StatisticalTrailingStopStream::try_new(StatisticalTrailingStopParams {
-            data_length: Some(data_length),
-            normalization_length: Some(normalization_length),
-            base_level: Some(base_level.to_string()),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<(f64, f64, f64, f64)> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct StatisticalTrailingStopBatchConfig {
-    pub data_length_range: (usize, usize, usize),
-    pub normalization_length_range: (usize, usize, usize),
-    pub base_level_range: (String, String, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct StatisticalTrailingStopBatchJsOutput {
-    pub level: Vec<f64>,
-    pub anchor: Vec<f64>,
-    pub bias: Vec<f64>,
-    pub changed: Vec<f64>,
-    pub combos: Vec<StatisticalTrailingStopParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn statistical_trailing_stop_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    data_length: usize,
-    normalization_length: usize,
-    base_level: &str,
-) -> Result<JsValue, JsValue> {
-    let input = StatisticalTrailingStopInput::from_slices(
-        high,
-        low,
-        close,
-        StatisticalTrailingStopParams {
-            data_length: Some(data_length),
-            normalization_length: Some(normalization_length),
-            base_level: Some(base_level.to_string()),
-        },
-    );
-    let output = statistical_trailing_stop_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn statistical_trailing_stop_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn statistical_trailing_stop_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn statistical_trailing_stop_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    level_ptr: *mut f64,
-    anchor_ptr: *mut f64,
-    bias_ptr: *mut f64,
-    changed_ptr: *mut f64,
-    len: usize,
-    data_length: usize,
-    normalization_length: usize,
-    base_level: &str,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || level_ptr.is_null()
-        || anchor_ptr.is_null()
-        || bias_ptr.is_null()
-        || changed_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let input = StatisticalTrailingStopInput::from_slices(
-            high,
-            low,
-            close,
-            StatisticalTrailingStopParams {
-                data_length: Some(data_length),
-                normalization_length: Some(normalization_length),
-                base_level: Some(base_level.to_string()),
-            },
-        );
-
-        let aliased = [
-            high_ptr as *const u8,
-            low_ptr as *const u8,
-            close_ptr as *const u8,
-        ]
-        .iter()
-        .any(|&inp| {
-            [
-                level_ptr as *const u8,
-                anchor_ptr as *const u8,
-                bias_ptr as *const u8,
-                changed_ptr as *const u8,
-            ]
-            .iter()
-            .any(|&out| inp == out)
-        }) || level_ptr == anchor_ptr
-            || level_ptr == bias_ptr
-            || level_ptr == changed_ptr
-            || anchor_ptr == bias_ptr
-            || anchor_ptr == changed_ptr
-            || bias_ptr == changed_ptr;
-
-        if aliased {
-            let output = statistical_trailing_stop_with_kernel(&input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(level_ptr, len).copy_from_slice(&output.level);
-            std::slice::from_raw_parts_mut(anchor_ptr, len).copy_from_slice(&output.anchor);
-            std::slice::from_raw_parts_mut(bias_ptr, len).copy_from_slice(&output.bias);
-            std::slice::from_raw_parts_mut(changed_ptr, len).copy_from_slice(&output.changed);
-        } else {
-            let level_out = std::slice::from_raw_parts_mut(level_ptr, len);
-            let anchor_out = std::slice::from_raw_parts_mut(anchor_ptr, len);
-            let bias_out = std::slice::from_raw_parts_mut(bias_ptr, len);
-            let changed_out = std::slice::from_raw_parts_mut(changed_ptr, len);
-            statistical_trailing_stop_into_slice(
-                level_out,
-                anchor_out,
-                bias_out,
-                changed_out,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = statistical_trailing_stop_batch)]
-pub fn statistical_trailing_stop_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: StatisticalTrailingStopBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = StatisticalTrailingStopBatchRange {
-        data_length: config.data_length_range,
-        normalization_length: config.normalization_length_range,
-        base_level: config.base_level_range,
-    };
-    let output =
-        statistical_trailing_stop_batch_with_kernel(high, low, close, &sweep, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js_output = StatisticalTrailingStopBatchJsOutput {
-        level: output.level,
-        anchor: output.anchor,
-        bias: output.bias,
-        changed: output.changed,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn statistical_trailing_stop_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    level_ptr: *mut f64,
-    anchor_ptr: *mut f64,
-    bias_ptr: *mut f64,
-    changed_ptr: *mut f64,
-    len: usize,
-    data_length_start: usize,
-    data_length_end: usize,
-    data_length_step: usize,
-    normalization_length_start: usize,
-    normalization_length_end: usize,
-    normalization_length_step: usize,
-    base_level_start: &str,
-    base_level_end: &str,
-    base_level_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || level_ptr.is_null()
-        || anchor_ptr.is_null()
-        || bias_ptr.is_null()
-        || changed_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    let sweep = StatisticalTrailingStopBatchRange {
-        data_length: (data_length_start, data_length_end, data_length_step),
-        normalization_length: (
-            normalization_length_start,
-            normalization_length_end,
-            normalization_length_step,
-        ),
-        base_level: (
-            base_level_start.to_string(),
-            base_level_end.to_string(),
-            base_level_step,
-        ),
-    };
-    let rows = expand_grid(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
-        .len();
-    let total = rows
-        .checked_mul(len)
-        .ok_or_else(|| JsValue::from_str("rows*len overflow"))?;
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let level_out = std::slice::from_raw_parts_mut(level_ptr, total);
-        let anchor_out = std::slice::from_raw_parts_mut(anchor_ptr, total);
-        let bias_out = std::slice::from_raw_parts_mut(bias_ptr, total);
-        let changed_out = std::slice::from_raw_parts_mut(changed_ptr, total);
-        statistical_trailing_stop_batch_inner_into(
-            high,
-            low,
-            close,
-            &sweep,
-            false,
-            level_out,
-            anchor_out,
-            bias_out,
-            changed_out,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn trend_data(size: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let mut high = Vec::with_capacity(size);
@@ -2132,7 +1645,7 @@ mod tests {
 
     #[test]
     fn statistical_trailing_stop_default_candles_smoke() -> Result<(), Box<dyn StdError>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let output = statistical_trailing_stop(
             &StatisticalTrailingStopInput::with_default_candles(&candles),
         )?;

@@ -1,26 +1,8 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -56,10 +38,6 @@ pub struct VolumeWeightedRelativeStrengthIndexOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VolumeWeightedRelativeStrengthIndexParams {
     pub rsi_length: Option<usize>,
     pub range_length: Option<usize>,
@@ -216,29 +194,43 @@ impl VolumeWeightedRelativeStrengthIndexBuilder {
 pub enum VolumeWeightedRelativeStrengthIndexError {
     #[error("volume_weighted_relative_strength_index: input data slice is empty")]
     EmptyInputData,
-    #[error("volume_weighted_relative_strength_index: data length mismatch: source={source_len}, volume={volume_len}")]
+    #[error(
+        "volume_weighted_relative_strength_index: data length mismatch: source={source_len}, volume={volume_len}"
+    )]
     DataLengthMismatch {
         source_len: usize,
         volume_len: usize,
     },
     #[error("volume_weighted_relative_strength_index: all values are NaN")]
     AllValuesNaN,
-    #[error("volume_weighted_relative_strength_index: invalid rsi_length: rsi_length = {rsi_length}, data length = {data_len}")]
+    #[error(
+        "volume_weighted_relative_strength_index: invalid rsi_length: rsi_length = {rsi_length}, data length = {data_len}"
+    )]
     InvalidRsiLength { rsi_length: usize, data_len: usize },
-    #[error("volume_weighted_relative_strength_index: invalid range_length: range_length = {range_length}, data length = {data_len}")]
+    #[error(
+        "volume_weighted_relative_strength_index: invalid range_length: range_length = {range_length}, data length = {data_len}"
+    )]
     InvalidRangeLength {
         range_length: usize,
         data_len: usize,
     },
-    #[error("volume_weighted_relative_strength_index: invalid ma_length: ma_length = {ma_length}, data length = {data_len}")]
+    #[error(
+        "volume_weighted_relative_strength_index: invalid ma_length: ma_length = {ma_length}, data length = {data_len}"
+    )]
     InvalidMaLength { ma_length: usize, data_len: usize },
     #[error("volume_weighted_relative_strength_index: invalid ma_type: {ma_type}")]
     InvalidMaType { ma_type: String },
-    #[error("volume_weighted_relative_strength_index: not enough valid data: needed = {needed}, valid = {valid}")]
+    #[error(
+        "volume_weighted_relative_strength_index: not enough valid data: needed = {needed}, valid = {valid}"
+    )]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("volume_weighted_relative_strength_index: output length mismatch: expected {expected}, got {got}")]
+    #[error(
+        "volume_weighted_relative_strength_index: output length mismatch: expected {expected}, got {got}"
+    )]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error("volume_weighted_relative_strength_index: invalid range: start={start}, end={end}, step={step}")]
+    #[error(
+        "volume_weighted_relative_strength_index: invalid range: start={start}, end={end}, step={step}"
+    )]
     InvalidRange {
         start: String,
         end: String,
@@ -1656,398 +1648,6 @@ unsafe fn mu_slice_as_f64_slice_mut(buf: &mut ManuallyDrop<Vec<MaybeUninit<f64>>
 unsafe fn vec_f64_from_mu_guard(buf: ManuallyDrop<Vec<MaybeUninit<f64>>>) -> Vec<f64> {
     let mut buf = buf;
     Vec::from_raw_parts(buf.as_mut_ptr() as *mut f64, buf.len(), buf.capacity())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "volume_weighted_relative_strength_index")]
-#[pyo3(signature = (
-    source,
-    volume,
-    rsi_length=DEFAULT_RSI_LENGTH,
-    range_length=DEFAULT_RANGE_LENGTH,
-    ma_length=DEFAULT_MA_LENGTH,
-    ma_type=DEFAULT_MA_TYPE,
-    kernel=None
-))]
-pub fn volume_weighted_relative_strength_index_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    rsi_length: usize,
-    range_length: usize,
-    ma_length: usize,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let source = source.as_slice()?;
-    let volume = volume.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = VolumeWeightedRelativeStrengthIndexInput::from_slices(
-        source,
-        volume,
-        VolumeWeightedRelativeStrengthIndexParams {
-            rsi_length: Some(rsi_length),
-            range_length: Some(range_length),
-            ma_length: Some(ma_length),
-            ma_type: Some(ma_type.to_string()),
-        },
-    );
-    let output = py
-        .allow_threads(|| volume_weighted_relative_strength_index_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("rsi", output.rsi.into_pyarray(py))?;
-    dict.set_item(
-        "consolidation_strength",
-        output.consolidation_strength.into_pyarray(py),
-    )?;
-    dict.set_item("rsi_ma", output.rsi_ma.into_pyarray(py))?;
-    dict.set_item("bearish_tp", output.bearish_tp.into_pyarray(py))?;
-    dict.set_item("bullish_tp", output.bullish_tp.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VolumeWeightedRelativeStrengthIndexStream")]
-pub struct VolumeWeightedRelativeStrengthIndexStreamPy {
-    stream: VolumeWeightedRelativeStrengthIndexStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VolumeWeightedRelativeStrengthIndexStreamPy {
-    #[new]
-    #[pyo3(signature = (
-        rsi_length=DEFAULT_RSI_LENGTH,
-        range_length=DEFAULT_RANGE_LENGTH,
-        ma_length=DEFAULT_MA_LENGTH,
-        ma_type=DEFAULT_MA_TYPE
-    ))]
-    fn new(
-        rsi_length: usize,
-        range_length: usize,
-        ma_length: usize,
-        ma_type: &str,
-    ) -> PyResult<Self> {
-        let stream = VolumeWeightedRelativeStrengthIndexStream::try_new(
-            VolumeWeightedRelativeStrengthIndexParams {
-                rsi_length: Some(rsi_length),
-                range_length: Some(range_length),
-                ma_length: Some(ma_length),
-                ma_type: Some(ma_type.to_string()),
-            },
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, source: f64, volume: f64) -> Option<(f64, f64, f64, f64, f64)> {
-        self.stream.update(source, volume).map(|output| {
-            (
-                output.rsi,
-                output.consolidation_strength,
-                output.rsi_ma,
-                output.bearish_tp,
-                output.bullish_tp,
-            )
-        })
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "volume_weighted_relative_strength_index_batch")]
-#[pyo3(signature = (
-    source,
-    volume,
-    rsi_length_range=(DEFAULT_RSI_LENGTH, DEFAULT_RSI_LENGTH, 0),
-    range_length_range=(DEFAULT_RANGE_LENGTH, DEFAULT_RANGE_LENGTH, 0),
-    ma_length_range=(DEFAULT_MA_LENGTH, DEFAULT_MA_LENGTH, 0),
-    ma_type=DEFAULT_MA_TYPE,
-    kernel=None
-))]
-pub fn volume_weighted_relative_strength_index_batch_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    rsi_length_range: (usize, usize, usize),
-    range_length_range: (usize, usize, usize),
-    ma_length_range: (usize, usize, usize),
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let source = source.as_slice()?;
-    let volume = volume.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let output = py
-        .allow_threads(|| {
-            volume_weighted_relative_strength_index_batch_with_kernel(
-                source,
-                volume,
-                &VolumeWeightedRelativeStrengthIndexBatchRange {
-                    rsi_length: rsi_length_range,
-                    range_length: range_length_range,
-                    ma_length: ma_length_range,
-                    ma_type: ma_type.to_string(),
-                },
-                kernel,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let total = output.rows * output.cols;
-    let out_rsi = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_consolidation = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_ma = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_bearish = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_bullish = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    unsafe { out_rsi.as_slice_mut()? }.copy_from_slice(&output.rsi);
-    unsafe { out_consolidation.as_slice_mut()? }.copy_from_slice(&output.consolidation_strength);
-    unsafe { out_ma.as_slice_mut()? }.copy_from_slice(&output.rsi_ma);
-    unsafe { out_bearish.as_slice_mut()? }.copy_from_slice(&output.bearish_tp);
-    unsafe { out_bullish.as_slice_mut()? }.copy_from_slice(&output.bullish_tp);
-
-    let dict = PyDict::new(py);
-    dict.set_item("rsi", out_rsi.reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "consolidation_strength",
-        out_consolidation.reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item("rsi_ma", out_ma.reshape((output.rows, output.cols))?)?;
-    dict.set_item(
-        "bearish_tp",
-        out_bearish.reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "bullish_tp",
-        out_bullish.reshape((output.rows, output.cols))?,
-    )?;
-    dict.set_item(
-        "rsi_lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.rsi_length.unwrap_or(DEFAULT_RSI_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "range_lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.range_length.unwrap_or(DEFAULT_RANGE_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_lengths",
-        output
-            .combos
-            .iter()
-            .map(|combo| combo.ma_length.unwrap_or(DEFAULT_MA_LENGTH) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_types",
-        output
-            .combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .ma_type
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_MA_TYPE.to_string())
-            })
-            .collect::<Vec<_>>(),
-    )?;
-    dict.set_item("rows", output.rows)?;
-    dict.set_item("cols", output.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_volume_weighted_relative_strength_index_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(
-        volume_weighted_relative_strength_index_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        volume_weighted_relative_strength_index_batch_py,
-        m
-    )?)?;
-    m.add_class::<VolumeWeightedRelativeStrengthIndexStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VolumeWeightedRelativeStrengthIndexJsOutput {
-    pub rsi: Vec<f64>,
-    pub consolidation_strength: Vec<f64>,
-    pub rsi_ma: Vec<f64>,
-    pub bearish_tp: Vec<f64>,
-    pub bullish_tp: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = volume_weighted_relative_strength_index_js)]
-pub fn volume_weighted_relative_strength_index_js(
-    source: &[f64],
-    volume: &[f64],
-    rsi_length: usize,
-    range_length: usize,
-    ma_length: usize,
-    ma_type: &str,
-) -> Result<JsValue, JsValue> {
-    let input = VolumeWeightedRelativeStrengthIndexInput::from_slices(
-        source,
-        volume,
-        VolumeWeightedRelativeStrengthIndexParams {
-            rsi_length: Some(rsi_length),
-            range_length: Some(range_length),
-            ma_length: Some(ma_length),
-            ma_type: Some(ma_type.to_string()),
-        },
-    );
-    let output = volume_weighted_relative_strength_index_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&VolumeWeightedRelativeStrengthIndexJsOutput {
-        rsi: output.rsi,
-        consolidation_strength: output.consolidation_strength,
-        rsi_ma: output.rsi_ma,
-        bearish_tp: output.bearish_tp,
-        bullish_tp: output.bullish_tp,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VolumeWeightedRelativeStrengthIndexBatchConfig {
-    pub rsi_length_range: (usize, usize, usize),
-    pub range_length_range: (usize, usize, usize),
-    pub ma_length_range: (usize, usize, usize),
-    pub ma_type: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VolumeWeightedRelativeStrengthIndexBatchJsOutput {
-    pub rsi: Vec<f64>,
-    pub consolidation_strength: Vec<f64>,
-    pub rsi_ma: Vec<f64>,
-    pub bearish_tp: Vec<f64>,
-    pub bullish_tp: Vec<f64>,
-    pub rsi_lengths: Vec<usize>,
-    pub range_lengths: Vec<usize>,
-    pub ma_lengths: Vec<usize>,
-    pub ma_types: Vec<String>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = volume_weighted_relative_strength_index_batch)]
-pub fn volume_weighted_relative_strength_index_batch_js(
-    source: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: VolumeWeightedRelativeStrengthIndexBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let output = volume_weighted_relative_strength_index_batch_with_kernel(
-        source,
-        volume,
-        &VolumeWeightedRelativeStrengthIndexBatchRange {
-            rsi_length: cfg.rsi_length_range,
-            range_length: cfg.range_length_range,
-            ma_length: cfg.ma_length_range,
-            ma_type: cfg.ma_type,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    serde_wasm_bindgen::to_value(&VolumeWeightedRelativeStrengthIndexBatchJsOutput {
-        rsi: output.rsi,
-        consolidation_strength: output.consolidation_strength,
-        rsi_ma: output.rsi_ma,
-        bearish_tp: output.bearish_tp,
-        bullish_tp: output.bullish_tp,
-        rsi_lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.rsi_length.unwrap_or(DEFAULT_RSI_LENGTH))
-            .collect(),
-        range_lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.range_length.unwrap_or(DEFAULT_RANGE_LENGTH))
-            .collect(),
-        ma_lengths: output
-            .combos
-            .iter()
-            .map(|combo| combo.ma_length.unwrap_or(DEFAULT_MA_LENGTH))
-            .collect(),
-        ma_types: output
-            .combos
-            .iter()
-            .map(|combo| {
-                combo
-                    .ma_type
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_MA_TYPE.to_string())
-            })
-            .collect(),
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_weighted_relative_strength_index_output_into_js(
-    source: &[f64],
-    volume: &[f64],
-    rsi_length: usize,
-    range_length: usize,
-    ma_length: usize,
-    ma_type: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = volume_weighted_relative_strength_index_js(
-        source,
-        volume,
-        rsi_length,
-        range_length,
-        ma_length,
-        ma_type,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "volume_weighted_relative_strength_index_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn volume_weighted_relative_strength_index_batch_output_into_js(
-    source: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = volume_weighted_relative_strength_index_batch_js(source, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "volume_weighted_relative_strength_index_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

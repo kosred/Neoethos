@@ -304,19 +304,14 @@ extern "C" __global__ void chop_many_series_one_param_f32(
 // PERIOD-BASED. `compute_chop_batch` (cpu_batch.rs:15086) reads `period`
 // (default 14), `scalar` (100.0) and `drift` (1).
 //
-// TWO CPU PATHS THAT ARE GENUINELY DIFFERENT ARITHMETIC, BOTH WRITTEN OUT.
-// `chop_scalar` forks at (period == 14 && drift == 1) to
-// `chop_scalar_period_14_drift_1`, and the fork is NOT a mere unroll:
-//   * general:  out = (scalar * (log10(sum_atr) - log10(range))) / log10(period)
-//   * (14, 1):  ratio = sum_atr / range; out = (scalar/ln(14)) * ln(ratio),
-//               with `ln_1p(ratio - 1)` substituted when |ratio - 1| < 1e-8.
-// These agree in exact arithmetic and differ in floating point at essentially
-// every bar -- a difference of logarithm base, of the order of the division,
-// and of the function used near ratio == 1. Since 14 is the DEFAULT period, a
-// sweep hits the second form on one row and the first on the others, so both
-// must exist. The 1e-8 is the crossover where `ln_1p` beats `ln` in DOUBLE
-// precision; it is already an f64-sized threshold and is carried over
-// unchanged (an f32-sized 1e-4 here would be wrong in both directions).
+// CHOP_TRADINGVIEW_LOG10_SEMANTICS_V1 follows the published operation shape:
+// `100 * LOG10(SUM(ATR(1), n) / range) / LOG10(n)`. The platform libc and
+// libdevice logarithms are different implementations: Gate196 observed the
+// AMD/Linux CPU bit 0x40569935e3af9c88 while the same RTX row produced
+// 0x40569935e3af9c87. Both CPU paths and this CUDA lane therefore use the same
+// fixed-order range reduction and 25-term atanh series below. The specialized
+// (14, 1) path still owns a true-range ring; only its old algebraic rewrite to
+// natural log/log1p was retired.
 //
 // NaN SEMANTICS -- THE adx-CLASS BUG, CHECKED: true range is
 // `hl.max(hc).max(lc)`, which is `f64::max` and therefore returns the NON-NaN
@@ -358,6 +353,53 @@ __device__ __forceinline__ bool neo_s1_isnan(double x) { return x != x; }
 #endif
 
 #define NEO_S1_CHOP_MAX_PERIOD 1024
+
+__device__ __forceinline__ double neoethos_chop_ln_cpu_exact_v1(double value) {
+    if (value == INFINITY) return INFINITY;
+    if (!(value > 0.0)) return neo_s1_qnan();
+
+    double normalized = value;
+    int exponent_adjustment = 0;
+    unsigned long long bits =
+        static_cast<unsigned long long>(__double_as_longlong(normalized));
+    if (((bits >> 52U) & 0x7ffU) == 0U) {
+        normalized *= __longlong_as_double(
+            static_cast<long long>(0x4350000000000000ULL));
+        exponent_adjustment = -54;
+        bits = static_cast<unsigned long long>(__double_as_longlong(normalized));
+    }
+
+    const int exponent =
+        static_cast<int>((bits >> 52U) & 0x7ffU) - 1023 + exponent_adjustment;
+    const unsigned long long mantissa_bits =
+        (bits & 0x000fffffffffffffULL) | 0x3ff0000000000000ULL;
+    const double mantissa =
+        __longlong_as_double(static_cast<long long>(mantissa_bits));
+    const double z = (mantissa - 1.0) / (mantissa + 1.0);
+    const double z_squared = z * z;
+    double term = z;
+    double sum = z;
+    unsigned int denominator = 3U;
+    while (denominator <= 49U) {
+        term *= z_squared;
+        sum += term / static_cast<double>(denominator);
+        denominator += 2U;
+    }
+    const double ln_2 = __longlong_as_double(
+        static_cast<long long>(0x3fe62e42fefa39efULL));
+    return static_cast<double>(exponent) * ln_2 + 2.0 * sum;
+}
+
+__device__ __forceinline__ double neoethos_chop_log10_cpu_exact_v1(double value) {
+    const double ln_10 = __longlong_as_double(
+        static_cast<long long>(0x40026bb1bbb55515ULL));
+    return neoethos_chop_ln_cpu_exact_v1(value) / ln_10;
+}
+
+__device__ __forceinline__ double neoethos_chop_value_from_ratio_exact_v1(
+    double ratio, double scalar, double log10_period) {
+    return (scalar * neoethos_chop_log10_cpu_exact_v1(ratio)) / log10_period;
+}
 
 // Front of the CPU's max-deque over `high` for the window [win_start, i].
 // An element k survives iff no LATER window element j has `high[k] <= high[j]`.
@@ -433,11 +475,12 @@ extern "C" __global__ void neoethos_chop_batch_f64(
     double rolling_sum_atr = 0.0;
 
     double prev_close = close[first_valid];
+    const double log10_period =
+        neoethos_chop_log10_cpu_exact_v1(static_cast<double>(period));
 
     if (period == 14 && drift == 1) {
         // `chop_scalar_period_14_drift_1`: the ring holds TRUE RANGE, not the
-        // smoothed ATR, and the output is the natural log form.
-        const double scale_ln = scalar / log(14.0);
+        // smoothed ATR. Its output still uses the published LOG10 form.
         for (int i = first_valid; i < n; ++i) {
             const double hi = high[i];
             const double lo = low[i];
@@ -463,9 +506,8 @@ extern "C" __global__ void neoethos_chop_batch_f64(
                                    - neo_s1_chop_front_low(low, win_start, i);
                 if (range > 0.0 && rolling_sum_atr > 0.0) {
                     const double ratio = rolling_sum_atr / range;
-                    row[i] = (fabs(ratio - 1.0) < 1e-8)
-                                 ? scale_ln * log1p(ratio - 1.0)
-                                 : scale_ln * log(ratio);
+                    row[i] = neoethos_chop_value_from_ratio_exact_v1(
+                        ratio, scalar, log10_period);
                 } else {
                     row[i] = neo_s1_qnan();
                 }
@@ -476,7 +518,6 @@ extern "C" __global__ void neoethos_chop_batch_f64(
 
     // General path.
     const double alpha = 1.0 / (double)drift;
-    const double logp = log10((double)period);
     double rma_atr = neo_s1_qnan();
     double sum_tr = 0.0;
 
@@ -521,7 +562,9 @@ extern "C" __global__ void neoethos_chop_batch_f64(
             const double range = neo_s1_chop_front_high(high, win_start, i)
                                - neo_s1_chop_front_low(low, win_start, i);
             if (range > 0.0 && rolling_sum_atr > 0.0) {
-                row[i] = (scalar * (log10(rolling_sum_atr) - log10(range))) / logp;
+                const double ratio = rolling_sum_atr / range;
+                row[i] = neoethos_chop_value_from_ratio_exact_v1(
+                    ratio, scalar, log10_period);
             } else {
                 row[i] = neo_s1_qnan();
             }

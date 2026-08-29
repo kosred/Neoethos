@@ -1,21 +1,15 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaFrama;
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::convert::AsRef;
 use std::error::Error;
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-use std::hint::unlikely;
-use std::mem::{swap, MaybeUninit};
+use std::mem::MaybeUninit;
 use thiserror::Error;
 
 impl<'a> AsRef<[f64]> for FramaInput<'a> {
@@ -28,13 +22,32 @@ impl<'a> AsRef<[f64]> for FramaInput<'a> {
     }
 }
 
+/// Stable identity handed to the Classic semantic-v9 source-closure owner.
+pub const FRAMA_F64_SEMANTIC_VERSION: u32 = 3;
+pub const FRAMA_F64_SEMANTIC_IDENTITY: &str =
+    "frama-f64-v3-finite-hlc-segment-reset-even-window-stable-fma-v2";
+pub const FRAMA_MAX_WINDOW: usize = 1024;
+
+const FRAMA_CANONICAL_QNAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+
 #[inline(always)]
-unsafe fn seed_sma(close: &[f64], first: usize, win: usize, out: &mut [f64]) {
-    let mut sum = 0.0;
-    for k in 0..win {
-        sum += *close.get_unchecked(first + k);
-    }
-    *out.get_unchecked_mut(first + win - 1) = sum / win as f64;
+fn frama_canonical_nan_f64_v3() -> f64 {
+    f64::from_bits(FRAMA_CANONICAL_QNAN_BITS)
+}
+
+#[inline(always)]
+fn frama_is_finite_triplet_v3(high: f64, low: f64, close: f64) -> bool {
+    high.is_finite() && low.is_finite() && close.is_finite()
+}
+
+/// Stable f64 FRAMA affine recurrence, shared by every host execution route.
+///
+/// The subtraction is rounded first and the multiply-add is fused once.  The
+/// strict CUDA mirror uses `__dsub_rn` followed by `__fma_rn` in the same
+/// order, so this schedule does not depend on host contraction choices.
+#[inline(always)]
+fn frama_stable_update_f64_v2(close: f64, previous: f64, alpha: f64) -> f64 {
+    alpha.mul_add(close - previous, previous)
 }
 
 #[derive(Debug, Clone)]
@@ -55,10 +68,6 @@ pub struct FramaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct FramaParams {
     pub window: Option<usize>,
     pub sc: Option<usize>,
@@ -244,6 +253,59 @@ pub enum FramaError {
     ArithmeticOverflow { context: &'static str },
 }
 
+#[inline(always)]
+fn frama_evenized_window_v3(window: usize, data_len: usize) -> Result<usize, FramaError> {
+    if window == 0 || window > FRAMA_MAX_WINDOW {
+        return Err(FramaError::InvalidWindow { window, data_len });
+    }
+    let evenized = window
+        .checked_add(window & 1)
+        .ok_or(FramaError::InvalidWindow { window, data_len })?;
+    if evenized > FRAMA_MAX_WINDOW {
+        return Err(FramaError::InvalidWindow { window, data_len });
+    }
+    Ok(evenized)
+}
+
+#[inline(always)]
+fn frama_validate_combo_windows_v3(
+    combos: &[FramaParams],
+    data_len: usize,
+) -> Result<usize, FramaError> {
+    let mut max_evenized = 0usize;
+    for combo in combos {
+        let window = combo.window.unwrap_or(10);
+        max_evenized = max_evenized.max(frama_evenized_window_v3(window, data_len)?);
+    }
+    Ok(max_evenized)
+}
+
+#[inline(always)]
+fn frama_validate_window_axis_v3(
+    (start, end, step): (usize, usize, usize),
+    data_len: usize,
+) -> Result<(), FramaError> {
+    if step == 0 || start == end {
+        frama_evenized_window_v3(start, data_len)?;
+        return Ok(());
+    }
+
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let mut window = lo;
+    loop {
+        frama_evenized_window_v3(window, data_len)?;
+        match window.checked_add(step) {
+            Some(next) if next <= hi => window = next,
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 pub fn frama(input: &FramaInput) -> Result<FramaOutput, FramaError> {
     frama_with_kernel(input, Kernel::Auto)
@@ -284,20 +346,16 @@ fn frama_prepare<'a>(
     if sc == 0 || fc == 0 {
         return Err(FramaError::InvalidSmoothing { sc, fc });
     }
-    let first = (0..len)
-        .find(|&i| !high[i].is_nan() && !low[i].is_nan() && !close[i].is_nan())
-        .ok_or(FramaError::AllValuesNaN)?;
-    if window == 0 || window > len {
+    let win = frama_evenized_window_v3(window, len)?;
+    if window > len {
         return Err(FramaError::InvalidWindow {
             window,
             data_len: len,
         });
     }
-
-    let mut win = window;
-    if win & 1 == 1 {
-        win += 1;
-    }
+    let first = (0..len)
+        .find(|&i| frama_is_finite_triplet_v3(high[i], low[i], close[i]))
+        .ok_or(FramaError::AllValuesNaN)?;
 
     if (len - first) < win {
         return Err(FramaError::NotEnoughValidData {
@@ -326,56 +384,17 @@ fn frama_compute_into(
     fc: usize,
     first: usize,
     len: usize,
-    warm: usize,
+    _warm: usize,
     chosen: Kernel,
     out: &mut [f64],
 ) -> Result<(), FramaError> {
-    let mut win = window;
-    if win & 1 == 1 {
-        win += 1;
-    }
-    let seed = close[first..first + win].iter().sum::<f64>() / win as f64;
-    out[first + win - 1] = seed;
-
     match chosen {
-        Kernel::Scalar | Kernel::ScalarBatch => {
-            if win <= 32 {
-                unsafe {
-                    match win {
-                        10 => {
-                            frama_small_scan_const::<10>(high, low, close, sc, fc, first, len, out)
-                        }
-                        14 => {
-                            frama_small_scan_const::<14>(high, low, close, sc, fc, first, len, out)
-                        }
-                        20 => {
-                            frama_small_scan_const::<20>(high, low, close, sc, fc, first, len, out)
-                        }
-                        32 => {
-                            frama_small_scan_const::<32>(high, low, close, sc, fc, first, len, out)
-                        }
-                        _ => frama_small_scan(high, low, close, win, sc, fc, first, len, out)?,
-                    }
-                }
-            } else {
-                frama_scalar_deque(high, low, close, win, sc, fc, first, len, out)?;
-            }
-        }
-
+        Kernel::Scalar | Kernel::ScalarBatch => {}
         #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx2 | Kernel::Avx2Batch => unsafe {
-            frama_avx2_into(high, low, close, win, sc, fc, first, len, out)?;
-        },
-
-        #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-        Kernel::Avx512 | Kernel::Avx512Batch => unsafe {
-            frama_avx512_into(high, low, close, win, sc, fc, first, len, out)?;
-        },
-
+        Kernel::Avx2 | Kernel::Avx2Batch | Kernel::Avx512 | Kernel::Avx512Batch => {}
         _ => unreachable!("`Auto` must be resolved above"),
     }
-
-    Ok(())
+    frama_f64_segmented_deque_v3(high, low, close, window, sc, fc, first, len, out)
 }
 
 pub fn frama_with_kernel(input: &FramaInput, kernel: Kernel) -> Result<FramaOutput, FramaError> {
@@ -388,7 +407,6 @@ pub fn frama_with_kernel(input: &FramaInput, kernel: Kernel) -> Result<FramaOutp
     Ok(FramaOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn frama_into(input: &FramaInput, out: &mut [f64]) -> Result<(), FramaError> {
     frama_into_slice(out, input, Kernel::Auto)
@@ -410,13 +428,14 @@ impl<const CAP: usize> MonoDeque<CAP> {
         }
     }
     #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+
+    #[inline(always)]
     fn clear(&mut self) {
         self.head = 0;
         self.tail = 0;
-    }
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.head == self.tail
     }
 
     #[inline(always)]
@@ -459,151 +478,117 @@ impl<const CAP: usize> MonoDeque<CAP> {
 }
 
 #[inline(always)]
-fn frama_scalar_deque(
+fn frama_f64_segmented_deque_v3(
     high: &[f64],
     low: &[f64],
     close: &[f64],
-    mut window: usize,
+    window: usize,
     sc: usize,
     fc: usize,
-    first: usize,
+    _first: usize,
     len: usize,
     out: &mut [f64],
 ) -> Result<(), FramaError> {
-    if window & 1 == 1 {
-        window += 1;
-    }
+    let window = frama_evenized_window_v3(window, len)?;
     let half = window / 2;
-    const MAX_W: usize = 1024;
-    assert!(window <= MAX_W, "window bigger than CAP");
 
-    let mut d_full_max: MonoDeque<MAX_W> = MonoDeque::new();
-    let mut d_full_min: MonoDeque<MAX_W> = MonoDeque::new();
-    let mut d_left_max: MonoDeque<MAX_W> = MonoDeque::new();
-    let mut d_left_min: MonoDeque<MAX_W> = MonoDeque::new();
-    let mut d_right_max: MonoDeque<MAX_W> = MonoDeque::new();
-    let mut d_right_min: MonoDeque<MAX_W> = MonoDeque::new();
+    out[..len].fill(frama_canonical_nan_f64_v3());
 
-    unsafe {
-        for idx in first..(first + window) {
-            if !high[idx].is_nan() && !low[idx].is_nan() {
-                d_full_max.push_max(idx, high);
-                d_full_min.push_min(idx, low);
-                if idx < first + half {
-                    d_left_max.push_max(idx, high);
-                    d_left_min.push_min(idx, low);
-                } else {
-                    d_right_max.push_max(idx, high);
-                    d_right_min.push_min(idx, low);
-                }
-            }
-        }
-    }
+    let mut d_left_max: MonoDeque<FRAMA_MAX_WINDOW> = MonoDeque::new();
+    let mut d_left_min: MonoDeque<FRAMA_MAX_WINDOW> = MonoDeque::new();
+    let mut d_right_max: MonoDeque<FRAMA_MAX_WINDOW> = MonoDeque::new();
+    let mut d_right_min: MonoDeque<FRAMA_MAX_WINDOW> = MonoDeque::new();
 
     let w_ln = (2.0 / (sc as f64 + 1.0)).ln();
     let sc_lim = 2.0 / (sc as f64 + 1.0);
     let mut d_prev = 1.0;
+    let mut finite_run = 0usize;
+    let mut seed_sum = 0.0;
+    let mut previous = frama_canonical_nan_f64_v3();
 
-    let mut pm1 = f64::NAN;
-    let mut pm2 = f64::NAN;
-    let mut pm3 = f64::NAN;
-    let mut pn1 = f64::NAN;
-    let mut pn2 = f64::NAN;
-    let mut pn3 = f64::NAN;
-
-    let mut half_progress = 0usize;
-
-    for i in (first + window)..len {
-        let idx_out = i - window;
-        d_full_max.expire(idx_out);
-        d_full_min.expire(idx_out);
-        d_left_max.expire(idx_out);
-        d_left_min.expire(idx_out);
-        d_right_max.expire(idx_out + half);
-        d_right_min.expire(idx_out + half);
-
-        let newest = i - 1;
-        if !high[newest].is_nan() && !low[newest].is_nan() {
-            unsafe {
-                d_full_max.push_max(newest, high);
-                d_full_min.push_min(newest, low);
-
-                if newest < (idx_out + half) {
-                    d_left_max.push_max(newest, high);
-                    d_left_min.push_min(newest, low);
-                } else {
-                    d_right_max.push_max(newest, high);
-                    d_right_min.push_min(newest, low);
-                }
-            }
-        }
-        fn front_or(
-            dq_max: &MonoDeque<MAX_W>,
-            dq_min: &MonoDeque<MAX_W>,
-            prev_max: &mut f64,
-            prev_min: &mut f64,
-            high: &[f64],
-            low: &[f64],
-        ) -> (f64, f64) {
-            let maxv = if !dq_max.is_empty() {
-                high[unsafe { dq_max.front() }]
-            } else {
-                *prev_max
-            };
-            let minv = if !dq_min.is_empty() {
-                low[unsafe { dq_min.front() }]
-            } else {
-                *prev_min
-            };
-            *prev_max = maxv;
-            *prev_min = minv;
-            (maxv, minv)
-        }
-        let (max1, min1) = front_or(&d_right_max, &d_right_min, &mut pm1, &mut pn1, high, low);
-        let (max2, min2) = front_or(&d_left_max, &d_left_min, &mut pm2, &mut pn2, high, low);
-        let (max3, min3) = front_or(&d_full_max, &d_full_min, &mut pm3, &mut pn3, high, low);
-
-        if !(high[i].is_nan() || low[i].is_nan() || close[i].is_nan()) {
-            let n1 = (max1 - min1) / (half as f64);
-            let n2 = (max2 - min2) / (half as f64);
-            let n3 = (max3 - min3) / (window as f64);
-
-            let d_cur = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
-                ((n1 + n2).ln() - n3.ln()) / std::f64::consts::LN_2
-            } else {
-                d_prev
-            };
-            d_prev = d_cur;
-
-            let mut alpha0 = (w_ln * (d_cur - 1.0)).exp();
-            if alpha0 < 0.1 {
-                alpha0 = 0.1;
-            }
-            if alpha0 > 1.0 {
-                alpha0 = 1.0;
-            }
-            let old_n = (2.0 - alpha0) / alpha0;
-            let new_n = (sc - fc) as f64 * ((old_n - 1.0) / (sc as f64 - 1.0)) + fc as f64;
-            let mut alpha = 2.0 / (new_n + 1.0);
-            if alpha < sc_lim {
-                alpha = sc_lim;
-            }
-            if alpha > 1.0 {
-                alpha = 1.0;
-            }
-
-            out[i] = alpha * close[i] + (1.0 - alpha) * out[i - 1];
-        } else {
-            out[i] = out[i - 1];
-        }
-
-        half_progress += 1;
-        if half_progress == half {
-            swap(&mut d_left_max, &mut d_right_max);
-            swap(&mut d_left_min, &mut d_right_min);
+    for i in 0..len {
+        if !frama_is_finite_triplet_v3(high[i], low[i], close[i]) {
+            d_left_max.clear();
+            d_left_min.clear();
             d_right_max.clear();
             d_right_min.clear();
-            half_progress = 0;
+            finite_run = 0;
+            seed_sum = 0.0;
+            d_prev = 1.0;
+            previous = frama_canonical_nan_f64_v3();
+            out[i] = previous;
+            continue;
+        }
+
+        if finite_run < window {
+            seed_sum += close[i];
+            unsafe {
+                if finite_run < half {
+                    d_left_max.push_max(i, high);
+                    d_left_min.push_min(i, low);
+                } else {
+                    d_right_max.push_max(i, high);
+                    d_right_min.push_min(i, low);
+                }
+            }
+            finite_run += 1;
+            if finite_run == window {
+                previous = seed_sum / window as f64;
+                out[i] = previous;
+            }
+            continue;
+        }
+
+        let max1 = high[unsafe { d_right_max.front() }];
+        let min1 = low[unsafe { d_right_min.front() }];
+        let max2 = high[unsafe { d_left_max.front() }];
+        let min2 = low[unsafe { d_left_min.front() }];
+        let max3 = max1.max(max2);
+        let min3 = min1.min(min2);
+
+        let n1 = (max1 - min1) / (half as f64);
+        let n2 = (max2 - min2) / (half as f64);
+        let n3 = (max3 - min3) / (window as f64);
+
+        let d_cur = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
+            ((n1 + n2).ln() - n3.ln()) / std::f64::consts::LN_2
+        } else {
+            d_prev
+        };
+        d_prev = d_cur;
+
+        let mut alpha0 = (w_ln * (d_cur - 1.0)).exp();
+        if alpha0 < 0.1 {
+            alpha0 = 0.1;
+        }
+        if alpha0 > 1.0 {
+            alpha0 = 1.0;
+        }
+        let old_n = (2.0 - alpha0) / alpha0;
+        let new_n = (sc - fc) as f64 * ((old_n - 1.0) / (sc as f64 - 1.0)) + fc as f64;
+        let mut alpha = 2.0 / (new_n + 1.0);
+        if alpha < sc_lim {
+            alpha = sc_lim;
+        }
+        if alpha > 1.0 {
+            alpha = 1.0;
+        }
+
+        previous = frama_stable_update_f64_v2(close[i], previous, alpha);
+        out[i] = previous;
+
+        let idx_out = i - window;
+        let crossing = i - half;
+        d_left_max.expire(idx_out);
+        d_left_min.expire(idx_out);
+        d_right_max.expire(crossing);
+        d_right_min.expire(crossing);
+
+        unsafe {
+            d_left_max.push_max(crossing, high);
+            d_left_min.push_min(crossing, low);
+            d_right_max.push_max(i, high);
+            d_right_min.push_min(i, low);
         }
     }
 
@@ -621,9 +606,12 @@ pub fn frama_scalar(
     first: usize,
     len: usize,
 ) -> Result<FramaOutput, FramaError> {
-    let mut win = window;
-    if win & 1 == 1 {
-        win += 1;
+    let win = frama_evenized_window_v3(window, len)?;
+    if window > len {
+        return Err(FramaError::InvalidWindow {
+            window,
+            data_len: len,
+        });
     }
     let warm = first + win - 1;
 
@@ -642,451 +630,6 @@ pub fn frama_scalar(
         &mut out,
     )?;
     Ok(FramaOutput { values: out })
-}
-
-#[inline(always)]
-unsafe fn frama_small_scan(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    win: usize,
-    sc: usize,
-    fc: usize,
-    first: usize,
-    len: usize,
-    out: &mut [f64],
-) -> Result<(), FramaError> {
-    let half = win >> 1;
-    let win_f64 = win as f64;
-    let half_f64 = half as f64;
-    let w_ln = (2.0 / (sc as f64 + 1.0)).ln();
-    let sc_floor = 2.0 / (sc as f64 + 1.0);
-    let mut d_prev = 1.0_f64;
-
-    for i in (first + win)..len {
-        let seg_start = i - win;
-        let mid = seg_start + half;
-
-        let mut max1 = f64::MIN;
-        let mut min1 = f64::MAX;
-        let mut max2 = f64::MIN;
-        let mut min2 = f64::MAX;
-
-        let mut j = seg_start;
-        while j + 1 < mid {
-            let h0 = *high.get_unchecked(j);
-            let h1 = *high.get_unchecked(j + 1);
-            let l0 = *low.get_unchecked(j);
-            let l1 = *low.get_unchecked(j + 1);
-            max2 = f64::max(max2, f64::max(h0, h1));
-            min2 = f64::min(min2, f64::min(l0, l1));
-            j += 2;
-        }
-        if j < mid {
-            max2 = f64::max(max2, *high.get_unchecked(j));
-            min2 = f64::min(min2, *low.get_unchecked(j));
-        }
-
-        j = mid;
-        while j + 1 < i {
-            let h0 = *high.get_unchecked(j);
-            let h1 = *high.get_unchecked(j + 1);
-            let l0 = *low.get_unchecked(j);
-            let l1 = *low.get_unchecked(j + 1);
-            max1 = f64::max(max1, f64::max(h0, h1));
-            min1 = f64::min(min1, f64::min(l0, l1));
-            j += 2;
-        }
-        if j < i {
-            max1 = f64::max(max1, *high.get_unchecked(j));
-            min1 = f64::min(min1, *low.get_unchecked(j));
-        }
-
-        let max3 = f64::max(max1, max2);
-        let min3 = f64::min(min1, min2);
-
-        let n1 = (max1 - min1) / half_f64;
-        let n2 = (max2 - min2) / half_f64;
-        let n3 = (max3 - min3) / win_f64;
-
-        let d_cur = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
-            ((n1 + n2).ln() - n3.ln()) / std::f64::consts::LN_2
-        } else {
-            d_prev
-        };
-        d_prev = d_cur;
-
-        let mut alpha0 = (w_ln * (d_cur - 1.0)).exp().clamp(0.1, 1.0);
-        let old_n = (2.0 - alpha0) / alpha0;
-        let new_n = (sc - fc) as f64 * ((old_n - 1.0) / (sc as f64 - 1.0)) + fc as f64;
-        let alpha = (2.0 / (new_n + 1.0)).clamp(sc_floor, 1.0);
-
-        out[i] = (*close.get_unchecked(i)).mul_add(alpha, (1.0 - alpha) * out[i - 1]);
-    }
-    Ok(())
-}
-
-#[inline(always)]
-unsafe fn frama_small_scan_const<const WIN: usize>(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    sc: usize,
-    fc: usize,
-    first: usize,
-    len: usize,
-    out: &mut [f64],
-) {
-    let half = WIN >> 1;
-    let win_f64 = WIN as f64;
-    let half_f64 = half as f64;
-    let w_ln = (2.0 / (sc as f64 + 1.0)).ln();
-    let sc_floor = 2.0 / (sc as f64 + 1.0);
-    let sc_diff = (sc - fc) as f64;
-    let sc_denom = sc as f64 - 1.0;
-    let fc_f64 = fc as f64;
-    let mut d_prev = 1.0_f64;
-
-    for i in (first + WIN)..len {
-        let seg_start = i - WIN;
-        let mid = seg_start + half;
-
-        let mut max2 = f64::MIN;
-        let mut min2 = f64::MAX;
-        for off in 0..half {
-            let j = seg_start + off;
-            max2 = f64::max(max2, *high.get_unchecked(j));
-            min2 = f64::min(min2, *low.get_unchecked(j));
-        }
-
-        let mut max1 = f64::MIN;
-        let mut min1 = f64::MAX;
-        for off in 0..half {
-            let j = mid + off;
-            max1 = f64::max(max1, *high.get_unchecked(j));
-            min1 = f64::min(min1, *low.get_unchecked(j));
-        }
-
-        let max3 = f64::max(max1, max2);
-        let min3 = f64::min(min1, min2);
-
-        let n1 = (max1 - min1) / half_f64;
-        let n2 = (max2 - min2) / half_f64;
-        let n3 = (max3 - min3) / win_f64;
-
-        let d_cur = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
-            ((n1 + n2).ln() - n3.ln()) / std::f64::consts::LN_2
-        } else {
-            d_prev
-        };
-        d_prev = d_cur;
-
-        let alpha0 = (w_ln * (d_cur - 1.0)).exp().clamp(0.1, 1.0);
-        let old_n = (2.0 - alpha0) / alpha0;
-        let new_n = sc_diff * ((old_n - 1.0) / sc_denom) + fc_f64;
-        let alpha = (2.0 / (new_n + 1.0)).clamp(sc_floor, 1.0);
-
-        *out.get_unchecked_mut(i) =
-            (*close.get_unchecked(i)).mul_add(alpha, (1.0 - alpha) * *out.get_unchecked(i - 1));
-    }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn hmax_pd256(v: __m256d) -> f64 {
-    let hi = _mm256_extractf128_pd::<1>(v);
-    let lo = _mm256_castpd256_pd128(v);
-    let m = _mm_max_pd(hi, lo);
-    let m = _mm_max_pd(m, _mm_permute_pd::<0b01>(m));
-    _mm_cvtsd_f64(m)
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn hmin_pd256(v: __m256d) -> f64 {
-    let hi = _mm256_extractf128_pd::<1>(v);
-    let lo = _mm256_castpd256_pd128(v);
-    let m = _mm_min_pd(hi, lo);
-    let m = _mm_min_pd(m, _mm_permute_pd::<0b01>(m));
-    _mm_cvtsd_f64(m)
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn frama_avx2_small<const WIN: usize>(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    sc: usize,
-    fc: usize,
-    first: usize,
-    len: usize,
-    out: &mut [f64],
-) {
-    const LANES: usize = 4;
-    const LN2: f64 = std::f64::consts::LN_2;
-
-    let half = WIN / 2;
-    let win_f64 = WIN as f64;
-    let half_f64 = half as f64;
-    let w_ln = (2.0 / (sc as f64 + 1.0)).ln();
-    let sc_floor = 2.0 / (sc as f64 + 1.0);
-    let mut d_prev = 1.0;
-
-    for i in (first + WIN)..len {
-        if unlikely(
-            (*high.get_unchecked(i)).is_nan()
-                || (*low.get_unchecked(i)).is_nan()
-                || (*close.get_unchecked(i)).is_nan(),
-        ) {
-            *out.get_unchecked_mut(i) = *out.get_unchecked(i - 1);
-            continue;
-        }
-
-        let mut v_max_l = _mm256_set1_pd(f64::MIN);
-        let mut v_min_l = _mm256_set1_pd(f64::MAX);
-        let mut idx_l = i - WIN;
-
-        for _ in 0..(half / LANES) {
-            let h = _mm256_loadu_pd(high.as_ptr().add(idx_l));
-            let l = _mm256_loadu_pd(low.as_ptr().add(idx_l));
-            v_max_l = _mm256_max_pd(v_max_l, h);
-            v_min_l = _mm256_min_pd(v_min_l, l);
-            idx_l += LANES;
-        }
-
-        let mut max_l = hmax_pd256(v_max_l);
-        let mut min_l = hmin_pd256(v_min_l);
-
-        for j in idx_l..(i - half) {
-            let h = *high.get_unchecked(j);
-            let l = *low.get_unchecked(j);
-            max_l = max_l.max(h);
-            min_l = min_l.min(l);
-        }
-
-        let mut v_max_r = _mm256_set1_pd(f64::MIN);
-        let mut v_min_r = _mm256_set1_pd(f64::MAX);
-        let mut idx_r = i - half;
-
-        for _ in 0..(half / LANES) {
-            let h = _mm256_loadu_pd(high.as_ptr().add(idx_r));
-            let l = _mm256_loadu_pd(low.as_ptr().add(idx_r));
-            v_max_r = _mm256_max_pd(v_max_r, h);
-            v_min_r = _mm256_min_pd(v_min_r, l);
-            idx_r += LANES;
-        }
-
-        let mut max_r = hmax_pd256(v_max_r);
-        let mut min_r = hmin_pd256(v_min_r);
-
-        for j in idx_r..i {
-            let h = *high.get_unchecked(j);
-            let l = *low.get_unchecked(j);
-            max_r = max_r.max(h);
-            min_r = min_r.min(l);
-        }
-
-        let max_w = max_l.max(max_r);
-        let min_w = min_l.min(min_r);
-
-        let n1 = (max_r - min_r) / half_f64;
-        let n2 = (max_l - min_l) / half_f64;
-        let n3 = (max_w - min_w) / win_f64;
-
-        let d = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
-            ((n1 + n2).ln() - n3.ln()) / LN2
-        } else {
-            d_prev
-        };
-        d_prev = d;
-
-        let mut a0 = (w_ln * (d - 1.0)).exp().clamp(0.1, 1.0);
-        let old_n = (2.0 - a0) / a0;
-        let new_n = (sc - fc) as f64 * ((old_n - 1.0) / (sc as f64 - 1.0)) + fc as f64;
-        let alpha = (2.0 / (new_n + 1.0)).clamp(sc_floor, 1.0);
-
-        *out.get_unchecked_mut(i) =
-            (*close.get_unchecked(i)).mul_add(alpha, (1.0 - alpha) * *out.get_unchecked(i - 1));
-    }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f")]
-unsafe fn frama_avx512_small<const WIN: usize>(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    sc: usize,
-    fc: usize,
-    first: usize,
-    len: usize,
-    out: &mut [f64],
-) {
-    const LANES: usize = 8;
-    const LN2: f64 = std::f64::consts::LN_2;
-
-    let half = WIN / 2;
-    let vec_cnt = half / LANES;
-    let tail = (half & (LANES - 1)) as i32;
-    let mask = (1u8 << tail) - 1;
-
-    let w_ln = (2.0 / (sc as f64 + 1.0)).ln();
-    let sc_floor = 2.0 / (sc as f64 + 1.0);
-    let win_f64 = WIN as f64;
-    let half_f64 = half as f64;
-
-    let v_min_init = _mm512_set1_pd(f64::MIN);
-    let v_max_init = _mm512_set1_pd(f64::MAX);
-
-    let mut d_prev = 1.0;
-
-    for i in (first + WIN)..len {
-        if unlikely(
-            (*high.get_unchecked(i)).is_nan()
-                || (*low.get_unchecked(i)).is_nan()
-                || (*close.get_unchecked(i)).is_nan(),
-        ) {
-            *out.get_unchecked_mut(i) = *out.get_unchecked(i - 1);
-            continue;
-        }
-
-        let mut v_max_l = v_min_init;
-        let mut v_min_l = v_max_init;
-        let base_l = i - WIN;
-
-        for k in 0..vec_cnt {
-            let off = base_l + k * LANES;
-            let h = _mm512_loadu_pd(high.as_ptr().add(off));
-            let l = _mm512_loadu_pd(low.as_ptr().add(off));
-            v_max_l = _mm512_max_pd(v_max_l, h);
-            v_min_l = _mm512_min_pd(v_min_l, l);
-        }
-
-        if tail != 0 {
-            let off = base_l + vec_cnt * LANES;
-            let h_tail =
-                _mm512_mask_loadu_pd(_mm512_set1_pd(f64::MIN), mask, high.as_ptr().add(off));
-            let l_tail =
-                _mm512_mask_loadu_pd(_mm512_set1_pd(f64::MAX), mask, low.as_ptr().add(off));
-            v_max_l = _mm512_max_pd(v_max_l, h_tail);
-            v_min_l = _mm512_min_pd(v_min_l, l_tail);
-        }
-
-        let max_l = _mm512_reduce_max_pd(v_max_l);
-        let min_l = _mm512_reduce_min_pd(v_min_l);
-
-        let mut v_max_r = v_min_init;
-        let mut v_min_r = v_max_init;
-        let base_r = i - half;
-
-        for k in 0..vec_cnt {
-            let off = base_r + k * LANES;
-            let h = _mm512_loadu_pd(high.as_ptr().add(off));
-            let l = _mm512_loadu_pd(low.as_ptr().add(off));
-            v_max_r = _mm512_max_pd(v_max_r, h);
-            v_min_r = _mm512_min_pd(v_min_r, l);
-        }
-
-        if tail != 0 {
-            let off = base_r + vec_cnt * LANES;
-            let h_tail =
-                _mm512_mask_loadu_pd(_mm512_set1_pd(f64::MIN), mask, high.as_ptr().add(off));
-            let l_tail =
-                _mm512_mask_loadu_pd(_mm512_set1_pd(f64::MAX), mask, low.as_ptr().add(off));
-            v_max_r = _mm512_max_pd(v_max_r, h_tail);
-            v_min_r = _mm512_min_pd(v_min_r, l_tail);
-        }
-
-        let max_r = _mm512_reduce_max_pd(v_max_r);
-        let min_r = _mm512_reduce_min_pd(v_min_r);
-
-        let max_w = max_l.max(max_r);
-        let min_w = min_l.min(min_r);
-
-        let n1 = (max_r - min_r) / half_f64;
-        let n2 = (max_l - min_l) / half_f64;
-        let n3 = (max_w - min_w) / win_f64;
-
-        let d = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
-            ((n1 + n2).ln() - n3.ln()) / LN2
-        } else {
-            d_prev
-        };
-        d_prev = d;
-
-        let mut a0 = (w_ln * (d - 1.0)).exp().clamp(0.1, 1.0);
-        let old_n = (2.0 - a0) / a0;
-        let new_n = (sc - fc) as f64 * ((old_n - 1.0) / (sc as f64 - 1.0)) + fc as f64;
-        let alpha = (2.0 / (new_n + 1.0)).clamp(sc_floor, 1.0);
-
-        *out.get_unchecked_mut(i) =
-            (*close.get_unchecked(i)).mul_add(alpha, (1.0 - alpha) * *out.get_unchecked(i - 1));
-    }
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn frama_avx2_into(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    window: usize,
-    sc: usize,
-    fc: usize,
-    first: usize,
-    len: usize,
-    out: &mut [f64],
-) -> Result<(), FramaError> {
-    let mut win = window;
-    if win & 1 == 1 {
-        win += 1;
-    }
-
-    if win <= 32 {
-        match win {
-            10 => unsafe { frama_avx2_small::<10>(high, low, close, sc, fc, first, len, out) },
-            14 => unsafe { frama_avx2_small::<14>(high, low, close, sc, fc, first, len, out) },
-            20 => unsafe { frama_avx2_small::<20>(high, low, close, sc, fc, first, len, out) },
-            32 => unsafe { frama_avx2_small::<32>(high, low, close, sc, fc, first, len, out) },
-            _ => unsafe { frama_small_scan(high, low, close, win, sc, fc, first, len, out)? },
-        }
-    } else {
-        frama_scalar_deque(high, low, close, win, sc, fc, first, len, out)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-#[inline(always)]
-unsafe fn frama_avx512_into(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    window: usize,
-    sc: usize,
-    fc: usize,
-    first: usize,
-    len: usize,
-    out: &mut [f64],
-) -> Result<(), FramaError> {
-    let mut win = window;
-    if win & 1 == 1 {
-        win += 1;
-    }
-
-    if win <= 32 {
-        match win {
-            10 => unsafe { frama_avx512_small::<10>(high, low, close, sc, fc, first, len, out) },
-            14 => unsafe { frama_avx512_small::<14>(high, low, close, sc, fc, first, len, out) },
-            20 => unsafe { frama_avx512_small::<20>(high, low, close, sc, fc, first, len, out) },
-            32 => unsafe { frama_avx512_small::<32>(high, low, close, sc, fc, first, len, out) },
-            _ => unsafe { frama_small_scan(high, low, close, win, sc, fc, first, len, out)? },
-        }
-    } else {
-        frama_scalar_deque(high, low, close, win, sc, fc, first, len, out)?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1284,6 +827,48 @@ pub fn frama_batch_par_slice(
     frama_batch_inner(high, low, close, sweep, kern, true)
 }
 
+#[inline]
+fn frama_batch_admission_v3(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    sweep: &FramaBatchRange,
+) -> Result<(Vec<FramaParams>, usize, usize), FramaError> {
+    if high.is_empty() || low.is_empty() || close.is_empty() {
+        return Err(FramaError::EmptyInputData);
+    }
+    if low.len() != high.len() || close.len() != high.len() {
+        return Err(FramaError::MismatchedInputLength {
+            high: high.len(),
+            low: low.len(),
+            close: close.len(),
+        });
+    }
+
+    let len = high.len();
+    frama_validate_window_axis_v3(sweep.window, len)?;
+    let combos = expand_grid(sweep);
+    if combos.is_empty() {
+        return Err(FramaError::InvalidRange {
+            start: sweep.window.0,
+            end: sweep.window.1,
+            step: sweep.window.2,
+        });
+    }
+    let max_even_window = frama_validate_combo_windows_v3(&combos, len)?;
+    let first = (0..len)
+        .find(|&index| frama_is_finite_triplet_v3(high[index], low[index], close[index]))
+        .ok_or(FramaError::AllValuesNaN)?;
+    let valid_tail = len - first;
+    if valid_tail < max_even_window {
+        return Err(FramaError::NotEnoughValidData {
+            needed: max_even_window,
+            valid: valid_tail,
+        });
+    }
+    Ok((combos, first, max_even_window))
+}
+
 #[inline(always)]
 fn frama_batch_inner(
     high: &[f64],
@@ -1293,18 +878,7 @@ fn frama_batch_inner(
     kern: Kernel,
     parallel: bool,
 ) -> Result<FramaBatchOutput, FramaError> {
-    if high.is_empty() || low.is_empty() || close.is_empty() {
-        return Err(FramaError::EmptyInputData);
-    }
-
-    let combos = expand_grid(sweep);
-    if combos.is_empty() {
-        return Err(FramaError::InvalidRange {
-            start: sweep.window.0,
-            end: sweep.window.1,
-            step: sweep.window.2,
-        });
-    }
+    let (combos, first, _) = frama_batch_admission_v3(high, low, close, sweep)?;
 
     let rows = combos.len();
     let cols = close.len();
@@ -1316,10 +890,6 @@ fn frama_batch_inner(
         })?;
 
     let mut buf_mu = make_uninit_matrix(rows, cols);
-
-    let first = (0..cols)
-        .find(|&i| !high[i].is_nan() && !low[i].is_nan() && !close[i].is_nan())
-        .unwrap_or(0);
 
     let warm: Vec<usize> = combos
         .iter()
@@ -1335,12 +905,13 @@ fn frama_batch_inner(
 
     init_matrix_prefixes(&mut buf_mu, cols, &warm);
 
-    let mut buf_guard = core::mem::ManuallyDrop::new(buf_mu);
-    let out: &mut [f64] = unsafe {
-        core::slice::from_raw_parts_mut(buf_guard.as_mut_ptr() as *mut f64, buf_guard.len())
+    let combos_ret = {
+        let out: &mut [f64] = unsafe {
+            core::slice::from_raw_parts_mut(buf_mu.as_mut_ptr() as *mut f64, buf_mu.len())
+        };
+        frama_batch_inner_into(high, low, close, sweep, kern, parallel, out)?
     };
-
-    let combos_ret = frama_batch_inner_into(high, low, close, sweep, kern, parallel, out)?;
+    let mut buf_guard = core::mem::ManuallyDrop::new(buf_mu);
 
     let values = unsafe {
         Vec::from_raw_parts(
@@ -1368,53 +939,10 @@ fn frama_batch_inner_into(
     parallel: bool,
     out: &mut [f64],
 ) -> Result<Vec<FramaParams>, FramaError> {
-    let combos = expand_grid(sweep);
-    if combos.is_empty() {
-        return Err(FramaError::InvalidRange {
-            start: sweep.window.0,
-            end: sweep.window.1,
-            step: sweep.window.2,
-        });
-    }
-
-    if high.is_empty() {
-        return Err(FramaError::EmptyInputData);
-    }
-    if low.len() != high.len() || close.len() != high.len() {
-        return Err(FramaError::MismatchedInputLength {
-            high: high.len(),
-            low: low.len(),
-            close: close.len(),
-        });
-    }
-
-    let len = high.len();
-    let first = (0..len)
-        .find(|&i| !high[i].is_nan() && !low[i].is_nan() && !close[i].is_nan())
-        .ok_or(FramaError::AllValuesNaN)?;
-
-    let max_even_w = combos
-        .iter()
-        .map(|c| {
-            let w = c.window.unwrap();
-            if w & 1 == 1 {
-                w + 1
-            } else {
-                w
-            }
-        })
-        .max()
-        .unwrap();
-
-    if len - first < max_even_w {
-        return Err(FramaError::NotEnoughValidData {
-            needed: max_even_w,
-            valid: len - first,
-        });
-    }
+    let (combos, first, _) = frama_batch_admission_v3(high, low, close, sweep)?;
 
     let rows = combos.len();
-    let cols = len;
+    let cols = high.len();
 
     let do_row = |row: usize, dst: &mut [f64]| unsafe {
         let p = &combos[row];
@@ -1491,16 +1019,7 @@ impl FramaStream {
         let window = params.window.unwrap_or(10);
         let sc = params.sc.unwrap_or(300);
         let fc = params.fc.unwrap_or(1);
-        if window == 0 {
-            return Err(FramaError::InvalidWindow {
-                window,
-                data_len: 0,
-            });
-        }
-        let mut n = window;
-        if n % 2 == 1 {
-            n += 1;
-        }
+        let n = frama_evenized_window_v3(window, 0)?;
         Ok(Self {
             window,
             sc,
@@ -1531,8 +1050,38 @@ impl FramaStream {
             sc_floor: 2.0 / (sc as f64 + 1.0),
         })
     }
+
+    #[inline(always)]
+    fn reset_finite_segment_v3(&mut self) {
+        let nan = frama_canonical_nan_f64_v3();
+        self.buffer.fill((nan, nan, nan));
+        self.head = 0;
+        self.filled = false;
+        self.last_val = nan;
+        self.d_prev = 1.0;
+        self.alpha_prev = self.sc_floor;
+        self.idx = 0;
+        self.dq_r_max.clear();
+        self.dq_r_min.clear();
+        self.dq_l_max.clear();
+        self.dq_l_min.clear();
+        self.dq_w_max.clear();
+        self.dq_w_min.clear();
+        self.pm_right = nan;
+        self.pn_right = nan;
+        self.pm_left = nan;
+        self.pn_left = nan;
+        self.pm_full = nan;
+        self.pn_full = nan;
+    }
+
     #[inline(always)]
     pub fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
+        if !frama_is_finite_triplet_v3(high, low, close) {
+            self.reset_finite_segment_v3();
+            return None;
+        }
+
         if !self.filled {
             self.buffer[self.head] = (high, low, close);
             self.head += 1;
@@ -1553,16 +1102,14 @@ impl FramaStream {
 
                 for j in 0..self.n {
                     let (h, l, _) = self.buffer[j];
-                    if !(h.is_nan() || l.is_nan()) {
-                        self.dq_w_max.push(j, h);
-                        self.dq_w_min.push(j, l);
-                        if j < self.half {
-                            self.dq_l_max.push(j, h);
-                            self.dq_l_min.push(j, l);
-                        } else {
-                            self.dq_r_max.push(j, h);
-                            self.dq_r_min.push(j, l);
-                        }
+                    self.dq_w_max.push(j, h);
+                    self.dq_w_min.push(j, l);
+                    if j < self.half {
+                        self.dq_l_max.push(j, h);
+                        self.dq_l_min.push(j, l);
+                    } else {
+                        self.dq_r_max.push(j, h);
+                        self.dq_r_min.push(j, l);
                     }
                 }
 
@@ -1618,58 +1165,50 @@ impl FramaStream {
         let half_f = self.half as f64;
         let win_f = self.n as f64;
 
-        let output = if !(high.is_nan() || low.is_nan() || close.is_nan()) {
-            let n1 = (max_r - min_r) / half_f;
-            let n2 = (max_l - min_l) / half_f;
-            let n3 = (max_w - min_w) / win_f;
+        let n1 = (max_r - min_r) / half_f;
+        let n2 = (max_l - min_l) / half_f;
+        let n3 = (max_w - min_w) / win_f;
 
-            let d = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
-                ((n1 + n2).ln() - n3.ln()) / std::f64::consts::LN_2
-            } else {
-                self.d_prev
-            };
-            self.d_prev = d;
-
-            let mut a0 = (self.w * (d - 1.0)).exp();
-            if a0 < 0.1 {
-                a0 = 0.1;
-            }
-            if a0 > 1.0 {
-                a0 = 1.0;
-            }
-
-            let old_n = (2.0 - a0) / a0;
-            let new_n = (self.sc - self.fc) as f64 * ((old_n - 1.0) / (self.sc as f64 - 1.0))
-                + self.fc as f64;
-
-            let mut alpha = 2.0 / (new_n + 1.0);
-            if alpha < self.sc_floor {
-                alpha = self.sc_floor;
-            }
-            if alpha > 1.0 {
-                alpha = 1.0;
-            }
-            self.alpha_prev = alpha;
-
-            close.mul_add(alpha, (1.0 - alpha) * self.last_val)
+        let d = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
+            ((n1 + n2).ln() - n3.ln()) / std::f64::consts::LN_2
         } else {
-            self.last_val
+            self.d_prev
         };
+        self.d_prev = d;
 
-        if !(high.is_nan() || low.is_nan()) {
-            self.dq_r_max.push(i, high);
-            self.dq_r_min.push(i, low);
-            self.dq_w_max.push(i, high);
-            self.dq_w_min.push(i, low);
+        let mut a0 = (self.w * (d - 1.0)).exp();
+        if a0 < 0.1 {
+            a0 = 0.1;
         }
+        if a0 > 1.0 {
+            a0 = 1.0;
+        }
+
+        let old_n = (2.0 - a0) / a0;
+        let new_n =
+            (self.sc - self.fc) as f64 * ((old_n - 1.0) / (self.sc as f64 - 1.0)) + self.fc as f64;
+
+        let mut alpha = 2.0 / (new_n + 1.0);
+        if alpha < self.sc_floor {
+            alpha = self.sc_floor;
+        }
+        if alpha > 1.0 {
+            alpha = 1.0;
+        }
+        self.alpha_prev = alpha;
+
+        let output = frama_stable_update_f64_v2(close, self.last_val, alpha);
+
+        self.dq_r_max.push(i, high);
+        self.dq_r_min.push(i, low);
+        self.dq_w_max.push(i, high);
+        self.dq_w_min.push(i, low);
 
         if i >= self.half {
             let j = i - self.half;
             let (h_l, l_l, _) = self.buffer[j % self.n];
-            if !(h_l.is_nan() || l_l.is_nan()) {
-                self.dq_l_max.push(j, h_l);
-                self.dq_l_min.push(j, l_l);
-            }
+            self.dq_l_max.push(j, h_l);
+            self.dq_l_min.push(j, l_l);
         }
 
         self.buffer[self.head] = (high, low, close);
@@ -1762,25 +1301,7 @@ pub unsafe fn frama_row_scalar(
     sc: usize,
     fc: usize,
 ) {
-    let len = high.len();
-
-    let mut win = window;
-    if win & 1 == 1 {
-        win += 1;
-    }
-    seed_sma(close, first, win, out);
-
-    if win <= 32 {
-        match win {
-            10 => frama_small_scan_const::<10>(high, low, close, sc, fc, first, len, out),
-            14 => frama_small_scan_const::<14>(high, low, close, sc, fc, first, len, out),
-            20 => frama_small_scan_const::<20>(high, low, close, sc, fc, first, len, out),
-            32 => frama_small_scan_const::<32>(high, low, close, sc, fc, first, len, out),
-            _ => frama_small_scan(high, low, close, win, sc, fc, first, len, out).unwrap(),
-        }
-    } else {
-        frama_scalar_deque(high, low, close, win, sc, fc, first, len, out).unwrap();
-    }
+    frama_f64_segmented_deque_v3(high, low, close, window, sc, fc, first, high.len(), out).unwrap();
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -1795,24 +1316,7 @@ pub unsafe fn frama_row_avx2(
     sc: usize,
     fc: usize,
 ) {
-    let mut win = window;
-    if win & 1 == 1 {
-        win += 1;
-    }
-
-    seed_sma(close, first, win, out);
-
-    if win <= 32 {
-        match win {
-            10 => frama_avx2_small::<10>(high, low, close, sc, fc, first, high.len(), out),
-            14 => frama_avx2_small::<14>(high, low, close, sc, fc, first, high.len(), out),
-            20 => frama_avx2_small::<20>(high, low, close, sc, fc, first, high.len(), out),
-            32 => frama_avx2_small::<32>(high, low, close, sc, fc, first, high.len(), out),
-            _ => frama_small_scan(high, low, close, win, sc, fc, first, high.len(), out).unwrap(),
-        }
-    } else {
-        frama_scalar_deque(high, low, close, win, sc, fc, first, high.len(), out).unwrap();
-    }
+    frama_f64_segmented_deque_v3(high, low, close, window, sc, fc, first, high.len(), out).unwrap();
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -1827,101 +1331,563 @@ pub unsafe fn frama_row_avx512(
     sc: usize,
     fc: usize,
 ) {
-    let mut win = window;
-    if win & 1 == 1 {
-        win += 1;
-    }
-
-    seed_sma(close, first, win, out);
-
-    if win <= 32 {
-        match win {
-            10 => frama_avx512_small::<10>(high, low, close, sc, fc, first, high.len(), out),
-            14 => frama_avx512_small::<14>(high, low, close, sc, fc, first, high.len(), out),
-            20 => frama_avx512_small::<20>(high, low, close, sc, fc, first, high.len(), out),
-            32 => frama_avx512_small::<32>(high, low, close, sc, fc, first, high.len(), out),
-            _ => frama_small_scan(high, low, close, win, sc, fc, first, high.len(), out).unwrap(),
-        }
-    } else {
-        frama_scalar_deque(high, low, close, win, sc, fc, first, high.len(), out).unwrap();
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn frama_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    window: usize,
-    sc: usize,
-    fc: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = frama_js(high, low, close, window, sc, fc)?;
-    crate::write_wasm_f64_output("frama_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn frama_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    window_start: usize,
-    window_end: usize,
-    window_step: usize,
-    sc_start: usize,
-    sc_end: usize,
-    sc_step: usize,
-    fc_start: usize,
-    fc_end: usize,
-    fc_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = frama_batch_js(
-        high,
-        low,
-        close,
-        window_start,
-        window_end,
-        window_step,
-        sc_start,
-        sc_end,
-        sc_step,
-        fc_start,
-        fc_end,
-        fc_step,
-    )?;
-    crate::write_wasm_f64_output("frama_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn frama_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = frama_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("frama_batch_unified_output_into_js", &value, out)
+    frama_f64_segmented_deque_v3(high, low, close, window, sc, fc, first, high.len(), out).unwrap();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FRAMA_RUST_SOURCE: &str = include_str!("frama.rs");
+    const FRAMA_CUDA_SOURCE: &str =
+        include_str!("../../../kernels/cuda/moving_averages/frama_kernel.cu");
+
+    #[test]
+    fn frama_stable_f64_recurrence_v2_source_contract() {
+        let production = FRAMA_RUST_SOURCE
+            .split("#[cfg(test)]")
+            .next()
+            .expect("frama.rs must retain a production section");
+
+        assert!(
+            production.contains("frama-f64-v3-finite-hlc-segment-reset-even-window-stable-fma-v2")
+        );
+        assert!(production.contains("fn frama_f64_segmented_deque_v3("));
+        assert!(production.contains("fn frama_is_finite_triplet_v3("));
+        assert!(production.contains("fn frama_canonical_nan_f64_v3()"));
+        assert_eq!(
+            production.matches("frama_f64_segmented_deque_v3(").count(),
+            5,
+            "one definition plus direct and the scalar/AVX batch row labels"
+        );
+        assert!(production.contains(
+            "fn frama_stable_update_f64_v2(close: f64, previous: f64, alpha: f64) -> f64"
+        ));
+        assert!(production.contains("alpha.mul_add(close - previous, previous)"));
+        assert_eq!(
+            production.matches("frama_stable_update_f64_v2(").count(),
+            3,
+            "one definition plus the common static authority and stream calls"
+        );
+        assert!(!production.contains("fn frama_small_scan"));
+        assert!(!production.contains("fn frama_avx2_small"));
+        assert!(!production.contains("fn frama_avx512_small"));
+        assert!(!production.contains("close.mul_add(alpha, (1.0 - alpha)"));
+        assert!(!production.contains("alpha * close[i] + (1.0 - alpha)"));
+
+        assert!(
+            FRAMA_CUDA_SOURCE
+                .contains("__device__ __forceinline__ double neo_frama_stable_update_f64_v2(")
+        );
+        assert!(
+            FRAMA_CUDA_SOURCE
+                .contains("return __fma_rn(alpha, __dsub_rn(close, previous), previous);")
+        );
+        assert_eq!(
+            FRAMA_CUDA_SOURCE
+                .matches("neo_frama_stable_update_f64_v2(")
+                .count(),
+            2,
+            "one device helper definition and one strict-f64 call"
+        );
+        assert!(!FRAMA_CUDA_SOURCE.contains("fma(close[i], alpha, (1.0 - alpha) * o[i - 1])"));
+        assert!(FRAMA_CUDA_SOURCE.contains("row_out[i] = fmaf(alpha, (close_i - prev), prev);"));
+        assert!(
+            FRAMA_CUDA_SOURCE
+                .contains("frama-f64-v3-finite-hlc-segment-reset-even-window-stable-fma-v2")
+        );
+        assert!(
+            FRAMA_CUDA_SOURCE
+                .contains("if (!isfinite(high[i]) || !isfinite(low[i]) || !isfinite(close[i]))")
+        );
+        assert!(FRAMA_CUDA_SOURCE.contains("finite_run = 0;"));
+        assert!(FRAMA_CUDA_SOURCE.contains("d_prev = 1.0;"));
+    }
+
+    #[test]
+    fn frama_stable_f64_recurrence_v2_has_the_reviewed_rounding_gate() {
+        let alpha = f64::from_bits(0x3fd0_530d_08f1_7f5c);
+        let close = f64::from_bits(0x3ff0_caee_225a_2949);
+        let previous = f64::from_bits(0x3ff0_b81c_8de4_fa9d);
+
+        let actual = frama_stable_update_f64_v2(close, previous, alpha);
+        assert_eq!(actual.to_bits(), 0x3ff0_bce9_5ea4_019e);
+
+        let superseded = close.mul_add(alpha, (1.0 - alpha) * previous);
+        assert_eq!(superseded.to_bits(), 0x3ff0_bce9_5ea4_019d);
+        assert_ne!(actual.to_bits(), superseded.to_bits());
+    }
+
+    #[test]
+    fn frama_f64_hole_contract_exact_witness_resets_every_route() {
+        const LEN: usize = 36;
+        const WINDOW: usize = 34;
+        const QNAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+
+        let mut high = vec![1.0; LEN];
+        let mut low = vec![0.0; LEN];
+        let mut close = vec![0.5; LEN];
+        high[34] = f64::from_bits(QNAN_BITS);
+        low[34] = f64::from_bits(QNAN_BITS);
+        close[34] = f64::from_bits(QNAN_BITS);
+
+        let params = FramaParams {
+            window: Some(WINDOW),
+            sc: Some(300),
+            fc: Some(1),
+        };
+        let input = FramaInput::from_slices(&high, &low, &close, params.clone());
+        let direct = frama_with_kernel(&input, Kernel::Scalar)
+            .expect("the exact hole witness is a valid FRAMA input");
+        let batch = frama_batch_with_kernel(
+            &high,
+            &low,
+            &close,
+            &FramaBatchRange {
+                window: (WINDOW, WINDOW, 0),
+                sc: (300, 300, 0),
+                fc: (1, 1, 0),
+            },
+            Kernel::ScalarBatch,
+        )
+        .expect("the exact hole witness is a valid FRAMA batch input");
+        let mut stream = FramaStream::try_new(params).expect("stream parameters are valid");
+        let streamed = (0..LEN)
+            .map(|row| stream.update(high[row], low[row], close[row]))
+            .collect::<Vec<_>>();
+
+        for row in 0..33 {
+            assert_eq!(direct.values[row].to_bits(), QNAN_BITS, "direct row {row}");
+            assert_eq!(batch.values[row].to_bits(), QNAN_BITS, "batch row {row}");
+            assert_eq!(streamed[row], None, "stream row {row}");
+        }
+        assert_eq!(direct.values[33].to_bits(), 0.5f64.to_bits());
+        assert_eq!(batch.values[33].to_bits(), 0.5f64.to_bits());
+        assert_eq!(streamed[33].map(f64::to_bits), Some(0.5f64.to_bits()));
+        for row in 34..LEN {
+            assert_eq!(direct.values[row].to_bits(), QNAN_BITS, "direct row {row}");
+            assert_eq!(batch.values[row].to_bits(), QNAN_BITS, "batch row {row}");
+            assert_eq!(streamed[row], None, "stream row {row}");
+        }
+    }
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
     use paste::paste;
     use proptest::prelude::*;
 
+    fn frama_direct_halves_reference(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        window: usize,
+        sc: usize,
+        fc: usize,
+    ) -> Vec<f64> {
+        let mut win = window;
+        if win & 1 == 1 {
+            win += 1;
+        }
+        let half = win / 2;
+        let mut out = vec![f64::NAN; close.len()];
+        let mut seed = 0.0;
+        for value in &close[..win] {
+            seed += *value;
+        }
+        out[win - 1] = seed / win as f64;
+
+        let w_ln = (2.0 / (sc as f64 + 1.0)).ln();
+        let sc_floor = 2.0 / (sc as f64 + 1.0);
+        let mut d_prev = 1.0;
+        for i in win..close.len() {
+            let start = i - win;
+            let mid = start + half;
+            let mut max2 = f64::MIN;
+            let mut min2 = f64::MAX;
+            for j in start..mid {
+                max2 = max2.max(high[j]);
+                min2 = min2.min(low[j]);
+            }
+            let mut max1 = f64::MIN;
+            let mut min1 = f64::MAX;
+            for j in mid..i {
+                max1 = max1.max(high[j]);
+                min1 = min1.min(low[j]);
+            }
+            let max3 = max1.max(max2);
+            let min3 = min1.min(min2);
+            let n1 = (max1 - min1) / half as f64;
+            let n2 = (max2 - min2) / half as f64;
+            let n3 = (max3 - min3) / win as f64;
+            let d_cur = if n1 > 0.0 && n2 > 0.0 && n3 > 0.0 {
+                ((n1 + n2).ln() - n3.ln()) / std::f64::consts::LN_2
+            } else {
+                d_prev
+            };
+            d_prev = d_cur;
+
+            let mut alpha0 = (w_ln * (d_cur - 1.0)).exp();
+            if alpha0 < 0.1 {
+                alpha0 = 0.1;
+            }
+            if alpha0 > 1.0 {
+                alpha0 = 1.0;
+            }
+            let old_n = (2.0 - alpha0) / alpha0;
+            let new_n = (sc - fc) as f64 * ((old_n - 1.0) / (sc as f64 - 1.0)) + fc as f64;
+            let mut alpha = 2.0 / (new_n + 1.0);
+            if alpha < sc_floor {
+                alpha = sc_floor;
+            }
+            if alpha > 1.0 {
+                alpha = 1.0;
+            }
+            out[i] = frama_stable_update_f64_v2(close[i], out[i - 1], alpha);
+        }
+        out
+    }
+
+    fn frama_finite_segments_reference(
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        window: usize,
+        sc: usize,
+        fc: usize,
+    ) -> Vec<f64> {
+        let mut out = vec![frama_canonical_nan_f64_v3(); close.len()];
+        let mut cursor = 0usize;
+        while cursor < close.len() {
+            if !frama_is_finite_triplet_v3(high[cursor], low[cursor], close[cursor]) {
+                cursor += 1;
+                continue;
+            }
+            let segment_start = cursor;
+            while cursor < close.len()
+                && frama_is_finite_triplet_v3(high[cursor], low[cursor], close[cursor])
+            {
+                cursor += 1;
+            }
+            let segment_end = cursor;
+            let even_window = if window & 1 == 1 { window + 1 } else { window };
+            if segment_end - segment_start >= even_window {
+                let segment = frama_direct_halves_reference(
+                    &high[segment_start..segment_end],
+                    &low[segment_start..segment_end],
+                    &close[segment_start..segment_end],
+                    window,
+                    sc,
+                    fc,
+                );
+                out[segment_start..segment_end].copy_from_slice(&segment);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn frama_f64_finite_segments_match_fresh_direct_runs_across_routes_and_windows() {
+        const LEN: usize = 1_000;
+        const QNAN: f64 = f64::from_bits(0x7ff8_0000_0000_0000);
+        let mut high = Vec::with_capacity(LEN);
+        let mut low = Vec::with_capacity(LEN);
+        let mut close = Vec::with_capacity(LEN);
+        for row in 0..LEN {
+            let center = 1.075 + row as f64 * 0.000_000_7 + ((row % 17) as f64 - 8.0) * 0.000_003;
+            high.push(center + 0.000_08 + (row % 7) as f64 * 0.000_001);
+            low.push(center - 0.000_07 - (row % 5) as f64 * 0.000_001);
+            close.push(center + ((row % 11) as f64 - 5.0) * 0.000_002);
+        }
+        high[250] = QNAN;
+        close[600] = f64::INFINITY;
+        low[850] = f64::NEG_INFINITY;
+
+        for window in [7, 21, 34, 50, 100, 200] {
+            let expected = frama_finite_segments_reference(&high, &low, &close, window, 300, 1);
+            let params = FramaParams {
+                window: Some(window),
+                sc: Some(300),
+                fc: Some(1),
+            };
+            let direct = frama_with_kernel(
+                &FramaInput::from_slices(&high, &low, &close, params.clone()),
+                Kernel::Scalar,
+            )
+            .expect("finite-segment fixture is a valid direct input");
+            let batch = frama_batch_with_kernel(
+                &high,
+                &low,
+                &close,
+                &FramaBatchRange {
+                    window: (window, window, 0),
+                    sc: (300, 300, 0),
+                    fc: (1, 1, 0),
+                },
+                Kernel::ScalarBatch,
+            )
+            .expect("finite-segment fixture is a valid batch input");
+            let mut stream = FramaStream::try_new(params).expect("stream parameters are valid");
+            let mut streamed = vec![frama_canonical_nan_f64_v3(); LEN];
+            for row in 0..LEN {
+                if let Some(value) = stream.update(high[row], low[row], close[row]) {
+                    streamed[row] = value;
+                }
+            }
+
+            for row in 0..LEN {
+                let expected_bits = expected[row].to_bits();
+                assert_eq!(
+                    direct.values[row].to_bits(),
+                    expected_bits,
+                    "direct/deque mismatch at window {window}, row {row}"
+                );
+                assert_eq!(
+                    batch.values[row].to_bits(),
+                    expected_bits,
+                    "batch mismatch at window {window}, row {row}"
+                );
+                assert_eq!(
+                    streamed[row].to_bits(),
+                    expected_bits,
+                    "stream mismatch at window {window}, row {row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frama_large_window_deque_matches_direct_halves() {
+        const LEN: usize = 4096;
+        const WINDOW: usize = 200;
+        let waves = [
+            0.000_041, -0.000_027, 0.000_013, -0.000_036, 0.000_022, -0.000_009, 0.000_033,
+            -0.000_019, 0.000_006, -0.000_031, 0.000_017,
+        ];
+        let mut high = Vec::with_capacity(LEN);
+        let mut low = Vec::with_capacity(LEN);
+        let mut close = Vec::with_capacity(LEN);
+        for row in 0..LEN {
+            let drift = row as f64 * 0.000_000_7;
+            let open = 1.075 + drift;
+            let row_close = open + waves[row % waves.len()];
+            high.push(open.max(row_close) + 0.000_08 + (row % 7) as f64 * 0.000_001);
+            low.push(open.min(row_close) - 0.000_07 - (row % 5) as f64 * 0.000_001);
+            close.push(row_close);
+        }
+        let final_row = LEN - 1;
+        close[final_row] = f64::from_bits(close[final_row].to_bits() ^ 1);
+        high[final_row] = high[final_row].max(close[final_row] + 0.000_001);
+        low[final_row] = low[final_row].min(close[final_row] - 0.000_001);
+
+        let expected = frama_direct_halves_reference(&high, &low, &close, WINDOW, 300, 1);
+        let input = FramaInput::from_slices(
+            &high,
+            &low,
+            &close,
+            FramaParams {
+                window: Some(WINDOW),
+                sc: Some(300),
+                fc: Some(1),
+            },
+        );
+        let actual = frama_with_kernel(&input, Kernel::Scalar)
+            .expect("large-window scalar route should accept the deterministic fixture");
+        let batch = frama_batch_with_kernel(
+            &high,
+            &low,
+            &close,
+            &FramaBatchRange {
+                window: (WINDOW, WINDOW, 0),
+                sc: (300, 300, 0),
+                fc: (1, 1, 0),
+            },
+            Kernel::ScalarBatch,
+        )
+        .expect("large-window batch route should accept the deterministic fixture");
+        assert_eq!(batch.rows, 1);
+        let batch_values = &batch.values[..LEN];
+
+        for row in (WINDOW - 1)..LEN {
+            assert_eq!(
+                actual.values[row].to_bits(),
+                expected[row].to_bits(),
+                "large-window deque drifted from the direct halves at row {row}: actual={:#018x}, expected={:#018x}",
+                actual.values[row].to_bits(),
+                expected[row].to_bits(),
+            );
+            assert_eq!(
+                batch_values[row].to_bits(),
+                expected[row].to_bits(),
+                "large-window batch deque drifted from the direct halves at row {row}",
+            );
+        }
+    }
+
+    #[test]
+    fn frama_large_window_deque_supports_public_maximum_and_odd_rounding() {
+        const LEN: usize = 1300;
+        let close = (0..LEN)
+            .map(|row| 10_000.0 - row as f64 * 0.25)
+            .collect::<Vec<_>>();
+        let high = close
+            .iter()
+            .enumerate()
+            .map(|(row, value)| value + 1.0 + (row % 3) as f64 * 0.001)
+            .collect::<Vec<_>>();
+        let low = close
+            .iter()
+            .enumerate()
+            .map(|(row, value)| value - 1.0 - (row % 5) as f64 * 0.001)
+            .collect::<Vec<_>>();
+
+        for requested_window in [1023, 1024] {
+            let expected =
+                frama_direct_halves_reference(&high, &low, &close, requested_window, 300, 1);
+            let actual = frama_with_kernel(
+                &FramaInput::from_slices(
+                    &high,
+                    &low,
+                    &close,
+                    FramaParams {
+                        window: Some(requested_window),
+                        sc: Some(300),
+                        fc: Some(1),
+                    },
+                ),
+                Kernel::Scalar,
+            )
+            .expect("public maximum/evenized large window should remain supported");
+            for row in 1023..LEN {
+                assert_eq!(
+                    actual.values[row].to_bits(),
+                    expected[row].to_bits(),
+                    "large-window deque drifted at requested window {requested_window}, row {row}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frama_evenized_window_cap_rejects_before_safe_route_allocation_or_dispatch() {
+        const LEN: usize = 1026;
+        assert_eq!(FRAMA_MAX_WINDOW, 1024);
+
+        let high = vec![2.0; LEN];
+        let low = vec![0.0; LEN];
+        let close = vec![1.0; LEN];
+
+        for window in [1025, usize::MAX] {
+            let params = FramaParams {
+                window: Some(window),
+                sc: Some(300),
+                fc: Some(1),
+            };
+            assert!(matches!(
+                frama_with_kernel(
+                    &FramaInput::from_slices(&high, &low, &close, params.clone()),
+                    Kernel::Scalar,
+                ),
+                Err(FramaError::InvalidWindow { window: rejected, .. }) if rejected == window
+            ));
+            assert!(matches!(
+                frama_scalar(&high, &low, &close, window, 300, 1, 0, LEN),
+                Err(FramaError::InvalidWindow { window: rejected, .. }) if rejected == window
+            ));
+
+            let sweep = FramaBatchRange {
+                window: (window, window, 0),
+                sc: (300, 300, 0),
+                fc: (1, 1, 0),
+            };
+            assert!(matches!(
+                frama_batch_slice(&high, &low, &close, &sweep, Kernel::Scalar),
+                Err(FramaError::InvalidWindow { window: rejected, .. }) if rejected == window
+            ));
+
+            let mut into = vec![0.25; LEN];
+            assert!(matches!(
+                frama_batch_inner_into(
+                    &high,
+                    &low,
+                    &close,
+                    &sweep,
+                    Kernel::Scalar,
+                    false,
+                    &mut into,
+                ),
+                Err(FramaError::InvalidWindow { window: rejected, .. }) if rejected == window
+            ));
+            assert!(
+                into.iter()
+                    .all(|value| value.to_bits() == 0.25f64.to_bits())
+            );
+
+            assert!(matches!(
+                FramaStream::try_new(params),
+                Err(FramaError::InvalidWindow { window: rejected, .. }) if rejected == window
+            ));
+        }
+    }
+
+    #[test]
+    fn frama_batch_admission_rejects_before_allocation_or_indexing() {
+        const LEN: usize = 64;
+        let sweep = FramaBatchRange {
+            window: (4, 4, 0),
+            sc: (300, 300, 0),
+            fc: (1, 1, 0),
+        };
+
+        let all_nonfinite = vec![f64::NAN; LEN];
+        for _ in 0..64 {
+            assert!(matches!(
+                frama_batch_slice(
+                    &all_nonfinite,
+                    &all_nonfinite,
+                    &all_nonfinite,
+                    &sweep,
+                    Kernel::Scalar,
+                ),
+                Err(FramaError::AllValuesNaN)
+            ));
+        }
+
+        let mut late_finite = vec![f64::NAN; LEN];
+        late_finite[LEN - 1] = 1.0;
+        assert!(matches!(
+            frama_batch_slice(
+                &late_finite,
+                &late_finite,
+                &late_finite,
+                &sweep,
+                Kernel::Scalar,
+            ),
+            Err(FramaError::NotEnoughValidData {
+                needed: 4,
+                valid: 1,
+            })
+        ));
+
+        assert!(matches!(
+            frama_batch_slice(
+                &vec![2.0; LEN],
+                &vec![0.0; LEN - 1],
+                &vec![1.0; LEN],
+                &sweep,
+                Kernel::Scalar,
+            ),
+            Err(FramaError::MismatchedInputLength {
+                high: LEN,
+                low,
+                close: LEN,
+            }) if low == LEN - 1
+        ));
+    }
+
     fn check_frama_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = FramaParams {
             window: None,
             sc: None,
@@ -1934,8 +1900,8 @@ mod tests {
     }
     fn check_frama_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = FramaInput::from_candles(&candles, FramaParams::default());
         let result = frama_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -2050,8 +2016,8 @@ mod tests {
 
     fn check_frama_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = FramaParams::default();
         let first_input = FramaInput::from_candles(&candles, params.clone());
@@ -2070,8 +2036,8 @@ mod tests {
 
     fn check_frama_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = FramaInput::from_candles(&candles, FramaParams::default());
         let res = frama_with_kernel(&input, kernel)?;
         if res.values.len() > 240 {
@@ -2090,8 +2056,8 @@ mod tests {
     fn check_frama_property(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let high = candles.select_candle_field("high").unwrap();
         let low = candles.select_candle_field("low").unwrap();
         let close = candles.select_candle_field("close").unwrap();
@@ -2216,8 +2182,8 @@ mod tests {
     }
     fn check_frama_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let high = candles.select_candle_field("high").unwrap();
         let low = candles.select_candle_field("low").unwrap();
         let close = candles.select_candle_field("close").unwrap();
@@ -2266,8 +2232,8 @@ mod tests {
     }
     fn check_frama_default_candles(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = FramaInput::with_default_candles(&c);
         match input.data {
             FramaData::Candles { .. } => {}
@@ -2282,8 +2248,8 @@ mod tests {
     fn check_frama_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_cases = vec![
             FramaParams::default(),
@@ -2415,8 +2381,8 @@ mod tests {
     );
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = FramaBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
         let def = FramaParams::default();
         let row = output.values_for(&def).expect("default row missing");
@@ -2442,8 +2408,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             ((4, 8, 2), (100, 300, 100), (1, 2, 1)),
@@ -2530,21 +2496,16 @@ mod tests {
 
     #[test]
     fn test_frama_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = FramaInput::with_default_candles(&candles);
         let baseline = frama(&input)?.values;
 
         let mut out = vec![0.0; candles.close.len()];
 
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             frama_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            frama_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(out.len(), baseline.len());
@@ -2560,546 +2521,6 @@ mod tests {
         Ok(())
     }
 }
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::frama_wrapper::CudaFramaBatchPlan;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::{CopyDestination, DeviceBuffer};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Frama", unsendable)]
-pub struct DeviceArrayF32FramaPy {
-    pub(crate) inner: DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32FramaPy {
-    #[new]
-    fn py_new() -> PyResult<Self> {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "use CUDA FRAMA factory functions to create this object",
-        ))
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let item = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * item, item))?;
-        let size = self.inner.rows.saturating_mul(self.inner.cols);
-        let ptr_val: usize = if size == 0 {
-            0
-        } else {
-            self.inner.buf.as_device_ptr().as_raw() as usize
-        };
-        d.set_item("data", (ptr_val, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32FramaPy {
-    pub fn new(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "FramaCudaBatchPlan", unsendable)]
-pub struct FramaCudaBatchPlanPy {
-    cuda: CudaFrama,
-    plan: CudaFramaBatchPlan,
-    _ctx_guard: Arc<Context>,
-    device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl FramaCudaBatchPlanPy {
-    #[getter]
-    fn rows(&self) -> usize {
-        self.plan.rows()
-    }
-
-    #[getter]
-    fn cols(&self) -> usize {
-        self.plan.cols()
-    }
-
-    #[getter]
-    fn device_id(&self) -> u32 {
-        self.device_id
-    }
-
-    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        let windows: Vec<u64> = self
-            .plan
-            .params()
-            .iter()
-            .map(|c| c.window.unwrap() as u64)
-            .collect();
-        let scs: Vec<u64> = self
-            .plan
-            .params()
-            .iter()
-            .map(|c| c.sc.unwrap() as u64)
-            .collect();
-        let fcs: Vec<u64> = self
-            .plan
-            .params()
-            .iter()
-            .map(|c| c.fc.unwrap() as u64)
-            .collect();
-        dict.set_item("windows", windows.into_pyarray(py))?;
-        dict.set_item("scs", scs.into_pyarray(py))?;
-        dict.set_item("fcs", fcs.into_pyarray(py))?;
-        dict.set_item("rows", self.plan.rows())?;
-        dict.set_item("cols", self.plan.cols())?;
-        Ok(dict)
-    }
-
-    fn execute<'py>(
-        &mut self,
-        py: Python<'py>,
-        high_f32: numpy::PyReadonlyArray1<'py, f32>,
-        low_f32: numpy::PyReadonlyArray1<'py, f32>,
-        close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let high = high_f32.as_slice()?;
-        let low = low_f32.as_slice()?;
-        let close = close_f32.as_slice()?;
-        let rows = self.plan.rows();
-        let cols = self.plan.cols();
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("frama CUDA plan rows*cols overflow"))?;
-        let values = py.allow_threads(|| -> PyResult<Vec<f32>> {
-            let d_high =
-                DeviceBuffer::from_slice(high).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let d_low =
-                DeviceBuffer::from_slice(low).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let d_close = DeviceBuffer::from_slice(close)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            self.cuda
-                .launch_frama_batch_plan(&d_high, &d_low, &d_close, &mut self.plan)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            self.cuda
-                .synchronize()
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let mut values = vec![0f32; total];
-            self.plan
-                .output()
-                .copy_to(&mut values)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok(values)
-        })?;
-        let dict = self.metadata(py)?;
-        let arr = values.into_pyarray(py);
-        dict.set_item("values", arr.reshape((rows, cols))?)?;
-        Ok(dict)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "frama_cuda_batch_plan_create")]
-#[pyo3(signature = (series_len, first_valid, window_range, sc_range, fc_range, device_id=0))]
-pub fn frama_cuda_batch_plan_create_py(
-    py: Python<'_>,
-    series_len: usize,
-    first_valid: usize,
-    window_range: (usize, usize, usize),
-    sc_range: (usize, usize, usize),
-    fc_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<FramaCudaBatchPlanPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let sweep = FramaBatchRange {
-        window: window_range,
-        sc: sc_range,
-        fc: fc_range,
-    };
-    let (cuda, plan, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaFrama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let plan = cuda
-            .prepare_frama_batch_plan(series_len, first_valid, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((cuda, plan, ctx, dev_id))
-    })?;
-    Ok(FramaCudaBatchPlanPy {
-        cuda,
-        plan,
-        _ctx_guard: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "frama")]
-#[pyo3(signature = (high, low, close, window, sc=300, fc=1, kernel=None))]
-pub fn frama_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    window: usize,
-    sc: usize,
-    fc: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let params = FramaParams {
-        window: Some(window),
-        sc: Some(sc),
-        fc: Some(fc),
-    };
-    let input = FramaInput::from_slices(h, l, c, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    let out: Vec<f64> = py
-        .allow_threads(|| frama_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(out.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "frama_batch")]
-#[pyo3(signature = (high, low, close, window_range, sc_range, fc_range, kernel=None))]
-pub fn frama_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    window_range: (usize, usize, usize),
-    sc_range: (usize, usize, usize),
-    fc_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let range = FramaBatchRange {
-        window: window_range,
-        sc: sc_range,
-        fc: fc_range,
-    };
-
-    let combos = expand_grid(&range);
-    let rows = combos.len();
-    let cols = close_slice.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos_result = py
-        .allow_threads(|| -> Result<Vec<FramaParams>, FramaError> {
-            let kernel = match kern {
-                Kernel::Auto => match detect_best_batch_kernel() {
-                    Kernel::Avx512Batch => Kernel::Avx2Batch,
-                    other => other,
-                },
-                k => k,
-            };
-
-            let single_kernel = match kernel {
-                Kernel::ScalarBatch => Kernel::Scalar,
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx2Batch => Kernel::Avx2,
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx512Batch => Kernel::Avx512,
-                _ => Kernel::Scalar,
-            };
-
-            let first = close_slice
-                .iter()
-                .enumerate()
-                .find(|(i, &v)| !v.is_nan() && !high_slice[*i].is_nan() && !low_slice[*i].is_nan())
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-
-            for (row_idx, combo) in combos.iter().enumerate() {
-                let window = combo.window.unwrap_or(10);
-                let warmup_period = first + window - 1;
-                let row_start = row_idx * cols;
-                for col_idx in 0..warmup_period.min(cols) {
-                    slice_out[row_start + col_idx] = f64::NAN;
-                }
-            }
-
-            frama_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &range,
-                single_kernel,
-                true,
-                slice_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-
-    let windows: Vec<u64> = combos_result
-        .iter()
-        .map(|c| c.window.unwrap_or(10) as u64)
-        .collect();
-    let scs: Vec<u64> = combos_result
-        .iter()
-        .map(|c| c.sc.unwrap_or(300) as u64)
-        .collect();
-    let fcs: Vec<u64> = combos_result
-        .iter()
-        .map(|c| c.fc.unwrap_or(1) as u64)
-        .collect();
-
-    dict.set_item("windows", windows.into_pyarray(py))?;
-    dict.set_item("scs", scs.into_pyarray(py))?;
-    dict.set_item("fcs", fcs.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "frama_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, window_range, sc_range, fc_range, device_id=0))]
-pub fn frama_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    window_range: (usize, usize, usize),
-    sc_range: (usize, usize, usize),
-    fc_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32FramaPy, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    use numpy::IntoPyArray;
-    use pyo3::types::PyDict;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high_slice = high_f32.as_slice()?;
-    let low_slice = low_f32.as_slice()?;
-    let close_slice = close_f32.as_slice()?;
-    if high_slice.len() != low_slice.len() || high_slice.len() != close_slice.len() {
-        return Err(PyValueError::new_err("mismatched slice lengths"));
-    }
-
-    let sweep = FramaBatchRange {
-        window: window_range,
-        sc: sc_range,
-        fc: fc_range,
-    };
-
-    let (inner, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaFrama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        cuda.frama_batch_dev(high_slice, low_slice, close_slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-            .map(|(d, c)| (d, c, ctx, dev_id))
-    })?;
-
-    let dict = PyDict::new(py);
-    let windows: Vec<u64> = combos.iter().map(|c| c.window.unwrap() as u64).collect();
-    let scs: Vec<u64> = combos.iter().map(|c| c.sc.unwrap() as u64).collect();
-    let fcs: Vec<u64> = combos.iter().map(|c| c.fc.unwrap() as u64).collect();
-    dict.set_item("windows", windows.into_pyarray(py))?;
-    dict.set_item("scs", scs.into_pyarray(py))?;
-    dict.set_item("fcs", fcs.into_pyarray(py))?;
-
-    Ok((DeviceArrayF32FramaPy::new(inner, ctx, dev_id), dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "frama_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, window, sc, fc, device_id=0))]
-pub fn frama_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    window: usize,
-    sc: usize,
-    fc: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32FramaPy> {
-    use crate::cuda::cuda_available;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high_shape = high_tm_f32.shape();
-    let low_shape = low_tm_f32.shape();
-    let close_shape = close_tm_f32.shape();
-    if low_shape != high_shape || close_shape != high_shape {
-        return Err(PyValueError::new_err(
-            "high, low, and close arrays must share the same shape",
-        ));
-    }
-
-    let rows = high_shape[0];
-    let cols = high_shape[1];
-    let high_slice = high_tm_f32.as_slice()?;
-    let low_slice = low_tm_f32.as_slice()?;
-    let close_slice = close_tm_f32.as_slice()?;
-
-    let params = FramaParams {
-        window: Some(window),
-        sc: Some(sc),
-        fc: Some(fc),
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaFrama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        cuda.frama_many_series_one_param_time_major_dev(
-            high_slice,
-            low_slice,
-            close_slice,
-            cols,
-            rows,
-            &params,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))
-        .map(|d| (d, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32FramaPy::new(inner, ctx, dev_id))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "FramaStream")]
-pub struct FramaStreamPy {
-    inner: FramaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl FramaStreamPy {
-    #[new]
-    fn new(window: usize, sc: usize, fc: usize) -> PyResult<Self> {
-        Ok(Self {
-            inner: FramaStream::try_new(FramaParams {
-                window: Some(window),
-                sc: Some(sc),
-                fc: Some(fc),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.inner.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[inline]
 pub fn frama_into_slice(
@@ -3132,327 +2553,4 @@ pub fn frama_into_slice(
     )?;
 
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn frama_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    window: usize,
-    sc: usize,
-    fc: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let input = FramaInput::from_slices(
-        high,
-        low,
-        close,
-        FramaParams {
-            window: Some(window),
-            sc: Some(sc),
-            fc: Some(fc),
-        },
-    );
-
-    let ((h, l, c), window, sc, fc, first, len, _warm, _chosen) =
-        frama_prepare(&input, Kernel::Scalar).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut out = vec![f64::NAN; len];
-
-    let mut stream = FramaStream::try_new(FramaParams {
-        window: Some(window),
-        sc: Some(sc),
-        fc: Some(fc),
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    for i in first..len {
-        if let Some(v) = stream.update(h[i], l[i], c[i]) {
-            out[i] = v;
-        }
-    }
-
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn frama_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    window_start: usize,
-    window_end: usize,
-    window_step: usize,
-    sc_start: usize,
-    sc_end: usize,
-    sc_step: usize,
-    fc_start: usize,
-    fc_end: usize,
-    fc_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let range = FramaBatchRange {
-        window: (window_start, window_end, window_step),
-        sc: (sc_start, sc_end, sc_step),
-        fc: (fc_start, fc_end, fc_step),
-    };
-
-    let combos = expand_grid(&range);
-    if combos.is_empty() {
-        return Err(JsValue::from_str(
-            &FramaError::InvalidRange {
-                start: window_start,
-                end: window_end,
-                step: window_step,
-            }
-            .to_string(),
-        ));
-    }
-
-    let cols = close.len();
-    let rows = combos.len();
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        JsValue::from_str(
-            &FramaError::ArithmeticOverflow {
-                context: "rows*cols",
-            }
-            .to_string(),
-        )
-    })?;
-    let mut out = vec![f64::NAN; total];
-
-    for (row, p) in combos.iter().enumerate() {
-        let window = p.window.unwrap_or(10);
-        let sc = p.sc.unwrap_or(300);
-        let fc = p.fc.unwrap_or(1);
-
-        let row_out = &mut out[row * cols..(row + 1) * cols];
-        let input = FramaInput::from_slices(
-            high,
-            low,
-            close,
-            FramaParams {
-                window: Some(window),
-                sc: Some(sc),
-                fc: Some(fc),
-            },
-        );
-        let ((h, l, c), window, sc, fc, first, len, _warm, _chosen) =
-            frama_prepare(&input, Kernel::Scalar).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        if row_out.len() != len {
-            return Err(JsValue::from_str(
-                &FramaError::OutputLengthMismatch {
-                    expected: len,
-                    got: row_out.len(),
-                }
-                .to_string(),
-            ));
-        }
-
-        let mut stream = FramaStream::try_new(FramaParams {
-            window: Some(window),
-            sc: Some(sc),
-            fc: Some(fc),
-        })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        for i in first..len {
-            if let Some(v) = stream.update(h[i], l[i], c[i]) {
-                row_out[i] = v;
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn frama_batch_metadata_js(
-    window_start: usize,
-    window_end: usize,
-    window_step: usize,
-    sc_start: usize,
-    sc_end: usize,
-    sc_step: usize,
-    fc_start: usize,
-    fc_end: usize,
-    fc_step: usize,
-) -> Vec<usize> {
-    let range = FramaBatchRange {
-        window: (window_start, window_end, window_step),
-        sc: (sc_start, sc_end, sc_step),
-        fc: (fc_start, fc_end, fc_step),
-    };
-
-    let combos = expand_grid(&range);
-    let mut metadata = Vec::with_capacity(combos.len() * 3);
-
-    for combo in combos {
-        metadata.push(combo.window.unwrap_or(10));
-        metadata.push(combo.sc.unwrap_or(300));
-        metadata.push(combo.fc.unwrap_or(1));
-    }
-
-    metadata
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn frama_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn frama_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = frama_into)]
-pub fn frama_into_js(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    window: usize,
-    sc: usize,
-    fc: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-        let input = FramaInput::from_slices(
-            h,
-            l,
-            c,
-            FramaParams {
-                window: Some(window),
-                sc: Some(sc),
-                fc: Some(fc),
-            },
-        );
-
-        if out_ptr as *const f64 == high_ptr
-            || out_ptr as *const f64 == low_ptr
-            || out_ptr as *const f64 == close_ptr
-        {
-            let mut tmp = vec![0.0; len];
-            frama_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            out.copy_from_slice(&tmp);
-        } else {
-            frama_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FramaBatchConfig {
-    pub window_range: (usize, usize, usize),
-    pub sc_range: (usize, usize, usize),
-    pub fc_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct FramaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<FramaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = frama_batch)]
-pub fn frama_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: FramaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = FramaBatchRange {
-        window: config.window_range,
-        sc: config.sc_range,
-        fc: config.fc_range,
-    };
-
-    let output = frama_batch_inner(high, low, close, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let result = FramaBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&result)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = frama_batch_into)]
-pub fn frama_batch_into_js(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    w0: usize,
-    w1: usize,
-    ws: usize,
-    s0: usize,
-    s1: usize,
-    ss: usize,
-    f0: usize,
-    f1: usize,
-    fs: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to frama_batch_into"));
-    }
-
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let sweep = FramaBatchRange {
-            window: (w0, w1, ws),
-            sc: (s0, s1, ss),
-            fc: (f0, f1, fs),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-        frama_batch_inner_into(h, l, c, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
 }

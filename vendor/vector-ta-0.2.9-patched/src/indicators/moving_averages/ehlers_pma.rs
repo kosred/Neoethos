@@ -1,31 +1,4 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, moving_averages::CudaEhlersPma};
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::{PyReadonlyArray2, PyUntypedArrayMethods};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{alloc_with_nan_prefix, detect_best_kernel};
 use std::convert::AsRef;
@@ -48,10 +21,6 @@ pub struct EhlersPmaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct EhlersPmaParams;
 
 impl Default for EhlersPmaParams {
@@ -113,93 +82,6 @@ impl<'a> EhlersPmaInput<'a> {
     #[inline]
     pub fn with_default_candles(c: &'a Candles) -> Self {
         Self::from_candles(c, "close", EhlersPmaParams::default())
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyo3::pyclass(module = "vector_ta", name = "EhlersPmaDeviceArrayF32", unsendable)]
-pub struct EhlersPmaDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-    pub(crate) stream: usize,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyo3::pymethods]
-impl EhlersPmaDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * core::mem::size_of::<f32>(),
-                core::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        mut slf: pyo3::PyRefMut<'py, Self>,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<pyo3::PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = slf.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        let dummy = cust::memory::DeviceBuffer::from_slice(&[])
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut slf.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
     }
 }
 
@@ -716,7 +598,6 @@ pub fn ehlers_pma_into_slices(
     ehlers_pma_into_slices_with_kernel(predict, trigger, input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ehlers_pma_into(
     input: &EhlersPmaInput,
@@ -1017,69 +898,6 @@ impl<const N: usize> RollingLwma<N> {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_pma")]
-#[pyo3(signature = (data, kernel=None))]
-pub fn ehlers_pma_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let slice = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let input = EhlersPmaInput::from_slice(slice, EhlersPmaParams::default());
-
-    let out = py
-        .allow_threads(|| ehlers_pma_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((out.predict.into_pyarray(py), out.trigger.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_pma_flat")]
-#[pyo3(signature = (data, kernel=None))]
-pub fn ehlers_pma_flat_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::PyArray1;
-    let slice = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let rows = 2usize;
-    let cols = slice.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let input = EhlersPmaInput::from_slice(slice, EhlersPmaParams::default());
-    py.allow_threads(|| ehlers_pma_into_flat_with_kernel(out_slice, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-
-    dict.set_item("lines", vec!["predict", "trigger"])?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ehlers_pma_batch")]
-#[pyo3(signature = (data, _period_range=(0,0,0), _offset_range=(0.0,0.0,0.0), _sigma_range=(0.0,0.0,0.0), kernel=None))]
-pub fn ehlers_pma_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    _period_range: (usize, usize, usize),
-    _offset_range: (f64, f64, f64),
-    _sigma_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    ehlers_pma_flat_py(py, data, kernel)
-}
-
 #[inline]
 fn usize_range_len(range: (usize, usize, usize)) -> Result<usize, EhlersPmaError> {
     let (start, end, step) = range;
@@ -1096,218 +914,19 @@ fn usize_range_len(range: (usize, usize, usize)) -> Result<usize, EhlersPmaError
     Ok(n)
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ehlers_pma_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range=(0,0,0), offset_range=(0.0,0.0,0.0), sigma_range=(0.0,0.0,0.0), device_id=0))]
-pub fn ehlers_pma_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    offset_range: (f64, f64, f64),
-    sigma_range: (f64, f64, f64),
-    device_id: usize,
-) -> PyResult<(EhlersPmaDeviceArrayF32Py, EhlersPmaDeviceArrayF32Py)> {
-    let _ = offset_range;
-    let _ = sigma_range;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let combos = usize_range_len(period_range)
-        .map_err(|_| PyValueError::new_err("invalid period sweep for ehlers_pma"))?;
-
-    let sweep = EhlersPmaBatchRange { combos };
-    let (predict, trigger, ctx_arc, dev_id, stream_handle) = py
-        .allow_threads(|| -> Result<_, crate::cuda::moving_averages::ehlers_pma_wrapper::CudaEhlersPmaError> {
-            let cuda = CudaEhlersPma::new(device_id)?;
-            let pair = cuda.ehlers_pma_batch_dev(slice_in, &sweep)?;
-            let ctx = cuda.context_arc();
-            let did = cuda.device_id();
-            let sh = cuda.stream_handle();
-            let crate::cuda::moving_averages::DeviceEhlersPmaPair { predict, trigger, .. } = pair;
-            Ok((predict, trigger, ctx, did, sh))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        EhlersPmaDeviceArrayF32Py {
-            inner: predict,
-            _ctx: ctx_arc.clone(),
-            device_id: dev_id,
-            stream: stream_handle,
-        },
-        EhlersPmaDeviceArrayF32Py {
-            inner: trigger,
-            _ctx: ctx_arc,
-            device_id: dev_id,
-            stream: stream_handle,
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ehlers_pma_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, device_id=0))]
-pub fn ehlers_pma_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    device_id: usize,
-) -> PyResult<(EhlersPmaDeviceArrayF32Py, EhlersPmaDeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected time-major 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-
-    let (predict, trigger, ctx_arc, dev_id, stream_handle) = py
-        .allow_threads(|| -> Result<_, crate::cuda::moving_averages::ehlers_pma_wrapper::CudaEhlersPmaError> {
-            let cuda = CudaEhlersPma::new(device_id)?;
-            let pair = cuda
-                .ehlers_pma_many_series_one_param_time_major_dev(flat, cols, rows)?;
-            let ctx = cuda.context_arc();
-            let did = cuda.device_id();
-            let sh = cuda.stream_handle();
-            let crate::cuda::moving_averages::DeviceEhlersPmaPair { predict, trigger, .. } = pair;
-            Ok((predict, trigger, ctx, did, sh))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        EhlersPmaDeviceArrayF32Py {
-            inner: predict,
-            _ctx: ctx_arc.clone(),
-            device_id: dev_id,
-            stream: stream_handle,
-        },
-        EhlersPmaDeviceArrayF32Py {
-            inner: trigger,
-            _ctx: ctx_arc,
-            device_id: dev_id,
-            stream: stream_handle,
-        },
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EhlersPmaStream")]
-pub struct EhlersPmaStreamPy {
-    stream: EhlersPmaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EhlersPmaStreamPy {
-    #[new]
-    #[pyo3(signature = (period=None, offset=None, sigma=None))]
-    fn new(period: Option<usize>, offset: Option<f64>, sigma: Option<f64>) -> PyResult<Self> {
-        let _ = (period, offset, sigma);
-        let stream = EhlersPmaStream::try_new(EhlersPmaParams::default())
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-
-    fn reset(&mut self) {
-        self.stream.reset();
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EhlersPmaJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_pma)]
-pub fn ehlers_pma_js(data: &[f64]) -> Result<JsValue, JsValue> {
-    let input = EhlersPmaInput::from_slice(data, EhlersPmaParams::default());
-    let mut values = vec![0.0_f64; 2 * data.len()];
-    let (rows, cols) =
-        ehlers_pma_into_flat(&mut values, &input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let result = EhlersPmaJsOutput { values, rows, cols };
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_pma_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(2 * len);
-    let ptr = v.as_mut_ptr();
-    core::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_pma_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ehlers_pma_into)]
-pub fn ehlers_pma_into_js(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(in_ptr, len);
-        let out = core::slice::from_raw_parts_mut(out_ptr, 2 * len);
-
-        if core::ptr::eq(in_ptr, out_ptr as *const f64) {
-            let mut tmp = vec![0.0f64; 2 * len];
-            let input = EhlersPmaInput::from_slice(data, EhlersPmaParams::default());
-            ehlers_pma_into_flat(&mut tmp, &input)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            out.copy_from_slice(&tmp);
-            return Ok(());
-        }
-
-        let input = EhlersPmaInput::from_slice(data, EhlersPmaParams::default());
-        ehlers_pma_into_flat(out, &input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ehlers_pma_output_into_js(data: &[f64], out: &js_sys::Object) -> Result<usize, JsValue> {
-    let value = ehlers_pma_js(data)?;
-    crate::write_wasm_object_f64_outputs("ehlers_pma_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
 
     fn check_ehlers_pma_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EhlersPmaInput::from_candles(&candles, "close", EhlersPmaParams::default());
 
         let out = ehlers_pma_with_kernel(&input, kernel)?;
@@ -1362,8 +981,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EhlersPmaInput::with_default_candles(&candles);
         match input.data {
@@ -1449,8 +1068,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EhlersPmaInput::from_candles(&candles, "hl2", EhlersPmaParams::default());
         let res = ehlers_pma_with_kernel(&input, kernel)?;
@@ -1483,8 +1102,8 @@ mod tests {
 
     fn check_ehlers_pma_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let hl2: Vec<f64> = candles
             .high
@@ -1557,8 +1176,8 @@ mod tests {
 
     fn check_ehlers_pma_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let hl2: Vec<f64> = candles
             .high
@@ -1583,8 +1202,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_ehlers_pma_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = EhlersPmaInput::from_candles(&candles, "hl2", EhlersPmaParams::default());
         let output = ehlers_pma_with_kernel(&input, kernel)?;
@@ -1850,9 +1469,9 @@ mod tests {
 
     #[test]
     fn check_ehlers_pma_into_slices_noalloc() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::utilities::data_loader::read_candles_from_csv;
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        use crate::utilities::data_loader::read_candles_from_vortex;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = EhlersPmaInput::with_default_candles(&c);
 
         let batch = ehlers_pma(&input).unwrap();

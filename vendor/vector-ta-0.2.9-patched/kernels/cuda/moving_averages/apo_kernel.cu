@@ -174,12 +174,12 @@ void apo_many_series_one_param_f32(const float* __restrict__ prices_tm,
 
 
 // =============================================================================
-// NeoEthos f64 lane — added in place, f64 end to end.
+// NeoEthos f64 lane â€” added in place, f64 end to end.
 //
 // CPU reference: src/indicators/apo.rs
-//   * `apo_prepare`  (:209) — first_valid = first non-NaN of the source series.
-//   * `apo_with_kernel` (:278) — warmup prefix is `first`, NOT first + long.
-//   * `apo_scalar`   (:311) — the arithmetic this reproduces.
+//   * `apo_prepare`  (:209) â€” first_valid = first non-NaN of the source series.
+//   * `apo_with_kernel` (:278) â€” warmup prefix is `first`, NOT first + long.
+//   * `apo_scalar`   (:311) â€” the arithmetic this reproduces.
 //
 // PERIOD-INVARIANT. `compute_apo_batch` (cpu_batch.rs:3374) reads
 // `short_period` (default 10) and `long_period` (default 20) and NEVER reads
@@ -189,7 +189,7 @@ void apo_many_series_one_param_f32(const float* __restrict__ prices_tm,
 //
 // ROUNDING COUNT. The CPU line is
 //     se = alpha_s * p0 + oma_s * se;
-// — TWO multiplies and ONE add, three roundings, and it is NOT `mul_add`.
+// â€” TWO multiplies and ONE add, three roundings, and it is NOT `mul_add`.
 // Reproduced literally; `-fmad=false` on this translation unit is what stops
 // nvcc contracting the multiply-add behind our back and silently producing a
 // DIFFERENT number from the CPU.
@@ -260,13 +260,14 @@ void neoethos_apo_f64(const double* __restrict__ prices,
 // the opt-out can be correct: the f32 and f64 entry points share one
 // translation unit and nvcc has no per-entry flag.
 //
-// CPU reference: src/indicators/apo.rs -- `apo_scalar` (:311), `apo_prepare` (:209), `apo_with_kernel` (:278)
+// Creator source oracle (the exact vendored release commit):
+// https://raw.githubusercontent.com/VectorAlpha-dev/VectorTA/e6197777837a18b88e43ce5c163b2e0023f73a2a/src/indicators/apo.rs
+// CPU reference: src/indicators/apo.rs -- `apo_scalar`, `apo_prepare`, `apo_with_kernel`
 //
-// PERIOD-INVARIANT. `compute_apo_batch` (cpu_batch.rs:3357) reads
-// `short_period` (default 10) and `long_period` (default 20) and NEVER reads
-// `period`, so every row of a period sweep is byte-identical -- exactly as
-// `tsi`/`obv` already are in this lane. The swept `periods[r]` is deliberately
-// not consulted; consulting it would compute something the CPU never computes.
+// PARAMETER ROUTING. NeoEthos' generic f64 ABI carries the sweep's long-period
+// anchor in periods[r]. The CPU plan scales VectorTA's 10:20 tuple with positive
+// integer half-up rounding. Thus 7/21/50/100/200 map to short
+// 4/11/25/50/100, while VectorTA's first-valid seeding remains unchanged.
 //
 // ARITHMETIC ORDER: the CPU line is `se = alpha_s * p0 + oma_s * se` -- two
 // multiplies and one add, THREE roundings, and NO `mul_add`. It is reproduced
@@ -305,10 +306,10 @@ extern "C" __global__ void neoethos_apo_batch_f64(
     if (r >= n_combos) return;
     double* __restrict__ row = out + (size_t)r * (size_t)n;
 
-    // `ApoParams::default()` -- apo.rs:73-74.
-    const int short_p = 10;
-    const int long_p  = 20;
-    (void)periods;
+    const int long_p = periods[r];
+    const long long scaled_short =
+        (10LL * (long long)long_p + 10LL) / 20LL;
+    const int short_p = (scaled_short < 1LL) ? 1 : (int)scaled_short;
 
     // Every branch of `apo_prepare` that returns Err, in its order.
     const bool declined =

@@ -46,6 +46,9 @@ fn parent_assignment_parser_is_strict_and_accepts_both_cli_forms() {
 #[test]
 fn trace_rejects_duplicate_or_backward_startup_events() {
     let mut trace = StartupTrace::default();
+    trace
+        .record(StartupEvent::ImportSignalPreflightCompleted)
+        .unwrap();
     trace.record(StartupEvent::ConfigurationLoaded).unwrap();
     trace.record(StartupEvent::ParentCpuCapParsed).unwrap();
     assert!(
@@ -69,6 +72,9 @@ fn diagnostics_report_the_reclamped_parent_budget_without_double_subtraction() {
     };
     let installed = install_process_budget(request).unwrap();
     let mut trace = StartupTrace::default();
+    trace
+        .record(StartupEvent::ImportSignalPreflightCompleted)
+        .unwrap();
     trace.record(StartupEvent::ParentCpuCapParsed).unwrap();
     trace.record(StartupEvent::CpuBudgetResolved).unwrap();
     trace.record(StartupEvent::CpuBudgetInstalled).unwrap();
@@ -92,6 +98,7 @@ fn diagnostics_report_the_reclamped_parent_budget_without_double_subtraction() {
     assert!(line.contains("runtime_kind=tokio"));
     assert!(line.contains("runtime_worker_threads=4"));
     assert!(line.contains(
-        "events=parent_cpu_cap_parsed,cpu_budget_resolved,cpu_budget_installed,tokio_runtime_built"
+        "events=import_signal_preflight_completed,parent_cpu_cap_parsed,cpu_budget_resolved,\
+         cpu_budget_installed,tokio_runtime_built"
     ));
 }

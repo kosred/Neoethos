@@ -190,7 +190,11 @@ mod tests {
     fn every_entry_is_actionable() {
         assert!(!RETIRED.is_empty(), "the tombstone list must not be empty");
         for e in RETIRED {
-            assert!(e.name.starts_with("NEOETHOS_"), "unexpected name {}", e.name);
+            assert!(
+                e.name.starts_with("NEOETHOS_"),
+                "unexpected name {}",
+                e.name
+            );
             assert!(
                 !e.used_to.trim().is_empty(),
                 "{} has no `used_to` clause — the notice would be unactionable",

@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -62,10 +46,6 @@ pub enum HistoricalVolatilityPercentileOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct HistoricalVolatilityPercentileParams {
     pub length: Option<usize>,
     pub annual_length: Option<usize>,
@@ -212,15 +192,21 @@ pub enum HistoricalVolatilityPercentileError {
     EmptyInputData,
     #[error("historical_volatility_percentile: All source values are invalid.")]
     AllValuesNaN,
-    #[error("historical_volatility_percentile: Invalid length: length = {length}, data length = {data_len}")]
+    #[error(
+        "historical_volatility_percentile: Invalid length: length = {length}, data length = {data_len}"
+    )]
     InvalidLength { length: usize, data_len: usize },
     #[error(
         "historical_volatility_percentile: Invalid annual length: annual_length = {annual_length}"
     )]
     InvalidAnnualLength { annual_length: usize },
-    #[error("historical_volatility_percentile: Not enough valid data: needed = {needed}, valid = {valid}")]
+    #[error(
+        "historical_volatility_percentile: Not enough valid data: needed = {needed}, valid = {valid}"
+    )]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("historical_volatility_percentile: Output length mismatch: expected = {expected}, got = {got}")]
+    #[error(
+        "historical_volatility_percentile: Output length mismatch: expected = {expected}, got = {got}"
+    )]
     OutputLengthMismatch { expected: usize, got: usize },
     #[error(
         "historical_volatility_percentile: Invalid range: start={start}, end={end}, step={step}"
@@ -548,7 +534,6 @@ pub fn historical_volatility_percentile_output_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn historical_volatility_percentile_into(
     input: &HistoricalVolatilityPercentileInput,
@@ -832,13 +817,6 @@ impl HistoricalVolatilityPercentileBatchBuilder {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HistoricalVolatilityPercentileBatchConfig {
-    pub length_range: Vec<usize>,
-    pub annual_length_range: Vec<usize>,
-}
-
 #[derive(Clone, Debug)]
 pub struct HistoricalVolatilityPercentileBatchOutput {
     pub hvp: Vec<f64>,
@@ -953,7 +931,7 @@ pub fn historical_volatility_percentile_batch_with_kernel(
         other => {
             return Err(HistoricalVolatilityPercentileError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
     historical_volatility_percentile_batch_par_slice(data, sweep, batch.to_non_batch())
@@ -1186,388 +1164,6 @@ fn historical_volatility_percentile_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "historical_volatility_percentile")]
-#[pyo3(signature = (data, length=21, annual_length=252, kernel=None))]
-pub fn historical_volatility_percentile_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length: usize,
-    annual_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let data = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let params = HistoricalVolatilityPercentileParams {
-        length: Some(length),
-        annual_length: Some(annual_length),
-    };
-    let input = HistoricalVolatilityPercentileInput::from_slice(data, params);
-    let output = py
-        .allow_threads(|| historical_volatility_percentile_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((output.hvp.into_pyarray(py), output.hvp_sma.into_pyarray(py)))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "HistoricalVolatilityPercentileStream")]
-pub struct HistoricalVolatilityPercentileStreamPy {
-    stream: HistoricalVolatilityPercentileStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl HistoricalVolatilityPercentileStreamPy {
-    #[new]
-    #[pyo3(signature = (length=21, annual_length=252))]
-    fn new(length: usize, annual_length: usize) -> PyResult<Self> {
-        let params = HistoricalVolatilityPercentileParams {
-            length: Some(length),
-            annual_length: Some(annual_length),
-        };
-        let stream = HistoricalVolatilityPercentileStream::try_new(params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "historical_volatility_percentile_batch")]
-#[pyo3(signature = (data, length_range, annual_length_range, kernel=None))]
-pub fn historical_volatility_percentile_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    annual_length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let sweep = HistoricalVolatilityPercentileBatchRange {
-        length: length_range,
-        annual_length: annual_length_range,
-    };
-    let combos = expand_grid_historical_volatility_percentile(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let hvp_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let hvp_sma_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let hvp_out = unsafe { hvp_arr.as_slice_mut()? };
-    let hvp_sma_out = unsafe { hvp_sma_arr.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        historical_volatility_percentile_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel.to_non_batch(),
-            true,
-            hvp_out,
-            hvp_sma_out,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("hvp", hvp_arr.reshape((rows, cols))?)?;
-    dict.set_item("hvp_sma", hvp_sma_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap_or(21) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "annual_lengths",
-        combos
-            .iter()
-            .map(|p| p.annual_length.unwrap_or(252) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_historical_volatility_percentile_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(historical_volatility_percentile_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        historical_volatility_percentile_batch_py,
-        m
-    )?)?;
-    m.add_class::<HistoricalVolatilityPercentileStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "historical_volatility_percentile_js")]
-pub fn historical_volatility_percentile_js(
-    data: &[f64],
-    length: usize,
-    annual_length: usize,
-) -> Result<JsValue, JsValue> {
-    let params = HistoricalVolatilityPercentileParams {
-        length: Some(length),
-        annual_length: Some(annual_length),
-    };
-    let input = HistoricalVolatilityPercentileInput::from_slice(data, params);
-    let mut hvp = vec![0.0; data.len()];
-    let mut hvp_sma = vec![0.0; data.len()];
-    historical_volatility_percentile_into_slice(&mut hvp, &mut hvp_sma, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("hvp"),
-        &serde_wasm_bindgen::to_value(&hvp).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("hvp_sma"),
-        &serde_wasm_bindgen::to_value(&hvp_sma).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "historical_volatility_percentile_batch_js")]
-pub fn historical_volatility_percentile_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: HistoricalVolatilityPercentileBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    if config.length_range.len() != 3 || config.annual_length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: ranges must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = HistoricalVolatilityPercentileBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-        annual_length: (
-            config.annual_length_range[0],
-            config.annual_length_range[1],
-            config.annual_length_range[2],
-        ),
-    };
-    let combos = expand_grid_historical_volatility_percentile(&sweep)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-    let mut hvp = vec![0.0; total];
-    let mut hvp_sma = vec![0.0; total];
-    historical_volatility_percentile_batch_inner_into(
-        data,
-        &sweep,
-        Kernel::Scalar,
-        false,
-        &mut hvp,
-        &mut hvp_sma,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("hvp"),
-        &serde_wasm_bindgen::to_value(&hvp).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("hvp_sma"),
-        &serde_wasm_bindgen::to_value(&hvp_sma).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&combos).unwrap(),
-    )?;
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_percentile_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(2 * len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_percentile_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_percentile_into(
-    data_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-    annual_length: usize,
-) -> Result<(), JsValue> {
-    if data_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to historical_volatility_percentile_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * len);
-        let (hvp, hvp_sma) = out.split_at_mut(len);
-        let params = HistoricalVolatilityPercentileParams {
-            length: Some(length),
-            annual_length: Some(annual_length),
-        };
-        let input = HistoricalVolatilityPercentileInput::from_slice(data, params);
-        historical_volatility_percentile_into_slice(hvp, hvp_sma, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "historical_volatility_percentile_into_host")]
-pub fn historical_volatility_percentile_into_host(
-    data: &[f64],
-    out_ptr: *mut f64,
-    length: usize,
-    annual_length: usize,
-) -> Result<(), JsValue> {
-    if out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to historical_volatility_percentile_into_host",
-        ));
-    }
-    unsafe {
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * data.len());
-        let (hvp, hvp_sma) = out.split_at_mut(data.len());
-        let params = HistoricalVolatilityPercentileParams {
-            length: Some(length),
-            annual_length: Some(annual_length),
-        };
-        let input = HistoricalVolatilityPercentileInput::from_slice(data, params);
-        historical_volatility_percentile_into_slice(hvp, hvp_sma, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_percentile_batch_into(
-    data_ptr: *const f64,
-    hvp_ptr: *mut f64,
-    hvp_sma_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    annual_length_start: usize,
-    annual_length_end: usize,
-    annual_length_step: usize,
-) -> Result<usize, JsValue> {
-    if data_ptr.is_null() || hvp_ptr.is_null() || hvp_sma_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to historical_volatility_percentile_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(data_ptr, len);
-        let sweep = HistoricalVolatilityPercentileBatchRange {
-            length: (length_start, length_end, length_step),
-            annual_length: (annual_length_start, annual_length_end, annual_length_step),
-        };
-        let combos = expand_grid_historical_volatility_percentile(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let hvp = std::slice::from_raw_parts_mut(hvp_ptr, total);
-        let hvp_sma = std::slice::from_raw_parts_mut(hvp_sma_ptr, total);
-        historical_volatility_percentile_batch_inner_into(
-            data,
-            &sweep,
-            Kernel::Scalar,
-            false,
-            hvp,
-            hvp_sma,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_percentile_output_into_js(
-    data: &[f64],
-    length: usize,
-    annual_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = historical_volatility_percentile_js(data, length, annual_length)?;
-    crate::write_wasm_object_f64_outputs(
-        "historical_volatility_percentile_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_percentile_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = historical_volatility_percentile_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "historical_volatility_percentile_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1646,7 +1242,6 @@ mod tests {
         assert!(series_close(&out.hvp_sma, &exp_hvp_sma, 1e-12));
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn historical_volatility_percentile_into_matches_api() -> Result<(), Box<dyn Error>> {
         let data = sample_data();

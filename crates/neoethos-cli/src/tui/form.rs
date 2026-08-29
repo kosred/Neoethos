@@ -6,9 +6,8 @@
 //! `String` for keyboard editability — page code converts to int / Vec
 //! at launch time.
 //!
-//! The Symbols page enumerates `symbol=*/` directories itself; this
-//! module no longer needs to scan disk (the earlier `discover_symbols_in_root`
-//! helper was removed in #200 because nothing called it).
+//! The Symbols page inventories exact manifest-backed dataset identities;
+//! this module does not maintain a second filesystem scanner.
 
 #[derive(Debug, Clone)]
 pub struct Field {
@@ -181,7 +180,7 @@ pub fn make_discover_form(default_root: &str) -> FormState {
         Field::new(
             "Data root",
             default_root,
-            "Path to data/ directory containing symbol=*/timeframe=*/",
+            "Root containing canonical manifest-backed Vortex generations",
         ),
         Field::new(
             "Out dir",
@@ -217,7 +216,6 @@ pub fn make_train_form(default_root: &str) -> FormState {
     ])
 }
 
-// `discover_symbols_in_root` was a half-wired helper for a Symbol-field
-// browse that never landed — the Symbols page already enumerates
-// `symbol=*` directories itself via `collect_inventory`. Deleted to
-// avoid two parallel scanners drifting (#200).
+// `discover_symbols_in_root` was a half-wired Symbol-field browser. The
+// Symbols page now owns the single manifest-only identity inventory, so a
+// parallel directory scanner would violate the canonical runtime contract.

@@ -1,33 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use js_sys;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaAroon};
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,10 +20,6 @@ pub enum AroonData<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AroonParams {
     pub length: Option<usize>,
 }
@@ -271,7 +243,6 @@ pub fn aroon_with_kernel(input: &AroonInput, kernel: Kernel) -> Result<AroonOutp
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn aroon_into(
     input: &AroonInput,
@@ -288,17 +259,19 @@ fn aroon_pair_is_finite(h: f64, l: f64) -> bool {
 }
 
 #[inline(always)]
-fn aroon_percent(dist: usize, scale_100: f64) -> f64 {
-    let v = 100.0 - (dist as f64) * scale_100;
-    v.max(0.0)
+fn aroon_percent(dist: usize, length: usize, scale_100: f64) -> f64 {
+    scale_100 * ((length - dist) as f64)
 }
 
 #[inline(always)]
 fn aroon_better<const HIGH: bool>(value: f64, current: f64) -> bool {
+    // Official TA-Lib chooses the latest equal extreme (`>=` / `<=`) in its
+    // period-plus-one-bar window.
+    // https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_AROON.c
     if HIGH {
-        value > current
+        value >= current
     } else {
-        value < current
+        value <= current
     }
 }
 
@@ -347,7 +320,7 @@ fn aroon_scalar_output_selected<const HIGH: bool>(
                     j += 1;
                 }
 
-                *dst_ptr.add(i0) = aroon_percent(i0 - best_idx, scale_100);
+                *dst_ptr.add(i0) = aroon_percent(i0 - best_idx, length, scale_100);
 
                 let mut i = i0 + 1;
                 while i < len {
@@ -371,7 +344,7 @@ fn aroon_scalar_output_selected<const HIGH: bool>(
                         best = v;
                     }
 
-                    *dst_ptr.add(i) = aroon_percent(i - best_idx, scale_100);
+                    *dst_ptr.add(i) = aroon_percent(i - best_idx, length, scale_100);
 
                     i += 1;
                 }
@@ -441,7 +414,7 @@ fn aroon_scalar_output_selected<const HIGH: bool>(
             }
         }
 
-        dst[i] = aroon_percent(i - best_idx, scale_100);
+        dst[i] = aroon_percent(i - best_idx, length, scale_100);
     }
 }
 
@@ -542,9 +515,8 @@ pub fn aroon_scalar(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
     }
 
     #[inline(always)]
-    fn aroon_percent(dist: usize, scale_100: f64) -> f64 {
-        let v = 100.0 - (dist as f64) * scale_100;
-        v.max(0.0)
+    fn aroon_percent(dist: usize, length: usize, scale_100: f64) -> f64 {
+        scale_100 * ((length - dist) as f64)
     }
 
     let mut all_finite = true;
@@ -578,20 +550,20 @@ pub fn aroon_scalar(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
                 let mut j = 1usize;
                 while j <= i0 {
                     let hv = *hp.add(j);
-                    if hv > max {
+                    if hv >= max {
                         max = hv;
                         maxi = j;
                     }
                     let lv = *lp.add(j);
-                    if lv < min {
+                    if lv <= min {
                         min = lv;
                         mini = j;
                     }
                     j += 1;
                 }
 
-                *up_ptr.add(i0) = aroon_percent(i0 - maxi, scale_100);
-                *dn_ptr.add(i0) = aroon_percent(i0 - mini, scale_100);
+                *up_ptr.add(i0) = aroon_percent(i0 - maxi, length, scale_100);
+                *dn_ptr.add(i0) = aroon_percent(i0 - mini, length, scale_100);
 
                 let mut i = i0 + 1;
                 while i < len {
@@ -605,13 +577,13 @@ pub fn aroon_scalar(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
                         let mut j = start + 1;
                         while j <= i {
                             let hv = *hp.add(j);
-                            if hv > max {
+                            if hv >= max {
                                 max = hv;
                                 maxi = j;
                             }
                             j += 1;
                         }
-                    } else if h > max {
+                    } else if h >= max {
                         maxi = i;
                         max = h;
                     }
@@ -622,19 +594,19 @@ pub fn aroon_scalar(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
                         let mut j = start + 1;
                         while j <= i {
                             let lv = *lp.add(j);
-                            if lv < min {
+                            if lv <= min {
                                 min = lv;
                                 mini = j;
                             }
                             j += 1;
                         }
-                    } else if l < min {
+                    } else if l <= min {
                         mini = i;
                         min = l;
                     }
 
-                    *up_ptr.add(i) = aroon_percent(i - maxi, scale_100);
-                    *dn_ptr.add(i) = aroon_percent(i - mini, scale_100);
+                    *up_ptr.add(i) = aroon_percent(i - maxi, length, scale_100);
+                    *dn_ptr.add(i) = aroon_percent(i - mini, length, scale_100);
 
                     i += 1;
                 }
@@ -686,12 +658,12 @@ pub fn aroon_scalar(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
             min = low[start];
             for j in (start + 1)..=i {
                 let hv = high[j];
-                if hv > max {
+                if hv >= max {
                     max = hv;
                     maxi = j;
                 }
                 let lv = low[j];
-                if lv < min {
+                if lv <= min {
                     min = lv;
                     mini = j;
                 }
@@ -703,12 +675,12 @@ pub fn aroon_scalar(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
                 max = high[maxi];
                 for j in (start + 1)..=i {
                     let hv = high[j];
-                    if hv > max {
+                    if hv >= max {
                         max = hv;
                         maxi = j;
                     }
                 }
-            } else if h > max {
+            } else if h >= max {
                 maxi = i;
                 max = h;
             }
@@ -718,12 +690,12 @@ pub fn aroon_scalar(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
                 min = low[mini];
                 for j in (start + 1)..=i {
                     let lv = low[j];
-                    if lv < min {
+                    if lv <= min {
                         min = lv;
                         mini = j;
                     }
                 }
-            } else if l < min {
+            } else if l <= min {
                 mini = i;
                 min = l;
             }
@@ -731,8 +703,8 @@ pub fn aroon_scalar(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
 
         let dist_hi = i - maxi;
         let dist_lo = i - mini;
-        up[i] = aroon_percent(dist_hi, scale_100);
-        down[i] = aroon_percent(dist_lo, scale_100);
+        up[i] = aroon_percent(dist_hi, length, scale_100);
+        down[i] = aroon_percent(dist_lo, length, scale_100);
     }
 }
 
@@ -802,67 +774,67 @@ pub fn aroon_avx512(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
                 _mm512_storeu_pd(hv.as_mut_ptr(), h8);
                 _mm512_storeu_pd(lv.as_mut_ptr(), l8);
 
-                if hv[0] > best_h {
+                if hv[0] >= best_h {
                     best_h = hv[0];
                     best_h_off = j;
                 }
-                if lv[0] < best_l {
+                if lv[0] <= best_l {
                     best_l = lv[0];
                     best_l_off = j;
                 }
-                if hv[1] > best_h {
+                if hv[1] >= best_h {
                     best_h = hv[1];
                     best_h_off = j + 1;
                 }
-                if lv[1] < best_l {
+                if lv[1] <= best_l {
                     best_l = lv[1];
                     best_l_off = j + 1;
                 }
-                if hv[2] > best_h {
+                if hv[2] >= best_h {
                     best_h = hv[2];
                     best_h_off = j + 2;
                 }
-                if lv[2] < best_l {
+                if lv[2] <= best_l {
                     best_l = lv[2];
                     best_l_off = j + 2;
                 }
-                if hv[3] > best_h {
+                if hv[3] >= best_h {
                     best_h = hv[3];
                     best_h_off = j + 3;
                 }
-                if lv[3] < best_l {
+                if lv[3] <= best_l {
                     best_l = lv[3];
                     best_l_off = j + 3;
                 }
-                if hv[4] > best_h {
+                if hv[4] >= best_h {
                     best_h = hv[4];
                     best_h_off = j + 4;
                 }
-                if lv[4] < best_l {
+                if lv[4] <= best_l {
                     best_l = lv[4];
                     best_l_off = j + 4;
                 }
-                if hv[5] > best_h {
+                if hv[5] >= best_h {
                     best_h = hv[5];
                     best_h_off = j + 5;
                 }
-                if lv[5] < best_l {
+                if lv[5] <= best_l {
                     best_l = lv[5];
                     best_l_off = j + 5;
                 }
-                if hv[6] > best_h {
+                if hv[6] >= best_h {
                     best_h = hv[6];
                     best_h_off = j + 6;
                 }
-                if lv[6] < best_l {
+                if lv[6] <= best_l {
                     best_l = lv[6];
                     best_l_off = j + 6;
                 }
-                if hv[7] > best_h {
+                if hv[7] >= best_h {
                     best_h = hv[7];
                     best_h_off = j + 7;
                 }
-                if lv[7] < best_l {
+                if lv[7] <= best_l {
                     best_l = lv[7];
                     best_l_off = j + 7;
                 }
@@ -881,11 +853,11 @@ pub fn aroon_avx512(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
                         invalid = true;
                         break;
                     }
-                    if h > best_h {
+                    if h >= best_h {
                         best_h = h;
                         best_h_off = j;
                     }
-                    if l < best_l {
+                    if l <= best_l {
                         best_l = l;
                         best_l_off = j;
                     }
@@ -899,8 +871,8 @@ pub fn aroon_avx512(high: &[f64], low: &[f64], length: usize, up: &mut [f64], do
             } else {
                 let dist_hi = length - best_h_off;
                 let dist_lo = length - best_l_off;
-                let up_val = (-(dist_hi as f64)).mul_add(scale, 100.0);
-                let dn_val = (-(dist_lo as f64)).mul_add(scale, 100.0);
+                let up_val = scale * ((length - dist_hi) as f64);
+                let dn_val = scale * ((length - dist_lo) as f64);
                 *up_ptr.add(i) = if dist_hi == 0 {
                     100.0
                 } else if dist_hi >= length {
@@ -986,35 +958,35 @@ pub fn aroon_avx2(high: &[f64], low: &[f64], length: usize, up: &mut [f64], down
                 _mm256_storeu_pd(hv.as_mut_ptr(), h4);
                 _mm256_storeu_pd(lv.as_mut_ptr(), l4);
 
-                if hv[0] > best_h {
+                if hv[0] >= best_h {
                     best_h = hv[0];
                     best_h_off = j;
                 }
-                if lv[0] < best_l {
+                if lv[0] <= best_l {
                     best_l = lv[0];
                     best_l_off = j;
                 }
-                if hv[1] > best_h {
+                if hv[1] >= best_h {
                     best_h = hv[1];
                     best_h_off = j + 1;
                 }
-                if lv[1] < best_l {
+                if lv[1] <= best_l {
                     best_l = lv[1];
                     best_l_off = j + 1;
                 }
-                if hv[2] > best_h {
+                if hv[2] >= best_h {
                     best_h = hv[2];
                     best_h_off = j + 2;
                 }
-                if lv[2] < best_l {
+                if lv[2] <= best_l {
                     best_l = lv[2];
                     best_l_off = j + 2;
                 }
-                if hv[3] > best_h {
+                if hv[3] >= best_h {
                     best_h = hv[3];
                     best_h_off = j + 3;
                 }
-                if lv[3] < best_l {
+                if lv[3] <= best_l {
                     best_l = lv[3];
                     best_l_off = j + 3;
                 }
@@ -1033,11 +1005,11 @@ pub fn aroon_avx2(high: &[f64], low: &[f64], length: usize, up: &mut [f64], down
                         invalid = true;
                         break;
                     }
-                    if h > best_h {
+                    if h >= best_h {
                         best_h = h;
                         best_h_off = j;
                     }
-                    if l < best_l {
+                    if l <= best_l {
                         best_l = l;
                         best_l_off = j;
                     }
@@ -1051,8 +1023,8 @@ pub fn aroon_avx2(high: &[f64], low: &[f64], length: usize, up: &mut [f64], down
             } else {
                 let dist_hi = length - best_h_off;
                 let dist_lo = length - best_l_off;
-                let up_val = (-(dist_hi as f64)).mul_add(scale, 100.0);
-                let dn_val = (-(dist_lo as f64)).mul_add(scale, 100.0);
+                let up_val = scale * ((length - dist_hi) as f64);
+                let dn_val = scale * ((length - dist_lo) as f64);
                 *up_ptr.add(i) = if dist_hi == 0 {
                     100.0
                 } else if dist_hi >= length {
@@ -1142,7 +1114,7 @@ impl AroonStream {
         } else if dist >= self.length {
             0.0
         } else {
-            (-(dist as f64)).mul_add(self.scale_100, 100.0)
+            self.scale_100 * ((self.length - dist) as f64)
         }
     }
 
@@ -1185,7 +1157,7 @@ impl AroonStream {
 
         if !invalid {
             while let Some(&(v, _)) = self.maxq.back() {
-                if high > v {
+                if high >= v {
                     self.maxq.pop_back();
                 } else {
                     break;
@@ -1194,7 +1166,7 @@ impl AroonStream {
             self.maxq.push_back((high, i));
 
             while let Some(&(v, _)) = self.minq.back() {
-                if low < v {
+                if low <= v {
                     self.minq.pop_back();
                 } else {
                     break;
@@ -1602,184 +1574,6 @@ fn aroon_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "aroon_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, length_range, device_id=0))]
-pub fn aroon_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    length_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(AroonDeviceArrayF32Py, AroonDeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let sweep = AroonBatchRange {
-        length: length_range,
-    };
-    let (up_dev, dn_dev, ctx_arc, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAroon::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let res = cuda
-            .aroon_batch_dev(h, l, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((
-            res.outputs.first,
-            res.outputs.second,
-            cuda.context_arc_clone(),
-            cuda.device_id(),
-        ))
-    })?;
-    Ok((
-        AroonDeviceArrayF32Py {
-            inner: up_dev,
-            _ctx: ctx_arc.clone(),
-            device_id: dev_id,
-        },
-        AroonDeviceArrayF32Py {
-            inner: dn_dev,
-            _ctx: ctx_arc,
-            device_id: dev_id,
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "aroon_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, length, device_id=0))]
-pub fn aroon_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    length: usize,
-    device_id: usize,
-) -> PyResult<(AroonDeviceArrayF32Py, AroonDeviceArrayF32Py)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = high_tm_f32.shape();
-    if shape.len() != 2 || low_tm_f32.shape() != shape {
-        return Err(PyValueError::new_err("expected two matching 2D arrays"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let (up_dev, dn_dev, ctx_arc, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAroon::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let pair = cuda
-            .aroon_many_series_one_param_time_major_dev(h, l, cols, rows, length)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((
-            pair.first,
-            pair.second,
-            cuda.context_arc_clone(),
-            cuda.device_id(),
-        ))
-    })?;
-    Ok((
-        AroonDeviceArrayF32Py {
-            inner: up_dev,
-            _ctx: ctx_arc.clone(),
-            device_id: dev_id,
-        },
-        AroonDeviceArrayF32Py {
-            inner: dn_dev,
-            _ctx: ctx_arc,
-            device_id: dev_id,
-        },
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "AroonDeviceArrayF32", unsendable)]
-pub struct AroonDeviceArrayF32Py {
-    pub(crate) inner: crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32,
-    pub(crate) _ctx: std::sync::Arc<cust::context::Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl AroonDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use cust::memory::DeviceBuffer;
-        use pyo3::types::PyAny;
-        use pyo3::Bound;
-
-        let (dev_ty, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((want_ty, want_dev)) = dev_obj.extract::<(i32, i32)>(py) {
-                if want_ty != dev_ty || want_dev != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound: Option<Bound<'py, PyAny>> =
-            max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
 #[inline(always)]
 pub unsafe fn aroon_row_scalar(
     high: &[f64],
@@ -1840,58 +1634,44 @@ pub unsafe fn aroon_row_avx512_long(
 ) {
     aroon_avx512(high, low, length, out_up, out_down)
 }
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroon_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = aroon_js(high, low, length)?;
-    crate::write_wasm_object_f64_outputs("aroon_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroon_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = aroon_batch_unified_js(high, low, length_start, length_end, length_step)?;
-    crate::write_wasm_selected_object_f64_outputs("aroon_batch_unified_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroon_batch_config_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = aroon_batch_config_js(high, low, config)?;
-    crate::write_wasm_selected_object_f64_outputs("aroon_batch_config_output_into_js", &value, out)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
+
+    #[test]
+    fn talib_latest_tie_is_shared_by_scalar_selected_and_stream() {
+        let high = [10.0, 10.0, 9.0];
+        let low = [5.0, 6.0, 5.0];
+        let mut up = [f64::NAN; 3];
+        let mut down = [f64::NAN; 3];
+        aroon_scalar(&high, &low, 2, &mut up, &mut down);
+        assert_eq!(up[2].to_bits(), 50.0f64.to_bits());
+        assert_eq!(down[2].to_bits(), 100.0f64.to_bits());
+
+        let mut selected = [f64::NAN; 3];
+        aroon_scalar_output_selected::<true>(&high, &low, 2, &mut selected);
+        assert_eq!(selected[2].to_bits(), 50.0f64.to_bits());
+
+        let mut stream =
+            AroonStream::try_new(AroonParams { length: Some(2) }).expect("valid Aroon stream");
+        assert_eq!(stream.update(10.0, 5.0), None);
+        assert_eq!(stream.update(10.0, 6.0), None);
+        let (stream_up, stream_down) = stream.update(9.0, 5.0).expect("first Aroon output");
+        assert_eq!(stream_up.to_bits(), 50.0f64.to_bits());
+        assert_eq!(stream_down.to_bits(), 100.0f64.to_bits());
+    }
 
     fn check_aroon_partial_params(
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = AroonParams { length: None };
         let input = AroonInput::from_candles(&candles, partial_params);
         let result = aroon_with_kernel(&input, kernel)?;
@@ -1905,8 +1685,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AroonInput::with_default_candles(&candles);
         let result = aroon_with_kernel(&input, kernel)?;
 
@@ -1951,8 +1731,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AroonInput::with_default_candles(&candles);
         match input.data {
             AroonData::Candles { .. } => {}
@@ -2014,8 +1794,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = AroonParams { length: Some(14) };
         let first_input = AroonInput::from_candles(&candles, first_params);
         let first_result = aroon_with_kernel(&first_input, kernel)?;
@@ -2034,8 +1814,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = AroonParams { length: Some(14) };
         let input = AroonInput::from_candles(&candles, params);
         let result = aroon_with_kernel(&input, kernel)?;
@@ -2063,8 +1843,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let length = 14;
 
         let input = AroonInput::from_candles(
@@ -2134,8 +1914,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             AroonParams::default(),
@@ -2763,8 +2543,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = AroonBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
         let def = AroonParams::default();
@@ -2786,8 +2566,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (1, 10, 1),
@@ -2954,7 +2734,6 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_aroon_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let len = 256usize;
@@ -3074,391 +2853,4 @@ pub fn aroon_into_slice(
         *v = f64::NAN;
     }
     Ok(())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "aroon")]
-#[pyo3(signature = (high, low, length, kernel=None))]
-pub fn aroon_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err(format!(
-            "High/low length mismatch: {} vs {}",
-            h.len(),
-            l.len()
-        )));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-    let params = AroonParams {
-        length: Some(length),
-    };
-    let input = AroonInput::from_slices_hl(h, l, params);
-
-    let out = py
-        .allow_threads(|| aroon_with_kernel(&input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((
-        out.aroon_up.into_pyarray(py),
-        out.aroon_down.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AroonStream")]
-pub struct AroonStreamPy {
-    stream: AroonStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AroonStreamPy {
-    #[new]
-    fn new(length: usize) -> PyResult<Self> {
-        let params = AroonParams {
-            length: Some(length),
-        };
-        let stream =
-            AroonStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AroonStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64) -> Option<(f64, f64)> {
-        self.stream.update(high, low)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "aroon_batch")]
-#[pyo3(signature = (high, low, length_range, kernel=None))]
-pub fn aroon_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    if h.len() != l.len() {
-        return Err(PyValueError::new_err(format!(
-            "High/low length mismatch: {} vs {}",
-            h.len(),
-            l.len()
-        )));
-    }
-
-    let sweep = AroonBatchRange {
-        length: length_range,
-    };
-    let combos = expand_grid_aroon(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = h.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow"))?;
-    let up_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let down_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let up_slice = unsafe { up_arr.as_slice_mut()? };
-    let down_slice = unsafe { down_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let batch = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-        let simd = match batch {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => unreachable!(),
-        };
-        aroon_batch_inner_into(h, l, &sweep, simd, true, up_slice, down_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("up", up_arr.reshape((rows, cols))?)?;
-    dict.set_item("down", down_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AroonJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "aroon_js")]
-pub fn aroon_js(high: &[f64], low: &[f64], length: usize) -> Result<JsValue, JsValue> {
-    let params = AroonParams {
-        length: Some(length),
-    };
-    let input = AroonInput::from_slices_hl(high, low, params);
-
-    let mut up = vec![0.0; high.len()];
-    let mut down = vec![0.0; high.len()];
-
-    aroon_into_slice(&mut up, &mut down, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("up"),
-        &serde_wasm_bindgen::to_value(&up).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("down"),
-        &serde_wasm_bindgen::to_value(&down).unwrap(),
-    )?;
-
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AroonBatchJsOutput {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-    pub combos: Vec<AroonParams>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "aroon_batch_js")]
-pub fn aroon_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<JsValue, JsValue> {
-    let sweep = AroonBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = high.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows * cols overflow"))?;
-
-    let mut up = vec![0.0; total];
-    let mut down = vec![0.0; total];
-
-    aroon_batch_inner_into(
-        high,
-        low,
-        &sweep,
-        detect_best_kernel(),
-        false,
-        &mut up,
-        &mut down,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("up"),
-        &serde_wasm_bindgen::to_value(&up).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("down"),
-        &serde_wasm_bindgen::to_value(&down).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&combos).unwrap(),
-    )?;
-
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "aroon_batch_metadata_js")]
-pub fn aroon_batch_metadata_js(
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AroonBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let metadata: Vec<f64> = combos
-        .iter()
-        .map(|c| c.length.unwrap_or(14) as f64)
-        .collect();
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AroonBatchConfig {
-    pub length_range: Vec<usize>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "aroon_batch")]
-pub fn aroon_batch_config_js(
-    high: &[f64],
-    low: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: AroonBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    if config.length_range.len() != 3 {
-        return Err(JsValue::from_str(
-            "Invalid config: length_range must have exactly 3 elements [start, end, step]",
-        ));
-    }
-
-    let sweep = AroonBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = high.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("rows * cols overflow"))?;
-
-    let mut up = vec![0.0; total];
-    let mut down = vec![0.0; total];
-
-    aroon_batch_inner_into(
-        high,
-        low,
-        &sweep,
-        detect_best_kernel(),
-        false,
-        &mut up,
-        &mut down,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("up"),
-        &serde_wasm_bindgen::to_value(&up).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("down"),
-        &serde_wasm_bindgen::to_value(&down).unwrap(),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(cols as f64),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("combos"),
-        &serde_wasm_bindgen::to_value(&combos).unwrap(),
-    )?;
-
-    Ok(obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroon_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(2 * len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroon_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, 2 * len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn aroon_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to aroon_into"));
-    }
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, 2 * len);
-
-        let params = AroonParams {
-            length: Some(length),
-        };
-        let input = AroonInput::from_slices_hl(high, low, params);
-
-        let (up, down) = out.split_at_mut(len);
-        aroon_into_slice(up, down, &input, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
 }

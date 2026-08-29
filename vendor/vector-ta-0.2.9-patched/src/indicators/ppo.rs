@@ -1,35 +1,10 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::oscillators::ppo_wrapper::{CudaPpo, DeviceArrayF32Ppo};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyDict};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::moving_averages::ma::{ma, MaData};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::indicators::moving_averages::ma::{MaData, ma};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -65,10 +40,6 @@ pub struct PpoOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct PpoParams {
     pub fast_period: Option<usize>,
     pub slow_period: Option<usize>,
@@ -358,7 +329,6 @@ pub fn ppo_into_slice(dst: &mut [f64], input: &PpoInput, kern: Kernel) -> Result
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ppo_into(input: &PpoInput, out: &mut [f64]) -> Result<(), PpoError> {
     ppo_into_slice(out, input, Kernel::Auto)
@@ -1407,40 +1377,16 @@ fn update_ema(e: &mut EmaState, x: f64) -> Option<f64> {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ppo_output_into_js(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    ma_type: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ppo_js(data, fast_period, slow_period, ma_type)?;
-    crate::write_wasm_f64_output("ppo_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ppo_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ppo_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("ppo_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_ppo_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = PpoParams {
             fast_period: None,
             slow_period: None,
@@ -1452,11 +1398,10 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_ppo_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PpoInput::from_candles(&candles, "close", PpoParams::default());
 
         let baseline = ppo(&input)?.values;
@@ -1485,8 +1430,8 @@ mod tests {
 
     fn check_ppo_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PpoInput::from_candles(&candles, "close", PpoParams::default());
         let result = ppo_with_kernel(&input, kernel)?;
         assert_eq!(result.values.len(), candles.close.len());
@@ -1515,8 +1460,8 @@ mod tests {
 
     fn check_ppo_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PpoInput::with_default_candles(&candles);
         match input.data {
             PpoData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1586,8 +1531,8 @@ mod tests {
 
     fn check_ppo_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = PpoInput::from_candles(
             &candles,
             "close",
@@ -1614,8 +1559,8 @@ mod tests {
 
     fn check_ppo_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let fast = 12;
         let slow = 26;
         let ma_type = "sma".to_string();
@@ -1664,8 +1609,8 @@ mod tests {
     fn check_ppo_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             PpoParams::default(),
@@ -1798,7 +1743,7 @@ mod tests {
         test_name: &str,
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::indicators::moving_averages::ma::{ma, MaData};
+        use crate::indicators::moving_averages::ma::{MaData, ma};
         use proptest::prelude::*;
         skip_if_unsupported!(kernel, test_name);
 
@@ -2036,8 +1981,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = PpoBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2086,8 +2031,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 12, 30, 3, "sma"),
@@ -2182,511 +2127,4 @@ mod tests {
 
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ppo")]
-#[pyo3(signature = (data, fast_period=None, slow_period=None, ma_type=None, kernel=None))]
-pub fn ppo_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    fast_period: Option<usize>,
-    slow_period: Option<usize>,
-    ma_type: Option<&str>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = PpoParams {
-        fast_period,
-        slow_period,
-        ma_type: ma_type.map(|s| s.to_string()),
-    };
-    let input = PpoInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| ppo_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "PpoStream")]
-pub struct PpoStreamPy {
-    stream: PpoStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PpoStreamPy {
-    #[new]
-    fn new(
-        fast_period: Option<usize>,
-        slow_period: Option<usize>,
-        ma_type: Option<&str>,
-    ) -> PyResult<Self> {
-        let params = PpoParams {
-            fast_period,
-            slow_period,
-            ma_type: ma_type.map(|s| s.to_string()),
-        };
-        let stream =
-            PpoStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(PpoStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct PpoDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32Ppo,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl PpoDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(pyo3::exceptions::PyBufferError::new_err(
-                            "__dlpack__: requested device does not match producer buffer",
-                        ));
-                    }
-                }
-            }
-        }
-
-        if let Some(copy_obj) = copy.as_ref() {
-            let do_copy: bool = copy_obj.extract::<bool>(py)?;
-            if do_copy {
-                return Err(pyo3::exceptions::PyBufferError::new_err(
-                    "__dlpack__(copy=True) not supported for ppo CUDA buffers",
-                ));
-            }
-        }
-
-        if let Some(s) = stream.as_ref() {
-            if let Ok(i) = s.extract::<i64>(py) {
-                if i == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__: stream 0 is disallowed for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let dev_id_u32 = self.inner.device_id;
-        let ctx_clone = self.inner.ctx.clone();
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Ppo {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx: ctx_clone,
-                device_id: dev_id_u32,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ppo_batch")]
-#[pyo3(signature = (data, fast_period_range, slow_period_range, ma_type=None, kernel=None))]
-pub fn ppo_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    ma_type: Option<&str>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice_in = data.as_slice()?;
-
-    let sweep = PpoBatchRange {
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        ma_type: ma_type.unwrap_or("sma").to_string(),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow in ppo_batch_py"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let warm: Vec<usize> = combos
-        .iter()
-        .map(|c| {
-            let first = slice_in.iter().position(|x| !x.is_nan()).unwrap_or(0);
-            first + c.slow_period.unwrap() - 1
-        })
-        .collect();
-
-    unsafe {
-        let mu: &mut [MaybeUninit<f64>] = std::slice::from_raw_parts_mut(
-            slice_out.as_mut_ptr() as *mut MaybeUninit<f64>,
-            slice_out.len(),
-        );
-        init_matrix_prefixes(mu, cols, &warm);
-    }
-
-    let kern = validate_kernel(kernel, true)?;
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                k if !k.is_batch() => k,
-                _ => Kernel::Scalar,
-            };
-            ppo_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_types",
-        combos
-            .iter()
-            .map(|p| p.ma_type.as_ref().unwrap().clone())
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ppo_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, fast_period_range, slow_period_range, ma_type="sma", device_id=0))]
-pub fn ppo_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    data_f32: numpy::PyReadonlyArray1<'py, f32>,
-    fast_period_range: (usize, usize, usize),
-    slow_period_range: (usize, usize, usize),
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<(PpoDeviceArrayF32Py, Bound<'py, PyDict>)> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let sweep = PpoBatchRange {
-        fast_period: fast_period_range,
-        slow_period: slow_period_range,
-        ma_type: ma_type.to_string(),
-    };
-    let (inner, combos) = py
-        .allow_threads(|| CudaPpo::new(device_id).and_then(|c| c.ppo_batch_dev(slice_in, &sweep)))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "fast_periods",
-        combos
-            .iter()
-            .map(|p| p.fast_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_periods",
-        combos
-            .iter()
-            .map(|p| p.slow_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "ma_types",
-        combos
-            .iter()
-            .map(|p| p.ma_type.as_ref().unwrap().clone())
-            .collect::<Vec<_>>(),
-    )?;
-    Ok((PpoDeviceArrayF32Py { inner }, dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ppo_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, fast_period, slow_period, ma_type="sma", device_id=0))]
-pub fn ppo_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    fast_period: usize,
-    slow_period: usize,
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<PpoDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-    let params = PpoParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let inner = py
-        .allow_threads(|| {
-            CudaPpo::new(device_id)
-                .and_then(|c| c.ppo_many_series_one_param_time_major_dev(flat, cols, rows, &params))
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(PpoDeviceArrayF32Py { inner })
-}
-
-#[cfg(feature = "python")]
-pub fn register_ppo_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(ppo_py, m)?)?;
-    m.add_function(wrap_pyfunction!(ppo_batch_py, m)?)?;
-    m.add_class::<PpoStreamPy>()?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_class::<PpoDeviceArrayF32Py>()?;
-        m.add_function(wrap_pyfunction!(ppo_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(ppo_cuda_many_series_one_param_dev_py, m)?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ppo_js(
-    data: &[f64],
-    fast_period: usize,
-    slow_period: usize,
-    ma_type: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let params = PpoParams {
-        fast_period: Some(fast_period),
-        slow_period: Some(slow_period),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = PpoInput::from_slice(data, params);
-    let mut out = vec![0.0; data.len()];
-    ppo_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ppo_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ppo_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ppo_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_period: usize,
-    slow_period: usize,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ppo_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = PpoParams {
-            fast_period: Some(fast_period),
-            slow_period: Some(slow_period),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let input = PpoInput::from_slice(data, params);
-        if in_ptr == out_ptr {
-            let mut tmp = vec![0.0; len];
-            ppo_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ppo_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PpoBatchConfig {
-    pub fast_period_range: (usize, usize, usize),
-    pub slow_period_range: (usize, usize, usize),
-    pub ma_type: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct PpoBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<PpoParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "ppo_batch")]
-pub fn ppo_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: PpoBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = PpoBatchRange {
-        fast_period: cfg.fast_period_range,
-        slow_period: cfg.slow_period_range,
-        ma_type: cfg.ma_type,
-    };
-    let out = ppo_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = PpoBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ppo_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    fast_start: usize,
-    fast_end: usize,
-    fast_step: usize,
-    slow_start: usize,
-    slow_end: usize,
-    slow_step: usize,
-    ma_type: &str,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ppo_batch_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = PpoBatchRange {
-            fast_period: (fast_start, fast_end, fast_step),
-            slow_period: (slow_start, slow_end, slow_step),
-            ma_type: ma_type.to_string(),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow in ppo_batch_into"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        ppo_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
 }

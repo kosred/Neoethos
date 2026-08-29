@@ -1,17 +1,17 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
+use crate::cuda::DeviceArrayF32Triplet;
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::cuda::oscillators::CudaWillr;
-use crate::cuda::DeviceArrayF32Triplet;
 use crate::indicators::kdj::{KdjBatchRange, KdjParams};
 use crate::indicators::willr::build_willr_gpu_tables;
 use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
 use cust::memory::{
-    mem_get_info, AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer,
+    AsyncCopyDestination, CopyDestination, DeviceBuffer, LockedBuffer, mem_get_info,
 };
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -120,11 +120,6 @@ impl CudaKdj {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/kdj_kernel.ptx"));
-        let jit = [
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("kdj_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -1009,14 +1004,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "kdj",
-            "one_series_many_params",
-            "kdj_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_mem_required(bytes_one_series_many_params())
-        .with_sample_size(10)]
+        vec![
+            CudaBenchScenario::new(
+                "kdj",
+                "one_series_many_params",
+                "kdj_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_mem_required(bytes_one_series_many_params())
+            .with_sample_size(10),
+        ]
     }
 }

@@ -1,20 +1,4 @@
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -27,101 +11,6 @@ use core::arch::x86_64::*;
 use rayon::prelude::*;
 use std::convert::AsRef;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-mod ultosc_python_cuda_handle {
-    use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-    use cust::context::Context;
-    use cust::memory::DeviceBuffer;
-    use pyo3::exceptions::PyValueError;
-    use pyo3::prelude::*;
-    use pyo3::types::PyDict;
-    use std::ffi::c_void;
-    use std::sync::Arc;
-
-    #[pyclass(module = "vector_ta", unsendable, name = "UltOscDeviceArrayF32Py")]
-    pub struct DeviceArrayF32Py {
-        pub(crate) buf: Option<DeviceBuffer<f32>>,
-        pub(crate) rows: usize,
-        pub(crate) cols: usize,
-        pub(crate) _ctx: Arc<Context>,
-        pub(crate) device_id: u32,
-    }
-
-    #[pymethods]
-    impl DeviceArrayF32Py {
-        #[getter]
-        fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-            let d = PyDict::new(py);
-            d.set_item("shape", (self.rows, self.cols))?;
-            d.set_item("typestr", "<f4")?;
-            d.set_item(
-                "strides",
-                (
-                    self.cols * std::mem::size_of::<f32>(),
-                    std::mem::size_of::<f32>(),
-                ),
-            )?;
-            let ptr = self
-                .buf
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-                .as_device_ptr()
-                .as_raw() as usize;
-            d.set_item("data", (ptr, false))?;
-            d.set_item("version", 3)?;
-            Ok(d)
-        }
-
-        fn __dlpack_device__(&self) -> (i32, i32) {
-            (2, self.device_id as i32)
-        }
-
-        #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-        fn __dlpack__<'py>(
-            &mut self,
-            py: Python<'py>,
-            stream: Option<pyo3::PyObject>,
-            max_version: Option<pyo3::PyObject>,
-            dl_device: Option<pyo3::PyObject>,
-            copy: Option<pyo3::PyObject>,
-        ) -> PyResult<PyObject> {
-            let (exp_dev_ty, alloc_dev) = self.__dlpack_device__();
-            if let Some(dev_obj) = dl_device.as_ref() {
-                if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                    if dev_ty != exp_dev_ty || dev_id != alloc_dev {
-                        let wants_copy = copy
-                            .as_ref()
-                            .and_then(|c| c.extract::<bool>(py).ok())
-                            .unwrap_or(false);
-                        if wants_copy {
-                            return Err(PyValueError::new_err(
-                                "device copy not implemented for __dlpack__",
-                            ));
-                        } else {
-                            return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                        }
-                    }
-                }
-            }
-            let _ = stream;
-
-            let buf = self
-                .buf
-                .take()
-                .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-            let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-            export_f32_cuda_dlpack_2d(py, buf, self.rows, self.cols, alloc_dev, max_version_bound)
-        }
-    }
-
-    pub use DeviceArrayF32Py as UltOscDeviceArrayF32Py;
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use self::ultosc_python_cuda_handle::UltOscDeviceArrayF32Py;
 
 #[derive(Debug, Clone)]
 pub enum UltOscData<'a> {
@@ -144,10 +33,6 @@ pub struct UltOscOutput {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct UltOscParams {
     pub timeperiod1: Option<usize>,
     pub timeperiod2: Option<usize>,
@@ -444,7 +329,6 @@ pub fn ultosc_with_kernel(
     Ok(UltOscOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn ultosc_into(input: &UltOscInput, out: &mut [f64]) -> Result<(), UltOscError> {
     let ((high, low, close), p1, p2, p3, first_valid, start_idx, chosen) =
         ultosc_prepare(input, Kernel::Auto)?;
@@ -822,23 +706,6 @@ impl Default for UltOscBatchRange {
             timeperiod3: (28, 277, 1),
         }
     }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct UltOscBatchConfig {
-    pub timeperiod1_range: (usize, usize, usize),
-    pub timeperiod2_range: (usize, usize, usize),
-    pub timeperiod3_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct UltOscBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<UltOscParams>,
-    pub rows: usize,
-    pub cols: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1259,39 +1126,11 @@ pub fn ultosc_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ultosc_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    timeperiod1: usize,
-    timeperiod2: usize,
-    timeperiod3: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ultosc_js(high, low, close, timeperiod1, timeperiod2, timeperiod3)?;
-    crate::write_wasm_f64_output("ultosc_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ultosc_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ultosc_batch_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("ultosc_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
@@ -1300,8 +1139,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = UltOscParams {
             timeperiod1: None,
             timeperiod2: None,
@@ -1318,8 +1157,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = UltOscParams {
             timeperiod1: Some(7),
             timeperiod2: Some(14),
@@ -1355,8 +1194,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = UltOscInput::with_default_candles(&candles);
         let result = ultosc_with_kernel(&input, kernel)?;
         assert_eq!(result.values.len(), candles.close.len());
@@ -1416,8 +1255,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             UltOscParams::default(),
@@ -1780,8 +1619,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let sweep = UltOscBatchRange {
             timeperiod1: (5, 9, 2),
@@ -1836,8 +1675,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_configs = vec![
             (2, 8, 2, 4, 16, 4, 8, 32, 8),
@@ -1974,21 +1813,16 @@ mod tests {
 
     #[test]
     fn test_ultosc_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input =
             UltOscInput::from_candles(&candles, "high", "low", "close", UltOscParams::default());
 
         let baseline = ultosc(&input)?;
 
         let mut out = vec![0.0; candles.close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             ultosc_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            ultosc_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.values.len(), out.len());
@@ -2147,17 +1981,9 @@ impl UltOscStream {
             let d1 = (high - prev_close).abs();
             let d2 = (low - prev_close).abs();
             let tr = if d1 > base {
-                if d2 > d1 {
-                    d2
-                } else {
-                    d1
-                }
+                if d2 > d1 { d2 } else { d1 }
             } else {
-                if d2 > base {
-                    d2
-                } else {
-                    base
-                }
+                if d2 > base { d2 } else { base }
             };
 
             (close - true_low, tr)
@@ -2222,394 +2048,4 @@ impl UltOscStream {
         let acc = f64::mul_add(self.w2, t2, self.w3 * t3);
         Some(f64::mul_add(self.w1, t1, acc))
     }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ultosc")]
-#[pyo3(signature = (high, low, close, timeperiod1=None, timeperiod2=None, timeperiod3=None, kernel=None))]
-pub fn ultosc_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    timeperiod1: Option<usize>,
-    timeperiod2: Option<usize>,
-    timeperiod3: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = UltOscParams {
-        timeperiod1,
-        timeperiod2,
-        timeperiod3,
-    };
-    let input = UltOscInput::from_slices(high_slice, low_slice, close_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| ultosc_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ultosc_batch")]
-#[pyo3(signature = (high, low, close, timeperiod1_range, timeperiod2_range, timeperiod3_range, kernel=None))]
-pub fn ultosc_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    timeperiod1_range: (usize, usize, usize),
-    timeperiod2_range: (usize, usize, usize),
-    timeperiod3_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = UltOscBatchRange {
-        timeperiod1: timeperiod1_range,
-        timeperiod2: timeperiod2_range,
-        timeperiod3: timeperiod3_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = high_slice.len();
-
-    let total_elems = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows * cols overflow in ultosc_batch_py"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total_elems], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-            ultosc_batch_inner_into(
-                high_slice,
-                low_slice,
-                close_slice,
-                &sweep,
-                simd,
-                true,
-                slice_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "timeperiod1",
-        combos
-            .iter()
-            .map(|p| p.timeperiod1.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "timeperiod2",
-        combos
-            .iter()
-            .map(|p| p.timeperiod2.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "timeperiod3",
-        combos
-            .iter()
-            .map(|p| p.timeperiod3.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ultosc_cuda_batch_dev")]
-#[pyo3(signature = (high, low, close, timeperiod1_range, timeperiod2_range, timeperiod3_range, device_id=0))]
-pub fn ultosc_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: PyReadonlyArray1<'_, f32>,
-    low: PyReadonlyArray1<'_, f32>,
-    close: PyReadonlyArray1<'_, f32>,
-    timeperiod1_range: (usize, usize, usize),
-    timeperiod2_range: (usize, usize, usize),
-    timeperiod3_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<UltOscDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::CudaUltosc;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    let sweep = UltOscBatchRange {
-        timeperiod1: timeperiod1_range,
-        timeperiod2: timeperiod2_range,
-        timeperiod3: timeperiod3_range,
-    };
-
-    let (buf, rows, cols, ctx_arc, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda = CudaUltosc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev = cuda
-            .ultosc_batch_dev(high_slice, low_slice, close_slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let buf = dev.buf;
-        let rows = dev.rows;
-        let cols = dev.cols;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        Ok((buf, rows, cols, ctx, dev_id))
-    })?;
-    Ok(UltOscDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx_arc,
-        device_id: dev_id as u32,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ultosc_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, close_tm, cols, rows, timeperiod1, timeperiod2, timeperiod3, device_id=0))]
-pub fn ultosc_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: PyReadonlyArray1<'_, f32>,
-    low_tm: PyReadonlyArray1<'_, f32>,
-    close_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    timeperiod1: usize,
-    timeperiod2: usize,
-    timeperiod3: usize,
-    device_id: usize,
-) -> PyResult<UltOscDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::CudaUltosc;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm.as_slice()?;
-    let l = low_tm.as_slice()?;
-    let c = close_tm.as_slice()?;
-    let (buf, rows_out, cols_out, ctx_arc, dev_id) = py.allow_threads(|| -> PyResult<_> {
-        let cuda = CudaUltosc::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev = cuda
-            .ultosc_many_series_one_param_time_major_dev(
-                h,
-                l,
-                c,
-                cols,
-                rows,
-                timeperiod1,
-                timeperiod2,
-                timeperiod3,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let buf = dev.buf;
-        let rows_out = dev.rows;
-        let cols_out = dev.cols;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        Ok((buf, rows_out, cols_out, ctx, dev_id))
-    })?;
-    Ok(UltOscDeviceArrayF32Py {
-        buf: Some(buf),
-        rows: rows_out,
-        cols: cols_out,
-        _ctx: ctx_arc,
-        device_id: dev_id as u32,
-    })
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "UltOscStream")]
-pub struct UltOscStreamPy {
-    stream: UltOscStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl UltOscStreamPy {
-    #[new]
-    #[pyo3(signature = (timeperiod1=None, timeperiod2=None, timeperiod3=None))]
-    fn new(
-        timeperiod1: Option<usize>,
-        timeperiod2: Option<usize>,
-        timeperiod3: Option<usize>,
-    ) -> PyResult<Self> {
-        let params = UltOscParams {
-            timeperiod1,
-            timeperiod2,
-            timeperiod3,
-        };
-        let stream =
-            UltOscStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(UltOscStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ultosc_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    timeperiod1: usize,
-    timeperiod2: usize,
-    timeperiod3: usize,
-) -> Result<Vec<f64>, JsValue> {
-    if high.is_empty() || low.is_empty() || close.is_empty() {
-        return Err(JsValue::from_str("Empty data"));
-    }
-    if timeperiod1 == 0 || timeperiod2 == 0 || timeperiod3 == 0 {
-        return Err(JsValue::from_str("Invalid period"));
-    }
-    let len = high.len();
-    if timeperiod1 > len || timeperiod2 > len || timeperiod3 > len {
-        return Err(JsValue::from_str("Period exceeds data length"));
-    }
-
-    let params = UltOscParams {
-        timeperiod1: Some(timeperiod1),
-        timeperiod2: Some(timeperiod2),
-        timeperiod3: Some(timeperiod3),
-    };
-    let input = UltOscInput::from_slices(high, low, close, params);
-
-    let mut output = vec![0.0; len];
-    ultosc_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ultosc_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    timeperiod1: usize,
-    timeperiod2: usize,
-    timeperiod3: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ultosc_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let params = UltOscParams {
-            timeperiod1: Some(timeperiod1),
-            timeperiod2: Some(timeperiod2),
-            timeperiod3: Some(timeperiod3),
-        };
-        let input = UltOscInput::from_slices(high, low, close, params);
-
-        if high_ptr == out_ptr as *const f64
-            || low_ptr == out_ptr as *const f64
-            || close_ptr == out_ptr as *const f64
-        {
-            let mut temp = vec![0.0; len];
-            ultosc_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ultosc_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ultosc_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ultosc_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ultosc_batch)]
-pub fn ultosc_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: UltOscBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = UltOscBatchRange {
-        timeperiod1: config.timeperiod1_range,
-        timeperiod2: config.timeperiod2_range,
-        timeperiod3: config.timeperiod3_range,
-    };
-
-    let batch_output = ultosc_batch_with_kernel(high, low, close, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let rows = batch_output.combos.len();
-    let cols = high.len();
-
-    let result = UltOscBatchJsOutput {
-        values: batch_output.values,
-        combos: batch_output.combos,
-        rows,
-        cols,
-    };
-
-    serde_wasm_bindgen::to_value(&result)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }

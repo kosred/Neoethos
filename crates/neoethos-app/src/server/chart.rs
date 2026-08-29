@@ -1,44 +1,29 @@
-//! GET /chart?symbol=EURUSD&timeframe=M1&limit=200
+//! GET /chart
 //!
-//! Returns OHLC candles + price range for a given symbol/timeframe.
+//! Returns OHLC candles from one of two explicit, mutually exclusive modes:
 //!
-//! ## G7 broker-passthrough doctrine (operator-approved 2026-05-25)
+//! - **broker-live** — omit `datasetIdentity` and `expectedGeneration`, and
+//!   provide `symbol` / `timeframe`. The route asks cTrader for that exact
+//!   period and returns an error when the live request fails.
+//! - **exact-local** — provide the opaque canonical `datasetIdentity` and its
+//!   current `expectedGeneration` receipt from `/data/bootstrap`. Symbol and
+//!   timeframe are derived from the identity; optional text fields are only
+//!   consistency assertions. The route fully verifies and pins that immutable
+//!   Vortex generation before reading values.
 //!
-//! Operator directive: "δεχόμαστε ότι στέλνει ο broker αυτό είναι
-//! αλήθεια το άλλο συνθετικό" — we accept what the broker sends as
-//! truth; everything else is synthetic. For chart data this means
-//! the routing priority is:
-//!
-//! 1. **Live broker historical-bars API** — when cTrader session is
-//!    connected, fetch via `ProtoOAGetTrendbarsReq` for the exact
-//!    `symbol × timeframe × period` requested. This is the ONLY
-//!    authoritative source. (Wiring lands in G7 Phase 2 — the
-//!    `live_spots_streamer` ring buffer already serves real-time
-//!    quotes; the historical bars layer is the next slot.)
-//!
-//! 2. **Local Vortex cache** — when cTrader is DISCONNECTED. Marked
-//!    `source: "disk-cache"` in the response so the UI can render a
-//!    "showing cached data, live unavailable" banner. The cache is
-//!    LEGITIMATE for offline replay + backtesting reproducibility
-//!    (operator preserved that use case in the G7 sign-off).
-//!
-//! 3. **Empty + headline** — when neither source is available. The
-//!    UI renders an empty-state with the bootstrap call-to-action.
-//!
-//! The current implementation is **G7 Phase 1**: still disk-only, but
-//! the response shape carries a `source` annotation so the UI can
-//! distinguish disk-cache from broker-passthrough once Phase 2 lands.
-//! No behaviour change for disconnected operators; the UI now knows
-//! the data is *cached* rather than blindly assuming it's live.
+//! These modes never fall through to one another. Every timeframe is a direct
+//! broker/import artifact selected by its own identity.
 
-use std::path::PathBuf;
+use std::path::Path;
 
+use anyhow::{Context, ensure};
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
-use neoethos_data::{discover_timeframes, load_symbol_timeframe_tail};
+use neoethos_data::{CanonicalDatasetIdentity, CanonicalOhlcvFrame, load_canonical_timeframe};
+use serde::Deserialize;
 
 use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
@@ -47,28 +32,186 @@ const DEFAULT_LIMIT: usize = 500;
 const MAX_LIMIT: usize = 2000;
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChartQuery {
     pub symbol: Option<String>,
     pub timeframe: Option<String>,
+    /// Exact canonical `d1-*` identity selected from `/data/bootstrap`.
+    /// When present, `expected_generation` is mandatory and the route reads
+    /// only that local immutable generation; it never contacts the broker.
+    #[serde(default, deserialize_with = "deserialize_optional_dataset_identity")]
+    pub dataset_identity: Option<CanonicalDatasetIdentity>,
+    /// Current content-addressed generation receipt returned by the inventory.
+    pub expected_generation: Option<String>,
     pub limit: Option<usize>,
 }
 
-/// Provenance tag — distinguishes broker-truth from disk-cached
-/// responses. **G7 Phase 1 (2026-05-25)** annotation per the
-/// operator-approved broker-passthrough doctrine: chart data sourced
-/// from the broker WSS is "live" / "broker"; everything from local
-/// Vortex files is "disk-cache" / "empty" so the UI can render the
-/// right banner. Phase 2 plumbs the broker source through.
+pub(super) fn deserialize_optional_dataset_identity<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<CanonicalDatasetIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = Option::<String>::deserialize(deserializer)?;
+    encoded
+        .map(|value| {
+            CanonicalDatasetIdentity::from_path_component(&value).map_err(|error| {
+                serde::de::Error::custom(format!(
+                    "invalid canonical dataset identity {value:?}: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Opaque selection of one exact current local generation.
 ///
-/// **Phase 2 (2026-06-01)** — `Broker` reintroduced. `load_chart` now
-/// fetches live trendbars straight from cTrader (`ProtoOAGetTrendbarsReq`
-/// via `broker_api::fetch_recent_chart_bars_blocking`) and tags the
-/// response `broker` when the broker session served the candles; it
-/// falls back to `DiskCache` (local Vortex files) only when the broker
-/// is unreachable, and `Empty` when neither has data. The Flutter
-/// `ChartSnapshot.isBrokerSource` (`source == "broker"`) already
-/// consumes this tag to hide the "cached" banner — producer and
-/// consumer stay in lockstep.
+/// The identity prevents source/account ambiguity. The generation receipt
+/// prevents a caller that selected an earlier inventory snapshot from silently
+/// reading a newer publication. `load_exact_current_frame` retains the reader
+/// lease for the whole computation that consumes the frame.
+#[derive(Debug, Clone)]
+pub(super) struct ExactDatasetReceipt {
+    identity: CanonicalDatasetIdentity,
+    expected_generation: String,
+}
+
+impl ExactDatasetReceipt {
+    pub(super) fn from_optional(
+        identity: Option<CanonicalDatasetIdentity>,
+        expected_generation: Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
+        match (identity, expected_generation) {
+            (None, None) => Ok(None),
+            (Some(identity), Some(expected_generation)) => {
+                let expected_generation = expected_generation.trim().to_owned();
+                ensure!(
+                    !expected_generation.is_empty(),
+                    "expectedGeneration cannot be empty"
+                );
+                Ok(Some(Self {
+                    identity,
+                    expected_generation,
+                }))
+            }
+            (Some(_), None) => {
+                anyhow::bail!("expectedGeneration is required with an exact datasetIdentity")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("datasetIdentity is required with an expectedGeneration receipt")
+            }
+        }
+    }
+
+    pub(super) const fn identity(&self) -> &CanonicalDatasetIdentity {
+        &self.identity
+    }
+
+    pub(super) fn expected_generation(&self) -> &str {
+        &self.expected_generation
+    }
+}
+
+pub(super) fn load_exact_current_frame(
+    root: impl AsRef<Path>,
+    receipt: &ExactDatasetReceipt,
+) -> anyhow::Result<CanonicalOhlcvFrame> {
+    let frame = load_canonical_timeframe(root, receipt.identity()).with_context(|| {
+        format!(
+            "failed to fully verify and pin exact dataset {}",
+            receipt.identity().to_path_component()
+        )
+    })?;
+    ensure!(
+        frame.artifact().generation_id() == receipt.expected_generation(),
+        "selected dataset generation changed: identity={}, expected={}, current={}; refresh the data inventory before retrying",
+        receipt.identity().to_path_component(),
+        receipt.expected_generation(),
+        frame.artifact().generation_id()
+    );
+    Ok(frame)
+}
+
+#[derive(Debug, Clone)]
+enum ChartRequest {
+    BrokerLive { symbol: String, timeframe: String },
+    ExactLocal { receipt: ExactDatasetReceipt },
+}
+
+impl ChartRequest {
+    fn symbol(&self) -> &str {
+        match self {
+            Self::BrokerLive { symbol, .. } => symbol,
+            Self::ExactLocal { receipt } => receipt.identity().symbol_name(),
+        }
+    }
+
+    fn timeframe(&self) -> &str {
+        match self {
+            Self::BrokerLive { timeframe, .. } => timeframe,
+            Self::ExactLocal { receipt } => receipt.identity().timeframe().as_str(),
+        }
+    }
+
+    const fn is_broker_live(&self) -> bool {
+        matches!(self, Self::BrokerLive { .. })
+    }
+}
+
+fn resolve_chart_request(query: ChartQuery) -> anyhow::Result<(ChartRequest, usize)> {
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let receipt =
+        ExactDatasetReceipt::from_optional(query.dataset_identity, query.expected_generation)?;
+    match receipt {
+        Some(receipt) => {
+            if let Some(asserted) = query
+                .symbol
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                ensure!(
+                    asserted.eq_ignore_ascii_case(receipt.identity().symbol_name()),
+                    "symbol assertion {asserted:?} disagrees with exact dataset identity symbol {:?}",
+                    receipt.identity().symbol_name()
+                );
+            }
+            if let Some(asserted) = query
+                .timeframe
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                ensure!(
+                    asserted.eq_ignore_ascii_case(receipt.identity().timeframe().as_str()),
+                    "timeframe assertion {asserted:?} disagrees with exact dataset identity timeframe {:?}",
+                    receipt.identity().timeframe().as_str()
+                );
+            }
+            Ok((ChartRequest::ExactLocal { receipt }, limit))
+        }
+        None => {
+            let symbol = query
+                .symbol
+                .unwrap_or_else(|| "EURUSD".to_owned())
+                .trim()
+                .to_uppercase();
+            let timeframe = query
+                .timeframe
+                .unwrap_or_else(|| "M1".to_owned())
+                .trim()
+                .to_uppercase();
+            ensure!(!symbol.is_empty(), "broker-live symbol cannot be empty");
+            ensure!(
+                !timeframe.is_empty(),
+                "broker-live timeframe cannot be empty"
+            );
+            Ok((ChartRequest::BrokerLive { symbol, timeframe }, limit))
+        }
+    }
+}
+
+/// Provenance tag for the explicitly selected chart mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChartDataSource {
@@ -76,11 +219,10 @@ pub enum ChartDataSource {
     /// API. The authoritative, current source — UI shows no "cached"
     /// banner.
     Broker,
-    /// Data loaded from the local Vortex cache. Use for offline
-    /// replay / backtests, or when the broker is unreachable. UI
-    /// should surface a "cached" banner.
+    /// Exact, fully verified local Vortex generation selected by identity and
+    /// generation receipt. The historical wire label remains `disk-cache`.
     DiskCache,
-    /// No data available from any source.
+    /// A successful broker-history page with no rows.
     Empty,
 }
 
@@ -115,8 +257,8 @@ pub struct ChartDto {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandleDto {
-    /// Unix timestamp in milliseconds. `None` if the dataset doesn't
-    /// carry timestamps (synthetic / older data).
+    /// Unix timestamp in milliseconds. Exact local generations always carry
+    /// canonical timestamps; broker-live rows carry broker timestamps.
     pub ts_ms: Option<i64>,
     pub open: f64,
     pub high: f64,
@@ -126,81 +268,67 @@ pub struct CandleDto {
 }
 
 pub async fn chart(State(state): State<AppApiState>, Query(q): Query<ChartQuery>) -> Response {
-    let symbol = q
-        .symbol
-        .unwrap_or_else(|| "EURUSD".to_string())
-        .trim()
-        .to_uppercase();
-    let timeframe = q
-        .timeframe
-        .unwrap_or_else(|| "M1".to_string())
-        .trim()
-        .to_uppercase();
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1);
+    let (request, limit) = match resolve_chart_request(q) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Chart request is not an exact local receipt or a valid broker-live selection.",
+                &error,
+            );
+        }
+    };
+    let symbol = request.symbol().to_owned();
+    let timeframe = request.timeframe().to_owned();
+    let broker_live = request.is_broker_live();
 
-    // **2026-05-25 — chart-cache fast path** (operator directive: TF
-    // switch must be immediate, no 100-500ms disk I/O per click).
-    // Check the in-memory `ChartDto` LRU cache first; on hit, return
-    // without ever touching disk. On miss, fall through to the
-    // existing spawn_blocking path which loads from Vortex AND
-    // populates the cache for the next click.
-    if let Some(cached) = super::chart_cache::get(&symbol, &timeframe, limit) {
-        return Json(cached).into_response();
+    // The legacy cache key cannot encode a canonical identity or immutable
+    // generation. It is therefore safe only for broker-live responses. Exact
+    // local reads always re-open, fully verify and pin the requested receipt.
+    if broker_live {
+        if let Some(cached) = super::chart_cache::get(&symbol, &timeframe, limit)
+            .filter(|cached| cached.source == ChartDataSource::Broker)
+        {
+            return Json(cached).into_response();
+        }
     }
 
-    // F-553/F-576 closure (2026-05-25): config path threaded from the
-    // CLI `--config` flag via `AppApiState::config_path()` instead of
-    // hardcoded inside `load_chart`.
     let config_path = state.config_path().to_path_buf();
     let symbol_for_cache = symbol.clone();
     let timeframe_for_cache = timeframe.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        load_chart(&config_path, symbol.clone(), timeframe.clone(), limit).or_else(|err| {
-            // Returning 404 made Flutter render a generic
-            // "Backend unreachable" banner that hid the *real*
-            // remedy ("run Data Bootstrap for this symbol /
-            // timeframe"). 200 with an empty candle list plus a
-            // human-readable headline lets the Chart screen draw
-            // its empty-state UI and the operator knows what to
-            // do next.
-            Ok::<ChartDto, anyhow::Error>(ChartDto {
-                symbol: symbol.clone(),
-                timeframe: timeframe.clone(),
-                available_timeframes: Vec::new(),
-                candle_count: 0,
-                candles: Vec::new(),
-                price_min: 0.0,
-                price_max: 0.0,
-                latest_close: 0.0,
-                price_change_pct: 0.0,
-                headline: format!(
-                    "No data on disk for {symbol} {timeframe}. \
-                         Go to Data Bootstrap and download a window \
-                         from the broker, then come back. ({err})"
-                ),
-                source: ChartDataSource::Empty,
-            })
-        })
+    let result = tokio::task::spawn_blocking(move || match request {
+        ChartRequest::BrokerLive { symbol, timeframe } => {
+            load_broker_chart(symbol, timeframe, limit)
+        }
+        ChartRequest::ExactLocal { receipt } => {
+            load_exact_local_chart(&config_path, receipt, limit)
+        }
     })
     .await;
 
     match result {
         Ok(Ok(dto)) => {
-            // **2026-05-25 — chart-cache populate**: cache the freshly-
-            // loaded DTO so the next click on the same (symbol, TF, limit)
-            // is a ~1 µs in-RAM hit instead of another 100-500 ms disk
-            // read. TTL inside `chart_cache` keeps the cache from
-            // serving stale data once the live bar progresses.
-            super::chart_cache::put(&symbol_for_cache, &timeframe_for_cache, limit, dto.clone());
+            if broker_live {
+                super::chart_cache::put(
+                    &symbol_for_cache,
+                    &timeframe_for_cache,
+                    limit,
+                    dto.clone(),
+                );
+            }
             Json(dto).into_response()
         }
-        // load_chart's or_else above always returns Ok, so this arm
-        // is only reachable if a future change re-introduces a fatal
-        // error path; surface a friendly message so the UI banner helps.
         Ok(Err(err)) => actionable_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Chart data could not be loaded. If the broker is connected, refresh; \
-             otherwise open Data Bootstrap and download a window for this symbol/timeframe.",
+            if broker_live {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::CONFLICT
+            },
+            if broker_live {
+                "Broker-live chart data could not be loaded; no local fallback was attempted."
+            } else {
+                "The exact local dataset receipt could not be fully verified and pinned. Refresh the data inventory before retrying."
+            },
             &err,
         ),
         Err(join_err) => internal_panic("Loading chart data", join_err),
@@ -309,132 +437,96 @@ pub async fn chart_history(
             })
             .into_response()
         }
-        // Broker unreachable / no session: 200 with an empty page so the
-        // chart simply stops scrolling back rather than throwing — older
-        // history just isn't available right now.
-        Ok(Err(err)) => {
-            tracing::debug!(
-                target: "neoethos_app::server::chart",
-                symbol = %symbol_for_dto,
-                timeframe = %timeframe_for_dto,
-                error = %err,
-                "chart history fetch failed; returning empty page"
-            );
-            Json(ChartHistoryDto {
-                symbol: symbol_for_dto,
-                timeframe: timeframe_for_dto,
-                candle_count: 0,
-                candles: Vec::new(),
-                has_more: false,
-                source: ChartDataSource::Empty,
-            })
-            .into_response()
-        }
+        Ok(Err(err)) => actionable_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Broker-live chart history could not be loaded; no local fallback was attempted.",
+            &err,
+        ),
         Err(join_err) => internal_panic("Loading older chart bars", join_err),
     }
 }
 
-/// Load OHLC candles for a symbol/timeframe from the local data dir.
-pub fn load_chart(
-    config_path: &PathBuf,
-    symbol: String,
-    timeframe: String,
+fn load_broker_chart(symbol: String, timeframe: String, limit: usize) -> anyhow::Result<ChartDto> {
+    let bars = crate::app_services::broker_api::fetch_recent_chart_bars_blocking(
+        &symbol, &timeframe, limit,
+    )
+    .with_context(|| format!("broker-live chart fetch failed for {symbol} {timeframe}"))?;
+    ensure!(
+        !bars.is_empty(),
+        "broker-live chart returned no bars for {symbol} {timeframe}"
+    );
+    let candles = bars
+        .into_iter()
+        .map(|bar| CandleDto {
+            ts_ms: Some(bar.timestamp_ms),
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume.unwrap_or(0) as f64,
+        })
+        .collect();
+    Ok(build_chart_dto(
+        symbol,
+        timeframe.clone(),
+        vec![timeframe],
+        candles,
+        ChartDataSource::Broker,
+    ))
+}
+
+fn load_exact_local_chart(
+    config_path: &Path,
+    receipt: ExactDatasetReceipt,
     limit: usize,
 ) -> anyhow::Result<ChartDto> {
     let settings = Settings::from_yaml(config_path)
-        .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
+        .map_err(|error| anyhow::anyhow!("{} not loadable: {error}", config_path.display()))?;
+    let frame = load_exact_current_frame(&settings.system.data_dir, &receipt)?;
+    let identity = receipt.identity();
+    ensure!(
+        frame.artifact().identity() == identity,
+        "verified local frame identity changed after exact selection"
+    );
+    let ohlcv = frame.ohlcv();
+    let timestamps = ohlcv
+        .timestamp
+        .as_deref()
+        .context("verified canonical chart generation has no timestamp_ms")?;
+    let total = ohlcv.len();
+    let start = total.saturating_sub(limit);
+    let volumes = ohlcv.volume.as_deref();
+    let candles = (start..total)
+        .map(|index| CandleDto {
+            ts_ms: Some(timestamps[index]),
+            open: ohlcv.open[index],
+            high: ohlcv.high[index],
+            low: ohlcv.low[index],
+            close: ohlcv.close[index],
+            volume: volumes
+                .and_then(|values| values.get(index))
+                .copied()
+                .unwrap_or(0.0),
+        })
+        .collect();
+    let symbol = identity.symbol_name().to_owned();
+    let timeframe = identity.timeframe().as_str().to_owned();
+    Ok(build_chart_dto(
+        symbol,
+        timeframe.clone(),
+        vec![timeframe],
+        candles,
+        ChartDataSource::DiskCache,
+    ))
+}
 
-    // #154: previously called `load_symbol_dataset` which eagerly loaded
-    // ALL discovered timeframes for the symbol (commonly 19+ Vortex
-    // files at ~30 MB each — half a gigabyte of disk reads to render a
-    // single timeframe). Now we ask `discover_timeframes` for the
-    // dropdown list (cheap directory listing, cached per #79) and load
-    // only the requested timeframe's Vortex file.
-    // Local timeframe list for the dropdown. Non-fatal: a symbol with no
-    // local cache can still be charted straight from the broker below, and
-    // the broker timeframe gets appended on a successful live fetch.
-    let mut available_timeframes =
-        discover_timeframes(&settings.system.data_dir, &symbol).unwrap_or_default();
-    available_timeframes.sort();
-
-    // Phase 2 — broker-passthrough: fetch LIVE trendbars straight from
-    // cTrader first (the authoritative, current source). Fall back to the
-    // local Vortex cache only when the broker is unreachable / has no
-    // session. This is what makes the chart show *current* candles instead
-    // of a stale bootstrap snapshot.
-    let (candles, source): (Vec<CandleDto>, ChartDataSource) =
-        match crate::app_services::broker_api::fetch_recent_chart_bars_blocking(
-            &symbol, &timeframe, limit,
-        ) {
-            Ok(bars) if !bars.is_empty() => {
-                // The broker serves this timeframe even if the local cache
-                // doesn't — make sure the dropdown lists it.
-                if !available_timeframes.contains(&timeframe) {
-                    available_timeframes.push(timeframe.clone());
-                    available_timeframes.sort();
-                }
-                let candles = bars
-                    .iter()
-                    .map(|b| CandleDto {
-                        ts_ms: Some(b.timestamp_ms),
-                        open: b.open,
-                        high: b.high,
-                        low: b.low,
-                        close: b.close,
-                        volume: b.volume.unwrap_or(0) as f64,
-                    })
-                    .collect();
-                (candles, ChartDataSource::Broker)
-            }
-            broker_result => {
-                if let Err(err) = &broker_result {
-                    tracing::debug!(
-                        target: "neoethos_app::server::chart",
-                        symbol = %symbol,
-                        timeframe = %timeframe,
-                        error = %err,
-                        "broker chart fetch failed; falling back to local Vortex cache"
-                    );
-                }
-                // Disk fallback requires the timeframe to exist locally.
-                if !available_timeframes.contains(&timeframe) {
-                    anyhow::bail!(
-                        "timeframe '{timeframe}' not available for {symbol} from \
-                         broker or local cache (cached: {})",
-                        available_timeframes.join(", ")
-                    );
-                }
-                // #155: trailing `limit` rows only — avoid loading a
-                // million-row Ohlcv just to slice the tail.
-                let ohlcv = load_symbol_timeframe_tail(
-                    &settings.system.data_dir,
-                    &symbol,
-                    &timeframe,
-                    limit,
-                )
-                .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol} {timeframe}: {e}"))?;
-                let total = ohlcv.len();
-                let timestamps = ohlcv.timestamp.as_deref();
-                let volumes = ohlcv.volume.as_deref();
-                let candles: Vec<CandleDto> = (0..total)
-                    .map(|idx| CandleDto {
-                        ts_ms: timestamps.and_then(|ts| ts.get(idx)).copied(),
-                        open: ohlcv.open[idx],
-                        high: ohlcv.high[idx],
-                        low: ohlcv.low[idx],
-                        close: ohlcv.close[idx],
-                        volume: volumes.and_then(|v| v.get(idx)).copied().unwrap_or(0.0),
-                    })
-                    .collect();
-                let source = if candles.is_empty() {
-                    ChartDataSource::Empty
-                } else {
-                    ChartDataSource::DiskCache
-                };
-                (candles, source)
-            }
-        };
-
+fn build_chart_dto(
+    symbol: String,
+    timeframe: String,
+    available_timeframes: Vec<String>,
+    candles: Vec<CandleDto>,
+    source: ChartDataSource,
+) -> ChartDto {
     let (price_min, price_max) = if candles.is_empty() {
         (0.0, 0.0)
     } else {
@@ -462,7 +554,7 @@ pub fn load_chart(
         )
     };
 
-    Ok(ChartDto {
+    ChartDto {
         symbol,
         timeframe,
         available_timeframes,
@@ -474,5 +566,5 @@ pub fn load_chart(
         price_change_pct,
         headline,
         source,
-    })
+    }
 }

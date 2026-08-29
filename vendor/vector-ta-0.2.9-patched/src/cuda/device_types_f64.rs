@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 //! The f64 half of the device vocabulary.
 //!
@@ -36,7 +36,7 @@
 //!   non-empty, matching lengths, matching device) and can only be built from
 //!   an owner via `as_view` or, unsafely, from raw parts.
 
-use super::device_types::{ensure_same_device, ensure_same_len, CudaDeviceViewError};
+use super::device_types::{CudaDeviceViewError, ensure_same_device, ensure_same_len};
 use super::{CudaDeviceMatrix, CudaDeviceVector};
 
 fn validate_raw_slice(device_ptr: u64, len: usize) -> Result<(), CudaDeviceViewError> {

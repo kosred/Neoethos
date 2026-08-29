@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -13,32 +13,6 @@ use std::collections::VecDeque;
 use std::convert::AsRef;
 use std::mem::ManuallyDrop;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::{PyTypeError, PyValueError};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum ChandeData<'a> {
@@ -58,10 +32,6 @@ pub struct ChandeOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct ChandeParams {
     pub period: Option<usize>,
     pub mult: Option<f64>,
@@ -329,7 +299,6 @@ pub fn chande_with_kernel(
     Ok(ChandeOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn chande_into(input: &ChandeInput, out: &mut [f64]) -> Result<(), ChandeError> {
     chande_into_slice(out, input, Kernel::Auto)
@@ -747,11 +716,7 @@ unsafe fn chande_fast_unchecked(
                 let hc = (hi - prev_close).abs();
                 let lc = (lo - prev_close).abs();
                 let t = if hl >= hc { hl } else { hc };
-                if t >= lc {
-                    t
-                } else {
-                    lc
-                }
+                if t >= lc { t } else { lc }
             };
 
             if i >= warmup {
@@ -799,11 +764,7 @@ unsafe fn chande_fast_unchecked(
                 let hc = (hi - prev_close).abs();
                 let lc = (lo - prev_close).abs();
                 let t = if hl >= hc { hl } else { hc };
-                if t >= lc {
-                    t
-                } else {
-                    lc
-                }
+                if t >= lc { t } else { lc }
             };
 
             if i >= warmup {
@@ -1553,91 +1514,25 @@ unsafe fn chande_row_avx512_long(
 ) {
     chande_fast_unchecked(high, low, close, period, mult, dir, first, out)
 }
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    mult: f64,
-    direction: &str,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = chande_js(high, low, close, period, mult, direction)?;
-    crate::write_wasm_f64_output("chande_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-    direction: &str,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = chande_batch_js(
-        high,
-        low,
-        close,
-        period_start,
-        period_end,
-        period_step,
-        mult_start,
-        mult_end,
-        mult_step,
-        direction,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs("chande_batch_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = chande_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "chande_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_chande_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = ChandeInput::with_default_candles(&candles);
 
         let baseline = chande(&input)?;
 
         let mut out = vec![0.0f64; candles.close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             chande_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            chande_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.values.len(), out.len());
@@ -1663,8 +1558,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = ChandeParams {
             period: None,
@@ -1683,8 +1578,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let close_prices = &candles.close;
 
         let params = ChandeParams {
@@ -1740,8 +1635,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ChandeParams {
             period: Some(0),
@@ -1764,8 +1659,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ChandeParams {
             period: Some(99999),
@@ -1788,8 +1683,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ChandeParams {
             period: Some(22),
@@ -1812,8 +1707,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ChandeParams {
             period: Some(22),
@@ -1841,8 +1736,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = ChandeParams {
             period: Some(22),
@@ -1885,8 +1780,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let param_combinations = vec![
             ChandeParams {
@@ -1920,24 +1815,39 @@ mod tests {
                 if bits == 0x11111111_11111111 {
                     panic!(
                         "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with params: period={}, mult={}, direction={}",
-                        test_name, val, bits, i,
-                        params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap(),
+                        params.mult.unwrap(),
+                        params.direction.as_ref().unwrap()
                     );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
                         "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with params: period={}, mult={}, direction={}",
-                        test_name, val, bits, i,
-                        params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap(),
+                        params.mult.unwrap(),
+                        params.direction.as_ref().unwrap()
                     );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
                         "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with params: period={}, mult={}, direction={}",
-                        test_name, val, bits, i,
-                        params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                        test_name,
+                        val,
+                        bits,
+                        i,
+                        params.period.unwrap(),
+                        params.mult.unwrap(),
+                        params.direction.as_ref().unwrap()
                     );
                 }
             }
@@ -2025,6 +1935,13 @@ mod tests {
                     timestamp: vec![],
                     open: vec![],
                     volume: vec![],
+                    fields: crate::utilities::data_loader::CandleFieldFlags {
+                        open: false,
+                        high: true,
+                        low: true,
+                        close: true,
+                        volume: false,
+                    },
                     hl2: vec![],
                     hlc3: vec![],
                     ohlc4: vec![],
@@ -2207,8 +2124,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = ChandeBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
         let def = ChandeParams::default();
@@ -2236,8 +2153,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = ChandeBatchBuilder::new()
             .kernel(kernel)
@@ -2259,24 +2176,45 @@ mod tests {
             if bits == 0x11111111_11111111 {
                 panic!(
                     "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, mult={}, direction={}",
-                    test, val, bits, row, col, idx,
-                    params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                    test,
+                    val,
+                    bits,
+                    row,
+                    col,
+                    idx,
+                    params.period.unwrap(),
+                    params.mult.unwrap(),
+                    params.direction.as_ref().unwrap()
                 );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
                     "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, mult={}, direction={}",
-                    test, val, bits, row, col, idx,
-                    params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                    test,
+                    val,
+                    bits,
+                    row,
+                    col,
+                    idx,
+                    params.period.unwrap(),
+                    params.mult.unwrap(),
+                    params.direction.as_ref().unwrap()
                 );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
                     "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, mult={}, direction={}",
-                    test, val, bits, row, col, idx,
-                    params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                    test,
+                    val,
+                    bits,
+                    row,
+                    col,
+                    idx,
+                    params.period.unwrap(),
+                    params.mult.unwrap(),
+                    params.direction.as_ref().unwrap()
                 );
             }
         }
@@ -2301,24 +2239,45 @@ mod tests {
             if bits == 0x11111111_11111111 {
                 panic!(
                     "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, mult={}, direction={}",
-                    test, val, bits, row, col, idx,
-                    params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                    test,
+                    val,
+                    bits,
+                    row,
+                    col,
+                    idx,
+                    params.period.unwrap(),
+                    params.mult.unwrap(),
+                    params.direction.as_ref().unwrap()
                 );
             }
 
             if bits == 0x22222222_22222222 {
                 panic!(
                     "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, mult={}, direction={}",
-                    test, val, bits, row, col, idx,
-                    params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                    test,
+                    val,
+                    bits,
+                    row,
+                    col,
+                    idx,
+                    params.period.unwrap(),
+                    params.mult.unwrap(),
+                    params.direction.as_ref().unwrap()
                 );
             }
 
             if bits == 0x33333333_33333333 {
                 panic!(
                     "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} (flat index {}) with params: period={}, mult={}, direction={}",
-                    test, val, bits, row, col, idx,
-                    params.period.unwrap(), params.mult.unwrap(), params.direction.as_ref().unwrap()
+                    test,
+                    val,
+                    bits,
+                    row,
+                    col,
+                    idx,
+                    params.period.unwrap(),
+                    params.mult.unwrap(),
+                    params.direction.as_ref().unwrap()
                 );
             }
         }
@@ -2356,605 +2315,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "chande")]
-#[pyo3(signature = (high, low, close, period, mult, direction, kernel=None))]
-pub fn chande_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    mult: f64,
-    direction: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = ChandeParams {
-        period: Some(period),
-        mult: Some(mult),
-        direction: Some(direction.to_string()),
-    };
-    let input = ChandeInput::from_slices(h, l, c, params);
-
-    let result_vec = py
-        .allow_threads(|| chande_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ChandeStream")]
-pub struct ChandeStreamPy {
-    stream: ChandeStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl ChandeStreamPy {
-    #[new]
-    fn new(period: usize, mult: f64, direction: &str) -> PyResult<Self> {
-        let params = ChandeParams {
-            period: Some(period),
-            mult: Some(mult),
-            direction: Some(direction.to_string()),
-        };
-        let stream =
-            ChandeStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(ChandeStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "chande_batch")]
-#[pyo3(signature = (high, low, close, period_range, mult_range, direction, kernel=None))]
-pub fn chande_batch_py<'py>(
-    py: Python<'py>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    direction: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    let sweep = ChandeBatchRange {
-        period: period_range,
-        mult: mult_range,
-    };
-    let combos =
-        expand_grid(&sweep, direction).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = h.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let simd = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k => k,
-        };
-
-        let simd = match simd {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => simd,
-        };
-        chande_batch_inner_into(h, l, c, &sweep, direction, simd, true, slice_out)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "mults",
-        combos
-            .iter()
-            .map(|p| p.mult.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "directions",
-        combos
-            .iter()
-            .map(|p| p.direction.as_deref().unwrap())
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Chande", unsendable)]
-pub struct DeviceArrayF32ChandePy {
-    pub(crate) inner: DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32ChandePy {
-    #[new]
-    fn py_new() -> PyResult<Self> {
-        Err(PyTypeError::new_err(
-            "DeviceArrayF32Chande cannot be created directly; use chande_cuda_* factories",
-        ))
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        let ptr_val: usize = self.inner.buf.as_device_ptr().as_raw() as usize;
-        d.set_item("data", (ptr_val, false))?;
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self._device_id as i32)
-    }
-
-    #[pyo3(signature = (_stream=None, max_version=None, _dl_device=None, _copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        _stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        _dl_device: Option<pyo3::PyObject>,
-        _copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use cust::memory::DeviceBuffer;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = _dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = _copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = _stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32ChandePy {
-    pub fn new(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "chande_cuda_batch_dev")]
-#[pyo3(signature = (high, low, close, period_range, mult_range, direction, device_id=0))]
-pub fn chande_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: PyReadonlyArray1<'_, f32>,
-    low: PyReadonlyArray1<'_, f32>,
-    close: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    mult_range: (f64, f64, f64),
-    direction: &str,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32ChandePy> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaChande;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-    if high_slice.len() != low_slice.len() || high_slice.len() != close_slice.len() {
-        return Err(PyValueError::new_err("mismatched input lengths"));
-    }
-
-    let sweep = ChandeBatchRange {
-        period: period_range,
-        mult: mult_range,
-    };
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let mut cuda =
-            CudaChande::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let dev_arr = cuda
-            .chande_batch_dev(high_slice, low_slice, close_slice, &sweep, direction)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((dev_arr, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32ChandePy::new(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "chande_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, close_tm, cols, rows, period, mult, direction, device_id=0))]
-pub fn chande_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: PyReadonlyArray1<'_, f32>,
-    low_tm: PyReadonlyArray1<'_, f32>,
-    close_tm: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    mult: f32,
-    direction: &str,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32ChandePy> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::CudaChande;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let high_slice = high_tm.as_slice()?;
-    let low_slice = low_tm.as_slice()?;
-    let close_slice = close_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if high_slice.len() != expected || low_slice.len() != expected || close_slice.len() != expected
-    {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaChande::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .chande_many_series_one_param_time_major_dev(
-                high_slice,
-                low_slice,
-                close_slice,
-                cols,
-                rows,
-                period,
-                mult,
-                direction,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-
-    Ok(DeviceArrayF32ChandePy::new(inner, ctx, dev_id))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    mult: f64,
-    direction: &str,
-) -> Result<Vec<f64>, JsValue> {
-    let params = ChandeParams {
-        period: Some(period),
-        mult: Some(mult),
-        direction: Some(direction.to_string()),
-    };
-    let input = ChandeInput::from_slices(high, low, close, params);
-    let mut out = vec![0.0; high.len()];
-    chande_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ChandeBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub mult_range: (f64, f64, f64),
-    pub direction: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct ChandeBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<ChandeParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    mult_start: f64,
-    mult_end: f64,
-    mult_step: f64,
-    direction: &str,
-) -> Result<JsValue, JsValue> {
-    use wasm_bindgen::prelude::*;
-
-    let sweep = ChandeBatchRange {
-        period: (period_start, period_end, period_step),
-        mult: (mult_start, mult_end, mult_step),
-    };
-
-    let simd = detect_best_batch_kernel().to_non_batch();
-
-    let out = chande_batch_inner(high, low, close, &sweep, direction, simd, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_obj = js_sys::Object::new();
-
-    let values_arr = js_sys::Float64Array::new_with_length(out.values.len() as u32);
-    values_arr.copy_from(&out.values);
-    js_sys::Reflect::set(&js_obj, &JsValue::from_str("values"), &values_arr.into())?;
-
-    let periods: Vec<f64> = out
-        .combos
-        .iter()
-        .map(|c| c.period.unwrap() as f64)
-        .collect();
-    let mults: Vec<f64> = out.combos.iter().map(|c| c.mult.unwrap()).collect();
-    let directions: Vec<String> = out
-        .combos
-        .iter()
-        .map(|c| c.direction.as_ref().unwrap().clone())
-        .collect();
-
-    let periods_arr = js_sys::Float64Array::new_with_length(periods.len() as u32);
-    periods_arr.copy_from(&periods);
-    js_sys::Reflect::set(&js_obj, &JsValue::from_str("periods"), &periods_arr.into())?;
-
-    let mults_arr = js_sys::Float64Array::new_with_length(mults.len() as u32);
-    mults_arr.copy_from(&mults);
-    js_sys::Reflect::set(&js_obj, &JsValue::from_str("mults"), &mults_arr.into())?;
-
-    let dirs_arr = js_sys::Array::new();
-    for dir in &directions {
-        dirs_arr.push(&JsValue::from_str(dir));
-    }
-    js_sys::Reflect::set(&js_obj, &JsValue::from_str("directions"), &dirs_arr.into())?;
-
-    js_sys::Reflect::set(
-        &js_obj,
-        &JsValue::from_str("rows"),
-        &JsValue::from_f64(out.rows as f64),
-    )?;
-    js_sys::Reflect::set(
-        &js_obj,
-        &JsValue::from_str("cols"),
-        &JsValue::from_f64(out.cols as f64),
-    )?;
-
-    Ok(js_obj.into())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = chande_batch)]
-pub fn chande_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: ChandeBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = ChandeBatchRange {
-        period: cfg.period_range,
-        mult: cfg.mult_range,
-    };
-    let simd = detect_best_batch_kernel().to_non_batch();
-    let out = chande_batch_inner(high, low, close, &sweep, &cfg.direction, simd, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = ChandeBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_alloc(len: usize) -> *mut f64 {
-    let mut v: Vec<f64> = Vec::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_into(
-    h_ptr: *const f64,
-    l_ptr: *const f64,
-    c_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    mult: f64,
-    direction: &str,
-) -> Result<(), JsValue> {
-    if [
-        h_ptr as usize,
-        l_ptr as usize,
-        c_ptr as usize,
-        out_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str("null pointer passed to chande_into"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(h_ptr, len);
-        let l = std::slice::from_raw_parts(l_ptr, len);
-        let c = std::slice::from_raw_parts(c_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-
-        if out_ptr as *const f64 == h_ptr
-            || out_ptr as *const f64 == l_ptr
-            || out_ptr as *const f64 == c_ptr
-        {
-            let mut tmp = vec![0.0; len];
-            let params = ChandeParams {
-                period: Some(period),
-                mult: Some(mult),
-                direction: Some(direction.to_string()),
-            };
-            let input = ChandeInput::from_slices(h, l, c, params);
-            chande_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            out.copy_from_slice(&tmp);
-        } else {
-            let params = ChandeParams {
-                period: Some(period),
-                mult: Some(mult),
-                direction: Some(direction.to_string()),
-            };
-            let input = ChandeInput::from_slices(h, l, c, params);
-            chande_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn chande_batch_into(
-    h_ptr: *const f64,
-    l_ptr: *const f64,
-    c_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    p_start: usize,
-    p_end: usize,
-    p_step: usize,
-    m_start: f64,
-    m_end: f64,
-    m_step: f64,
-    direction: &str,
-) -> Result<usize, JsValue> {
-    if [
-        h_ptr as usize,
-        l_ptr as usize,
-        c_ptr as usize,
-        out_ptr as usize,
-    ]
-    .iter()
-    .any(|&p| p == 0)
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to chande_batch_into",
-        ));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(h_ptr, len);
-        let l = std::slice::from_raw_parts(l_ptr, len);
-        let c = std::slice::from_raw_parts(c_ptr, len);
-        let sweep = ChandeBatchRange {
-            period: (p_start, p_end, p_step),
-            mult: (m_start, m_end, m_step),
-        };
-        let combos =
-            expand_grid(&sweep, direction).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let simd = match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        };
-        chande_batch_inner_into(h, l, c, &sweep, direction, simd, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
 }

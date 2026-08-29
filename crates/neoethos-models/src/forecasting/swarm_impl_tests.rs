@@ -1,4 +1,4 @@
-// TODO(real-data): every dataframe / value vector in this file is
+// TODO(real-data): every feature frame / value vector in this file is
 // synthesised (linear ramps, cyclic class labels, hand-written floats).
 // Replace every fixture below with a cTrader historical sample for
 // the symbol/timeframe the swarm forecaster is intended to run on
@@ -6,7 +6,7 @@
 // real broker data shape, including weekend gaps and quote noise.
 use super::*;
 
-use polars::prelude::NamedFrom;
+use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,62 +23,59 @@ fn test_artifact_dir(name: &str) -> PathBuf {
 }
 
 #[test]
-fn extract_series_rejects_class_like_target_column_as_price_source() {
-    let frame = DataFrame::new(vec![
-        Series::new(
-            "feature".into(),
-            (0..64).map(|idx| idx as f64).collect::<Vec<_>>(),
-        )
-        .into(),
-        Series::new(
-            "target".into(),
-            (0..64)
-                .map(|idx| match idx % 3 {
-                    0 => -1,
-                    1 => 0,
-                    _ => 1,
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into(),
-    ])
-    .expect("frame");
-    let labels = Series::new(
-        "labels".into(),
-        (0..64)
-            .map(|idx| match idx % 3 {
-                0 => -1,
-                1 => 0,
-                _ => 1,
-            })
-            .collect::<Vec<_>>(),
-    );
+fn exact_training_series_rejects_a_frame_without_quant_close() {
+    let rows = 64;
+    let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+        neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+        vec![
+            FeatureColumnF64::new(
+                "feature",
+                (0..rows).map(|row| row as f64).collect(),
+                vec![FeatureCellValidity::Valid; rows],
+            )
+            .expect("feature column"),
+        ],
+    )
+    .expect("feature frame");
 
-    let err = extract_series_from_frame(&frame, &labels)
-        .expect_err("class-like target column must not be forecast as price");
-    assert!(err.to_string().contains("price-like series"));
+    let err = exact_training_series_from_frame(&frame)
+        .expect_err("swarm training must require exact quant_close");
+    assert!(err.to_string().contains("quant_close"));
 }
 
 #[test]
-fn extract_series_uses_continuous_labels_when_price_column_is_absent() {
-    let frame = DataFrame::new(vec![
-        Series::new(
-            "feature".into(),
-            (0..64).map(|idx| idx as f64).collect::<Vec<_>>(),
-        )
-        .into(),
-    ])
-    .expect("frame");
-    let labels = Series::new(
-        "continuous_target".into(),
-        (0..64)
-            .map(|idx| 1.10_f64 + idx as f64 * 0.0001)
-            .collect::<Vec<_>>(),
-    );
+fn exact_training_series_uses_quant_close_and_canonical_timestamps() {
+    let rows = 64;
+    let expected = (0..rows)
+        .map(|row| 1.10_f64 + row as f64 * 0.0001)
+        .collect::<Vec<_>>();
+    let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(rows);
+    let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+        timestamps.clone(),
+        vec![
+            FeatureColumnF64::new(
+                SWARM_PRICE_COLUMN,
+                expected.clone(),
+                vec![FeatureCellValidity::Valid; rows],
+            )
+            .expect("quant_close column"),
+        ],
+    )
+    .expect("feature frame");
 
-    let values = extract_series_from_frame(&frame, &labels).expect("continuous label series");
+    let (values, actual_timestamps) =
+        exact_training_series_from_frame(&frame).expect("exact swarm training series");
     assert_eq!(values.len(), 64);
-    assert!(values[63] > values[0]);
+    for (actual, expected) in values.iter().zip(expected) {
+        assert_eq!(actual.to_bits(), (expected as f32).to_bits());
+    }
+    assert_eq!(
+        actual_timestamps,
+        timestamps
+            .into_iter()
+            .map(|timestamp| timestamp as f64)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -1759,5 +1756,8 @@ fn project_to_simplex_clips_and_renormalizes() {
     // All-zero (or all-negative) collapses to uniform.
     let mut zeros = vec![0.0_f32, 0.0, 0.0, 0.0];
     project_to_simplex(&mut zeros);
-    assert!(zeros.iter().all(|w| (*w - 0.25).abs() < 1e-6), "all-zero -> uniform");
+    assert!(
+        zeros.iter().all(|w| (*w - 0.25).abs() < 1e-6),
+        "all-zero -> uniform"
+    );
 }

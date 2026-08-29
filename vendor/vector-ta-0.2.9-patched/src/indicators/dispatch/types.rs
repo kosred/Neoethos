@@ -1,4 +1,4 @@
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 use crate::cuda::{
     CudaDeviceCloseVolumeRef, CudaDeviceHighLowRef, CudaDeviceOhlcRef, CudaDeviceOhlcvRef,
     CudaDeviceSliceF32Ref,
@@ -102,14 +102,14 @@ pub struct IndicatorComputeOutput {
     pub pattern_ids: Option<Vec<String>>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CudaOutputTarget {
     DeviceF32,
     HostF32,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Clone)]
 pub struct DeviceMatrixF32 {
     pub device_ptr: u64,
@@ -119,7 +119,7 @@ pub struct DeviceMatrixF32 {
     owner: std::sync::Arc<crate::cuda::moving_averages::DeviceArrayF32>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 impl std::fmt::Debug for DeviceMatrixF32 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceMatrixF32")
@@ -131,7 +131,7 @@ impl std::fmt::Debug for DeviceMatrixF32 {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 impl PartialEq for DeviceMatrixF32 {
     fn eq(&self, other: &Self) -> bool {
         self.device_ptr == other.device_ptr
@@ -141,10 +141,10 @@ impl PartialEq for DeviceMatrixF32 {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 impl Eq for DeviceMatrixF32 {}
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 impl DeviceMatrixF32 {
     pub(crate) fn from_owned(
         owner: crate::cuda::moving_averages::DeviceArrayF32,
@@ -173,7 +173,7 @@ impl DeviceMatrixF32 {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Debug, Clone, Copy)]
 pub enum IndicatorCudaDataRef<'a> {
     Slice {
@@ -205,7 +205,7 @@ pub enum IndicatorCudaDataRef<'a> {
     },
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Debug, Clone, Copy)]
 pub struct IndicatorCudaRequest<'a> {
     pub indicator_id: &'a str,
@@ -216,17 +216,7 @@ pub struct IndicatorCudaRequest<'a> {
     pub target: CudaOutputTarget,
 }
 
-#[cfg(feature = "cuda")]
-#[derive(Debug, Clone, Copy)]
-pub struct IndicatorCudaBitmaskRequest<'a> {
-    pub indicator_id: &'a str,
-    pub output_id: Option<&'a str>,
-    pub data: IndicatorCudaDataRef<'a>,
-    pub params: &'a [ParamKV<'a>],
-    pub kernel: Kernel,
-}
-
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndicatorCudaDeviceDataRef {
     Slice { values: CudaDeviceSliceF32Ref },
@@ -236,7 +226,7 @@ pub enum IndicatorCudaDeviceDataRef {
     CloseVolume(CudaDeviceCloseVolumeRef),
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Debug, Clone, Copy)]
 pub struct IndicatorCudaDeviceRequest<'a> {
     pub indicator_id: &'a str,
@@ -247,24 +237,14 @@ pub struct IndicatorCudaDeviceRequest<'a> {
     pub target: CudaOutputTarget,
 }
 
-#[cfg(feature = "cuda")]
-#[derive(Debug, Clone, Copy)]
-pub struct IndicatorCudaDeviceBitmaskRequest<'a> {
-    pub indicator_id: &'a str,
-    pub output_id: Option<&'a str>,
-    pub data: IndicatorCudaDeviceDataRef,
-    pub params: &'a [ParamKV<'a>],
-    pub kernel: Kernel,
-}
-
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndicatorCudaSeries {
     DeviceF32(DeviceMatrixF32),
     HostF32(Vec<f32>),
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-build-native")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndicatorCudaOutput {
     pub output_id: String,
@@ -273,31 +253,4 @@ pub struct IndicatorCudaOutput {
     pub rows: usize,
     pub cols: usize,
     pub pattern_ids: Option<Vec<String>>,
-}
-
-#[cfg(feature = "cuda")]
-pub struct PatternRecognitionCudaBitmaskOutput {
-    pub output_id: String,
-    pub series: crate::cuda::pattern_recognition_wrapper::DevicePatternBitmaskU64,
-    pub warmup: Option<usize>,
-    pub rows: usize,
-    pub cols: usize,
-    pub words_per_row: usize,
-    pub pattern_ids: Vec<String>,
-}
-
-#[cfg(feature = "cuda")]
-impl std::fmt::Debug for PatternRecognitionCudaBitmaskOutput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PatternRecognitionCudaBitmaskOutput")
-            .field("output_id", &self.output_id)
-            .field("device_ptr", &self.series.device_ptr())
-            .field("rows", &self.rows)
-            .field("cols", &self.cols)
-            .field("words_per_row", &self.words_per_row)
-            .field("device_id", &self.series.device_id)
-            .field("warmup", &self.warmup)
-            .field("pattern_ids", &self.pattern_ids)
-            .finish()
-    }
 }

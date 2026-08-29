@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::indicators::moving_averages::alma::{AlmaBatchRange, AlmaParams};
 use cust::context::Context;
@@ -6,8 +6,8 @@ use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
 use cust::memory::AsyncCopyDestination;
-use cust::memory::{mem_get_info, DeviceBuffer, DevicePointer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, DevicePointer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -137,12 +137,6 @@ impl CudaAlma {
         let device = Device::get_device(device_id as u32)?;
         let context = std::sync::Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/alma_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("alma_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
@@ -178,11 +172,11 @@ impl CudaAlma {
         unsafe {
             use cust::device::Device as CuDevice;
             use cust::sys::{
-                cuCtxSetLimit, cuDeviceGetAttribute, cuStreamSetAttribute,
                 CUaccessPolicyWindow_v1 as CUaccessPolicyWindow,
                 CUaccessProperty_enum as AccessProp, CUdevice_attribute_enum as DevAttr,
                 CUlimit_enum as CULimit, CUstreamAttrID_enum as StreamAttrId,
-                CUstreamAttrValue_v1 as CUstreamAttrValue,
+                CUstreamAttrValue_v1 as CUstreamAttrValue, cuCtxSetLimit, cuDeviceGetAttribute,
+                cuStreamSetAttribute,
             };
 
             let mut max_window_bytes_i32: i32 = 0;

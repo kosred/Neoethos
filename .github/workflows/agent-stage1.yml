@@ -74,47 +74,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash -n scripts/gpu-bench/preflight.sh scripts/gpu-bench/prepare_worktrees.sh
+          bash -n \
+            scripts/gpu-bench/preflight.sh \
+            scripts/gpu-bench/remote_bootstrap.sh \
+            scripts/gpu-bench/prepare_worktrees.sh \
+            scripts/gpu-bench/run_rented.sh \
+            scripts/gpu-bench/check_cuda_hardware.sh \
+            scripts/gpu-bench/run_cuda_test_gate.sh \
+            scripts/gpu-bench/run_compute_sanitizer_gate.sh \
+            scripts/gpu-bench/run_cuda_validation.sh \
+            scripts/gpu-bench/run_cuda_memcheck_validation.sh
           python3 -m py_compile \
-            scripts/gpu-bench/run_matrix.py \
-            scripts/gpu-bench/collate.py \
-            scripts/gpu-bench/prepare_snapshot.py \
             scripts/gpu-bench/test_prepare_worktrees.py \
+            scripts/gpu-bench/test_cuda_gate_behavior.py \
             scripts/gpu-bench/test_preflight_contract.py \
+            scripts/gpu-bench/test_remote_bootstrap_contract.py \
             scripts/gpu-bench/test_stage1_ci_contract.py
           python3 scripts/gpu-bench/test_prepare_worktrees.py
+          python3 scripts/gpu-bench/test_cuda_gate_behavior.py
           python3 scripts/gpu-bench/test_preflight_contract.py
+          python3 scripts/gpu-bench/test_remote_bootstrap_contract.py
           python3 scripts/gpu-bench/test_stage1_ci_contract.py
-          tmp="$(mktemp -d)"
-          export SNAPSHOT_SMOKE_DIR="$tmp"
-          python3 - <<'PY'
-          import csv, math, os, pathlib
-          root = pathlib.Path(os.environ["SNAPSHOT_SMOKE_DIR"])
-          path = root / "M1.csv"
-          with path.open("w", newline="", encoding="utf-8") as handle:
-              writer = csv.writer(handle)
-              writer.writerow(["timestamp", "high", "low", "close", "feature_0", "feature_1"])
-              for bar in range(96):
-                  close = 1.10 + math.sin(bar * 0.1) * 0.002
-                  writer.writerow([
-                      1_700_000_000_000 + bar * 60_000,
-                      close + 0.0005,
-                      close - 0.0005,
-                      close,
-                      math.sin(bar * 0.07),
-                      math.cos(bar * 0.11),
-                  ])
-          PY
-          python3 scripts/gpu-bench/prepare_snapshot.py \
-            --csv "$tmp/M1.csv" --out "$tmp/M1.json" --timeframe M1 --population 8
-          python3 - <<'PY'
-          import json, os, pathlib
-          payload = json.loads((pathlib.Path(os.environ["SNAPSHOT_SMOKE_DIR"]) / "M1.json").read_text())
-          assert payload["schema_version"] == 1
-          assert payload["timeframe"] == "M1"
-          assert len(payload["close"]) == 96
-          assert len(payload["long_thresholds"]) == 8
-          PY
+          rustc --edition 2024 --test \
+            crates/neoethos-cli/tests/canonical_runtime_source_contract.rs \
+            -D warnings -o /tmp/canonical-runtime-source-contract
+          /tmp/canonical-runtime-source-contract \
+            paid_gpu_preparation_reopens_shared_imported_vortex_only --exact --nocapture
 
       - name: Test search crate
         shell: bash

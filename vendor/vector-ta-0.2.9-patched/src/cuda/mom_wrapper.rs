@@ -1,12 +1,12 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::mom::{MomBatchRange, MomParams};
 use cust::context::{Context, ContextFlags};
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -114,14 +114,7 @@ impl CudaMom {
 
         context.set_flags(ContextFlags::SCHED_AUTO)?;
 
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/mom_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O4),
-        ];
-        let module = Module::from_ptx(ptx, jit_opts)
-            .or_else(|_| Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]))
-            .or_else(|_| Module::from_ptx(ptx, &[]))?;
+        let module = crate::load_cuda_embedded_module!("mom_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
         let sm_count = device.get_attribute(DeviceAttribute::MultiprocessorCount)? as u32;

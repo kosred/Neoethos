@@ -683,41 +683,21 @@ DEFINE_EHMA_MS1P_TILED_ASYNC(ehma_ms1p_tiled_f32_tx128_ty4_async, 128, 4)
 /* ===========================================================================
  * S4 f64 LANE — ehma (Ehlers Hann moving average)
  * ---------------------------------------------------------------------------
- * CPU oracle: src/indicators/moving_averages/ehma.rs
- *   `ehma_prepare`           (:215) — first_valid and the Err branches
- *   `build_hann_weights_rec` (:257) — the weight RECURRENCE and inv_coef
- *   `reverse_weights_in_place` (:281)
- *   `ehma_with_kernel`       (:285) — warmup = first + period - 1
- *   `ehma_scalar`            (:392) — the dot product, ascending, `mul_add`
+ * Accuracy identity shared byte-for-byte in intent with ehma.rs:
+ *   ehma_hann_f64_msun_ddangle_symmetric_pow2_anchored_dot2_v2
  *
- * WHAT THE f32 KERNELS ABOVE GET WRONG, AND IS FIXED HERE
+ * John F. Ehlers' Hann moving average uses
+ *   weight(k) = 1 - cos(2*pi*k/(period+1)), k = 1..period,
+ * followed by sum(weight*price)/sum(weight).  This f64 lane evaluates the
+ * equivalent cancellation-safe identity `2*sin(pi*k/(period+1))^2`.
  *
- *  1. `__fmaf_rn` x30 — every term of the dot product and every step of the
- *     weight recurrence was an f32 fused multiply-add. Here the dot product
- *     uses `fma` (the CPU uses `f64::mul_add`, so the fusion is REQUIRED to
- *     match) and the weight recurrence uses PLAIN `*` and `-`/`+`, because
- *     ehma.rs:270-271 writes `cm * cos_w - sm * sin_w` with no `mul_add`.
- *     Fusing there would be one rounding fewer than the reference.
- *  2. THE WEIGHTS ARE A RECURRENCE, NOT `1 - cos(j*omega)`. The CPU rotates
- *     (cm, sm) forward from (cos w, sin w). Calling `cos((j+1)*omega)` per
- *     term is mathematically the same and numerically is not — the recurrence
- *     drifts, and the reference IS the drifting sequence.
- *  3. THE WEIGHTS ARE REVERSED BEFORE USE (ehma.rs:287). Term j of the sum
- *     pairs `data[start + j]` with `w[period - 1 - j]`. Dropping the reversal
- *     computes a different, plausible-looking average.
- *
- * WHY A PER-THREAD ARRAY. The reversal forces the weights to be consumed in
- * DESCENDING recurrence index while the recurrence only runs ascending, and
- * running the rotation backwards is not bit-equal to running it forwards. So
- * the row builds the weights once, ascending, into a local array and then
- * indexes it in reverse. That array is a fixed compile-time bound, which is
- * why this kernel declares `max_period()` — `sweep` refuses a larger period
- * BY NAME rather than truncating the window (which would be a different
- * indicator) or moving it to the host (which is the silent fallback this lane
- * exists to remove).
- *
- * inv_coef is `1.0 / (period + 1)` (ehma.rs:276) — NOT 1/sum(w). Copied, not
- * re-derived, because it is the reference's definition.
+ * The half-angle is built with a double-double residual, sine is the vendored
+ * FreeBSD-msun polynomial/reduction (not host libm/libdevice), and only the
+ * first half of the exactly symmetric window is evaluated.  The chronological
+ * dot product is anchored after power-of-two normalization and accumulated as
+ * product plus FMA residual plus TwoSum residual.  Explicit CUDA RN intrinsics
+ * mirror every intentional CPU rounding point; no AVX reassociation defines
+ * the result.  The f32 kernels above retain their independent contract.
  * =========================================================================== */
 
 #ifndef NEO_F64_NAN
@@ -726,6 +706,272 @@ DEFINE_EHMA_MS1P_TILED_ASYNC(ehma_ms1p_tiled_f32_tx128_ty4_async, 128, 4)
 
 // Must equal `EHMA_MAX_PERIOD` in src/cuda/neoethos_f64_wrapper.rs.
 #define NEO_EHMA_MAX_PERIOD 512
+
+static __device__ __forceinline__ unsigned long long neo_ehma_bits_v2(double value)
+{
+    return (unsigned long long)__double_as_longlong(value);
+}
+
+static __device__ __forceinline__ bool neo_ehma_is_nan_bits_v2(
+    unsigned long long bits)
+{
+    const unsigned long long absolute = bits & 0x7fffffffffffffffULL;
+    return absolute > 0x7ff0000000000000ULL;
+}
+
+/* FreeBSD msun k_sin/k_cos and medium pi/2 reduction.
+ *
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ * Developed at SunPro/SunSoft. Permission to use, copy, modify, and
+ * distribute this software is freely granted, provided this notice is
+ * preserved.
+ */
+static __device__ __forceinline__ double neo_ehma_msun_k_cos_v2(
+    double x,
+    double y)
+{
+    const double c1 = 0x1.555555555554cp-5;
+    const double c2 = -0x1.6c16c16c15177p-10;
+    const double c3 = 0x1.a01a019cb1590p-16;
+    const double c4 = -0x1.27e4f809c52adp-22;
+    const double c5 = 0x1.1ee9ebdb4b1c4p-29;
+    const double c6 = -0x1.8fae9be8838d4p-37;
+    const double z = __dmul_rn(x, x);
+    const double w2 = __dmul_rn(z, z);
+    const double low = __dadd_rn(c2, __dmul_rn(z, c3));
+    const double left = __dmul_rn(z, __dadd_rn(c1, __dmul_rn(z, low)));
+    const double high = __dadd_rn(c5, __dmul_rn(z, c6));
+    const double right = __dmul_rn(
+        __dmul_rn(w2, w2),
+        __dadd_rn(c4, __dmul_rn(z, high)));
+    const double r = __dadd_rn(left, right);
+    const double hz = __dmul_rn(0.5, z);
+    const double w = __dsub_rn(1.0, hz);
+    const double rounding = __dsub_rn(__dsub_rn(1.0, w), hz);
+    const double tail = __dsub_rn(__dmul_rn(z, r), __dmul_rn(x, y));
+    return __dadd_rn(w, __dadd_rn(rounding, tail));
+}
+
+static __device__ __forceinline__ double neo_ehma_msun_k_sin_v2(
+    double x,
+    double y,
+    bool has_tail)
+{
+    const double s1 = -0x1.5555555555549p-3;
+    const double s2 = 0x1.111111110f8a6p-7;
+    const double s3 = -0x1.a01a019c161d5p-13;
+    const double s4 = 0x1.71de357b1fe7dp-19;
+    const double s5 = -0x1.ae5e68a2b9cebp-26;
+    const double s6 = 0x1.5d93a5acfd57cp-33;
+    const double z = __dmul_rn(x, x);
+    const double w = __dmul_rn(z, z);
+    const double first = __dadd_rn(
+        s2,
+        __dmul_rn(z, __dadd_rn(s3, __dmul_rn(z, s4))));
+    const double second = __dmul_rn(
+        __dmul_rn(z, w),
+        __dadd_rn(s5, __dmul_rn(z, s6)));
+    const double r = __dadd_rn(first, second);
+    const double v = __dmul_rn(z, x);
+    if (has_tail) {
+        const double inner = __dsub_rn(
+            __dmul_rn(z, __dsub_rn(__dmul_rn(0.5, y), __dmul_rn(v, r))),
+            y);
+        return __dsub_rn(x, __dsub_rn(inner, __dmul_rn(v, s1)));
+    }
+    return __dadd_rn(x, __dmul_rn(v, __dadd_rn(s1, __dmul_rn(z, r))));
+}
+
+static __device__ __forceinline__ int neo_ehma_reduce_pio2_v2(
+    double x,
+    double* y0_out,
+    double* y1_out)
+{
+    const double inv_pio2 = 0x1.45f306dc9c883p-1;
+    const double to_int = 0x1.8p+52;
+    const double pio2_1 = 0x1.921fb54400000p+0;
+    const double pio2_1t = 0x1.0b4611a626331p-34;
+    const double pio2_2 = 0x1.0b4611a600000p-34;
+    const double pio2_2t = 0x1.3198a2e037073p-69;
+    const double pio2_3 = 0x1.3198a2e000000p-69;
+    const double pio2_3t = 0x1.b839a252049c1p-104;
+
+    const double tmp = __dadd_rn(__dmul_rn(x, inv_pio2), to_int);
+    const double f_n = __dsub_rn(tmp, to_int);
+    const int n = (int)f_n;
+    double r = __dsub_rn(x, __dmul_rn(f_n, pio2_1));
+    double w = __dmul_rn(f_n, pio2_1t);
+    double y0 = __dsub_rn(r, w);
+    const int ex = (int)((neo_ehma_bits_v2(x) >> 52) & 0x7ffULL);
+    int ey = (int)((neo_ehma_bits_v2(y0) >> 52) & 0x7ffULL);
+    if (ex - ey > 16) {
+        const double t = r;
+        w = __dmul_rn(f_n, pio2_2);
+        r = __dsub_rn(t, w);
+        w = __dsub_rn(
+            __dmul_rn(f_n, pio2_2t),
+            __dsub_rn(__dsub_rn(t, r), w));
+        y0 = __dsub_rn(r, w);
+        ey = (int)((neo_ehma_bits_v2(y0) >> 52) & 0x7ffULL);
+        if (ex - ey > 49) {
+            const double t2 = r;
+            w = __dmul_rn(f_n, pio2_3);
+            r = __dsub_rn(t2, w);
+            w = __dsub_rn(
+                __dmul_rn(f_n, pio2_3t),
+                __dsub_rn(__dsub_rn(t2, r), w));
+            y0 = __dsub_rn(r, w);
+        }
+    }
+    *y0_out = y0;
+    *y1_out = __dsub_rn(__dsub_rn(r, y0), w);
+    return n;
+}
+
+static __device__ __forceinline__ double neo_ehma_deterministic_sin_v2(double x)
+{
+    const unsigned int high =
+        (unsigned int)((neo_ehma_bits_v2(x) >> 32) & 0x7fffffffULL);
+    if (high <= 0x3fe921fbU) {
+        return neo_ehma_msun_k_sin_v2(x, 0.0, false);
+    }
+
+    double y0;
+    double y1;
+    const int quadrant = neo_ehma_reduce_pio2_v2(x, &y0, &y1);
+    const double sine = neo_ehma_msun_k_sin_v2(y0, y1, true);
+    const double cosine = neo_ehma_msun_k_cos_v2(y0, y1);
+    switch (quadrant & 3) {
+        case 0: return sine;
+        case 1: return cosine;
+        case 2: return -sine;
+        default: return -cosine;
+    }
+}
+
+static __device__ __forceinline__ double neo_ehma_half_angle_v2(
+    int period,
+    int k)
+{
+    const double pi_hi = 0x1.921fb54442d18p+1;
+    const double pi_lo = 0x1.1a62633145c07p-53;
+    const double denominator = __dadd_rn((double)period, 1.0);
+    const double numerator = (double)k;
+    const double quotient = __ddiv_rn(numerator, denominator);
+    const double quotient_remainder = __fma_rn(-quotient, denominator, numerator);
+    const double product = __dmul_rn(quotient, pi_hi);
+    const double product_error = __fma_rn(quotient, pi_hi, -product);
+    const double correction = __dadd_rn(
+        __dadd_rn(product_error, __dmul_rn(quotient, pi_lo)),
+        __dmul_rn(__ddiv_rn(quotient_remainder, denominator), pi_hi));
+    return __dadd_rn(product, correction);
+}
+
+static __device__ __forceinline__ void neo_ehma_dot2_add_product_v2(
+    double left,
+    double right,
+    double* sum,
+    double* correction)
+{
+    const double product = __dmul_rn(left, right);
+    const double product_error = __fma_rn(left, right, -product);
+    const double updated = __dadd_rn(*sum, product);
+    const double recovered = __dsub_rn(updated, *sum);
+    const double addition_error = __dadd_rn(
+        __dsub_rn(*sum, __dsub_rn(updated, recovered)),
+        __dsub_rn(product, recovered));
+    *sum = updated;
+    *correction = __dadd_rn(
+        *correction,
+        __dadd_rn(product_error, addition_error));
+}
+
+static __device__ __forceinline__ double neo_ehma_build_weights_v2(
+    int period,
+    double* weights)
+{
+    const int half = (period + 1) / 2;
+    for (int k = 1; k <= half; ++k) {
+        const double sine = neo_ehma_deterministic_sin_v2(
+            neo_ehma_half_angle_v2(period, k));
+        const double weight = __dmul_rn(2.0, __dmul_rn(sine, sine));
+        weights[k - 1] = weight;
+        weights[period - k] = weight;
+    }
+
+    double sum = 0.0;
+    double correction = 0.0;
+    for (int k = 0; k < period; ++k) {
+        neo_ehma_dot2_add_product_v2(1.0, weights[k], &sum, &correction);
+    }
+    return __dadd_rn(sum, correction);
+}
+
+static __device__ __forceinline__ double neo_ehma_floor_power_of_two_scale_v2(
+    double max_abs_input)
+{
+    const unsigned long long bits = neo_ehma_bits_v2(max_abs_input);
+    const unsigned long long exponent = (bits >> 52) & 0x7ffULL;
+    if (exponent != 0ULL) {
+        return __longlong_as_double((long long)(exponent << 52));
+    }
+    const unsigned long long fraction = bits & ((1ULL << 52) - 1ULL);
+    const int highest_bit = 63 - __clzll(fraction);
+    return __longlong_as_double((long long)(1ULL << highest_bit));
+}
+
+static __device__ __forceinline__ double neo_ehma_stable_window_v2(
+    const double* values,
+    int period,
+    const double* weights,
+    double coefficient)
+{
+    double max_abs_input = 0.0;
+    bool has_infinite = false;
+    for (int index = 0; index < period; ++index) {
+        const unsigned long long bits = neo_ehma_bits_v2(values[index]);
+        const unsigned long long absolute_bits = bits & 0x7fffffffffffffffULL;
+        if (absolute_bits > 0x7ff0000000000000ULL) {
+            return NEO_F64_NAN;
+        }
+        if (absolute_bits == 0x7ff0000000000000ULL) {
+            has_infinite = true;
+        } else {
+            const double absolute = __longlong_as_double((long long)absolute_bits);
+            if (absolute > max_abs_input) max_abs_input = absolute;
+        }
+    }
+
+    if (has_infinite) {
+        double sum = 0.0;
+        for (int index = 0; index < period; ++index) {
+            sum = __fma_rn(values[index], weights[index], sum);
+        }
+        const double result = __ddiv_rn(sum, coefficient);
+        return neo_ehma_is_nan_bits_v2(neo_ehma_bits_v2(result))
+            ? NEO_F64_NAN
+            : result;
+    }
+    if (max_abs_input == 0.0) return 0.0;
+
+    const double scale = neo_ehma_floor_power_of_two_scale_v2(max_abs_input);
+    const double anchor = __ddiv_rn(values[0], scale);
+    double sum = 0.0;
+    double correction = 0.0;
+    for (int index = 0; index < period; ++index) {
+        const double normalized = __ddiv_rn(values[index], scale);
+        neo_ehma_dot2_add_product_v2(
+            __dsub_rn(normalized, anchor),
+            weights[index],
+            &sum,
+            &correction);
+    }
+    const double shifted = __dadd_rn(sum, correction);
+    const double result = __dmul_rn(
+        scale,
+        __dadd_rn(anchor, __ddiv_rn(shifted, coefficient)));
+    return result == 0.0 ? 0.0 : result;
+}
 
 extern "C" __global__
 void ehma_neo_batch_f64(const double* __restrict__ data,
@@ -751,35 +997,7 @@ void ehma_neo_batch_f64(const double* __restrict__ data,
     }
 
     double w[NEO_EHMA_MAX_PERIOD];
-
-    // build_hann_weights_rec, ehma.rs:257-278. `2.0 * PI` then divide, in that
-    // order, because `omega = 2.0 * PI / (period as f64 + 1.0)` is written
-    // that way and `(2*PI)/x` and `2*(PI/x)` differ in the last place.
-    const double pi = 3.14159265358979323846;   // == std::f64::consts::PI
-    const double omega = (2.0 * pi) / ((double)period + 1.0);
-    // KNOWN AND DECLARED ULP SOURCE: the CPU calls `f64::sin_cos`, i.e. the
-    // host libm; this calls CUDA's `sincos`. Both are sub-ulp but they are not
-    // the same function, so w[0] can differ in the last place and that
-    // difference propagates through the rotation. It is the only term in this
-    // kernel that is not bit-reproducible, it is stated here rather than
-    // discovered by a parity run, and there is no way to remove it short of
-    // shipping our own argument-reduced sine.
-    double sin_w, cos_w;
-    sincos(omega, &sin_w, &cos_w);
-
-    {
-        double cm = cos_w;
-        double sm = sin_w;
-        for (int j = 0; j < period; ++j) {
-            w[j] = 1.0 - cm;
-            const double next_cm = cm * cos_w - sm * sin_w;
-            const double next_sm = sm * cos_w + cm * sin_w;
-            cm = next_cm;
-            sm = next_sm;
-        }
-    }
-
-    const double inv_coef = 1.0 / ((double)period + 1.0);
+    const double coefficient = neo_ehma_build_weights_v2(period, w);
 
     const int warm = first_valid + period - 1;
     for (int i = 0; i < len && i < warm; ++i) o[i] = NEO_F64_NAN;
@@ -787,12 +1005,6 @@ void ehma_neo_batch_f64(const double* __restrict__ data,
 
     for (int i = warm; i < len; ++i) {
         const int start = i + 1 - period;
-        double sum = 0.0;
-        // ehma.rs:412-414, with the reversal of ehma.rs:287 folded into the
-        // index: weights[j] after reversal is w[period - 1 - j].
-        for (int j = 0; j < period; ++j) {
-            sum = fma(data[start + j], w[period - 1 - j], sum);
-        }
-        o[i] = sum * inv_coef;
+        o[i] = neo_ehma_stable_window_v2(data + start, period, w, coefficient);
     }
 }

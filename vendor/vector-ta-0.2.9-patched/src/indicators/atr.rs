@@ -1,27 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
-#[cfg(feature = "python")]
-use pyo3::exceptions::{PyBufferError, PyValueError};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaAtr};
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
@@ -48,10 +30,6 @@ pub struct AtrOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AtrParams {
     pub length: Option<usize>,
 }
@@ -181,7 +159,9 @@ pub enum AtrError {
 
     #[error("Invalid length for ATR calculation (length={length}).")]
     InvalidLength { length: usize },
-    #[error("Inconsistent slice lengths for ATR calculation: high={high_len}, low={low_len}, close={close_len}")]
+    #[error(
+        "Inconsistent slice lengths for ATR calculation: high={high_len}, low={low_len}, close={close_len}"
+    )]
     InconsistentSliceLengths {
         high_len: usize,
         low_len: usize,
@@ -275,7 +255,6 @@ pub fn atr_with_kernel(input: &AtrInput, kernel: Kernel) -> Result<AtrOutput, At
     Ok(AtrOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn atr_into(input: &AtrInput, out: &mut [f64]) -> Result<(), AtrError> {
     let (high, low, close) = match &input.data {
         AtrData::Candles { candles } => (&candles.high[..], &candles.low[..], &candles.close[..]),
@@ -1379,61 +1358,19 @@ unsafe fn precompute_tr_into_avx512(
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn atr_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = atr_js(high, low, close, length).map_err(|e| JsValue::from(e))?;
-    crate::write_wasm_f64_output("atr_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn atr_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = atr_batch_js(high, low, close, length_start, length_end, length_step)
-        .map_err(|e| JsValue::from(e))?;
-    crate::write_wasm_f64_output("atr_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn atr_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = atr_batch_unified_js(high, low, close, config).map_err(|e| JsValue::from(e))?;
-    crate::write_wasm_selected_object_f64_outputs("atr_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_atr_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let partial_params = AtrParams { length: None };
         let input_partial = AtrInput::from_candles(&candles, partial_params);
         let result_partial = atr_with_kernel(&input_partial, kernel)?;
@@ -1447,8 +1384,8 @@ mod tests {
 
     fn check_atr_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AtrInput::with_default_candles(&candles);
         let result = atr_with_kernel(&input, kernel)?;
         let expected_last_five = [916.89, 874.33, 838.45, 801.92, 811.57];
@@ -1483,8 +1420,8 @@ mod tests {
 
     fn check_atr_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AtrInput::with_default_candles(&candles);
         match input.data {
             AtrData::Candles { .. } => {}
@@ -1499,8 +1436,8 @@ mod tests {
 
     fn check_atr_zero_length(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let zero_length_params = AtrParams { length: Some(0) };
         let input_zero_length = AtrInput::from_candles(&candles, zero_length_params);
         let result_zero_length = atr_with_kernel(&input_zero_length, kernel);
@@ -1513,8 +1450,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let too_long_params = AtrParams {
             length: Some(candles.close.len() + 10),
         };
@@ -1539,11 +1476,10 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_atr_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AtrInput::with_default_candles(&candles);
 
         let baseline = atr(&input)?;
@@ -1578,8 +1514,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = AtrParams { length: Some(14) };
         let first_input = AtrInput::from_candles(&candles, first_params);
         let first_result = atr_with_kernel(&first_input, kernel)?;
@@ -1598,8 +1534,8 @@ mod tests {
 
     fn check_atr_accuracy_nan_check(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = AtrParams { length: Some(14) };
         let input = AtrInput::from_candles(&candles, params);
         let result = atr_with_kernel(&input, kernel)?;
@@ -1616,8 +1552,8 @@ mod tests {
     fn check_atr_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_lengths = vec![2, 5, 10, 14, 20, 50, 100, 200];
 
@@ -1637,23 +1573,23 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with length={}",
-						test_name, val, bits, i, length
-					);
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} with length={}",
+                        test_name, val, bits, i, length
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with length={}",
-						test_name, val, bits, i, length
-					);
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} with length={}",
+                        test_name, val, bits, i, length
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with length={}",
-						test_name, val, bits, i, length
-					);
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} with length={}",
+                        test_name, val, bits, i, length
+                    );
                 }
             }
         }
@@ -1918,8 +1854,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = AtrBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
         let def = AtrParams::default();
@@ -1942,8 +1878,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 1),
@@ -2025,188 +1961,6 @@ mod tests {
     gen_batch_tests!(check_batch_no_poison);
 }
 
-#[cfg(feature = "python")]
-use pyo3::create_exception;
-
-#[cfg(feature = "python")]
-create_exception!(atr, InvalidLengthError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, InconsistentSliceLengthsError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, NoCandlesAvailableError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, NotEnoughDataError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, EmptyInputDataError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, AllValuesNaNError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, InvalidPeriodError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, NotEnoughValidDataError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, OutputLengthMismatchError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, InvalidRangeError, PyValueError);
-#[cfg(feature = "python")]
-create_exception!(atr, InvalidKernelForBatchError, PyValueError);
-
-#[cfg(feature = "python")]
-impl From<AtrError> for PyErr {
-    fn from(err: AtrError) -> PyErr {
-        match err {
-            AtrError::EmptyInputData => {
-                EmptyInputDataError::new_err("atr: Input data slice is empty.")
-            }
-            AtrError::AllValuesNaN => AllValuesNaNError::new_err("atr: All values are NaN."),
-            AtrError::InvalidPeriod { period, data_len } => InvalidPeriodError::new_err(format!(
-                "atr: Invalid period: period = {}, data length = {}",
-                period, data_len
-            )),
-            AtrError::NotEnoughValidData { needed, valid } => {
-                NotEnoughValidDataError::new_err(format!(
-                    "atr: Not enough valid data: needed = {}, valid = {}",
-                    needed, valid
-                ))
-            }
-            AtrError::OutputLengthMismatch { expected, got } => {
-                OutputLengthMismatchError::new_err(format!(
-                    "atr: Output slice length mismatch: expected = {}, got = {}",
-                    expected, got
-                ))
-            }
-            AtrError::InvalidRange { start, end, step } => InvalidRangeError::new_err(format!(
-                "atr: Invalid range: start = {}, end = {}, step = {}",
-                start, end, step
-            )),
-            AtrError::InvalidKernelForBatch(k) => InvalidKernelForBatchError::new_err(format!(
-                "atr: Invalid kernel type for batch operation: {:?}",
-                k
-            )),
-            AtrError::InvalidLength { length } => InvalidLengthError::new_err(format!(
-                "Invalid length for ATR calculation (length={}).",
-                length
-            )),
-            AtrError::InconsistentSliceLengths {
-                high_len,
-                low_len,
-                close_len,
-            } => InconsistentSliceLengthsError::new_err(format!(
-                "Inconsistent slice lengths for ATR calculation: high={}, low={}, close={}",
-                high_len, low_len, close_len
-            )),
-            AtrError::NoCandlesAvailable => {
-                NoCandlesAvailableError::new_err("No candles available for ATR calculation.")
-            }
-            AtrError::NotEnoughData { length, data_len } => NotEnoughDataError::new_err(format!(
-                "Not enough data to calculate ATR: length={}, data length={}",
-                length, data_len
-            )),
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::atr_wrapper::DeviceArrayF32Atr;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32Atr,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        use cust::memory::DeviceBuffer;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyBufferError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyBufferError::new_err(
-                            "__dlpack__: requested device does not match producer buffer",
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        if let Some(copy_obj) = copy.as_ref() {
-            let do_copy: bool = copy_obj.extract(py)?;
-            if do_copy {
-                return Err(PyBufferError::new_err(
-                    "__dlpack__(copy=True) not supported for atr CUDA buffers",
-                ));
-            }
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let rows = self.inner.rows;
-        let cols = self.inner.cols;
-        let ctx = self.inner.ctx.clone();
-        let device_id = self.inner.device_id;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Atr {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx,
-                device_id,
-            },
-        );
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, inner.buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
 #[inline(always)]
 fn atr_prepare_from_input<'a>(
     input: &'a AtrInput,
@@ -2253,500 +2007,4 @@ fn atr_prepare<'a>(
     }
 
     Ok((high, low, close, length))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "atr")]
-#[pyo3(signature = (high, low, close, length=14, kernel=None))]
-pub fn atr_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    length: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let kernel_enum = validate_kernel(kernel, false)?;
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    let params = AtrParams {
-        length: Some(length),
-    };
-    let input = AtrInput::from_slices(high_slice, low_slice, close_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| atr_with_kernel(&input, kernel_enum).map(|output| output.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AtrStream")]
-pub struct AtrStreamPy {
-    stream: AtrStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AtrStreamPy {
-    #[new]
-    pub fn new(length: Option<usize>) -> PyResult<Self> {
-        let params = AtrParams { length };
-        let stream = AtrStream::try_new(params)?;
-        Ok(Self { stream })
-    }
-
-    pub fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "atr_batch")]
-#[pyo3(signature = (high, low, close, length_range, kernel=None))]
-pub fn atr_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    length_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let k = validate_kernel(kernel, true)?;
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-    let cs = close.as_slice()?;
-
-    let range = AtrBatchRange {
-        length: length_range,
-    };
-    let combos = expand_grid(&range);
-    let rows = combos.len();
-    let cols = cs.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("atr_batch: rows*cols overflow"))?;
-
-    let out_arr = unsafe { numpy::PyArray1::<f64>::new(py, [total], false) };
-    let buf = unsafe { out_arr.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        let simd = match match k {
-            Kernel::Auto => detect_best_batch_kernel(),
-            k if k.is_batch() => k,
-            Kernel::Scalar => Kernel::ScalarBatch,
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2 => Kernel::Avx2Batch,
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512 => Kernel::Avx512Batch,
-            _ => Kernel::ScalarBatch,
-        } {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            Kernel::ScalarBatch => Kernel::Scalar,
-            _ => unreachable!(),
-        };
-        atr_batch_inner_into(hs, ls, cs, &range, simd, true, buf)
-            .map(|_| ())
-            .map_err(|e| e)
-    })
-    .map_err(|e: AtrError| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lengths",
-        combos
-            .iter()
-            .map(|p| p.length.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "atr_cuda_batch_dev")]
-#[pyo3(signature = (high, low, close, length_range, device_id=0))]
-pub fn atr_cuda_batch_dev_py(
-    py: Python<'_>,
-    high: numpy::PyReadonlyArray1<'_, f32>,
-    low: numpy::PyReadonlyArray1<'_, f32>,
-    close: numpy::PyReadonlyArray1<'_, f32>,
-    length_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let hs = high.as_slice()?;
-    let ls = low.as_slice()?;
-    let cs = close.as_slice()?;
-    if hs.len() != ls.len() || ls.len() != cs.len() {
-        return Err(PyValueError::new_err("input length mismatch"));
-    }
-    let sweep = AtrBatchRange {
-        length: length_range,
-    };
-    let inner = py.allow_threads(|| {
-        let cuda = CudaAtr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.atr_batch_dev(hs, ls, cs, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "atr_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm, low_tm, close_tm, cols, rows, length, device_id=0))]
-pub fn atr_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    length: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm.as_slice()?;
-    let l = low_tm.as_slice()?;
-    let c = close_tm.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if h.len() != expected || l.len() != expected || c.len() != expected {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let inner = py.allow_threads(|| {
-        let cuda = CudaAtr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.atr_many_series_one_param_time_major_dev(h, l, c, cols, rows, length)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(DeviceArrayF32Py { inner })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-pub fn atr_into_slice(dst: &mut [f64], input: &AtrInput, kern: Kernel) -> Result<(), AtrError> {
-    let (high, low, close) = match &input.data {
-        AtrData::Candles { candles } => (&candles.high[..], &candles.low[..], &candles.close[..]),
-        AtrData::Slices { high, low, close } => (*high, *low, *close),
-    };
-
-    let length = input.params.length.unwrap_or(14);
-    let (high, low, close, length) = atr_prepare(high, low, close, length)?;
-    let first = first_valid_hlc(high, low, close);
-    let valid = close.len().saturating_sub(first);
-    if valid < length {
-        return Err(AtrError::NotEnoughValidData {
-            needed: length,
-            valid,
-        });
-    }
-    let warm = first + length - 1;
-
-    if dst.len() != close.len() {
-        return Err(AtrError::OutputLengthMismatch {
-            expected: close.len(),
-            got: dst.len(),
-        });
-    }
-
-    for v in &mut dst[..warm] {
-        *v = f64::NAN;
-    }
-
-    let k = match kern {
-        Kernel::Auto => Kernel::Scalar,
-        k => k,
-    };
-    atr_compute_into(high, low, close, length, first, k, dst);
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "atr")]
-pub fn atr_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length: usize,
-) -> Result<Vec<f64>, JsError> {
-    let params = AtrParams {
-        length: Some(length),
-    };
-    let input = AtrInput::from_slices(high, low, close, params);
-
-    let mut output = vec![0.0; high.len()];
-    atr_into_slice(&mut output, &input, Kernel::Auto).map_err(|e| JsError::new(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "atrBatch")]
-pub fn atr_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<Vec<f64>, JsError> {
-    let range = AtrBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-    let output = atr_batch_with_kernel(high, low, close, &range, Kernel::Auto)
-        .map_err(|e| JsError::new(&e.to_string()))?;
-    Ok(output.values)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "atrBatchMetadata")]
-pub fn atr_batch_metadata_js(
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Vec<f64> {
-    let range = AtrBatchRange {
-        length: (length_start, length_end, length_step),
-    };
-    let combos = expand_grid(&range);
-
-    combos
-        .iter()
-        .map(|p| p.length.unwrap_or(14) as f64)
-        .collect()
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "atr_batch", skip_jsdoc)]
-pub fn atr_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsError> {
-    #[derive(Deserialize)]
-    struct BatchConfig {
-        length_range: [usize; 3],
-    }
-
-    let config: BatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsError::new(&e.to_string()))?;
-
-    let range = AtrBatchRange {
-        length: (
-            config.length_range[0],
-            config.length_range[1],
-            config.length_range[2],
-        ),
-    };
-
-    let output = atr_batch_with_kernel(high, low, close, &range, Kernel::Auto)
-        .map_err(|e| JsError::new(&e.to_string()))?;
-
-    #[derive(Serialize)]
-    struct BatchResult {
-        values: Vec<f64>,
-        combos: Vec<AtrParams>,
-        rows: usize,
-        cols: usize,
-    }
-
-    let result = BatchResult {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn atr_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn atr_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn atr_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length: usize,
-) -> Result<(), JsError> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsError::new("null pointer passed to atr_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let params = AtrParams {
-            length: Some(length),
-        };
-        let input = AtrInput::from_slices(high, low, close, params);
-
-        if high_ptr == out_ptr || low_ptr == out_ptr || close_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            atr_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsError::new(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            atr_into_slice(out, &input, Kernel::Auto).map_err(|e| JsError::new(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn atr_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    length_start: usize,
-    length_end: usize,
-    length_step: usize,
-) -> Result<(), JsError> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsError::new("null pointer passed to atr_batch_into"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let range = AtrBatchRange {
-            length: (length_start, length_end, length_step),
-        };
-
-        let combos = expand_grid(&range);
-        let rows = combos.len();
-        let cols = len;
-        let output_size = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsError::new("atr_batch_into: rows*cols overflow"))?;
-
-        if high_ptr == out_ptr || low_ptr == out_ptr || close_ptr == out_ptr {
-            let output = atr_batch_with_kernel(high, low, close, &range, Kernel::Auto)
-                .map_err(|e| JsError::new(&e.to_string()))?;
-            let out_slice = std::slice::from_raw_parts_mut(out_ptr, output_size);
-            out_slice.copy_from_slice(&output.values);
-        } else {
-            let out_slice = std::slice::from_raw_parts_mut(out_ptr, output_size);
-
-            let kernel = match detect_best_batch_kernel() {
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx512Batch => Kernel::Avx512,
-                #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => Kernel::Scalar,
-            };
-
-            atr_batch_inner_into(high, low, close, &range, kernel, false, out_slice)
-                .map_err(|e| JsError::new(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[deprecated(
-    since = "1.0.0",
-    note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-)]
-pub struct AtrContext {
-    stream: AtrStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-#[allow(deprecated)]
-impl AtrContext {
-    #[wasm_bindgen(constructor)]
-    #[deprecated(
-        since = "1.0.0",
-        note = "For weight reuse patterns, use the fast/unsafe API with persistent buffers"
-    )]
-    pub fn new(length: usize) -> Result<AtrContext, JsError> {
-        let params = AtrParams {
-            length: Some(length),
-        };
-        let stream = AtrStream::try_new(params).map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(AtrContext { stream })
-    }
-
-    #[wasm_bindgen]
-    pub fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-
-    #[wasm_bindgen]
-    pub fn reset(&mut self) -> Result<(), JsError> {
-        let length = self.stream.length;
-        let params = AtrParams {
-            length: Some(length),
-        };
-        self.stream = AtrStream::try_new(params).map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-pub fn register_atr_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add(
-        "InvalidLengthError",
-        m.py().get_type::<InvalidLengthError>(),
-    )?;
-    m.add(
-        "InconsistentSliceLengthsError",
-        m.py().get_type::<InconsistentSliceLengthsError>(),
-    )?;
-    m.add(
-        "NoCandlesAvailableError",
-        m.py().get_type::<NoCandlesAvailableError>(),
-    )?;
-    m.add(
-        "NotEnoughDataError",
-        m.py().get_type::<NotEnoughDataError>(),
-    )?;
-    Ok(())
 }

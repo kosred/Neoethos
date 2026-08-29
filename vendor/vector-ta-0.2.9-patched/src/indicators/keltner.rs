@@ -1,20 +1,4 @@
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -27,17 +11,6 @@ use rayon::prelude::*;
 use std::convert::AsRef;
 use std::error::Error;
 use thiserror::Error;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::keltner_wrapper::CudaKeltner;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum KeltnerData<'a> {
@@ -56,10 +29,6 @@ pub struct KeltnerOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct KeltnerParams {
     pub period: Option<usize>,
     pub multiplier: Option<f64>,
@@ -377,7 +346,6 @@ pub fn keltner_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline(always)]
 pub fn keltner_into(
     input: &KeltnerInput,
@@ -848,7 +816,7 @@ pub fn keltner_scalar(
     match ma_type {
         "ema" => {
             use crate::indicators::moving_averages::ema::{
-                ema_into_slice, EmaData, EmaInput, EmaParams,
+                EmaData, EmaInput, EmaParams, ema_into_slice,
             };
             let ema_input = EmaInput {
                 data: EmaData::Slice(source),
@@ -860,7 +828,7 @@ pub fn keltner_scalar(
         }
         "sma" => {
             use crate::indicators::moving_averages::sma::{
-                sma_into_slice, SmaData, SmaInput, SmaParams,
+                SmaData, SmaInput, SmaParams, sma_into_slice,
             };
             let sma_input = SmaInput {
                 data: SmaData::Slice(source),
@@ -1784,53 +1752,19 @@ impl KeltnerStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn keltner_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &[f64],
-    period: usize,
-    multiplier: f64,
-    ma_type: String,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = keltner_js(high, low, close, source, period, multiplier, ma_type)?;
-    crate::write_wasm_object_f64_outputs("keltner_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn keltner_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = keltner_batch_unified_js(high, low, close, source, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "keltner_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     fn check_keltner_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = KeltnerParams {
             period: Some(20),
@@ -1900,8 +1834,8 @@ mod tests {
 
     fn check_keltner_default_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = KeltnerParams::default();
         let input = KeltnerInput::from_candles(&candles, "close", default_params);
         let result = keltner_with_kernel(&input, kernel)?;
@@ -1913,8 +1847,8 @@ mod tests {
 
     fn check_keltner_zero_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = KeltnerParams {
             period: Some(0),
             multiplier: Some(2.0),
@@ -1931,8 +1865,8 @@ mod tests {
 
     fn check_keltner_large_period(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = KeltnerParams {
             period: Some(999999),
             multiplier: Some(2.0),
@@ -1949,8 +1883,8 @@ mod tests {
 
     fn check_keltner_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = KeltnerParams::default();
         let input = KeltnerInput::from_candles(&candles, "close", params);
         let result = keltner_with_kernel(&input, kernel)?;
@@ -1971,8 +1905,8 @@ mod tests {
     fn check_keltner_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 20;
         let multiplier = 2.0;
 
@@ -2037,8 +1971,8 @@ mod tests {
     fn check_keltner_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             KeltnerParams::default(),
@@ -2117,38 +2051,50 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at index {} \
 							 in {} band with params: period={}, multiplier={}, ma_type={} (param set {})",
-							test_name, val, bits, i, band_name,
-							params.period.unwrap_or(20),
-							params.multiplier.unwrap_or(2.0),
-							params.ma_type.as_deref().unwrap_or("ema"),
-							param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            band_name,
+                            params.period.unwrap_or(20),
+                            params.multiplier.unwrap_or(2.0),
+                            params.ma_type.as_deref().unwrap_or("ema"),
+                            param_idx
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at index {} \
 							 in {} band with params: period={}, multiplier={}, ma_type={} (param set {})",
-							test_name, val, bits, i, band_name,
-							params.period.unwrap_or(20),
-							params.multiplier.unwrap_or(2.0),
-							params.ma_type.as_deref().unwrap_or("ema"),
-							param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            band_name,
+                            params.period.unwrap_or(20),
+                            params.multiplier.unwrap_or(2.0),
+                            params.ma_type.as_deref().unwrap_or("ema"),
+                            param_idx
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
                         panic!(
-							"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
+                            "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at index {} \
 							 in {} band with params: period={}, multiplier={}, ma_type={} (param set {})",
-							test_name, val, bits, i, band_name,
-							params.period.unwrap_or(20),
-							params.multiplier.unwrap_or(2.0),
-							params.ma_type.as_deref().unwrap_or("ema"),
-							param_idx
-						);
+                            test_name,
+                            val,
+                            bits,
+                            i,
+                            band_name,
+                            params.period.unwrap_or(20),
+                            params.multiplier.unwrap_or(2.0),
+                            params.ma_type.as_deref().unwrap_or("ema"),
+                            param_idx
+                        );
                     }
                 }
             }
@@ -2165,8 +2111,8 @@ mod tests {
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = KeltnerBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2185,8 +2131,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 0.5, 2.5, 0.5),
@@ -2224,22 +2170,36 @@ mod tests {
 
                     if bits == 0x11111111_11111111 {
                         panic!(
-							"[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found alloc_with_nan_prefix poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) in {} band with params: period={}, multiplier={}",
-							test, cfg_idx, val, bits, row, col, idx, band_name,
-							combo.period.unwrap_or(20),
-							combo.multiplier.unwrap_or(2.0)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            band_name,
+                            combo.period.unwrap_or(20),
+                            combo.multiplier.unwrap_or(2.0)
+                        );
                     }
 
                     if bits == 0x22222222_22222222 {
                         panic!(
-							"[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
+                            "[{}] Config {}: Found init_matrix_prefixes poison value {} (0x{:016X}) \
 							 at row {} col {} (flat index {}) in {} band with params: period={}, multiplier={}",
-							test, cfg_idx, val, bits, row, col, idx, band_name,
-							combo.period.unwrap_or(20),
-							combo.multiplier.unwrap_or(2.0)
-						);
+                            test,
+                            cfg_idx,
+                            val,
+                            bits,
+                            row,
+                            col,
+                            idx,
+                            band_name,
+                            combo.period.unwrap_or(20),
+                            combo.multiplier.unwrap_or(2.0)
+                        );
                     }
 
                     if bits == 0x33333333_33333333 {
@@ -2687,691 +2647,5 @@ mod tests {
                 lo[i]
             );
         }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub struct KeltnerDeviceArrayF32 {
-    pub inner: DeviceArrayF32,
-    pub context: Arc<Context>,
-    pub device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct KeltnerDeviceArrayF32Py {
-    pub(crate) inner: KeltnerDeviceArrayF32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl KeltnerDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner.inner;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use cust::memory::DeviceBuffer;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-
-        let _ = stream;
-
-        if let Some(copy_obj) = copy.as_ref() {
-            let do_copy: bool = copy_obj.extract(py)?;
-            if do_copy {
-                return Err(PyValueError::new_err(
-                    "__dlpack__(copy=True) not supported for keltner CUDA buffers",
-                ));
-            }
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let context = self.inner.context.clone();
-        let device_id = self.inner.device_id;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            KeltnerDeviceArrayF32 {
-                inner: DeviceArrayF32 {
-                    buf: dummy,
-                    rows: 0,
-                    cols: 0,
-                },
-                context,
-                device_id,
-            },
-        );
-
-        let rows = inner.inner.rows;
-        let cols = inner.inner.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(
-            py,
-            inner.inner.buf,
-            rows,
-            cols,
-            alloc_dev,
-            max_version_bound,
-        )
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "keltner")]
-#[pyo3(signature = (high, low, close, source, period, multiplier, ma_type="ema", kernel=None))]
-pub fn keltner_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    source: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    multiplier: f64,
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-)> {
-    use numpy::{PyArray1, PyArrayMethods};
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let s = source.as_slice()?;
-    let len = c.len();
-
-    let mut up_arr = unsafe { PyArray1::<f64>::new(py, [len], false) };
-    let mut mid_arr = unsafe { PyArray1::<f64>::new(py, [len], false) };
-    let mut low_arr = unsafe { PyArray1::<f64>::new(py, [len], false) };
-
-    let up = unsafe { up_arr.as_slice_mut()? };
-    let mid = unsafe { mid_arr.as_slice_mut()? };
-    let lowo = unsafe { low_arr.as_slice_mut()? };
-
-    let params = KeltnerParams {
-        period: Some(period),
-        multiplier: Some(multiplier),
-        ma_type: Some(ma_type.to_string()),
-    };
-    let input = KeltnerInput::from_slice(h, l, c, s, params);
-    let kern = validate_kernel(kernel, false)?;
-
-    py.allow_threads(|| keltner_into_slice(up, mid, lowo, &input, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok((up_arr, mid_arr, low_arr))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "KeltnerStream")]
-pub struct KeltnerStreamPy {
-    stream: KeltnerStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl KeltnerStreamPy {
-    #[new]
-    fn new(period: usize, multiplier: f64, ma_type: &str) -> PyResult<Self> {
-        let params = KeltnerParams {
-            period: Some(period),
-            multiplier: Some(multiplier),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let stream =
-            KeltnerStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(KeltnerStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64, source: f64) -> Option<(f64, f64, f64)> {
-        self.stream.update(high, low, close, source)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "keltner_batch")]
-#[pyo3(signature = (high, low, close, source, period_range, multiplier_range, kernel=None))]
-pub fn keltner_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    source: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    multiplier_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{PyArray1, PyArrayMethods};
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    let s = source.as_slice()?;
-
-    let sweep = KeltnerBatchRange {
-        period: period_range,
-        multiplier: multiplier_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let out = py
-        .allow_threads(|| {
-            keltner_batch_par_slice(
-                h,
-                l,
-                c,
-                s,
-                &sweep,
-                match kern {
-                    Kernel::Auto => detect_best_batch_kernel(),
-                    k => k,
-                },
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let rows = out.rows;
-    let cols = out.cols;
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    let up_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let mid_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let low_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    unsafe { up_arr.as_slice_mut()? }.copy_from_slice(&out.upper_band);
-    unsafe { mid_arr.as_slice_mut()? }.copy_from_slice(&out.middle_band);
-    unsafe { low_arr.as_slice_mut()? }.copy_from_slice(&out.lower_band);
-
-    let dict = PyDict::new(py);
-    dict.set_item("upper", up_arr.reshape((rows, cols))?)?;
-    dict.set_item("middle", mid_arr.reshape((rows, cols))?)?;
-    dict.set_item("lower", low_arr.reshape((rows, cols))?)?;
-    use numpy::IntoPyArray;
-    dict.set_item(
-        "periods",
-        out.combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "multipliers",
-        out.combos
-            .iter()
-            .map(|p| p.multiplier.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "keltner_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, source_f32, period_range, multiplier_range, ma_type="ema", device_id=0))]
-pub fn keltner_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    source_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    multiplier_range: (f64, f64, f64),
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let s = source_f32.as_slice()?;
-    if !(h.len() == l.len() && l.len() == c.len() && c.len() == s.len()) {
-        return Err(PyValueError::new_err("input length mismatch"));
-    }
-    let sweep = KeltnerBatchRange {
-        period: period_range,
-        multiplier: multiplier_range,
-    };
-    let (up, mid, low, rows, cols, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaKeltner::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let res = cuda
-            .keltner_batch_dev(h, l, c, s, &sweep, ma_type)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let rows = res.outputs.upper.rows;
-        let cols = res.outputs.upper.cols;
-        Ok::<_, PyErr>((
-            res.outputs.upper,
-            res.outputs.middle,
-            res.outputs.lower,
-            rows,
-            cols,
-            ctx,
-            dev_id,
-        ))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "upper",
-        Py::new(
-            py,
-            KeltnerDeviceArrayF32Py {
-                inner: KeltnerDeviceArrayF32 {
-                    inner: up,
-                    context: ctx.clone(),
-                    device_id: dev_id,
-                },
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "middle",
-        Py::new(
-            py,
-            KeltnerDeviceArrayF32Py {
-                inner: KeltnerDeviceArrayF32 {
-                    inner: mid,
-                    context: ctx.clone(),
-                    device_id: dev_id,
-                },
-            },
-        )?,
-    )?;
-    dict.set_item(
-        "lower",
-        Py::new(
-            py,
-            KeltnerDeviceArrayF32Py {
-                inner: KeltnerDeviceArrayF32 {
-                    inner: low,
-                    context: ctx,
-                    device_id: dev_id,
-                },
-            },
-        )?,
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "keltner_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, source_tm_f32, cols, rows, period, multiplier, ma_type="ema", device_id=0))]
-pub fn keltner_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    source_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    multiplier: f32,
-    ma_type: &str,
-    device_id: usize,
-) -> PyResult<(
-    KeltnerDeviceArrayF32Py,
-    KeltnerDeviceArrayF32Py,
-    KeltnerDeviceArrayF32Py,
-)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let ht = high_tm_f32.as_slice()?;
-    let lt = low_tm_f32.as_slice()?;
-    let ct = close_tm_f32.as_slice()?;
-    let st = source_tm_f32.as_slice()?;
-    let expected = cols
-        .checked_mul(rows)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-    if ht.len() != expected || lt.len() != expected || ct.len() != expected || st.len() != expected
-    {
-        return Err(PyValueError::new_err("time-major input length mismatch"));
-    }
-    let (up, mid, low, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaKeltner::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let trip = cuda
-            .keltner_many_series_one_param_time_major_dev(
-                ht, lt, ct, st, cols, rows, period, multiplier, ma_type,
-            )
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((trip.upper, trip.middle, trip.lower, ctx, dev_id))
-    })?;
-    Ok((
-        KeltnerDeviceArrayF32Py {
-            inner: KeltnerDeviceArrayF32 {
-                inner: up,
-                context: ctx.clone(),
-                device_id: dev_id,
-            },
-        },
-        KeltnerDeviceArrayF32Py {
-            inner: KeltnerDeviceArrayF32 {
-                inner: mid,
-                context: ctx.clone(),
-                device_id: dev_id,
-            },
-        },
-        KeltnerDeviceArrayF32Py {
-            inner: KeltnerDeviceArrayF32 {
-                inner: low,
-                context: ctx,
-                device_id: dev_id,
-            },
-        },
-    ))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KeltnerResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "keltner")]
-pub fn keltner_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &[f64],
-    period: usize,
-    multiplier: f64,
-    ma_type: String,
-) -> Result<JsValue, JsValue> {
-    if !(high.len() == low.len() && low.len() == close.len() && close.len() == source.len()) {
-        return Err(JsValue::from_str("Input arrays must have equal length"));
-    }
-    let len = close.len();
-
-    let mut values = vec![0.0f64; 3 * len];
-    let (upper, rest) = values.split_at_mut(len);
-    let (middle, lower) = rest.split_at_mut(len);
-
-    let params = KeltnerParams {
-        period: Some(period),
-        multiplier: Some(multiplier),
-        ma_type: Some(ma_type),
-    };
-    let input = KeltnerInput::from_slice(high, low, close, source, params);
-
-    keltner_into_slice(upper, middle, lower, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let out = KeltnerResult {
-        values,
-        rows: 3,
-        cols: len,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn keltner_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    source_ptr: *const f64,
-    upper_ptr: *mut f64,
-    middle_ptr: *mut f64,
-    lower_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    multiplier: f64,
-    ma_type: &str,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || source_ptr.is_null()
-        || upper_ptr.is_null()
-        || middle_ptr.is_null()
-        || lower_ptr.is_null()
-    {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let source = std::slice::from_raw_parts(source_ptr, len);
-
-        let params = KeltnerParams {
-            period: Some(period),
-            multiplier: Some(multiplier),
-            ma_type: Some(ma_type.to_string()),
-        };
-        let input = KeltnerInput::from_slice(high, low, close, source, params);
-
-        let input_ptrs = [
-            high_ptr as *const f64,
-            low_ptr as *const f64,
-            close_ptr as *const f64,
-            source_ptr as *const f64,
-        ];
-        let output_ptrs = [
-            upper_ptr as *const f64,
-            middle_ptr as *const f64,
-            lower_ptr as *const f64,
-        ];
-
-        let has_aliasing = input_ptrs
-            .iter()
-            .any(|&in_ptr| output_ptrs.iter().any(|&out_ptr| in_ptr == out_ptr));
-
-        if has_aliasing {
-            let mut temp_upper = vec![0.0; len];
-            let mut temp_middle = vec![0.0; len];
-            let mut temp_lower = vec![0.0; len];
-
-            keltner_into_slice(
-                &mut temp_upper,
-                &mut temp_middle,
-                &mut temp_lower,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let upper_out = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let middle_out = std::slice::from_raw_parts_mut(middle_ptr, len);
-            let lower_out = std::slice::from_raw_parts_mut(lower_ptr, len);
-
-            upper_out.copy_from_slice(&temp_upper);
-            middle_out.copy_from_slice(&temp_middle);
-            lower_out.copy_from_slice(&temp_lower);
-        } else {
-            let upper_out = std::slice::from_raw_parts_mut(upper_ptr, len);
-            let middle_out = std::slice::from_raw_parts_mut(middle_ptr, len);
-            let lower_out = std::slice::from_raw_parts_mut(lower_ptr, len);
-
-            keltner_into_slice(upper_out, middle_out, lower_out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn keltner_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn keltner_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KeltnerBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub multiplier_range: (f64, f64, f64),
-    pub ma_type: String,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct KeltnerBatchJsOutput {
-    pub upper: Vec<f64>,
-    pub middle: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub combos: Vec<KeltnerParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "keltner_batch")]
-pub fn keltner_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    source: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let cfg: KeltnerBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = KeltnerBatchRange {
-        period: cfg.period_range,
-        multiplier: cfg.multiplier_range,
-    };
-
-    let out = keltner_batch_inner(
-        high,
-        low,
-        close,
-        source,
-        &sweep,
-        detect_best_batch_kernel(),
-        false,
-        Some(&cfg.ma_type),
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_out = KeltnerBatchJsOutput {
-        upper: out.upper_band,
-        middle: out.middle_band,
-        lower: out.lower_band,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js_out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "keltner_into_concat")]
-pub fn keltner_into_concat(
-    h_ptr: *const f64,
-    l_ptr: *const f64,
-    c_ptr: *const f64,
-    s_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    multiplier: f64,
-    ma_type: String,
-) -> Result<(), JsValue> {
-    if [h_ptr, l_ptr, c_ptr, s_ptr, out_ptr as *const f64]
-        .iter()
-        .any(|p| p.is_null())
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to keltner_into_concat",
-        ));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(h_ptr, len);
-        let l = std::slice::from_raw_parts(l_ptr, len);
-        let c = std::slice::from_raw_parts(c_ptr, len);
-        let s = std::slice::from_raw_parts(s_ptr, len);
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, 3 * len);
-        let (upper, rest) = out.split_at_mut(len);
-        let (middle, lower) = rest.split_at_mut(len);
-
-        let params = KeltnerParams {
-            period: Some(period),
-            multiplier: Some(multiplier),
-            ma_type: Some(ma_type),
-        };
-        let input = KeltnerInput::from_slice(h, l, c, s, params);
-        keltner_into_slice(upper, middle, lower, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }

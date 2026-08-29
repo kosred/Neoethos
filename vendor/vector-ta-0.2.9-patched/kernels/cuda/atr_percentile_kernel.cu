@@ -117,8 +117,12 @@ extern "C" __global__ void atr_percentile_batch_f64(
  *
  * SINGLE OUTPUT ("value", cpu_batch.rs:8388 `expect_value_output`).
  *
- * PERIOD-INVARIANT. The CPU batch reads `atr_length` (10) and
- * `percentile_length` (50) and never `period`.
+ * WINDOW-ANCHORED. NeoEthos' versioned scalar ABI carries the largest member
+ * of the registry tuple.  V1 is the declared (atr_length=10,
+ * percentile_length=50) shape, scaled with positive integer half-up rounding:
+ * percentile_length=anchor and atr_length=round(10*anchor/50).  This is the
+ * same mapping used to build the CPU authority request; it is not an invented
+ * `period` alias.
  *
  * FIRST-VALID IGNORED. `atr_percentile_into_slice` fills NaN and calls the
  * row function, which walks from index 0 and does NOT take `first`
@@ -148,16 +152,66 @@ extern "C" __global__ void atr_percentile_batch_f64(
  * non-finite bar, but the nesting is kept identical so the two agree even on
  * an infinity.
  *
- * SEQUENTIAL, one thread per combo column. Both rings are fixed-size
- * per-thread arrays at the CPU defaults (10 and 50 doubles plus their flags).
+ * SEQUENTIAL, one thread per combo column.  The output row is first used as
+ * ATR scratch, then converted in DESCENDING index order so every historical
+ * ATR is still present when compared.  True range eviction is recomputed from
+ * the immutable HLC inputs, eliminating a fixed-size per-thread ring without
+ * changing the CPU subtract-then-add accumulator order.
  * =========================================================================== */
 
 #ifndef NEO_F64_NAN
 #define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
 #endif
 
-#define ATRP_NEO_ATR_LEN   10
-#define ATRP_NEO_PCT_LEN   50
+/* V1 of the registry-ratio ABI: round-half-up(anchor * 10 / 50).  For a
+ * positive integral anchor this is quotient + (remainder >= 3).  Keeping the
+ * quotient and remainder separate avoids signed overflow at INT_MAX.
+ */
+__device__ __forceinline__ int anchor_atr_length_v1(int anchor) {
+    const int quotient = anchor / 5;
+    const int remainder = anchor % 5;
+    const int scaled = quotient + (remainder >= 3 ? 1 : 0);
+    return scaled > 0 ? scaled : 1;
+}
+
+__device__ __forceinline__ bool atrp_neo_valid_bar(double high,
+                                                   double low,
+                                                   double close) {
+    return isfinite(high) && isfinite(low) && isfinite(close);
+}
+
+__device__ __forceinline__ bool atrp_neo_true_range_at(
+    const double* __restrict__ high,
+    const double* __restrict__ low,
+    const double* __restrict__ close,
+    int i,
+    double* __restrict__ value)
+{
+    const double h = high[i], l = low[i], c = close[i];
+    if (!atrp_neo_valid_bar(h, l, c)) return false;
+
+    const double hl = h - l;
+    if (i == 0 || !atrp_neo_valid_bar(high[i - 1], low[i - 1], close[i - 1])) {
+        *value = hl;
+        return true;
+    }
+
+    const double prev_close = close[i - 1];
+    const double hc = fabs(h - prev_close);
+    const double lc = fabs(l - prev_close);
+    *value = fmax(fmax(hl, hc), lc);
+    return true;
+}
+
+/* Scratch must retain the CPU's validity flag independently of its numeric
+ * ATR.  Finite HLC values can still overflow an arithmetic expression to NaN;
+ * such a value is VALID in the CPU ring and comparisons against it are simply
+ * false.  A dedicated payload represents only an invalid HLC window.
+ */
+#define ATRP_NEO_INVALID_SCRATCH (__longlong_as_double(0x7ff8000000000001ULL))
+__device__ __forceinline__ bool atrp_neo_scratch_valid(double value) {
+    return (unsigned long long)__double_as_longlong(value) != 0x7ff8000000000001ULL;
+}
 
 extern "C" __global__
 void atr_percentile_neo_batch_f64(
@@ -172,104 +226,71 @@ void atr_percentile_neo_batch_f64(
 {
     const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (combo >= n_combos) return;
-    (void)periods; (void)first_valid;
+    (void)first_valid;
 
     const int len = series_len;
     double* __restrict__ o = out + (size_t)combo * (size_t)len;
 
-    const int AL = ATRP_NEO_ATR_LEN;
-    const int PL = ATRP_NEO_PCT_LEN;
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+    if (len <= 0) return;
 
-    double tr_values[ATRP_NEO_ATR_LEN];
-    unsigned char tr_valid[ATRP_NEO_ATR_LEN];
-    int    tr_idx = 0, tr_count = 0, tr_valid_count = 0;
+    const int anchor = periods[combo];
+    if (anchor <= 0) return;
+    const int AL = anchor_atr_length_v1(anchor);
+    const int PL = anchor;
+    if (AL > len || PL > len || PL > len - AL) return;
+
+    int tr_count = 0;
+    int tr_valid_count = 0;
     double tr_sum = 0.0;
-    #pragma unroll
-    for (int k = 0; k < ATRP_NEO_ATR_LEN; ++k) { tr_values[k] = 0.0; tr_valid[k] = 0; }
 
-    double atr_values[ATRP_NEO_PCT_LEN];
-    unsigned char atr_valid[ATRP_NEO_PCT_LEN];
-    int    atr_idx = 0, atr_count = 0, atr_valid_count = 0;
-    #pragma unroll
-    for (int k = 0; k < ATRP_NEO_PCT_LEN; ++k) { atr_values[k] = 0.0; atr_valid[k] = 0; }
-
-    double prev_close = NEO_F64_NAN;
-    bool   has_prev_close = false;
-
+    /* Pass 1: identical subtract-old, add-new accumulator; o[i] temporarily
+     * holds the ATR and its validity payload.
+     */
     for (int i = 0; i < len; ++i) {
-        o[i] = NEO_F64_NAN;              /* dst.fill(NAN) before the walk */
-
         if (tr_count >= AL) {
-            const int old_idx = tr_idx;
-            if (tr_valid[old_idx] != 0) {
+            double old_tr = 0.0;
+            if (atrp_neo_true_range_at(high, low, close, i - AL, &old_tr)) {
                 if (tr_valid_count > 0) tr_valid_count -= 1;
-                tr_sum -= tr_values[old_idx];
+                tr_sum -= old_tr;
             }
         } else {
             tr_count += 1;
         }
 
-        const double h = high[i], l = low[i], c = close[i];
-        const bool bar_ok = isfinite(h) && isfinite(l) && isfinite(c);
-        bool   have_tr = false;
         double tr = 0.0;
-        if (bar_ok) {
-            const double hl = h - l;
-            if (!has_prev_close || !isfinite(prev_close)) {
-                tr = hl;
-            } else {
-                const double hc = fabs(h - prev_close);
-                const double lc = fabs(l - prev_close);
-                tr = fmax(fmax(hl, hc), lc);
-            }
-            have_tr = true;
-        }
-
-        if (have_tr) {
-            tr_values[tr_idx] = tr;
-            tr_valid[tr_idx] = 1;
+        if (atrp_neo_true_range_at(high, low, close, i, &tr)) {
             tr_valid_count += 1;
             tr_sum += tr;
-        } else {
-            tr_values[tr_idx] = 0.0;
-            tr_valid[tr_idx] = 0;
         }
-        tr_idx += 1; if (tr_idx == AL) tr_idx = 0;
 
         if (tr_count >= AL) {
-            const bool   atr_valid_now = (tr_valid_count == AL);
-            const double atr_now = atr_valid_now ? tr_sum / (double)AL : 0.0;
-
-            if (atr_count >= PL) {
-                if (atr_valid_now && atr_valid_count == PL) {
-                    int below = 0;
-                    for (int k = 0; k < PL; ++k) {
-                        if (atr_now > atr_values[k]) below += 1;
-                    }
-                    o[i] = 100.0 * (double)below / (double)PL;
-                } else {
-                    o[i] = NEO_F64_NAN;
-                }
-                const int old_idx = atr_idx;
-                if (atr_valid[old_idx] != 0) {
-                    if (atr_valid_count > 0) atr_valid_count -= 1;
-                }
-            } else {
-                atr_count += 1;
-            }
-
-            if (atr_valid_now) {
-                atr_values[atr_idx] = atr_now;
-                atr_valid[atr_idx] = 1;
-                atr_valid_count += 1;
-            } else {
-                atr_values[atr_idx] = 0.0;
-                atr_valid[atr_idx] = 0;
-            }
-            atr_idx += 1; if (atr_idx == PL) atr_idx = 0;
+            o[i] = tr_valid_count == AL
+                ? tr_sum / (double)AL
+                : ATRP_NEO_INVALID_SCRATCH;
+        } else {
+            o[i] = ATRP_NEO_INVALID_SCRATCH;
         }
-
-        if (bar_ok) { prev_close = c; has_prev_close = true; }
-        else        { prev_close = NEO_F64_NAN; has_prev_close = false; }
     }
+
+    /* Pass 2 descends so o[i-k] is still the historical ATR scratch.  The CPU
+     * compares against exactly the PL prior ATRs, never against the current
+     * value itself.
+     */
+    const int first_output = AL + PL - 1;
+    for (int i = len - 1; i >= first_output; --i) {
+        const double current = o[i];
+        bool valid = atrp_neo_scratch_valid(current);
+        int below = 0;
+        for (int k = 1; valid && k <= PL; ++k) {
+            const double previous = o[i - k];
+            if (!atrp_neo_scratch_valid(previous)) {
+                valid = false;
+            } else if (current > previous) {
+                below += 1;
+            }
+        }
+        o[i] = valid ? 100.0 * (double)below / (double)PL : NEO_F64_NAN;
+    }
+    for (int i = 0; i < first_output; ++i) o[i] = NEO_F64_NAN;
 }

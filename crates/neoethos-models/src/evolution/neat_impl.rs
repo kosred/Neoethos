@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
-use polars::prelude::{DataFrame, Series};
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoroshiro128PlusPlus;
 use rayon::prelude::*;
@@ -13,11 +14,13 @@ use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
 use neoethos_core::BackendKind;
 
 #[cfg(feature = "neuro-evolution-gpu")]
-use super::neat_gpu::{neat_cuda_kernel_enabled, try_population_scores_cuda};
+use super::neat_gpu::try_population_scores_cuda;
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, three_class_runtime_confidence,
     try_build_runtime_artifact_metadata,
 };
+#[cfg(feature = "neuro-evolution-gpu")]
+use crate::common::ResolvedCudaDevicePolicy;
 use crate::runtime::artifacts::{
     RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
 };
@@ -27,7 +30,7 @@ use crate::runtime::capabilities::{
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_dataframe,
+    FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_frame,
     read_json, remap_three_class_labels, softmax_rows, write_json,
 };
 
@@ -37,6 +40,30 @@ const NEAT_RUNTIME_BACKEND: &str = "symbios_neat_cpu";
 #[cfg(feature = "neuro-evolution-gpu")]
 const NEAT_CUDA_FITNESS_BACKEND: &str = "symbios_neat_cuda_fitness";
 const DEFAULT_NEAT_SPECIES_ELITISM: usize = 0;
+
+/// Checked, backend-local narrowing for symbios-neat, whose evaluator accepts
+/// f32 inputs. The shared typed frame and scaler remain f64, and values that
+/// cannot survive this explicit boundary fail closed.
+fn neat_backend_f32_matrix(features: &Array2<f64>) -> Result<Array2<f32>> {
+    let mut narrowed = Vec::with_capacity(features.len());
+    for ((row, column), value) in features.indexed_iter() {
+        if value.abs() > f32::MAX as f64 {
+            bail!("NEAT f32 backend cannot represent feature row {row} column {column}: {value}");
+        }
+        let converted = *value as f32;
+        if !converted.is_finite() {
+            bail!("NEAT f32 backend produced non-finite feature row {row} column {column}");
+        }
+        if *value != 0.0 && converted == 0.0 {
+            bail!(
+                "NEAT f32 backend underflowed non-zero feature row {row} column {column}: {value}"
+            );
+        }
+        narrowed.push(converted);
+    }
+    Array2::from_shape_vec(features.dim(), narrowed)
+        .context("shape NEAT f32 backend feature matrix")
+}
 
 fn default_neat_requested_device_policy() -> String {
     "auto".to_string()
@@ -83,6 +110,7 @@ struct NeatArtifact {
     runtime_backend_kind: Option<BackendKind>,
     #[serde(default = "default_neat_requested_device_policy")]
     requested_device_policy: String,
+    effective_device_policy: String,
     best_fitness: f32,
     best_loss: f32,
     best_accuracy: f32,
@@ -116,6 +144,7 @@ impl Default for NeatArtifact {
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
             requested_device_policy: default_neat_requested_device_policy(),
+            effective_device_policy: "unresolved".to_string(),
             best_fitness: f32::NEG_INFINITY,
             best_loss: f32::INFINITY,
             best_accuracy: 0.0,
@@ -159,13 +188,13 @@ impl<'a> NeatDatasetEvaluator<'a> {
             }
         };
 
-        let mut log_loss = 0.0_f32;
+        let mut log_loss = 0.0_f64;
         let mut correct = 0usize;
-        let mut confidence_sum = 0.0_f32;
+        let mut confidence_sum = 0.0_f64;
         for row in 0..probabilities.nrows() {
             let expected = self.labels[row];
             let mut best_idx = 0usize;
-            let mut best_value = f32::NEG_INFINITY;
+            let mut best_value = f64::NEG_INFINITY;
             for class_idx in 0..probabilities.ncols() {
                 let probability = probabilities[(row, class_idx)].clamp(1e-6, 1.0 - 1e-6);
                 if class_idx == expected {
@@ -182,19 +211,19 @@ impl<'a> NeatDatasetEvaluator<'a> {
             }
         }
 
-        let rows = probabilities.nrows().max(1) as f32;
+        let rows = probabilities.nrows().max(1) as f64;
         let avg_loss = log_loss / rows;
-        let accuracy = correct as f32 / rows;
+        let accuracy = correct as f64 / rows;
         let confidence = confidence_sum / rows;
-        let complexity_penalty = complexity_penalty(genome);
+        let complexity_penalty = f64::from(complexity_penalty(genome));
         let fitness = (accuracy * 3.0 + confidence) - avg_loss - complexity_penalty;
 
         GenomeScore {
             genome: genome.clone(),
-            fitness,
-            loss: avg_loss,
-            accuracy,
-            adjusted_fitness: fitness,
+            fitness: fitness as f32,
+            loss: avg_loss as f32,
+            accuracy: accuracy as f32,
+            adjusted_fitness: fitness as f32,
         }
     }
 }
@@ -205,7 +234,7 @@ fn complexity_penalty(genome: &NeatGenome) -> f32 {
     hidden_nodes * 0.003 + enabled_connections * 0.0006
 }
 
-fn evaluate_probabilities(genome: &NeatGenome, features: &Array2<f32>) -> Result<Array2<f32>> {
+fn evaluate_probabilities(genome: &NeatGenome, features: &Array2<f32>) -> Result<Array2<f64>> {
     let evaluator = CppnEvaluator::try_new(genome).context("compile NEAT evaluator")?;
     if evaluator.num_outputs() != 3 {
         bail!(
@@ -226,7 +255,7 @@ fn evaluate_probabilities(genome: &NeatGenome, features: &Array2<f32>) -> Result
         }
     }
 
-    Ok(softmax_rows(&logits))
+    softmax_rows(&logits.mapv(f64::from))
 }
 
 fn build_neat_config(input_dim: usize) -> NeatConfig {
@@ -444,6 +473,7 @@ pub struct NeatExpert {
     val_rows: usize,
     runtime_backend: String,
     requested_device_policy: String,
+    effective_device_policy: String,
     best_fitness: f32,
     best_loss: f32,
     best_accuracy: f32,
@@ -479,6 +509,7 @@ impl NeatExpert {
             val_rows: 0,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             requested_device_policy: default_neat_requested_device_policy(),
+            effective_device_policy: "unresolved".to_string(),
             best_fitness: f32::NEG_INFINITY,
             best_loss: f32::INFINITY,
             best_accuracy: 0.0,
@@ -502,7 +533,13 @@ impl NeatExpert {
     }
 
     pub fn with_device_policy(mut self, policy: impl AsRef<str>) -> Self {
-        self.requested_device_policy = normalize_runtime_device_policy(policy.as_ref());
+        let policy = policy.as_ref().trim();
+        self.requested_device_policy = if policy.is_empty() {
+            "auto".to_string()
+        } else {
+            policy.to_ascii_lowercase()
+        };
+        self.effective_device_policy = "unresolved".to_string();
         self
     }
 
@@ -511,7 +548,7 @@ impl NeatExpert {
             return ((0..rows).collect(), Vec::new());
         }
 
-        let val_rows = ((rows as f32) * 0.2).round() as usize;
+        let val_rows = ((rows as f64) * 0.2).round() as usize;
         let val_rows = val_rows.clamp(1, rows.saturating_sub(1));
         let train_rows = rows - val_rows;
 
@@ -564,57 +601,36 @@ impl NeatExpert {
             accuracy: 0.0,
             adjusted_fitness: f32::NEG_INFINITY,
         };
+        let resolved_cuda_device = crate::common::resolve_cuda_device_policy(
+            &self.requested_device_policy,
+            crate::tree_models::config::nvidia_gpu_count(),
+        )?;
+        self.effective_device_policy = match resolved_cuda_device {
+            crate::common::ResolvedCudaDevicePolicy::Cpu => "cpu".to_string(),
+            crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } => {
+                format!("gpu:{ordinal}")
+            }
+        };
         #[cfg(feature = "neuro-evolution-gpu")]
         let mut used_cuda_fitness = false;
         #[cfg(feature = "neuro-evolution-gpu")]
-        let mut cuda_fitness_disabled = false;
+        let resolved_cuda_policy = match resolved_cuda_device {
+            ResolvedCudaDevicePolicy::Cpu => None,
+            ResolvedCudaDevicePolicy::Cuda { ordinal } => Some(format!("gpu:{ordinal}")),
+        };
+        #[cfg(feature = "neuro-evolution-gpu")]
+        let _cubecl_training_residency_scope = resolved_cuda_policy
+            .as_ref()
+            .map(|_| crate::cubecl_lifecycle::cubecl_residency_scope());
+        #[cfg(not(feature = "neuro-evolution-gpu"))]
+        if let crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } = resolved_cuda_device {
+            bail!(
+                "NEAT resolved CUDA ordinal {ordinal} from policy `{}`, but this binary was built without `neuro-evolution-gpu`",
+                self.requested_device_policy
+            );
+        }
 
         for _generation in 0..self.generations {
-            #[cfg(feature = "neuro-evolution-gpu")]
-            let mut cuda_scores = None;
-            #[cfg(feature = "neuro-evolution-gpu")]
-            if !cuda_fitness_disabled && neat_cuda_kernel_enabled(&self.requested_device_policy) {
-                match try_population_scores_cuda(
-                    &population,
-                    train_features,
-                    train_labels,
-                    val_features,
-                    val_labels,
-                    &self.requested_device_policy,
-                ) {
-                    Ok(metrics) if metrics.len() == population.len() => {
-                        used_cuda_fitness = true;
-                        cuda_scores = Some(
-                            population
-                                .iter()
-                                .cloned()
-                                .zip(metrics)
-                                .map(|(genome, metrics)| GenomeScore {
-                                    genome,
-                                    fitness: metrics.fitness,
-                                    loss: metrics.loss,
-                                    accuracy: metrics.accuracy,
-                                    adjusted_fitness: metrics.fitness,
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                    }
-                    Ok(metrics) => {
-                        cuda_fitness_disabled = true;
-                        tracing::warn!(
-                            "NEAT cuda fitness kernel returned {} scores for {} genomes; falling back to cpu fitness evaluation",
-                            metrics.len(),
-                            population.len()
-                        );
-                    }
-                    Err(err) => {
-                        cuda_fitness_disabled = true;
-                        tracing::warn!(
-                            "NEAT cuda fitness kernel unavailable, falling back to cpu fitness evaluation: {err}"
-                        );
-                    }
-                }
-            }
             let cpu_scores = || {
                 population
                     .par_iter()
@@ -632,7 +648,39 @@ impl NeatExpert {
                     .collect::<Vec<_>>()
             };
             #[cfg(feature = "neuro-evolution-gpu")]
-            let mut scores = cuda_scores.unwrap_or_else(cpu_scores);
+            let mut scores = if let Some(cuda_policy) = resolved_cuda_policy.as_deref() {
+                let metrics = try_population_scores_cuda(
+                    &population,
+                    train_features,
+                    train_labels,
+                    val_features,
+                    val_labels,
+                    cuda_policy,
+                )
+                .context("execute requested NEAT cuda fitness kernel")?;
+                if metrics.len() != population.len() {
+                    bail!(
+                        "NEAT cuda fitness kernel returned {} scores for {} genomes",
+                        metrics.len(),
+                        population.len()
+                    );
+                }
+                used_cuda_fitness = true;
+                population
+                    .iter()
+                    .cloned()
+                    .zip(metrics)
+                    .map(|(genome, metrics)| GenomeScore {
+                        genome,
+                        fitness: metrics.fitness,
+                        loss: metrics.loss,
+                        accuracy: metrics.accuracy,
+                        adjusted_fitness: metrics.fitness,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                cpu_scores()
+            };
             #[cfg(not(feature = "neuro-evolution-gpu"))]
             let mut scores = cpu_scores();
             sort_scores_desc(&mut scores);
@@ -826,8 +874,12 @@ impl NeatExpert {
         Ok(())
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
         let (execution_backend, degraded_reason) = self.runtime_details();
         let mut predictions = Vec::with_capacity(probabilities.nrows());
         for row in probabilities.outer_iter() {
@@ -961,9 +1013,74 @@ impl NeatExpert {
                 );
             }
         }
-        if artifact.requested_device_policy.trim().is_empty() {
-            bail!("NEAT artifact requested_device_policy must not be blank");
+        let requested_device =
+            crate::common::parse_cuda_device_policy(&artifact.requested_device_policy)
+                .context("validate NEAT artifact requested CUDA policy")?;
+        let effective_label = artifact.effective_device_policy.trim().to_ascii_lowercase();
+        let effective_device =
+            crate::common::parse_cuda_device_policy(&artifact.effective_device_policy)
+                .context("validate NEAT artifact effective CUDA policy")?;
+        let effective_cuda_ordinal = match effective_device {
+            crate::common::CudaDevicePolicy::Cpu if effective_label == "cpu" => None,
+            crate::common::CudaDevicePolicy::Gpu { ordinal }
+                if effective_label == format!("gpu:{ordinal}") =>
+            {
+                Some(ordinal)
+            }
+            _ => bail!(
+                "NEAT artifact effective device must be `cpu` or exact `gpu:<ordinal>`, got `{}`",
+                artifact.effective_device_policy
+            ),
+        };
+        match (requested_device, effective_cuda_ordinal) {
+            (crate::common::CudaDevicePolicy::Cpu, Some(_)) => {
+                bail!("NEAT artifact requested CPU but recorded CUDA fitness")
+            }
+            (crate::common::CudaDevicePolicy::Gpu { .. }, None) => {
+                bail!("NEAT artifact requested explicit CUDA but recorded CPU fitness")
+            }
+            (crate::common::CudaDevicePolicy::Gpu { ordinal: requested }, Some(recorded))
+                if requested != recorded =>
+            {
+                bail!(
+                    "NEAT artifact CUDA ordinal mismatch: requested {requested}, recorded {recorded}"
+                )
+            }
+            (crate::common::CudaDevicePolicy::Auto, Some(recorded)) if recorded != 0 => {
+                bail!("NEAT Auto artifact must record CUDA ordinal 0, got {recorded}")
+            }
+            _ => {}
         }
+        if artifact.runtime_backend.contains("cuda") != effective_cuda_ordinal.is_some() {
+            bail!(
+                "NEAT runtime backend `{}` is inconsistent with effective device `{}`",
+                artifact.runtime_backend,
+                artifact.effective_device_policy
+            );
+        }
+        let current_device = crate::common::resolve_cuda_device_policy(
+            &artifact.requested_device_policy,
+            crate::tree_models::config::nvidia_gpu_count(),
+        )?;
+        if matches!(requested_device, crate::common::CudaDevicePolicy::Auto)
+            && matches!(
+                current_device,
+                crate::common::ResolvedCudaDevicePolicy::Cuda { .. }
+            )
+            && effective_cuda_ordinal.is_none()
+        {
+            bail!(
+                "NEAT Auto artifact recorded CPU fitness, but NVIDIA is now visible; retrain the artifact on CUDA"
+            );
+        }
+        #[cfg(not(feature = "neuro-evolution-gpu"))]
+        if let crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } = current_device {
+            bail!(
+                "NEAT artifact resolves CUDA ordinal {ordinal}, but this build lacks `neuro-evolution-gpu`"
+            );
+        }
+        #[cfg(feature = "neuro-evolution-gpu")]
+        let _ = current_device;
 
         if artifact.mutation_rate.is_nan()
             || !artifact.mutation_rate.is_finite()
@@ -1105,49 +1222,53 @@ impl Default for NeatExpert {
 }
 
 impl ExpertModel for NeatExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
-        let scaler = FeatureScaler::fit(&features)?;
-        let scaled = scaler.transform(&features)?;
-        let labels = remap_three_class_labels(y)?;
-        if scaled.nrows() < 32 {
-            bail!(
-                "NEAT requires at least 32 rows, received {}",
-                scaled.nrows()
-            );
-        }
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| {
+            let (features, feature_columns) = feature_matrix_from_frame(x)?;
+            let scaler = FeatureScaler::fit(&features)?;
+            let scaled = neat_backend_f32_matrix(&scaler.transform(&features)?)?;
+            let labels = remap_three_class_labels(y)?;
+            if scaled.nrows() < 32 {
+                bail!(
+                    "NEAT requires at least 32 rows, received {}",
+                    scaled.nrows()
+                );
+            }
 
-        self.config = build_neat_config(scaled.ncols());
-        self.feature_columns = feature_columns;
-        self.scaler = Some(scaler);
-        self.dataset_rows = scaled.nrows();
-        let (train_indices, val_indices) = Self::split_train_val_indices(scaled.nrows());
-        let train_features = Self::slice_rows(&scaled, &train_indices);
-        let val_features = Self::slice_rows(&scaled, &val_indices);
-        let train_labels = Self::slice_labels(&labels, &train_indices);
-        let val_labels = Self::slice_labels(&labels, &val_indices);
-        self.train_rows = train_features.nrows();
-        self.val_rows = val_features.nrows();
-        self.runtime_backend = NEAT_RUNTIME_BACKEND.to_string();
+            self.config = build_neat_config(scaled.ncols());
+            self.feature_columns = feature_columns;
+            self.scaler = Some(scaler);
+            self.dataset_rows = scaled.nrows();
+            let (train_indices, val_indices) = Self::split_train_val_indices(scaled.nrows());
+            let train_features = Self::slice_rows(&scaled, &train_indices);
+            let val_features = Self::slice_rows(&scaled, &val_indices);
+            let train_labels = Self::slice_labels(&labels, &train_indices);
+            let val_labels = Self::slice_labels(&labels, &val_indices);
+            self.train_rows = train_features.nrows();
+            self.val_rows = val_features.nrows();
+            self.runtime_backend = NEAT_RUNTIME_BACKEND.to_string();
 
-        let best =
-            self.evolve_population(&train_features, &train_labels, &val_features, &val_labels)?;
-        self.best_fitness = best.fitness;
-        self.best_loss = best.loss;
-        self.best_accuracy = best.accuracy;
-        self.best_genome = Some(best.genome);
-        self.fitted = true;
-        Ok(())
+            let best =
+                self.evolve_population(&train_features, &train_labels, &val_features, &val_labels)?;
+            self.best_fitness = best.fitness;
+            self.best_loss = best.loss;
+            self.best_accuracy = best.accuracy;
+            self.best_genome = Some(best.genome);
+            self.fitted = true;
+            Ok(())
+        })
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        self.ensure_runtime_state_ready()?;
-        ensure_feature_columns_match(&self.feature_columns, x)?;
-        let (features, _) = feature_matrix_from_dataframe(x)?;
-        let scaler = self.scaler.as_ref().context("NEAT scaler missing")?;
-        let scaled = scaler.transform(&features)?;
-        let genome = self.best_genome.as_ref().context("NEAT genome missing")?;
-        evaluate_probabilities(genome, &scaled)
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| {
+            self.ensure_runtime_state_ready()?;
+            ensure_feature_columns_match(&self.feature_columns, x)?;
+            let (features, _) = feature_matrix_from_frame(x)?;
+            let scaler = self.scaler.as_ref().context("NEAT scaler missing")?;
+            let scaled = neat_backend_f32_matrix(&scaler.transform(&features)?)?;
+            let genome = self.best_genome.as_ref().context("NEAT genome missing")?;
+            evaluate_probabilities(genome, &scaled)
+        })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -1185,6 +1306,7 @@ impl ExpertModel for NeatExpert {
                 runtime_backend: self.runtime_backend.clone(),
                 runtime_backend_kind: Some(neat_runtime_backend_kind(&self.runtime_backend)),
                 requested_device_policy: self.requested_device_policy.clone(),
+                effective_device_policy: self.effective_device_policy.clone(),
                 best_fitness: self.best_fitness,
                 best_loss: self.best_loss,
                 best_accuracy: self.best_accuracy,
@@ -1215,7 +1337,8 @@ impl ExpertModel for NeatExpert {
         let next_val_rows = artifact.val_rows;
         let next_runtime_backend = artifact.runtime_backend;
         let next_requested_device_policy =
-            normalize_runtime_device_policy(&artifact.requested_device_policy);
+            artifact.requested_device_policy.trim().to_ascii_lowercase();
+        let next_effective_device_policy = artifact.effective_device_policy;
         let next_best_fitness = artifact.best_fitness;
         let next_best_loss = artifact.best_loss;
         let next_best_accuracy = artifact.best_accuracy;
@@ -1237,6 +1360,7 @@ impl ExpertModel for NeatExpert {
         self.val_rows = next_val_rows;
         self.runtime_backend = next_runtime_backend;
         self.requested_device_policy = next_requested_device_policy;
+        self.effective_device_policy = next_effective_device_policy;
         self.best_fitness = next_best_fitness;
         self.best_loss = next_best_loss;
         self.best_accuracy = next_best_accuracy;
@@ -1249,7 +1373,8 @@ mod tests {
     use super::*;
     use crate::base::build_runtime_artifact_metadata;
     use crate::statistical::common::read_json;
-    use polars::prelude::{DataFrame, NamedFrom, Series};
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+    use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_model_dir(name: &str) -> std::path::PathBuf {
@@ -1264,29 +1389,42 @@ mod tests {
         ))
     }
 
-    fn training_frame() -> Result<(DataFrame, Series)> {
-        let features = DataFrame::new(vec![
-            Series::new(
-                "f1".into(),
-                (0..32).map(|idx| idx as f64).collect::<Vec<_>>(),
-            )
-            .into(),
-            Series::new(
-                "f2".into(),
+    fn typed_frame(columns: Vec<(&str, Vec<f64>)>) -> Result<FeatureFrame> {
+        let rows = columns.first().map_or(0, |(_, values)| values.len());
+        let columns = columns
+            .into_iter()
+            .map(|(name, values)| {
+                FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+    }
+
+    fn one_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one worker is valid");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("isolated NEAT test lease")
+    }
+
+    fn training_frame() -> Result<(FeatureFrame, Vec<i32>)> {
+        let features = typed_frame(vec![
+            ("f1", (0..32).map(|idx| idx as f64).collect::<Vec<_>>()),
+            (
+                "f2",
                 (0..32).map(|idx| (idx as f64) * 0.5).collect::<Vec<_>>(),
-            )
-            .into(),
+            ),
         ])?;
-        let labels = Series::new(
-            "target".into(),
-            (0..32)
-                .map(|idx| match idx % 3 {
-                    0 => -1,
-                    1 => 0,
-                    _ => 1,
-                })
-                .collect::<Vec<_>>(),
-        );
+        let labels = (0..32)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
         Ok((features, labels))
     }
 
@@ -1300,7 +1438,7 @@ mod tests {
     fn neat_save_records_train_val_rows_and_runtime_backend() -> Result<()> {
         let (features, labels) = training_frame()?;
         let mut expert = NeatExpert::with_config(2, 24, 8);
-        expert.fit(&features, &labels)?;
+        expert.fit(&features, &labels, &one_worker_lease())?;
 
         let path = temp_model_dir("neat");
         expert.save(&path)?;
@@ -1328,9 +1466,9 @@ mod tests {
     fn neat_predict_runtime_reports_backend_details() -> Result<()> {
         let (features, labels) = training_frame()?;
         let mut expert = NeatExpert::with_config(2, 24, 8);
-        expert.fit(&features, &labels)?;
+        expert.fit(&features, &labels, &one_worker_lease())?;
 
-        let predictions = expert.predict_runtime(&features)?;
+        let predictions = expert.predict_runtime(&features, &one_worker_lease())?;
         assert_eq!(predictions.len(), 32);
         assert_eq!(
             predictions[0].metadata().execution_backend.as_deref(),
@@ -1352,7 +1490,7 @@ mod tests {
     fn neat_load_falls_back_to_embedded_metadata_when_sidecar_missing() -> Result<()> {
         let (features, labels) = training_frame()?;
         let mut expert = NeatExpert::with_config(2, 24, 8);
-        expert.fit(&features, &labels)?;
+        expert.fit(&features, &labels, &one_worker_lease())?;
         let path = temp_model_dir("neat_sidecar_missing");
         expert.save(&path)?;
         std::fs::remove_file(path.join(METADATA_FILE_NAME))?;
@@ -1368,7 +1506,7 @@ mod tests {
     fn neat_load_rejects_sidecar_drift_against_embedded() -> Result<()> {
         let (features, labels) = training_frame()?;
         let mut expert = NeatExpert::with_config(2, 24, 8);
-        expert.fit(&features, &labels)?;
+        expert.fit(&features, &labels, &one_worker_lease())?;
         let path = temp_model_dir("neat_sidecar_drift");
         expert.save(&path)?;
 
@@ -1420,7 +1558,8 @@ mod tests {
             val_rows: 1,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
-            requested_device_policy: default_neat_requested_device_policy(),
+            requested_device_policy: "cpu".to_string(),
+            effective_device_policy: "cpu".to_string(),
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,
@@ -1467,7 +1606,8 @@ mod tests {
             val_rows: 6,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
-            requested_device_policy: default_neat_requested_device_policy(),
+            requested_device_policy: "cpu".to_string(),
+            effective_device_policy: "cpu".to_string(),
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,
@@ -1514,7 +1654,8 @@ mod tests {
             val_rows: 6,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
-            requested_device_policy: default_neat_requested_device_policy(),
+            requested_device_policy: "cpu".to_string(),
+            effective_device_policy: "cpu".to_string(),
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,
@@ -1534,11 +1675,11 @@ mod tests {
     fn predict_proba_rejects_missing_runtime_backend() -> Result<()> {
         let (features, labels) = training_frame()?;
         let mut expert = NeatExpert::with_config(2, 24, 8);
-        expert.fit(&features, &labels)?;
+        expert.fit(&features, &labels, &one_worker_lease())?;
         expert.runtime_backend.clear();
 
         let err = expert
-            .predict_proba(&features)
+            .predict_proba(&features, &one_worker_lease())
             .expect_err("missing runtime backend should fail early");
         assert!(err.to_string().contains("runtime backend"));
         Ok(())

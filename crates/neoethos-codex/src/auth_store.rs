@@ -98,7 +98,10 @@ impl std::fmt::Debug for SecretString {
         if self.0.is_empty() {
             f.write_str("SecretString(<empty>)")
         } else {
-            f.write_fmt(format_args!("SecretString(<redacted, {} chars>)", self.0.len()))
+            f.write_fmt(format_args!(
+                "SecretString(<redacted, {} chars>)",
+                self.0.len()
+            ))
         }
     }
 }
@@ -208,20 +211,19 @@ impl OnDiskAuth {
     /// fields. Fails with [`CodexError::AuthStoreParse`] when no
     /// access token is present in either location.
     fn into_stored(self) -> Result<StoredAuth, CodexError> {
-        let (access_token, refresh_token, id_token) =
-            if let Some(t) = self.tokens {
-                (t.access_token, t.refresh_token, t.id_token)
-            } else if let Some(at) = self.access_token {
-                (at, self.refresh_token, self.id_token)
-            } else {
-                return Err(CodexError::AuthStoreParse(
-                    "auth.json has neither a `tokens.access_token` (modern \
+        let (access_token, refresh_token, id_token) = if let Some(t) = self.tokens {
+            (t.access_token, t.refresh_token, t.id_token)
+        } else if let Some(at) = self.access_token {
+            (at, self.refresh_token, self.id_token)
+        } else {
+            return Err(CodexError::AuthStoreParse(
+                "auth.json has neither a `tokens.access_token` (modern \
                      Codex CLI) nor a top-level `access_token` (legacy) — \
                      re-run `codex login` or reconnect from Settings → \
                      Account."
-                        .to_string(),
-                ));
-            };
+                    .to_string(),
+            ));
+        };
         // Decode the email claim from the id_token when the legacy
         // `email` field wasn't already stored.
         let decoded_email = id_token.as_deref().and_then(parse_email_claim);
@@ -316,10 +318,13 @@ impl AuthStore {
     /// fsyncs, then renames over the target. A crash mid-write
     /// leaves the previous version intact.
     pub fn save(&self, auth: &StoredAuth) -> Result<(), CodexError> {
-        let parent = self.path.parent().ok_or_else(|| CodexError::AuthStoreWrite {
-            path: self.path.display().to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir"),
-        })?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| CodexError::AuthStoreWrite {
+                path: self.path.display().to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir"),
+            })?;
         std::fs::create_dir_all(parent).map_err(|source| CodexError::AuthStoreWrite {
             path: parent.display().to_string(),
             source,
@@ -328,8 +333,8 @@ impl AuthStore {
         let mut tmp = self.path.clone();
         tmp.set_extension("json.tmp");
 
-        let json =
-            serde_json::to_vec_pretty(auth).map_err(|e| CodexError::AuthStoreParse(e.to_string()))?;
+        let json = serde_json::to_vec_pretty(auth)
+            .map_err(|e| CodexError::AuthStoreParse(e.to_string()))?;
         std::fs::write(&tmp, &json).map_err(|source| CodexError::AuthStoreWrite {
             path: tmp.display().to_string(),
             source,
@@ -377,16 +382,16 @@ impl AuthStore {
 /// claim to block the whole login flow.
 fn parse_email_claim(id_token: &str) -> Option<String> {
     let payload = id_token.split('.').nth(1)?;
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        payload,
-    )
-    .or_else(|_| {
-        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, payload)
-    })
-    .ok()?;
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+            .or_else(|_| {
+                base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, payload)
+            })
+            .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    json.get("email").and_then(|v| v.as_str()).map(str::to_string)
+    json.get("email")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -425,10 +430,7 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trips() {
-        let dir = std::env::temp_dir().join(format!(
-            "neoethos-codex-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("neoethos-codex-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");
@@ -482,8 +484,8 @@ mod tests {
         // StoredAuth (top-level `access_token`) and failed with
         // "missing field `access_token`" — which surfaced as a permanent
         // "Not authenticated" in the AI Helper. This must now parse.
-        let dir = std::env::temp_dir()
-            .join(format!("neoethos-codex-nested-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("neoethos-codex-nested-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");
@@ -522,13 +524,12 @@ mod tests {
         // Neither a nested `tokens.access_token` nor a top-level one →
         // fail loud with a message that tells the operator to re-login,
         // rather than silently behaving as "not authenticated".
-        let dir = std::env::temp_dir()
-            .join(format!("neoethos-codex-noauth-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("neoethos-codex-noauth-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");
-        std::fs::write(&path, r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null}"#)
-            .unwrap();
+        std::fs::write(&path, r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null}"#).unwrap();
 
         let store = AuthStore::new(path);
         let err = store.load().unwrap_err();

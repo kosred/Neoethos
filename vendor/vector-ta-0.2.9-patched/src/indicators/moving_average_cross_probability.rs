@@ -1,22 +1,6 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::indicators::dispatch::{
-    compute_cpu_batch, IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV,
-    ParamValue,
+    IndicatorBatchRequest, IndicatorDataRef, IndicatorParamSet, ParamKV, ParamValue,
+    compute_cpu_batch,
 };
 use crate::indicators::moving_averages::ema::{EmaParams, EmaStream};
 use crate::indicators::moving_averages::hma::{HmaParams, HmaStream};
@@ -27,8 +11,6 @@ use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, init_matrix_prefixes, make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -43,11 +25,6 @@ const DEFAULT_FAST_LENGTH: usize = 14;
 const DEFAULT_RESOLUTION: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "snake_case")
-)]
 pub enum MovingAverageCrossProbabilityMaType {
     Ema,
     Sma,
@@ -99,10 +76,6 @@ pub struct MovingAverageCrossProbabilityOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct MovingAverageCrossProbabilityParams {
     pub ma_type: Option<MovingAverageCrossProbabilityMaType>,
     pub smoothing_window: Option<usize>,
@@ -281,7 +254,9 @@ pub enum MovingAverageCrossProbabilityError {
     InvalidFastLength { fast_length: usize },
     #[error("moving_average_cross_probability: Invalid resolution: {resolution}")]
     InvalidResolution { resolution: usize },
-    #[error("moving_average_cross_probability: Invalid length order: fast_length={fast_length}, slow_length={slow_length}")]
+    #[error(
+        "moving_average_cross_probability: Invalid length order: fast_length={fast_length}, slow_length={slow_length}"
+    )]
     InvalidLengthOrder {
         fast_length: usize,
         slow_length: usize,
@@ -536,11 +511,7 @@ where
         }
     }
 
-    if first {
-        lo + 1
-    } else {
-        resolution - hi
-    }
+    if first { lo + 1 } else { resolution - hi }
 }
 
 #[inline(always)]
@@ -764,11 +735,7 @@ fn moving_average_cross_probability_compute_into(
         out_fast_ma[idx] = fast_ma;
 
         let direction = if slow_ma.is_finite() && fast_ma.is_finite() {
-            if fast_ma > slow_ma {
-                -1.0
-            } else {
-                1.0
-            }
+            if fast_ma > slow_ma { -1.0 } else { 1.0 }
         } else {
             f64::NAN
         };
@@ -863,11 +830,7 @@ fn moving_average_cross_probability_ema_finite_compute_into(
         out_fast_ma[idx] = fast_ma;
 
         let direction = if slow_ma.is_finite() && fast_ma.is_finite() {
-            if fast_ma > slow_ma {
-                -1.0
-            } else {
-                1.0
-            }
+            if fast_ma > slow_ma { -1.0 } else { 1.0 }
         } else {
             f64::NAN
         };
@@ -977,7 +940,6 @@ pub fn moving_average_cross_probability_with_kernel(
     })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn moving_average_cross_probability_into(
     input: &MovingAverageCrossProbabilityInput,
     out_value: &mut [f64],
@@ -1090,11 +1052,7 @@ impl MovingAverageCrossProbabilityStream {
         let current_hma = self.hma_stream.update(value).unwrap_or(f64::NAN);
         let current_std = self.stddev_stream.update(value).unwrap_or(f64::NAN);
         let direction = if slow_ma.is_finite() && fast_ma.is_finite() {
-            if fast_ma > slow_ma {
-                -1.0
-            } else {
-                1.0
-            }
+            if fast_ma > slow_ma { -1.0 } else { 1.0 }
         } else {
             f64::NAN
         };
@@ -1344,7 +1302,7 @@ pub fn moving_average_cross_probability_batch_with_kernel(
         other => {
             return Err(MovingAverageCrossProbabilityError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
     moving_average_cross_probability_batch_inner(data, range, batch_kernel.is_batch())
@@ -1492,7 +1450,7 @@ pub fn moving_average_cross_probability_batch_into_slice(
         other => {
             return Err(MovingAverageCrossProbabilityError::InvalidKernelForBatch(
                 other,
-            ))
+            ));
         }
     };
     moving_average_cross_probability_batch_inner_into(
@@ -1599,602 +1557,6 @@ fn moving_average_cross_probability_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "moving_average_cross_probability")]
-#[pyo3(signature = (
-    data,
-    ma_type="ema",
-    smoothing_window=7,
-    slow_length=30,
-    fast_length=14,
-    resolution=50,
-    kernel=None
-))]
-pub fn moving_average_cross_probability_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    ma_type: &str,
-    smoothing_window: usize,
-    slow_length: usize,
-    fast_length: usize,
-    resolution: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let input = MovingAverageCrossProbabilityInput::from_slice(
-        data,
-        MovingAverageCrossProbabilityParams {
-            ma_type: Some(
-                MovingAverageCrossProbabilityMaType::from_str(ma_type)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            ),
-            smoothing_window: Some(smoothing_window),
-            slow_length: Some(slow_length),
-            fast_length: Some(fast_length),
-            resolution: Some(resolution),
-        },
-    );
-    let kernel = validate_kernel(kernel, false)?;
-    let out = py
-        .allow_threads(|| moving_average_cross_probability_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let dict = PyDict::new(py);
-    dict.set_item("value", out.value.into_pyarray(py))?;
-    dict.set_item("slow_ma", out.slow_ma.into_pyarray(py))?;
-    dict.set_item("fast_ma", out.fast_ma.into_pyarray(py))?;
-    dict.set_item("forecast", out.forecast.into_pyarray(py))?;
-    dict.set_item("upper", out.upper.into_pyarray(py))?;
-    dict.set_item("lower", out.lower.into_pyarray(py))?;
-    dict.set_item("direction", out.direction.into_pyarray(py))?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "MovingAverageCrossProbabilityStream")]
-pub struct MovingAverageCrossProbabilityStreamPy {
-    stream: MovingAverageCrossProbabilityStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl MovingAverageCrossProbabilityStreamPy {
-    #[new]
-    #[pyo3(signature = (
-        ma_type="ema",
-        smoothing_window=7,
-        slow_length=30,
-        fast_length=14,
-        resolution=50
-    ))]
-    fn new(
-        ma_type: &str,
-        smoothing_window: usize,
-        slow_length: usize,
-        fast_length: usize,
-        resolution: usize,
-    ) -> PyResult<Self> {
-        let stream =
-            MovingAverageCrossProbabilityStream::try_new(MovingAverageCrossProbabilityParams {
-                ma_type: Some(
-                    MovingAverageCrossProbabilityMaType::from_str(ma_type)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                ),
-                smoothing_window: Some(smoothing_window),
-                slow_length: Some(slow_length),
-                fast_length: Some(fast_length),
-                resolution: Some(resolution),
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> (f64, f64, f64, f64, f64, f64, f64) {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "moving_average_cross_probability_batch")]
-#[pyo3(signature = (
-    data,
-    smoothing_window_range=(7,7,0),
-    slow_length_range=(30,30,0),
-    fast_length_range=(14,14,0),
-    resolution_range=(50,50,0),
-    ma_type="ema",
-    kernel=None
-))]
-pub fn moving_average_cross_probability_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    smoothing_window_range: (usize, usize, usize),
-    slow_length_range: (usize, usize, usize),
-    fast_length_range: (usize, usize, usize),
-    resolution_range: (usize, usize, usize),
-    ma_type: &str,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let data = data.as_slice()?;
-    let sweep = MovingAverageCrossProbabilityBatchRange {
-        smoothing_window: smoothing_window_range,
-        slow_length: slow_length_range,
-        fast_length: fast_length_range,
-        resolution: resolution_range,
-        ma_type: MovingAverageCrossProbabilityMaType::from_str(ma_type)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-    };
-    let combos = moving_average_cross_probability_expand_grid(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_value = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slow_ma = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_fast_ma = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_forecast = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_upper = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_lower = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_direction = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let value_slice = unsafe { out_value.as_slice_mut()? };
-    let slow_slice = unsafe { out_slow_ma.as_slice_mut()? };
-    let fast_slice = unsafe { out_fast_ma.as_slice_mut()? };
-    let forecast_slice = unsafe { out_forecast.as_slice_mut()? };
-    let upper_slice = unsafe { out_upper.as_slice_mut()? };
-    let lower_slice = unsafe { out_lower.as_slice_mut()? };
-    let direction_slice = unsafe { out_direction.as_slice_mut()? };
-    let kernel = validate_kernel(kernel, true)?;
-
-    py.allow_threads(|| {
-        let batch_kernel = match kernel {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        moving_average_cross_probability_batch_inner_into(
-            data,
-            &sweep,
-            batch_kernel.is_batch(),
-            value_slice,
-            slow_slice,
-            fast_slice,
-            forecast_slice,
-            upper_slice,
-            lower_slice,
-            direction_slice,
-        )
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("value", out_value.reshape((rows, cols))?)?;
-    dict.set_item("slow_ma", out_slow_ma.reshape((rows, cols))?)?;
-    dict.set_item("fast_ma", out_fast_ma.reshape((rows, cols))?)?;
-    dict.set_item("forecast", out_forecast.reshape((rows, cols))?)?;
-    dict.set_item("upper", out_upper.reshape((rows, cols))?)?;
-    dict.set_item("lower", out_lower.reshape((rows, cols))?)?;
-    dict.set_item("direction", out_direction.reshape((rows, cols))?)?;
-    dict.set_item(
-        "smoothing_windows",
-        combos
-            .iter()
-            .map(|combo| combo.smoothing_window.unwrap_or(DEFAULT_SMOOTHING_WINDOW))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "slow_lengths",
-        combos
-            .iter()
-            .map(|combo| combo.slow_length.unwrap_or(DEFAULT_SLOW_LENGTH))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "fast_lengths",
-        combos
-            .iter()
-            .map(|combo| combo.fast_length.unwrap_or(DEFAULT_FAST_LENGTH))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "resolutions",
-        combos
-            .iter()
-            .map(|combo| combo.resolution.unwrap_or(DEFAULT_RESOLUTION))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_moving_average_cross_probability_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(moving_average_cross_probability_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        moving_average_cross_probability_batch_py,
-        m
-    )?)?;
-    m.add_class::<MovingAverageCrossProbabilityStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MovingAverageCrossProbabilityJsOutput {
-    pub value: Vec<f64>,
-    pub slow_ma: Vec<f64>,
-    pub fast_ma: Vec<f64>,
-    pub forecast: Vec<f64>,
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub direction: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn js_vec3_to_usize(name: &str, values: &[f64]) -> Result<(usize, usize, usize), JsValue> {
-    if values.len() != 3 {
-        return Err(JsValue::from_str(&format!(
-            "Invalid config: {name} must have exactly 3 elements [start, end, step]"
-        )));
-    }
-    let mut out = [0usize; 3];
-    for (idx, value) in values.iter().enumerate() {
-        if !value.is_finite() || *value < 0.0 || value.fract() != 0.0 {
-            return Err(JsValue::from_str(&format!(
-                "Invalid config: {name} values must be non-negative integers"
-            )));
-        }
-        out[idx] = *value as usize;
-    }
-    Ok((out[0], out[1], out[2]))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "moving_average_cross_probability_js")]
-pub fn moving_average_cross_probability_js(
-    data: &[f64],
-    ma_type: String,
-    smoothing_window: usize,
-    slow_length: usize,
-    fast_length: usize,
-    resolution: usize,
-) -> Result<JsValue, JsValue> {
-    let input = MovingAverageCrossProbabilityInput::from_slice(
-        data,
-        MovingAverageCrossProbabilityParams {
-            ma_type: Some(
-                MovingAverageCrossProbabilityMaType::from_str(&ma_type)
-                    .map_err(|e| JsValue::from_str(&e))?,
-            ),
-            smoothing_window: Some(smoothing_window),
-            slow_length: Some(slow_length),
-            fast_length: Some(fast_length),
-            resolution: Some(resolution),
-        },
-    );
-    let out = moving_average_cross_probability_with_kernel(&input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&MovingAverageCrossProbabilityJsOutput {
-        value: out.value,
-        slow_ma: out.slow_ma,
-        fast_ma: out.fast_ma,
-        forecast: out.forecast,
-        upper: out.upper,
-        lower: out.lower,
-        direction: out.direction,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MovingAverageCrossProbabilityBatchConfig {
-    pub smoothing_window_range: Vec<f64>,
-    pub slow_length_range: Vec<f64>,
-    pub fast_length_range: Vec<f64>,
-    pub resolution_range: Vec<f64>,
-    pub ma_type: Option<String>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MovingAverageCrossProbabilityBatchJsOutput {
-    pub value: Vec<f64>,
-    pub slow_ma: Vec<f64>,
-    pub fast_ma: Vec<f64>,
-    pub forecast: Vec<f64>,
-    pub upper: Vec<f64>,
-    pub lower: Vec<f64>,
-    pub direction: Vec<f64>,
-    pub smoothing_windows: Vec<usize>,
-    pub slow_lengths: Vec<usize>,
-    pub fast_lengths: Vec<usize>,
-    pub resolutions: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "moving_average_cross_probability_batch_js")]
-pub fn moving_average_cross_probability_batch_js(
-    data: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: MovingAverageCrossProbabilityBatchConfig =
-        serde_wasm_bindgen::from_value(config)
-            .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let ma_type = config
-        .ma_type
-        .as_deref()
-        .map(MovingAverageCrossProbabilityMaType::from_str)
-        .transpose()
-        .map_err(|e| JsValue::from_str(&e))?
-        .unwrap_or(DEFAULT_MA_TYPE);
-    let sweep = MovingAverageCrossProbabilityBatchRange {
-        smoothing_window: js_vec3_to_usize(
-            "smoothing_window_range",
-            &config.smoothing_window_range,
-        )?,
-        slow_length: js_vec3_to_usize("slow_length_range", &config.slow_length_range)?,
-        fast_length: js_vec3_to_usize("fast_length_range", &config.fast_length_range)?,
-        resolution: js_vec3_to_usize("resolution_range", &config.resolution_range)?,
-        ma_type,
-    };
-    let out = moving_average_cross_probability_batch_with_kernel(data, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&MovingAverageCrossProbabilityBatchJsOutput {
-        value: out.value,
-        slow_ma: out.slow_ma,
-        fast_ma: out.fast_ma,
-        forecast: out.forecast,
-        upper: out.upper,
-        lower: out.lower,
-        direction: out.direction,
-        smoothing_windows: out
-            .combos
-            .iter()
-            .map(|combo| combo.smoothing_window.unwrap_or(DEFAULT_SMOOTHING_WINDOW))
-            .collect(),
-        slow_lengths: out
-            .combos
-            .iter()
-            .map(|combo| combo.slow_length.unwrap_or(DEFAULT_SLOW_LENGTH))
-            .collect(),
-        fast_lengths: out
-            .combos
-            .iter()
-            .map(|combo| combo.fast_length.unwrap_or(DEFAULT_FAST_LENGTH))
-            .collect(),
-        resolutions: out
-            .combos
-            .iter()
-            .map(|combo| combo.resolution.unwrap_or(DEFAULT_RESOLUTION))
-            .collect(),
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn moving_average_cross_probability_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn moving_average_cross_probability_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn moving_average_cross_probability_into(
-    in_ptr: *const f64,
-    out_value_ptr: *mut f64,
-    out_slow_ma_ptr: *mut f64,
-    out_fast_ma_ptr: *mut f64,
-    out_forecast_ptr: *mut f64,
-    out_upper_ptr: *mut f64,
-    out_lower_ptr: *mut f64,
-    out_direction_ptr: *mut f64,
-    len: usize,
-    ma_type: String,
-    smoothing_window: usize,
-    slow_length: usize,
-    fast_length: usize,
-    resolution: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null()
-        || out_value_ptr.is_null()
-        || out_slow_ma_ptr.is_null()
-        || out_fast_ma_ptr.is_null()
-        || out_forecast_ptr.is_null()
-        || out_upper_ptr.is_null()
-        || out_lower_ptr.is_null()
-        || out_direction_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to moving_average_cross_probability_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let out_value = std::slice::from_raw_parts_mut(out_value_ptr, len);
-        let out_slow_ma = std::slice::from_raw_parts_mut(out_slow_ma_ptr, len);
-        let out_fast_ma = std::slice::from_raw_parts_mut(out_fast_ma_ptr, len);
-        let out_forecast = std::slice::from_raw_parts_mut(out_forecast_ptr, len);
-        let out_upper = std::slice::from_raw_parts_mut(out_upper_ptr, len);
-        let out_lower = std::slice::from_raw_parts_mut(out_lower_ptr, len);
-        let out_direction = std::slice::from_raw_parts_mut(out_direction_ptr, len);
-        let input = MovingAverageCrossProbabilityInput::from_slice(
-            data,
-            MovingAverageCrossProbabilityParams {
-                ma_type: Some(
-                    MovingAverageCrossProbabilityMaType::from_str(&ma_type)
-                        .map_err(|e| JsValue::from_str(&e))?,
-                ),
-                smoothing_window: Some(smoothing_window),
-                slow_length: Some(slow_length),
-                fast_length: Some(fast_length),
-                resolution: Some(resolution),
-            },
-        );
-        moving_average_cross_probability_into_slice(
-            out_value,
-            out_slow_ma,
-            out_fast_ma,
-            out_forecast,
-            out_upper,
-            out_lower,
-            out_direction,
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn moving_average_cross_probability_batch_into(
-    in_ptr: *const f64,
-    out_value_ptr: *mut f64,
-    out_slow_ma_ptr: *mut f64,
-    out_fast_ma_ptr: *mut f64,
-    out_forecast_ptr: *mut f64,
-    out_upper_ptr: *mut f64,
-    out_lower_ptr: *mut f64,
-    out_direction_ptr: *mut f64,
-    len: usize,
-    smoothing_window_start: usize,
-    smoothing_window_end: usize,
-    smoothing_window_step: usize,
-    slow_length_start: usize,
-    slow_length_end: usize,
-    slow_length_step: usize,
-    fast_length_start: usize,
-    fast_length_end: usize,
-    fast_length_step: usize,
-    resolution_start: usize,
-    resolution_end: usize,
-    resolution_step: usize,
-    ma_type: String,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null()
-        || out_value_ptr.is_null()
-        || out_slow_ma_ptr.is_null()
-        || out_fast_ma_ptr.is_null()
-        || out_forecast_ptr.is_null()
-        || out_upper_ptr.is_null()
-        || out_lower_ptr.is_null()
-        || out_direction_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to moving_average_cross_probability_batch_into",
-        ));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = MovingAverageCrossProbabilityBatchRange {
-            smoothing_window: (
-                smoothing_window_start,
-                smoothing_window_end,
-                smoothing_window_step,
-            ),
-            slow_length: (slow_length_start, slow_length_end, slow_length_step),
-            fast_length: (fast_length_start, fast_length_end, fast_length_step),
-            resolution: (resolution_start, resolution_end, resolution_step),
-            ma_type: MovingAverageCrossProbabilityMaType::from_str(&ma_type)
-                .map_err(|e| JsValue::from_str(&e))?,
-        };
-        let combos = moving_average_cross_probability_expand_grid(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows.checked_mul(len).ok_or_else(|| {
-            JsValue::from_str("rows*cols overflow in moving_average_cross_probability_batch_into")
-        })?;
-        let out_value = std::slice::from_raw_parts_mut(out_value_ptr, total);
-        let out_slow_ma = std::slice::from_raw_parts_mut(out_slow_ma_ptr, total);
-        let out_fast_ma = std::slice::from_raw_parts_mut(out_fast_ma_ptr, total);
-        let out_forecast = std::slice::from_raw_parts_mut(out_forecast_ptr, total);
-        let out_upper = std::slice::from_raw_parts_mut(out_upper_ptr, total);
-        let out_lower = std::slice::from_raw_parts_mut(out_lower_ptr, total);
-        let out_direction = std::slice::from_raw_parts_mut(out_direction_ptr, total);
-        moving_average_cross_probability_batch_into_slice(
-            out_value,
-            out_slow_ma,
-            out_fast_ma,
-            out_forecast,
-            out_upper,
-            out_lower,
-            out_direction,
-            data,
-            &sweep,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn moving_average_cross_probability_output_into_js(
-    data: &[f64],
-    ma_type: String,
-    smoothing_window: usize,
-    slow_length: usize,
-    fast_length: usize,
-    resolution: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = moving_average_cross_probability_js(
-        data,
-        ma_type,
-        smoothing_window,
-        slow_length,
-        fast_length,
-        resolution,
-    )?;
-    crate::write_wasm_object_f64_outputs(
-        "moving_average_cross_probability_output_into_js",
-        &value,
-        out,
-    )
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn moving_average_cross_probability_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = moving_average_cross_probability_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "moving_average_cross_probability_batch_output_into_js",
-        &value,
-        out,
-    )
 }
 
 #[cfg(test)]

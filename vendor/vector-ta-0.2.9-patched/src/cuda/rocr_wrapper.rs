@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::rocr::RocrBatchRange;
@@ -6,14 +6,14 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -89,11 +89,6 @@ impl CudaRocr {
         let sm_count = device.get_attribute(DeviceAttribute::MultiprocessorCount)? as u32;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/rocr_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("rocr_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -621,7 +616,13 @@ impl CudaRocr {
             {
                 eprintln!(
                     "[DEBUG] ROCR many-series kernel: rocr_many_series_one_param_f32, block=({},{}), grid=({},{}), cols={}, rows={}, period={}",
-                    block_x, block_y, grid_x.max(1), grid_y.max(1), cols, rows, period
+                    block_x,
+                    block_y,
+                    grid_x.max(1),
+                    grid_y.max(1),
+                    cols,
+                    rows,
+                    period
                 );
             }
         }

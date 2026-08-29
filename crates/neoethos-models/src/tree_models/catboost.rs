@@ -3,45 +3,50 @@ use catboost_rust as catboost;
 
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-// `std::io::Write` and many of the `super::common::*` imports below are only
-// exercised when `feature = "catboost"` is enabled. When the feature is off
-// (e.g. the partial-feature builds the v0.4.1 audit added under Batch 8) the
-// unused-import lint fires; suppress it here because the imports are correct
-// for the FFI-active build.
 #[cfg(feature = "catboost")]
 use std::io::Write;
 use std::path::Path;
+#[cfg(feature = "catboost")]
 use std::path::PathBuf;
 
-use crate::base::{ExpertModel, feature_columns_from_dataframe};
-use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
+use crate::base::ExpertModel;
+#[cfg(feature = "catboost")]
+use crate::base::feature_columns_from_frame;
+use crate::common::CudaDevicePolicy;
+#[cfg(feature = "catboost")]
+use crate::common::{ResolvedCudaDevicePolicy, resolve_cuda_device_policy};
+#[cfg(feature = "catboost")]
+use crate::runtime::artifacts::RuntimeArtifactMetadata;
+use crate::runtime::artifacts::TrainingSummaryMetadata;
+#[cfg(feature = "catboost")]
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
-#[allow(unused_imports)] // some entries are only used when feature = "catboost" is on
+use super::common::build_tree_runtime_predictions;
+#[cfg(feature = "catboost")]
 use super::common::{
-    CATBOOST_MODEL_FILE_NAME, TreeLocalFallbackArtifact, atomic_write,
-    build_tree_local_fallback_artifact, build_tree_runtime_predictions,
-    calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
-    ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
-    read_runtime_metadata, read_tree_json_artifact, remap_labels_to_tree_targets,
-    reshape_three_class_probabilities, tree_artifact_paths, tree_runtime_metadata,
-    validate_tree_local_fallback_artifact, write_runtime_metadata, write_tree_json_artifact,
+    CATBOOST_MODEL_FILE_NAME, atomic_write, calibrate_three_class_probabilities,
+    default_training_summary, ensure_feature_columns_match, feature_frame_to_tree_f32_row_major,
+    normalize_three_class_probabilities, read_runtime_metadata, read_tree_json_artifact,
+    remap_labels_to_tree_targets, tree_artifact_paths, tree_runtime_metadata,
+    write_runtime_metadata, write_tree_json_artifact,
 };
 use super::config::*;
 
+#[cfg(feature = "catboost")]
 const CATBOOST_RUNTIME_FILE_NAME: &str = "runtime.json";
-const CATBOOST_LOCAL_FALLBACK_FILE_NAME: &str = "catboost_local_fallback.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CatBoostRuntimeArtifact {
     executable: String,
     task_type: String,
-    device_preference: String,
-    gpu_available: bool,
+    requested_device_policy: String,
+    cuda_ordinal: Option<usize>,
+    visible_nvidia_devices: usize,
     gpu_only: bool,
     model_dimensions: usize,
     feature_count: usize,
@@ -61,11 +66,12 @@ struct CatBoostRuntimeArtifact {
 
 impl CatBoostRuntimeArtifact {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "catboost")]
     fn new(
         executable: Option<&Path>,
-        task_type: Option<&str>,
-        device_preference: &str,
-        gpu_available: bool,
+        resolved_device: ResolvedCudaDevicePolicy,
+        requested_device_policy: &str,
+        visible_nvidia_devices: usize,
         gpu_only: bool,
         model_dimensions: usize,
         feature_count: usize,
@@ -84,14 +90,16 @@ impl CatBoostRuntimeArtifact {
         let executable = executable
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        let task_type = task_type
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        let (task_type, cuda_ordinal) = match resolved_device {
+            ResolvedCudaDevicePolicy::Cpu => ("CPU".to_string(), None),
+            ResolvedCudaDevicePolicy::Cuda { ordinal } => ("GPU".to_string(), Some(ordinal)),
+        };
         Self {
             executable,
             task_type,
-            device_preference: device_preference.to_string(),
-            gpu_available,
+            requested_device_policy: requested_device_policy.to_string(),
+            cuda_ordinal,
+            visible_nvidia_devices,
             gpu_only,
             model_dimensions,
             feature_count,
@@ -118,17 +126,65 @@ fn validate_runtime_artifact(
     if artifact.executable.trim().is_empty() {
         bail!("CatBoost runtime artifact executable must not be blank");
     }
-    if !matches!(artifact.task_type.as_str(), "CPU" | "GPU" | "unknown") {
+    if !matches!(artifact.task_type.as_str(), "CPU" | "GPU") {
         bail!(
-            "CatBoost runtime artifact task_type must be CPU, GPU, or unknown, got {}",
+            "CatBoost runtime artifact task_type must be CPU or GPU, got {}",
             artifact.task_type
         );
     }
-    if !matches!(artifact.device_preference.as_str(), "cpu" | "gpu" | "auto") {
-        bail!(
-            "CatBoost runtime artifact device_preference must be cpu, gpu, or auto, got {}",
-            artifact.device_preference
-        );
+    let requested_device = parse_tree_cuda_device_policy(&artifact.requested_device_policy)
+        .with_context(|| {
+            format!(
+                "CatBoost runtime artifact has invalid requested device policy `{}`",
+                artifact.requested_device_policy
+            )
+        })?;
+    match artifact.task_type.as_str() {
+        "CPU" => {
+            if artifact.cuda_ordinal.is_some() {
+                bail!(
+                    "CatBoost CPU runtime artifact must not record a CUDA ordinal, got {:?}",
+                    artifact.cuda_ordinal
+                );
+            }
+            if matches!(requested_device, CudaDevicePolicy::Gpu { .. }) {
+                bail!(
+                    "CatBoost runtime artifact requested explicit CUDA but recorded CPU execution"
+                );
+            }
+            if matches!(requested_device, CudaDevicePolicy::Auto)
+                && artifact.visible_nvidia_devices > 0
+            {
+                bail!(
+                    "CatBoost Auto runtime artifact recorded CPU despite {} visible NVIDIA device(s)",
+                    artifact.visible_nvidia_devices
+                );
+            }
+        }
+        "GPU" => {
+            let cuda_ordinal = artifact
+                .cuda_ordinal
+                .context("CatBoost GPU runtime artifact must record the exact CUDA ordinal")?;
+            if artifact.visible_nvidia_devices == 0
+                || cuda_ordinal >= artifact.visible_nvidia_devices
+            {
+                bail!(
+                    "CatBoost runtime artifact CUDA ordinal {cuda_ordinal} is inconsistent with {} visible NVIDIA device(s)",
+                    artifact.visible_nvidia_devices
+                );
+            }
+            if matches!(requested_device, CudaDevicePolicy::Cpu) {
+                bail!("CatBoost runtime artifact requested CPU but recorded GPU execution");
+            }
+            if let CudaDevicePolicy::Gpu { ordinal } = requested_device
+                && ordinal != cuda_ordinal
+            {
+                bail!(
+                    "CatBoost runtime artifact CUDA ordinal mismatch: requested {ordinal}, recorded {cuda_ordinal}"
+                );
+            }
+        }
+        _ => unreachable!("validated CatBoost task type above"),
     }
     if artifact.feature_count == 0 {
         bail!("CatBoost runtime artifact requires at least one feature");
@@ -208,6 +264,42 @@ fn validate_runtime_artifact(
 }
 
 #[cfg(feature = "catboost")]
+fn validate_loaded_runtime_device_identity(artifact: &CatBoostRuntimeArtifact) -> Result<()> {
+    let requested = parse_tree_cuda_device_policy(&artifact.requested_device_policy)?;
+    let visible_nvidia_devices = nvidia_gpu_count();
+    let resolved =
+        resolve_cuda_device_policy(&artifact.requested_device_policy, visible_nvidia_devices)?;
+    let recorded = match artifact.task_type.as_str() {
+        "CPU" => ResolvedCudaDevicePolicy::Cpu,
+        "GPU" => ResolvedCudaDevicePolicy::Cuda {
+            ordinal: artifact
+                .cuda_ordinal
+                .context("CatBoost CUDA artifact is missing its recorded ordinal")?,
+        },
+        other => bail!("CatBoost artifact has unsupported recorded task type `{other}`"),
+    };
+    if artifact.gpu_only && matches!(resolved, ResolvedCudaDevicePolicy::Cpu) {
+        bail!(
+            "CatBoost gpu-only artifact cannot relocate to CPU because no NVIDIA device is visible"
+        );
+    }
+    let auto_cpu_relocation = matches!(requested, CudaDevicePolicy::Auto)
+        && matches!(recorded, ResolvedCudaDevicePolicy::Cuda { .. })
+        && matches!(resolved, ResolvedCudaDevicePolicy::Cpu)
+        && visible_nvidia_devices == 0
+        && !artifact.gpu_only;
+    if !auto_cpu_relocation && recorded != resolved {
+        bail!(
+            "CatBoost runtime device drift on load: recorded {:?}, resolved {:?} from policy `{}`",
+            recorded,
+            resolved,
+            artifact.requested_device_policy
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "catboost")]
 fn validate_training_frame(flat_x: &[f32], rows: usize, cols: usize, labels: &[i32]) -> Result<()> {
     if rows == 0 || cols == 0 {
         bail!("CatBoost training requires a non-empty feature matrix");
@@ -243,15 +335,10 @@ fn validate_training_frame(flat_x: &[f32], rows: usize, cols: usize, labels: &[i
 pub struct CatBoostExpert {
     pub idx: usize,
     pub config: TreeModelConfig,
-    gpu_only_disabled: bool,
-    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
     feature_columns: Vec<String>,
-    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
     training_summary: Option<TrainingSummaryMetadata>,
-    local_fallback: Option<TreeLocalFallbackArtifact>,
-    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
+    #[cfg(feature = "catboost")]
     model_bytes: Option<Vec<u8>>,
-    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
     runtime_artifact: Option<CatBoostRuntimeArtifact>,
     #[cfg(feature = "catboost")]
     model: Option<catboost::Model>,
@@ -261,7 +348,11 @@ pub struct CatBoostExpert {
 
 impl CatBoostExpert {
     pub fn new(idx: usize) -> Self {
-        let params = Self::default_params();
+        Self::new_with_params(idx, Self::default_params())
+    }
+
+    pub fn new_with_params(idx: usize, params: HashMap<String, ParamValue>) -> Self {
+        let requested_device_policy = tree_device_policy_from_params(&params, "catboost");
         let device_pref =
             device_preference_from_params(&params, tree_device_preference_for("catboost"));
         let gpu_only = gpu_only_from_params(&params, gpu_only_mode_for("catboost"));
@@ -271,14 +362,14 @@ impl CatBoostExpert {
             config: TreeModelConfig {
                 idx,
                 params,
+                requested_device_policy,
                 device_pref,
                 gpu_only,
                 cpu_threads: Some(cpu_threads),
             },
-            gpu_only_disabled: false,
             feature_columns: Vec::new(),
             training_summary: None,
-            local_fallback: None,
+            #[cfg(feature = "catboost")]
             model_bytes: None,
             runtime_artifact: None,
             model: None,
@@ -300,8 +391,9 @@ impl CatBoostExpert {
         params
     }
 
-    fn probability_temperature(&self) -> f32 {
-        let configured = param_float(&self.config.params, "probability_temperature", 1.0) as f32;
+    #[cfg(feature = "catboost")]
+    fn probability_temperature(&self) -> f64 {
+        let configured = param_float(&self.config.params, "probability_temperature", 1.0);
         if configured.is_finite() && configured > 0.0 {
             configured
         } else {
@@ -309,6 +401,7 @@ impl CatBoostExpert {
         }
     }
 
+    #[cfg(feature = "catboost")]
     fn stored_training_summary(&self) -> TrainingSummaryMetadata {
         self.training_summary
             .clone()
@@ -334,11 +427,8 @@ impl CatBoostExpert {
                 summary.val_rows
             );
         }
-        if self.model.is_none() && self.local_fallback.is_none() {
-            bail!("CatBoost runtime state has neither a native model nor a local surrogate");
-        }
-        if let Some(fallback) = self.local_fallback.as_ref() {
-            validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+        if self.model.is_none() {
+            bail!("CatBoost runtime state is missing its native model");
         }
         if let Some(runtime_artifact) = self.runtime_artifact.as_ref() {
             validate_runtime_artifact(runtime_artifact, self.feature_columns.len())?;
@@ -346,35 +436,12 @@ impl CatBoostExpert {
         Ok(())
     }
 
+    #[cfg(feature = "catboost")]
     fn runtime_artifact_path(path: &Path) -> PathBuf {
         path.join(CATBOOST_RUNTIME_FILE_NAME)
     }
 
-    fn local_fallback_path(path: &Path) -> std::path::PathBuf {
-        path.join(CATBOOST_LOCAL_FALLBACK_FILE_NAME)
-    }
-
-    fn persist_local_fallback(&self, path: &Path) -> Result<()> {
-        if let Some(artifact) = self.local_fallback.as_ref() {
-            validate_tree_local_fallback_artifact(artifact, &self.feature_columns)?;
-            write_tree_json_artifact(
-                &Self::local_fallback_path(path),
-                artifact,
-                "CatBoost local fallback",
-            )?;
-        }
-        Ok(())
-    }
-
-    fn read_local_fallback(path: &Path) -> Result<Option<TreeLocalFallbackArtifact>> {
-        let fallback_path = Self::local_fallback_path(path);
-        if !fallback_path.exists() {
-            return Ok(None);
-        }
-        let artifact = read_tree_json_artifact(&fallback_path, "CatBoost local fallback")?;
-        Ok(Some(artifact))
-    }
-
+    #[cfg(feature = "catboost")]
     fn read_runtime_artifact(path: &Path) -> Result<Option<CatBoostRuntimeArtifact>> {
         let runtime_path = Self::runtime_artifact_path(path);
         if !runtime_path.exists() {
@@ -384,20 +451,27 @@ impl CatBoostExpert {
         Ok(Some(artifact))
     }
 
-    fn effective_task_type(&self) -> &'static str {
-        let wants_gpu = matches!(self.config.device_pref, DevicePreference::Gpu)
-            || (matches!(self.config.device_pref, DevicePreference::Auto) && gpu_count() > 0);
-        if wants_gpu && gpu_count() > 0 {
-            "GPU"
-        } else {
-            "CPU"
-        }
+    #[cfg(feature = "catboost")]
+    fn resolve_cuda_device(&self) -> Result<(ResolvedCudaDevicePolicy, usize)> {
+        let visible_nvidia_devices = nvidia_gpu_count();
+        let resolved_device = resolve_cuda_device_policy(
+            &self.config.requested_device_policy,
+            visible_nvidia_devices,
+        )?;
+        Ok((resolved_device, visible_nvidia_devices))
     }
 
+    #[cfg(feature = "catboost")]
+    fn validate_runtime_device_for_load(&self, artifact: &CatBoostRuntimeArtifact) -> Result<()> {
+        validate_loaded_runtime_device_identity(artifact)
+    }
+
+    #[cfg(feature = "catboost")]
     fn build_runtime_artifact(
         &self,
         executable: Option<&Path>,
-        task_type: Option<&str>,
+        resolved_device: ResolvedCudaDevicePolicy,
+        visible_nvidia_devices: usize,
         model_dimensions: usize,
         feature_count: usize,
     ) -> CatBoostRuntimeArtifact {
@@ -414,13 +488,12 @@ impl CatBoostExpert {
             .unwrap_or_else(cpu_threads_hint)
             .max(1);
         let loss_function = param_string(&self.config.params, "loss_function", "MultiClass");
-        let device_preference = format!("{:?}", self.config.device_pref).to_lowercase();
 
         CatBoostRuntimeArtifact::new(
             executable,
-            task_type.or(Some(self.effective_task_type())),
-            &device_preference,
-            gpu_count() > 0,
+            resolved_device,
+            &self.config.requested_device_policy,
+            visible_nvidia_devices,
             self.config.gpu_only,
             model_dimensions,
             feature_count,
@@ -438,18 +511,17 @@ impl CatBoostExpert {
         )
     }
 
-    fn build_surrogate_runtime_artifact(&self, feature_count: usize) -> CatBoostRuntimeArtifact {
-        self.build_runtime_artifact(None, None, 3, feature_count)
-    }
-
-    fn apply_runtime_artifact(&mut self, artifact: &CatBoostRuntimeArtifact) {
+    #[cfg(feature = "catboost")]
+    fn apply_runtime_artifact(&mut self, artifact: &CatBoostRuntimeArtifact) -> Result<()> {
         self.config.gpu_only = artifact.gpu_only;
         self.config.cpu_threads = Some(artifact.thread_count.max(1));
-        self.config.device_pref = match artifact.device_preference.as_str() {
-            "gpu" => DevicePreference::Gpu,
-            "cpu" => DevicePreference::Cpu,
-            _ => DevicePreference::Auto,
-        };
+        self.config.requested_device_policy = artifact.requested_device_policy.clone();
+        self.config.device_pref =
+            match parse_tree_cuda_device_policy(&artifact.requested_device_policy)? {
+                CudaDevicePolicy::Gpu { .. } => DevicePreference::Gpu,
+                CudaDevicePolicy::Cpu => DevicePreference::Cpu,
+                CudaDevicePolicy::Auto => DevicePreference::Auto,
+            };
         self.config.params.insert(
             "iterations".into(),
             ParamValue::Int(artifact.iterations.max(1)),
@@ -479,13 +551,14 @@ impl CatBoostExpert {
         );
         self.feature_columns = artifact.feature_columns.clone();
         self.training_summary = Some(artifact.training_summary.clone());
+        Ok(())
     }
 
+    #[cfg(feature = "catboost")]
     fn resolve_runtime_metadata(
         path: &Path,
         metadata_path: &Path,
         runtime_artifact: Option<&CatBoostRuntimeArtifact>,
-        local_fallback: Option<&TreeLocalFallbackArtifact>,
     ) -> Result<RuntimeArtifactMetadata> {
         if metadata_path.exists() {
             let metadata = read_runtime_metadata(metadata_path)?;
@@ -507,14 +580,9 @@ impl CatBoostExpert {
                 artifact.feature_columns.clone(),
                 artifact.training_summary.clone(),
             )
-        } else if let Some(fallback) = local_fallback {
-            (
-                fallback.feature_columns.clone(),
-                fallback.training_summary.clone(),
-            )
         } else {
             bail!(
-                "CatBoost metadata sidecar missing and no runtime/local artifact is available at {}",
+                "CatBoost metadata sidecar and runtime artifact are missing at {}",
                 path.display()
             );
         };
@@ -586,8 +654,8 @@ impl CatBoostExpert {
     fn write_training_files(
         &self,
         dir: &Path,
-        x: &DataFrame,
-        y: &Series,
+        x: &FeatureFrame,
+        y: &[i32],
     ) -> Result<(PathBuf, PathBuf, PathBuf)> {
         let learn_path = dir.join("learn.tsv");
         let cd_path = dir.join("learn.cd");
@@ -597,7 +665,7 @@ impl CatBoostExpert {
             .into_iter()
             .map(|value| value as i32)
             .collect::<Vec<_>>();
-        let (flat_x, rows, cols) = dataframe_to_row_major_vec(x)?;
+        let (flat_x, rows, cols) = feature_frame_to_tree_f32_row_major(x)?;
         validate_training_frame(&flat_x, rows, cols, &labels)?;
 
         {
@@ -655,13 +723,20 @@ impl CatBoostExpert {
         cd_path: &Path,
         model_path: &Path,
         train_dir: &Path,
-    ) -> Result<()> {
-        if self.config.gpu_only && gpu_count() == 0 {
-            bail!("CatBoost gpu-only mode requested but no GPU is available");
+    ) -> Result<(ResolvedCudaDevicePolicy, usize)> {
+        let (resolved_device, visible_nvidia_devices) = self.resolve_cuda_device()?;
+        if self.config.gpu_only && matches!(resolved_device, ResolvedCudaDevicePolicy::Cpu) {
+            bail!(
+                "CatBoost gpu-only mode requested but `{}` resolved to CPU",
+                self.config.requested_device_policy
+            );
         }
 
         let mut command = std::process::Command::new(executable);
-        let task_type = self.effective_task_type();
+        let task_type = match resolved_device {
+            ResolvedCudaDevicePolicy::Cpu => "CPU",
+            ResolvedCudaDevicePolicy::Cuda { .. } => "GPU",
+        };
         command
             .arg("fit")
             .arg("--learn-set")
@@ -729,10 +804,11 @@ impl CatBoostExpert {
             command.arg("--use-best-model");
         }
 
-        command
-            .arg("--task-type")
-            .arg(task_type)
-            .current_dir(train_dir);
+        command.arg("--task-type").arg(task_type);
+        if let ResolvedCudaDevicePolicy::Cuda { ordinal } = resolved_device {
+            command.arg("--devices").arg(ordinal.to_string());
+        }
+        command.current_dir(train_dir);
 
         let output = command
             .output()
@@ -756,11 +832,15 @@ impl CatBoostExpert {
             );
         }
 
-        Ok(())
+        Ok((resolved_device, visible_nvidia_devices))
     }
 
     #[cfg(feature = "catboost")]
-    fn softmax_probabilities(raw_scores: Vec<f64>, rows: usize, cols: usize) -> Result<Vec<f32>> {
+    fn softmax_probabilities(
+        raw_scores: Vec<f64>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Array2<f64>> {
         if cols != 3 {
             bail!("expected CatBoost multiclass logits with 3 columns, got {cols}");
         }
@@ -779,7 +859,7 @@ impl CatBoostExpert {
             if !sum.is_finite() || sum <= 0.0 {
                 bail!("CatBoost produced invalid raw logits for softmax conversion");
             }
-            probabilities.extend(exp_values.into_iter().map(|value| (value / sum) as f32));
+            probabilities.extend(exp_values.into_iter().map(|value| value / sum));
         }
 
         if probabilities.len() != rows * cols {
@@ -790,17 +870,19 @@ impl CatBoostExpert {
             );
         }
 
-        Ok(probabilities)
+        Array2::from_shape_vec((rows, cols), probabilities)
+            .context("reshape CatBoost softmax probabilities")
     }
 }
 
 impl CatBoostExpert {
     fn fit_internal(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        val_x: Option<&DataFrame>,
-        val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+        lease_width: usize,
     ) -> Result<()> {
         // M6: CatBoost trains via the upstream CLI executable, which
         // already supports `--test-set` + `--use-best-model` for
@@ -809,14 +891,42 @@ impl CatBoostExpert {
         // from this code path; for now record that val data was supplied
         // so an operator can audit whether early-stopping kicked in. The
         // CatBoost adapter then proceeds with the standard CLI training.
-        if val_x.is_some() && val_y.is_some() {
-            tracing::info!(
-                model = "catboost",
-                "CatBoost val frame supplied; CLI training currently ignores it (--test-set wiring is a follow-up)"
-            );
+        match (val_x, val_y) {
+            (Some(validation_frame), Some(validation_labels)) => {
+                if validation_frame.n_features() != x.n_features()
+                    || validation_frame.n_samples() != validation_labels.len()
+                {
+                    bail!("CatBoost validation frame/label shape does not match training schema");
+                }
+                tracing::info!(
+                    model = "catboost",
+                    "CatBoost val frame supplied; CLI training currently ignores it (--test-set wiring is a follow-up)"
+                );
+            }
+            (None, None) => {}
+            _ => bail!(
+                "CatBoostExpert::fit_with_validation requires both val_x and val_y or neither"
+            ),
         }
         #[cfg(feature = "catboost")]
         {
+            if x.n_samples() == 0 || y.is_empty() {
+                bail!("CatBoost requires non-empty training features and labels");
+            }
+            if x.n_samples() != y.len() {
+                bail!(
+                    "CatBoost requires matching feature and label rows: {} features vs {} labels",
+                    x.n_samples(),
+                    y.len()
+                );
+            }
+            self.config.cpu_threads = Some(
+                self.config
+                    .cpu_threads
+                    .unwrap_or(lease_width)
+                    .min(lease_width)
+                    .max(1),
+            );
             let temp_dir = self.create_training_dir()?;
             let result = (|| -> Result<()> {
                 let train_dir = temp_dir.join("train");
@@ -826,7 +936,8 @@ impl CatBoostExpert {
                 let (learn_path, cd_path, model_path) =
                     self.write_training_files(&temp_dir, x, y)?;
                 let executable = self.resolve_executable()?;
-                self.train_cli(&executable, &learn_path, &cd_path, &model_path, &train_dir)?;
+                let (resolved_device, visible_nvidia_devices) =
+                    self.train_cli(&executable, &learn_path, &cd_path, &model_path, &train_dir)?;
 
                 let model_bytes = std::fs::read(&model_path)
                     .with_context(|| format!("read CatBoost artifact {}", model_path.display()))?;
@@ -840,18 +951,13 @@ impl CatBoostExpert {
                     );
                 }
 
-                self.feature_columns = feature_columns_from_dataframe(x);
+                self.feature_columns = feature_columns_from_frame(x);
                 self.training_summary = Some(default_training_summary(x));
-                self.local_fallback = Some(build_tree_local_fallback_artifact(
-                    x,
-                    y,
-                    self.stored_training_summary(),
-                )?);
-                self.gpu_only_disabled = false;
                 self.model_bytes = Some(model_bytes);
                 let runtime_artifact = self.build_runtime_artifact(
                     Some(&executable),
-                    Some(self.effective_task_type()),
+                    resolved_device,
+                    visible_nvidia_devices,
                     model_dimensions,
                     self.feature_columns.len(),
                 );
@@ -866,128 +972,70 @@ impl CatBoostExpert {
         }
         #[cfg(not(feature = "catboost"))]
         {
-            if x.height() == 0 || y.is_empty() {
-                bail!("CatBoost requires non-empty training features and labels");
-            }
-            if x.height() != y.len() {
-                bail!(
-                    "CatBoost requires matching feature and label rows: {} features vs {} labels",
-                    x.height(),
-                    y.len()
-                );
-            }
-
-            self.feature_columns = feature_columns_from_dataframe(x);
-            self.training_summary = Some(default_training_summary(x));
-            self.local_fallback = Some(build_tree_local_fallback_artifact(
-                x,
-                y,
-                self.stored_training_summary(),
-            )?);
-            self.gpu_only_disabled = false;
-            self.model_bytes = None;
-            let runtime_artifact =
-                self.build_surrogate_runtime_artifact(self.feature_columns.len());
-            validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
-            self.runtime_artifact = Some(runtime_artifact);
-            self.model = None;
-            Ok(())
+            let _ = (x, y, lease_width);
+            bail!("CatBoost native backend unavailable: compile with the `catboost` feature")
         }
     }
 }
 
 impl ExpertModel for CatBoostExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        self.fit_internal(x, y, None, None)
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| self.fit_internal(x, y, None, None, lease.width().get()))
     }
 
     fn fit_with_validation(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        val_x: Option<&DataFrame>,
-        val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+        lease: &CpuLease,
     ) -> Result<()> {
-        self.fit_internal(x, y, val_x, val_y)
+        lease.scope(|| self.fit_internal(x, y, val_x, val_y, lease.width().get()))
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        if self.gpu_only_disabled {
-            anyhow::bail!("CatBoost disabled: gpu-only mode requested without an available GPU");
-        }
-        #[cfg(feature = "catboost")]
-        {
-            ensure_feature_columns_match(&self.feature_columns, x)?;
-            if x.height() == 0 {
-                return Ok(Array2::zeros((0, 3)));
-            }
-            if self.model.is_none() {
-                if let Some(fallback) = self.local_fallback.as_ref() {
-                    tracing::warn!(
-                        model = "catboost",
-                        surrogate_kind = %fallback.surrogate_kind,
-                        surrogate_rows = fallback.training_summary.dataset_rows,
-                        "CatBoost native model unavailable during predict_proba; using local surrogate fallback"
-                    );
-                    let probabilities = predict_tree_local_fallback(fallback, x)?;
-                    let probabilities = calibrate_three_class_probabilities(
-                        probabilities,
-                        self.probability_temperature(),
-                        "CatBoost",
-                    )?;
-                    return normalize_three_class_probabilities(probabilities, "CatBoost");
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| {
+            #[cfg(feature = "catboost")]
+            {
+                ensure_feature_columns_match(&self.feature_columns, x)?;
+                if x.n_samples() == 0 {
+                    return Ok(Array2::zeros((0, 3)));
                 }
-                bail!("CatBoost not trained");
+                let model = self.model.as_ref().context("CatBoost not trained")?;
+                if model.get_dimensions_count() != 3 {
+                    bail!(
+                        "CatBoost model dimensions mismatch: expected 3 classes, got {}",
+                        model.get_dimensions_count()
+                    );
+                }
+                if let Some(runtime_artifact) = self.runtime_artifact.as_ref() {
+                    validate_runtime_artifact(runtime_artifact, self.feature_columns.len())?;
+                }
+                let (flat_x, rows, cols) = feature_frame_to_tree_f32_row_major(x)?;
+                let float_features = flat_x
+                    .chunks(cols.max(1))
+                    .map(|row| row.to_vec())
+                    .collect::<Vec<_>>();
+                let cat_features: Vec<Vec<String>> = Vec::new();
+                let raw_scores = model
+                    .calc_model_prediction(&float_features, &cat_features)
+                    .context("run CatBoost prediction on float features")?;
+                let raw_cols = raw_scores.len() / rows.max(1);
+                let probabilities = Self::softmax_probabilities(raw_scores, rows, raw_cols)?;
+                let probabilities = calibrate_three_class_probabilities(
+                    probabilities,
+                    self.probability_temperature(),
+                    "CatBoost",
+                )?;
+                normalize_three_class_probabilities(probabilities, "CatBoost")
             }
-            let model = self.model.as_ref().context("CatBoost not trained")?;
-            if model.get_dimensions_count() != 3 {
-                bail!(
-                    "CatBoost model dimensions mismatch: expected 3 classes, got {}",
-                    model.get_dimensions_count()
-                );
+            #[cfg(not(feature = "catboost"))]
+            {
+                let _ = x;
+                bail!("CatBoost native backend unavailable: compile with the `catboost` feature")
             }
-            if let Some(runtime_artifact) = self.runtime_artifact.as_ref() {
-                validate_runtime_artifact(runtime_artifact, self.feature_columns.len())?;
-            }
-            let (flat_x, rows, cols) = dataframe_to_row_major_vec(x)?;
-            let float_features = flat_x
-                .chunks(cols.max(1))
-                .map(|row| row.to_vec())
-                .collect::<Vec<_>>();
-            let cat_features: Vec<Vec<String>> = Vec::new();
-            let raw_scores = model
-                .calc_model_prediction(&float_features, &cat_features)
-                .context("run CatBoost prediction on float features")?;
-            let raw_cols = raw_scores.len() / rows.max(1);
-            let probabilities = Self::softmax_probabilities(raw_scores, rows, raw_cols)?;
-            let probabilities = reshape_three_class_probabilities(probabilities, rows, raw_cols)?;
-            let probabilities = calibrate_three_class_probabilities(
-                probabilities,
-                self.probability_temperature(),
-                "CatBoost",
-            )?;
-            normalize_three_class_probabilities(probabilities, "CatBoost")
-        }
-        #[cfg(not(feature = "catboost"))]
-        {
-            let fallback = self
-                .local_fallback
-                .as_ref()
-                .context("CatBoost local fallback not trained")?;
-            tracing::warn!(
-                model = "catboost",
-                surrogate_kind = %fallback.surrogate_kind,
-                surrogate_rows = fallback.training_summary.dataset_rows,
-                "CatBoost native model unavailable in this build; using local surrogate fallback"
-            );
-            let probabilities = predict_tree_local_fallback(fallback, x)?;
-            let probabilities = calibrate_three_class_probabilities(
-                probabilities,
-                self.probability_temperature(),
-                "CatBoost",
-            )?;
-            normalize_three_class_probabilities(probabilities, "CatBoost")
-        }
+        })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -1004,18 +1052,19 @@ impl ExpertModel for CatBoostExpert {
             )?;
             let (model_path, metadata_path) = tree_artifact_paths(path, CATBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
-            let runtime_artifact = self.runtime_artifact.clone().unwrap_or_else(|| {
-                if self.model_bytes.is_some() {
+            let runtime_artifact = match self.runtime_artifact.clone() {
+                Some(runtime_artifact) => runtime_artifact,
+                None => {
+                    let (resolved_device, visible_nvidia_devices) = self.resolve_cuda_device()?;
                     self.build_runtime_artifact(
                         self.resolve_executable().ok().as_deref(),
-                        Some(self.effective_task_type()),
+                        resolved_device,
+                        visible_nvidia_devices,
                         3,
                         self.feature_columns.len(),
                     )
-                } else {
-                    self.build_surrogate_runtime_artifact(self.feature_columns.len())
                 }
-            });
+            };
             validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
             let runtime_path = Self::runtime_artifact_path(path);
             write_tree_json_artifact(
@@ -1023,41 +1072,17 @@ impl ExpertModel for CatBoostExpert {
                 &runtime_artifact,
                 "CatBoost runtime artifact",
             )?;
-            if let Some(model_bytes) = self.model_bytes.as_ref() {
-                atomic_write(&model_path, model_bytes)?;
-            } else if self.local_fallback.is_none() {
-                bail!("CatBoost model bytes unavailable; train or load before saving");
-            }
-            self.persist_local_fallback(path)?;
+            let model_bytes = self
+                .model_bytes
+                .as_ref()
+                .context("CatBoost model bytes unavailable; train or load before saving")?;
+            atomic_write(&model_path, model_bytes)?;
             Ok(())
         }
         #[cfg(not(feature = "catboost"))]
         {
-            std::fs::create_dir_all(path).with_context(|| {
-                format!(
-                    "create CatBoost fallback artifact directory {}",
-                    path.display()
-                )
-            })?;
-            let metadata = tree_runtime_metadata(
-                "catboost",
-                self.feature_columns.clone(),
-                self.stored_training_summary(),
-            )?;
-            let (_, metadata_path) = tree_artifact_paths(path, CATBOOST_MODEL_FILE_NAME);
-            write_runtime_metadata(&metadata_path, &metadata)?;
-            let runtime_artifact = self.runtime_artifact.clone().unwrap_or_else(|| {
-                self.build_surrogate_runtime_artifact(self.feature_columns.len())
-            });
-            validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
-            let runtime_path = Self::runtime_artifact_path(path);
-            write_tree_json_artifact(
-                &runtime_path,
-                &runtime_artifact,
-                "CatBoost runtime artifact",
-            )?;
-            self.persist_local_fallback(path)?;
-            Ok(())
+            let _ = path;
+            bail!("CatBoost native backend unavailable: compile with the `catboost` feature")
         }
     }
 
@@ -1066,12 +1091,10 @@ impl ExpertModel for CatBoostExpert {
         {
             let (model_path, metadata_path) = tree_artifact_paths(path, CATBOOST_MODEL_FILE_NAME);
             let persisted_runtime_artifact = Self::read_runtime_artifact(path)?;
-            self.local_fallback = Self::read_local_fallback(path)?;
             let metadata = Self::resolve_runtime_metadata(
                 path,
                 &metadata_path,
                 persisted_runtime_artifact.as_ref(),
-                self.local_fallback.as_ref(),
             )?;
             let metadata_feature_columns = metadata.feature_columns.clone();
             let metadata_training_summary = metadata.training_summary.clone();
@@ -1079,6 +1102,7 @@ impl ExpertModel for CatBoostExpert {
             self.training_summary = Some(metadata.training_summary);
             if let Some(runtime_artifact) = persisted_runtime_artifact.as_ref() {
                 validate_runtime_artifact(runtime_artifact, self.feature_columns.len())?;
+                self.validate_runtime_device_for_load(runtime_artifact)?;
                 if runtime_artifact.feature_count != metadata_feature_columns.len() {
                     bail!(
                         "CatBoost runtime artifact feature mismatch with metadata: runtime={} metadata={}",
@@ -1086,132 +1110,63 @@ impl ExpertModel for CatBoostExpert {
                         metadata_feature_columns.len()
                     );
                 }
-                self.apply_runtime_artifact(runtime_artifact);
+                self.apply_runtime_artifact(runtime_artifact)?;
             }
-            let native_model_result = if model_path.exists() {
-                Some((|| -> Result<(Vec<u8>, catboost::Model)> {
-                    let model_bytes = std::fs::read(&model_path).with_context(|| {
-                        format!("read CatBoost artifact {}", model_path.display())
-                    })?;
-                    let model = catboost::Model::load_buffer(&model_bytes).with_context(|| {
-                        format!("load CatBoost model from {}", model_path.display())
-                    })?;
-                    if model.get_dimensions_count() != 3 {
-                        bail!(
-                            "CatBoost model dimensions mismatch: expected 3 classes, got {}",
-                            model.get_dimensions_count()
-                        );
-                    }
-                    if model.get_float_features_count() != self.feature_columns.len() {
-                        bail!(
-                            "CatBoost feature count mismatch: model expects {}, metadata has {}",
-                            model.get_float_features_count(),
-                            self.feature_columns.len()
-                        );
-                    }
-                    Ok((model_bytes, model))
-                })())
-            } else {
-                None
-            };
-
-            match native_model_result {
-                Some(Ok((model_bytes, model))) => {
-                    let runtime_artifact = persisted_runtime_artifact.unwrap_or_else(|| {
-                        self.build_runtime_artifact(
-                            None,
-                            Some(self.effective_task_type()),
-                            model.get_dimensions_count(),
-                            self.feature_columns.len(),
-                        )
-                    });
-                    validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
-                    if metadata_training_summary.dataset_rows == 0 {
-                        bail!(
-                            "CatBoost metadata training summary must record non-zero dataset_rows"
-                        );
-                    }
-                    if metadata_training_summary.dataset_rows
-                        != metadata_training_summary.train_rows + metadata_training_summary.val_rows
-                    {
-                        bail!("CatBoost metadata training summary is inconsistent");
-                    }
-                    self.apply_runtime_artifact(&runtime_artifact);
-                    if let Some(fallback) = self.local_fallback.as_ref() {
-                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-                    }
-                    self.model_bytes = Some(model_bytes);
-                    self.runtime_artifact = Some(runtime_artifact);
-                    self.model = Some(model);
-                }
-                Some(Err(native_err)) => {
-                    self.model_bytes = None;
-                    self.runtime_artifact = persisted_runtime_artifact;
-                    self.model = None;
-                    if let Some(fallback) = self.local_fallback.as_ref() {
-                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-                        tracing::warn!(
-                            model = "catboost",
-                            path = %path.display(),
-                            surrogate_kind = %fallback.surrogate_kind,
-                            surrogate_rows = fallback.training_summary.dataset_rows,
-                            error = %native_err,
-                            "failed to restore native CatBoost model; using local surrogate fallback"
-                        );
-                    } else {
-                        return Err(native_err);
-                    }
-                }
+            if !model_path.exists() {
+                bail!(
+                    "CatBoost native model artifact is missing at {}",
+                    model_path.display()
+                );
+            }
+            let model_bytes = std::fs::read(&model_path)
+                .with_context(|| format!("read CatBoost artifact {}", model_path.display()))?;
+            let model = catboost::Model::load_buffer(&model_bytes)
+                .with_context(|| format!("load CatBoost model from {}", model_path.display()))?;
+            if model.get_dimensions_count() != 3 {
+                bail!(
+                    "CatBoost model dimensions mismatch: expected 3 classes, got {}",
+                    model.get_dimensions_count()
+                );
+            }
+            if model.get_float_features_count() != self.feature_columns.len() {
+                bail!(
+                    "CatBoost feature count mismatch: model expects {}, metadata has {}",
+                    model.get_float_features_count(),
+                    self.feature_columns.len()
+                );
+            }
+            let runtime_artifact = match persisted_runtime_artifact {
+                Some(runtime_artifact) => runtime_artifact,
                 None => {
-                    self.model_bytes = None;
-                    self.runtime_artifact = persisted_runtime_artifact;
-                    self.model = None;
-                    self.local_fallback = Self::read_local_fallback(path)?;
-                    if let Some(fallback) = self.local_fallback.as_ref() {
-                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-                        tracing::warn!(
-                            model = "catboost",
-                            path = %path.display(),
-                            surrogate_kind = %fallback.surrogate_kind,
-                            surrogate_rows = fallback.training_summary.dataset_rows,
-                            "CatBoost artifact missing native model; using local surrogate fallback"
-                        );
-                    } else {
-                        bail!(
-                            "CatBoost artifact {} is missing both native model and local fallback payload",
-                            path.display()
-                        );
-                    }
+                    let (resolved_device, visible_nvidia_devices) = self.resolve_cuda_device()?;
+                    self.build_runtime_artifact(
+                        None,
+                        resolved_device,
+                        visible_nvidia_devices,
+                        model.get_dimensions_count(),
+                        self.feature_columns.len(),
+                    )
                 }
+            };
+            validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
+            if metadata_training_summary.dataset_rows == 0 {
+                bail!("CatBoost metadata training summary must record non-zero dataset_rows");
             }
-            self.gpu_only_disabled = false;
+            if metadata_training_summary.dataset_rows
+                != metadata_training_summary.train_rows + metadata_training_summary.val_rows
+            {
+                bail!("CatBoost metadata training summary is inconsistent");
+            }
+            self.apply_runtime_artifact(&runtime_artifact)?;
+            self.model_bytes = Some(model_bytes);
+            self.runtime_artifact = Some(runtime_artifact);
+            self.model = Some(model);
             Ok(())
         }
         #[cfg(not(feature = "catboost"))]
         {
-            let (_, metadata_path) = tree_artifact_paths(path, CATBOOST_MODEL_FILE_NAME);
-            let persisted_runtime_artifact = Self::read_runtime_artifact(path)?;
-            self.local_fallback = Self::read_local_fallback(path)?;
-            let metadata = Self::resolve_runtime_metadata(
-                path,
-                &metadata_path,
-                persisted_runtime_artifact.as_ref(),
-                self.local_fallback.as_ref(),
-            )?;
-            self.feature_columns = metadata.feature_columns;
-            self.training_summary = Some(metadata.training_summary);
-            if let Some(runtime_artifact) = persisted_runtime_artifact.as_ref() {
-                validate_runtime_artifact(runtime_artifact, self.feature_columns.len())?;
-                self.apply_runtime_artifact(runtime_artifact);
-            }
-            if let Some(fallback) = self.local_fallback.as_ref() {
-                validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-            }
-            self.model_bytes = None;
-            self.runtime_artifact = persisted_runtime_artifact;
-            self.model = None;
-            self.gpu_only_disabled = false;
-            Ok(())
+            let _ = path;
+            bail!("CatBoost native backend unavailable: compile with the `catboost` feature")
         }
     }
 }
@@ -1225,42 +1180,58 @@ impl CatBoostExpert {
         &self.feature_columns
     }
 
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
-        build_tree_runtime_predictions(
-            "catboost",
-            &probabilities,
-            self.model.is_some(),
-            "catboost_native",
-            self.local_fallback.as_ref(),
-            "native_catboost_unavailable",
-            "catboost_unknown",
-        )
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
+        build_tree_runtime_predictions("catboost", &probabilities, "catboost_native")
     }
 }
 
 #[cfg(all(test, feature = "catboost"))]
 mod tests {
     use super::{CatBoostExpert, ExpertModel};
-    use crate::base::feature_columns_from_dataframe;
+    use crate::base::feature_columns_from_frame;
+    use crate::common::ResolvedCudaDevicePolicy;
     use crate::runtime::artifacts::TrainingSummaryMetadata;
     use crate::tree_models::common::{
-        build_tree_local_fallback_artifact, default_training_summary,
+        default_training_summary, tree_runtime_metadata, write_runtime_metadata,
+        write_tree_json_artifact,
     };
-    use polars::df;
-    use polars::prelude::*;
+    use crate::tree_models::config::DevicePreference;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn sample_three_class_dataset() -> (DataFrame, Series) {
-        let x = df![
-            "momentum" => &[0.96, 0.93, 0.89, 0.07, 0.03, 0.11, -0.94, -0.91, -0.88],
-            "trend" => &[0.87, 0.91, 0.86, 0.01, -0.02, 0.04, -0.9, -0.86, -0.93],
-            "volatility" => &[0.62, 0.58, 0.6, 0.2, 0.18, 0.23, 0.69, 0.66, 0.64],
+    fn sample_three_class_frame() -> FeatureFrame {
+        let rows = 9;
+        let columns = [
+            (
+                "momentum",
+                vec![0.96, 0.93, 0.89, 0.07, 0.03, 0.11, -0.94, -0.91, -0.88],
+            ),
+            (
+                "trend",
+                vec![0.87, 0.91, 0.86, 0.01, -0.02, 0.04, -0.9, -0.86, -0.93],
+            ),
+            (
+                "volatility",
+                vec![0.62, 0.58, 0.6, 0.2, 0.18, 0.23, 0.69, 0.66, 0.64],
+            ),
         ]
-        .expect("build training dataframe");
-        let y = Series::new("label".into(), &[1_i32, 1, 1, 0, 0, 0, -1, -1, -1]);
-        (x, y)
+        .into_iter()
+        .map(|(name, values)| {
+            FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+                .expect("valid typed feature column")
+        })
+        .collect::<Vec<_>>();
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+        .expect("build typed training frame")
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -1274,36 +1245,42 @@ mod tests {
     }
 
     #[test]
-    fn catboost_loads_fallback_when_native_artifact_is_corrupt() {
-        let (x, y) = sample_three_class_dataset();
+    fn catboost_rejects_corrupt_native_artifact_without_a_surrogate() {
+        let frame = sample_three_class_frame();
         let artifact_dir = unique_temp_dir("catboost-corrupt-artifact");
 
         let mut expert = CatBoostExpert::new(9);
-        let training_summary = default_training_summary(&x);
-        expert.feature_columns = feature_columns_from_dataframe(&x);
+        expert.config.requested_device_policy = "cpu".into();
+        expert.config.device_pref = DevicePreference::Cpu;
+        let training_summary = default_training_summary(&frame);
+        expert.feature_columns = feature_columns_from_frame(&frame);
         expert.training_summary = Some(training_summary.clone());
-        expert.local_fallback = Some(
-            build_tree_local_fallback_artifact(&x, &y, training_summary)
-                .expect("build fallback artifact"),
+        let runtime_artifact = expert.build_runtime_artifact(
+            None,
+            ResolvedCudaDevicePolicy::Cpu,
+            0,
+            3,
+            expert.feature_columns.len(),
         );
-
-        expert.save(&artifact_dir).expect("save should succeed");
+        let metadata =
+            tree_runtime_metadata("catboost", expert.feature_columns.clone(), training_summary)
+                .expect("valid runtime metadata");
+        write_runtime_metadata(&artifact_dir.join("metadata.json"), &metadata)
+            .expect("persist runtime metadata");
+        write_tree_json_artifact(
+            &artifact_dir.join("runtime.json"),
+            &runtime_artifact,
+            "CatBoost runtime artifact",
+        )
+        .expect("persist runtime artifact");
         std::fs::write(artifact_dir.join("model.cbm"), b"corrupt catboost model")
-            .expect("overwrite native model artifact");
+            .expect("write corrupt native model artifact");
 
         let mut loaded = CatBoostExpert::new(9);
-        loaded
+        let error = loaded
             .load(&artifact_dir)
-            .expect("load should recover from persisted fallback");
-
-        let probabilities = loaded
-            .predict_proba(&x)
-            .expect("prediction should succeed from fallback");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
-        for row in probabilities.outer_iter() {
-            let sum = row.iter().copied().sum::<f32>();
-            assert!((sum - 1.0).abs() < 1e-3_f32);
-        }
+            .expect_err("corrupt native artifact must fail closed");
+        assert!(error.to_string().contains("load CatBoost model"));
     }
 
     #[test]
@@ -1311,8 +1288,9 @@ mod tests {
         let artifact = super::CatBoostRuntimeArtifact {
             executable: "unknown".into(),
             task_type: "CPU".into(),
-            device_preference: "gpu".into(),
-            gpu_available: false,
+            requested_device_policy: "auto".into(),
+            cuda_ordinal: None,
+            visible_nvidia_devices: 0,
             gpu_only: true,
             model_dimensions: 3,
             feature_count: 3,
@@ -1341,16 +1319,12 @@ mod tests {
 
     #[test]
     fn catboost_save_rejects_missing_training_summary() {
-        let (x, y) = sample_three_class_dataset();
+        let frame = sample_three_class_frame();
         let artifact_dir = unique_temp_dir("catboost-missing-summary");
 
         let mut expert = CatBoostExpert::new(9);
-        expert.feature_columns = feature_columns_from_dataframe(&x);
+        expert.feature_columns = feature_columns_from_frame(&frame);
         expert.training_summary = None;
-        expert.local_fallback = Some(
-            build_tree_local_fallback_artifact(&x, &y, default_training_summary(&x))
-                .expect("build fallback artifact"),
-        );
 
         let err = expert
             .save(&artifact_dir)
@@ -1359,36 +1333,36 @@ mod tests {
     }
 
     #[test]
-    fn catboost_load_uses_runtime_artifacts_when_metadata_sidecar_missing() {
-        let (x, y) = sample_three_class_dataset();
+    fn catboost_resolves_metadata_from_runtime_artifact_when_sidecar_is_missing() {
+        let frame = sample_three_class_frame();
         let artifact_dir = unique_temp_dir("catboost-metadata-missing");
 
         let mut expert = CatBoostExpert::new(17);
-        let training_summary = default_training_summary(&x);
-        expert.feature_columns = feature_columns_from_dataframe(&x);
+        expert.config.requested_device_policy = "cpu".into();
+        expert.config.device_pref = DevicePreference::Cpu;
+        let training_summary = default_training_summary(&frame);
+        expert.feature_columns = feature_columns_from_frame(&frame);
         expert.training_summary = Some(training_summary.clone());
-        expert.local_fallback = Some(
-            build_tree_local_fallback_artifact(&x, &y, training_summary)
-                .expect("build fallback artifact"),
+        let runtime_artifact = expert.build_runtime_artifact(
+            None,
+            ResolvedCudaDevicePolicy::Cpu,
+            0,
+            3,
+            expert.feature_columns.len(),
         );
-
-        expert.save(&artifact_dir).expect("save should succeed");
         let metadata_path = artifact_dir.join("metadata.json");
         assert!(
-            metadata_path.exists(),
-            "expected metadata sidecar at {}",
+            !metadata_path.exists(),
+            "metadata sidecar should be absent at {}",
             metadata_path.display()
         );
-        std::fs::remove_file(&metadata_path)
-            .expect("remove metadata sidecar to trigger reconstruction");
-
-        let mut loaded = CatBoostExpert::new(17);
-        loaded
-            .load(&artifact_dir)
-            .expect("load should reconstruct metadata from runtime artifacts");
-        let probabilities = loaded
-            .predict_proba(&x)
-            .expect("prediction should succeed after metadata reconstruction");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
+        let metadata = CatBoostExpert::resolve_runtime_metadata(
+            &artifact_dir,
+            &metadata_path,
+            Some(&runtime_artifact),
+        )
+        .expect("runtime artifact should reconstruct metadata");
+        assert_eq!(metadata.feature_columns, expert.feature_columns);
+        assert_eq!(metadata.training_summary, training_summary);
     }
 }

@@ -15,16 +15,26 @@ fn tree_experts_construct_without_python_runtime_requirements() {
     assert_eq!(catboost.idx, 3);
 }
 
+#[cfg(any(
+    feature = "xgboost",
+    feature = "lightgbm",
+    feature = "catboost",
+    feature = "sklears-tree"
+))]
 #[test]
-#[allow(clippy::assertions_on_constants)]
 fn compiled_tree_feature_set_is_not_empty() {
-    let any_tree_backend = cfg!(feature = "xgboost")
-        || cfg!(feature = "lightgbm")
-        || cfg!(feature = "catboost")
-        || cfg!(feature = "sklears-tree");
+    let mut compiled_backends = Vec::new();
+    #[cfg(feature = "xgboost")]
+    compiled_backends.push("xgboost");
+    #[cfg(feature = "lightgbm")]
+    compiled_backends.push("lightgbm");
+    #[cfg(feature = "catboost")]
+    compiled_backends.push("catboost");
+    #[cfg(feature = "sklears-tree")]
+    compiled_backends.push("sklears-tree");
 
     assert!(
-        any_tree_backend,
-        "neoethos-models should expose at least one compiled tree backend in the default tree stack"
+        !compiled_backends.is_empty(),
+        "a tree-feature build must expose at least one compiled backend"
     );
 }

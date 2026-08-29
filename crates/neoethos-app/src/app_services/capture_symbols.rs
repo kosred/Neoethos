@@ -34,14 +34,14 @@ use serde_json::{Map, Value, json, to_value};
 
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::ctrader_data::{
-    parse_asset_class_list_response, parse_asset_list_response, parse_symbol_by_id_response,
-    parse_symbol_category_list_response, parse_symbols_list_response, CTraderSymbolInfo,
+    CTraderSymbolInfo, parse_asset_class_list_response, parse_asset_list_response,
+    parse_symbol_by_id_response, parse_symbol_category_list_response, parse_symbols_list_response,
 };
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
-    build_account_auth_request, build_application_auth_request, build_asset_class_list_request,
-    build_asset_list_request, build_symbol_by_id_request, build_symbol_category_list_request,
-    build_symbols_list_request, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
+    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
+    build_application_auth_request, build_asset_class_list_request, build_asset_list_request,
+    build_symbol_by_id_request, build_symbol_category_list_request, build_symbols_list_request,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
 
@@ -51,8 +51,9 @@ use crate::app_services::secure_store::production_ctrader_token_store;
 ///
 /// User directive (2026-05-28): "FX majors/minors/exotics + Metals
 /// + Indices + Commodities (oil/gas) — ΑΥΤΑ ΚΑΙ ΜΟΝΟ ΑΥΤΑ".
-pub const FOREX_AI_ASSET_CLASS_KEYWORDS: &[&str] =
-    &["forex", "fx", "metal", "indice", "index", "commodit", "energ", "oil", "gas"];
+pub const FOREX_AI_ASSET_CLASS_KEYWORDS: &[&str] = &[
+    "forex", "fx", "metal", "indice", "index", "commodit", "energ", "oil", "gas",
+];
 
 /// True iff the broker's asset class name matches one of the
 /// forex-ai keep keywords. Case-insensitive substring match — broker
@@ -139,7 +140,11 @@ pub fn run_capture(symbols: &[String], output_dir: &Path) -> Result<()> {
             &ctrader.client_secret,
             "capture-app-auth",
         ),
-        build_account_auth_request(account_id, &token_bundle.access_token, "capture-account-auth"),
+        build_account_auth_request(
+            account_id,
+            &token_bundle.access_token,
+            "capture-account-auth",
+        ),
         build_symbols_list_request(account_id, false, "capture-symbols-list"),
     ])?;
     if auth_responses.len() < 3 {
@@ -222,7 +227,10 @@ pub fn run_capture(symbols: &[String], output_dir: &Path) -> Result<()> {
 
         let raw_path = output_dir.join(format!("ctrader_symbol_{needle}.raw.json"));
         if let Err(e) = std::fs::write(&raw_path, &raw_pretty) {
-            eprintln!("[capture] {needle}: failed to write {}: {e}", raw_path.display());
+            eprintln!(
+                "[capture] {needle}: failed to write {}: {e}",
+                raw_path.display()
+            );
             failed.push(needle);
             continue;
         }
@@ -245,9 +253,7 @@ pub fn run_capture(symbols: &[String], output_dir: &Path) -> Result<()> {
                     let decoded = make_decoded_summary(&sym, &light.symbol_name);
                     if let Ok(text) = serde_json::to_string_pretty(&decoded) {
                         if let Err(e) = std::fs::write(&decoded_path, &text) {
-                            eprintln!(
-                                "[capture] {needle}: failed to write decoded summary: {e}"
-                            );
+                            eprintln!("[capture] {needle}: failed to write decoded summary: {e}");
                         } else {
                             eprintln!(
                                 "[capture] {needle}: wrote decoded summary → {}",
@@ -308,7 +314,10 @@ fn make_decoded_summary(symbol: &CTraderSymbolInfo, broker_name: &str) -> Value 
             // ~30-field financials projection via a `Map` instead.
             let mut m = Map::new();
             // Commission
-            m.insert("commission_type".into(), to_value(f.commission_type).unwrap_or(Value::Null));
+            m.insert(
+                "commission_type".into(),
+                to_value(f.commission_type).unwrap_or(Value::Null),
+            );
             m.insert(
                 "precise_trading_commission_rate".into(),
                 to_value(f.precise_trading_commission_rate).unwrap_or(Value::Null),
@@ -334,8 +343,14 @@ fn make_decoded_summary(symbol: &CTraderSymbolInfo, broker_name: &str) -> Value 
                 to_value(f.pnl_conversion_fee_rate).unwrap_or(Value::Null),
             );
             // Swap
-            m.insert("swap_long".into(), to_value(f.swap_long).unwrap_or(Value::Null));
-            m.insert("swap_short".into(), to_value(f.swap_short).unwrap_or(Value::Null));
+            m.insert(
+                "swap_long".into(),
+                to_value(f.swap_long).unwrap_or(Value::Null),
+            );
+            m.insert(
+                "swap_short".into(),
+                to_value(f.swap_short).unwrap_or(Value::Null),
+            );
             m.insert(
                 "swap_calculation_type".into(),
                 to_value(f.swap_calculation_type).unwrap_or(Value::Null),
@@ -394,7 +409,10 @@ fn make_decoded_summary(symbol: &CTraderSymbolInfo, broker_name: &str) -> Value 
                 "gsl_distance_points".into(),
                 to_value(f.gsl_distance_points).unwrap_or(Value::Null),
             );
-            m.insert("gsl_charge".into(), to_value(f.gsl_charge).unwrap_or(Value::Null));
+            m.insert(
+                "gsl_charge".into(),
+                to_value(f.gsl_charge).unwrap_or(Value::Null),
+            );
             m.insert(
                 "distance_set_in".into(),
                 to_value(f.distance_set_in).unwrap_or(Value::Null),
@@ -404,7 +422,10 @@ fn make_decoded_summary(symbol: &CTraderSymbolInfo, broker_name: &str) -> Value 
                 to_value(f.guaranteed_stop_loss_available).unwrap_or(Value::Null),
             );
             // Trading-mode + short-selling
-            m.insert("trading_mode".into(), to_value(f.trading_mode).unwrap_or(Value::Null));
+            m.insert(
+                "trading_mode".into(),
+                to_value(f.trading_mode).unwrap_or(Value::Null),
+            );
             m.insert(
                 "enable_short_selling".into(),
                 to_value(f.enable_short_selling).unwrap_or(Value::Null),
@@ -420,8 +441,14 @@ fn make_decoded_summary(symbol: &CTraderSymbolInfo, broker_name: &str) -> Value 
             );
             m.insert("holidays_count".into(), Value::from(f.holidays.len()));
             // Misc
-            m.insert("max_exposure".into(), to_value(f.max_exposure).unwrap_or(Value::Null));
-            m.insert("leverage_id".into(), to_value(f.leverage_id).unwrap_or(Value::Null));
+            m.insert(
+                "max_exposure".into(),
+                to_value(f.max_exposure).unwrap_or(Value::Null),
+            );
+            m.insert(
+                "leverage_id".into(),
+                to_value(f.leverage_id).unwrap_or(Value::Null),
+            );
             m.insert(
                 "measurement_units".into(),
                 to_value(&f.measurement_units).unwrap_or(Value::Null),
@@ -534,9 +561,7 @@ pub fn run_bootstrap(env_label: &str, output_root: &Path) -> Result<()> {
     let token_bundle = production_ctrader_token_store()
         .load_token_bundle_with_legacy_fallback()
         .map_err(|e| anyhow!("token bundle load failed: {e}"))?
-        .ok_or_else(|| {
-            anyhow!("no saved cTrader OAuth token bundle — run --reauth first")
-        })?;
+        .ok_or_else(|| anyhow!("no saved cTrader OAuth token bundle — run --reauth first"))?;
 
     let environment = match ctrader.environment {
         crate::app_services::broker_config::CTraderBrokerEnvironment::Demo => {
@@ -561,7 +586,11 @@ pub fn run_bootstrap(env_label: &str, output_root: &Path) -> Result<()> {
             &ctrader.client_secret,
             "bootstrap-app-auth",
         ),
-        build_account_auth_request(account_id, &token_bundle.access_token, "bootstrap-acct-auth"),
+        build_account_auth_request(
+            account_id,
+            &token_bundle.access_token,
+            "bootstrap-acct-auth",
+        ),
         build_symbols_list_request(account_id, false, "bootstrap-symbols-list"),
     ])?;
     if auth_responses.len() < 3 {
@@ -572,7 +601,10 @@ pub fn run_bootstrap(env_label: &str, output_root: &Path) -> Result<()> {
     }
     let symbols_list = parse_symbols_list_response(&auth_responses[2])?;
     let total_raw = symbols_list.symbols.len();
-    eprintln!("[bootstrap] symbols catalog: {} entries (unfiltered)", total_raw);
+    eprintln!(
+        "[bootstrap] symbols catalog: {} entries (unfiltered)",
+        total_raw
+    );
     if total_raw == 0 {
         return Err(anyhow!(
             "broker returned an empty symbol catalog — refusing to write a useless bootstrap"
@@ -815,8 +847,7 @@ pub fn run_bootstrap(env_label: &str, output_root: &Path) -> Result<()> {
             // count mismatch.
             for r in &responses {
                 if let Ok(env) = parse_open_api_envelope(r) {
-                    if env.payload_type
-                        != CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE
+                    if env.payload_type != CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE
                         && env.payload_type != CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE
                     {
                         return Err(anyhow!(
@@ -997,8 +1028,8 @@ pub fn build_symbol_metadata_table_from_catalog(
     // ── Load the three on-disk artefacts ─────────────────────────
     let assets_raw = std::fs::read_to_string(env_dir.join("asset_list.json"))
         .map_err(|e| anyhow!("read asset_list.json: {e}"))?;
-    let assets_doc: Value = serde_json::from_str(&assets_raw)
-        .map_err(|e| anyhow!("parse asset_list.json: {e}"))?;
+    let assets_doc: Value =
+        serde_json::from_str(&assets_raw).map_err(|e| anyhow!("parse asset_list.json: {e}"))?;
     let mut asset_lookup: HashMap<i64, String> = HashMap::new();
     if let Some(arr) = assets_doc.get("assets").and_then(|v| v.as_array()) {
         for entry in arr {
@@ -1015,8 +1046,8 @@ pub fn build_symbol_metadata_table_from_catalog(
 
     let light_raw = std::fs::read_to_string(env_dir.join("light_symbols.json"))
         .map_err(|e| anyhow!("read light_symbols.json: {e}"))?;
-    let light_doc: Value = serde_json::from_str(&light_raw)
-        .map_err(|e| anyhow!("parse light_symbols.json: {e}"))?;
+    let light_doc: Value =
+        serde_json::from_str(&light_raw).map_err(|e| anyhow!("parse light_symbols.json: {e}"))?;
     let mut light_lookup: HashMap<i64, (String, Option<i64>, Option<i64>)> = HashMap::new();
     if let Some(arr) = light_doc.get("symbols").and_then(|v| v.as_array()) {
         for entry in arr {
@@ -1055,8 +1086,8 @@ pub fn build_symbol_metadata_table_from_catalog(
     let mut skipped: Vec<String> = Vec::new();
 
     for path in &batch_files {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {e}", path.display()))?;
         let parsed = parse_symbol_by_id_response(&raw)
             .map_err(|e| anyhow!("parse {}: {e}", path.display()))?;
         for sym in parsed {
@@ -1125,21 +1156,20 @@ pub fn build_symbol_metadata_table_from_catalog(
             // cost model can fail loud rather than apply the wrong
             // formula. The 92/92 filtered catalog uses PIPS so this
             // is safe for forex-ai today.
-            let (daily_swap_long, daily_swap_short) =
-                if let Some(fin) = sym.financials.as_ref() {
-                    use crate::app_services::ctrader_data::SwapCalculationType;
-                    let is_pips = fin
-                        .swap_calculation_type
-                        .map(|k| matches!(k, SwapCalculationType::Pips))
-                        .unwrap_or(true); // None defaults to PIPS per proto
-                    if is_pips {
-                        (fin.daily_swap_long(), fin.daily_swap_short())
-                    } else {
-                        (None, None)
-                    }
+            let (daily_swap_long, daily_swap_short) = if let Some(fin) = sym.financials.as_ref() {
+                use crate::app_services::ctrader_data::SwapCalculationType;
+                let is_pips = fin
+                    .swap_calculation_type
+                    .map(|k| matches!(k, SwapCalculationType::Pips))
+                    .unwrap_or(true); // None defaults to PIPS per proto
+                if is_pips {
+                    (fin.daily_swap_long(), fin.daily_swap_short())
                 } else {
                     (None, None)
-                };
+                }
+            } else {
+                (None, None)
+            };
 
             // pnl_conversion_fee_rate: proto stores `1 = 0.01%`.
             // We carry a fraction (`0.0001`) so cost_model multiplies
@@ -1176,9 +1206,9 @@ pub fn build_symbol_metadata_table_from_catalog(
                 min_lot,
                 max_lot,
                 lot_step,
-                typical_price: None,           // live tick is source of truth
-                typical_spread_pips: None,     // live tick is source of truth
-                commission_per_lot: None,      // cost model derives at runtime
+                typical_price: None,       // live tick is source of truth
+                typical_spread_pips: None, // live tick is source of truth
+                commission_per_lot: None,  // cost model derives at runtime
                 daily_swap_long_pips: daily_swap_long,
                 daily_swap_short_pips: daily_swap_short,
                 pnl_conversion_fee_rate: pnl_conv_fee,
@@ -1197,7 +1227,12 @@ pub fn build_symbol_metadata_table_from_catalog(
         if skipped.is_empty() {
             "none".to_string()
         } else {
-            skipped.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+            skipped
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
         }
     );
 

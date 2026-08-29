@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
@@ -44,10 +28,6 @@ pub struct AdxOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdxParams {
     pub period: Option<usize>,
 }
@@ -229,7 +209,6 @@ pub fn adx(input: &AdxInput) -> Result<AdxOutput, AdxError> {
     adx_with_kernel(input, Kernel::Auto)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn adx_into(input: &AdxInput, out: &mut [f64]) -> Result<(), AdxError> {
     adx_into_slice(out, input, Kernel::Auto)
@@ -1193,220 +1172,6 @@ impl AdxBatchOutput {
     }
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::adx_wrapper::CudaAdx;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "adx_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, period_range, device_id=0))]
-pub fn adx_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<(DeviceArrayF32AdxPy, Bound<'py, PyDict>)> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = AdxBatchRange {
-        period: period_range,
-    };
-    let (inner, combos, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAdx::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let (dev_arr, cmb) = cuda
-            .adx_batch_dev(h, l, c, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((dev_arr, cmb, ctx, dev_id))
-    })?;
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok((DeviceArrayF32AdxPy::new(inner, ctx, dev_id), dict))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "adx_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, cols, rows, period, device_id=0))]
-pub fn adx_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    high_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    low_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32AdxPy> {
-    use crate::cuda::cuda_available;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAdx::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.ctx();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .adx_many_series_one_param_time_major_dev(h, l, c, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(DeviceArrayF32AdxPy::new(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "DeviceArrayF32Adx", unsendable)]
-pub struct DeviceArrayF32AdxPy {
-    pub(crate) inner: DeviceArrayF32,
-    _ctx_guard: Arc<Context>,
-    _device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl DeviceArrayF32AdxPy {
-    #[new]
-    fn py_new() -> PyResult<Self> {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "use factory methods from CUDA functions",
-        ))
-    }
-
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = &self.inner;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let size = inner.rows.saturating_mul(inner.cols);
-        let ptr = if size == 0 {
-            0usize
-        } else {
-            inner.device_ptr() as usize
-        };
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> PyResult<(i32, i32)> {
-        let mut device_ordinal: i32 = 0;
-        unsafe {
-            let attr = cust::sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-            let mut value = std::mem::MaybeUninit::<i32>::uninit();
-            let err = cust::sys::cuPointerGetAttribute(
-                value.as_mut_ptr() as *mut std::ffi::c_void,
-                attr,
-                self.inner.buf.as_device_ptr().as_raw(),
-            );
-            if err == cust::sys::CUresult::CUDA_SUCCESS {
-                device_ordinal = value.assume_init();
-            } else {
-                let _ = cust::sys::cuCtxGetDevice(&mut device_ordinal);
-            }
-        }
-        Ok((2, device_ordinal))
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__()?;
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d(
-            py,
-            buf,
-            rows,
-            cols,
-            alloc_dev,
-            max_version_bound,
-        )
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl DeviceArrayF32AdxPy {
-    pub fn new(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner,
-            _ctx_guard: ctx_guard,
-            _device_id: device_id,
-        }
-    }
-}
-
 #[inline(always)]
 fn expand_grid(r: &AdxBatchRange) -> Vec<AdxParams> {
     fn axis_usize((start, end, step): (usize, usize, usize)) -> Vec<usize> {
@@ -2117,52 +1882,11 @@ impl AdxStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = adx_js(high, low, close, period)?;
-    crate::write_wasm_f64_output("adx_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = adx_batch_js(high, low, close, period_start, period_end, period_step)?;
-    crate::write_wasm_f64_output("adx_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adx_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("adx_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     #[test]
     fn test_adx_into_matches_api() -> Result<(), Box<dyn Error>> {
@@ -2186,13 +1910,8 @@ mod tests {
         let AdxOutput { values: expected } = adx(&input)?;
 
         let mut got = vec![0.0; n];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             adx_into(&input, &mut got)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            return Ok(());
         }
 
         assert_eq!(expected.len(), got.len());
@@ -2214,8 +1933,8 @@ mod tests {
 
     fn check_adx_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let default_params = AdxParams { period: None };
         let input = AdxInput::from_candles(&candles, default_params);
@@ -2227,8 +1946,8 @@ mod tests {
 
     fn check_adx_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AdxInput::from_candles(&candles, AdxParams::default());
         let result = adx_with_kernel(&input, kernel)?;
@@ -2251,8 +1970,8 @@ mod tests {
 
     fn check_adx_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AdxInput::with_default_candles(&candles);
         let output = adx_with_kernel(&input, kernel)?;
@@ -2314,8 +2033,8 @@ mod tests {
 
     fn check_adx_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = AdxParams { period: Some(14) };
         let first_input = AdxInput::from_candles(&candles, first_params);
@@ -2339,8 +2058,8 @@ mod tests {
 
     fn check_adx_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = AdxInput::from_candles(&candles, AdxParams { period: Some(14) });
         let res = adx_with_kernel(&input, kernel)?;
@@ -2360,8 +2079,8 @@ mod tests {
 
     fn check_adx_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let period = 14;
 
@@ -2406,8 +2125,8 @@ mod tests {
     fn check_adx_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             AdxParams::default(),
@@ -2794,8 +2513,8 @@ mod tests {
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let output = AdxBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
 
@@ -2823,8 +2542,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (5, 20, 5),
@@ -2913,10 +2632,15 @@ mod tests {
                             || bits == 0x33333333_33333333
                         {
                             panic!(
-								"[{}] Config {}: Found poison value {} (0x{:016X}) in sliced output \
+                                "[{}] Config {}: Found poison value {} (0x{:016X}) in sliced output \
 								at index {} with params: period={}",
-								test, cfg_idx, val, bits, idx, p.period.unwrap_or(14)
-							);
+                                test,
+                                cfg_idx,
+                                val,
+                                bits,
+                                idx,
+                                p.period.unwrap_or(14)
+                            );
                         }
                     }
                 }
@@ -2953,361 +2677,6 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adx")]
-#[pyo3(signature = (high, low, close, period, kernel=None))]
-pub fn adx_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    if high_slice.len() != low_slice.len() || high_slice.len() != close_slice.len() {
-        return Err(PyValueError::new_err(
-            "Input arrays must have the same length",
-        ));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = AdxParams {
-        period: Some(period),
-    };
-    let adx_in = AdxInput::from_slices(high_slice, low_slice, close_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| adx_with_kernel(&adx_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdxStream")]
-pub struct AdxStreamPy {
-    stream: AdxStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdxStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = AdxParams {
-            period: Some(period),
-        };
-        let stream =
-            AdxStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AdxStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adx_batch")]
-#[pyo3(signature = (high, low, close, period_range, kernel=None))]
-pub fn adx_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-    if h.len() != l.len() || h.len() != c.len() {
-        return Err(PyValueError::new_err(
-            "Input arrays must have the same length",
-        ));
-    }
-
-    let sweep = AdxBatchRange {
-        period: period_range,
-    };
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = c.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let kern = validate_kernel(kernel, true)?;
-    py.allow_threads(|| {
-        let k = match kern {
-            Kernel::Auto => detect_best_batch_kernel(),
-            other => other,
-        };
-        let simd = match k {
-            Kernel::ScalarBatch => Kernel::Scalar,
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx2Batch => Kernel::Avx2,
-            #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-            Kernel::Avx512Batch => Kernel::Avx512,
-            _ => Kernel::Scalar,
-        };
-        adx_batch_inner_into(h, l, c, &sweep, simd, true, out_slice)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_alloc(len: usize) -> *mut f64 {
-    let mut v: Vec<f64> = Vec::with_capacity(len);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_into(
-    h_ptr: *const f64,
-    l_ptr: *const f64,
-    c_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if [
-        h_ptr as *const u8,
-        l_ptr as *const u8,
-        c_ptr as *const u8,
-        out_ptr as *const u8,
-    ]
-    .iter()
-    .any(|p| p.is_null())
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(h_ptr, len);
-        let l = std::slice::from_raw_parts(l_ptr, len);
-        let c = std::slice::from_raw_parts(c_ptr, len);
-        let out = std::slice::from_raw_parts_mut(out_ptr, len);
-        let params = AdxParams {
-            period: Some(period),
-        };
-        let input = AdxInput::from_slices(h, l, c, params);
-        adx_into_slice(out, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    if high.len() != low.len() || high.len() != close.len() {
-        return Err(JsValue::from_str("Input arrays must have the same length"));
-    }
-
-    let params = AdxParams {
-        period: Some(period),
-    };
-    let input = AdxInput::from_slices(high, low, close, params);
-
-    let mut output = vec![0.0; high.len()];
-    #[cfg(target_arch = "wasm32")]
-    let kernel = Kernel::Scalar;
-    #[cfg(not(target_arch = "wasm32"))]
-    let kernel = Kernel::Auto;
-
-    adx_into_slice(&mut output, &input, kernel).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_batch_into(
-    h_ptr: *const f64,
-    l_ptr: *const f64,
-    c_ptr: *const f64,
-    len: usize,
-    out_ptr: *mut f64,
-    rows: usize,
-    cols: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if [
-        h_ptr as *const u8,
-        l_ptr as *const u8,
-        c_ptr as *const u8,
-        out_ptr as *const u8,
-    ]
-    .iter()
-    .any(|p| p.is_null())
-    {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    if cols != len {
-        return Err(JsValue::from_str("cols must equal len"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(h_ptr, len);
-        let l = std::slice::from_raw_parts(l_ptr, len);
-        let c = std::slice::from_raw_parts(c_ptr, len);
-        let sweep = AdxBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos = expand_grid(&sweep);
-        if combos.len() != rows {
-            return Err(JsValue::from_str("rows mismatch"));
-        }
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-        adx_batch_inner_into(h, l, c, &sweep, detect_best_kernel(), false, out)
-            .map(|_| rows)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    if high.len() != low.len() || high.len() != close.len() {
-        return Err(JsValue::from_str("Input arrays must have the same length"));
-    }
-
-    let sweep = AdxBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    #[cfg(target_arch = "wasm32")]
-    let kernel = Kernel::Scalar;
-    #[cfg(not(target_arch = "wasm32"))]
-    let kernel = Kernel::Auto;
-
-    adx_batch_inner(high, low, close, &sweep, kernel, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adx_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AdxBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep);
-    let metadata: Vec<f64> = combos
-        .into_iter()
-        .map(|combo| combo.period.unwrap() as f64)
-        .collect();
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdxBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdxBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AdxParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adx_batch)]
-pub fn adx_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    if high.len() != low.len() || high.len() != close.len() {
-        return Err(JsValue::from_str("Input arrays must have the same length"));
-    }
-
-    let config: AdxBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AdxBatchRange {
-        period: config.period_range,
-    };
-
-    #[cfg(target_arch = "wasm32")]
-    let kernel = Kernel::ScalarBatch;
-    #[cfg(not(target_arch = "wasm32"))]
-    let kernel = Kernel::Auto;
-
-    let output = adx_batch_inner(high, low, close, &sweep, kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = AdxBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }
 
 #[inline]

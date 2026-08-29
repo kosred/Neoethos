@@ -1,14 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
-use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::cuda::DeviceArrayF32Triplet;
+use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::mod_god_mode::{ModGodModeBatchRange, ModGodModeMode, ModGodModeParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::device::DeviceAttribute as DevAttr;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -94,11 +94,6 @@ impl CudaModGodMode {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/mod_god_mode_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("mod_god_mode_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
         Ok(Self {
@@ -1006,14 +1001,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "mod_god_mode",
-            "one_series_many_params",
-            "mod_god_mode_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "mod_god_mode",
+                "one_series_many_params",
+                "mod_god_mode_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }

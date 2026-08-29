@@ -1,43 +1,44 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::CudaAdxr;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use numpy::PyUntypedArrayMethods;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
 use thiserror::Error;
+
+// External formula/lookback authorities (audit oracles only; never runtime backends):
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_ADXR.c
+// https://raw.githubusercontent.com/TA-Lib/ta-lib/3800d9ed0006fa63cab818737fbea998219419ce/src/ta_func/ta_ADX.c
+
+#[inline(always)]
+const fn adxr_lag(period: usize) -> usize {
+    period - 1
+}
+
+#[inline(always)]
+const fn adxr_lookback(period: usize) -> usize {
+    3 * period - 2
+}
+
+#[inline(always)]
+fn adxr_push_lagged(ring: &mut [f64], head: &mut usize, current: f64) -> f64 {
+    if ring.is_empty() {
+        return current;
+    }
+
+    let previous = ring[*head];
+    ring[*head] = current;
+    *head += 1;
+    if *head == ring.len() {
+        *head = 0;
+    }
+    previous
+}
 
 #[derive(Debug, Clone)]
 pub enum AdxrData<'a> {
@@ -57,10 +58,6 @@ pub struct AdxrOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct AdxrParams {
     pub period: Option<usize>,
 }
@@ -204,7 +201,7 @@ pub fn adxr_with_kernel(input: &AdxrInput, kernel: Kernel) -> Result<AdxrOutput,
 
     let len = close.len();
 
-    let warmup_period = first + 2 * period;
+    let warmup_period = first + adxr_lookback(period);
     let mut out = alloc_with_nan_prefix(len, warmup_period);
     unsafe {
         match chosen {
@@ -315,7 +312,7 @@ pub fn adxr_into_slice(dst: &mut [f64], input: &AdxrInput, kern: Kernel) -> Resu
         }
     }
 
-    let warmup_end = (first + 2 * period).min(dst.len());
+    let warmup_end = (first + adxr_lookback(period)).min(dst.len());
     for v in &mut dst[..warmup_end] {
         *v = f64::NAN;
     }
@@ -323,7 +320,6 @@ pub fn adxr_into_slice(dst: &mut [f64], input: &AdxrInput, kern: Kernel) -> Resu
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn adxr_into(input: &AdxrInput, out: &mut [f64]) -> Result<(), AdxrError> {
     adxr_into_slice(out, input, Kernel::Auto)
@@ -347,7 +343,7 @@ pub fn adxr_scalar(
     let rp = 1.0 / p;
     let om = 1.0 - rp;
     let pm1 = p - 1.0;
-    let warmup_start = first + 2 * period;
+    let warmup_start = first + adxr_lookback(period);
 
     let mut atr_sum = 0.0;
     let mut plus_dm_sum = 0.0;
@@ -393,8 +389,18 @@ pub fn adxr_scalar(
     let mut adx_last = f64::NAN;
     let mut have_adx = false;
 
-    let mut adx_ring = vec![f64::NAN; period];
+    let mut adx_ring = vec![f64::NAN; adxr_lag(period)];
     let mut head = 0usize;
+
+    if dx_count == period {
+        adx_last = dx_sum * rp;
+        have_adx = true;
+        let previous_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_last);
+        let initial_adx_index = first + period;
+        if initial_adx_index >= warmup_start && initial_adx_index < len {
+            out[initial_adx_index] = 0.5 * (adx_last + previous_adx);
+        }
+    }
 
     let mut i = first + period + 1;
     while i < len {
@@ -437,12 +443,7 @@ pub fn adxr_scalar(
                 adx_last = dx_sum * rp;
                 have_adx = true;
 
-                let prev_adx = adx_ring[head];
-                adx_ring[head] = adx_last;
-                head += 1;
-                if head == period {
-                    head = 0;
-                }
+                let prev_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_last);
 
                 if i >= warmup_start {
                     let v = if prev_adx.is_finite() {
@@ -457,12 +458,7 @@ pub fn adxr_scalar(
             let adx_curr = (adx_last * pm1 + dx) * rp;
             adx_last = adx_curr;
 
-            let prev_adx = adx_ring[head];
-            adx_ring[head] = adx_curr;
-            head += 1;
-            if head == period {
-                head = 0;
-            }
+            let prev_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_curr);
 
             if i >= warmup_start {
                 let v = if prev_adx.is_finite() {
@@ -553,7 +549,7 @@ unsafe fn adxr_scalar_unchecked(
     let rp = 1.0 / p;
     let om = 1.0 - rp;
     let pm1 = p - 1.0;
-    let warmup_start = first + 2 * period;
+    let warmup_start = first + adxr_lookback(period);
 
     let mut atr_sum = 0.0;
     let mut plus_dm_sum = 0.0;
@@ -601,8 +597,18 @@ unsafe fn adxr_scalar_unchecked(
     let mut adx_last = f64::NAN;
     let mut have_adx = false;
 
-    let mut adx_ring = vec![f64::NAN; period];
+    let mut adx_ring = vec![f64::NAN; adxr_lag(period)];
     let mut head = 0usize;
+
+    if dx_count == period {
+        adx_last = dx_sum * rp;
+        have_adx = true;
+        let previous_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_last);
+        let initial_adx_index = first + period;
+        if initial_adx_index >= warmup_start && initial_adx_index < len {
+            *out.get_unchecked_mut(initial_adx_index) = 0.5 * (adx_last + previous_adx);
+        }
+    }
 
     i = first + period + 1;
     while i < len {
@@ -645,12 +651,7 @@ unsafe fn adxr_scalar_unchecked(
                 adx_last = dx_sum * rp;
                 have_adx = true;
 
-                let prev_adx = *adx_ring.get_unchecked(head);
-                *adx_ring.get_unchecked_mut(head) = adx_last;
-                head += 1;
-                if head == period {
-                    head = 0;
-                }
+                let prev_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_last);
 
                 if i >= warmup_start {
                     let v = if prev_adx.is_finite() {
@@ -665,12 +666,7 @@ unsafe fn adxr_scalar_unchecked(
             let adx_curr = (adx_last * pm1 + dx) * rp;
             adx_last = adx_curr;
 
-            let prev_adx = *adx_ring.get_unchecked(head);
-            *adx_ring.get_unchecked_mut(head) = adx_curr;
-            head += 1;
-            if head == period {
-                head = 0;
-            }
+            let prev_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_curr);
 
             if i >= warmup_start {
                 let v = if prev_adx.is_finite() {
@@ -719,7 +715,7 @@ pub fn adxr_batch_with_kernel(
         .map(|p| {
             let first = c.iter().position(|x| !x.is_nan()).unwrap_or(0);
 
-            first + 2 * p.period.unwrap()
+            first + adxr_lookback(p.period.unwrap())
         })
         .collect();
     init_matrix_prefixes(&mut buf_mu, cols, &warm);
@@ -926,7 +922,7 @@ fn adxr_row_from_precomputed(
     let rp = 1.0 / p;
     let om = 1.0 - rp;
     let pm1 = p - 1.0;
-    let warmup_start = first + 2 * period;
+    let warmup_start = first + adxr_lookback(period);
 
     let atr0 = prefix_tr.get(period).copied().unwrap_or(0.0);
     let pdm0 = prefix_pdm.get(period).copied().unwrap_or(0.0);
@@ -947,8 +943,18 @@ fn adxr_row_from_precomputed(
     let mut dx_count: usize = 1;
     let mut adx_last = f64::NAN;
     let mut have_adx = false;
-    let mut adx_ring = vec![f64::NAN; period];
+    let mut adx_ring = vec![f64::NAN; adxr_lag(period)];
     let mut head = 0usize;
+
+    if dx_count == period {
+        adx_last = dx_sum * rp;
+        have_adx = true;
+        let previous_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_last);
+        let initial_adx_index = first + period;
+        if initial_adx_index >= warmup_start && initial_adx_index < len {
+            out[initial_adx_index] = 0.5 * (adx_last + previous_adx);
+        }
+    }
 
     let mut i = first + period + 1;
     while i < len {
@@ -977,12 +983,7 @@ fn adxr_row_from_precomputed(
                 adx_last = dx_sum * rp;
                 have_adx = true;
 
-                let prev_adx = adx_ring[head];
-                adx_ring[head] = adx_last;
-                head += 1;
-                if head == period {
-                    head = 0;
-                }
+                let prev_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_last);
 
                 if i >= warmup_start {
                     let v = if prev_adx.is_finite() {
@@ -997,12 +998,7 @@ fn adxr_row_from_precomputed(
             let adx_curr = (adx_last * pm1 + dx) * rp;
             adx_last = adx_curr;
 
-            let prev_adx = adx_ring[head];
-            adx_ring[head] = adx_curr;
-            head += 1;
-            if head == period {
-                head = 0;
-            }
+            let prev_adx = adxr_push_lagged(&mut adx_ring, &mut head, adx_curr);
 
             if i >= warmup_start {
                 let v = if prev_adx.is_finite() {
@@ -1070,7 +1066,7 @@ fn adxr_batch_inner(
 
     let warm: Vec<usize> = combos
         .iter()
-        .map(|c| first + 2 * c.period.unwrap())
+        .map(|c| first + adxr_lookback(c.period.unwrap()))
         .collect();
 
     init_matrix_prefixes(&mut buf_mu, cols, &warm);
@@ -1216,7 +1212,7 @@ pub fn adxr_batch_inner_into(
 
     let warm: Vec<usize> = combos
         .iter()
-        .map(|c| first + 2 * c.period.unwrap())
+        .map(|c| first + adxr_lookback(c.period.unwrap()))
         .collect();
 
     let out_mu: &mut [std::mem::MaybeUninit<f64>] = unsafe {
@@ -1410,7 +1406,7 @@ impl AdxrStream {
             dx_count: 0,
             adx_last: f64::NAN,
             have_adx: false,
-            adx_ring: vec![f64::NAN; period],
+            adx_ring: vec![f64::NAN; adxr_lag(period)],
             head: 0,
             prev_hlc: None,
             seen: 0,
@@ -1458,6 +1454,15 @@ impl AdxrStream {
                 };
                 self.dx_sum = dx0;
                 self.dx_count = 1;
+                if self.dx_count == self.period {
+                    self.adx_last = self.dx_sum * self.rp;
+                    self.have_adx = true;
+                    let previous_adx =
+                        adxr_push_lagged(&mut self.adx_ring, &mut self.head, self.adx_last);
+                    return previous_adx
+                        .is_finite()
+                        .then_some(0.5 * (self.adx_last + previous_adx));
+                }
             }
             return None;
         }
@@ -1483,18 +1488,18 @@ impl AdxrStream {
                 self.adx_last = self.dx_sum * self.rp;
                 self.have_adx = true;
 
-                self.adx_ring[self.head] = self.adx_last;
-                self.head = (self.head + 1) % self.period;
-                return None;
+                let previous_adx =
+                    adxr_push_lagged(&mut self.adx_ring, &mut self.head, self.adx_last);
+                return previous_adx
+                    .is_finite()
+                    .then_some(0.5 * (self.adx_last + previous_adx));
             }
         }
 
         let adx_curr = (self.adx_last.mul_add(self.pm1, dx)) * self.rp;
         self.adx_last = adx_curr;
 
-        let adx_period_ago = self.adx_ring[self.head];
-        self.adx_ring[self.head] = adx_curr;
-        self.head = (self.head + 1) % self.period;
+        let adx_period_ago = adxr_push_lagged(&mut self.adx_ring, &mut self.head, adx_curr);
 
         if adx_period_ago.is_finite() {
             Some(0.5 * (adx_curr + adx_period_ago))
@@ -1504,58 +1509,17 @@ impl AdxrStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = adxr_js(high, low, close, period)?;
-    crate::write_wasm_f64_output("adxr_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_batch_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = adxr_batch_js(high, low, close, period_start, period_end, period_step)?;
-    crate::write_wasm_f64_output("adxr_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_batch_unified_output_into_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = adxr_batch_unified_js(high, low, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("adxr_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
 
     fn check_adxr_partial_params(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdxrInput::from_candles(&candles, AdxrParams { period: None });
         let output = adxr_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -1564,8 +1528,8 @@ mod tests {
 
     fn check_adxr_accuracy(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdxrInput::from_candles(&candles, AdxrParams::default());
         let result = adxr_with_kernel(&input, kernel)?;
         let expected = [37.10, 37.3, 37.0, 36.2, 36.3];
@@ -1628,8 +1592,8 @@ mod tests {
 
     fn check_adxr_reinput(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_input = AdxrInput::from_candles(&candles, AdxrParams { period: Some(14) });
         let first_result = adxr_with_kernel(&first_input, kernel)?;
         let high = &candles.high;
@@ -1643,8 +1607,8 @@ mod tests {
 
     fn check_adxr_nan_handling(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = AdxrInput::from_candles(&candles, AdxrParams { period: Some(14) });
         let res = adxr_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -1689,8 +1653,8 @@ mod tests {
     fn check_adxr_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             AdxrParams::default(),
@@ -1834,7 +1798,7 @@ mod tests {
 
                 let first = close_data.iter().position(|x| !x.is_nan()).unwrap_or(0);
 
-                let warmup_period = first + 2 * period;
+                let warmup_period = first + adxr_lookback(period);
 
                 for i in 0..out.len() {
                     let y = out[i];
@@ -1942,8 +1906,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = AdxrBatchBuilder::new().kernel(kernel).apply_candles(&c)?;
         let def = AdxrParams::default();
         let row = output.values_for(&def).expect("default row missing");
@@ -1975,8 +1939,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -2080,13 +2044,8 @@ mod tests {
         let baseline = adxr(&input)?.values;
 
         let mut out = vec![0.0f64; len];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         {
             adxr_into(&input, &mut out)?;
-        }
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            adxr_into_slice(&mut out, &input, Kernel::Auto)?;
         }
 
         assert_eq!(baseline.len(), out.len());
@@ -2096,505 +2055,5 @@ mod tests {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adxr")]
-#[pyo3(signature = (high, low, close, period=None, kernel=None))]
-pub fn adxr_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    period: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let high_slice = high.as_slice()?;
-    let low_slice = low.as_slice()?;
-    let close_slice = close.as_slice()?;
-
-    if high_slice.len() != low_slice.len() || high_slice.len() != close_slice.len() {
-        return Err(PyValueError::new_err(format!(
-            "HLC data length mismatch: high={}, low={}, close={}",
-            high_slice.len(),
-            low_slice.len(),
-            close_slice.len()
-        )));
-    }
-
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = AdxrParams {
-        period: period.or(Some(14)),
-    };
-    let adxr_in = AdxrInput::from_slices(high_slice, low_slice, close_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| adxr_with_kernel(&adxr_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "AdxrStream")]
-pub struct AdxrStreamPy {
-    stream: AdxrStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl AdxrStreamPy {
-    #[new]
-    #[pyo3(signature = (period=None))]
-    fn new(period: Option<usize>) -> PyResult<Self> {
-        let params = AdxrParams {
-            period: period.or(Some(14)),
-        };
-        let stream =
-            AdxrStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(AdxrStreamPy { stream })
-    }
-
-    fn update(&mut self, high: f64, low: f64, close: f64) -> Option<f64> {
-        self.stream.update(high, low, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "adxr_batch")]
-#[pyo3(signature = (high, low, close, period_range, kernel=None))]
-pub fn adxr_batch_py<'py>(
-    py: Python<'py>,
-    high: numpy::PyReadonlyArray1<'py, f64>,
-    low: numpy::PyReadonlyArray1<'py, f64>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let h = high.as_slice()?;
-    let l = low.as_slice()?;
-    let c = close.as_slice()?;
-
-    if h.len() != l.len() || h.len() != c.len() {
-        return Err(PyValueError::new_err(format!(
-            "HLC data length mismatch: high={}, low={}, close={}",
-            h.len(),
-            l.len(),
-            c.len()
-        )));
-    }
-
-    let sweep = AdxrBatchRange {
-        period: period_range,
-    };
-    let combos_probe = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos_probe.len();
-    let cols = c.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let k = crate::utilities::kernel_validation::validate_kernel(kernel, true)?;
-    let simd = match k {
-        Kernel::Auto => match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        },
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        other => other,
-    };
-
-    let combos = py
-        .allow_threads(|| adxr_batch_inner_into(h, l, c, &sweep, simd, true, out_slice))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "adxr_cuda_batch_dev")]
-#[pyo3(signature = (high_f32, low_f32, close_f32, period_range, device_id=0))]
-pub fn adxr_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    high_f32: numpy::PyReadonlyArray1<'py, f32>,
-    low_f32: numpy::PyReadonlyArray1<'py, f32>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<AdxrDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let h = high_f32.as_slice()?;
-    let l = low_f32.as_slice()?;
-    let c = close_f32.as_slice()?;
-    let sweep = AdxrBatchRange {
-        period: period_range,
-    };
-    let (inner, ctx_arc, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAdxr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let (dev, _combos) = cuda
-            .adxr_batch_dev(h, l, c, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((dev, cuda.context_arc_clone(), cuda.device_id()))
-    })?;
-    Ok(AdxrDeviceArrayF32Py {
-        inner: Some(inner),
-        _ctx: ctx_arc,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "adxr_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (high_tm_f32, low_tm_f32, close_tm_f32, period, device_id=0))]
-pub fn adxr_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    high_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    low_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    close_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<AdxrDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let shape = high_tm_f32.shape();
-    if shape.len() != 2 || low_tm_f32.shape() != shape || close_tm_f32.shape() != shape {
-        return Err(PyValueError::new_err("expected three matching 2D arrays"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let h = high_tm_f32.as_slice()?;
-    let l = low_tm_f32.as_slice()?;
-    let c = close_tm_f32.as_slice()?;
-    let (inner, ctx_arc, dev_id) = py.allow_threads(|| {
-        let cuda = CudaAdxr::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev = cuda
-            .adxr_many_series_one_param_time_major_dev(h, l, c, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((dev, cuda.context_arc_clone(), cuda.device_id()))
-    })?;
-    Ok(AdxrDeviceArrayF32Py {
-        inner: Some(inner),
-        _ctx: ctx_arc,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "AdxrDeviceArrayF32", unsendable)]
-pub struct AdxrDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32>,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl AdxrDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = AdxrParams {
-        period: Some(period),
-    };
-    let input = AdxrInput::from_slices(high, low, close, params);
-
-    let mut output = vec![0.0; close.len()];
-
-    adxr_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_batch_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AdxrBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    adxr_batch_inner(high, low, close, &sweep, Kernel::Scalar, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = AdxrBatchRange {
-        period: (period_start, period_end, period_step),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut metadata = Vec::with_capacity(combos.len());
-
-    for combo in combos {
-        metadata.push(combo.period.unwrap() as f64);
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdxrBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct AdxrBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<AdxrParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = adxr_batch)]
-pub fn adxr_batch_unified_js(
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: AdxrBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = AdxrBatchRange {
-        period: config.period_range,
-    };
-
-    let output = adxr_batch_inner(high, low, close, &sweep, Kernel::Scalar, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = AdxrBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        if period == 0 || period > len {
-            return Err(JsValue::from_str("Invalid period"));
-        }
-
-        let params = AdxrParams {
-            period: Some(period),
-        };
-        let input = AdxrInput::from_slices(high, low, close, params);
-
-        if high_ptr == out_ptr as *const f64
-            || low_ptr == out_ptr as *const f64
-            || close_ptr == out_ptr as *const f64
-        {
-            let mut temp = vec![0.0; len];
-            adxr_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            adxr_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn adxr_batch_into(
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if high_ptr.is_null() || low_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-    unsafe {
-        let h = std::slice::from_raw_parts(high_ptr, len);
-        let l = std::slice::from_raw_parts(low_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = AdxrBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        adxr_batch_inner_into(h, l, c, &sweep, Kernel::Scalar, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
     }
 }

@@ -506,7 +506,28 @@ pub struct CanonicalSurvivor {
     pub gene: Gene,
 }
 
-pub const STREAMING_RUN_PORTFOLIO_SCHEMA_VERSION: u32 = 1;
+pub const STREAMING_RUN_PORTFOLIO_SCHEMA_VERSION: u32 = 2;
+
+/// One immutable, batch-local validation snapshot referenced by the run-level
+/// streaming artifact. The local gene is authoritative; the remapped gene in
+/// [`CanonicalSurvivor`] deliberately is not exact-hash-equivalent.
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamingBatchValidationSnapshotRefV1 {
+    pub source_cursor: usize,
+    pub snapshot_root: String,
+    pub pointer: crate::validation_snapshot::DiscoveryValidationSnapshotPointerV1,
+}
+
+/// Explicit fail-closed boundary for canonical-remapped streaming survivors.
+/// A future semantic remap proof may add a new versioned variant; v1 authorizes
+/// only the exact local genes stored inside the referenced batch snapshots.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "authority", rename_all = "snake_case")]
+pub enum StreamingPromotionAuthorityV1 {
+    PerBatchLocalOnly {
+        batch_snapshots: Vec<StreamingBatchValidationSnapshotRefV1>,
+    },
+}
 
 /// The run-level artifact of a streaming sweep: the union portfolio, the
 /// canonical name list its genes address, and the full batch census.
@@ -519,6 +540,7 @@ pub struct StreamingRunPortfolio {
     /// INVARIANT 1's list. Gene indices below are positions into THIS.
     pub canonical_feature_names: Vec<String>,
     pub survivors: Vec<CanonicalSurvivor>,
+    pub promotion_authority: StreamingPromotionAuthorityV1,
     /// Cursor the sweep would resume from — one integer, the whole resumable
     /// state.
     pub next_cursor: usize,
@@ -619,7 +641,9 @@ mod tests {
     fn range_assertion_catches_an_escaped_local_index() {
         let mut canon = CanonicalFeatureIndex::new();
         let local = vec!["a".to_string()];
-        let _ = canon.remap_gene(&gene_with("ok", vec![0]), &local, 0).unwrap();
+        let _ = canon
+            .remap_gene(&gene_with("ok", vec![0]), &local, 0)
+            .unwrap();
         // A gene that never went through `remap_gene` still carries a LOCAL
         // index — the exact escape invariant 2 exists to prevent.
         let escaped = vec![gene_with("escaped", vec![9])];

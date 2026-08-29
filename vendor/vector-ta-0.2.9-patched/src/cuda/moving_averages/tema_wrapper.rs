@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::DeviceArrayF32;
 use crate::indicators::moving_averages::tema::{TemaBatchRange, TemaParams};
@@ -6,15 +6,15 @@ use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const WARP: u32 = 32;
 #[inline]
@@ -880,15 +880,17 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "tema",
-            "one_series_many_params",
-            "tema_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "tema",
+                "one_series_many_params",
+                "tema_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }
 
@@ -897,11 +899,11 @@ impl CudaTema {
         unsafe {
             use cust::device::Device as CuDevice;
             use cust::sys::{
-                cuCtxSetLimit, cuDeviceGetAttribute, cuStreamSetAttribute,
                 CUaccessPolicyWindow_v1 as CUaccessPolicyWindow,
                 CUaccessProperty_enum as AccessProp, CUdevice_attribute_enum as DevAttr,
                 CUlimit_enum as CULimit, CUstreamAttrID_enum as StreamAttrId,
-                CUstreamAttrValue_v1 as CUstreamAttrValue,
+                CUstreamAttrValue_v1 as CUstreamAttrValue, cuCtxSetLimit, cuDeviceGetAttribute,
+                cuStreamSetAttribute,
             };
 
             let mut max_win_i32: i32 = 0;

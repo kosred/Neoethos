@@ -1,13 +1,13 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
-use crate::indicators::var::{var_expand_grid, VarBatchRange, VarParams};
+use crate::indicators::var::{VarBatchRange, VarParams, var_expand_grid};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::error::CudaError;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, DeviceCopy, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -71,11 +71,11 @@ impl CudaVar {
         unsafe {
             use cust::device::Device as CuDevice;
             use cust::sys::{
-                cuCtxSetLimit, cuDeviceGetAttribute, cuStreamSetAttribute,
                 CUaccessPolicyWindow_v1 as CUaccessPolicyWindow,
                 CUaccessProperty_enum as AccessProp, CUdevice_attribute_enum as DevAttr,
                 CUlimit_enum as CULimit, CUstreamAttrID_enum as StreamAttrId,
-                CUstreamAttrValue_v1 as CUstreamAttrValue,
+                CUstreamAttrValue_v1 as CUstreamAttrValue, cuCtxSetLimit, cuDeviceGetAttribute,
+                cuStreamSetAttribute,
             };
 
             let mut max_window_bytes_i32: i32 = 0;
@@ -159,11 +159,6 @@ impl CudaVar {
             device.get_attribute(DeviceAttribute::MaxThreadsPerBlock)? as u32;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/var_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("var_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
@@ -909,14 +904,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "var",
-            "one_series_many_params",
-            "var_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "var",
+                "one_series_many_params",
+                "var_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }

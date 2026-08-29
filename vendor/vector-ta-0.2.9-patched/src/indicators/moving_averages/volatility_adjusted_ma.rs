@@ -1,33 +1,13 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::vama_wrapper::DeviceArrayF32Vama;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 
-use crate::indicators::moving_averages::ema::{ema, ema_into_slice, EmaInput, EmaParams};
-use crate::indicators::moving_averages::sma::{sma, sma_into_slice, SmaInput, SmaParams};
-use crate::indicators::moving_averages::wma::{wma, wma_into_slice, WmaInput, WmaParams};
+use crate::indicators::moving_averages::ema::{EmaInput, EmaParams, ema, ema_into_slice};
+use crate::indicators::moving_averages::sma::{SmaInput, SmaParams, sma, sma_into_slice};
+use crate::indicators::moving_averages::wma::{WmaInput, WmaParams, wma, wma_into_slice};
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -85,10 +65,6 @@ pub struct VamaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct VamaParams {
     pub base_period: Option<usize>,
     pub vol_period: Option<usize>,
@@ -619,7 +595,6 @@ pub fn vama_with_kernel(input: &VamaInput, kernel: Kernel) -> Result<VamaOutput,
     Ok(VamaOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn vama_into(input: &VamaInput, out: &mut [f64]) -> Result<(), VamaError> {
     vama_into_slice(out, input, Kernel::Auto)
 }
@@ -1519,502 +1494,13 @@ pub fn vama_batch_with_kernel(
     vama_batch_inner(data, ranges, simd, parallel)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "vama")]
-#[pyo3(signature = (data, base_period=None, vol_period=51, smoothing=true, smooth_type=3, smooth_period=5, kernel=None, length=None))]
-pub fn vama_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    base_period: Option<usize>,
-    vol_period: usize,
-    smoothing: bool,
-    smooth_type: usize,
-    smooth_period: usize,
-    kernel: Option<&str>,
-    length: Option<usize>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let k = validate_kernel(kernel, false)?;
-
-    let data_slice: &[f64];
-    let owned;
-    match data.as_slice() {
-        Ok(s) => {
-            data_slice = s;
-        }
-        Err(_) => {
-            owned = data.to_owned_array();
-            data_slice = owned.as_slice().unwrap();
-        }
-    }
-
-    let base_p = match (length, base_period) {
-        (Some(len), _) => len,
-        (None, Some(bp)) => bp,
-        (None, None) => 113,
-    };
-    let params = VamaParams {
-        base_period: Some(base_p),
-        vol_period: Some(vol_period),
-        smoothing: Some(smoothing),
-        smooth_type: Some(smooth_type),
-        smooth_period: Some(smooth_period),
-    };
-    let input = VamaInput::from_slice(data_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| vama_with_kernel(&input, k).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "vama_batch")]
-#[pyo3(signature = (data, base_period_range=None, vol_period_range=(40,60,10), kernel=None, length_range=None))]
-pub fn vama_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    base_period_range: Option<(usize, usize, usize)>,
-    vol_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-    length_range: Option<(usize, usize, usize)>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in: &[f64];
-    let owned;
-    match data.as_slice() {
-        Ok(s) => slice_in = s,
-        Err(_) => {
-            owned = data.to_owned_array();
-            slice_in = owned.as_slice().unwrap();
-        }
-    }
-
-    let base_rng = match (length_range, base_period_range) {
-        (Some(lr), _) => lr,
-        (None, Some(br)) => br,
-        (None, None) => (100, 130, 10),
-    };
-    let ranges = VamaBatchRange {
-        base_period: base_rng,
-        vol_period: vol_period_range,
-    };
-    let kern = validate_kernel(kernel, true)?;
-
-    let combos = expand_grid_vama(&ranges).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("vama_batch: rows*cols overflow"))?;
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-
-    let out_slice = unsafe { out_arr.as_slice_mut()? };
-
-    let simd = match kern {
-        Kernel::Auto => match detect_best_batch_kernel() {
-            Kernel::Avx512Batch => Kernel::Avx512,
-            Kernel::Avx2Batch => Kernel::Avx2,
-            _ => Kernel::Scalar,
-        },
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => return Err(PyValueError::new_err("invalid batch kernel")),
-    };
-
-    let first = slice_in
-        .iter()
-        .position(|x| !x.is_nan())
-        .ok_or_else(|| PyValueError::new_err("vama: All values are NaN"))?;
-    py.allow_threads(|| {
-        vama_batch_inner_into_with_simd(slice_in, &combos, first, simd, out_slice, cols, true)
-    })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "base_periods",
-        combos
-            .iter()
-            .map(|p| p.base_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "vol_periods",
-        combos
-            .iter()
-            .map(|p| p.vol_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict.into())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vama_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, base_period_range=(100,130,10), vol_period_range=(40,60,10), device_id=0))]
-pub fn vama_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: PyReadonlyArray1<'_, f32>,
-    base_period_range: (usize, usize, usize),
-    vol_period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<VamaDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::CudaVama;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice_in = data_f32.as_slice()?;
-    let ranges = VamaBatchRange {
-        base_period: base_period_range,
-        vol_period: vol_period_range,
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaVama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.vama_batch_dev(slice_in, &ranges)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(VamaDeviceArrayF32Py { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "vama_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, base_period, vol_period, device_id=0))]
-pub fn vama_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: PyReadonlyArray2<'_, f32>,
-    base_period: usize,
-    vol_period: usize,
-    device_id: usize,
-) -> PyResult<VamaDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::CudaVama;
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    if base_period == 0 || vol_period == 0 {
-        return Err(PyValueError::new_err(
-            "base_period and vol_period must be positive",
-        ));
-    }
-
-    let flat: &[f32] = data_tm_f32.as_slice()?;
-    let shape = data_tm_f32.shape();
-    let rows = shape[0];
-    let cols = shape[1];
-    let params = VamaParams {
-        base_period: Some(base_period),
-        vol_period: Some(vol_period),
-        smoothing: Some(false),
-        smooth_type: Some(3),
-        smooth_period: Some(5),
-    };
-
-    let inner = py.allow_threads(|| {
-        let cuda = CudaVama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.vama_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))
-    })?;
-
-    Ok(VamaDeviceArrayF32Py { inner })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct VamaDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32Vama,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl VamaDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.inner.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let dummy = cust::memory::DeviceBuffer::from_slice(&[])
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = self.inner.ctx.clone();
-        let device_id = self.inner.device_id;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32Vama {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-                ctx,
-                device_id,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "VamaStream")]
-pub struct VamaStreamPy {
-    stream: VamaStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl VamaStreamPy {
-    #[new]
-    #[pyo3(signature = (base_period=113, vol_period=51, smoothing=true, smooth_type=3, smooth_period=5))]
-    pub fn new(
-        base_period: usize,
-        vol_period: usize,
-        smoothing: bool,
-        smooth_type: usize,
-        smooth_period: usize,
-    ) -> PyResult<Self> {
-        let params = VamaParams {
-            base_period: Some(base_period),
-            vol_period: Some(vol_period),
-            smoothing: Some(smoothing),
-            smooth_type: Some(smooth_type),
-            smooth_period: Some(smooth_period),
-        };
-
-        let stream = VamaStream::try_new(params)
-            .map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))?;
-
-        Ok(Self { stream })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vama_js(
-    data: &[f64],
-    base_period: usize,
-    vol_period: usize,
-    smoothing: bool,
-    smooth_type: usize,
-    smooth_period: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let params = VamaParams {
-        base_period: Some(base_period),
-        vol_period: Some(vol_period),
-        smoothing: Some(smoothing),
-        smooth_type: Some(smooth_type),
-        smooth_period: Some(smooth_period),
-    };
-    let input = VamaInput::from_slice(data, params);
-    let mut out = vec![0.0; data.len()];
-    vama_into_slice(&mut out, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vama_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vama_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vama_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    base_period: usize,
-    vol_period: usize,
-    smoothing: bool,
-    smooth_type: usize,
-    smooth_period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to vama_into"));
-    }
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = VamaParams {
-            base_period: Some(base_period),
-            vol_period: Some(vol_period),
-            smoothing: Some(smoothing),
-            smooth_type: Some(smooth_type),
-            smooth_period: Some(smooth_period),
-        };
-        let input = VamaInput::from_slice(data, params);
-
-        if core::ptr::eq(in_ptr, out_ptr) {
-            let mut tmp = vec![0.0; len];
-            vama_into_slice(&mut tmp, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            vama_into_slice(out, &input, detect_best_kernel())
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VamaBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<VamaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct VamaBatchConfig {
-    pub base_period_range: (usize, usize, usize),
-    pub vol_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = vama_batch)]
-pub fn vama_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: VamaBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let ranges = VamaBatchRange {
-        base_period: cfg.base_period_range,
-        vol_period: cfg.vol_period_range,
-    };
-
-    let out = vama_batch_inner(data, &ranges, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = VamaBatchJsOutput {
-        values: out.values,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vama_output_into_js(
-    data: &[f64],
-    base_period: usize,
-    vol_period: usize,
-    smoothing: bool,
-    smooth_type: usize,
-    smooth_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = vama_js(
-        data,
-        base_period,
-        vol_period,
-        smoothing,
-        smooth_type,
-        smooth_period,
-    )?;
-    crate::write_wasm_f64_output("vama_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn vama_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = vama_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("vama_batch_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_vama_into_matches_api() -> Result<(), Box<dyn Error>> {
         let mut data = Vec::with_capacity(256);
@@ -2100,8 +1586,8 @@ mod tests {
 
     fn check_vama_warmup_nan(test_name: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let input = VamaInput::with_default_candles(&candles);
         let out = vama_with_kernel(&input, k)?;
         let first = candles.close.iter().position(|x| !x.is_nan()).unwrap();
@@ -2113,8 +1599,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_vama_no_poison(test_name: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let input = VamaInput::with_default_candles(&candles);
         let out = vama_with_kernel(&input, k)?;
         for &v in &out.values {
@@ -2130,8 +1616,8 @@ mod tests {
     }
 
     fn check_kernel_consistency(test_name: &str) -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let input = VamaInput::with_default_candles(&candles);
 
         let scalar = vama_with_kernel(&input, Kernel::Scalar)?;
@@ -2189,8 +1675,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = VamaBatchBuilder::new()
             .kernel(k)
             .base_period_static(113)
@@ -2210,8 +1696,8 @@ mod tests {
 
     fn check_batch_sweep(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = VamaBatchBuilder::new()
             .kernel(k)
             .base_period_range(100, 104, 2)
@@ -2225,8 +1711,8 @@ mod tests {
     #[cfg(debug_assertions)]
     fn check_vama_batch_no_poison(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let out = VamaBatchBuilder::new()
             .kernel(k)
             .base_period_range(2, 6, 2)
@@ -2323,8 +1809,8 @@ mod tests {
     fn check_vama_smoothing(test_name: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let data: Vec<f64> = candles.close[..100].to_vec();
 
         for smooth_type in 1..=3 {
@@ -2353,8 +1839,8 @@ mod tests {
     fn check_vama_batch_consistency(test_name: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let data: Vec<f64> = candles.close[..50].to_vec();
         let ranges = VamaBatchRange {
             base_period: (10, 12, 2),
@@ -2419,7 +1905,7 @@ mod tests {
 
     #[test]
     fn test_vama_accuracy() -> Result<(), Box<dyn Error>> {
-        use crate::utilities::data_loader::read_candles_from_csv;
+        use crate::utilities::data_loader::read_candles_from_vortex;
 
         let expected = vec![
             61437.31013970,
@@ -2429,8 +1915,8 @@ mod tests {
             61321.57890702,
         ];
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = VamaParams {
             base_period: Some(113),
@@ -2515,8 +2001,8 @@ mod tests {
 
     #[test]
     fn test_vama_builder() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let data: Vec<f64> = candles.close.clone();
 
         let result = VamaBuilder::new()
@@ -2553,8 +2039,8 @@ mod tests {
 
     #[test]
     fn test_vama_input_variants() -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let result_candles = VamaInput::with_default_candles(&candles);
         let out_candles = vama(&result_candles)?;
@@ -2574,8 +2060,8 @@ mod tests {
 
     #[test]
     fn test_vama_into_slice() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let data: Vec<f64> = candles.close.clone();
         let mut output = vec![0.0; data.len()];
 
@@ -2635,8 +2121,8 @@ mod tests {
 
     fn check_vama_partial_params(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = VamaInput::from_candles(
             &c,
             "close",
@@ -2655,8 +2141,8 @@ mod tests {
 
     fn check_vama_default_candles(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = VamaInput::with_default_candles(&c);
         match input.data {
             VamaData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -2715,8 +2201,8 @@ mod tests {
 
     fn check_vama_reinput(test: &str, k: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(k, test);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let data: Vec<f64> = candles.close[..200].to_vec();
         let params = VamaParams {
             base_period: Some(20),

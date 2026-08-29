@@ -1,5 +1,5 @@
-//! Symbol metadata — the broker-authoritative source for pip size,
-//! contract size, lot constraints and quote-conversion rates.
+//! Typed symbol metadata for pip size, contract size, lot constraints and
+//! quote-conversion inputs.
 //!
 //! Trading systems are notoriously unforgiving about hardcoded
 //! per-symbol constants. JPY pairs use a 0.01 pip; metals use 0.01 too
@@ -31,8 +31,9 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Authoritative per-symbol trading constants. All fields use the
-/// broker convention (cTrader Open API field names where possible).
+/// Per-symbol trading constants using broker conventions where possible.
+/// Values may be broker-captured or operator-supplied; operation-specific
+/// evidence gates decide whether a field is authoritative for their purpose.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SymbolMetadata {
     /// Canonical symbol — uppercase, no separators. e.g. "EURUSD".
@@ -64,18 +65,15 @@ pub struct SymbolMetadata {
     /// on price). Not authoritative — use a live quote when you have
     /// one. None for symbols with no obvious "typical" value.
     pub typical_price: Option<f64>,
-    /// **F-126 fix (2026-05-25)** — broker-authoritative typical spread
-    /// in pips for this symbol. Replaces the per-asset-class synthetic
-    /// defaults in `genetic::strategy_gene::infer_market_cost_profile`
-    /// (metal 2.5 / crypto 8 / fx 1.5 — F-029 root cause). When `Some`,
-    /// the backtest cost-model MUST use this value instead of the
-    /// asset-class heuristic. When `None`, the caller is responsible
-    /// for supplying an override or rejecting the backtest.
+    /// Optional broad-screening spread assumption in pips for this symbol.
+    /// Replaces the former per-asset-class synthetic defaults in
+    /// `genetic::strategy_gene::infer_market_cost_profile`. This field has no
+    /// per-value provenance and MUST NOT be called historical quote evidence.
+    /// Current cTrader symbol capture leaves it `None`; callers must supply an
+    /// explicit screening override or reject the backtest.
     ///
-    /// Sourced from cTrader's `ProtoOASymbol::spread` field (in pips)
-    /// or an operator override in `data/symbol_metadata.json`. Use
-    /// `serde(default)` so existing on-disk tables without this field
-    /// load with `None`.
+    /// Operator-authored tables may set it in `data/symbol_metadata.json`.
+    /// `serde(default)` keeps existing tables without the field readable.
     #[serde(default)]
     pub typical_spread_pips: Option<f64>,
     /// **F-126 fix (2026-05-25)** — broker-authoritative commission per
@@ -261,11 +259,8 @@ impl SymbolMetadata {
         if !max_loss_account_ccy.is_finite() || max_loss_account_ccy <= 0.0 {
             return None;
         }
-        let pip_value_account = self.pip_value_in_account(
-            account_currency,
-            quote_to_account_rate,
-            live_price,
-        );
+        let pip_value_account =
+            self.pip_value_in_account(account_currency, quote_to_account_rate, live_price);
         if !pip_value_account.is_finite() || pip_value_account <= 0.0 {
             return None;
         }
@@ -473,8 +468,7 @@ impl SymbolMetadata {
                 if account_currency.eq_ignore_ascii_case("USD") {
                     Some(amount)
                 } else {
-                    let r =
-                        usd_to_account_rate.filter(|v| v.is_finite() && *v > 0.0)?;
+                    let r = usd_to_account_rate.filter(|v| v.is_finite() && *v > 0.0)?;
                     Some(amount * r)
                 }
             }
@@ -502,11 +496,8 @@ impl SymbolMetadata {
         if !lots.is_finite() || lots == 0.0 {
             return None;
         }
-        let pip_value_account = self.pip_value_in_account(
-            account_currency,
-            quote_to_account_rate,
-            live_price,
-        );
+        let pip_value_account =
+            self.pip_value_in_account(account_currency, quote_to_account_rate, live_price);
         if !pip_value_account.is_finite() || pip_value_account <= 0.0 {
             return None;
         }
@@ -533,17 +524,15 @@ impl SymbolMetadata {
     /// `lot_size_cents` is the per-symbol `CTraderSymbolInfo.lot_size`
     /// value. Pass `None` and the helper returns `None` so callers
     /// don't silently underflow with a default.
-    pub fn lots_to_wire_volume(
-        &self,
-        lots: f64,
-        lot_size_cents: Option<i64>,
-    ) -> Option<i64> {
+    pub fn lots_to_wire_volume(&self, lots: f64, lot_size_cents: Option<i64>) -> Option<i64> {
         if !lots.is_finite() || lots <= 0.0 {
             return None;
         }
         let lot_size = lot_size_cents.filter(|&v| v > 0)?;
         let wire = (lots * lot_size as f64).round() as i64;
-        if wire <= 0 { return None; }
+        if wire <= 0 {
+            return None;
+        }
         Some(wire)
     }
 
@@ -561,7 +550,9 @@ impl SymbolMetadata {
         }
         let lot_size = lot_size_cents.filter(|&v| v > 0)?;
         let lots = wire_volume as f64 / lot_size as f64;
-        if !lots.is_finite() { return None; }
+        if !lots.is_finite() {
+            return None;
+        }
         Some(lots)
     }
 
@@ -592,7 +583,11 @@ impl SymbolMetadata {
             return None;
         }
         let price_delta_pips = (exit_price - entry_price) / self.pip_size;
-        let signed_pips = if is_buy { price_delta_pips } else { -price_delta_pips };
+        let signed_pips = if is_buy {
+            price_delta_pips
+        } else {
+            -price_delta_pips
+        };
         let pip_value_account = self.pip_value_in_account(
             account_currency,
             quote_to_account_rate,
@@ -868,8 +863,9 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
             max_lot: 100.0,
             lot_step: 0.01,
             typical_price: Some(2_400.0),
-            // F-126 fix: None forces caller to supply real broker spread
-            // / commission — no per-asset-class synthetic default.
+            // F-126 fix: None forces the caller to supply explicit screening
+            // spread / commission assumptions — no per-asset-class synthetic
+            // default and no implied historical quote provenance.
             typical_spread_pips: None,
             commission_per_lot: None,
             // Phase C — broker-supplied; None forces caller to fetch.
@@ -1191,10 +1187,7 @@ mod tests {
         let lots = eurusd
             .risk_money_to_lots(100.0, 20.0, "GBP", Some(0.79), None)
             .expect("ok");
-        assert!(
-            (lots - 0.6329).abs() < 1e-3,
-            "expected ≈0.633, got {lots}"
-        );
+        assert!((lots - 0.6329).abs() < 1e-3, "expected ≈0.633, got {lots}");
         // And the realized loss at 20 pips × 0.6329 lots × £7.90/pip/lot
         // should land within ~1p of the £100 budget — the round-trip
         // sanity check.
@@ -1213,12 +1206,16 @@ mod tests {
     #[test]
     fn risk_money_to_lots_refuses_zero_sl() {
         let eurusd = baked_in_default("EURUSD").unwrap();
-        assert!(eurusd
-            .risk_money_to_lots(100.0, 0.0, "USD", None, None)
-            .is_none());
-        assert!(eurusd
-            .risk_money_to_lots(100.0, -5.0, "USD", None, None)
-            .is_none());
+        assert!(
+            eurusd
+                .risk_money_to_lots(100.0, 0.0, "USD", None, None)
+                .is_none()
+        );
+        assert!(
+            eurusd
+                .risk_money_to_lots(100.0, -5.0, "USD", None, None)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1280,7 +1277,10 @@ mod tests {
         let lots = 0.01;
         let wire = eurusd.lots_to_wire_volume(lots, Some(10_000_000)).unwrap();
         let back = eurusd.wire_volume_to_lots(wire, Some(10_000_000)).unwrap();
-        assert!((back - lots).abs() < 1e-9, "round-trip lost: {back} ≠ {lots}");
+        assert!(
+            (back - lots).abs() < 1e-9,
+            "round-trip lost: {back} ≠ {lots}"
+        );
     }
 
     #[test]
@@ -1308,13 +1308,7 @@ mod tests {
         let eurusd = baked_in_default("EURUSD").unwrap();
         let pnl = eurusd
             .position_pnl_account(
-                1.0820,
-                1.0800,
-                0.1,
-                /* is_buy */ false,
-                "USD",
-                None,
-                None,
+                1.0820, 1.0800, 0.1, /* is_buy */ false, "USD", None, None,
             )
             .expect("ok");
         // pip_value $10/lot, 0.1 lot, 20 pips → $20.
@@ -1383,7 +1377,9 @@ mod tests {
     fn commission_helper_usd_per_lot_is_literal_rate() {
         // commission_type=2 UsdPerLot, rate_decimal=7.0 → flat $7/lot.
         let m = eurusd_with_ctype(2, 7.0);
-        let c = m.commission_per_lot_quote_ccy(None, None).expect("commission");
+        let c = m
+            .commission_per_lot_quote_ccy(None, None)
+            .expect("commission");
         assert!((c - 7.0).abs() < 1e-9, "expected $7, got ${c}");
     }
 
@@ -1407,7 +1403,9 @@ mod tests {
     fn commission_helper_quote_ccy_per_lot_is_literal_rate() {
         // commission_type=4 QuoteCcyPerLot → returned as-is in quote ccy.
         let m = eurusd_with_ctype(4, 12.5);
-        let c = m.commission_per_lot_quote_ccy(None, None).expect("commission");
+        let c = m
+            .commission_per_lot_quote_ccy(None, None)
+            .expect("commission");
         assert!((c - 12.5).abs() < 1e-9, "expected 12.5, got {c}");
     }
 
@@ -1449,8 +1447,7 @@ mod tests {
             "max_lot": 100.0,
             "lot_step": 0.01
         }"#;
-        let m: SymbolMetadata =
-            serde_json::from_str(legacy_json).expect("legacy deserialize");
+        let m: SymbolMetadata = serde_json::from_str(legacy_json).expect("legacy deserialize");
         assert_eq!(m.commission_type, None);
         assert_eq!(m.commission_rate_decimal, None);
     }
@@ -1535,9 +1532,10 @@ mod tests {
         let mut m = baked_in_default("EURUSD").unwrap();
         m.commission_type = Some(1);
         m.commission_rate_decimal = Some(45.0);
-        assert!(m
-            .commission_per_lot_account_ccy("EUR", Some(1.10), Some(1.20))
-            .is_none());
+        assert!(
+            m.commission_per_lot_account_ccy("EUR", Some(1.10), Some(1.20))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1548,18 +1546,20 @@ mod tests {
         m.contract_size = 1.0;
         m.commission_type = Some(3);
         m.commission_rate_decimal = Some(0.02);
-        assert!(m
-            .commission_per_lot_account_ccy("USD", Some(20_000.0), None)
-            .is_none());
+        assert!(
+            m.commission_per_lot_account_ccy("USD", Some(20_000.0), None)
+                .is_none()
+        );
     }
 
     #[test]
     fn account_commission_helper_missing_type_bails() {
         let m = baked_in_default("EURUSD").unwrap();
         // No commission_type set → must bail.
-        assert!(m
-            .commission_per_lot_account_ccy("USD", Some(1.10), None)
-            .is_none());
+        assert!(
+            m.commission_per_lot_account_ccy("USD", Some(1.10), None)
+                .is_none()
+        );
     }
 
     // ─── F-300 D.2f: USD↔account-ccy extension ───────────────────────
@@ -1577,8 +1577,8 @@ mod tests {
             .commission_per_lot_account_ccy_v2(
                 "EUR",
                 Some(1.10),
-                None,        // quote (USD) → EUR not needed; quote IS USD
-                Some(0.91),  // USD → EUR
+                None,       // quote (USD) → EUR not needed; quote IS USD
+                Some(0.91), // USD → EUR
             )
             .expect("commission");
         assert!((c - 4.5045).abs() < 1e-3, "expected ≈€4.50, got {c}");
@@ -1619,12 +1619,7 @@ mod tests {
         let mut m = baked_in_default("EURUSD").unwrap();
         m.commission_type = Some(1);
         m.commission_rate_decimal = Some(45.0);
-        let c = m.commission_per_lot_account_ccy_v2(
-            "EUR",
-            Some(1.10),
-            None,
-            None,
-        );
+        let c = m.commission_per_lot_account_ccy_v2("EUR", Some(1.10), None, None);
         assert!(c.is_none(), "must bail without USD→account rate");
     }
 

@@ -17,12 +17,12 @@ pub struct PopulationEvalInputs<'a> {
     pub close: &'a [f64],
     pub high: &'a [f64],
     pub low: &'a [f64],
-    pub indicators: ArrayView2<'a, f32>,
+    pub indicators: ArrayView2<'a, f64>,
     pub gene_offsets: &'a [i32],
     pub gene_indices: &'a [i32],
-    pub gene_weights: &'a [f32],
-    pub long_thr: &'a [f32],
-    pub short_thr: &'a [f32],
+    pub gene_weights: &'a [f64],
+    pub long_thr: &'a [f64],
+    pub short_thr: &'a [f64],
     pub month_idx: &'a [i64],
     pub day_idx: &'a [i64],
     pub timestamps: &'a [i64],
@@ -35,18 +35,15 @@ pub struct PopulationEvalInputs<'a> {
     pub stop_vol_mult: &'a [f64],
     pub smc_data: &'a [SmcRow],
     pub gene_smc_flags: &'a [SmcRow],
-    pub gate_threshold: f32,
-    pub weights: &'a [f32; 11],
+    pub gate_threshold: f64,
+    pub weights: &'a [f64; 11],
     pub settings: &'a BacktestSettings,
 }
 
 static RAYON_INIT: Once = Once::new();
 
-fn require_broker_real_historical_evaluation() -> anyhow::Result<()> {
-    neoethos_core::current_broker_financial_truth_capability_v1()
-        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
-        .map(|_| ())
-        .map_err(anyhow::Error::new)
+fn require_historical_evaluation_authority() -> anyhow::Result<()> {
+    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1().map(|_| ())
 }
 
 fn init_rayon() {
@@ -81,6 +78,116 @@ fn mean_std(values: &[f64]) -> (f64, f64) {
         return (0.0, 0.0);
     }
     (mean, std)
+}
+
+/// Versioned hard-reject marker for a completed-month return whose account-money
+/// numerator or month-start-equity denominator is not a valid finite quantity.
+/// `ga_fitness` already rejects non-finite Sharpe, so this marker must survive
+/// metric assembly instead of being folded into the generic zero scrub.
+pub(crate) const INVALID_MONTHLY_RETURN_SHARPE_V1: f64 = f64::NEG_INFINITY;
+
+/// Sharpe over completed-month percentage returns, not raw account-currency PnL.
+///
+/// The period return is `month_pnl / that_month_start_equity`. Any shape,
+/// denominator, input, intermediate, or final arithmetic failure is a candidate
+/// rejection, represented by [`INVALID_MONTHLY_RETURN_SHARPE_V1`]. Empty or
+/// single-period valid samples retain the existing zero-Sharpe behavior.
+pub(crate) fn completed_month_return_sharpe_v1(
+    monthly_pnls: &[f64],
+    month_start_equities: &[f64],
+) -> f64 {
+    if monthly_pnls.len() != month_start_equities.len() {
+        return INVALID_MONTHLY_RETURN_SHARPE_V1;
+    }
+
+    let mut sum = 0.0;
+    for (&monthly_pnl, &start_equity) in monthly_pnls.iter().zip(month_start_equities) {
+        if !monthly_pnl.is_finite() || !start_equity.is_finite() || start_equity <= 0.0 {
+            return INVALID_MONTHLY_RETURN_SHARPE_V1;
+        }
+        let period_return = monthly_pnl / start_equity;
+        if !period_return.is_finite() {
+            return INVALID_MONTHLY_RETURN_SHARPE_V1;
+        }
+        sum += period_return;
+        if !sum.is_finite() {
+            return INVALID_MONTHLY_RETURN_SHARPE_V1;
+        }
+    }
+
+    if monthly_pnls.len() < 2 {
+        return 0.0;
+    }
+    let mean = sum / monthly_pnls.len() as f64;
+    if !mean.is_finite() {
+        return INVALID_MONTHLY_RETURN_SHARPE_V1;
+    }
+
+    let mut squared_deviation_sum = 0.0;
+    for (&monthly_pnl, &start_equity) in monthly_pnls.iter().zip(month_start_equities) {
+        let period_return = monthly_pnl / start_equity;
+        let deviation = period_return - mean;
+        let squared_deviation = deviation * deviation;
+        if !squared_deviation.is_finite() {
+            return INVALID_MONTHLY_RETURN_SHARPE_V1;
+        }
+        squared_deviation_sum += squared_deviation;
+        if !squared_deviation_sum.is_finite() {
+            return INVALID_MONTHLY_RETURN_SHARPE_V1;
+        }
+    }
+
+    let stddev = (squared_deviation_sum / (monthly_pnls.len() - 1) as f64).sqrt();
+    if !stddev.is_finite() {
+        return INVALID_MONTHLY_RETURN_SHARPE_V1;
+    }
+    if stddev <= 0.0 {
+        return 0.0;
+    }
+
+    let sharpe = (mean / stddev) * 3.4641;
+    if sharpe.is_finite() {
+        sharpe
+    } else {
+        INVALID_MONTHLY_RETURN_SHARPE_V1
+    }
+}
+
+#[inline]
+fn sanitize_sharpe_v1(sharpe: f64) -> f64 {
+    if sharpe == INVALID_MONTHLY_RETURN_SHARPE_V1 || sharpe.is_finite() {
+        sharpe
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod monthly_return_sharpe_authority_v1_tests {
+    use super::{
+        INVALID_MONTHLY_RETURN_SHARPE_V1, completed_month_return_sharpe_v1, sanitize_sharpe_v1,
+    };
+
+    #[test]
+    fn equal_money_pnl_with_different_start_equity_is_not_a_zero_return_sharpe() {
+        let sharpe = completed_month_return_sharpe_v1(&[1_000.0, 1_000.0], &[100_000.0, 200_000.0]);
+        assert!(sharpe.is_finite() && sharpe > 0.0);
+    }
+
+    #[test]
+    fn invalid_denominator_is_a_fitness_rejection_sentinel_not_zero() {
+        for invalid_start in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let sharpe = completed_month_return_sharpe_v1(&[100.0], &[invalid_start]);
+            assert_eq!(sharpe, INVALID_MONTHLY_RETURN_SHARPE_V1);
+            assert_eq!(sanitize_sharpe_v1(sharpe), f64::NEG_INFINITY);
+        }
+    }
+
+    #[test]
+    fn valid_empty_or_single_period_keeps_the_existing_zero_sharpe_scope() {
+        assert_eq!(completed_month_return_sharpe_v1(&[], &[]), 0.0);
+        assert_eq!(completed_month_return_sharpe_v1(&[100.0], &[10_000.0]), 0.0);
+    }
 }
 
 /// Per-session spread overrides. Values are spread in pips for each
@@ -246,6 +353,7 @@ pub struct BacktestSettings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BacktestMetrics {
     pub net_profit: f64,
     pub sharpe: f64,
@@ -254,6 +362,7 @@ pub struct BacktestMetrics {
     pub win_rate: f64,
     pub profit_factor: f64,
     pub expectancy: f64,
+    pub monthly_target_hit_rate: f64,
     pub trade_count: usize,
     pub consistency: f64,
     pub max_daily_drawdown: f64,
@@ -278,12 +387,10 @@ pub struct BacktestMetrics {
 /// and prototype C (`prototype_c_engine/device.rs` → `metric_base + 7`). Any new
 /// producer MUST write this slot or the dominant reward silently reads 0.0.
 ///
-/// The [`BacktestMetrics`] STRUCT does not model this field, so [`BacktestMetrics::
-/// from_metric_array`] ignores slot 7 and [`BacktestMetrics::to_metric_array`] writes
-/// 0.0. That round-trip is for the struct view (display / persistence) and never feeds
-/// the GA fitness, so the divergence is intentional and contained. Code that hand-rolls
-/// a `[f64; 11]` to feed `ga_fitness` must set slot 7 to the hit-rate (0.0 disables the
-/// dominant consistency reward).
+/// [`BacktestMetrics`] models and persists this field explicitly, and its array
+/// conversions preserve all 11 slots. Code that hand-rolls a `[f64; 11]` to feed
+/// `ga_fitness` must still set slot 7 to the hit-rate (0.0 disables the dominant
+/// consistency reward).
 pub const BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX: usize = 7;
 
 impl BacktestMetrics {
@@ -292,9 +399,6 @@ impl BacktestMetrics {
     pub const MONTHLY_TARGET_HIT_RATE_INDEX: usize = BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX;
 
     pub fn from_metric_array(metrics: [f64; 11]) -> Self {
-        // metrics[7] is monthly_target_hit_rate (see the const's doc). The STRUCT
-        // does not model it — it is a GA-fitness-only signal read straight off the
-        // raw array — so it is deliberately not read here.
         Self {
             net_profit: metrics[0],
             sharpe: metrics[1],
@@ -303,6 +407,7 @@ impl BacktestMetrics {
             win_rate: metrics[4],
             profit_factor: metrics[5],
             expectancy: metrics[6],
+            monthly_target_hit_rate: metrics[Self::MONTHLY_TARGET_HIT_RATE_INDEX],
             trade_count: if metrics[8].is_finite() && metrics[8] > 0.0 {
                 metrics[8].round() as usize
             } else {
@@ -314,10 +419,6 @@ impl BacktestMetrics {
     }
 
     pub fn to_metric_array(self) -> [f64; 11] {
-        // Index 7 is monthly_target_hit_rate, which this STRUCT does not model,
-        // so the struct view writes 0.0 there. Feeding this array to ga_fitness
-        // therefore disables the dominant consistency reward — only the raw eval
-        // output (or a GPU metrics row) is valid fitness input.
         [
             self.net_profit,
             self.sharpe,
@@ -326,8 +427,7 @@ impl BacktestMetrics {
             self.win_rate,
             self.profit_factor,
             self.expectancy,
-            0.0, // slot 7: monthly_target_hit_rate is not modelled by this struct
-            // — see BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX
+            self.monthly_target_hit_rate,
             self.trade_count as f64,
             self.consistency,
             self.max_daily_drawdown,
@@ -417,8 +517,7 @@ impl Default for BacktestSettings {
 /// previously changed canonical backtest math (`initial_equity`,
 /// `month_capacity`) on every metric evaluation. The struct is the single
 /// place these values live; production callers install them once via
-/// [`install_backtest_runtime_overrides`] (or
-/// [`install_backtest_runtime_overrides_from_env`] for backward compat).
+/// [`install_backtest_runtime_overrides`].
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct BacktestRuntimeOverrides {
     /// Starting equity used for canonical backtest PnL accounting. Must be
@@ -434,8 +533,7 @@ pub struct BacktestRuntimeOverrides {
     /// **F-695 closure (2026-05-25 — F-CORE3)**: previously read inline
     /// inside `init_rayon` via `env::var("NEOETHOS_BOT_RUST_THREADS")` +
     /// `env::var("RAYON_NUM_THREADS")`. Now consolidated to this typed
-    /// boundary so the env is read once at process startup through
-    /// `BacktestRuntimeOverrides::from_env`.
+    /// boundary installed from `Settings` at process startup.
     pub rayon_threads: Option<usize>,
 }
 
@@ -495,23 +593,6 @@ pub fn install_backtest_runtime_overrides(
     overrides: BacktestRuntimeOverrides,
 ) -> Result<(), BacktestRuntimeOverrides> {
     BACKTEST_RUNTIME_OVERRIDES.set(overrides)
-}
-
-/// RETIRED 2026-08-10. Installs the typed defaults and reads no environment.
-///
-/// The symbol survives only because `lib.rs` and `genetic/mod.rs` re-export it
-/// and neither file belongs to this change; removing the re-exports and this
-/// shim is a one-line follow-up recorded in the handoff. Calling it on a
-/// production path would install DEFAULTS over the operator's config, so it
-/// says so, loudly, rather than doing it quietly.
-pub fn install_backtest_runtime_overrides_from_env() {
-    tracing::error!(
-        target: "neoethos_search::retired_env",
-        "install_backtest_runtime_overrides_from_env() is RETIRED and installs typed \
-         DEFAULTS — the NEOETHOS_BOT_BACKTEST_* / RAYON_NUM_THREADS layer no longer \
-         exists. Call install_backtest_runtime_overrides_from_settings(&settings)."
-    );
-    let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the backtest knobs from the single
@@ -806,7 +887,7 @@ pub(crate) fn fast_evaluate_strategy_core(
     high: &[f64],
     low: &[f64],
     signals: &[i8],
-    confidences: &[f32],
+    confidences: &[f64],
     month_idx: &[i64],
     day_idx: &[i64],
     timestamps: &[i64],
@@ -1275,22 +1356,22 @@ pub(crate) fn fast_evaluate_strategy_core(
         0.0
     };
 
-    let mut month_returns = Vec::new();
-    if month_ptr >= 0 {
+    let (sharpe, avg_m, std_m, completed_month_count) = if month_ptr >= 0 {
         let limit = month_ptr.min(month_capacity.saturating_sub(1) as i64) as usize;
-        month_returns.extend_from_slice(&monthly_pnls[..=limit]);
-    }
-    let (avg_m, std_m) = mean_std(&month_returns);
-
-    // Annualize Sharpe using monthly returns: sqrt(12)
-    let sharpe = if std_m > 0.0 {
-        (avg_m / std_m) * 3.4641
+        let sharpe = completed_month_return_sharpe_v1(
+            &monthly_pnls[..=limit],
+            &month_start_equities[..=limit],
+        );
+        let (avg_m, std_m) = mean_std(&monthly_pnls[..=limit]);
+        (sharpe, avg_m, std_m, limit + 1)
     } else {
-        0.0
+        (0.0, 0.0, 0.0, 0)
     };
+
+    // Custom/versioned consistency stays on its historical raw-money inputs.
     let consistency = if std_m > 0.0 {
         (avg_m / std_m).clamp(0.0, 1.0)
-    } else if avg_m > 0.0 && month_returns.len() < 2 {
+    } else if avg_m > 0.0 && completed_month_count < 2 {
         1.0
     } else {
         0.0
@@ -1381,7 +1462,7 @@ pub(crate) fn fast_evaluate_strategy_core(
     let sanitize = |v: f64| if v.is_finite() { v } else { 0.0 };
     [
         sanitize(net_profit),
-        sanitize(sharpe),
+        sanitize_sharpe_v1(sharpe),
         sanitize(peak_equity),
         sanitize(max_dd),
         sanitize(win_rate),
@@ -1702,7 +1783,7 @@ pub fn simulate_trades_broker_real(
     signals: &[i8],
     settings: &BacktestSettings,
 ) -> anyhow::Result<Vec<Trade>> {
-    require_broker_real_historical_evaluation()?;
+    require_historical_evaluation_authority()?;
     Ok(simulate_trades_core(
         close, high, low, timestamps, signals, settings,
     ))
@@ -1724,20 +1805,20 @@ pub fn simulate_trades_broker_real(
 /// signal is non-zero), so it aligns exactly with the signals slice.
 #[allow(clippy::too_many_arguments)]
 fn synthesize_signals_and_confidence_cpu(
-    indicators: ArrayView2<'_, f32>,
+    indicators: ArrayView2<'_, f64>,
     gene_offsets: &[i32],
     gene_indices: &[i32],
-    gene_weights: &[f32],
-    long_thr: &[f32],
-    short_thr: &[f32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
     smc_data: &[SmcRow],
     gene_smc_flags: &[SmcRow],
-    gate_threshold: f32,
-    weights: &[f32; 11],
+    gate_threshold: f64,
+    weights: &[f64; 11],
     gene_index: usize,
     n_samples: usize,
-) -> (Vec<i8>, Vec<f32>) {
-    let mut combined = vec![0.0_f32; n_samples];
+) -> (Vec<i8>, Vec<f64>) {
+    let mut combined = vec![0.0_f64; n_samples];
     let start = gene_offsets[gene_index] as usize;
     let end = gene_offsets[gene_index + 1] as usize;
     for i in start..end {
@@ -1752,14 +1833,14 @@ fn synthesize_signals_and_confidence_cpu(
     }
 
     let mut signals = vec![0i8; n_samples];
-    let mut confidences = vec![0.0_f32; n_samples];
+    let mut confidences = vec![0.0_f64; n_samples];
     let lt = long_thr[gene_index];
     let st = short_thr[gene_index];
     // Threshold gap normaliser for confidence; guard against a zero/inverted
     // gap so the division is always finite.
     let gap = (lt - st).abs().max(1e-6);
     let flags = gene_smc_flags[gene_index];
-    let active_sum: f32 = flags
+    let active_sum: f64 = flags
         .iter()
         .enumerate()
         .map(|(i, &f)| if f != 0 { weights[i] } else { 0.0 })
@@ -1797,7 +1878,7 @@ fn synthesize_signals_and_confidence_cpu(
         let conf = (margin / gap).clamp(0.0, 1.0);
 
         if active_sum > 0.0 {
-            let mut score = 0.0f32;
+            let mut score = 0.0f64;
             let smc = smc_data[i];
             for j in 0..11 {
                 if flags[j] != 0 {
@@ -1863,12 +1944,11 @@ pub fn gpu_submission_ceiling(bars: usize, feature_count: usize) -> Option<usize
     }
     #[cfg(feature = "gpu-b-adapter")]
     {
-        let device = eval_gpu_devices().first().copied().unwrap_or(0);
-        crate::gpu_native::prototype_b_population_eval::submission_ceiling(
-            device,
-            bars,
-            feature_count,
-        )
+        // This pre-run API has no sealed device route, so it cannot guess
+        // ordinal zero or let configuration choose one. Exact same-ordinal
+        // allocation rebatching occurs after the run probe seals its route.
+        let _ = (bars, feature_count);
+        None
     }
     #[cfg(not(feature = "gpu-b-adapter"))]
     {
@@ -1879,9 +1959,20 @@ pub fn gpu_submission_ceiling(bars: usize, feature_count: usize) -> Option<usize
     }
 }
 
+/// Standalone Prototype-B adapter build: query Prototype B directly without
+/// compiling or consulting the generic CubeCL runtime. Adapter-only builds link
+/// the honest no-device stub; `gpu-b-native` replaces it with the CUDA backend.
+#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
+pub fn gpu_submission_ceiling(bars: usize, feature_count: usize) -> Option<usize> {
+    // A no-argument sizing query cannot select a CUDA ordinal. The exact
+    // run-bound route owns device sizing and deterministic same-card rebatching.
+    let _ = (bars, feature_count);
+    None
+}
+
 /// Non-GPU build: there is no card, so there is no ceiling — callers keep their
 /// CPU-sized constants and the build compiles the same call sites unchanged.
-#[cfg(not(feature = "gpu"))]
+#[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
 pub fn gpu_submission_ceiling(_bars: usize, _feature_count: usize) -> Option<usize> {
     None
 }
@@ -1897,6 +1988,59 @@ pub fn gpu_submission_ceiling(_bars: usize, _feature_count: usize) -> Option<usi
 /// must see identical input, so normalise once at every entry point.
 pub(crate) fn normalized_stop_vol_mult(stop_vol_mult: &[f64], n_genes: usize) -> Option<Vec<f64>> {
     stop_vol_mult.is_empty().then(|| vec![0.0; n_genes])
+}
+
+#[cfg(any(test, feature = "gpu-b-adapter"))]
+fn require_exact_native_population_rows(
+    outcome: Result<Vec<[f64; 11]>, String>,
+    expected: usize,
+    lane: &'static str,
+) -> Result<Vec<[f64; 11]>, String> {
+    match outcome {
+        Ok(rows) if rows.len() == expected => Ok(rows),
+        Ok(rows) => Err(format!(
+            "Prototype B native {lane} returned {} metric rows for {expected} candidates; \
+             refusing CPU substitution",
+            rows.len()
+        )),
+        Err(error) => Err(format!(
+            "Prototype B native {lane} device evaluation failed: {error}; \
+             refusing CPU substitution"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod native_population_outcome_contract_tests {
+    use super::require_exact_native_population_rows;
+
+    #[test]
+    fn prototype_b_native_production_contract_accepts_only_the_exact_shape() {
+        let rows = vec![[1.0_f64; 11], [2.0_f64; 11]];
+        let accepted = require_exact_native_population_rows(Ok(rows.clone()), 2, "population_eval")
+            .expect("the exact native result shape must be accepted");
+        assert_eq!(accepted, rows);
+
+        let error =
+            require_exact_native_population_rows(Ok(vec![[0.0_f64; 11]]), 2, "population_eval")
+                .expect_err("a short native result must fail loud");
+        assert!(error.contains("population_eval"));
+        assert!(error.contains("returned 1 metric rows for 2 candidates"));
+        assert!(error.contains("refusing CPU substitution"));
+    }
+
+    #[test]
+    fn prototype_b_native_production_contract_propagates_device_errors() {
+        let error = require_exact_native_population_rows(
+            Err("CUDA launch failed".to_string()),
+            4,
+            "validation_eval",
+        )
+        .expect_err("a native device error must fail loud");
+        assert!(error.contains("validation_eval"));
+        assert!(error.contains("CUDA launch failed"));
+        assert!(error.contains("refusing CPU substitution"));
+    }
 }
 
 /// Is a usable CUDA card + the native f64 prototype-B lane present? The ONLY
@@ -1916,15 +2060,77 @@ fn prototype_b_card_present() -> bool {
     }
 }
 
+/// Production route for the native CUDA engine.
+///
+/// `gpu-b-adapter` type-checks this control flow against the honest no-device
+/// stub; `gpu-b-native` selects the linked CUDA implementation. When a card is
+/// present and the resolved backend did not explicitly select the CPU, the
+/// canonical population caller enters this function before the generic CubeCL
+/// lane, a Rayon pool, or a CPU work list. A native error or wrong result shape
+/// is an error; only an absent card or an explicit CPU selection returns `None`.
+#[cfg(feature = "gpu-b-adapter")]
+fn evaluate_population_b_when_available(
+    inputs: &PopulationEvalInputs<'_>,
+    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
+    lane: &'static str,
+) -> Result<Option<Vec<[f64; 11]>>, String> {
+    let expected = inputs.long_thr.len();
+    if expected == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let evidence = evidence.ok_or_else(|| {
+        format!(
+            "Prototype B native {lane} requires sealed exact population evidence; refusing detached caller buffers"
+        )
+    })?;
+    if evidence.require_cpu_route_receipt_v1().is_ok() {
+        return Ok(None);
+    }
+    evidence
+        .require_exact_cuda_device_ordinal_v1()
+        .map_err(|error| error.to_string())?;
+
+    let stop_vol_mult_fallback =
+        normalized_stop_vol_mult(inputs.stop_vol_mult, inputs.long_thr.len());
+    let stop_vol_mult = stop_vol_mult_fallback
+        .as_deref()
+        .unwrap_or(inputs.stop_vol_mult);
+    let started = std::time::Instant::now();
+    let outcome = crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+        evidence,
+        inputs.gene_offsets,
+        inputs.gene_indices,
+        inputs.gene_weights,
+        inputs.long_thr,
+        inputs.short_thr,
+        inputs.sl_pips,
+        inputs.tp_pips,
+        stop_vol_mult,
+        inputs.gene_smc_flags,
+        inputs.gate_threshold,
+        inputs.weights,
+    )
+    .map_err(|error| format!("{error:#}"));
+    let rows = require_exact_native_population_rows(outcome, expected, lane)?;
+    crate::eval_telemetry::record_device(
+        lane,
+        crate::eval_telemetry::Device::Gpu,
+        started.elapsed(),
+    );
+    Ok(Some(rows))
+}
+
 pub fn evaluate_population_core(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
-    require_broker_real_historical_evaluation().map_err(|error| error.to_string())?;
-    evaluate_population_core_unchecked(inputs)
+    require_historical_evaluation_authority().map_err(|error| error.to_string())?;
+    evaluate_population_core_unchecked(inputs, None)
 }
 
 fn evaluate_population_core_unchecked(
     inputs: PopulationEvalInputs<'_>,
+    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
 ) -> Result<Vec<[f64; 11]>, String> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
@@ -1941,6 +2147,23 @@ fn evaluate_population_core_unchecked(
         _telemetry_items,
         _telemetry_started,
     );
+    let evidence = evidence.ok_or_else(|| {
+        "population evaluation requires a run-bound sealed device route; refusing detached execution"
+            .to_string()
+    })?;
+    let cpu_route = evidence.require_cpu_route_receipt_v1().is_ok();
+    #[cfg(feature = "gpu-b-adapter")]
+    if let Some(rows) =
+        evaluate_population_b_when_available(&inputs, Some(evidence), "population_eval")?
+    {
+        return Ok(rows);
+    }
+    if !cpu_route {
+        return Err(
+            "sealed native route did not execute the native CUDA engine; refusing CPU substitution"
+                .to_string(),
+        );
+    }
     let PopulationEvalInputs {
         close,
         high,
@@ -2055,7 +2278,8 @@ fn evaluate_population_core_unchecked(
                 );
             });
         }
-        if PHASE1_GPU_SIZING_PORTED
+        if !cpu_route
+            && PHASE1_GPU_SIZING_PORTED
             && cuda_eval_signal_kernel_enabled()
             && cuda_eval_backtest_kernel_enabled()
             // An integrated / shared-memory GPU is a net loss for this eval
@@ -2152,34 +2376,20 @@ fn evaluate_population_core_unchecked(
         }
     }
 
-    // A card + the native f64 lane are present but the GPU gate above was closed
-    // (a kernel kill-switch or an integrated-GPU verdict). Refuse the silent CPU
-    // tail — this is one of the seams that hid `prop_search_device: cpu`: a run
-    // that puts nothing on the card looks identical to a healthy one, only
-    // slower. This closes the seam for EVERY caller of evaluate_population_core,
-    // including the ones that bypass the backend dispatch (evaluate_genes ->
-    // regime_labels), which the match arms cannot reach.
-    // The one exception is the deliberate `cpu_forced` escape: when the operator
-    // installed a CPU backend by name, running on the CPU is what was asked for,
-    // so the guard must not override it (this is also the only way a
-    // dispatch-bypassing caller can honour the escape at all).
-    #[cfg(feature = "gpu-b-adapter")]
-    if crate::gpu_native::prototype_b_population_eval::prototype_b_available()
-        && crate::backend::current_evaluation_backend().device
-            != crate::backend::DevicePreference::Cpu
-    {
-        return Err(
-            "a CUDA card + prototype B are present but the GPU population lane gate was \
-             closed (kernel kill-switch / integrated-GPU verdict); refusing the silent CPU \
-             tail — fix the fault or set models.prop_search_device: cpu_forced"
-                .to_string(),
-        );
-    }
-
-    // Full-CPU path: no GPU feature, GPU disabled (card-less build), or a
-    // degenerate split. Time the WALL and attribute it to the CPU device.
+    // The only legal CPU branch is the exact-zero-device route sealed before
+    // this evaluation. Backend configuration cannot grant or block it.
+    evidence
+        .require_cpu_route_receipt_v1()
+        .map_err(|error| error.to_string())?;
     let cpu_started = std::time::Instant::now();
     let results: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+    evidence
+        .record_successful_population(
+            crate::engine_identity::PopulationEvalEngine::Cpu,
+            n_genes,
+            results.len(),
+        )
+        .map_err(|error| error.to_string())?;
     crate::eval_telemetry::record_device(
         "population_eval",
         crate::eval_telemetry::Device::Cpu,
@@ -2195,7 +2405,7 @@ fn evaluate_population_core_unchecked(
 pub(crate) fn evaluate_population_core_test_oracle(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
-    evaluate_population_core_unchecked(inputs)
+    evaluate_population_core_unchecked(inputs, None)
 }
 
 /// AREA 2 / Stage A (2026-06-09) — shared GPU-try + CPU-fallback entry for the
@@ -2222,13 +2432,15 @@ pub(crate) fn evaluate_population_core_test_oracle(
 /// This keeps the never-OOM invariant: a GPU failure becomes a slow-but-correct
 /// CPU recompute, never a crash.
 ///
-/// Determinism note: the GPU lane is f32, the CPU lane f64. Callers that consume
-/// only the SIGN of a metric (e.g. the MC profitable-run COUNT, which tests
-/// `metrics[0] > 0.0`) get CPU==GPU agreement except for a strategy whose
-/// `net_profit` sits within f32 epsilon of zero — the parity test
-/// `gpu_montecarlo_batch_matches_cpu` pins this to within ±1 run.
+/// Determinism note: both GPU and CPU lanes are f64. Callers that consume only
+/// the SIGN of a metric (e.g. the MC profitable-run COUNT, which tests
+/// `metrics[0] > 0.0`) still treat an exact zero as the no-profit boundary; the
+/// parity test `gpu_montecarlo_batch_matches_cpu` pins the result to ±1 run.
 #[cfg(feature = "gpu")]
-pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+fn validation_backtest_population_inner(
+    inputs: PopulationEvalInputs<'_>,
+    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
+) -> Vec<[f64; 11]> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
     let _telemetry_started = std::time::Instant::now();
@@ -2244,6 +2456,24 @@ pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -
         _telemetry_items,
         _telemetry_started,
     );
+    let evidence = evidence.unwrap_or_else(|| {
+        panic!(
+            "validation population requires a run-bound sealed device route; refusing detached execution"
+        )
+    });
+    let cpu_route = evidence.require_cpu_route_receipt_v1().is_ok();
+    #[cfg(feature = "gpu-b-adapter")]
+    if !cpu_route {
+        match evaluate_population_b_when_available(&inputs, Some(evidence), "validation_eval") {
+            Ok(Some(rows)) => return rows,
+            Ok(None) => panic!("sealed native validation route resolved as CPU"),
+            Err(error) => panic!("strict native validation failed: {error}"),
+        }
+    }
+    #[cfg(not(feature = "gpu-b-adapter"))]
+    if !cpu_route {
+        panic!("sealed native validation route requires the compiled native CUDA adapter");
+    }
     let PopulationEvalInputs {
         close,
         high,
@@ -2357,11 +2587,12 @@ pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -
             );
         }
     });
-    if signal_ok && backtest_ok && !integrated {
+    if !cpu_route && signal_ok && backtest_ok && !integrated {
         // See the twin in `evaluate_population_core`: the shared adapter cannot
         // tell these two callers apart on its own.
         let _lane = crate::eval_telemetry::LaneScope::enter("validation_eval");
         let gpu_started = std::time::Instant::now();
+        #[cfg(not(feature = "gpu-b-adapter"))]
         let device_override = eval_gpu_devices().first().copied();
         // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
         // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is
@@ -2396,28 +2627,20 @@ pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -
         let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(feature = "gpu-b-adapter")]
             {
+                evidence.require_exact_cuda_device_ordinal_v1()?;
                 crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-                    close,
-                    high,
-                    low,
-                    indicators,
+                    evidence,
                     gene_offsets,
                     gene_indices,
                     gene_weights,
                     long_thr,
                     short_thr,
-                    month_idx,
-                    day_idx,
-                    timestamps,
                     sl_pips,
                     tp_pips,
                     stop_vol_mult,
-                    smc_data,
                     gene_smc_flags,
                     gate_threshold,
                     weights,
-                    settings,
-                    device_override,
                 )
             }
             #[cfg(not(feature = "gpu-b-adapter"))]
@@ -2460,12 +2683,7 @@ pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -
         // `gpu-cuda` was never affected: the adapter arm cfg'd all of it out.
         // The compiler said so plainly — `unused variable: gpu`, twice — but
         // only a per-feature check ever compiled this lane to hear it.
-        // Classify the outcome, then let the shared policy decide. The default
-        // (NEOETHOS_REQUIRE_GPU unset) always recomputes on the CPU — identical
-        // to the historical behaviour. With it set, an availability fault fails
-        // loud instead of silently draining a rented card's hours on the CPU.
-        use crate::gpu_fallback::{FallbackDecision, GpuFailure, decide_env};
-        let failure = match gpu {
+        match gpu {
             Ok(Ok(v)) if v.len() == n_genes => {
                 crate::eval_telemetry::record_device(
                     "validation_eval",
@@ -2474,63 +2692,31 @@ pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -
                 );
                 return v;
             }
-            Ok(Ok(rows)) => {
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    expected = n_genes,
-                    returned = rows.len(),
-                    "validation GPU returned the wrong number of rows"
-                );
-                GpuFailure::WrongShape
-            }
-            // The error was discarded and every failure reported as allocation
-            // pressure, which sent every investigation looking at memory. A
-            // measured run had 648 600 of 655 086 items take this branch — the
-            // card doing almost none of the validation — and the reason never
-            // reached the log.
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    genes = n_genes,
-                    error = format!("{error:#}"),
-                    "validation GPU lane refused the work — this is why it is on the CPU"
-                );
-                GpuFailure::AllocationPressure
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    genes = n_genes,
-                    "validation GPU lane panicked (cubecl #243 pool) — falling back"
-                );
-                GpuFailure::AllocationPressure
-            }
-        };
-        match decide_env(failure) {
-            FallbackDecision::FailLoud => panic!(
-                "the resolved backend refuses a CPU recompute (system.enable_gpu_preference / models.prop_search_device names a *_required value) but the validation GPU lane failed \
-                 ({failure:?}); refusing to run the whole validation on the CPU. \
-                 Change that config value to allow the CPU fallback."
+            Ok(Ok(rows)) => panic!(
+                "strict validation GPU returned {} metric rows for {n_genes}; refusing CPU substitution",
+                rows.len()
             ),
-            FallbackDecision::RecomputeOnCpu => {
-                // A card-present fallback is the bad kind; count it so
-                // `device_summary` can surface a starved card at run end. On a
-                // card-less host this is a no-op and reports 0.
-                crate::eval_telemetry::note_cpu_fallback("validation_eval");
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    ?failure,
-                    "validation GPU lane unusable — recomputing on CPU"
-                );
+            Ok(Err(error)) => {
+                panic!("strict validation GPU failed: {error:#}; refusing CPU substitution")
             }
+            Err(_) => panic!("strict validation GPU panicked; refusing CPU substitution"),
         }
     }
 
-    // CPU fallback — full-population re-evaluation (fail-loud already logged).
-    // Reached after a gate-closed skip or a GPU-lane fallback; time the WALL and
-    // attribute it to the CPU device so the run-end summary is honest.
+    // Canonical CPU execution exists only under the sealed exact-zero-device
+    // receipt checked above; it is not a recovery action after native failure.
+    evidence
+        .require_cpu_route_receipt_v1()
+        .unwrap_or_else(|error| panic!("CPU validation route is not authorized: {error}"));
     let cpu_started = std::time::Instant::now();
     let out: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+    evidence
+        .record_successful_population(
+            crate::engine_identity::PopulationEvalEngine::Cpu,
+            n_genes,
+            out.len(),
+        )
+        .unwrap_or_else(|error| panic!("record exact CPU validation output: {error}"));
     crate::eval_telemetry::record_device(
         "validation_eval",
         crate::eval_telemetry::Device::Cpu,
@@ -2539,11 +2725,24 @@ pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -
     out
 }
 
+#[cfg(feature = "gpu")]
+pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    validation_backtest_population_inner(inputs, None)
+}
+
+#[cfg(feature = "gpu")]
+pub(crate) fn validation_backtest_population_with_evidence(
+    inputs: PopulationEvalInputs<'_>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+) -> Vec<[f64; 11]> {
+    validation_backtest_population_inner(inputs, Some(evidence))
+}
+
 /// Pure-CPU population evaluation — the canonical semantic reference for the
 /// whole validation tail, available in EVERY build (with or without `gpu`).
 ///
-/// It is what the non-GPU build runs, what the GPU build's fallback arm mirrors,
-/// and the in-process reference the GPU benchmark harness (Task 6) checks parity
+/// It is the in-process mathematical reference the GPU benchmark harness checks
+/// for parity. Production dispatch must validate the sealed route before entry;
 /// against. There is exactly one CPU population implementation, so the reference
 /// can never drift from what actually runs.
 pub(crate) fn validation_backtest_population_cpu(
@@ -2594,10 +2793,6 @@ pub(crate) fn validation_backtest_population_cpu(
     if n_genes == 0 {
         return Vec::new();
     }
-    // Same record as every other lane — see `engine_identity`.
-    crate::engine_identity::record_population_engine(
-        crate::engine_identity::PopulationEvalEngine::Cpu,
-    );
     let eval_gene_cpu = |g: usize| -> [f64; 11] {
         let (signals, confidences) = synthesize_signals_and_confidence_cpu(
             indicators,
@@ -2634,13 +2829,82 @@ pub(crate) fn validation_backtest_population_cpu(
     (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
 }
 
-/// CPU-only twin of [`validation_backtest_population`] for the non-GPU build, so
-/// `discovery.rs` (and any other validation consumer) compiles and runs the SAME
-/// code path with or without the `gpu` feature. Behaviour is identical to the
-/// GPU twin's fallback arm: a full-population CPU re-evaluation.
-#[cfg(not(feature = "gpu"))]
+/// Standalone native validation route. A present card is evaluated by the same
+/// direct Prototype-B function as the canonical population path. `Ok(None)` is
+/// reserved for a card-less host or an explicit CPU selection; an attempted
+/// device evaluation can only return rows or terminate with the error below.
+#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
+fn validation_backtest_population_native_only(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    let _ = inputs;
+    panic!("native validation requires a run-bound sealed device route")
+}
+
+#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
+fn validation_backtest_population_native_only_with_evidence(
+    inputs: PopulationEvalInputs<'_>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+) -> Vec<[f64; 11]> {
+    let expected = inputs.long_thr.len();
+    match evaluate_population_b_when_available(&inputs, Some(evidence), "validation_eval") {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            evidence
+                .require_cpu_route_receipt_v1()
+                .unwrap_or_else(|error| panic!("CPU validation route is not authorized: {error}"));
+            let rows = validation_backtest_population_cpu(inputs);
+            evidence
+                .record_successful_population(
+                    crate::engine_identity::PopulationEvalEngine::Cpu,
+                    expected,
+                    rows.len(),
+                )
+                .unwrap_or_else(|error| panic!("record native-only CPU validation: {error}"));
+            rows
+        }
+        Err(error) => panic!("Prototype B native validation failed: {error}"),
+    }
+}
+
+#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
 pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
-    validation_backtest_population_cpu(inputs)
+    validation_backtest_population_native_only(inputs)
+}
+
+#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
+pub(crate) fn validation_backtest_population_with_evidence(
+    inputs: PopulationEvalInputs<'_>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+) -> Vec<[f64; 11]> {
+    validation_backtest_population_native_only_with_evidence(inputs, evidence)
+}
+
+/// CPU-only twin of [`validation_backtest_population`] for a build with no GPU
+/// engine. It runs the same canonical CPU reference used when a native build is
+/// card-less or was explicitly configured for the CPU.
+#[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
+pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
+    let _ = inputs;
+    panic!("CPU validation requires a run-bound sealed zero-device receipt")
+}
+
+#[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
+pub(crate) fn validation_backtest_population_with_evidence(
+    inputs: PopulationEvalInputs<'_>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+) -> Vec<[f64; 11]> {
+    let expected = inputs.long_thr.len();
+    evidence
+        .require_cpu_route_receipt_v1()
+        .unwrap_or_else(|error| panic!("CPU validation route is not authorized: {error}"));
+    let rows = validation_backtest_population_cpu(inputs);
+    evidence
+        .record_successful_population(
+            crate::engine_identity::PopulationEvalEngine::Cpu,
+            expected,
+            rows.len(),
+        )
+        .unwrap_or_else(|error| panic!("record exact CPU validation: {error}"));
+    rows
 }
 
 // ── Scenarios: one launch, many treatments ───────────────────────────────────
@@ -2675,7 +2939,7 @@ pub fn validation_backtest_scenarios_cpu(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
 ) -> anyhow::Result<Vec<[f64; 11]>> {
-    require_broker_real_historical_evaluation()?;
+    require_historical_evaluation_authority()?;
     validation_backtest_scenarios_cpu_unchecked(inputs, scenarios)
 }
 
@@ -2757,7 +3021,7 @@ fn validation_backtest_scenarios_cpu_unchecked(
             let one_short = [perturbed
                 .as_ref()
                 .map_or(short_thr[gene], |p| p.short_threshold)];
-            let one_weights: &[f32] = perturbed
+            let one_weights: &[f64] = perturbed
                 .as_ref()
                 .map_or(&gene_weights[start..end], |p| p.weights.as_slice());
 
@@ -2830,14 +3094,57 @@ pub(crate) fn validation_backtest_scenarios_cpu_test_oracle(
 /// mirror is returned rather than swallowed — there is no third thing to try,
 /// and a screen that cannot be computed must not report a number.
 #[cfg(feature = "gpu")]
-pub fn validation_backtest_scenarios(
+fn validation_backtest_scenarios_inner(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
 ) -> anyhow::Result<Vec<[f64; 11]>> {
-    require_broker_real_historical_evaluation()?;
+    require_historical_evaluation_authority()?;
+    let evidence = evidence.ok_or_else(|| {
+        anyhow::anyhow!(
+            "validation scenarios require a run-bound sealed device route; refusing detached execution"
+        )
+    })?;
+    let cpu_route = evidence.require_cpu_route_receipt_v1().is_ok();
     let n_scenarios = scenarios.len();
     if n_scenarios == 0 {
         return Ok(Vec::new());
+    }
+    #[cfg(feature = "gpu-b-adapter")]
+    if !cpu_route {
+        evidence.require_exact_cuda_device_ordinal_v1()?;
+        let started = std::time::Instant::now();
+        let rows = crate::gpu_native::prototype_b_population_eval::try_evaluate_scenarios_b(
+            evidence,
+            inputs.gene_offsets,
+            inputs.gene_indices,
+            inputs.gene_weights,
+            inputs.long_thr,
+            inputs.short_thr,
+            inputs.sl_pips,
+            inputs.tp_pips,
+            inputs.stop_vol_mult,
+            inputs.gene_smc_flags,
+            inputs.gate_threshold,
+            inputs.weights,
+            scenarios,
+        )?;
+        if rows.len() != n_scenarios {
+            anyhow::bail!(
+                "strict native scenario evaluation returned {} rows for {n_scenarios}; refusing CPU substitution",
+                rows.len()
+            );
+        }
+        crate::eval_telemetry::record_device(
+            "validation_eval",
+            crate::eval_telemetry::Device::Gpu,
+            started.elapsed(),
+        );
+        return Ok(rows);
+    }
+    #[cfg(not(feature = "gpu-b-adapter"))]
+    if !cpu_route {
+        anyhow::bail!("sealed native scenario route requires the compiled native CUDA adapter");
     }
     let signal_ok = cuda_eval_signal_kernel_enabled();
     let backtest_ok = cuda_eval_backtest_kernel_enabled();
@@ -2866,25 +3173,6 @@ pub fn validation_backtest_scenarios(
         }
     });
 
-    // A card + the native f64 lane are present but the gate above is closed (a
-    // kernel kill-switch or an integrated-GPU verdict). Refuse the silent CPU
-    // screen, exactly as `evaluate_population_core` does: a run that puts
-    // nothing on the card looks identical to a healthy one, only slower. The
-    // `cpu_forced` escape is honoured because that is what the operator asked
-    // for by name.
-    #[cfg(feature = "gpu-b-adapter")]
-    if !(signal_ok && backtest_ok && !integrated)
-        && prototype_b_card_present()
-        && crate::backend::current_evaluation_backend().device
-            != crate::backend::DevicePreference::Cpu
-    {
-        anyhow::bail!(
-            "a CUDA card + prototype B are present but the scenario GPU lane gate was closed \
-             (kernel kill-switch / integrated-GPU verdict); refusing the silent CPU quality \
-             screen — fix the fault or set models.prop_search_device: cpu_forced"
-        );
-    }
-
     // The scenario lane exists only on Prototype B. The cubecl lane has no
     // notion of a descriptor — it takes a gene array and one settings struct —
     // so on a Vulkan/ROCm build this whole function is the CPU mirror. That is
@@ -2892,44 +3180,28 @@ pub fn validation_backtest_scenarios(
     // silently degrades to a different computation is the defect this file has
     // been repeatedly bitten by.
     #[cfg(feature = "gpu-b-adapter")]
-    if signal_ok && backtest_ok && !integrated {
+    if !cpu_route && signal_ok && backtest_ok && !integrated {
         let _lane = crate::eval_telemetry::LaneScope::enter("validation_eval");
         let gpu_started = std::time::Instant::now();
-        let device_override = eval_gpu_devices().first().copied();
+        evidence.require_exact_cuda_device_ordinal_v1()?;
         let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::gpu_native::prototype_b_population_eval::try_evaluate_scenarios_b(
-                inputs.close,
-                inputs.high,
-                inputs.low,
-                inputs.indicators,
+                evidence,
                 inputs.gene_offsets,
                 inputs.gene_indices,
                 inputs.gene_weights,
                 inputs.long_thr,
                 inputs.short_thr,
-                inputs.month_idx,
-                inputs.day_idx,
-                inputs.timestamps,
                 inputs.sl_pips,
                 inputs.tp_pips,
                 inputs.stop_vol_mult,
-                inputs.smc_data,
                 inputs.gene_smc_flags,
                 inputs.gate_threshold,
                 inputs.weights,
-                inputs.settings,
-                device_override,
                 scenarios,
             )
         }));
-        // Classify, then let the SHARED policy decide — the population twin's
-        // arms, verbatim. This lane had neither: it logged a warning and ran the
-        // CPU mirror, so on a rented card with NEOETHOS_REQUIRE_GPU set the
-        // whole quality screen (50.4 % of measured wall) went to the CPU
-        // quietly. That is the invariant landed at d8681a1d, bypassed by the
-        // newest lane.
-        use crate::gpu_fallback::{FallbackDecision, GpuFailure, decide_env};
-        let failure = match gpu {
+        match gpu {
             Ok(Ok(rows)) if rows.len() == n_scenarios => {
                 crate::eval_telemetry::record_device(
                     "validation_eval",
@@ -2938,76 +3210,33 @@ pub fn validation_backtest_scenarios(
                 );
                 return Ok(rows);
             }
-            Ok(Ok(rows)) => {
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    expected = n_scenarios,
-                    returned = rows.len(),
-                    "scenario GPU lane returned the wrong number of rows"
-                );
-                GpuFailure::WrongShape
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    scenarios = n_scenarios,
-                    error = format!("{error:#}"),
-                    "scenario GPU lane refused the work — this is why it is on the CPU"
-                );
-                GpuFailure::AllocationPressure
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    scenarios = n_scenarios,
-                    "scenario GPU lane panicked — falling back"
-                );
-                GpuFailure::AllocationPressure
-            }
-        };
-        match decide_env(failure) {
-            FallbackDecision::FailLoud => panic!(
-                "the resolved backend refuses a CPU recompute (a *_required device value) but the scenario GPU lane failed \
-                 ({failure:?}); refusing to run the whole quality screen on the CPU. \
-                 Change that config value to allow the CPU fallback."
+            Ok(Ok(rows)) => anyhow::bail!(
+                "strict scenario GPU returned {} rows for {n_scenarios}; refusing CPU substitution",
+                rows.len()
             ),
-            FallbackDecision::RecomputeOnCpu => {
-                crate::eval_telemetry::note_cpu_fallback("validation_eval");
-                tracing::warn!(
-                    target: "neoethos_search::eval",
-                    ?failure,
-                    "scenario GPU lane unusable — recomputing on CPU"
-                );
+            Ok(Err(error)) => {
+                anyhow::bail!("strict scenario GPU failed: {error:#}; refusing CPU substitution")
             }
+            Err(_) => anyhow::bail!("strict scenario GPU panicked; refusing CPU substitution"),
         }
     }
     #[cfg(not(feature = "gpu-b-adapter"))]
     {
         let _ = (signal_ok, backtest_ok, integrated);
-        // `gpu` WITHOUT `gpu-b-adapter` is a Vulkan or ROCm build, and there is
-        // no scenario lane there: the cubecl entry point takes a gene array and
-        // one settings struct, so it cannot express a descriptor list at all.
-        //
-        // The whole quality screen therefore runs on the CPU on those builds —
-        // which is a correct result and an unacceptable silence. `card_present()`
-        // is false on a non-CUDA build, so `device_summary` would take its
-        // friendly info branch and a Vulkan run would look exactly like a
-        // healthy one. Say it once, loudly, and count it.
-        static NO_SCENARIO_LANE: std::sync::Once = std::sync::Once::new();
-        NO_SCENARIO_LANE.call_once(|| {
-            tracing::warn!(
-                target: "neoethos_search::eval",
-                build = "gpu without gpu-b-adapter (Vulkan/ROCm)",
-                "this build has NO scenario GPU lane — the cubecl entry point takes a gene \
-                 array and one settings struct and cannot express a work list, so the entire \
-                 quality screen runs on the CPU. Build with `gpu-cuda` for the device lane."
-            );
-        });
-        crate::eval_telemetry::note_cpu_fallback("validation_eval");
     }
 
+    evidence.require_cpu_route_receipt_v1()?;
     let cpu_started = std::time::Instant::now();
     let out = validation_backtest_scenarios_cpu(inputs, scenarios);
+    if let Ok(rows) = &out {
+        evidence
+            .record_successful_population(
+                crate::engine_identity::PopulationEvalEngine::Cpu,
+                n_scenarios,
+                rows.len(),
+            )
+            .map_err(anyhow::Error::new)?;
+    }
     crate::eval_telemetry::record_device(
         "validation_eval",
         crate::eval_telemetry::Device::Cpu,
@@ -3016,13 +3245,138 @@ pub fn validation_backtest_scenarios(
     out
 }
 
-/// CPU-only twin for the non-GPU build. See [`validation_backtest_scenarios`].
-#[cfg(not(feature = "gpu"))]
+#[cfg(feature = "gpu")]
 pub fn validation_backtest_scenarios(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
 ) -> anyhow::Result<Vec<[f64; 11]>> {
-    validation_backtest_scenarios_cpu(inputs, scenarios)
+    validation_backtest_scenarios_inner(inputs, scenarios, None)
+}
+
+#[cfg(feature = "gpu")]
+pub(crate) fn validation_backtest_scenarios_with_evidence(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    validation_backtest_scenarios_inner(inputs, scenarios, Some(evidence))
+}
+
+/// Standalone Prototype-B adapter route without the generic CubeCL `gpu`
+/// feature. The adapter-only build reaches the honest no-device stub; a native
+/// build reaches the same sealed scenario evaluator used by the aggregate CUDA
+/// feature. Once a device attempt begins, failure is returned rather than
+/// silently recomputed on the CPU.
+#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
+fn validation_backtest_scenarios_native_only(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    require_historical_evaluation_authority()?;
+    let evidence = evidence.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Prototype B scenarios require sealed exact population evidence; refusing detached caller buffers"
+        )
+    })?;
+    let expected = scenarios.len();
+    if expected == 0 {
+        return Ok(Vec::new());
+    }
+
+    if evidence.require_cpu_route_receipt_v1().is_ok() {
+        let started = std::time::Instant::now();
+        let rows = validation_backtest_scenarios_cpu_unchecked(inputs, scenarios)?;
+        evidence
+            .record_successful_population(
+                crate::engine_identity::PopulationEvalEngine::Cpu,
+                expected,
+                rows.len(),
+            )
+            .map_err(anyhow::Error::new)?;
+        crate::eval_telemetry::record_device(
+            "validation_eval",
+            crate::eval_telemetry::Device::Cpu,
+            started.elapsed(),
+        );
+        return Ok(rows);
+    }
+
+    evidence.require_exact_cuda_device_ordinal_v1()?;
+    let started = std::time::Instant::now();
+    let rows = crate::gpu_native::prototype_b_population_eval::try_evaluate_scenarios_b(
+        evidence,
+        inputs.gene_offsets,
+        inputs.gene_indices,
+        inputs.gene_weights,
+        inputs.long_thr,
+        inputs.short_thr,
+        inputs.sl_pips,
+        inputs.tp_pips,
+        inputs.stop_vol_mult,
+        inputs.gene_smc_flags,
+        inputs.gate_threshold,
+        inputs.weights,
+        scenarios,
+    )?;
+    if rows.len() != expected {
+        anyhow::bail!(
+            "strict native scenario evaluation returned {} rows for {expected}; refusing CPU substitution",
+            rows.len()
+        );
+    }
+    crate::eval_telemetry::record_device(
+        "validation_eval",
+        crate::eval_telemetry::Device::Gpu,
+        started.elapsed(),
+    );
+    Ok(rows)
+}
+
+#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
+pub fn validation_backtest_scenarios(
+    _inputs: PopulationEvalInputs<'_>,
+    _scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    anyhow::bail!("validation scenarios require a run-bound sealed device route")
+}
+
+#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
+pub(crate) fn validation_backtest_scenarios_with_evidence(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    validation_backtest_scenarios_native_only(inputs, scenarios, Some(evidence))
+}
+
+/// CPU-only twin for a build with neither CubeCL nor the Prototype-B adapter.
+/// See [`validation_backtest_scenarios`].
+#[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
+pub fn validation_backtest_scenarios(
+    _inputs: PopulationEvalInputs<'_>,
+    _scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    anyhow::bail!("CPU validation scenarios require a run-bound sealed zero-device receipt")
+}
+
+#[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
+pub(crate) fn validation_backtest_scenarios_with_evidence(
+    inputs: PopulationEvalInputs<'_>,
+    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+) -> anyhow::Result<Vec<[f64; 11]>> {
+    let expected = scenarios.len();
+    evidence.require_cpu_route_receipt_v1()?;
+    let rows = validation_backtest_scenarios_cpu(inputs, scenarios)?;
+    evidence
+        .record_successful_population(
+            crate::engine_identity::PopulationEvalEngine::Cpu,
+            expected,
+            rows.len(),
+        )
+        .map_err(anyhow::Error::new)?;
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -3034,7 +3388,7 @@ mod scenario_mirror_tests {
     /// series, evaluated through the same CPU engine production uses.
     fn fixture() -> (
         Vec<f64>,
-        ndarray::Array2<f32>,
+        ndarray::Array2<f64>,
         Vec<SmcRow>,
         Vec<i64>,
         BacktestSettings,
@@ -3043,10 +3397,10 @@ mod scenario_mirror_tests {
         let close: Vec<f64> = (0..bars)
             .map(|i| 1.1000 + ((i as f64) * 0.37).sin() * 0.0040)
             .collect();
-        let mut indicators = ndarray::Array2::<f32>::zeros((2, bars));
+        let mut indicators = ndarray::Array2::<f64>::zeros((2, bars));
         for i in 0..bars {
-            indicators[(0, i)] = ((i as f32) * 0.11).sin();
-            indicators[(1, i)] = ((i as f32) * 0.07).cos();
+            indicators[(0, i)] = ((i as f64) * 0.11).sin();
+            indicators[(1, i)] = ((i as f64) * 0.07).cos();
         }
         let smc = vec![[0_i8; 11]; bars];
         let months = vec![0_i64; bars];
@@ -3063,19 +3417,19 @@ mod scenario_mirror_tests {
 
     fn inputs<'a>(
         close: &'a [f64],
-        indicators: &'a ndarray::Array2<f32>,
+        indicators: &'a ndarray::Array2<f64>,
         smc: &'a [SmcRow],
         months: &'a [i64],
         settings: &'a BacktestSettings,
         offsets: &'a [i32],
         idx: &'a [i32],
-        w: &'a [f32],
-        lt: &'a [f32],
-        st: &'a [f32],
+        w: &'a [f64],
+        lt: &'a [f64],
+        st: &'a [f64],
         sl: &'a [f64],
         tp: &'a [f64],
         flags: &'a [SmcRow],
-        smc_weights: &'a [f32; 11],
+        smc_weights: &'a [f64; 11],
     ) -> PopulationEvalInputs<'a> {
         PopulationEvalInputs {
             close,
@@ -3112,13 +3466,13 @@ mod scenario_mirror_tests {
         let (close, indicators, smc, months, settings) = fixture();
         let offsets = [0_i32, 1, 2];
         let idx = [0_i32, 1];
-        let w = [1.0_f32, 1.0];
-        let lt = [0.5_f32, 0.4];
-        let st = [-0.5_f32, -0.4];
+        let w = [1.0_f64, 1.0];
+        let lt = [0.5_f64, 0.4];
+        let st = [-0.5_f64, -0.4];
         let sl = [20.0_f64, 25.0];
         let tp = [40.0_f64, 50.0];
         let flags = [[0_i8; 11]; 2];
-        let smc_weights = [0.0_f32; 11];
+        let smc_weights = [0.0_f64; 11];
 
         let population = validation_backtest_population_cpu(inputs(
             &close,
@@ -3176,13 +3530,13 @@ mod scenario_mirror_tests {
         let (close, indicators, smc, months, settings) = fixture();
         let offsets = [0_i32, 1];
         let idx = [0_i32];
-        let w = [1.0_f32];
-        let lt = [0.3_f32];
-        let st = [-0.3_f32];
+        let w = [1.0_f64];
+        let lt = [0.3_f64];
+        let st = [-0.3_f64];
         let sl = [20.0_f64];
         let tp = [40.0_f64];
         let flags = [[0_i8; 11]; 1];
-        let smc_weights = [0.0_f32; 11];
+        let smc_weights = [0.0_f64; 11];
 
         let base = scenario::base_scenario(0, 0, close.len());
         // 4 pips and $9/lot against the fixture's 1 pip and $2/lot.
@@ -3236,13 +3590,13 @@ mod scenario_mirror_tests {
         let (close, indicators, smc, months, settings) = fixture();
         let offsets = [0_i32, 2];
         let idx = [0_i32, 1];
-        let w = [1.0_f32, 0.5];
-        let lt = [0.3_f32];
-        let st = [-0.3_f32];
+        let w = [1.0_f64, 0.5];
+        let lt = [0.3_f64];
+        let st = [-0.3_f64];
         let sl = [20.0_f64];
         let tp = [40.0_f64];
         let flags = [[0_i8; 11]; 1];
-        let smc_weights = [0.0_f32; 11];
+        let smc_weights = [0.0_f64; 11];
 
         let mut work_list = vec![scenario::base_scenario(0, 0, close.len())];
         for run in 0..8u64 {
@@ -3311,13 +3665,13 @@ mod scenario_mirror_tests {
         let (close, indicators, smc, months, settings) = fixture();
         let offsets = [0_i32, 1];
         let idx = [0_i32];
-        let w = [1.0_f32];
-        let lt = [0.3_f32];
-        let st = [-0.3_f32];
+        let w = [1.0_f64];
+        let lt = [0.3_f64];
+        let st = [-0.3_f64];
         let sl = [20.0_f64];
         let tp = [40.0_f64];
         let flags = [[0_i8; 11]; 1];
-        let smc_weights = [0.0_f32; 11];
+        let smc_weights = [0.0_f64; 11];
 
         let mut windowed = scenario::base_scenario(0, 0, close.len());
         windowed.window_offset = 50;
@@ -3618,7 +3972,7 @@ mod overrides_tests {
         risk_based_sizing: bool,
         risk_min: f64,
         risk_max: f64,
-        confidences: &[f32],
+        confidences: &[f64],
     ) -> [f64; 11] {
         let pip = 0.0001_f64;
         let pip_value_per_lot = 10.0_f64;
@@ -3670,7 +4024,7 @@ mod overrides_tests {
     fn risk_sizing_full_sl_loses_risk_pct() {
         // Force risk_pct = 1% by pinning min == max. Confidence is full.
         let risk = 0.01_f64;
-        let conf = vec![1.0_f32; 4];
+        let conf = vec![1.0_f64; 4];
         let initial_equity = BacktestSettings::default().initial_equity();
         let expected_loss = -risk * initial_equity; // -1% of entry equity
 
@@ -3697,7 +4051,7 @@ mod overrides_tests {
         // exactly sl_pips × pip_value_per_lot (the legacy fixed-1-lot path),
         // and must SCALE with sl_pips (unlike the risk-based path).
         let pip_value_per_lot = 10.0_f64;
-        let conf = vec![1.0_f32; 4]; // ignored when sizing is disabled
+        let conf = vec![1.0_f64; 4]; // ignored when sizing is disabled
         for sl_pips in [20.0_f64, 40.0_f64] {
             let m = run_single_sl_trade(sl_pips, false, 0.01, 0.01, &conf);
             let net_profit = m[0];
@@ -3867,13 +4221,25 @@ mod gpu_cpu_parity_tests {
     //! reproduces the CPU reference (the path the shipped binary runs) on a
     //! deterministic scenario. SMC gating is disabled (all-zero flags + zero
     //! gate) so signals are pure indicator-threshold crossings — CPU and GPU
-    //! must agree, hence the metrics match within f32-vs-f64 rounding. Skips
+    //! must agree, hence the metrics match within the declared numeric tolerance. Skips
     //! cleanly when no GPU device is present.
     use super::*;
     use ndarray::Array2;
 
+    fn real_cuda_search_test_enabled(test: &str) -> bool {
+        if std::env::var("NEOETHOS_RUN_CUDA_SEARCH_TESTS").as_deref() == Ok("1") {
+            true
+        } else {
+            eprintln!("SKIPPED {test} — set NEOETHOS_RUN_CUDA_SEARCH_TESTS=1 on a real GPU host");
+            false
+        }
+    }
+
     #[test]
     fn gpu_population_eval_matches_cpu() {
+        if !real_cuda_search_test_enabled("gpu_population_eval_matches_cpu") {
+            return;
+        }
         let n_samples = 800usize;
         let n_features = 6usize;
         let n_genes = 4usize;
@@ -3887,23 +4253,23 @@ mod gpu_cpu_parity_tests {
 
         // [features × samples], values well clear of the ±0.3 thresholds.
         let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
-            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+            (((i + f * 11) as f64) * 0.05).sin() * 0.8
         });
 
         // CSR genes: each sums 2 features (weight 1.0).
         let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
         let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4];
-        let gene_weights: Vec<f32> = vec![1.0; 8];
-        let long_thr: Vec<f32> = vec![0.3; n_genes];
-        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; 8];
+        let long_thr: Vec<f64> = vec![0.3; n_genes];
+        let short_thr: Vec<f64> = vec![-0.3; n_genes];
         let sl_pips: Vec<f64> = vec![25.0; n_genes];
         let tp_pips: Vec<f64> = vec![50.0; n_genes];
 
         // SMC gating OFF: zero flags + zero gate → signals pass through ungated.
         let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
         let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
-        let smc_weights = [0.0f32; 11];
-        let gate_threshold = 0.0f32;
+        let smc_weights = [0.0f64; 11];
+        let gate_threshold = 0.0f64;
 
         // 1-minute bars; fine month/day buckets so slot-7 monthly_target_hit_rate
         // is non-trivial (800 bars → 8 months, ~27 days; crosses real boundaries).
@@ -3965,7 +4331,7 @@ mod gpu_cpu_parity_tests {
             })
             .collect();
 
-        // GPU path — skip (don't fail) when no usable device is present.
+        // Direct real-device CubeCL path; the explicit gate above makes errors fatal.
         let gpu = match crate::cubecl_eval::try_evaluate_population_cuda(
             &close,
             &high,
@@ -3990,15 +4356,7 @@ mod gpu_cpu_parity_tests {
             None,
         ) {
             Ok(g) => g,
-            Err(e) => {
-                // On a real GPU box set NEOETHOS_REQUIRE_GPU=1 so a device/driver
-                // misconfig fails LOUD instead of vacuously skipping.
-                if crate::gpu_fallback::require_gpu() {
-                    panic!("NEOETHOS_REQUIRE_GPU set but GPU eval failed: {e}");
-                }
-                eprintln!("GPU parity test SKIPPED (no usable GPU device): {e}");
-                return;
-            }
+            Err(e) => panic!("GPU population real-device evaluation failed: {e}"),
         };
 
         assert_eq!(gpu.len(), n_genes, "gpu returned wrong gene count");
@@ -4013,7 +4371,7 @@ mod gpu_cpu_parity_tests {
             );
             for m in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
                 let (c, v) = (cpu[g][m], gpu[g][m]);
-                // f32 GPU vs f64 CPU: tolerate accumulation rounding, catch
+                // Both lanes are f64: tolerate accumulation rounding, catch
                 // gross logic divergence.
                 let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
                 assert!(
@@ -4023,61 +4381,26 @@ mod gpu_cpu_parity_tests {
             }
         }
 
-        // ── Hybrid (evaluate_population_core) must also match the CPU ──────
-        // Exercises the CPU+GPU split, the CSR prefix slicing, and the merge.
-        // (If the GPU lane errors at runtime it falls back to CPU, so this also
-        // passes on a GPU-less box — just exactly instead of within tolerance.)
-        let hybrid = evaluate_population_core(PopulationEvalInputs {
-            close: &close,
-            high: &high,
-            low: &low,
-            indicators: indicators.view(),
-            gene_offsets: &gene_offsets,
-            gene_indices: &gene_indices,
-            gene_weights: &gene_weights,
-            long_thr: &long_thr,
-            short_thr: &short_thr,
-            month_idx: &month_idx,
-            day_idx: &day_idx,
-            timestamps: &timestamps,
-            sl_pips: &sl_pips,
-            tp_pips: &tp_pips,
-            stop_vol_mult: &[],
-            smc_data: &smc_data,
-            gene_smc_flags: &gene_smc_flags,
-            gate_threshold,
-            weights: &smc_weights,
-            settings: &settings,
-        })
-        .expect("hybrid population eval");
-        assert_eq!(hybrid.len(), n_genes, "hybrid returned wrong gene count");
-        for g in 0..n_genes {
-            assert!(
-                (cpu[g][8] - hybrid[g][8]).abs() <= 1.0,
-                "hybrid gene {g} trade-count: cpu={} hybrid={}",
-                cpu[g][8],
-                hybrid[g][8]
-            );
-            for m in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
-                let (c, v) = (cpu[g][m], hybrid[g][m]);
-                let tol = 1e-2 * c.abs().max(1.0) + 1e-3;
-                assert!(
-                    (c - v).abs() <= tol,
-                    "hybrid gene {g} metric[{m}]: cpu={c} hybrid={v} tol={tol}"
-                );
-            }
-        }
+        // This module is the direct CubeCL CUDA parity gate. Aggregate routing
+        // to native Prototype B has its own real-device parity module and source
+        // contract; calling the production dispatcher here would test that
+        // separate engine and would also cross the fail-closed broker-financial-
+        // truth boundary before reaching either GPU kernel.
     }
 
     /// PARITY GATE (2026-06-09) for the GPU FTMO prop-firm observables emitted by
     /// `backtest_population_kernel` into the new `ftmo_out` array. The GPU computes
     /// the 6 FTMO observables on-device; this asserts they match the CPU ground
     /// truth = `simulate_trades_core` → `compute_prop_firm_risk_summary`
-    /// (validation.rs:746) bit-for-bit within f32 tolerance. A subtle bug here would
+    /// (validation.rs:746) within f64 accumulation tolerance. A subtle bug here would
     /// corrupt which strategies the prop-firm gate keeps, so this is the safety net.
-    /// Skips cleanly without a GPU device (set NEOETHOS_REQUIRE_GPU=1 to fail loud).
+    /// Runs only when the explicit real-device test gate is set; once selected,
+    /// every device error fails loud.
     #[test]
     fn gpu_cpu_prop_firm_ftmo_matches() {
+        if !real_cuda_search_test_enabled("gpu_cpu_prop_firm_ftmo_matches") {
+            return;
+        }
         use crate::validation::{
             PropFirmRiskInput, PropFirmRiskRules, compute_prop_firm_risk_summary,
         };
@@ -4098,23 +4421,23 @@ mod gpu_cpu_parity_tests {
 
         // [features × samples], values well clear of the ±0.3 thresholds.
         let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
-            (((i + f * 7) as f32) * 0.06).sin() * 0.85
+            (((i + f * 7) as f64) * 0.06).sin() * 0.85
         });
 
         // CSR genes: each sums 2 features (weight 1.0).
         let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8, 10, 12];
         let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 0];
-        let gene_weights: Vec<f32> = vec![1.0; 12];
-        let long_thr: Vec<f32> = vec![0.3; n_genes];
-        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; 12];
+        let long_thr: Vec<f64> = vec![0.3; n_genes];
+        let short_thr: Vec<f64> = vec![-0.3; n_genes];
         let sl_pips: Vec<f64> = vec![20.0; n_genes];
         let tp_pips: Vec<f64> = vec![40.0; n_genes];
 
         // SMC gating OFF: zero flags + zero gate → signals pass through ungated.
         let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
         let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
-        let smc_weights = [0.0f32; 11];
-        let gate_threshold = 0.0f32;
+        let smc_weights = [0.0f64; 11];
+        let gate_threshold = 0.0f64;
 
         // 1-hour bars; day_idx = timestamp/86_400_000 (the SAME key both the CPU
         // bucketing in compute_prop_firm_risk_summary and the GPU kernel use).
@@ -4184,7 +4507,7 @@ mod gpu_cpu_parity_tests {
             })
             .collect();
 
-        // GPU path — skip (don't fail) when no usable device is present.
+        // Direct real-device CubeCL path; the explicit gate above makes errors fatal.
         let gpu = match crate::cubecl_eval::try_evaluate_ftmo_population_cuda(
             &close,
             &high,
@@ -4209,13 +4532,7 @@ mod gpu_cpu_parity_tests {
             None,
         ) {
             Ok(g) => g,
-            Err(e) => {
-                if crate::gpu_fallback::require_gpu() {
-                    panic!("NEOETHOS_REQUIRE_GPU set but GPU FTMO eval failed: {e}");
-                }
-                eprintln!("GPU FTMO parity test SKIPPED (no usable GPU device): {e}");
-                return;
-            }
+            Err(e) => panic!("GPU FTMO real-device evaluation failed: {e}"),
         };
 
         assert_eq!(gpu.len(), n_genes, "gpu returned wrong gene count");
@@ -4224,7 +4541,7 @@ mod gpu_cpu_parity_tests {
             let c = cpu[g];
             let v = gpu[g];
             // [0] net_return_pct, [1] max_daily_loss_pct, [2] max_overall_drawdown_pct,
-            // [3] largest_profit_share — float (f32 vs f64): abs tol ~1e-3.
+            // [3] largest_profit_share — f64 accumulation: abs tol ~1e-3.
             for m in [0usize, 1, 2, 3] {
                 let (cm, vm) = (c[m], v[m] as f64);
                 let tol = 1e-3 * cm.abs().max(1.0) + 1e-3;
@@ -4252,6 +4569,9 @@ mod gpu_cpu_parity_tests {
     /// before the adaptive→CPU guard is lifted. Skips cleanly with no GPU.
     #[test]
     fn gpu_population_eval_matches_cpu_adaptive_stops() {
+        if !real_cuda_search_test_enabled("gpu_population_eval_matches_cpu_adaptive_stops") {
+            return;
+        }
         let n_samples = 800usize;
         let n_features = 6usize;
         let n_genes = 4usize;
@@ -4262,13 +4582,13 @@ mod gpu_cpu_parity_tests {
         let high: Vec<f64> = close.iter().map(|c| c + 0.0008).collect();
         let low: Vec<f64> = close.iter().map(|c| c - 0.0008).collect();
         let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
-            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+            (((i + f * 11) as f64) * 0.05).sin() * 0.8
         });
         let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
         let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4];
-        let gene_weights: Vec<f32> = vec![1.0; 8];
-        let long_thr: Vec<f32> = vec![0.3; n_genes];
-        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; 8];
+        let long_thr: Vec<f64> = vec![0.3; n_genes];
+        let short_thr: Vec<f64> = vec![-0.3; n_genes];
         // Fixed sl/tp are present but IGNORED once the multiplier is active.
         let sl_pips: Vec<f64> = vec![25.0; n_genes];
         let tp_pips: Vec<f64> = vec![50.0; n_genes];
@@ -4276,8 +4596,8 @@ mod gpu_cpu_parity_tests {
         let stop_vol_mult: Vec<f64> = vec![1.2, 2.0, 0.8, 1.5];
         let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
         let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
-        let smc_weights = [0.0f32; 11];
-        let gate_threshold = 0.0f32;
+        let smc_weights = [0.0f64; 11];
+        let gate_threshold = 0.0f64;
         let timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
         let month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 100).collect();
         let day_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 30).collect();
@@ -4368,13 +4688,7 @@ mod gpu_cpu_parity_tests {
             None,
         ) {
             Ok(g) => g,
-            Err(e) => {
-                if crate::gpu_fallback::require_gpu() {
-                    panic!("NEOETHOS_REQUIRE_GPU set but adaptive GPU eval failed: {e}");
-                }
-                eprintln!("adaptive GPU parity test SKIPPED (no usable GPU device): {e}");
-                return;
-            }
+            Err(e) => panic!("adaptive GPU real-device evaluation failed: {e}"),
         };
         assert_eq!(gpu.len(), n_genes, "gpu returned wrong gene count");
         // At least one gene must trade, else the parity assertion is vacuous.
@@ -4402,14 +4716,12 @@ mod gpu_cpu_parity_tests {
     /// AREA 1 (2026-06-09) regression lock for the raised per-buffer cap. The
     /// 800-row case above fits one window/one batch, so it never exercised the
     /// windowing/batching machinery the cap-raise relies on as its safety net.
-    /// This drives ~2M samples with a DELIBERATELY tiny per-buffer cap (set via
-    /// `NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB`, which `gpu_buffer_elem_cap` now treats
-    /// as a ceiling) so the signal-synth splits into MANY windows AND the backtest
+    /// This drives ~2M samples with a DELIBERATELY tiny per-buffer cap through
+    /// the test-only cap seam so signal synthesis splits into MANY windows AND the backtest
     /// splits into MANY gene-batches — and asserts the concatenated GPU result
     /// still matches the whole-series CPU reference within the SAME tolerance. This
-    /// is the lock proving the cap change did not break windowing. Runs only on a
-    /// real GPU box (skips cleanly otherwise; set NEOETHOS_REQUIRE_GPU=1 to fail
-    /// loud on a device misconfig).
+    /// is the lock proving the cap change did not break windowing. The explicit
+    /// real-device gate skips card-less runs; once selected, errors fail loud.
     ///
     /// Note: the env-var read by `gpu_buffer_elem_cap` is process-global, but
     /// windowing/batching are EXACT by construction (each window splits on
@@ -4418,6 +4730,9 @@ mod gpu_cpu_parity_tests {
     /// is still correct — only the split COUNT differs, never the math.
     #[test]
     fn gpu_population_eval_matches_cpu_heavy_rows() {
+        if !real_cuda_search_test_enabled("gpu_population_eval_matches_cpu_heavy_rows") {
+            return;
+        }
         // 600k bars × 8 genes: large enough that an 8MB buffer cap forces SEVERAL
         // sample-windows in the signal synth (600k×8B = 4.8MB/gene > the 8MB/4=2M-elem
         // window) AND several gene-batches in the backtest (8MB/4/600k ≈ 3 genes per
@@ -4430,11 +4745,11 @@ mod gpu_cpu_parity_tests {
 
         // Price: a flat close with a WIDE per-bar high/low band (±300 pips, far
         // beyond SL=25 / TP=50) so EVERY trade resolves on its first bar by a huge
-        // margin. This is deliberate: with a grazing price path, f32-on-GPU vs
+        // margin. This is deliberate: with a grazing price path, tiny arithmetic
         // f64-on-CPU sub-pip rounding flips TP-hit-vs-SL-hit for thousands of
         // borderline trades over 2M bars → divergent win-rate/profit-factor that has
         // nothing to do with windowing. Overshooting both levels by 250+ pips makes
-        // the per-trade OUTCOME f32/f64-agnostic, leaving windowing/batching as the
+        // the per-trade OUTCOME precision-agnostic, leaving windowing/batching as the
         // only GPU-vs-CPU variable.
         let close: Vec<f64> = vec![1.10; n_samples];
         let high: Vec<f64> = close.iter().map(|c| c + 0.0300).collect();
@@ -4442,8 +4757,8 @@ mod gpu_cpu_parity_tests {
 
         // SLOW SQUARE wave (period ~5000 bars), each feature decisively ±0.8 — NOT a
         // smooth sine. This is deliberate: the 800-bar test keeps values "well clear
-        // of the ±0.3 thresholds" so CPU(f64) and GPU(f32) agree on the SIGN at every
-        // bar; a sine grazes the threshold and, over 2M bars, f32-vs-f64 epsilon flips
+        // of the ±0.3 thresholds" so CPU and GPU agree on the SIGN at every
+        // bar; a sine grazes the threshold and, over 2M bars, tiny differences flip
         // thousands of boundary signals → wildly different trade SETS (not just a
         // count drift), which would mask the thing we're actually testing. With a
         // square wave each gene's 2-feature sum is ±1.6 (5× the threshold) except on
@@ -4454,7 +4769,7 @@ mod gpu_cpu_parity_tests {
         let period = 5_000i64;
         let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
             let phase = (i as i64 + (f as i64) * 911) % period;
-            if phase < period / 2 { 0.8f32 } else { -0.8f32 }
+            if phase < period / 2 { 0.8f64 } else { -0.8f64 }
         });
 
         // 8 CSR genes, each summing 2 distinct features (unit weight). Feature pairs
@@ -4468,16 +4783,16 @@ mod gpu_cpu_parity_tests {
             gene_indices.push(b);
             gene_offsets.push(gene_indices.len() as i32);
         }
-        let gene_weights: Vec<f32> = vec![1.0; gene_indices.len()];
-        let long_thr: Vec<f32> = vec![0.3; n_genes];
-        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; gene_indices.len()];
+        let long_thr: Vec<f64> = vec![0.3; n_genes];
+        let short_thr: Vec<f64> = vec![-0.3; n_genes];
         let sl_pips: Vec<f64> = vec![25.0; n_genes];
         let tp_pips: Vec<f64> = vec![50.0; n_genes];
 
         let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
         let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; n_genes];
-        let smc_weights = [0.0f32; 11];
-        let gate_threshold = 0.0f32;
+        let smc_weights = [0.0f64; 11];
+        let gate_threshold = 0.0f64;
 
         // 1-minute bars; ~7 months / ~417 days so the monthly/slot-7 buckets are
         // exercised across many month boundaries.
@@ -4575,16 +4890,8 @@ mod gpu_cpu_parity_tests {
         // the 2M-row buffers but with DIFFERENT split granularities. Both stay tiny
         // so they never approach the device's memory limit (a single huge-cap launch
         // would OOM a shared-RAM iGPU — exactly what windowing exists to avoid).
-        let gpu_a = match run_gpu_with_cap(8) {
-            Ok(g) => g,
-            Err(e) => {
-                if crate::gpu_fallback::require_gpu() {
-                    panic!("strict-GPU backend installed but heavy-row GPU eval failed: {e}");
-                }
-                eprintln!("GPU heavy-row parity test SKIPPED (no usable GPU device): {e}");
-                return;
-            }
-        };
+        let gpu_a = run_gpu_with_cap(8)
+            .unwrap_or_else(|e| panic!("heavy-row GPU real-device evaluation failed: {e}"));
         let gpu_b =
             run_gpu_with_cap(16).expect("second-granularity GPU eval after the first succeeded");
 
@@ -4592,9 +4899,9 @@ mod gpu_cpu_parity_tests {
         assert_eq!(gpu_b.len(), n_genes, "gpu(cap=16) wrong gene count");
 
         // ── PRIMARY LOCK: windowing/batching is EXACT (split-invariant) ───────
-        // Both runs are f32-on-GPU but split the 2M rows into DIFFERENT numbers of
+        // Both runs are f64-on-GPU but split the 2M rows into DIFFERENT numbers of
         // windows + gene-batches. If the split is numerically faithful they must be
-        // BIT-IDENTICAL. This isolates the cap-raise's windowing from ALL f32-vs-f64
+        // BIT-IDENTICAL. This isolates the cap-raise's windowing from all precision
         // noise — a gather/concatenation bug shows up here as an exact-equality
         // failure regardless of the CPU reference.
         let gpu_multi = &gpu_a;
@@ -4611,7 +4918,7 @@ mod gpu_cpu_parity_tests {
 
         // ── SECONDARY: GPU multi-window matches the CPU reference ─────────────
         // The square-wave signal is clear of the ±0.3 threshold and every trade
-        // overshoots SL/TP by 250+ pips, so f32-vs-f64 cannot flip a signal or a
+        // overshoots SL/TP by 250+ pips, so rounding cannot flip a signal or a
         // trade outcome → the GPU result matches CPU within the EXISTING tolerance.
         for g in 0..n_genes {
             let (ct, gt) = (cpu[g][8], gpu_multi[g][8]);
@@ -4650,13 +4957,15 @@ mod gpu_cpu_parity_tests {
     ///
     /// The only consumed signal is the SIGN of net_profit, so the COUNT is asserted
     /// EXACT-equal with a ±1 tolerance for the sole edge case (a run whose net sits
-    /// within f32 epsilon of zero); any near-zero sign flip is logged. The
-    /// per-metric tolerance band of the sibling tests is NOT loosened. Runs only on
-    /// a real GPU box (skips cleanly otherwise; `NEOETHOS_REQUIRE_GPU=1` fails loud
-    /// on a device misconfig), and falls back to a CPU==CPU check on a GPU-less box
-    /// (since `validation_backtest_population` CPU-falls-back there).
+    /// within floating-point epsilon of zero); any near-zero sign flip is logged. The
+    /// per-metric tolerance band of the sibling tests is NOT loosened. The explicit
+    /// real-device gate skips card-less runs; once selected, the test calls CubeCL
+    /// directly and permits no CPU substitution.
     #[test]
     fn gpu_montecarlo_batch_matches_cpu() {
+        if !real_cuda_search_test_enabled("gpu_montecarlo_batch_matches_cpu") {
+            return;
+        }
         use rand::Rng;
         use rand::SeedableRng;
 
@@ -4672,7 +4981,7 @@ mod gpu_cpu_parity_tests {
         let high: Vec<f64> = close.iter().map(|c| c + 0.0008).collect();
         let low: Vec<f64> = close.iter().map(|c| c - 0.0008).collect();
         let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
-            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+            (((i + f * 11) as f64) * 0.05).sin() * 0.8
         });
 
         let timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
@@ -4683,8 +4992,8 @@ mod gpu_cpu_parity_tests {
         // indicator-threshold crossings — keeps the test's signal path identical
         // CPU↔GPU, isolating the MC batching as the thing under test.
         let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
-        let smc_weights = [0.0f32; 11];
-        let gate_threshold = 0.0f32;
+        let smc_weights = [0.0f64; 11];
+        let gate_threshold = 0.0f64;
 
         // Fixed-1-lot cost model (mirrors `discovery_backtest_settings` after the
         // helper forces `risk_based_sizing = false`).
@@ -4702,9 +5011,9 @@ mod gpu_cpu_parity_tests {
         // A "base gene": sums features 0+1 (weight 1.0), modest thresholds, finite
         // SL/TP. Each MC run perturbs a clone of this, exactly like the discovery
         // loop perturbs `gene`.
-        let base_long_thr = 0.30f32;
-        let base_short_thr = -0.30f32;
-        let base_weights = [1.0f32, 1.0f32];
+        let base_long_thr = 0.30f64;
+        let base_short_thr = -0.30f64;
+        let base_weights = [1.0f64, 1.0f64];
         let base_indices = [0i32, 1i32];
         let base_sl = 25.0f64;
         let base_tp = 50.0f64;
@@ -4718,9 +5027,9 @@ mod gpu_cpu_parity_tests {
         // Per-run perturbed gene parameters (CSR-flat for the population call).
         let mut gene_offsets: Vec<i32> = Vec::with_capacity(mc_runs + 1);
         let mut gene_indices: Vec<i32> = Vec::with_capacity(mc_runs * 2);
-        let mut gene_weights: Vec<f32> = Vec::with_capacity(mc_runs * 2);
-        let mut long_thr: Vec<f32> = Vec::with_capacity(mc_runs);
-        let mut short_thr: Vec<f32> = Vec::with_capacity(mc_runs);
+        let mut gene_weights: Vec<f64> = Vec::with_capacity(mc_runs * 2);
+        let mut long_thr: Vec<f64> = Vec::with_capacity(mc_runs);
+        let mut short_thr: Vec<f64> = Vec::with_capacity(mc_runs);
         let mut sl_pips: Vec<f64> = Vec::with_capacity(mc_runs);
         let mut tp_pips: Vec<f64> = Vec::with_capacity(mc_runs);
         gene_offsets.push(0);
@@ -4728,10 +5037,10 @@ mod gpu_cpu_parity_tests {
             let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
                 combo_seed ^ ((candidate_idx) << 20) ^ run_idx,
             );
-            let lt = base_long_thr * (1.0 + rng.random_range(-0.15f32..=0.15));
-            let st = base_short_thr * (1.0 + rng.random_range(-0.15f32..=0.15));
-            let w0 = base_weights[0] * (1.0 + rng.random_range(-0.20f32..=0.20));
-            let w1 = base_weights[1] * (1.0 + rng.random_range(-0.20f32..=0.20));
+            let lt = base_long_thr * (1.0 + rng.random_range(-0.15f64..=0.15));
+            let st = base_short_thr * (1.0 + rng.random_range(-0.15f64..=0.15));
+            let w0 = base_weights[0] * (1.0 + rng.random_range(-0.20f64..=0.20));
+            let w1 = base_weights[1] * (1.0 + rng.random_range(-0.20f64..=0.20));
             // sl/tp are finite>0, so the conditional draws ALWAYS happen (same as
             // the discovery loop, whose base gene has finite SL/TP).
             let sl = base_sl * (1.0 + rng.random_range(-0.25f64..=0.25));
@@ -4778,32 +5087,31 @@ mod gpu_cpu_parity_tests {
             }
         }
 
-        // ── BATCHED POPULATION (GPU-try, CPU-fallback) ──────────────────────────
-        // On a GPU box this exercises the real kernel; on a GPU-less box the helper
-        // CPU-falls-back, so this still validates the pass-test equivalence and RNG
-        // determinism (the CPU vs CPU comparison is then EXACT).
-        let metrics = validation_backtest_population(PopulationEvalInputs {
-            close: &close,
-            high: &high,
-            low: &low,
-            indicators: indicators.view(),
-            gene_offsets: &gene_offsets,
-            gene_indices: &gene_indices,
-            gene_weights: &gene_weights,
-            long_thr: &long_thr,
-            short_thr: &short_thr,
-            month_idx: &month_idx,
-            day_idx: &day_idx,
-            timestamps: &timestamps,
-            sl_pips: &sl_pips,
-            tp_pips: &tp_pips,
-            stop_vol_mult: &[],
-            smc_data: &smc_data,
-            gene_smc_flags: &gene_smc_flags,
+        // ── BATCHED POPULATION — direct CubeCL, no CPU fallback ───────────────
+        let metrics = crate::cubecl_eval::try_evaluate_population_cuda(
+            &close,
+            &high,
+            &low,
+            indicators.view(),
+            &gene_offsets,
+            &gene_indices,
+            &gene_weights,
+            &long_thr,
+            &short_thr,
+            &month_idx,
+            &day_idx,
+            &timestamps,
+            &sl_pips,
+            &tp_pips,
+            &[],
+            &smc_data,
+            &gene_smc_flags,
             gate_threshold,
-            weights: &smc_weights,
-            settings: &settings,
-        });
+            &smc_weights,
+            &settings,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("GPU Monte-Carlo real-device evaluation failed: {error}"));
         assert_eq!(
             metrics.len(),
             mc_runs,
@@ -4811,7 +5119,7 @@ mod gpu_cpu_parity_tests {
         );
         let batch_profitable = metrics.iter().filter(|m| m[0] > 0.0).count();
 
-        // Log + tolerate near-zero sign flips (the f32-vs-f64 edge case the ±1
+        // Log + tolerate near-zero sign flips (the floating-point edge case the ±1
         // tolerance covers). A flip far from zero is a real divergence and fails.
         let mut near_zero_flips = 0usize;
         for run in 0..mc_runs {
@@ -4871,11 +5179,13 @@ mod gpu_cpu_parity_tests {
     /// exactly as the gate does). GPU: gather the indicators + full-series SMC at
     /// `absolute_idx` and run the population kernel. Assert per-gene metric parity
     /// within the EXISTING tolerance (`1e-2*|c|.max(1)+1e-3`, trade-count ±1) — NOT
-    /// loosened. Skips cleanly without a device; `NEOETHOS_REQUIRE_GPU=1` fails
-    /// loud on a misconfig (the helper CPU-falls-back on a GPU-less box, so the
-    /// comparison is then CPU==CPU and EXACT).
+    /// loosened. The explicit real-device gate skips card-less runs; once
+    /// selected, the direct CubeCL call permits no CPU substitution.
     #[test]
     fn gpu_cpcv_gathered_fold_matches_cpu() {
+        if !real_cuda_search_test_enabled("gpu_cpcv_gathered_fold_matches_cpu") {
+            return;
+        }
         let n_samples = 1_200usize;
         let n_features = 6usize;
         let n_genes = 6usize;
@@ -4889,17 +5199,17 @@ mod gpu_cpu_parity_tests {
         let low: Vec<f64> = close.iter().map(|c| c - 0.0008).collect();
 
         // [features × samples], values well clear of the ±0.3 thresholds so the
-        // SIGN is f32/f64-agnostic and the gather is the only variable.
+        // SIGN is precision-agnostic and the gather is the only variable.
         let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
-            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+            (((i + f * 11) as f64) * 0.05).sin() * 0.8
         });
 
         // CSR genes: each sums 2 features (weight 1.0).
         let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8, 10, 12];
         let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 0];
-        let gene_weights: Vec<f32> = vec![1.0; 12];
-        let long_thr: Vec<f32> = vec![0.3; n_genes];
-        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; 12];
+        let long_thr: Vec<f64> = vec![0.3; n_genes];
+        let short_thr: Vec<f64> = vec![-0.3; n_genes];
         let sl_pips: Vec<f64> = vec![25.0; n_genes];
         let tp_pips: Vec<f64> = vec![50.0; n_genes];
 
@@ -4935,8 +5245,8 @@ mod gpu_cpu_parity_tests {
                 row
             })
             .collect();
-        let smc_weights = [0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
-        let gate_threshold = 1.0f32;
+        let smc_weights = [0.0f64, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let gate_threshold = 1.0f64;
 
         // Full-series month/day buckets (gathered per fold below).
         let full_month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 150).collect();
@@ -4993,7 +5303,7 @@ mod gpu_cpu_parity_tests {
                     n_samples,
                 );
                 let g_sig: Vec<i8> = absolute_idx.iter().map(|&i| full_signals[i]).collect();
-                let g_conf: Vec<f32> = absolute_idx.iter().map(|&i| full_conf[i]).collect();
+                let g_conf: Vec<f64> = absolute_idx.iter().map(|&i| full_conf[i]).collect();
                 let mut s = settings.clone();
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
@@ -5012,9 +5322,9 @@ mod gpu_cpu_parity_tests {
             .collect();
 
         // ── GPU PATH — gather indicators + full-series SMC at absolute_idx, then
-        // run the population kernel (or CPU-fallback on a GPU-less box) ──────────
+        // run the population kernel directly with no CPU substitution ───────────
         // Build the gathered indicators matrix [features × fold_n].
-        let mut g_ind = Array2::<f32>::zeros((n_features, fold_n));
+        let mut g_ind = Array2::<f64>::zeros((n_features, fold_n));
         for f in 0..n_features {
             for (k, &abs) in absolute_idx.iter().enumerate() {
                 g_ind[(f, k)] = indicators[(f, abs)];
@@ -5022,9 +5332,10 @@ mod gpu_cpu_parity_tests {
         }
         let g_smc: Vec<SmcRow> = absolute_idx.iter().map(|&i| full_smc[i]).collect();
 
-        // NEOETHOS_REQUIRE_GPU fail-loud: probe a device the same way the sibling
-        // tests do; on failure either panic (REQUIRE_GPU) or skip.
-        if let Err(e) = crate::cubecl_eval::try_evaluate_population_cuda(
+        // Direct CubeCL execution: this test has already passed the
+        // NEOETHOS_RUN_CUDA_SEARCH_TESTS gate, so any error is fatal and there
+        // is no CPU/native-engine substitution.
+        let gpu = crate::cubecl_eval::try_evaluate_population_cuda(
             &g_close,
             &g_high,
             &g_low,
@@ -5046,36 +5357,8 @@ mod gpu_cpu_parity_tests {
             &smc_weights,
             &settings,
             None,
-        ) {
-            if crate::gpu_fallback::require_gpu() {
-                panic!("NEOETHOS_REQUIRE_GPU set but GPU CPCV eval failed: {e:#}");
-            }
-            eprintln!("GPU CPCV parity test SKIPPED (no usable GPU device): {e}");
-            return;
-        }
-
-        let gpu = validation_backtest_population(PopulationEvalInputs {
-            close: &g_close,
-            high: &g_high,
-            low: &g_low,
-            indicators: g_ind.view(),
-            gene_offsets: &gene_offsets,
-            gene_indices: &gene_indices,
-            gene_weights: &gene_weights,
-            long_thr: &long_thr,
-            short_thr: &short_thr,
-            month_idx: &g_month,
-            day_idx: &g_day,
-            timestamps: &[],
-            sl_pips: &sl_pips,
-            tp_pips: &tp_pips,
-            stop_vol_mult: &[],
-            smc_data: &g_smc,
-            gene_smc_flags: &gene_smc_flags,
-            gate_threshold,
-            weights: &smc_weights,
-            settings: &settings,
-        });
+        )
+        .unwrap_or_else(|e| panic!("GPU CPCV real-device evaluation failed: {e:#}"));
         assert_eq!(gpu.len(), n_genes, "gpu CPCV returned wrong gene count");
 
         for g in 0..n_genes {
@@ -5119,12 +5402,14 @@ mod gpu_cpu_parity_tests {
     ///     NOT loosened.
     ///
     /// ACTIVE SMC gating is used so the SMC slice actually influences the gate.
-    /// Modest fixture (1 200 rows × 6 genes) to avoid the iGPU async-OOM. Skips
-    /// cleanly without a device; `NEOETHOS_REQUIRE_GPU=1` fails loud on a misconfig
-    /// (the helper CPU-falls-back on a GPU-less box, so the comparison is then
-    /// CPU==CPU and EXACT).
+    /// Modest fixture (1 200 rows × 6 genes) to avoid the iGPU async-OOM. The
+    /// explicit real-device gate skips card-less runs; once selected, the direct
+    /// CubeCL call permits no CPU substitution.
     #[test]
     fn gpu_walkforward_split_matches_cpu() {
+        if !real_cuda_search_test_enabled("gpu_walkforward_split_matches_cpu") {
+            return;
+        }
         let n_samples = 1_200usize;
         let n_features = 6usize;
         let n_genes = 6usize;
@@ -5138,15 +5423,15 @@ mod gpu_cpu_parity_tests {
 
         // [features × samples], values well clear of the ±0.3 thresholds.
         let indicators = Array2::from_shape_fn((n_features, n_samples), |(f, i)| {
-            (((i + f * 11) as f32) * 0.05).sin() * 0.8
+            (((i + f * 11) as f64) * 0.05).sin() * 0.8
         });
 
         // CSR genes: each sums 2 features (weight 1.0).
         let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8, 10, 12];
         let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 0];
-        let gene_weights: Vec<f32> = vec![1.0; 12];
-        let long_thr: Vec<f32> = vec![0.3; n_genes];
-        let short_thr: Vec<f32> = vec![-0.3; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; 12];
+        let long_thr: Vec<f64> = vec![0.3; n_genes];
+        let short_thr: Vec<f64> = vec![-0.3; n_genes];
         let sl_pips: Vec<f64> = vec![25.0; n_genes];
         let tp_pips: Vec<f64> = vec![50.0; n_genes];
 
@@ -5177,8 +5462,8 @@ mod gpu_cpu_parity_tests {
                 row
             })
             .collect();
-        let smc_weights = [0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
-        let gate_threshold = 1.0f32;
+        let smc_weights = [0.0f64, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let gate_threshold = 1.0f64;
 
         // Full-series calendar buckets (sliced contiguously per window).
         let full_month_idx: Vec<i64> = (0..n_samples as i64).map(|i| i / 150).collect();
@@ -5307,8 +5592,9 @@ mod gpu_cpu_parity_tests {
             );
         }
 
-        // NEOETHOS_REQUIRE_GPU fail-loud probe (same pattern as the siblings).
-        if let Err(e) = crate::cubecl_eval::try_evaluate_population_cuda(
+        // Direct CubeCL execution; no skip/fallback is permitted after the
+        // NEOETHOS_RUN_CUDA_SEARCH_TESTS gate.
+        let gpu = crate::cubecl_eval::try_evaluate_population_cuda(
             slice_close,
             slice_high,
             slice_low,
@@ -5330,39 +5616,8 @@ mod gpu_cpu_parity_tests {
             &smc_weights,
             &settings,
             None,
-        ) {
-            if crate::gpu_fallback::require_gpu() {
-                panic!("NEOETHOS_REQUIRE_GPU set but GPU walk-forward eval failed: {e:#}");
-            }
-            eprintln!("GPU walk-forward parity test SKIPPED (no usable GPU device): {e}");
-            return;
-        }
-
-        // Half (2): population metrics half via the SAME entry the WF window path
-        // uses (`validation_backtest_population`), fixed-1-lot, on the contiguous
-        // slice.
-        let gpu = validation_backtest_population(PopulationEvalInputs {
-            close: slice_close,
-            high: slice_high,
-            low: slice_low,
-            indicators: win_ind.view(),
-            gene_offsets: &gene_offsets,
-            gene_indices: &gene_indices,
-            gene_weights: &gene_weights,
-            long_thr: &long_thr,
-            short_thr: &short_thr,
-            month_idx: slice_month,
-            day_idx: slice_day,
-            timestamps: slice_ts,
-            sl_pips: &sl_pips,
-            tp_pips: &tp_pips,
-            stop_vol_mult: &[],
-            smc_data: &win_smc,
-            gene_smc_flags: &gene_smc_flags,
-            gate_threshold,
-            weights: &smc_weights,
-            settings: &settings,
-        });
+        )
+        .unwrap_or_else(|e| panic!("GPU walk-forward real-device evaluation failed: {e:#}"));
         assert_eq!(
             gpu.len(),
             n_genes,
@@ -5428,12 +5683,12 @@ mod cubecl_trailing_parity_tests {
         close: Vec<f64>,
         high: Vec<f64>,
         low: Vec<f64>,
-        indicators: ndarray::Array2<f32>,
+        indicators: ndarray::Array2<f64>,
         gene_offsets: Vec<i32>,
         gene_indices: Vec<i32>,
-        gene_weights: Vec<f32>,
-        long_thr: Vec<f32>,
-        short_thr: Vec<f32>,
+        gene_weights: Vec<f64>,
+        long_thr: Vec<f64>,
+        short_thr: Vec<f64>,
         sl_pips: Vec<f64>,
         tp_pips: Vec<f64>,
         stop_vol_mult: Vec<f64>,
@@ -5468,7 +5723,7 @@ mod cubecl_trailing_parity_tests {
         let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
         let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
             let t = i as f64;
-            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+            (t / (18.0 + 11.0 * f as f64)).sin()
         });
 
         let mut settings = BacktestSettings::default();
@@ -5575,7 +5830,7 @@ mod cubecl_trailing_parity_tests {
                 smc_data: &self.smc_data,
                 gene_smc_flags: &self.gene_smc_flags,
                 gate_threshold: 0.0,
-                weights: &[1.0f32; 11],
+                weights: &[1.0f64; 11],
                 settings: &self.settings,
             }
         }
@@ -5670,30 +5925,23 @@ mod cubecl_trailing_parity_tests {
 
     /// CubeCL kernel vs CPU with the trail ON.
     ///
-    /// Named with a `gpu_` prefix because both GPU CI jobs filter on it
-    /// (`.github/workflows/ci.yml:155` for gpu-cuda, `:210` for gpu-rocm run
-    /// `cargo test -p neoethos-search --release --features <f> gpu_`). The ROCm
-    /// job is the one that matters here: `gpu-rocm` does not pull
-    /// `gpu-b-adapter`, so `try_evaluate_population_cuda` runs this kernel
-    /// rather than short-circuiting into prototype B.
+    /// Named with a `gpu_` prefix because GPU CI filters on it. The test calls
+    /// the exclusively-CubeCL entrypoint directly, so aggregate CUDA builds
+    /// exercise this kernel even when native Prototype B is also compiled.
     #[cfg(feature = "gpu")]
     #[test]
     fn gpu_cubecl_trailing_stop_matches_cpu() {
-        // Say so rather than claim coverage we did not get: on a `gpu-cuda`
-        // build with a live card, `try_evaluate_population_cuda` returns from
-        // the prototype-B short-circuit (cubecl_eval.rs:4777-4791) and never
-        // reaches the CubeCL kernel. `trailing_parity_tests` is the B lane's
-        // equivalent; this one is only meaningful where B is absent.
-        #[cfg(feature = "gpu-b-adapter")]
-        {
-            if crate::gpu_native::prototype_b_population_eval::prototype_b_available() {
-                eprintln!(
-                    "SKIPPED gpu_cubecl_trailing_stop_matches_cpu — prototype B intercepts \
-                     try_evaluate_population_cuda on this build; the CubeCL trailing path is \
-                     covered by the gpu-vulkan / gpu-rocm jobs"
-                );
-                return;
-            }
+        // This is a real-device gate, not a generic feature-build unit test.
+        // The explicit test-only switch prevents card-less `cargo test --features
+        // gpu-*` jobs from claiming device evidence. Once selected, every device
+        // error is fatal; Prototype B being available is irrelevant because this
+        // test calls the exclusively-CubeCL entrypoint directly.
+        if std::env::var("NEOETHOS_RUN_CUDA_SEARCH_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIPPED gpu_cubecl_trailing_stop_matches_cpu — set \
+                 NEOETHOS_RUN_CUDA_SEARCH_TESTS=1 on a real GPU host"
+            );
+            return;
         }
 
         // Both shapes production runs: the gene's scalar stop, and the adaptive
@@ -5724,23 +5972,12 @@ mod cubecl_trailing_parity_tests {
                 &fx.smc_data,
                 &fx.gene_smc_flags,
                 0.0,
-                &[1.0f32; 11],
+                &[1.0f64; 11],
                 &fx.settings,
                 None,
             ) {
                 Ok(rows) => rows,
-                Err(e) => {
-                    if crate::gpu_fallback::require_gpu() {
-                        panic!(
-                            "NEOETHOS_REQUIRE_GPU set but CubeCL trailing eval failed \
-                             ({label}): {e}"
-                        );
-                    }
-                    eprintln!(
-                        "CubeCL trailing parity SKIPPED ({label}, no usable GPU device): {e}"
-                    );
-                    return;
-                }
+                Err(e) => panic!("CubeCL trailing real-device evaluation failed ({label}): {e}"),
             };
 
             let cpu = validation_backtest_population_cpu(fx.inputs());
@@ -5756,17 +5993,13 @@ mod cubecl_trailing_parity_tests {
                 // moved stop would have closed on, so the counts separate long
                 // before the money does.
                 //
-                // This lane is f32 by default (`gpu_f64_backtest_enabled`), so
-                // if this ever fires, re-run with NEOETHOS_GPU_F64=1 before
-                // blaming the trail: equal counts under f64 mean precision, not
-                // arithmetic. The fixture is deliberately small (1 200 smooth
-                // bars, 20/60-pip barriers, zero spread) so no comparison sits
-                // near a tie and f32 rounding cannot decide an exit on its own.
+                // The fixture is deliberately small (1 200 smooth bars,
+                // 20/60-pip barriers, zero spread) so no comparison sits near a
+                // tie; any trade-count mismatch is an arithmetic defect.
                 assert!(
                     (g[8] - c[8]).abs() <= 0.5,
                     "{label} gene {gene} trade count: gpu {} vs cpu {} — the kernel and \
-                     the CPU disagree about when a trailing stop fires (re-check under \
-                     NEOETHOS_GPU_F64=1 to rule out f32 drift)",
+                     the CPU disagree about when a trailing stop fires",
                     g[8],
                     c[8]
                 );
@@ -5791,6 +6024,64 @@ mod cubecl_trailing_parity_tests {
 mod trailing_parity_tests {
     use super::*;
 
+    fn exact_test_parent(
+        close: &[f64],
+        high: &[f64],
+        low: &[f64],
+        indicators: ndarray::ArrayView2<'_, f64>,
+        timestamps: &[i64],
+    ) -> (
+        crate::data_selection::CanonicalSearchArtifactScopeV2,
+        neoethos_data::FeatureFrame,
+        neoethos_data::Ohlcv,
+    ) {
+        let columns = (0..indicators.nrows())
+            .map(|feature| {
+                neoethos_data::FeatureColumnF64::new(
+                    format!("native_parity_{feature}"),
+                    indicators.row(feature).to_vec(),
+                    vec![neoethos_data::FeatureCellValidity::Valid; indicators.ncols()],
+                )
+                .unwrap()
+            })
+            .collect();
+        let features = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            timestamps.to_vec(),
+            columns,
+        )
+        .unwrap();
+        let ohlcv = neoethos_data::Ohlcv {
+            timestamp: Some(timestamps.to_vec()),
+            open: close.to_vec(),
+            high: high.to_vec(),
+            low: low.to_vec(),
+            close: close.to_vec(),
+            volume: None,
+        };
+        let anchor = features.provenance().bindings()[0]
+            .dataset_identity()
+            .clone();
+        let receipt = crate::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(
+            &anchor, &features,
+        )
+        .unwrap();
+        let scope = crate::data_selection::CanonicalSearchArtifactScopeV2::for_entire_receipt(
+            crate::data_selection::CanonicalSearchWindowRoleV1::DiscoveryInput,
+            receipt,
+        )
+        .unwrap();
+        (scope, features, ohlcv)
+    }
+
+    fn real_native_cuda_search_test_enabled(test: &str) -> bool {
+        if std::env::var("NEOETHOS_RUN_CUDA_SEARCH_TESTS").as_deref() == Ok("1") {
+            true
+        } else {
+            eprintln!("SKIPPED {test} — set NEOETHOS_RUN_CUDA_SEARCH_TESTS=1 on a real CUDA host");
+            false
+        }
+    }
+
     /// The case that had no test at all.
     ///
     /// Every parity fixture ran with `trailing_enabled: false`, so the kernel's
@@ -5804,6 +6095,9 @@ mod trailing_parity_tests {
     /// catches.
     #[test]
     fn gpu_matches_cpu_with_a_trailing_stop() {
+        if !real_native_cuda_search_test_enabled("gpu_matches_cpu_with_a_trailing_stop") {
+            return;
+        }
         let n_samples = 1_200usize;
         let n_genes = 4usize;
         // A series with sustained runs, so the trail actually arms and ratchets
@@ -5818,13 +6112,13 @@ mod trailing_parity_tests {
         let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
         let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
             let t = i as f64;
-            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+            (t / (18.0 + 11.0 * f as f64)).sin()
         });
         let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
         let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
-        let gene_weights: Vec<f32> = vec![1.0; 8];
-        let long_thr: Vec<f32> = vec![0.25; n_genes];
-        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; 8];
+        let long_thr: Vec<f64> = vec![0.25; n_genes];
+        let short_thr: Vec<f64> = vec![-0.25; n_genes];
         let sl_pips: Vec<f64> = vec![20.0; n_genes];
         let tp_pips: Vec<f64> = vec![60.0; n_genes];
         let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
@@ -5849,37 +6143,34 @@ mod trailing_parity_tests {
         settings.trailing_be_trigger_r = 0.1;
         settings.trailing_min_lock_pips = 2.0;
 
-        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-            &close,
-            &high,
-            &low,
-            indicators.view(),
+        let (scope, features, ohlcv) =
+            exact_test_parent(&close, &high, &low, indicators.view(), &timestamps);
+        let admission = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+        let run = crate::population_execution_evidence_v1::begin_exact_population_execution_run_v1(
+            admission, &scope, &features, &ohlcv,
+        )
+        .unwrap();
+        let evidence = run
+            .seal_evaluation(
+                &settings,
+                crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::Full,
+            )
+            .unwrap();
+        let gpu = crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &evidence,
             &gene_offsets,
             &gene_indices,
             &gene_weights,
             &long_thr,
             &short_thr,
-            &months,
-            &days,
-            &timestamps,
             &sl_pips,
             &tp_pips,
             &stop_vol_mult,
-            &smc,
             &gene_smc,
             0.0,
-            &[1.0f32; 11],
-            &settings,
-            None,
-        ) {
-            Ok(rows) => rows,
-            // No card here: the assertion is worth nothing without one, and a
-            // skip that says so beats a green test that checked nothing.
-            Err(err) => {
-                eprintln!("skipping trailing parity — no usable device: {err}");
-                return;
-            }
-        };
+            &[1.0f64; 11],
+        )
+        .unwrap_or_else(|err| panic!("Prototype B real-device parity failed: {err}"));
 
         let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
             close: &close,
@@ -5900,7 +6191,7 @@ mod trailing_parity_tests {
             smc_data: &smc,
             gene_smc_flags: &gene_smc,
             gate_threshold: 0.0,
-            weights: &[1.0f32; 11],
+            weights: &[1.0f64; 11],
             settings: &settings,
         });
 
@@ -5929,6 +6220,9 @@ mod trailing_parity_tests {
     /// all and the buckets are a red herring.
     #[test]
     fn uniform_buckets_are_a_scalar_by_another_name() {
+        if !real_native_cuda_search_test_enabled("uniform_buckets_are_a_scalar_by_another_name") {
+            return;
+        }
         let n_samples = 1_200usize;
         let n_genes = 4usize;
         let close: Vec<f64> = (0..n_samples)
@@ -5941,13 +6235,13 @@ mod trailing_parity_tests {
         let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
         let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
             let t = i as f64;
-            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+            (t / (18.0 + 11.0 * f as f64)).sin()
         });
         let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
         let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
-        let gene_weights: Vec<f32> = vec![1.0; 8];
-        let long_thr: Vec<f32> = vec![0.25; n_genes];
-        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; 8];
+        let long_thr: Vec<f64> = vec![0.25; n_genes];
+        let short_thr: Vec<f64> = vec![-0.25; n_genes];
         let sl_pips: Vec<f64> = vec![20.0; n_genes];
         let tp_pips: Vec<f64> = vec![60.0; n_genes];
         let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
@@ -5973,35 +6267,36 @@ mod trailing_parity_tests {
             late_ny_pips: 2.0,
         });
 
-        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-            &close,
-            &high,
-            &low,
-            indicators.view(),
+        let (scope, features, ohlcv) =
+            exact_test_parent(&close, &high, &low, indicators.view(), &timestamps);
+        let admission = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+        let run = crate::population_execution_evidence_v1::begin_exact_population_execution_run_v1(
+            admission, &scope, &features, &ohlcv,
+        )
+        .unwrap();
+        let evidence = run
+            .seal_evaluation(
+                &settings,
+                crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::Full,
+            )
+            .unwrap();
+        let gpu = crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &evidence,
             &gene_offsets,
             &gene_indices,
             &gene_weights,
             &long_thr,
             &short_thr,
-            &months,
-            &days,
-            &timestamps,
             &sl_pips,
             &tp_pips,
             &stop_vol_mult,
-            &smc,
             &gene_smc,
             0.0,
-            &[1.0f32; 11],
-            &settings,
-            None,
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                eprintln!("skipping uniform-bucket parity — no usable device: {err}");
-                return;
-            }
-        };
+            &[1.0f64; 11],
+        )
+        .unwrap_or_else(|err| {
+            panic!("Prototype B uniform-bucket real-device parity failed: {err}")
+        });
 
         let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
             close: &close,
@@ -6022,7 +6317,7 @@ mod trailing_parity_tests {
             smc_data: &smc,
             gene_smc_flags: &gene_smc,
             gate_threshold: 0.0,
-            weights: &[1.0f32; 11],
+            weights: &[1.0f64; 11],
             settings: &settings,
         });
 
@@ -6054,6 +6349,9 @@ mod trailing_parity_tests {
     /// many times and a kernel that charged one flat number cannot match.
     #[test]
     fn gpu_matches_cpu_with_a_session_spread_profile() {
+        if !real_native_cuda_search_test_enabled("gpu_matches_cpu_with_a_session_spread_profile") {
+            return;
+        }
         let n_samples = 1_200usize;
         let n_genes = 4usize;
         let close: Vec<f64> = (0..n_samples)
@@ -6066,13 +6364,13 @@ mod trailing_parity_tests {
         let low: Vec<f64> = close.iter().map(|c| c - 0.0006).collect();
         let indicators = ndarray::Array2::from_shape_fn((4, n_samples), |(f, i)| {
             let t = i as f64;
-            ((t / (18.0 + 11.0 * f as f64)).sin()) as f32
+            (t / (18.0 + 11.0 * f as f64)).sin()
         });
         let gene_offsets: Vec<i32> = vec![0, 2, 4, 6, 8];
         let gene_indices: Vec<i32> = vec![0, 1, 1, 2, 2, 3, 3, 0];
-        let gene_weights: Vec<f32> = vec![1.0; 8];
-        let long_thr: Vec<f32> = vec![0.25; n_genes];
-        let short_thr: Vec<f32> = vec![-0.25; n_genes];
+        let gene_weights: Vec<f64> = vec![1.0; 8];
+        let long_thr: Vec<f64> = vec![0.25; n_genes];
+        let short_thr: Vec<f64> = vec![-0.25; n_genes];
         let sl_pips: Vec<f64> = vec![20.0; n_genes];
         let tp_pips: Vec<f64> = vec![60.0; n_genes];
         let stop_vol_mult: Vec<f64> = vec![0.0; n_genes];
@@ -6102,35 +6400,36 @@ mod trailing_parity_tests {
             late_ny_pips: 1.4,
         });
 
-        let gpu = match crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-            &close,
-            &high,
-            &low,
-            indicators.view(),
+        let (scope, features, ohlcv) =
+            exact_test_parent(&close, &high, &low, indicators.view(), &timestamps);
+        let admission = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+        let run = crate::population_execution_evidence_v1::begin_exact_population_execution_run_v1(
+            admission, &scope, &features, &ohlcv,
+        )
+        .unwrap();
+        let evidence = run
+            .seal_evaluation(
+                &settings,
+                crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::Full,
+            )
+            .unwrap();
+        let gpu = crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
+            &evidence,
             &gene_offsets,
             &gene_indices,
             &gene_weights,
             &long_thr,
             &short_thr,
-            &months,
-            &days,
-            &timestamps,
             &sl_pips,
             &tp_pips,
             &stop_vol_mult,
-            &smc,
             &gene_smc,
             0.0,
-            &[1.0f32; 11],
-            &settings,
-            None,
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                eprintln!("skipping session-spread parity — no usable device: {err}");
-                return;
-            }
-        };
+            &[1.0f64; 11],
+        )
+        .unwrap_or_else(|err| {
+            panic!("Prototype B session-spread real-device parity failed: {err}")
+        });
 
         let cpu = validation_backtest_population_cpu(PopulationEvalInputs {
             close: &close,
@@ -6151,7 +6450,7 @@ mod trailing_parity_tests {
             smc_data: &smc,
             gene_smc_flags: &gene_smc,
             gate_threshold: 0.0,
-            weights: &[1.0f32; 11],
+            weights: &[1.0f64; 11],
             settings: &settings,
         });
 

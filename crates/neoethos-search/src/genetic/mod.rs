@@ -20,17 +20,19 @@ pub mod strategy_gene;
 // use — emitting them next to each gene is still valuable diagnostics.
 pub use diversity::{DiversityKey, EvalMetrics, diversity_key, smc_mask};
 pub use evolution_math::{
-    EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory,
+    EvolutionSearchPolicy, ParentSelectionPolicy, ResolvedGeneStopBounds, SeenSignatureMemory,
     SeenSignatureMemoryRuntimeOverrides, SurvivorSelectionPolicy, apply_metrics,
-    ResolvedGeneStopBounds, clear_adaptive_threshold_ladder, clear_gene_stop_atr_scale, crossover,
+    clear_adaptive_threshold_ladder, clear_gene_stop_atr_scale, crossover,
     current_gene_stop_bounds, current_seen_signature_memory_runtime_overrides,
     current_threshold_ladder, derive_adaptive_threshold_ladder_from_features, gene_signature_hash,
     generate_random_genes, install_adaptive_threshold_ladder, install_gene_stop_atr_scale,
     install_seen_signature_memory_runtime_overrides,
-    install_seen_signature_memory_runtime_overrides_from_env,
     install_seen_signature_memory_runtime_overrides_from_settings, mutate, new_random_gene,
-    reset_gene_metrics, select_parent_index, select_survivor_indices,
-    unique_candidate_or_retry,
+    reset_gene_metrics, select_parent_index, select_survivor_indices, unique_candidate_or_retry,
+};
+pub use migration::{
+    migration_enabled, push_incoming as push_migrants, set_migration_enabled,
+    take_outgoing as take_elites,
 };
 pub use regime_labels::{
     RegimeLabelPolicy, RegimeWindow, StrategyRegimeProfile, WindowPerformanceLabel,
@@ -44,13 +46,10 @@ pub use runtime_overrides::{
     current_determinism_policy, current_gene_stop_bounds_overrides,
     current_genetic_search_runtime_overrides, current_strategy_evaluation_runtime_overrides,
     install_gene_stop_bounds_overrides_from_settings, install_genetic_search_runtime_overrides,
-    install_genetic_search_runtime_overrides_from_env,
     install_genetic_search_runtime_overrides_from_settings,
     install_strategy_evaluation_runtime_overrides,
-    install_strategy_evaluation_runtime_overrides_from_env,
     install_strategy_evaluation_runtime_overrides_from_settings, smc_gate_disabled,
 };
-pub(crate) use search_engine::{adaptive_pip_size, calendar_day_key_ms};
 pub use search_engine::{
     SmcGateArrays, WalkforwardPopulationGenePack, evaluate_genes, evolve_search,
     evolve_search_with_progress, evolve_search_with_progress_and_limits, month_day_indices,
@@ -60,14 +59,12 @@ pub use search_engine::{
     validation_genes_population, validation_genes_population_gathered,
     validation_genes_population_window,
 };
-pub use migration::{
-    migration_enabled, push_incoming as push_migrants, set_migration_enabled,
-    take_outgoing as take_elites,
+pub(crate) use search_engine::{
+    adaptive_pip_size, calendar_day_key_ms, evolve_search_with_progress_and_limits_exact,
 };
 pub use seed_templates::seed_professional_templates;
 pub use smc_indicators::{
     SmcSearchConfig, build_smc_arrays, derive_smc_arrays, enforce_min_structural_smc_flags,
-    enforce_population_smc_ratio, install_smc_search_config_from_env,
-    install_smc_search_config_from_settings, randomize_smc_flags,
+    enforce_population_smc_ratio, install_smc_search_config_from_settings, randomize_smc_flags,
 };
 pub use strategy_gene::{EvaluationConfig, FilteringConfig, Gene, SearchResult};

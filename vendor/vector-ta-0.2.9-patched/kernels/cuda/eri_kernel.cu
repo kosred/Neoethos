@@ -450,8 +450,8 @@ extern "C" __global__ void transpose_rm_to_tm_32x32_pad_f64(
  *   by term rather than assumed, because the analogous fast path in `epma` is
  *   NOT identical and needed reproducing.
  *
- * Column: output_id "value" / "bull" -> `out.bull` = high - ma (cpu_batch.rs
- *   :14743). `bear` is the low-side twin and is not this column.
+ * Columns: canonical `bull` = high - ema and `bear` = low - ema. The retired
+ *   anonymous `value` spelling is not part of either CPU or CUDA production.
  *
  * PERIOD-SWEPT: `compute_eri_batch` (cpu_batch.rs:14727) reads a parameter
  *   literally named `period` (default 13).
@@ -472,6 +472,60 @@ extern "C" __global__ void transpose_rm_to_tm_32x32_pad_f64(
 #define NEO_F64_NAN (__longlong_as_double(0x7ff8000000000000ULL))
 #endif
 
+__device__ __forceinline__
+void eri_row_f64(const double* __restrict__ high,
+                 const double* __restrict__ low,
+                 const double* __restrict__ close,
+                 int n,
+                 int period,
+                 int first_valid,
+                 double* __restrict__ bull,
+                 double* __restrict__ bear)
+{
+    for (int i = 0; i < n; ++i) {
+        if (bull) bull[i] = NEO_F64_NAN;
+        if (bear) bear[i] = NEO_F64_NAN;
+    }
+    if (period <= 0 || period > n) return;
+    if (first_valid < 0 || first_valid >= n) return;
+    if (n - first_valid < period) return;
+
+    const int start_idx = first_valid + period - 1;
+    if (start_idx >= n) return;
+
+    const double alpha = 2.0 / ((double)period + 1.0);
+    const double beta = 1.0 - alpha;
+    double sum = 0.0;
+    for (int i = 0; i < period; ++i) sum += close[first_valid + i];
+    double ema = sum / (double)period;
+
+    if (bull) bull[start_idx] = high[start_idx] - ema;
+    if (bear) bear[start_idx] = low[start_idx] - ema;
+    for (int i = start_idx + 1; i < n; ++i) {
+        ema = alpha * close[i] + beta * ema;
+        if (bull) bull[i] = high[i] - ema;
+        if (bear) bear[i] = low[i] - ema;
+    }
+}
+
+extern "C" __global__
+void eri_outputs_f64(const double* __restrict__ high,
+                     const double* __restrict__ low,
+                     const double* __restrict__ close,
+                     int n,
+                     const int* __restrict__ periods,
+                     int n_combos,
+                     int first_valid,
+                     double* __restrict__ bull_out,
+                     double* __restrict__ bear_out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    double* __restrict__ bull = bull_out + (size_t)combo * (size_t)n;
+    double* __restrict__ bear = bear_out + (size_t)combo * (size_t)n;
+    eri_row_f64(high, low, close, n, periods[combo], first_valid, bull, bear);
+}
+
 extern "C" __global__
 void eri_neo_batch_f64(const double* __restrict__ high,
                        const double* __restrict__ low,
@@ -484,29 +538,6 @@ void eri_neo_batch_f64(const double* __restrict__ high,
 {
     const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (combo >= n_combos || n <= 0) return;
-    (void)low;   /* the `bear` column, not this one */
-
     double* __restrict__ o = out + (size_t)combo * (size_t)n;
-    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
-
-    const int period = periods[combo];
-    if (period <= 0 || period > n) return;
-    if (first_valid < 0 || first_valid >= n) return;
-    if (n - first_valid < period) return;
-
-    const int start_idx = first_valid + period - 1;
-    if (start_idx >= n) return;
-
-    const double alpha = 2.0 / ((double)period + 1.0);
-    const double beta  = 1.0 - alpha;
-
-    double sum = 0.0;
-    for (int i = 0; i < period; ++i) sum += close[first_valid + i];
-    double ema = sum / (double)period;
-
-    o[start_idx] = high[start_idx] - ema;
-    for (int i = start_idx + 1; i < n; ++i) {
-        ema = alpha * close[i] + beta * ema;
-        o[i] = high[i] - ema;
-    }
+    eri_row_f64(high, low, close, n, periods[combo], first_valid, o, nullptr);
 }

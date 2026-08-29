@@ -1,10 +1,4 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::gaussian_wrapper::DeviceArrayF32Py;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::CudaGaussian;
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_uninit_f64, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -47,62 +41,10 @@ impl<'a> AsRef<[f64]> for GaussianInput<'a> {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_output_into_js(
-    data: &[f64],
-    period: usize,
-    poles: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = gaussian_js(data, period, poles)?;
-    crate::write_wasm_f64_output("gaussian_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_batch_output_into_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    poles_start: usize,
-    poles_end: usize,
-    poles_step: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = gaussian_batch_js(
-        data,
-        period_start,
-        period_end,
-        period_step,
-        poles_start,
-        poles_end,
-        poles_step,
-    )?;
-    crate::write_wasm_f64_output("gaussian_batch_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = gaussian_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "gaussian_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests_into {
     use super::*;
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_gaussian_into_matches_api() -> Result<(), Box<dyn std::error::Error>> {
         let mut data = Vec::with_capacity(256);
@@ -156,10 +98,6 @@ pub struct GaussianOutput {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct GaussianParams {
     pub period: Option<usize>,
     pub poles: Option<usize>,
@@ -281,9 +219,13 @@ pub enum GaussianError {
     AllValuesNaN,
     #[error("gaussian: Not enough valid data: needed = {needed}, valid = {valid}")]
     NotEnoughValidData { needed: usize, valid: usize },
-    #[error("gaussian: Period too small. Period must be >= 2 for meaningful Gaussian filtering. Got period={period}")]
+    #[error(
+        "gaussian: Period too small. Period must be >= 2 for meaningful Gaussian filtering. Got period={period}"
+    )]
     DegeneratePeriod { period: usize },
-    #[error("gaussian: Period of 1 causes degenerate filter (alpha=0). This produces constant zero output. Use period >= 2.")]
+    #[error(
+        "gaussian: Period of 1 causes degenerate filter (alpha=0). This produces constant zero output. Use period >= 2."
+    )]
     PeriodOneDegenerate,
     #[error("gaussian: output length mismatch: expected {expected}, got {got}")]
     OutputLengthMismatch { expected: usize, got: usize },
@@ -932,7 +874,6 @@ pub fn gaussian_into_slice(
     gaussian_with_kernel_into(input, kern, dst)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn gaussian_into(input: &GaussianInput, out: &mut [f64]) -> Result<(), GaussianError> {
     let data = input.as_ref();
@@ -1512,7 +1453,7 @@ pub unsafe fn gaussian_row_avx512(data: &[f64], prm: &GaussianParams, out: &mut 
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use proptest::prelude::*;
 
     fn check_gaussian_partial_params(
@@ -1520,8 +1461,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = GaussianParams {
             period: None,
             poles: None,
@@ -1537,8 +1478,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = GaussianParams {
             period: Some(14),
             poles: Some(4),
@@ -1573,8 +1514,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = GaussianInput::with_default_candles(&candles);
         match input.data {
             GaussianData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -1702,8 +1643,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = GaussianParams {
             period: Some(14),
             poles: Some(4),
@@ -1734,8 +1675,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = GaussianInput::from_candles(&candles, "close", GaussianParams::default());
         let res = gaussian_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -1756,8 +1697,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 14;
         let poles = 4;
         let input = GaussianInput::from_candles(
@@ -2222,8 +2163,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_cases = vec![
             GaussianParams {
@@ -2331,8 +2272,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = GaussianBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2379,8 +2320,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn std::error::Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let batch_configs = vec![
             ((10, 30, 10), (1, 4, 1)),
@@ -2410,26 +2351,26 @@ mod tests {
 
                 if bits == 0x11111111_11111111 {
                     panic!(
-						"[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found alloc_with_nan_prefix poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}, poles={:?}",
-						test, val, bits, row, col, idx, combo.period, combo.poles
-					);
+                        test, val, bits, row, col, idx, combo.period, combo.poles
+                    );
                 }
 
                 if bits == 0x22222222_22222222 {
                     panic!(
-						"[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found init_matrix_prefixes poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}, poles={:?}",
-						test, val, bits, row, col, idx, combo.period, combo.poles
-					);
+                        test, val, bits, row, col, idx, combo.period, combo.poles
+                    );
                 }
 
                 if bits == 0x33333333_33333333 {
                     panic!(
-						"[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} \
+                        "[{}] Found make_uninit_matrix poison value {} (0x{:016X}) at row {} col {} \
                          (flat index {}) with params period={:?}, poles={:?}",
-						test, val, bits, row, col, idx, combo.period, combo.poles
-					);
+                        test, val, bits, row, col, idx, combo.period, combo.poles
+                    );
                 }
             }
         }
@@ -2448,22 +2389,6 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
 }
-
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[inline(always)]
 fn gaussian_batch_inner_into(
@@ -2576,426 +2501,4 @@ fn gaussian_batch_inner_into(
     }
 
     Ok(combos)
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "gaussian")]
-#[pyo3(signature = (data, period, poles, kernel=None))]
-pub fn gaussian_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    poles: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = GaussianParams {
-        period: Some(period),
-        poles: Some(poles),
-    };
-    let gaussian_in = GaussianInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| gaussian_with_kernel(&gaussian_in, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "GaussianStream")]
-pub struct GaussianStreamPy {
-    stream: GaussianStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl GaussianStreamPy {
-    #[new]
-    fn new(period: usize, poles: usize) -> PyResult<Self> {
-        let params = GaussianParams {
-            period: Some(period),
-            poles: Some(poles),
-        };
-        let stream =
-            GaussianStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(GaussianStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        Some(self.stream.update(value))
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "gaussian_batch")]
-#[pyo3(signature = (data, period_range, poles_range, kernel=None))]
-pub fn gaussian_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    poles_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = GaussianBatchRange {
-        period: period_range,
-        poles: poles_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => match detect_best_batch_kernel() {
-                    Kernel::Avx512Batch => Kernel::Avx2Batch,
-                    other => other,
-                },
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            gaussian_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "poles",
-        combos
-            .iter()
-            .map(|p| p.poles.unwrap_or(4) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "gaussian_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, period_range, poles_range, device_id=0))]
-pub fn gaussian_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    poles_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice = data_f32.as_slice()?;
-    let sweep = GaussianBatchRange {
-        period: period_range,
-        poles: poles_range,
-    };
-
-    let cuda = CudaGaussian::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let stream = cuda.stream_handle();
-    let dev_id = cuda.device_id();
-    let ctx_guard = cuda.context_arc();
-    let inner = py
-        .allow_threads(|| cuda.gaussian_batch_dev(slice, &sweep))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(
-        inner, stream, ctx_guard, dev_id,
-    ))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "gaussian_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, period, poles, device_id=0))]
-pub fn gaussian_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    poles: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let shape = prices_tm_f32.shape();
-    let rows = shape[0];
-    let cols = shape[1];
-
-    let flat = prices_tm_f32.as_slice()?;
-    let params = GaussianParams {
-        period: Some(period),
-        poles: Some(poles),
-    };
-
-    let cuda = CudaGaussian::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let stream = cuda.stream_handle();
-    let dev_id = cuda.device_id();
-    let ctx_guard = cuda.context_arc();
-    let inner = py
-        .allow_threads(|| {
-            cuda.gaussian_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(DeviceArrayF32Py::new_from_rust(
-        inner, stream, ctx_guard, dev_id,
-    ))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_js(data: &[f64], period: usize, poles: usize) -> Result<Vec<f64>, JsValue> {
-    let params = GaussianParams {
-        period: Some(period),
-        poles: Some(poles),
-    };
-    let input = GaussianInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    gaussian_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-    poles: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to gaussian_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        if period == 1 {
-            return Err(JsValue::from_str("Period of 1 causes degenerate filter"));
-        }
-        if period < 2 {
-            return Err(JsValue::from_str(&format!(
-                "Period must be >= 2, got {}",
-                period
-            )));
-        }
-        if period > len {
-            return Err(JsValue::from_str(&format!(
-                "Period {} is longer than data length {}",
-                period, len
-            )));
-        }
-
-        if !(1..=4).contains(&poles) {
-            return Err(JsValue::from_str("Invalid poles (must be 1-4)"));
-        }
-
-        let params = GaussianParams {
-            period: Some(period),
-            poles: Some(poles),
-        };
-        let input = GaussianInput::from_slice(data, params);
-
-        if in_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            gaussian_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            gaussian_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_batch_js(
-    data: &[f64],
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    poles_start: usize,
-    poles_end: usize,
-    poles_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = GaussianBatchRange {
-        period: (period_start, period_end, period_step),
-        poles: (poles_start, poles_end, poles_step),
-    };
-
-    gaussian_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map(|output| output.values)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_batch_metadata_js(
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    poles_start: usize,
-    poles_end: usize,
-    poles_step: usize,
-) -> Result<Vec<f64>, JsValue> {
-    let sweep = GaussianBatchRange {
-        period: (period_start, period_end, period_step),
-        poles: (poles_start, poles_end, poles_step),
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let metadata: Vec<f64> = combos
-        .iter()
-        .flat_map(|combo| {
-            vec![
-                combo.period.unwrap_or(14) as f64,
-                combo.poles.unwrap_or(4) as f64,
-            ]
-        })
-        .collect();
-
-    Ok(metadata)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct GaussianBatchConfig {
-    pub period_range: (usize, usize, usize),
-    pub poles_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct GaussianBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<GaussianParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = gaussian_batch)]
-pub fn gaussian_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: GaussianBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = GaussianBatchRange {
-        period: config.period_range,
-        poles: config.poles_range,
-    };
-
-    let output = gaussian_batch_inner(data, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = GaussianBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn gaussian_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-    poles_start: usize,
-    poles_end: usize,
-    poles_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to gaussian_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let sweep = GaussianBatchRange {
-            period: (period_start, period_end, period_step),
-            poles: (poles_start, poles_end, poles_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        gaussian_batch_inner_into(data, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

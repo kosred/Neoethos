@@ -3,6 +3,7 @@ import { enginesStatus, trainingStart, trainingStop, dataCoverage, type StartJob
 import { usePoll } from "../hooks";
 import { SymbolSelect, TimeframeSelect } from "../components/Select";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
+import { dataOperationErrorText, symbolCoverageFailureText } from "../apiContracts";
 
 const pick = <T,>(...vals: (T | undefined)[]) => vals.find((v) => v !== undefined);
 
@@ -24,7 +25,15 @@ export default function Training() {
     let live = true;
     dataCoverage([symbol.trim().toUpperCase()], baseTf.trim().toUpperCase())
       .then((c) => { if (live) setCov(c[0] ?? null); })
-      .catch(() => { if (live) setCov(null); });
+      .catch((error) => {
+        if (live) {
+          setCov({
+            status: "failed",
+            symbol: symbol.trim().toUpperCase(),
+            error: { kind: "command_failed", detail: dataOperationErrorText(error) },
+          });
+        }
+      });
     return () => { live = false; };
   }, [symbol, baseTf]);
 
@@ -97,7 +106,9 @@ export default function Training() {
             <>
               training <b>{symbol.trim().toUpperCase()} {baseTf.trim().toUpperCase()}</b> on{" "}
               {cov ? (
-                cov.bars > 0 ? (
+                cov.status === "failed" ? (
+                  <span className="sell">⚠ coverage failed — {symbolCoverageFailureText(cov)}</span>
+                ) : cov.bars > 0 ? (
                   <><b>{cov.years.toFixed(1)} years</b> ({cov.bars.toLocaleString()} bars){cov.years < 2 ? " ⚠ low history" : ""}</>
                 ) : (
                   <span className="sell">⚠ no local data — download it in Data first</span>

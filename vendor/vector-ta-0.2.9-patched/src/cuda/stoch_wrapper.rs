@@ -1,16 +1,16 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
-use crate::cuda::moving_averages::ma_selector::{CudaMaData, CudaMaDeviceDataRef, CudaMaSelector};
-use crate::cuda::moving_averages::DeviceArrayF32;
-use crate::cuda::runtime::CudaSession;
 use crate::cuda::CudaDeviceSliceF32Ref;
+use crate::cuda::moving_averages::DeviceArrayF32;
+use crate::cuda::moving_averages::ma_selector::{CudaMaData, CudaMaDeviceDataRef, CudaMaSelector};
+use crate::cuda::runtime::CudaSession;
 use crate::indicators::stoch::{StochBatchRange, StochParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
 use cust::memory::mem_get_info;
 use cust::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::collections::HashMap;
@@ -69,26 +69,12 @@ impl CudaStoch {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let load = |ptx: &'static str| -> Result<Module, CudaStochError> {
-            Module::from_ptx(
-                ptx,
-                &[
-                    ModuleJitOption::DetermineTargetFromContext,
-                    ModuleJitOption::OptLevel(OptLevel::O2),
-                ],
-            )
-            .or_else(|_| Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]))
-            .or_else(|_| Module::from_ptx(ptx, &[]))
-            .map_err(CudaStochError::Cuda)
-        };
-
-        let ptx_stoch: &str = include_str!(concat!(env!("OUT_DIR"), "/stoch_kernel.ptx"));
-        let module = load(ptx_stoch)?;
-
-        let ptx_sma: &str = include_str!(concat!(env!("OUT_DIR"), "/sma_kernel.ptx"));
-        let sma_module = load(ptx_sma)?;
-        let ptx_ema: &str = include_str!(concat!(env!("OUT_DIR"), "/ema_kernel.ptx"));
-        let ema_module = load(ptx_ema)?;
+        let module =
+            crate::load_cuda_embedded_module!("stoch_kernel").map_err(CudaStochError::Cuda)?;
+        let sma_module =
+            crate::load_cuda_embedded_module!("sma_kernel").map_err(CudaStochError::Cuda)?;
+        let ema_module =
+            crate::load_cuda_embedded_module!("ema_kernel").map_err(CudaStochError::Cuda)?;
 
         let stream = Arc::new(Stream::new(StreamFlags::NON_BLOCKING, None)?);
 
@@ -103,26 +89,12 @@ impl CudaStoch {
     }
 
     pub fn from_session(session: Arc<CudaSession>) -> Result<Self, CudaStochError> {
-        let load = |ptx: &'static str| -> Result<Module, CudaStochError> {
-            Module::from_ptx(
-                ptx,
-                &[
-                    ModuleJitOption::DetermineTargetFromContext,
-                    ModuleJitOption::OptLevel(OptLevel::O2),
-                ],
-            )
-            .or_else(|_| Module::from_ptx(ptx, &[ModuleJitOption::DetermineTargetFromContext]))
-            .or_else(|_| Module::from_ptx(ptx, &[]))
-            .map_err(CudaStochError::Cuda)
-        };
-
-        let ptx_stoch: &str = include_str!(concat!(env!("OUT_DIR"), "/stoch_kernel.ptx"));
-        let module = load(ptx_stoch)?;
-
-        let ptx_sma: &str = include_str!(concat!(env!("OUT_DIR"), "/sma_kernel.ptx"));
-        let sma_module = load(ptx_sma)?;
-        let ptx_ema: &str = include_str!(concat!(env!("OUT_DIR"), "/ema_kernel.ptx"));
-        let ema_module = load(ptx_ema)?;
+        let module =
+            crate::load_cuda_embedded_module!("stoch_kernel").map_err(CudaStochError::Cuda)?;
+        let sma_module =
+            crate::load_cuda_embedded_module!("sma_kernel").map_err(CudaStochError::Cuda)?;
+        let ema_module =
+            crate::load_cuda_embedded_module!("ema_kernel").map_err(CudaStochError::Cuda)?;
 
         Ok(Self {
             module,
@@ -1539,14 +1511,16 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "stoch",
-            "one_series_many_params",
-            "stoch_cuda_batch_dev",
-            "1m_x_250",
-            prep_one_series_many_params,
-        )
-        .with_sample_size(10)
-        .with_mem_required(bytes_one_series_many_params())]
+        vec![
+            CudaBenchScenario::new(
+                "stoch",
+                "one_series_many_params",
+                "stoch_cuda_batch_dev",
+                "1m_x_250",
+                prep_one_series_many_params,
+            )
+            .with_sample_size(10)
+            .with_mem_required(bytes_one_series_many_params()),
+        ]
     }
 }

@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 //! `insync_index` on the card.
 //!
@@ -26,10 +26,10 @@
 //! the indicator, never a quiet recomputation on the host.
 
 use crate::cuda::f64_launch::{
-    checked_mul, plan_slots, scratch_elems, validate_launch, LaunchPlanError, DEFAULT_HEADROOM,
+    DEFAULT_HEADROOM, LaunchPlanError, checked_mul, plan_slots, scratch_elems, validate_launch,
 };
 use crate::indicators::insync_index::{
-    expand_grid_insync_index, InsyncIndexBatchRange, InsyncIndexParams,
+    InsyncIndexBatchRange, InsyncIndexParams, expand_grid_insync_index,
 };
 use cust::context::Context;
 use cust::device::Device;
@@ -208,7 +208,10 @@ impl CudaInsyncIndex {
         let mut seg = DPO_DELAY_CAP;
 
         for combo in &combos {
-            let get = |value: Option<usize>, default: usize, name: &str| -> Result<usize, CudaInsyncIndexError> {
+            let get = |value: Option<usize>,
+                       default: usize,
+                       name: &str|
+             -> Result<usize, CudaInsyncIndexError> {
                 let value = value.unwrap_or(default);
                 if value == 0 {
                     return Err(CudaInsyncIndexError::InvalidInput(format!(
@@ -229,8 +232,16 @@ impl CudaInsyncIndex {
             let roc_len = get(combo.roc_length, DEFAULT_ROC_LENGTH, "roc_length")?;
             let rsi_len = get(combo.rsi_length, DEFAULT_RSI_LENGTH, "rsi_length")?;
             let stoch_len = get(combo.stoch_length, DEFAULT_STOCH_LENGTH, "stoch_length")?;
-            let stoch_d = get(combo.stoch_d_length, DEFAULT_STOCH_D_LENGTH, "stoch_d_length")?;
-            let stoch_k = get(combo.stoch_k_length, DEFAULT_STOCH_K_LENGTH, "stoch_k_length")?;
+            let stoch_d = get(
+                combo.stoch_d_length,
+                DEFAULT_STOCH_D_LENGTH,
+                "stoch_d_length",
+            )?;
+            let stoch_k = get(
+                combo.stoch_k_length,
+                DEFAULT_STOCH_K_LENGTH,
+                "stoch_k_length",
+            )?;
             let sma_len = get(combo.sma_length, DEFAULT_SMA_LENGTH, "sma_length")?;
 
             let bb_mult = combo.bb_multiplier.unwrap_or(DEFAULT_BB_MULTIPLIER);
@@ -280,7 +291,11 @@ impl CudaInsyncIndex {
         let ints_per_slot = checked_mul(INDICATOR, "int scratch/slot", INT_SEGMENTS, seg)?;
         let bytes_per_slot = doubles_per_slot
             .checked_mul(f64_size)
-            .and_then(|b| ints_per_slot.checked_mul(i32_size).and_then(|c| b.checked_add(c)))
+            .and_then(|b| {
+                ints_per_slot
+                    .checked_mul(i32_size)
+                    .and_then(|c| b.checked_add(c))
+            })
             .ok_or(LaunchPlanError::SizeOverflow {
                 indicator: INDICATOR,
                 what: "bytes/slot",
@@ -288,7 +303,10 @@ impl CudaInsyncIndex {
 
         let fixed_bytes = output_elems
             .checked_mul(f64_size)
-            .and_then(|b| cols.checked_mul(4 * f64_size).and_then(|c| b.checked_add(c)))
+            .and_then(|b| {
+                cols.checked_mul(4 * f64_size)
+                    .and_then(|c| b.checked_add(c))
+            })
             .and_then(|b| {
                 rows.checked_mul(14 * i32_size + f64_size)
                     .and_then(|c| b.checked_add(c))
@@ -298,7 +316,13 @@ impl CudaInsyncIndex {
                 what: "fixed bytes",
             })?;
 
-        let plan = plan_slots(INDICATOR, rows, fixed_bytes, bytes_per_slot, DEFAULT_HEADROOM)?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )?;
         let scratch_doubles =
             scratch_elems(INDICATOR, "double scratch", plan.slots, doubles_per_slot)?;
         let scratch_ints = scratch_elems(INDICATOR, "int scratch", plan.slots, ints_per_slot)?;

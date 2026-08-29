@@ -82,9 +82,9 @@ impl Default for AdmissionPolicy {
         Self {
             vram_usable_fraction: 0.80,
             ram_usable_fraction: 0.75,
-            bytes_per_gene_sample: 8, // i32 signal + f32 confidence
+            bytes_per_gene_sample: 8,  // i32 signal + f32 confidence
             bytes_per_feature_cell: 4, // f32
-            ram_overhead_factor: 2.0, // raw cube + working copies
+            ram_overhead_factor: 2.0,  // raw cube + working copies
             heavy_ram_fraction: 0.50,
         }
     }
@@ -209,7 +209,11 @@ pub fn plan_combo(
         ((usable_ram / ram_per_combo).floor() as usize).max(1)
     };
     let heavy = ram_per_combo >= usable_ram * policy.heavy_ram_fraction;
-    let class = if heavy { ComboClass::Heavy } else { ComboClass::Light };
+    let class = if heavy {
+        ComboClass::Heavy
+    } else {
+        ComboClass::Light
+    };
     if ram_per_combo > usable_ram {
         notes.push(format!(
             "combo RAM est {:.1}GB exceeds usable RAM {:.1}GB — runs alone and may page; consider chunking rows",
@@ -320,7 +324,11 @@ pub struct ComboItem {
 
 impl ComboItem {
     pub fn new(id: impl Into<String>, shape: ComboShape, plan: ComboAdmissionPlan) -> Self {
-        Self { id: id.into(), shape, plan }
+        Self {
+            id: id.into(),
+            shape,
+            plan,
+        }
     }
 }
 
@@ -448,7 +456,11 @@ impl WorkScheduler {
                 cpu_threads: 0, // set fairly below
                 class,
             });
-            self.running.push(RunningItem { item, card_ids, ram_gb: ram });
+            self.running.push(RunningItem {
+                item,
+                card_ids,
+                ram_gb: ram,
+            });
         }
         // Fairly split CPU cores across ALL in-flight workers (advisory budget;
         // avoids over-subscribing the cores when several combos run concurrently).
@@ -647,7 +659,11 @@ mod tests {
         let combos: Vec<_> = (0..8)
             .map(|i| mk_item(&format!("L{i}"), ComboClass::Light, 1, 1.0))
             .collect();
-        let mut sched = WorkScheduler::new(combos, &hw(64, 256.0, &[48.0; 8]), &AdmissionPolicy::default());
+        let mut sched = WorkScheduler::new(
+            combos,
+            &hw(64, 256.0, &[48.0; 8]),
+            &AdmissionPolicy::default(),
+        );
         let started = sched.poll();
         assert_eq!(started.len(), 8, "8 cards => 8 light combos concurrently");
         // Distinct, non-overlapping card slots covering 0..8.
@@ -672,9 +688,17 @@ mod tests {
             &hw(8, 32.0, &[0.0, 0.0]),
             &AdmissionPolicy::default(),
         );
-        assert_eq!(sched.total_cards(), 2, "two 0-VRAM GPUs must count as 2 cards");
+        assert_eq!(
+            sched.total_cards(),
+            2,
+            "two 0-VRAM GPUs must count as 2 cards"
+        );
         let started = sched.poll();
-        assert_eq!(started.len(), 2, "both combos dispatched across the 2 cards");
+        assert_eq!(
+            started.len(),
+            2,
+            "both combos dispatched across the 2 cards"
+        );
         assert_eq!(sched.free_cards(), 0);
     }
 
@@ -685,13 +709,20 @@ mod tests {
             mk_item("H", ComboClass::Heavy, 8, 70.0),
             mk_item("Lother", ComboClass::Light, 1, 1.0),
         ];
-        let mut sched = WorkScheduler::new(combos, &hw(60, 116.0, &[48.0; 8]), &AdmissionPolicy::default());
+        let mut sched = WorkScheduler::new(
+            combos,
+            &hw(60, 116.0, &[48.0; 8]),
+            &AdmissionPolicy::default(),
+        );
         // No heavy-exclusivity: the heavy (sorted first) runs on ONE card while
         // the two lights run concurrently on other cards (70+1+1 = 72 <= 87 usable).
         let started = sched.poll();
         assert_eq!(started.len(), 3, "heavy + 2 lights run concurrently");
         assert_eq!(started[0].id, "H", "heavy-first ordering");
-        assert!(started.iter().all(|a| a.card_ids.len() == 1), "one card per combo");
+        assert!(
+            started.iter().all(|a| a.card_ids.len() == 1),
+            "one card per combo"
+        );
         assert_eq!(started[0].cpu_threads, 20, "60 cores / 3 in-flight workers");
         assert_eq!(sched.free_cards(), 5);
         assert_eq!(sched.running_len(), 3);
@@ -703,7 +734,11 @@ mod tests {
         let combos: Vec<_> = (0..8)
             .map(|i| mk_item(&format!("L{i}"), ComboClass::Light, 1, 40.0))
             .collect();
-        let mut sched = WorkScheduler::new(combos, &hw(64, 134.0, &[48.0; 8]), &AdmissionPolicy::default());
+        let mut sched = WorkScheduler::new(
+            combos,
+            &hw(64, 134.0, &[48.0; 8]),
+            &AdmissionPolicy::default(),
+        );
         let started = sched.poll();
         assert_eq!(started.len(), 2, "RAM-bound to 2 despite 8 free cards");
         assert_eq!(sched.free_cards(), 6);
@@ -715,7 +750,11 @@ mod tests {
             mk_item("A", ComboClass::Light, 2, 10.0),
             mk_item("B", ComboClass::Light, 2, 10.0),
         ];
-        let mut sched = WorkScheduler::new(combos, &hw(32, 128.0, &[48.0; 4]), &AdmissionPolicy::default());
+        let mut sched = WorkScheduler::new(
+            combos,
+            &hw(32, 128.0, &[48.0; 4]),
+            &AdmissionPolicy::default(),
+        );
         let started = sched.poll();
         assert_eq!(started.len(), 2);
         // One card per combo now (sharding disabled): 2 of 4 cards used.
@@ -730,7 +769,8 @@ mod tests {
     #[test]
     fn cpu_only_box_runs_combo_on_cpu_lane() {
         let combos = vec![mk_item("H", ComboClass::Heavy, 0, 200.0)];
-        let mut sched = WorkScheduler::new(combos, &hw(96, 256.0, &[]), &AdmissionPolicy::default());
+        let mut sched =
+            WorkScheduler::new(combos, &hw(96, 256.0, &[]), &AdmissionPolicy::default());
         assert_eq!(sched.total_cards(), 0);
         let started = sched.poll();
         assert_eq!(started.len(), 1);
@@ -741,7 +781,11 @@ mod tests {
     #[test]
     fn oom_requeue_moves_combo_to_cpu_lane() {
         let combos = vec![mk_item("G", ComboClass::Light, 2, 10.0)];
-        let mut sched = WorkScheduler::new(combos, &hw(32, 128.0, &[48.0; 4]), &AdmissionPolicy::default());
+        let mut sched = WorkScheduler::new(
+            combos,
+            &hw(32, 128.0, &[48.0; 4]),
+            &AdmissionPolicy::default(),
+        );
         let started = sched.poll();
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].card_ids.len(), 1, "one card per combo");
@@ -750,7 +794,10 @@ mod tests {
         assert_eq!(sched.free_cards(), 4, "card freed after failure");
         let retry = sched.poll();
         assert_eq!(retry.len(), 1);
-        assert!(retry[0].card_ids.is_empty(), "retried on CPU lane, no cards");
+        assert!(
+            retry[0].card_ids.is_empty(),
+            "retried on CPU lane, no cards"
+        );
         assert_eq!(sched.pending_len(), 0);
     }
 }

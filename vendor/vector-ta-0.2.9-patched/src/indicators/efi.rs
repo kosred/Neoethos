@@ -1,39 +1,17 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
 use std::convert::AsRef;
 use std::error::Error;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaEfi, DeviceArrayF32};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
 
 #[inline(always)]
 fn first_valid_diff_index(price: &[f64], volume: &[f64], first_valid_idx: usize) -> usize {
@@ -75,10 +53,6 @@ pub struct EfiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct EfiParams {
     pub period: Option<usize>,
 }
@@ -265,7 +239,6 @@ pub fn efi_with_kernel(input: &EfiInput, kernel: Kernel) -> Result<EfiOutput, Ef
     Ok(EfiOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn efi_into(input: &EfiInput, out: &mut [f64]) -> Result<(), EfiError> {
     efi_into_slice(out, input, Kernel::Auto)
 }
@@ -795,58 +768,6 @@ unsafe fn efi_row_avx512_long(
     efi_scalar(price, volume, period, first, out);
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "efi")]
-#[pyo3(signature = (price, volume, period, kernel=None))]
-pub fn efi_py<'py>(
-    py: Python<'py>,
-    price: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let price_slice = price.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = EfiParams {
-        period: Some(period),
-    };
-    let input = EfiInput::from_slices(price_slice, volume_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| efi_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "EfiStream")]
-pub struct EfiStreamPy {
-    stream: EfiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl EfiStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = EfiParams {
-            period: Some(period),
-        };
-        let stream =
-            EfiStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(EfiStreamPy { stream })
-    }
-
-    fn update(&mut self, price: f64, volume: f64) -> Option<f64> {
-        self.stream.update(price, volume)
-    }
-}
-
 #[inline(always)]
 fn efi_batch_inner_into(
     price: &[f64],
@@ -996,438 +917,17 @@ fn efi_row_from_precomputed(
     }
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "efi_batch")]
-#[pyo3(signature = (price, volume, period_range, kernel=None))]
-pub fn efi_batch_py<'py>(
-    py: Python<'py>,
-    price: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let price_slice = price.as_slice()?;
-    let volume_slice = volume.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = EfiBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep);
-    let rows = combos.len();
-    let cols = price_slice.len();
-    let total = rows.checked_mul(cols).ok_or_else(|| {
-        PyValueError::new_err("efi: Invalid range expansion (rows*cols overflow)")
-    })?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            efi_batch_inner_into(price_slice, volume_slice, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn efi_js(price: &[f64], volume: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = EfiParams {
-        period: Some(period),
-    };
-    let input = EfiInput::from_slices(price, volume, params);
-
-    let mut output = vec![0.0; price.len()];
-    efi_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn efi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn efi_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn efi_into(
-    in_price_ptr: *const f64,
-    in_volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if in_price_ptr.is_null() || in_volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let price = std::slice::from_raw_parts(in_price_ptr, len);
-        let volume = std::slice::from_raw_parts(in_volume_ptr, len);
-        let params = EfiParams {
-            period: Some(period),
-        };
-        let input = EfiInput::from_slices(price, volume, params);
-
-        if in_price_ptr == out_ptr || in_volume_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            efi_into_slice(&mut temp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            efi_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EfiBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct EfiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<EfiParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = efi_batch)]
-pub fn efi_batch_js(price: &[f64], volume: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: EfiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = EfiBatchRange {
-        period: config.period_range,
-    };
-
-    let output = efi_batch_with_kernel(price, volume, &sweep, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = EfiBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", unsendable)]
-pub struct EfiDeviceArrayF32Py {
-    pub(crate) inner: Option<DeviceArrayF32>,
-    pub(crate) ctx: Arc<Context>,
-    pub(crate) device_id: i32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl EfiDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-        let d = PyDict::new(py);
-        d.set_item("shape", (inner.rows, inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                inner.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        d.set_item("data", (inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?;
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d(
-            py,
-            buf,
-            rows,
-            cols,
-            alloc_dev,
-            max_version_bound,
-        )
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "efi_cuda_batch_dev")]
-#[pyo3(signature = (price_f32, volume_f32, period_range=(13,13,0), device_id=0))]
-pub fn efi_cuda_batch_dev_py(
-    py: Python<'_>,
-    price_f32: numpy::PyReadonlyArray1<'_, f32>,
-    volume_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<EfiDeviceArrayF32Py> {
-    use numpy::PyArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let p = price_f32.as_slice()?;
-    let v = volume_f32.as_slice()?;
-    if p.len() != v.len() {
-        return Err(PyValueError::new_err(
-            "price and volume must have same length",
-        ));
-    }
-    let sweep = EfiBatchRange {
-        period: period_range,
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaEfi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id() as i32;
-        let arr = cuda
-            .efi_batch_dev(p, v, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(EfiDeviceArrayF32Py {
-        inner: Some(inner),
-        ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "efi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (prices_tm_f32, volumes_tm_f32, period=13, device_id=0))]
-pub fn efi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    prices_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    volumes_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<EfiDeviceArrayF32Py> {
-    use numpy::PyArrayMethods;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let p_flat = prices_tm_f32.as_slice()?;
-    let v_flat = volumes_tm_f32.as_slice()?;
-    let shp_p = prices_tm_f32.shape();
-    let shp_v = volumes_tm_f32.shape();
-    if shp_p.len() != 2 || shp_v.len() != 2 || shp_p != shp_v {
-        return Err(PyValueError::new_err(
-            "prices_tm and volumes_tm must be same 2D shape",
-        ));
-    }
-    let rows = shp_p[0];
-    let cols = shp_p[1];
-    let params = EfiParams {
-        period: Some(period),
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaEfi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id() as i32;
-        let arr = cuda
-            .efi_many_series_one_param_time_major_dev(p_flat, v_flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(EfiDeviceArrayF32Py {
-        inner: Some(inner),
-        ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn efi_batch_into(
-    in_price_ptr: *const f64,
-    in_volume_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if in_price_ptr.is_null() || in_volume_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to efi_batch_into"));
-    }
-
-    unsafe {
-        let price = std::slice::from_raw_parts(in_price_ptr, len);
-        let volume = std::slice::from_raw_parts(in_volume_ptr, len);
-
-        let sweep = EfiBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep);
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("efi_batch_into: rows*cols overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-
-        let first = price
-            .iter()
-            .zip(volume.iter())
-            .position(|(p, v)| !p.is_nan() && !v.is_nan())
-            .ok_or_else(|| JsValue::from_str("All values are NaN"))?;
-
-        let warm = first_valid_diff_index(price, volume, first);
-
-        for row in 0..rows {
-            let row_start = row * cols;
-            for i in 0..warm.min(cols) {
-                out[row_start + i] = f64::NAN;
-            }
-        }
-
-        efi_batch_inner_into(price, volume, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn efi_output_into_js(
-    price: &[f64],
-    volume: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = efi_js(price, volume, period)?;
-    crate::write_wasm_f64_output("efi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn efi_batch_output_into_js(
-    price: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = efi_batch_js(price, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs("efi_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use crate::utilities::enums::Kernel;
 
     fn check_efi_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = EfiParams { period: None };
         let input = EfiInput::from_candles(&candles, "close", default_params);
         let output = efi_with_kernel(&input, kernel)?;
@@ -1437,8 +937,8 @@ mod tests {
 
     fn check_efi_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EfiInput::from_candles(&candles, "close", EfiParams::default());
         let result = efi_with_kernel(&input, kernel)?;
         let expected_last_five = [
@@ -1499,8 +999,8 @@ mod tests {
 
     fn check_efi_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = EfiInput::from_candles(&candles, "close", EfiParams { period: Some(13) });
         let res = efi_with_kernel(&input, kernel)?;
         assert_eq!(res.values.len(), candles.close.len());
@@ -1509,8 +1009,8 @@ mod tests {
 
     fn check_efi_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let period = 13;
         let input = EfiInput::from_candles(
             &candles,
@@ -1552,8 +1052,8 @@ mod tests {
     fn check_efi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             EfiParams::default(),
@@ -1804,8 +1304,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = EfiBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -1819,8 +1319,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -1928,7 +1428,6 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_efi_into_matches_api() -> Result<(), Box<dyn Error>> {
         let len = 256usize;

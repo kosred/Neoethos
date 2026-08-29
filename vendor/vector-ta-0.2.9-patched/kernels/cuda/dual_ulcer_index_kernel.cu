@@ -163,25 +163,21 @@ extern "C" __global__ void dual_ulcer_index_finalize_f64(
 /* ===========================================================================
  * f64 LANE  --  closer 2, round 2                        dual_ulcer_index
  * ---------------------------------------------------------------------------
- * CPU reference: `compute_dual_ulcer_index_selected_row`,
- * src/indicators/dual_ulcer_index.rs:566, reached from
- * `dual_ulcer_index_output_into_slice` (:766) which the batch dispatcher calls
- * per combo (cpu_batch.rs:6735).
+ * CPU reference: `compute_dual_ulcer_index_row` and its operation-identical
+ * selected-row sibling in src/indicators/dual_ulcer_index.rs, reached from the
+ * canonical batch dispatcher once per output and parameter tuple.
  *
  * `period` IS the swept parameter (cpu_batch.rs:6723, default 5).
- * `auto_threshold` is true and `threshold` is 0.1 by default (:6724-6726); the
- * lane emits the LONG ULCER series, which is what the dispatcher returns for
- * `output_id` "value" as well as "long_ulcer" and "uulcer" (:6700-6706), so
- * `threshold` never reaches the emitted column at all.
+ * `auto_threshold` is true and `threshold` is 0.1 by default. The registry and
+ * CPU dispatcher expose exactly long_ulcer/short_ulcer/threshold; the retired
+ * value/uulcer/dulcer spellings are not production identities.
  *
  * WHY THE EXISTING ENTRY POINTS COULD NOT BE REUSED. This file already carries
- * `dual_ulcer_index_build_squares_f64` and `dual_ulcer_index_finalize_f64`,
- * a TWO-PASS pair that writes two intermediate matrices and takes a
- * `thresholds` array and an `auto_threshold` flag. The lane launches
- * (series, n, periods, n_combos, first_valid, out) and allocates ONE matrix, so
- * neither of those signatures can be launched from it -- a variant pointing at
- * one would read the stack. This entry point fuses the two passes into one
- * thread body and needs no intermediate matrix at all.
+ * `dual_ulcer_index_build_squares_f64` and `dual_ulcer_index_finalize_f64`, a
+ * public TWO-PASS pair retained for its standalone ABI. Production cannot use
+ * it because it allocates intermediate matrices and launches twice. The typed
+ * shared-session ABI below fuses the work into one thread body and one launch;
+ * the preserved generic primary delegates to that same row authority.
  *
  * SEQUENTIAL, one thread per column: `long_sq_sum` is a SLIDING sum, updated as
  * `sum -= leaving; sum += arriving` in that order (:646, :653), and its value
@@ -197,10 +193,9 @@ extern "C" __global__ void dual_ulcer_index_finalize_f64(
  *     ever holds bars since the last reset, and the emit condition is
  *     `close_count >= period` -- i.e. the whole window is valid -- so the two
  *     windows coincide;
- *   * the value LEAVING the sliding sum is `long_sq` at bar `t - period`, which
- *     is a deterministic function of the data. It is recomputed rather than
- *     stored, which is the same double because every operation between is
- *     deterministic.
+ *   * the long and short values LEAVING their sliding sums are the two squared
+ *     returns at bar `t - period`. They are recomputed rather than stored,
+ *     which gives the same doubles because the operation sequence is fixed.
  * The cost is a second O(period) rescan per bar. The benefit is that an
  * oversized period is not refused by name and no local array exists to size.
  *
@@ -224,12 +219,13 @@ extern "C" __global__ void dual_ulcer_index_finalize_f64(
 __device__ __forceinline__
 static bool neo_dui_valid(double v) { return isfinite(v) && v > 0.0; }
 
-/* The squared long return at bar `t` for a window of `period` bars ending
- * there, dual_ulcer_index.rs:638-642. Returns false when the window is not
- * entirely valid, which on the CPU cannot happen at a bar the loop emits. */
+/* The exact long/short squared returns at bar `t` for a window of `period`
+ * bars ending there, dual_ulcer_index.rs:619-642. Returns false when the
+ * complete window is not valid. */
 __device__ __forceinline__
-static bool neo_dui_long_sq(const double* __restrict__ data,
-                            int t, int period, double* out_sq)
+static bool neo_dui_squares(const double* __restrict__ data,
+                            int t, int period,
+                            double* out_long_sq, double* out_short_sq)
 {
     const int window_start = t + 1 - period;
     if (window_start < 0) return false;
@@ -237,16 +233,137 @@ static bool neo_dui_long_sq(const double* __restrict__ data,
     if (!neo_dui_valid(close)) return false;
 
     double highest = data[window_start];
+    double lowest = highest;
     if (!neo_dui_valid(highest)) return false;
     for (int i = window_start + 1; i <= t; ++i) {
         const double v = data[i];
         if (!neo_dui_valid(v)) return false;
         if (v > highest) highest = v;
+        if (v < lowest) lowest = v;
     }
 
     const double long_ret = 100.0 * (close - highest) / highest;
-    *out_sq = long_ret * long_ret;
+    const double short_ret = 100.0 * (close - lowest) / lowest;
+    *out_long_sq = long_ret * long_ret;
+    *out_short_sq = short_ret * short_ret;
     return true;
+}
+
+/* One production arithmetic authority for both the canonical triple-output
+ * launch and the preserved long-ulcer primary ABI. Null output pointers mean
+ * "do not materialize this matrix"; every scalar operation still executes in
+ * the same order as compute_dual_ulcer_index_selected_row. */
+__device__ __forceinline__
+static void dual_ulcer_index_row_f64(
+    const double* __restrict__ data,
+    int n,
+    int period,
+    bool auto_threshold,
+    double custom_threshold,
+    double* __restrict__ out_long_ulcer,
+    double* __restrict__ out_short_ulcer,
+    double* __restrict__ out_threshold)
+{
+    for (int i = 0; i < n; ++i) {
+        if (out_long_ulcer != nullptr) out_long_ulcer[i] = NEO_F64_NAN;
+        if (out_short_ulcer != nullptr) out_short_ulcer[i] = NEO_F64_NAN;
+        if (out_threshold != nullptr) out_threshold[i] = NEO_F64_NAN;
+    }
+    if (period <= 0 || period > n || !isfinite(custom_threshold) ||
+        custom_threshold < 0.0) {
+        return;
+    }
+
+    int close_count = 0;
+    int sq_count = 0;
+    double long_sq_sum = 0.0;
+    double short_sq_sum = 0.0;
+    double diff_sum = 0.0;
+    int diff_count = 0;
+
+    for (int t = 0; t < n; ++t) {
+        const double close = data[t];
+        if (!neo_dui_valid(close)) {
+            close_count = 0;
+            sq_count = 0;
+            long_sq_sum = 0.0;
+            short_sq_sum = 0.0;
+            continue;
+        }
+
+        if (close_count < period) close_count += 1;
+        if (close_count < period) continue;
+
+        double long_sq;
+        double short_sq;
+        if (!neo_dui_squares(data, t, period, &long_sq, &short_sq)) {
+            close_count = 0;
+            sq_count = 0;
+            long_sq_sum = 0.0;
+            short_sq_sum = 0.0;
+            continue;
+        }
+
+        if (sq_count == period) {
+            double leaving_long_sq;
+            double leaving_short_sq;
+            if (!neo_dui_squares(data, t - period, period,
+                                 &leaving_long_sq, &leaving_short_sq)) {
+                return;
+            }
+            long_sq_sum -= leaving_long_sq;
+            short_sq_sum -= leaving_short_sq;
+        } else {
+            sq_count += 1;
+        }
+        long_sq_sum += long_sq;
+        short_sq_sum += short_sq;
+
+        if (sq_count < period) continue;
+
+        const double denom = (double)period;
+        const double long_ulcer = sqrt(long_sq_sum) / denom;
+        const double short_ulcer = sqrt(short_sq_sum) / denom;
+        const double diff = fabs(long_ulcer - short_ulcer);
+        double threshold_value;
+        if (auto_threshold) {
+            diff_sum += diff;
+            diff_count += 1;
+            threshold_value = diff_sum / (double)diff_count;
+        } else {
+            threshold_value = custom_threshold;
+        }
+
+        if (out_long_ulcer != nullptr) out_long_ulcer[t] = long_ulcer;
+        if (out_short_ulcer != nullptr) out_short_ulcer[t] = short_ulcer;
+        if (out_threshold != nullptr) out_threshold[t] = threshold_value;
+    }
+}
+
+extern "C" __global__
+void dual_ulcer_index_all_outputs_f64(
+    const double* __restrict__ data,
+    int n,
+    const int* __restrict__ periods,
+    const int* __restrict__ auto_thresholds,
+    const double* __restrict__ thresholds,
+    int n_combos,
+    double* __restrict__ out_long_ulcer,
+    double* __restrict__ out_short_ulcer,
+    double* __restrict__ out_threshold)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || n <= 0) return;
+    const size_t base = (size_t)combo * (size_t)n;
+    dual_ulcer_index_row_f64(
+        data,
+        n,
+        periods[combo],
+        auto_thresholds[combo] != 0,
+        thresholds[combo],
+        out_long_ulcer + base,
+        out_short_ulcer + base,
+        out_threshold + base);
 }
 
 extern "C" __global__
@@ -259,57 +376,14 @@ void dual_ulcer_index_neo_batch_f64(const double* __restrict__ data,
 {
     const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (combo >= n_combos || n <= 0) return;
-    (void)first_valid;   /* the CPU row starts at bar 0 -- see the header. */
-
-    double* __restrict__ o = out + (size_t)combo * (size_t)n;
-    for (int i = 0; i < n; ++i) o[i] = NEO_F64_NAN;
-
-    const int period = periods[combo];
-    /* validate_common, :411-424 -- period 0 or longer than the data errors. */
-    if (period <= 0 || period > n) return;
-
-    int    close_count  = 0;
-    int    sq_count     = 0;
-    double long_sq_sum  = 0.0;
-
-    for (int t = 0; t < n; ++t) {
-        const double close = data[t];
-        if (!neo_dui_valid(close)) {
-            /* :591-599 -- an invalid close resets the whole carried state. */
-            close_count  = 0;
-            sq_count     = 0;
-            long_sq_sum  = 0.0;
-            continue;
-        }
-
-        if (close_count < period) close_count += 1;    /* :631-633 */
-        if (close_count < period) continue;            /* :634-636 */
-
-        double long_sq;
-        if (!neo_dui_long_sq(data, t, period, &long_sq)) {
-            /* Unreachable while `close_count >= period`; kept so a future
-             * change to the validity predicate cannot read past the array. */
-            close_count = 0;
-            sq_count    = 0;
-            long_sq_sum = 0.0;
-            continue;
-        }
-
-        if (sq_count == period) {
-            /* :645-647 -- the value leaving is the long_sq of bar t - period,
-             * recomputed rather than stored. */
-            double leaving;
-            if (!neo_dui_long_sq(data, t - period, period, &leaving)) return;
-            long_sq_sum -= leaving;
-        } else {
-            sq_count += 1;                             /* :648-650 */
-        }
-
-        long_sq_sum += long_sq;                        /* :653 */
-
-        if (sq_count < period) continue;               /* :660-662 */
-
-        const double denom = (double)period;
-        o[t] = sqrt(long_sq_sum) / denom;              /* :664-665 */
-    }
+    (void)first_valid;
+    dual_ulcer_index_row_f64(
+        data,
+        n,
+        periods[combo],
+        true,
+        0.1,
+        out + (size_t)combo * (size_t)n,
+        nullptr,
+        nullptr);
 }

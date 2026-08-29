@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 //! `smooth_theil_sen` on the card.
 //!
@@ -19,11 +19,11 @@
 //! been created. A launch failure is an `Err` naming the indicator.
 
 use crate::cuda::f64_launch::{
-    checked_mul, plan_slots, scratch_elems, validate_launch, LaunchPlanError, DEFAULT_HEADROOM,
+    DEFAULT_HEADROOM, LaunchPlanError, checked_mul, plan_slots, scratch_elems, validate_launch,
 };
 use crate::indicators::smooth_theil_sen::{
-    smooth_theil_sen_expand_grid, SmoothTheilSenBatchRange, SmoothTheilSenDeviationType,
-    SmoothTheilSenParams, SmoothTheilSenStatStyle,
+    SmoothTheilSenBatchRange, SmoothTheilSenDeviationType, SmoothTheilSenParams,
+    SmoothTheilSenStatStyle, smooth_theil_sen_expand_grid,
 };
 use cust::context::Context;
 use cust::device::Device;
@@ -237,13 +237,22 @@ impl CudaSmoothTheilSen {
         let bytes_per_slot = checked_mul(INDICATOR, "bytes/slot", doubles_per_slot, f64_size)?;
         let fixed_bytes = checked_mul(INDICATOR, "output bytes", output_elems, 6 * f64_size)?
             .checked_add(cols * f64_size)
-            .and_then(|b| rows.checked_mul(2 * i32_size + f64_size).and_then(|c| b.checked_add(c)))
+            .and_then(|b| {
+                rows.checked_mul(2 * i32_size + f64_size)
+                    .and_then(|c| b.checked_add(c))
+            })
             .ok_or(LaunchPlanError::SizeOverflow {
                 indicator: INDICATOR,
                 what: "fixed bytes",
             })?;
 
-        let plan = plan_slots(INDICATOR, rows, fixed_bytes, bytes_per_slot, DEFAULT_HEADROOM)?;
+        let plan = plan_slots(
+            INDICATOR,
+            rows,
+            fixed_bytes,
+            bytes_per_slot,
+            DEFAULT_HEADROOM,
+        )?;
         let scratch_len = scratch_elems(INDICATOR, "scratch", plan.slots, doubles_per_slot)?;
 
         let func = self

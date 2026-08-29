@@ -1,13 +1,13 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
-use crate::indicators::moving_averages::zlema::{expand_grid_zlema, ZlemaBatchRange, ZlemaParams};
+use crate::indicators::moving_averages::zlema::{ZlemaBatchRange, ZlemaParams, expand_grid_zlema};
 use cust::context::{CacheConfig, Context};
 use cust::device::Device;
 use cust::device::DeviceAttribute as DevAttr;
 use cust::function::{BlockSize, GridSize};
 use cust::memory::{AsyncCopyDestination, DeviceBuffer, DevicePointer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
@@ -139,9 +139,6 @@ impl CudaZlema {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/zlema_kernel.ptx"));
-
-        let jit_opts = &[ModuleJitOption::DetermineTargetFromContext];
         let module = crate::load_cuda_embedded_module!("zlema_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

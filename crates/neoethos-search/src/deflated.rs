@@ -49,6 +49,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::data_selection::CanonicalSearchInputReceiptV2;
 use crate::trial_returns::{TRIAL_RETURNS_MAGIC, binary_path};
 
 /// Schema tag for the statistics block embedded in the trial-returns manifest.
@@ -254,10 +255,14 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedTrialMatrix, DecodeError> {
         return Err(DecodeError::EmptyPeriodGrid);
     }
     let grid_end = HEADER
-        .checked_add(periods.checked_mul(8).ok_or(DecodeError::TruncatedPeriodGrid {
-            periods,
-            bytes: bytes.len(),
-        })?)
+        .checked_add(
+            periods
+                .checked_mul(8)
+                .ok_or(DecodeError::TruncatedPeriodGrid {
+                    periods,
+                    bytes: bytes.len(),
+                })?,
+        )
         .ok_or(DecodeError::TruncatedPeriodGrid {
             periods,
             bytes: bytes.len(),
@@ -326,13 +331,37 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedTrialMatrix, DecodeError> {
     })
 }
 
-/// Read and decode the payload written next to the ledger for `(symbol, tf)`.
-pub fn read_matrix(cache_dir: &str, symbol: &str, tf: &str) -> anyhow::Result<DecodedTrialMatrix> {
-    read_matrix_at(&binary_path(cache_dir, symbol, tf))
+/// Read and decode only the payload whose manifest validates against the exact
+/// canonical receipt and resolved configuration.
+pub fn read_matrix(
+    cache_dir: &str,
+    symbol: &str,
+    tf: &str,
+    expected_receipt: &CanonicalSearchInputReceiptV2,
+    expected_config_hash: &str,
+) -> anyhow::Result<DecodedTrialMatrix> {
+    crate::trial_returns::load_manifest(
+        cache_dir,
+        symbol,
+        tf,
+        expected_receipt,
+        expected_config_hash,
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no receipt-bound trial-returns manifest for {symbol}/{tf} and config {expected_config_hash}"
+        )
+    })?;
+    read_matrix_at(&binary_path(
+        cache_dir,
+        expected_receipt,
+        expected_config_hash,
+    )?)
 }
 
-/// Read and decode a payload at an explicit path.
-pub fn read_matrix_at(path: &Path) -> anyhow::Result<DecodedTrialMatrix> {
+/// Internal decode helper. External consumers must enter through
+/// [`read_matrix`], which validates the receipt/config-bound manifest first.
+fn read_matrix_at(path: &Path) -> anyhow::Result<DecodedTrialMatrix> {
     let bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("read trial matrix {}: {e}", path.display()))?;
     decode(&bytes).map_err(|e| anyhow::anyhow!("decode trial matrix {}: {e}", path.display()))
@@ -525,10 +554,7 @@ pub struct DeflatedSharpeReport {
 /// [`redeflate_sharpe`] recomputes it at a larger `N`; a second copy of this
 /// formula anywhere would let the two answers drift apart silently, and the
 /// whole point of the deflation is that N is not negotiable.
-fn expected_max_sharpe(
-    sharpe_variance_across_trials: f64,
-    trials_n: usize,
-) -> Result<f64, String> {
+fn expected_max_sharpe(sharpe_variance_across_trials: f64, trials_n: usize) -> Result<f64, String> {
     let n = trials_n as f64;
     let (Some(q1), Some(q2)) = (
         normal_ppf(1.0 - 1.0 / n),
@@ -916,8 +942,7 @@ pub fn pbo_cscv(matrix: &DecodedTrialMatrix) -> Result<PboReport, String> {
         .rows
         .iter()
         .filter(|r| {
-            r.returns.iter().all(|v| v.is_finite())
-                && r.returns.windows(2).any(|w| w[0] != w[1])
+            r.returns.iter().all(|v| v.is_finite()) && r.returns.windows(2).any(|w| w[0] != w[1])
         })
         .collect();
     let excluded = matrix.rows.len() - usable.len();
@@ -1246,7 +1271,9 @@ impl TrialStatisticsReport {
 
     /// Convenience for a caller that only wants to log one number each.
     pub fn dsr_value(&self) -> Option<f64> {
-        self.deflated_sharpe.as_ref().map(|d| d.deflated_sharpe_ratio)
+        self.deflated_sharpe
+            .as_ref()
+            .map(|d| d.deflated_sharpe_ratio)
     }
     pub fn pbo_value(&self) -> Option<f64> {
         self.pbo.as_ref().map(|p| p.pbo)
@@ -1352,7 +1379,10 @@ impl TrialStatisticsReport {
                         p.degenerate_oos_evaluations
                     ));
                 }
-                s.push_str(&format!("  group choice        : {}\n", p.group_choice_reason));
+                s.push_str(&format!(
+                    "  group choice        : {}\n",
+                    p.group_choice_reason
+                ));
                 for a in &p.assumptions {
                     s.push_str(&format!("    assumes: {a}\n"));
                 }
@@ -1431,19 +1461,33 @@ pub fn analyse_matrix(matrix: &DecodedTrialMatrix, trials_offered: usize) -> Tri
     }
 }
 
-/// Read the payload for `(symbol, tf)` and compute both statistics.
+/// Read the exact receipt/config-bound payload and compute both statistics.
 ///
 /// The entry point for a consumer outside the writer — a CLI subcommand, a UI
 /// panel, or a re-analysis of an old run's matrix.
-pub fn analyse_run(cache_dir: &str, symbol: &str, tf: &str) -> TrialStatisticsReport {
-    let path = binary_path(cache_dir, symbol, tf);
-    let trials_offered = crate::trial_returns::load_manifest(cache_dir, symbol, tf)
-        .map(|m| m.trials_offered)
-        .unwrap_or(0);
-    match std::fs::read(&path) {
-        Ok(bytes) => analyse_bytes(&bytes, trials_offered),
-        Err(e) => TrialStatisticsReport::unreadable(format!("read {}: {e}", path.display())),
-    }
+pub fn analyse_run(
+    cache_dir: &str,
+    symbol: &str,
+    tf: &str,
+    expected_receipt: &CanonicalSearchInputReceiptV2,
+    expected_config_hash: &str,
+) -> anyhow::Result<TrialStatisticsReport> {
+    let manifest = crate::trial_returns::load_manifest(
+        cache_dir,
+        symbol,
+        tf,
+        expected_receipt,
+        expected_config_hash,
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no receipt-bound trial-returns manifest for {symbol}/{tf} and config {expected_config_hash}"
+        )
+    })?;
+    let path = binary_path(cache_dir, expected_receipt, expected_config_hash)?;
+    let bytes = std::fs::read(&path)
+        .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+    Ok(analyse_bytes(&bytes, manifest.trials_offered))
 }
 
 #[cfg(test)]
@@ -1462,7 +1506,11 @@ mod tests {
         (u - 0.5) * 0.04
     }
 
-    fn build(rows: usize, periods: usize, mean_of_row: impl Fn(usize) -> f64) -> DecodedTrialMatrix {
+    fn build(
+        rows: usize,
+        periods: usize,
+        mean_of_row: impl Fn(usize) -> f64,
+    ) -> DecodedTrialMatrix {
         let matrix = TrialReturnMatrix {
             period_keys: (0..periods as i64).map(|i| 24_000 + i).collect(),
             initial_balance: 10_000.0,
@@ -1578,7 +1626,11 @@ mod tests {
                     returns: (0..periods)
                         .map(|j| {
                             let base = pattern(7, j);
-                            if i == 0 { base + 0.05 } else { base + 0.0001 * i as f64 }
+                            if i == 0 {
+                                base + 0.05
+                            } else {
+                                base + 0.0001 * i as f64
+                            }
                         })
                         .collect(),
                     trades_outside_grid: 0,
@@ -1592,7 +1644,10 @@ mod tests {
         assert!(p.mean_logit > 0.0);
         assert_eq!(p.trials_ranked, rows);
         assert!(p.combinations >= 70, "all balanced splits are evaluated");
-        assert!(!p.assumptions.is_empty(), "the value states its assumptions");
+        assert!(
+            !p.assumptions.is_empty(),
+            "the value states its assumptions"
+        );
     }
 
     #[test]
@@ -1627,7 +1682,13 @@ mod tests {
                     strategy_id: format!("gene_{i}"),
                     // Every third trial never closed a trade inside the grid.
                     returns: (0..periods)
-                        .map(|j| if i % 3 == 0 { 0.0 } else { pattern(i as u64 + 1, j) })
+                        .map(|j| {
+                            if i % 3 == 0 {
+                                0.0
+                            } else {
+                                pattern(i as u64 + 1, j)
+                            }
+                        })
                         .collect(),
                     trades_outside_grid: 0,
                 })
@@ -1636,7 +1697,10 @@ mod tests {
         let refs: Vec<&TrialReturnRow> = matrix.rows.iter().collect();
         let m = decode(&encode(&matrix, &refs)).unwrap();
         let p = pbo_cscv(&m).expect("computable");
-        assert_eq!(p.trials_excluded_constant, 8, "24 rows, every third is flat");
+        assert_eq!(
+            p.trials_excluded_constant, 8,
+            "24 rows, every third is flat"
+        );
         assert_eq!(p.trials_ranked, 16);
         assert!(
             p.assumptions.iter().any(|a| a.contains("PBO DOWN")),
@@ -1656,7 +1720,10 @@ mod tests {
             (d.raw_sharpe_annualised - d.raw_sharpe_per_period * PERIODS_PER_YEAR.sqrt()).abs()
                 < 1e-9
         );
-        assert!(d.expected_max_sharpe_per_period > 0.0, "N trials raise the bar");
+        assert!(
+            d.expected_max_sharpe_per_period > 0.0,
+            "N trials raise the bar"
+        );
         assert!(
             (d.excess_over_expected_max_per_period
                 - (d.raw_sharpe_per_period - d.expected_max_sharpe_per_period))
@@ -1729,7 +1796,12 @@ mod tests {
     fn an_unreadable_matrix_refuses_both_statistics_rather_than_looking_unrun() {
         let r = analyse_bytes(&[0u8; 3], 0);
         assert!(r.deflated_sharpe.is_none() && r.pbo.is_none());
-        assert!(r.deflated_sharpe_refusal.as_ref().unwrap().contains("REFUSED"));
+        assert!(
+            r.deflated_sharpe_refusal
+                .as_ref()
+                .unwrap()
+                .contains("REFUSED")
+        );
         assert!(r.pbo_refusal.as_ref().unwrap().contains("REFUSED"));
         assert!(r.render().contains("un-deflated"));
     }
@@ -1742,7 +1814,10 @@ mod tests {
         assert!(text.contains("DEFLATED SHARPE RATIO"));
         assert!(text.contains("PROBABILITY OF BACKTEST OVERFITTING"));
         assert!(text.contains("RAW Sharpe"), "raw sits beside deflated");
-        assert!(text.contains("assumes:"), "assumptions are part of the output");
+        assert!(
+            text.contains("assumes:"),
+            "assumptions are part of the output"
+        );
         assert!(text.contains("honest denominator"));
     }
 
@@ -1767,11 +1842,17 @@ mod tests {
         let at_session = analyse_matrix(&m, 25_000);
 
         let redeflated = redeflate_sharpe(
-            at_own_count.deflated_sharpe.as_ref().expect("a DSR at N=200"),
+            at_own_count
+                .deflated_sharpe
+                .as_ref()
+                .expect("a DSR at N=200"),
             25_000,
         )
         .expect("re-deflation at a larger N");
-        let truth = at_session.deflated_sharpe.as_ref().expect("a DSR at N=25000");
+        let truth = at_session
+            .deflated_sharpe
+            .as_ref()
+            .expect("a DSR at N=25000");
 
         assert_eq!(redeflated.trials_n, truth.trials_n);
         assert_eq!(

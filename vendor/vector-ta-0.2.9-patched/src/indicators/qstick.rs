@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -12,11 +12,6 @@ use rayon::prelude::*;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum QstickData<'a> {
@@ -53,10 +48,6 @@ pub struct QstickOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct QstickParams {
     pub period: Option<usize>,
 }
@@ -279,7 +270,6 @@ pub fn qstick_with_kernel(
     Ok(QstickOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn qstick_into(input: &QstickInput, out: &mut [f64]) -> Result<(), QstickError> {
     let (open, close) = match &input.data {
         QstickData::Candles {
@@ -1266,53 +1256,24 @@ impl QstickStream {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qstick_output_into_js(
-    open: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = qstick_js(open, close, period)?;
-    crate::write_wasm_f64_output("qstick_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qstick_batch_unified_output_into_js(
-    open: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = qstick_batch_unified_js(open, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "qstick_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
 
     #[test]
     fn test_qstick_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = QstickParams { period: Some(5) };
         let input = QstickInput::from_candles(&candles, "open", "close", params);
 
         let baseline = qstick(&input)?.values;
 
         let mut into_out = vec![0.0; baseline.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         qstick_into(&input, &mut into_out)?;
 
         assert_eq!(baseline.len(), into_out.len());
@@ -1324,8 +1285,8 @@ mod tests {
     }
     fn check_qstick_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = QstickParams { period: None };
         let input_default = QstickInput::from_candles(&candles, "open", "close", default_params);
         let output_default = qstick_with_kernel(&input_default, kernel)?;
@@ -1338,8 +1299,8 @@ mod tests {
     }
     fn check_qstick_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = QstickParams { period: Some(5) };
         let input = QstickInput::from_candles(&candles, "open", "close", params);
         let result = qstick_with_kernel(&input, kernel)?;
@@ -1409,8 +1370,8 @@ mod tests {
     }
     fn check_qstick_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = QstickParams { period: Some(5) };
         let first_input = QstickInput::from_candles(&candles, "open", "close", first_params);
         let first_result = qstick_with_kernel(&first_input, kernel)?;
@@ -1431,8 +1392,8 @@ mod tests {
     }
     fn check_qstick_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = QstickParams { period: Some(5) };
         let input = QstickInput::from_candles(&candles, "open", "close", params);
         let qstick_result = qstick_with_kernel(&input, kernel)?;
@@ -1453,8 +1414,8 @@ mod tests {
     fn check_qstick_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             QstickParams::default(),
@@ -1711,8 +1672,8 @@ mod tests {
     generate_all_qstick_tests!(check_qstick_property);
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = QstickBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "open", "close")?;
@@ -1734,8 +1695,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2),
@@ -1842,323 +1803,6 @@ mod tests {
     gen_batch_tests!(check_batch_no_poison);
 }
 
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(name = "QstickDeviceArrayF32Py")]
-pub struct QstickDeviceArrayF32Py {
-    pub(crate) buf: Option<DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl QstickDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item("shape", (self.rows, self.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item(
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("buffer already exported via __dlpack__"))?
-            .as_device_ptr()
-            .as_raw() as usize;
-        d.set_item("data", (ptr, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> PyResult<PyObject> {
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err("dl_device mismatch for __dlpack__"));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self
-            .buf
-            .take()
-            .ok_or_else(|| PyValueError::new_err("__dlpack__ may only be called once"))?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "qstick")]
-#[pyo3(signature = (open, close, period, kernel=None))]
-pub fn qstick_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let open_slice = open.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = QstickParams {
-        period: Some(period),
-    };
-    let input = QstickInput::from_slices(open_slice, close_slice, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| qstick_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "QstickStream")]
-pub struct QstickStreamPy {
-    stream: QstickStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl QstickStreamPy {
-    #[new]
-    pub fn new(period: usize) -> PyResult<Self> {
-        let params = QstickParams {
-            period: Some(period),
-        };
-        let stream =
-            QstickStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(QstickStreamPy { stream })
-    }
-
-    pub fn update(&mut self, open: f64, close: f64) -> Option<f64> {
-        self.stream.update(open, close)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "qstick_batch")]
-#[pyo3(signature = (open, close, period_range, kernel=None))]
-pub fn qstick_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let open_slice = open.as_slice()?;
-    let close_slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = QstickBatchRange {
-        period: period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = open_slice.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => kernel,
-            };
-
-            qstick_batch_inner_into(open_slice, close_slice, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_qstick_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(qstick_py, m)?)?;
-    m.add_function(wrap_pyfunction!(qstick_batch_py, m)?)?;
-    m.add_class::<QstickStreamPy>()?;
-    #[cfg(all(feature = "python", feature = "cuda"))]
-    {
-        m.add_class::<QstickDeviceArrayF32Py>()?;
-    }
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(qstick_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(
-            qstick_cuda_many_series_one_param_dev_py,
-            m
-        )?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "qstick_cuda_batch_dev")]
-#[pyo3(signature = (open_f32, close_f32, period_range, device_id=0))]
-pub fn qstick_cuda_batch_dev_py(
-    py: Python<'_>,
-    open_f32: numpy::PyReadonlyArray1<'_, f32>,
-    close_f32: numpy::PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<QstickDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
-    use crate::cuda::CudaQstick;
-    use cust::context::Context;
-    use cust::memory::DeviceBuffer;
-    use std::sync::Arc;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let open_slice = open_f32.as_slice()?;
-    let close_slice = close_f32.as_slice()?;
-    let sweep = QstickBatchRange {
-        period: period_range,
-    };
-    let (buf, rows, cols, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaQstick::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out: DeviceArrayF32 = cuda
-            .qstick_batch_dev(open_slice, close_slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_arc: Arc<Context> = cuda.context_arc();
-        Ok::<_, pyo3::PyErr>((out.buf, out.rows, out.cols, ctx_arc, cuda.device_id()))
-    })?;
-    Ok(QstickDeviceArrayF32Py {
-        buf: Some(buf),
-        rows,
-        cols,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "qstick_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (open_tm_f32, close_tm_f32, period, device_id=0))]
-pub fn qstick_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    open_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    close_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    period: usize,
-    device_id: usize,
-) -> PyResult<QstickDeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::moving_averages::alma_wrapper::DeviceArrayF32;
-    use crate::cuda::CudaQstick;
-    use cust::context::Context;
-    use cust::memory::DeviceBuffer;
-    use numpy::PyUntypedArrayMethods;
-    use std::sync::Arc;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    if open_tm_f32.shape() != close_tm_f32.shape() {
-        return Err(PyValueError::new_err("open/close shapes differ"));
-    }
-    let flat_open: &[f32] = open_tm_f32.as_slice()?;
-    let flat_close: &[f32] = close_tm_f32.as_slice()?;
-    let rows = open_tm_f32.shape()[0];
-    let cols = open_tm_f32.shape()[1];
-
-    let (buf, r_out, c_out, ctx, dev_id) = py.allow_threads(|| {
-        let cuda = CudaQstick::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let out: DeviceArrayF32 = cuda
-            .qstick_many_series_one_param_time_major_dev(flat_open, flat_close, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx_arc: Arc<Context> = cuda.context_arc();
-        Ok::<_, pyo3::PyErr>((out.buf, out.rows, out.cols, ctx_arc, cuda.device_id()))
-    })?;
-    Ok(QstickDeviceArrayF32Py {
-        buf: Some(buf),
-        rows: r_out,
-        cols: c_out,
-        _ctx: ctx,
-        device_id: dev_id,
-    })
-}
-
 pub fn qstick_into_slice(
     dst: &mut [f64],
     open: &[f64],
@@ -2228,161 +1872,4 @@ pub fn qstick_into_slice(
     }
 
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qstick_js(open: &[f64], close: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let len = open.len();
-    if len != close.len() {
-        return Err(JsValue::from_str(
-            "Open and close arrays must have the same length",
-        ));
-    }
-
-    let mut output = vec![0.0; len];
-
-    qstick_into_slice(&mut output, open, close, period, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qstick_into(
-    open_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        if open_ptr == out_ptr || close_ptr == out_ptr {
-            let mut temp = vec![0.0; len];
-            qstick_into_slice(&mut temp, open, close, period, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            qstick_into_slice(out, open, close, period, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qstick_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qstick_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct QstickBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct QstickBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<QstickParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = qstick_batch)]
-pub fn qstick_batch_unified_js(
-    open: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: QstickBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let len = open.len();
-    if len != close.len() {
-        return Err(JsValue::from_str(
-            "Open and close arrays must have the same length",
-        ));
-    }
-
-    let sweep = QstickBatchRange {
-        period: config.period_range,
-    };
-
-    let output = qstick_batch_inner(open, close, &sweep, Kernel::Auto, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = QstickBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn qstick_batch_into(
-    open_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period_start: usize,
-    period_end: usize,
-    period_step: usize,
-) -> Result<usize, JsValue> {
-    if open_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-
-        let sweep = QstickBatchRange {
-            period: (period_start, period_end, period_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total_size = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("size overflow"))?;
-
-        let out = std::slice::from_raw_parts_mut(out_ptr, total_size);
-
-        qstick_batch_inner_into(open, close, &sweep, Kernel::Auto, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

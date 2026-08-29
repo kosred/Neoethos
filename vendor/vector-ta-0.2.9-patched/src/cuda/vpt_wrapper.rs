@@ -1,11 +1,11 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use crate::cuda::moving_averages::DeviceArrayF32;
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::launch;
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::sync::Arc;
@@ -61,11 +61,6 @@ impl CudaVpt {
         cust::init(CudaFlags::empty())?;
         let device = Device::get_device(device_id as u32)?;
         let ctx = Arc::new(Context::new(device)?);
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/vpt_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("vpt_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

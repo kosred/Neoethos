@@ -187,7 +187,7 @@ pub fn label_strategies_by_regime_windows(
     let mut per_gene_labels: Vec<Vec<WindowPerformanceLabel>> = vec![Vec::new(); genes.len()];
 
     for window in &windows {
-        let wf = slice_feature_frame(features, window.start_idx, window.end_idx);
+        let wf = slice_feature_frame(features, window.start_idx, window.end_idx)?;
         let wo = slice_ohlcv(
             ohlcv,
             window.start_idx,
@@ -208,12 +208,8 @@ pub fn label_strategies_by_regime_windows(
         .collect())
 }
 
-fn slice_feature_frame(features: &FeatureFrame, start: usize, end: usize) -> FeatureFrame {
-    FeatureFrame {
-        timestamps: features.timestamps[start..end].to_vec(),
-        names: features.names.clone(),
-        data: neoethos_data::FeatureData::InMemory(features.sample_window(start, end)),
-    }
+fn slice_feature_frame(features: &FeatureFrame, start: usize, end: usize) -> Result<FeatureFrame> {
+    features.row_window(start, end)
 }
 
 fn slice_ohlcv(ohlcv: &Ohlcv, start: usize, end: usize, fallback_timestamps: &[i64]) -> Ohlcv {

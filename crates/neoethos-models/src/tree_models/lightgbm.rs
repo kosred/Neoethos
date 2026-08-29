@@ -1,52 +1,55 @@
-// Tree-models LightGBM expert. Some helpers from `super::common`
-// are imported for symmetry with the XGBoost variant — they're
-// reached via the trait-object path so the compiler can't see the
-// direct call sites. Gated `unused_imports` here keeps the import
-// list aligned with the XGBoost sibling so a diff between the two
-// is a substantive diff, not import noise.
-#![allow(unused_imports)]
-
 use anyhow::{Context, Result, bail};
 #[cfg(feature = "lightgbm")]
 use lightgbm3;
 use ndarray::Array2;
-use polars::prelude::*;
+use neoethos_data::FeatureFrame;
+use neoethos_execution_budget::CpuLease;
+#[cfg(feature = "lightgbm")]
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+#[cfg(feature = "lightgbm")]
 use std::path::PathBuf;
 
-use crate::base::{ExpertModel, feature_columns_from_dataframe};
-use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
+use crate::base::ExpertModel;
+#[cfg(feature = "lightgbm")]
+use crate::base::feature_columns_from_frame;
+#[cfg(feature = "lightgbm")]
+use crate::common::{CudaDevicePolicy, ResolvedCudaDevicePolicy, resolve_cuda_device_policy};
+#[cfg(feature = "lightgbm")]
+use crate::runtime::artifacts::RuntimeArtifactMetadata;
+use crate::runtime::artifacts::TrainingSummaryMetadata;
+#[cfg(feature = "lightgbm")]
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
+use super::common::build_tree_runtime_predictions;
+#[cfg(feature = "lightgbm")]
 use super::common::{
-    LIGHTGBM_MODEL_FILE_NAME, TreeLocalFallbackArtifact, build_tree_local_fallback_artifact,
-    build_tree_runtime_predictions, calibrate_three_class_probabilities,
-    dataframe_to_row_major_vec, default_training_summary, ensure_feature_columns_match,
-    normalize_three_class_probabilities, predict_tree_local_fallback, read_runtime_metadata,
-    read_tree_json_artifact, remap_labels_to_tree_targets, reshape_three_class_probabilities,
-    tree_artifact_paths, tree_runtime_metadata, validate_tree_local_fallback_artifact,
+    LIGHTGBM_MODEL_FILE_NAME, calibrate_three_class_probabilities, default_training_summary,
+    ensure_feature_columns_match, feature_frame_to_tree_f32_row_major,
+    normalize_three_class_probabilities, read_runtime_metadata, read_tree_json_artifact,
+    remap_labels_to_tree_targets, tree_artifact_paths, tree_runtime_metadata,
     write_runtime_metadata, write_tree_json_artifact,
 };
 #[cfg(feature = "lightgbm")]
 use super::config::{
     DevicePreference, ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
-    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for,
-    lightgbm_gpu_allowed, param_bool, param_float, param_int, param_string,
-    tree_device_preference_for,
+    device_preference_from_params, gpu_only_from_params, gpu_only_mode_for, lightgbm_gpu_allowed,
+    nvidia_gpu_count, param_bool, param_float, param_int, param_string,
+    parse_tree_cuda_device_policy, tree_device_policy_from_params, tree_device_preference_for,
 };
 #[cfg(not(feature = "lightgbm"))]
 use super::config::{
-    DevicePreference, ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
-    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for,
-    lightgbm_gpu_allowed, param_float, param_string, tree_device_preference_for,
+    ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
+    device_preference_from_params, gpu_only_from_params, gpu_only_mode_for,
+    tree_device_policy_from_params, tree_device_preference_for,
 };
 use std::collections::HashMap;
 
+#[cfg(feature = "lightgbm")]
 const LIGHTGBM_RUNTIME_FILE_NAME: &str = "runtime.json";
-const LIGHTGBM_LOCAL_FALLBACK_FILE_NAME: &str = "lightgbm_local_fallback.json";
 
+#[cfg(feature = "lightgbm")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LightGBMRuntimeArtifact {
     configured_params: HashMap<String, ParamValue>,
@@ -54,7 +57,9 @@ struct LightGBMRuntimeArtifact {
     feature_columns: Vec<String>,
     training_summary: TrainingSummaryMetadata,
     device_pref: DevicePreference,
+    requested_device_policy: String,
     effective_device_type: String,
+    cuda_ordinal: Option<usize>,
     boosting_type: String,
     probability_temperature: f64,
     gpu_only: bool,
@@ -64,21 +69,18 @@ struct LightGBMRuntimeArtifact {
 pub struct LightGBMExpert {
     pub idx: usize,
     pub config: TreeModelConfig,
-    #[cfg_attr(not(feature = "lightgbm"), allow(dead_code))]
     feature_columns: Vec<String>,
-    #[cfg_attr(not(feature = "lightgbm"), allow(dead_code))]
     training_summary: Option<TrainingSummaryMetadata>,
-    local_fallback: Option<TreeLocalFallbackArtifact>,
     #[cfg(feature = "lightgbm")]
     model: Option<lightgbm3::Booster>,
     #[cfg(not(feature = "lightgbm"))]
-    #[allow(dead_code)]
     model: Option<()>,
 }
 
 impl LightGBMExpert {
     pub fn new(idx: usize, params: Option<HashMap<String, ParamValue>>) -> Self {
         let params = params.unwrap_or_else(Self::default_params);
+        let requested_device_policy = tree_device_policy_from_params(&params, "lightgbm");
         let device_pref =
             device_preference_from_params(&params, tree_device_preference_for("lightgbm"));
         let gpu_only = gpu_only_from_params(&params, gpu_only_mode_for("lightgbm"));
@@ -88,13 +90,13 @@ impl LightGBMExpert {
             config: TreeModelConfig {
                 idx,
                 params,
+                requested_device_policy,
                 device_pref,
                 gpu_only,
                 cpu_threads: Some(cpu_threads),
             },
             feature_columns: Vec::new(),
             training_summary: None,
-            local_fallback: None,
             model: None,
         }
     }
@@ -124,16 +126,19 @@ impl LightGBMExpert {
         params
     }
 
+    #[cfg(feature = "lightgbm")]
     fn stored_training_summary(&self) -> TrainingSummaryMetadata {
         self.training_summary
             .clone()
             .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
     }
 
+    #[cfg(feature = "lightgbm")]
     fn boosting_type(&self) -> String {
         param_string(&self.config.params, "boosting_type", "gbdt").to_lowercase()
     }
 
+    #[cfg(feature = "lightgbm")]
     fn probability_temperature(&self) -> f64 {
         let configured = param_float(&self.config.params, "probability_temperature", 1.0);
         if configured.is_finite() && configured > 0.0 {
@@ -160,37 +165,52 @@ impl LightGBMExpert {
     ///   2. the build linked the CUDA learner (`lightgbm-gpu` feature);
     ///   3. the operator's device preference is not an explicit `cpu`;
     ///   4. a GPU is actually visible.
-    /// Otherwise `cpu` — which is the whole of today's behaviour, because (1)
-    /// defaults to false.
+    /// An explicit CUDA request fails when any prerequisite is missing. Auto
+    /// remains CPU only when the LightGBM-specific opt-in is off or no NVIDIA
+    /// device is visible; after Auto selects CUDA, every setup/training error
+    /// is returned to the caller.
     ///
     /// Note the vocabulary: `cuda`, never `gpu`. In LightGBM those name two
     /// different tree learners, and `gpu` is the OpenCL one we do not build.
-    fn effective_device_type(&self) -> String {
+    #[cfg(feature = "lightgbm")]
+    fn resolved_cuda_device(&self) -> Result<ResolvedCudaDevicePolicy> {
+        let requested = parse_tree_cuda_device_policy(&self.config.requested_device_policy)?;
         if !lightgbm_gpu_allowed() {
-            return "cpu".to_string();
+            if matches!(requested, CudaDevicePolicy::Gpu { .. }) {
+                bail!(
+                    "LightGBM CUDA policy `{}` cannot be honoured because models.tree_runtime.lightgbm_gpu is false",
+                    self.config.requested_device_policy
+                );
+            }
+            return Ok(ResolvedCudaDevicePolicy::Cpu);
         }
-        if !cfg!(feature = "lightgbm-gpu") {
-            // Opted in on a build without the learner. Say so rather than
-            // silently returning cpu: the operator set a knob that this
-            // binary cannot honour, and that is worth one line in the log.
-            tracing::warn!(
-                target: "neoethos_models::lightgbm",
-                "models.tree_runtime.lightgbm_gpu is on, but this binary was built \
-                 without the `lightgbm-gpu` feature, so no CUDA tree learner is linked. \
-                 Training on CPU. Rebuild with --features gpu-cuda to honour the knob."
+
+        let resolved = self.config.resolved_cuda_device()?;
+        if matches!(resolved, ResolvedCudaDevicePolicy::Cuda { .. })
+            && !cfg!(feature = "lightgbm-gpu")
+        {
+            bail!(
+                "LightGBM resolved `{}` to CUDA, but this binary was built without the `lightgbm-gpu` feature",
+                self.config.requested_device_policy
             );
-            return "cpu".to_string();
         }
-        if matches!(self.config.device_pref, DevicePreference::Cpu) {
-            return "cpu".to_string();
-        }
-        if gpu_count() == 0 {
-            return "cpu".to_string();
-        }
-        "cuda".to_string()
+        Ok(resolved)
     }
 
-    fn resolved_params(&self) -> HashMap<String, ParamValue> {
+    #[cfg(feature = "lightgbm")]
+    fn resolved_device_parts(&self) -> Result<(&'static str, Option<usize>)> {
+        Ok(match self.resolved_cuda_device()? {
+            ResolvedCudaDevicePolicy::Cpu => ("cpu", None),
+            ResolvedCudaDevicePolicy::Cuda { ordinal } => ("cuda", Some(ordinal)),
+        })
+    }
+
+    #[cfg(feature = "lightgbm")]
+    fn resolved_params_for(
+        &self,
+        device_type: &str,
+        cuda_ordinal: Option<usize>,
+    ) -> Result<HashMap<String, ParamValue>> {
         let mut params = self.config.params.clone();
         params.insert(
             "boosting_type".into(),
@@ -198,8 +218,14 @@ impl LightGBMExpert {
         );
         params.insert(
             "device_type".into(),
-            ParamValue::String(self.effective_device_type()),
+            ParamValue::String(device_type.to_string()),
         );
+        params.remove("gpu_device_id");
+        if let Some(cuda_ordinal) = cuda_ordinal {
+            let cuda_ordinal = i32::try_from(cuda_ordinal)
+                .context("LightGBM CUDA ordinal exceeds the supported i32 parameter range")?;
+            params.insert("gpu_device_id".into(), ParamValue::Int(cuda_ordinal));
+        }
         params.insert(
             "probability_temperature".into(),
             ParamValue::Float(self.probability_temperature()),
@@ -209,26 +235,32 @@ impl LightGBMExpert {
             "cpu_threads".into(),
             ParamValue::Int(self.config.cpu_threads.unwrap_or(1).max(1) as i32),
         );
-        params
+        Ok(params)
     }
 
-    fn runtime_artifact(&self) -> LightGBMRuntimeArtifact {
-        LightGBMRuntimeArtifact {
+    #[cfg(feature = "lightgbm")]
+    fn runtime_artifact(&self) -> Result<LightGBMRuntimeArtifact> {
+        let (effective_device_type, cuda_ordinal) = self.resolved_device_parts()?;
+        Ok(LightGBMRuntimeArtifact {
             configured_params: self.config.params.clone(),
-            resolved_params: self.resolved_params(),
+            resolved_params: self.resolved_params_for(effective_device_type, cuda_ordinal)?,
             feature_columns: self.feature_columns.clone(),
             training_summary: self.stored_training_summary(),
             device_pref: self.config.device_pref,
-            effective_device_type: self.effective_device_type(),
+            requested_device_policy: self.config.requested_device_policy.clone(),
+            effective_device_type: effective_device_type.to_string(),
+            cuda_ordinal,
             boosting_type: self.boosting_type(),
             probability_temperature: self.probability_temperature(),
             gpu_only: self.config.gpu_only,
             cpu_threads: self.config.cpu_threads.unwrap_or(1).max(1),
-        }
+        })
     }
 
+    #[cfg(feature = "lightgbm")]
     fn apply_runtime_artifact(&mut self, artifact: LightGBMRuntimeArtifact) {
         self.config.device_pref = artifact.device_pref;
+        self.config.requested_device_policy = artifact.requested_device_policy;
         self.config.gpu_only = artifact.gpu_only;
         self.config.cpu_threads = Some(artifact.cpu_threads.max(1));
         self.config.params = artifact.configured_params;
@@ -236,35 +268,12 @@ impl LightGBMExpert {
         self.training_summary = Some(artifact.training_summary);
     }
 
+    #[cfg(feature = "lightgbm")]
     fn runtime_profile_path(root: &Path) -> PathBuf {
         root.join(LIGHTGBM_RUNTIME_FILE_NAME)
     }
 
-    fn local_fallback_path(root: &Path) -> std::path::PathBuf {
-        root.join(LIGHTGBM_LOCAL_FALLBACK_FILE_NAME)
-    }
-
-    fn persist_local_fallback(&self, root: &Path) -> Result<()> {
-        if let Some(artifact) = self.local_fallback.as_ref() {
-            validate_tree_local_fallback_artifact(artifact, &self.feature_columns)?;
-            write_tree_json_artifact(
-                &Self::local_fallback_path(root),
-                artifact,
-                "LightGBM local fallback",
-            )?;
-        }
-        Ok(())
-    }
-
-    fn read_local_fallback(root: &Path) -> Result<Option<TreeLocalFallbackArtifact>> {
-        let path = Self::local_fallback_path(root);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let artifact = read_tree_json_artifact(&path, "LightGBM local fallback")?;
-        Ok(Some(artifact))
-    }
-
+    #[cfg(feature = "lightgbm")]
     fn read_runtime_artifact(root: &Path) -> Result<Option<LightGBMRuntimeArtifact>> {
         let path = Self::runtime_profile_path(root);
         if !path.exists() {
@@ -275,10 +284,14 @@ impl LightGBMExpert {
     }
 
     #[cfg(feature = "lightgbm")]
-    fn prediction_params(&self) -> String {
+    fn prediction_params(&self, lease_width: usize) -> String {
         format!(
             "num_threads={}",
-            self.config.cpu_threads.unwrap_or(1).max(1)
+            self.config
+                .cpu_threads
+                .unwrap_or(lease_width)
+                .min(lease_width)
+                .max(1)
         )
     }
 
@@ -321,60 +334,12 @@ impl LightGBMExpert {
         params
     }
 
-    #[cfg(feature = "lightgbm")]
-    fn normalize_probabilities(
-        probabilities: Vec<f32>,
-        rows: usize,
-        cols: usize,
-    ) -> Result<Vec<f32>> {
-        if probabilities.len() != rows.saturating_mul(cols) {
-            anyhow::bail!(
-                "LightGBM prediction shape mismatch: expected {} values for {}x{}, got {}",
-                rows * cols,
-                rows,
-                cols,
-                probabilities.len()
-            );
-        }
-
-        let mut normalized = probabilities;
-        for row in normalized.chunks_exact_mut(cols) {
-            let mut sum = 0.0_f32;
-            for value in row.iter_mut() {
-                if !value.is_finite() {
-                    anyhow::bail!("LightGBM predicted a non-finite probability: {value}");
-                }
-                if *value < 0.0 {
-                    *value = 0.0;
-                }
-                sum += *value;
-            }
-            if sum > f32::EPSILON {
-                for value in row.iter_mut() {
-                    *value /= sum;
-                }
-            } else {
-                bail!("LightGBM produced a degenerate probability row with zero total mass");
-            }
-        }
-
-        Ok(normalized)
-    }
-
     fn runtime_predictions(
         &self,
         model_name: &str,
-        probabilities: &Array2<f32>,
+        probabilities: &Array2<f64>,
     ) -> Result<Vec<RuntimePrediction>> {
-        build_tree_runtime_predictions(
-            model_name,
-            probabilities,
-            self.model.is_some(),
-            "lightgbm_native",
-            self.local_fallback.as_ref(),
-            "native_lightgbm_unavailable",
-            "lightgbm_unknown",
-        )
+        build_tree_runtime_predictions(model_name, probabilities, "lightgbm_native")
     }
 
     fn ensure_runtime_state_ready(&self) -> Result<()> {
@@ -396,15 +361,13 @@ impl LightGBMExpert {
                 summary.val_rows
             );
         }
-        if self.model.is_none() && self.local_fallback.is_none() {
-            bail!("LightGBM runtime state has neither a native booster nor a local surrogate");
-        }
-        if let Some(fallback) = self.local_fallback.as_ref() {
-            validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+        if self.model.is_none() {
+            bail!("LightGBM runtime state is missing its native booster");
         }
         Ok(())
     }
 
+    #[cfg(feature = "lightgbm")]
     fn validate_runtime_artifact(
         artifact: &LightGBMRuntimeArtifact,
         expected_feature_columns: &[String],
@@ -454,6 +417,13 @@ impl LightGBMExpert {
         if artifact.boosting_type.trim().is_empty() {
             bail!("LightGBM runtime artifact boosting_type must not be blank");
         }
+        let requested_device = parse_tree_cuda_device_policy(&artifact.requested_device_policy)
+            .with_context(|| {
+                format!(
+                    "LightGBM runtime artifact has invalid requested device policy `{}`",
+                    artifact.requested_device_policy
+                )
+            })?;
         // `cuda` = the CUDA tree learner (the one we build). `gpu` = the
         // OpenCL learner; still accepted so artifacts written before
         // 2026-08-02 load, but nothing produces it any more.
@@ -467,13 +437,112 @@ impl LightGBMExpert {
                 artifact.effective_device_type
             );
         }
+        match artifact.effective_device_type.as_str() {
+            "cpu" => {
+                if artifact.cuda_ordinal.is_some() {
+                    bail!(
+                        "LightGBM CPU runtime artifact must not record a CUDA ordinal, got {:?}",
+                        artifact.cuda_ordinal
+                    );
+                }
+                if matches!(requested_device, CudaDevicePolicy::Gpu { .. }) {
+                    bail!(
+                        "LightGBM runtime artifact requested explicit CUDA but recorded CPU execution"
+                    );
+                }
+                if artifact.resolved_params.contains_key("gpu_device_id") {
+                    bail!(
+                        "LightGBM CPU runtime artifact must not contain a gpu_device_id parameter"
+                    );
+                }
+            }
+            "cuda" | "gpu" => {
+                let cuda_ordinal = artifact
+                    .cuda_ordinal
+                    .context("LightGBM CUDA runtime artifact must record the exact CUDA ordinal")?;
+                if matches!(requested_device, CudaDevicePolicy::Cpu) {
+                    bail!("LightGBM runtime artifact requested CPU but recorded CUDA execution");
+                }
+                if let CudaDevicePolicy::Gpu { ordinal } = requested_device
+                    && ordinal != cuda_ordinal
+                {
+                    bail!(
+                        "LightGBM runtime artifact CUDA ordinal mismatch: requested {ordinal}, recorded {cuda_ordinal}"
+                    );
+                }
+                let recorded_param = artifact.resolved_params.get("gpu_device_id");
+                let expected_param = i32::try_from(cuda_ordinal).context(
+                    "LightGBM runtime artifact CUDA ordinal exceeds the supported i32 parameter range",
+                )?;
+                if recorded_param != Some(&ParamValue::Int(expected_param)) {
+                    bail!(
+                        "LightGBM runtime artifact gpu_device_id mismatch: expected {expected_param}, got {:?}",
+                        recorded_param
+                    );
+                }
+            }
+            _ => unreachable!("validated LightGBM device vocabulary above"),
+        }
         Ok(())
     }
 
+    #[cfg(feature = "lightgbm")]
+    fn validate_runtime_device_for_load(artifact: &LightGBMRuntimeArtifact) -> Result<()> {
+        let requested = parse_tree_cuda_device_policy(&artifact.requested_device_policy)?;
+        let visible_nvidia_devices = nvidia_gpu_count();
+        let resolved = if !lightgbm_gpu_allowed() {
+            if matches!(requested, CudaDevicePolicy::Gpu { .. }) {
+                bail!(
+                    "LightGBM CUDA artifact policy `{}` cannot be honoured because models.tree_runtime.lightgbm_gpu is false",
+                    artifact.requested_device_policy
+                );
+            }
+            ResolvedCudaDevicePolicy::Cpu
+        } else {
+            resolve_cuda_device_policy(&artifact.requested_device_policy, visible_nvidia_devices)?
+        };
+        if matches!(resolved, ResolvedCudaDevicePolicy::Cuda { .. })
+            && !cfg!(feature = "lightgbm-gpu")
+        {
+            bail!(
+                "LightGBM artifact resolves CUDA from policy `{}`, but this build lacks `lightgbm-gpu`",
+                artifact.requested_device_policy
+            );
+        }
+        let recorded = match artifact.effective_device_type.as_str() {
+            "cpu" => ResolvedCudaDevicePolicy::Cpu,
+            "cuda" | "gpu" => ResolvedCudaDevicePolicy::Cuda {
+                ordinal: artifact
+                    .cuda_ordinal
+                    .context("LightGBM CUDA artifact is missing its recorded ordinal")?,
+            },
+            other => bail!("LightGBM artifact has unsupported recorded device `{other}`"),
+        };
+        if artifact.gpu_only && matches!(resolved, ResolvedCudaDevicePolicy::Cpu) {
+            bail!(
+                "LightGBM gpu-only artifact cannot relocate to CPU because no NVIDIA device is visible"
+            );
+        }
+        let auto_cpu_relocation = matches!(requested, CudaDevicePolicy::Auto)
+            && matches!(recorded, ResolvedCudaDevicePolicy::Cuda { .. })
+            && matches!(resolved, ResolvedCudaDevicePolicy::Cpu)
+            && visible_nvidia_devices == 0
+            && !artifact.gpu_only;
+        if !auto_cpu_relocation && recorded != resolved {
+            bail!(
+                "LightGBM runtime device drift on load: recorded {:?}, resolved {:?} from policy `{}`",
+                recorded,
+                resolved,
+                artifact.requested_device_policy
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "lightgbm")]
     fn resolve_runtime_metadata(
         path: &Path,
         runtime_artifact: Option<&LightGBMRuntimeArtifact>,
-        local_fallback: Option<&TreeLocalFallbackArtifact>,
     ) -> Result<RuntimeArtifactMetadata> {
         let (_, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
         if metadata_path.exists() {
@@ -496,14 +565,9 @@ impl LightGBMExpert {
                 runtime_artifact.feature_columns.clone(),
                 runtime_artifact.training_summary.clone(),
             )
-        } else if let Some(local_fallback) = local_fallback {
-            (
-                local_fallback.feature_columns.clone(),
-                local_fallback.training_summary.clone(),
-            )
         } else {
             bail!(
-                "LightGBM metadata sidecar missing and no runtime/local artifact is available at {}",
+                "LightGBM metadata sidecar and runtime artifact are missing at {}",
                 path.display()
             );
         };
@@ -524,50 +588,41 @@ impl LightGBMExpert {
     /// `num_iterations`.
     fn fit_internal(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        val_x: Option<&DataFrame>,
-        val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+        lease_width: usize,
     ) -> Result<()> {
         #[cfg(not(feature = "lightgbm"))]
         {
-            if x.height() == 0 || y.is_empty() {
-                bail!("LightGBM requires non-empty training features and labels");
-            }
-            if x.height() != y.len() {
-                bail!(
-                    "LightGBM requires matching feature and label rows: {} features vs {} labels",
-                    x.height(),
-                    y.len()
-                );
-            }
-            // Validation data is ignored in the no-feature path because the
-            // local fallback surrogate does not support eval-set early
-            // stopping. Surface a debug log so the caller can see why their
-            // val frame was dropped.
-            if val_x.is_some() && val_y.is_some() {
-                tracing::debug!(
-                    "LightGBM compiled without `lightgbm` feature; ignoring supplied val frame"
-                );
-            }
-
-            self.feature_columns = feature_columns_from_dataframe(x);
-            self.training_summary = Some(default_training_summary(x));
-            self.local_fallback = Some(build_tree_local_fallback_artifact(
-                x,
-                y,
-                self.stored_training_summary(),
-            )?);
-            self.model = None;
-            Ok(())
+            let _ = (x, y, val_x, val_y, lease_width);
+            bail!("LightGBM native backend unavailable: compile with the `lightgbm` feature")
         }
         #[cfg(feature = "lightgbm")]
         {
+            if x.n_samples() == 0 || y.is_empty() {
+                bail!("LightGBM requires non-empty training features and labels");
+            }
+            if x.n_samples() != y.len() {
+                bail!(
+                    "LightGBM requires matching feature and label rows: {} features vs {} labels",
+                    x.n_samples(),
+                    y.len()
+                );
+            }
+            self.config.cpu_threads = Some(
+                self.config
+                    .cpu_threads
+                    .unwrap_or(lease_width)
+                    .min(lease_width)
+                    .max(1),
+            );
             // Resolve the device once and fail before allocating a dataset or
             // entering native training. `gpu_only` means no CPU fallback,
             // regardless of whether the missing prerequisite is the config
             // opt-in, CUDA build feature, explicit device policy, or hardware.
-            let device_type = self.effective_device_type();
+            let (device_type, cuda_ordinal) = self.resolved_device_parts()?;
             if self.config.gpu_only && device_type != "cuda" {
                 anyhow::bail!(
                     "LightGBM gpu-only mode is set but the resolved device is `{device_type}`. \
@@ -578,61 +633,90 @@ impl LightGBMExpert {
                 );
             }
 
-            let (flat_x, _rows, cols) = dataframe_to_row_major_vec(x)?;
-            let labels = remap_labels_to_tree_targets(y)?;
-            if labels.len() != x.height() {
-                anyhow::bail!(
-                    "LightGBM training row count mismatch: {} features rows, {} labels",
-                    x.height(),
-                    labels.len()
-                );
-            }
-            let dataset = lightgbm3::Dataset::from_slice(&flat_x, &labels, cols as i32, true)
-                .context("create LightGBM dataset from dataframe")?;
-
             let mut params = self.build_training_params();
 
-            // ONE device decision, made by effective_device_type() and used
+            // ONE device decision, made by resolved_device_parts() and used
             // both here and in the artifact. The block that used to live here
             // wrote "gpu" — LightGBM's OpenCL learner — whenever a card was
-            // visible, without ever consulting effective_device_type(), which
+            // visible, without ever consulting the strict resolver, which
             // was simultaneously reporting "cpu" into the runtime artifact.
-            params["device_type"] = serde_json::json!(device_type.clone());
+            params["device_type"] = serde_json::json!(device_type);
+            if device_type == "cuda" {
+                let cuda_ordinal = cuda_ordinal
+                    .context("LightGBM CUDA resolution did not produce a device ordinal")?;
+                params["gpu_device_id"] = serde_json::json!(cuda_ordinal);
+                // LightGBM 4.6 has no CUDA multiclass metric implementation;
+                // requesting multi_logloss emits a warning and copies scores
+                // back for CPU evaluation on every round. NeoEthos performs
+                // its canonical held-out evaluation after fit, so CUDA mode
+                // trains the requested fixed iteration budget with no native
+                // CPU metric fallback. CUDA also does not support the sparse
+                // feature optimization and requires it disabled at dataset
+                // construction time.
+                params["metric"] = serde_json::json!("None");
+                params["is_enable_sparse"] = serde_json::json!(false);
+            }
             tracing::info!(
                 target: "neoethos_models::lightgbm",
                 idx = self.idx,
-                device_type = %device_type,
+                device_type = device_type,
+                cuda_ordinal = ?cuda_ordinal,
                 num_threads = self.config.cpu_threads.unwrap_or(1).max(1),
                 "LightGBM training device resolved"
             );
 
+            let (flat_x, _rows, cols) = feature_frame_to_tree_f32_row_major(x)?;
+            let labels = remap_labels_to_tree_targets(y)?;
+            if labels.len() != x.n_samples() {
+                anyhow::bail!(
+                    "LightGBM training row count mismatch: {} features rows, {} labels",
+                    x.n_samples(),
+                    labels.len()
+                );
+            }
+            let dataset = lightgbm3::Dataset::from_slice_with_params(
+                &flat_x,
+                &labels,
+                cols as i32,
+                true,
+                &params,
+            )
+            .context("create LightGBM dataset from typed feature frame")?;
+
             let valid_dataset = match (val_x, val_y) {
                 (Some(vx), Some(vy)) => {
-                    if vx.width() != x.width() {
+                    if vx.n_features() != x.n_features() {
                         anyhow::bail!(
                             "LightGBM validation column count mismatch: train {}, val {}",
-                            x.width(),
-                            vx.width()
+                            x.n_features(),
+                            vx.n_features()
                         );
                     }
-                    if vx.height() != vy.len() {
+                    if vx.n_samples() != vy.len() {
                         anyhow::bail!(
                             "LightGBM validation row/label mismatch: {} rows vs {} labels",
-                            vx.height(),
+                            vx.n_samples(),
                             vy.len()
                         );
                     }
-                    let (vflat, _vrows, vcols) = dataframe_to_row_major_vec(vx)?;
+                    let (vflat, _vrows, vcols) = feature_frame_to_tree_f32_row_major(vx)?;
                     let vlabels = remap_labels_to_tree_targets(vy)?;
-                    let valid =
-                        lightgbm3::Dataset::from_slice(&vflat, &vlabels, vcols as i32, true)
-                            .context("create LightGBM validation dataset from dataframe")?;
+                    let valid = lightgbm3::Dataset::from_slice_with_reference_and_params(
+                        &vflat,
+                        &vlabels,
+                        vcols as i32,
+                        true,
+                        Some(&dataset),
+                        &params,
+                    )
+                    .context("create LightGBM validation dataset from typed feature frame")?;
                     // Default early_stopping_rounds when caller did not
                     // explicitly set one. 50 rounds is a conservative
                     // patience for `num_iterations >= 200`.
-                    if !params
-                        .get("early_stopping_rounds")
-                        .is_some_and(|v| v.is_i64())
+                    if device_type != "cuda"
+                        && !params
+                            .get("early_stopping_rounds")
+                            .is_some_and(|v| v.is_i64())
                     {
                         params["early_stopping_rounds"] = serde_json::json!(50);
                     }
@@ -647,13 +731,8 @@ impl LightGBMExpert {
             let model = lightgbm3::Booster::train_with_valid(dataset, valid_dataset, &params)
                 .context("train LightGBM booster")?;
 
-            self.feature_columns = feature_columns_from_dataframe(x);
+            self.feature_columns = feature_columns_from_frame(x);
             self.training_summary = Some(default_training_summary(x));
-            self.local_fallback = Some(build_tree_local_fallback_artifact(
-                x,
-                y,
-                self.stored_training_summary(),
-            )?);
             self.model = Some(model);
             Ok(())
         }
@@ -661,107 +740,59 @@ impl LightGBMExpert {
 }
 
 impl ExpertModel for LightGBMExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
-        self.fit_with_validation(x, y, None, None)
+    fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
+        lease.scope(|| self.fit_internal(x, y, None, None, lease.width().get()))
     }
 
     fn fit_with_validation(
         &mut self,
-        x: &DataFrame,
-        y: &Series,
-        val_x: Option<&DataFrame>,
-        val_y: Option<&Series>,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+        lease: &CpuLease,
     ) -> Result<()> {
-        self.fit_internal(x, y, val_x, val_y)
+        lease.scope(|| self.fit_internal(x, y, val_x, val_y, lease.width().get()))
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        #[cfg(not(feature = "lightgbm"))]
-        let _ = x;
-        #[cfg(feature = "lightgbm")]
-        {
-            ensure_feature_columns_match(&self.feature_columns, x)?;
-            if self.model.is_none() {
-                if let Some(fallback) = self.local_fallback.as_ref() {
-                    tracing::warn!(
-                        model = "lightgbm",
-                        surrogate_kind = %fallback.surrogate_kind,
-                        surrogate_rows = fallback.training_summary.dataset_rows,
-                        "LightGBM native booster unavailable during predict_proba; using local surrogate fallback"
-                    );
-                    let probabilities = predict_tree_local_fallback(fallback, x)?;
-                    let probabilities = calibrate_three_class_probabilities(
-                        probabilities,
-                        self.probability_temperature() as f32,
-                        "LightGBM",
-                    )?;
-                    return normalize_three_class_probabilities(probabilities, "LightGBM");
-                }
-                bail!("LightGBM not trained");
+    fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
+        lease.scope(|| {
+            #[cfg(feature = "lightgbm")]
+            {
+                ensure_feature_columns_match(&self.feature_columns, x)?;
+                let model = self.model.as_ref().context("LightGBM not trained")?;
+                let (flat_x, rows, cols) = feature_frame_to_tree_f32_row_major(x)?;
+                let probabilities = model
+                    .predict_with_params(
+                        &flat_x,
+                        cols as i32,
+                        true,
+                        &self.prediction_params(lease.width().get()),
+                    )
+                    .context("predict LightGBM class probabilities")?;
+                let probabilities = Array2::from_shape_vec((rows, 3), probabilities)
+                    .context("reshape LightGBM class probabilities")?;
+                let probabilities = calibrate_three_class_probabilities(
+                    probabilities,
+                    self.probability_temperature(),
+                    "LightGBM",
+                )?;
+                normalize_three_class_probabilities(probabilities, "LightGBM")
             }
-            let model = self.model.as_ref().context("LightGBM not trained")?;
-            let (flat_x, rows, cols) = dataframe_to_row_major_vec(x)?;
-            let probabilities = model
-                .predict_with_params(&flat_x, cols as i32, true, &self.prediction_params())
-                .context("predict LightGBM class probabilities")?
-                .into_iter()
-                .map(|value| value as f32)
-                .collect::<Vec<_>>();
-            let normalized = Self::normalize_probabilities(probabilities, rows, 3)?;
-            let probabilities = reshape_three_class_probabilities(normalized, rows, 3)?;
-            let probabilities = calibrate_three_class_probabilities(
-                probabilities,
-                self.probability_temperature() as f32,
-                "LightGBM",
-            )?;
-            normalize_three_class_probabilities(probabilities, "LightGBM")
-        }
-        #[cfg(not(feature = "lightgbm"))]
-        {
-            let fallback = self
-                .local_fallback
-                .as_ref()
-                .context("LightGBM local fallback not trained")?;
-            let probabilities = predict_tree_local_fallback(fallback, x)?;
-            let probabilities = calibrate_three_class_probabilities(
-                probabilities,
-                self.probability_temperature() as f32,
-                "LightGBM",
-            )?;
-            normalize_three_class_probabilities(probabilities, "LightGBM")
-        }
+            #[cfg(not(feature = "lightgbm"))]
+            {
+                let _ = x;
+                bail!("LightGBM native backend unavailable: compile with the `lightgbm` feature")
+            }
+        })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
         self.ensure_runtime_state_ready()?;
         #[cfg(not(feature = "lightgbm"))]
         {
-            std::fs::create_dir_all(path).with_context(|| {
-                format!(
-                    "create LightGBM fallback artifact directory {}",
-                    path.display()
-                )
-            })?;
-            let metadata = tree_runtime_metadata(
-                "lightgbm",
-                self.feature_columns.clone(),
-                self.stored_training_summary(),
-            )?;
-            let (_, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
-            write_runtime_metadata(&metadata_path, &metadata)?;
-            let runtime_profile = self.runtime_artifact();
-            Self::validate_runtime_artifact(
-                &runtime_profile,
-                &self.feature_columns,
-                &self.stored_training_summary(),
-            )?;
-            write_tree_json_artifact(
-                &Self::runtime_profile_path(path),
-                &runtime_profile,
-                "LightGBM runtime artifact",
-            )?;
-            self.persist_local_fallback(path)?;
-            Ok(())
+            let _ = path;
+            bail!("LightGBM native backend unavailable: compile with the `lightgbm` feature")
         }
         #[cfg(feature = "lightgbm")]
         {
@@ -775,7 +806,7 @@ impl ExpertModel for LightGBMExpert {
             )?;
             let (model_path, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
-            let runtime_profile = self.runtime_artifact();
+            let runtime_profile = self.runtime_artifact()?;
             Self::validate_runtime_artifact(
                 &runtime_profile,
                 &self.feature_columns,
@@ -786,18 +817,14 @@ impl ExpertModel for LightGBMExpert {
                 &runtime_profile,
                 "LightGBM runtime artifact",
             )?;
-            if let Some(model) = self.model.as_ref() {
-                model
-                    .save_file(
-                        model_path
-                            .to_str()
-                            .context("LightGBM artifact path must be valid unicode")?,
-                    )
-                    .with_context(|| format!("save LightGBM artifact {}", model_path.display()))?;
-            } else if self.local_fallback.is_none() {
-                bail!("LightGBM not trained");
-            }
-            self.persist_local_fallback(path)?;
+            let model = self.model.as_ref().context("LightGBM not trained")?;
+            model
+                .save_file(
+                    model_path
+                        .to_str()
+                        .context("LightGBM artifact path must be valid unicode")?,
+                )
+                .with_context(|| format!("save LightGBM artifact {}", model_path.display()))?;
             Ok(())
         }
     }
@@ -805,46 +832,14 @@ impl ExpertModel for LightGBMExpert {
     fn load(&mut self, path: &Path) -> Result<()> {
         #[cfg(not(feature = "lightgbm"))]
         {
-            let runtime_profile = Self::read_runtime_artifact(path)?;
-            self.local_fallback = Self::read_local_fallback(path)?;
-            let metadata = Self::resolve_runtime_metadata(
-                path,
-                runtime_profile.as_ref(),
-                self.local_fallback.as_ref(),
-            )?;
-            let metadata_feature_columns = metadata.feature_columns.clone();
-            let metadata_training_summary = metadata.training_summary.clone();
-            if let Some(runtime_profile) = runtime_profile {
-                Self::validate_runtime_artifact(
-                    &runtime_profile,
-                    &metadata_feature_columns,
-                    &metadata_training_summary,
-                )?;
-                self.apply_runtime_artifact(runtime_profile);
-            } else {
-                self.feature_columns = metadata_feature_columns;
-                self.training_summary = Some(metadata_training_summary);
-                tracing::warn!(
-                    path = %path.display(),
-                    "LightGBM runtime.json missing; using metadata/local fallback to restore runtime state"
-                );
-            }
-            if let Some(fallback) = self.local_fallback.as_ref() {
-                validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-            }
-            self.model = None;
-            Ok(())
+            let _ = path;
+            bail!("LightGBM native backend unavailable: compile with the `lightgbm` feature")
         }
         #[cfg(feature = "lightgbm")]
         {
             let (model_path, _) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             let runtime_profile = Self::read_runtime_artifact(path)?;
-            self.local_fallback = Self::read_local_fallback(path)?;
-            let metadata = Self::resolve_runtime_metadata(
-                path,
-                runtime_profile.as_ref(),
-                self.local_fallback.as_ref(),
-            )?;
+            let metadata = Self::resolve_runtime_metadata(path, runtime_profile.as_ref())?;
             let metadata_feature_columns = metadata.feature_columns.clone();
             let metadata_training_summary = metadata.training_summary.clone();
             if let Some(runtime_profile) = runtime_profile {
@@ -853,78 +848,42 @@ impl ExpertModel for LightGBMExpert {
                     &metadata_feature_columns,
                     &metadata_training_summary,
                 )?;
+                Self::validate_runtime_device_for_load(&runtime_profile)?;
                 self.apply_runtime_artifact(runtime_profile);
             } else {
                 self.feature_columns = metadata_feature_columns;
                 self.training_summary = Some(metadata_training_summary);
                 tracing::warn!(
                     path = %path.display(),
-                    "LightGBM runtime.json missing; using metadata/local fallback to restore runtime state"
+                    "LightGBM runtime.json missing; using metadata to restore runtime state"
                 );
             }
-            let native_model_result = if model_path.exists() {
-                Some(
-                    lightgbm3::Booster::from_file(
-                        model_path
-                            .to_str()
-                            .context("LightGBM artifact path must be valid unicode")?,
-                    )
-                    .with_context(|| format!("load LightGBM artifact {}", model_path.display())),
-                )
-            } else {
-                None
-            };
-
-            match native_model_result {
-                Some(Ok(model)) => {
-                    self.model = Some(model);
-                    if let Some(fallback) = self.local_fallback.as_ref() {
-                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-                    }
-                }
-                Some(Err(native_err)) => {
-                    self.model = None;
-                    if let Some(fallback) = self.local_fallback.as_ref() {
-                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-                        tracing::warn!(
-                            model = "lightgbm",
-                            path = %path.display(),
-                            surrogate_kind = %fallback.surrogate_kind,
-                            surrogate_rows = fallback.training_summary.dataset_rows,
-                            error = %native_err,
-                            "failed to restore native LightGBM booster; using local surrogate fallback"
-                        );
-                    } else {
-                        return Err(native_err);
-                    }
-                }
-                None => {
-                    self.model = None;
-                    if let Some(fallback) = self.local_fallback.as_ref() {
-                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
-                        tracing::warn!(
-                            model = "lightgbm",
-                            path = %path.display(),
-                            surrogate_kind = %fallback.surrogate_kind,
-                            surrogate_rows = fallback.training_summary.dataset_rows,
-                            "LightGBM artifact missing native booster; using local surrogate fallback"
-                        );
-                    } else {
-                        bail!(
-                            "LightGBM artifact {} is missing both native model and local fallback payload",
-                            path.display()
-                        );
-                    }
-                }
+            if !model_path.exists() {
+                bail!(
+                    "LightGBM native model artifact is missing at {}",
+                    model_path.display()
+                );
             }
+            self.model = Some(
+                lightgbm3::Booster::from_file(
+                    model_path
+                        .to_str()
+                        .context("LightGBM artifact path must be valid unicode")?,
+                )
+                .with_context(|| format!("load LightGBM artifact {}", model_path.display()))?,
+            );
             Ok(())
         }
     }
 }
 
 impl LightGBMExpert {
-    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
-        let probabilities = self.predict_proba(x)?;
+    pub fn predict_runtime(
+        &self,
+        x: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x, lease)?;
         self.runtime_predictions("lightgbm", &probabilities)
     }
 
@@ -939,17 +898,40 @@ impl LightGBMExpert {
 
 #[cfg(all(test, feature = "lightgbm"))]
 mod tests {
-    use super::{ExpertModel, LightGBMExpert, build_tree_local_fallback_artifact};
+    use super::{ExpertModel, LightGBMExpert};
     use crate::runtime::artifacts::TrainingSummaryMetadata;
     use crate::tree_models::config::{DevicePreference, ParamValue};
     use ndarray::Array2;
-    use polars::df;
-    use polars::prelude::*;
+    use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame};
+    use neoethos_execution_budget::{CpuLease, CpuPermitBroker, CpuPermitRequest, WorkerLimit};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn sample_three_class_dataset() -> (DataFrame, Series) {
+    fn frame_from_columns(columns: Vec<(&str, Vec<f64>)>) -> FeatureFrame {
+        let rows = columns.first().map(|(_, values)| values.len()).unwrap_or(0);
+        let columns = columns
+            .into_iter()
+            .map(|(name, values)| {
+                FeatureColumnF64::new(name, values, vec![FeatureCellValidity::Valid; rows])
+                    .expect("valid typed feature column")
+            })
+            .collect::<Vec<_>>();
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+        .expect("build typed feature frame")
+    }
+
+    fn single_worker_lease() -> CpuLease {
+        let width = WorkerLimit::new(1).expect("one is a valid worker limit");
+        CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .expect("single-worker model test lease")
+    }
+
+    fn sample_three_class_dataset() -> (FeatureFrame, Vec<i32>) {
         let mut momentum = Vec::new();
         let mut trend = Vec::new();
         let mut volatility = Vec::new();
@@ -979,14 +961,14 @@ mod tests {
             labels.push(-1_i32);
         }
 
-        let x = df![
-            "momentum" => momentum,
-            "trend" => trend,
-            "volatility" => volatility,
-        ]
-        .expect("build training dataframe");
-        let y = Series::new("label".into(), labels);
-        (x, y)
+        (
+            frame_from_columns(vec![
+                ("momentum", momentum),
+                ("trend", trend),
+                ("volatility", volatility),
+            ]),
+            labels,
+        )
     }
 
     /// A training fold where only 2 of the 3 classes appear (no -1/sell). The
@@ -1013,11 +995,14 @@ mod tests {
             volatility.push(0.12 + o * 0.03);
             labels.push(0_i32);
         }
-        let x = df!["momentum" => momentum, "trend" => trend, "volatility" => volatility]
-            .expect("build 2-class dataframe");
-        let y = Series::new("label".into(), labels);
+        let x = frame_from_columns(vec![
+            ("momentum", momentum),
+            ("trend", trend),
+            ("volatility", volatility),
+        ]);
+        let lease = single_worker_lease();
         let mut expert = LightGBMExpert::new(7, None);
-        let res = expert.fit(&x, &y);
+        let res = expert.fit(&x, &labels, &lease);
         assert!(res.is_ok(), "2-class fold must train, got: {:?}", res.err());
     }
 
@@ -1031,12 +1016,12 @@ mod tests {
         path
     }
 
-    fn assert_rows_are_non_uniform(probabilities: &Array2<f32>) {
+    fn assert_rows_are_non_uniform(probabilities: &Array2<f64>) {
         assert_eq!(probabilities.ncols(), 3);
         assert!(
             probabilities.outer_iter().any(|row| {
                 row.iter()
-                    .any(|value| (value - (1.0_f32 / 3.0_f32)).abs() > 0.05_f32)
+                    .any(|value| (value - (1.0_f64 / 3.0_f64)).abs() > 0.05_f64)
             }),
             "expected at least one non-uniform probability row, got {probabilities:?}"
         );
@@ -1046,12 +1031,15 @@ mod tests {
     fn lightgbm_trains_three_class_probabilities_and_persists_artifacts() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("lightgbm-artifact");
+        let lease = single_worker_lease();
 
         let mut expert = LightGBMExpert::new(7, None);
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
 
-        let probabilities = expert.predict_proba(&x).expect("predict should succeed");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
+        let probabilities = expert
+            .predict_proba(&x, &lease)
+            .expect("predict should succeed");
+        assert_eq!(probabilities.dim(), (x.n_samples(), 3));
         assert_rows_are_non_uniform(&probabilities);
 
         expert.save(&artifact_dir).expect("save should succeed");
@@ -1074,54 +1062,48 @@ mod tests {
         let mut loaded = LightGBMExpert::new(7, None);
         loaded.load(&artifact_dir).expect("load should succeed");
         let reloaded = loaded
-            .predict_proba(&x)
+            .predict_proba(&x, &lease)
             .expect("reloaded predict should succeed");
 
         for (lhs, rhs) in probabilities.iter().zip(reloaded.iter()) {
             assert!(
-                (lhs - rhs).abs() < 1e-3_f32,
+                (lhs - rhs).abs() < 1e-3_f64,
                 "expected persisted probabilities to round-trip, left={lhs}, right={rhs}"
             );
         }
     }
 
     #[test]
-    fn lightgbm_loads_fallback_when_native_artifact_is_corrupt() {
+    fn lightgbm_rejects_corrupt_native_artifact_without_a_surrogate() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("lightgbm-corrupt-artifact");
+        let lease = single_worker_lease();
 
         let mut expert = LightGBMExpert::new(7, None);
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
         expert.save(&artifact_dir).expect("save should succeed");
 
         std::fs::write(artifact_dir.join("model.txt"), b"corrupt lightgbm model")
             .expect("overwrite native model artifact");
 
         let mut loaded = LightGBMExpert::new(7, None);
-        loaded
+        let error = loaded
             .load(&artifact_dir)
-            .expect("load should recover from persisted fallback");
-
-        let probabilities = loaded
-            .predict_proba(&x)
-            .expect("prediction should succeed from fallback");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
-        for row in probabilities.outer_iter() {
-            let sum = row.iter().copied().sum::<f32>();
-            assert!((sum - 1.0).abs() < 1e-3_f32);
-        }
+            .expect_err("corrupt native artifact must fail closed");
+        assert!(error.to_string().contains("load LightGBM artifact"));
     }
 
     #[test]
     fn lightgbm_load_uses_runtime_profile_when_metadata_sidecar_missing() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("lightgbm-missing-metadata-sidecar");
+        let lease = single_worker_lease();
 
         let mut expert = LightGBMExpert::new(7, None);
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
         expert.save(&artifact_dir).expect("save should succeed");
         std::fs::remove_file(artifact_dir.join("metadata.json"))
-            .expect("remove metadata sidecar to force fallback path");
+            .expect("remove metadata sidecar to force runtime-profile reconstruction");
 
         let mut loaded = LightGBMExpert::new(7, None);
         loaded
@@ -1129,31 +1111,32 @@ mod tests {
             .expect("load should reconstruct runtime metadata from runtime profile");
 
         let probabilities = loaded
-            .predict_proba(&x)
+            .predict_proba(&x, &lease)
             .expect("prediction should succeed after metadata reconstruction");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
+        assert_eq!(probabilities.dim(), (x.n_samples(), 3));
     }
 
     #[test]
     fn lightgbm_load_uses_metadata_when_runtime_sidecar_missing() {
         let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("lightgbm-missing-runtime-sidecar");
+        let lease = single_worker_lease();
 
         let mut expert = LightGBMExpert::new(11, None);
-        expert.fit(&x, &y).expect("fit should succeed");
+        expert.fit(&x, &y, &lease).expect("fit should succeed");
         expert.save(&artifact_dir).expect("save should succeed");
         std::fs::remove_file(artifact_dir.join("runtime.json"))
-            .expect("remove runtime sidecar to force metadata/local fallback path");
+            .expect("remove runtime sidecar to force metadata reconstruction");
 
         let mut loaded = LightGBMExpert::new(11, None);
         loaded
             .load(&artifact_dir)
-            .expect("load should reconstruct runtime state from metadata/local fallback");
+            .expect("load should reconstruct runtime state from metadata");
 
         let probabilities = loaded
-            .predict_proba(&x)
+            .predict_proba(&x, &lease)
             .expect("prediction should succeed after runtime reconstruction");
-        assert_eq!(probabilities.dim(), (x.height(), 3));
+        assert_eq!(probabilities.dim(), (x.n_samples(), 3));
     }
 
     /// The default config keeps LightGBM on the CPU, whatever the host has.
@@ -1174,15 +1157,17 @@ mod tests {
             "models.tree_runtime.lightgbm_gpu must default to false"
         );
         assert_eq!(
-            expert.effective_device_type(),
-            "cpu",
+            expert
+                .resolved_device_parts()
+                .expect("default LightGBM device policy must resolve"),
+            ("cpu", None),
             "default config must resolve LightGBM to the CPU learner"
         );
         // And the artifact must record the same string the trainer was given
         // — the two disagreeing is the defect this replaced.
         //
         // 2026-08-09: this assertion never ran. `runtime_artifact()` builds
-        // `training_summary` BEFORE `effective_device_type`, and on an unfitted
+        // `training_summary` BEFORE resolving the device, and on an unfitted
         // expert `stored_training_summary()` calls
         // `TrainingSummaryMetadata::new(0, 0, 0)`, whose `dataset_rows > 0`
         // assert panics — so the test aborted before it could compare a single
@@ -1190,7 +1175,10 @@ mod tests {
         // so the device-parity check this test exists for actually executes.
         expert.training_summary = Some(TrainingSummaryMetadata::new(9, 7, 2));
         assert_eq!(
-            expert.runtime_artifact().effective_device_type,
+            expert
+                .runtime_artifact()
+                .expect("default LightGBM runtime artifact must resolve")
+                .effective_device_type,
             "cpu",
             "artifact device must match the resolved training device"
         );
@@ -1201,23 +1189,35 @@ mod tests {
     /// so loading them must still work.
     #[test]
     fn lightgbm_runtime_artifact_accepts_cuda_and_legacy_gpu() {
-        let make = |device: &str| super::LightGBMRuntimeArtifact {
-            configured_params: HashMap::from([(
-                "boosting_type".into(),
-                ParamValue::String("gbdt".into()),
-            )]),
-            resolved_params: HashMap::from([(
-                "device_type".into(),
-                ParamValue::String(device.into()),
-            )]),
-            feature_columns: vec!["momentum".into(), "trend".into()],
-            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
-            device_pref: DevicePreference::Auto,
-            effective_device_type: device.into(),
-            boosting_type: "gbdt".into(),
-            probability_temperature: 1.0,
-            gpu_only: false,
-            cpu_threads: 4,
+        let make = |device: &str| {
+            let cuda_ordinal: Option<usize> = matches!(device, "cuda" | "gpu").then_some(0);
+            let mut resolved_params =
+                HashMap::from([("device_type".into(), ParamValue::String(device.into()))]);
+            if let Some(cuda_ordinal) = cuda_ordinal {
+                resolved_params.insert(
+                    "gpu_device_id".into(),
+                    ParamValue::Int(
+                        i32::try_from(cuda_ordinal).expect("test CUDA ordinal must fit in i32"),
+                    ),
+                );
+            }
+            super::LightGBMRuntimeArtifact {
+                configured_params: HashMap::from([(
+                    "boosting_type".into(),
+                    ParamValue::String("gbdt".into()),
+                )]),
+                resolved_params,
+                feature_columns: vec!["momentum".into(), "trend".into()],
+                training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+                device_pref: DevicePreference::Auto,
+                requested_device_policy: "auto".into(),
+                effective_device_type: device.into(),
+                cuda_ordinal,
+                boosting_type: "gbdt".into(),
+                probability_temperature: 1.0,
+                gpu_only: false,
+                cpu_threads: 4,
+            }
         };
         let columns = ["momentum".to_string(), "trend".to_string()];
         let summary = TrainingSummaryMetadata::new(9, 9, 0);
@@ -1244,7 +1244,9 @@ mod tests {
             feature_columns: vec!["momentum".into(), "trend".into()],
             training_summary: TrainingSummaryMetadata::new(9, 9, 0),
             device_pref: DevicePreference::Cpu,
+            requested_device_policy: "cpu".into(),
             effective_device_type: "cpu".into(),
+            cuda_ordinal: None,
             boosting_type: "gbdt".into(),
             probability_temperature: 0.0,
             gpu_only: false,
@@ -1262,19 +1264,10 @@ mod tests {
 
     #[test]
     fn lightgbm_save_rejects_missing_training_summary() {
-        let (x, y) = sample_three_class_dataset();
         let artifact_dir = unique_temp_dir("lightgbm-missing-summary");
 
         let mut expert = LightGBMExpert::new(7, None);
         expert.feature_columns = vec!["momentum".into(), "trend".into(), "volatility".into()];
-        expert.local_fallback = Some(
-            build_tree_local_fallback_artifact(
-                &x,
-                &y,
-                TrainingSummaryMetadata::new(x.height(), x.height(), 0),
-            )
-            .expect("fallback artifact"),
-        );
         expert.training_summary = None;
 
         let err = expert

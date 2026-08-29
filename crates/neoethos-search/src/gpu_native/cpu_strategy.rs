@@ -175,6 +175,28 @@ where
     Ok(operation())
 }
 
+/// Execute canonical CPU work only after the run-owned native probe proved
+/// that the loaded CUDA runtime enumerated exactly zero devices.
+///
+/// This boundary deliberately has no [`EvaluationBackend`] argument: operator
+/// configuration cannot grant or revoke the CPU authority carried by the
+/// opaque receipt. The ordinary [`run`] policy remains available to reference
+/// and legacy callers, while production Discovery consumes this sealed route.
+pub(crate) fn run_with_sealed_no_gpu_receipt<T, F>(
+    receipt: &crate::strict_discovery_device_route_v1::SealedCpuDiscoveryRouteReceiptV2,
+    audit: &CpuStrategyAuditContext,
+    category: CpuStrategyCategory,
+    operation: F,
+) -> T
+where
+    F: FnOnce() -> T,
+{
+    debug_assert!(receipt.authority_is_nonzero_v2());
+    audit.record_attempt(category);
+    audit.record_execution(category);
+    operation()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CpuStrategyAuditError {
     CpuForbidden {

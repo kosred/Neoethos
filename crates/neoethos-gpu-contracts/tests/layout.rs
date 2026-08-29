@@ -11,7 +11,7 @@ use neoethos_gpu_contracts::{
 
 #[test]
 fn population_abi_constants_are_numerically_pinned() {
-    assert_eq!(ABI_VERSION, 3);
+    assert_eq!(ABI_VERSION, 4);
     assert_eq!(POPULATION_SETTINGS_FLAG_RISK_BASED_SIZING, 1);
     assert_eq!(POPULATION_DIRECTION_LONG, 1);
     assert_eq!(POPULATION_DIRECTION_SHORT, -1);
@@ -41,9 +41,18 @@ fn population_settings_has_stable_c_layout() {
     assert_eq!(offset_of!(NeoPopulationSettings, spread_pips_asian), 160);
     assert_eq!(offset_of!(NeoPopulationSettings, spread_pips_late_ny), 176);
     assert_eq!(offset_of!(NeoPopulationSettings, trailing_enabled), 128);
-    assert_eq!(offset_of!(NeoPopulationSettings, trailing_atr_multiplier), 136);
-    assert_eq!(offset_of!(NeoPopulationSettings, trailing_be_trigger_r), 144);
-    assert_eq!(offset_of!(NeoPopulationSettings, trailing_min_lock_pips), 152);
+    assert_eq!(
+        offset_of!(NeoPopulationSettings, trailing_atr_multiplier),
+        136
+    );
+    assert_eq!(
+        offset_of!(NeoPopulationSettings, trailing_be_trigger_r),
+        144
+    );
+    assert_eq!(
+        offset_of!(NeoPopulationSettings, trailing_min_lock_pips),
+        152
+    );
     assert_eq!(align_of::<NeoPopulationSettings>(), 8);
     assert_eq!(offset_of!(NeoPopulationSettings, abi_version), 0);
     assert_eq!(offset_of!(NeoPopulationSettings, flags), 4);

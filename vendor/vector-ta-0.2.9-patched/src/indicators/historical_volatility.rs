@@ -1,25 +1,9 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::convert::AsRef;
@@ -51,10 +35,6 @@ pub struct HistoricalVolatilityOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct HistoricalVolatilityParams {
     pub lookback: Option<usize>,
     pub annualization_days: Option<f64>,
@@ -518,7 +498,6 @@ pub fn historical_volatility_into_slice(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn historical_volatility_into(
     input: &HistoricalVolatilityInput,
@@ -985,337 +964,15 @@ pub fn historical_volatility_batch_inner_into(
     Ok(combos)
 }
 
-#[cfg(feature = "python")]
-#[pyfunction(name = "historical_volatility")]
-#[pyo3(signature = (data, lookback=20, annualization_days=250.0, kernel=None))]
-pub fn historical_volatility_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    lookback: usize,
-    annualization_days: f64,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, false)?;
-    let input = HistoricalVolatilityInput::from_slice(
-        slice,
-        HistoricalVolatilityParams {
-            lookback: Some(lookback),
-            annualization_days: Some(annualization_days),
-        },
-    );
-    let output = py
-        .allow_threads(|| historical_volatility_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(output.values.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "HistoricalVolatilityStream")]
-pub struct HistoricalVolatilityStreamPy {
-    stream: HistoricalVolatilityStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl HistoricalVolatilityStreamPy {
-    #[new]
-    fn new(lookback: usize, annualization_days: f64) -> PyResult<Self> {
-        let stream = HistoricalVolatilityStream::try_new(HistoricalVolatilityParams {
-            lookback: Some(lookback),
-            annualization_days: Some(annualization_days),
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "historical_volatility_batch")]
-#[pyo3(signature = (data, lookback_range, annualization_days_range=(250.0, 250.0, 0.0), kernel=None))]
-pub fn historical_volatility_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    lookback_range: (usize, usize, usize),
-    annualization_days_range: (f64, f64, f64),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let slice = data.as_slice()?;
-    let kernel = validate_kernel(kernel, true)?;
-    let sweep = HistoricalVolatilityBatchRange {
-        lookback: lookback_range,
-        annualization_days: annualization_days_range,
-    };
-
-    let combos = expand_grid_historical_volatility(&sweep)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let batch = match kernel {
-                Kernel::Auto => detect_best_batch_kernel(),
-                other => other,
-            };
-            historical_volatility_batch_inner_into(
-                slice,
-                &sweep,
-                batch.to_non_batch(),
-                true,
-                slice_out,
-            )
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "lookbacks",
-        combos
-            .iter()
-            .map(|combo| combo.lookback.unwrap_or(20) as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "annualization_days",
-        combos
-            .iter()
-            .map(|combo| combo.annualization_days.unwrap_or(250.0))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_historical_volatility_module(
-    module: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(historical_volatility_py, module)?)?;
-    module.add_function(wrap_pyfunction!(historical_volatility_batch_py, module)?)?;
-    module.add_class::<HistoricalVolatilityStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "historical_volatility_js")]
-pub fn historical_volatility_js(
-    data: &[f64],
-    lookback: usize,
-    annualization_days: f64,
-) -> Result<Vec<f64>, JsValue> {
-    let input = HistoricalVolatilityInput::from_slice(
-        data,
-        HistoricalVolatilityParams {
-            lookback: Some(lookback),
-            annualization_days: Some(annualization_days),
-        },
-    );
-    let mut output = vec![0.0; data.len()];
-    historical_volatility_into_slice(&mut output, &input, Kernel::Auto)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    lookback: usize,
-    annualization_days: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let input = HistoricalVolatilityInput::from_slice(
-            data,
-            HistoricalVolatilityParams {
-                lookback: Some(lookback),
-                annualization_days: Some(annualization_days),
-            },
-        );
-
-        if in_ptr == out_ptr {
-            let mut tmp = vec![0.0; len];
-            historical_volatility_into_slice(&mut tmp, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(out_ptr, len).copy_from_slice(&tmp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            historical_volatility_into_slice(out, &input, Kernel::Auto)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HistoricalVolatilityBatchConfig {
-    pub lookback_range: (usize, usize, usize),
-    pub annualization_days_range: Option<(f64, f64, f64)>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct HistoricalVolatilityBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<HistoricalVolatilityParams>,
-    pub lookbacks: Vec<usize>,
-    pub annualization_days: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "historical_volatility_batch_js")]
-pub fn historical_volatility_batch_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: HistoricalVolatilityBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?;
-    let sweep = HistoricalVolatilityBatchRange {
-        lookback: config.lookback_range,
-        annualization_days: config
-            .annualization_days_range
-            .unwrap_or((250.0, 250.0, 0.0)),
-    };
-    let output = historical_volatility_batch_inner(data, &sweep, detect_best_kernel(), false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&HistoricalVolatilityBatchJsOutput {
-        lookbacks: output
-            .combos
-            .iter()
-            .map(|combo| combo.lookback.unwrap_or(20))
-            .collect(),
-        annualization_days: output
-            .combos
-            .iter()
-            .map(|combo| combo.annualization_days.unwrap_or(250.0))
-            .collect(),
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    lookback_start: usize,
-    lookback_end: usize,
-    lookback_step: usize,
-    annualization_days_start: f64,
-    annualization_days_end: f64,
-    annualization_days_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("Null pointer provided"));
-    }
-
-    let sweep = HistoricalVolatilityBatchRange {
-        lookback: (lookback_start, lookback_end, lookback_step),
-        annualization_days: (
-            annualization_days_start,
-            annualization_days_end,
-            annualization_days_step,
-        ),
-    };
-    let combos =
-        expand_grid_historical_volatility(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, total);
-        historical_volatility_batch_inner_into(data, &sweep, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    }
-
-    Ok(rows)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_output_into_js(
-    data: &[f64],
-    lookback: usize,
-    annualization_days: f64,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = historical_volatility_js(data, lookback, annualization_days)?;
-    crate::write_wasm_f64_output("historical_volatility_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn historical_volatility_batch_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = historical_volatility_batch_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "historical_volatility_batch_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     fn load_close() -> Result<Vec<f64>, Box<dyn Error>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
-        Ok(candles.close)
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
+        Ok(candles.close.clone())
     }
 
     #[test]

@@ -429,18 +429,17 @@ void dvdiqqe_many_series_one_param_f32(
  * seed at the first non-NaN, incremental mean for `period` bars, then
  * `beta.mul_add(prev, alpha * x)`.
  *
- * WHICH SERIES THIS EMITS. `dvdi`, the indicator's primary line. `fast_tl`,
- * `slow_tl` and `center_line` are separate outputs; none of them feeds `dvdi`,
- * so the `ranges` / `smooth_range` chain (:559-576) and the trailing-stop
- * ratchet (:588-623) are not computed here. That is not an omission — they are
- * downstream of `dvdi` and read nothing this matrix needs.
+ * WHICH SERIES THIS EMITS. The canonical family is exactly `dvdi`, `fast_tl`,
+ * `slow_tl`, `center_line`. The full ABI materializes all four in one launch;
+ * the preserved primary ABI materializes only `dvdi` but delegates to the same
+ * row authority and therefore retains no second arithmetic implementation.
  *
  * INPUT IS (open, close, volume). `dvdiqqe_compute_into` takes high and low as
  * `_high` and `_low` — it never reads them (:447-448). Declaring an Hlc or
  * Ohlc shape would hand this kernel two series it does not use and, worse,
  * would not hand it `open`, which the tick-range term needs at every bar.
  *
- * PERIOD-INVARIANT, AND THAT IS FAITHFUL. `compute_dvdiqqe_batch`
+ * PERIOD-SWEPT. `compute_dvdiqqe_batch`
  * (cpu_batch.rs:14490-14496) reads `period` (13), `smoothing_period` (6),
  * two multipliers, `volume_type` ("default"), `center_type` ("dynamic") and
  * `tick_size` (0.01). It DOES read a parameter literally named `period` — but
@@ -482,11 +481,11 @@ void dvdiqqe_many_series_one_param_f32(
  * PVI whenever `sel_vol > 0`. Copied, because it sets the level of the entire
  * PVI series.
  *
- * ONE THREAD PER COLUMN. Carried: pvi, nvi, prev_close, prev_vol, tickrng_prev
- * and four EMA states. Every stage is fused into ONE ascending pass — each EMA
- * at bar i needs only bar i's input and its own carry, so the reference's four
- * O(n) intermediate vectors collapse to eight scalars without moving a single
- * rounding.
+ * ONE THREAD PER COLUMN. Carried: pvi, nvi, prev_close, prev_vol, tickrng_prev,
+ * six EMA states, two ratchets, and the cumulative center sum/count. Every
+ * stage is fused into ONE ascending pass — each value at bar i needs only bar
+ * i's input and its own prior carry, so the reference's intermediate vectors
+ * collapse to scalar state without moving a single rounding.
  * =========================================================================== */
 
 #ifndef NEO_F64_NAN
@@ -494,6 +493,8 @@ void dvdiqqe_many_series_one_param_f32(
 #endif
 
 #define NEO_DVDIQQE_SMOOTHING 6
+#define NEO_DVDIQQE_FAST      2.618
+#define NEO_DVDIQQE_SLOW      4.236
 #define NEO_DVDIQQE_TICK      0.01
 
 /* `is_finite_fast` in ema.rs / cci_cycle.rs: tests the EXPONENT FIELD, so it
@@ -510,7 +511,7 @@ struct NeoDvdiEma {
     double mean;
     double prev;
     int    first;        /* index of the seed bar, -1 until seeded          */
-    int    warmup_end;   /* first + period                                  */
+    long long warmup_end;/* first + period without signed-int overflow       */
     int    valid_count;
     double alpha, beta;
     int    period;
@@ -531,14 +532,14 @@ __device__ __forceinline__ double neo_dvdi_ema_step(NeoDvdiEma* e, int i, double
     if (e->first < 0) {
         if (isnan(x)) return NEO_F64_NAN;      /* ema_prepare's `!is_nan` scan */
         e->first = i;
-        e->warmup_end = i + e->period;
+        e->warmup_end = (long long)i + (long long)e->period;
         if (e->warmup_end > len) e->warmup_end = len;
         e->mean = x;
         e->valid_count = 1;
         e->prev = e->mean;
         return e->mean;
     }
-    if (i < e->warmup_end) {
+    if ((long long)i < e->warmup_end) {
         if (neo_dvdi_finite_fast(x)) {
             e->valid_count += 1;
             const double vc = (double)e->valid_count;
@@ -553,46 +554,67 @@ __device__ __forceinline__ double neo_dvdi_ema_step(NeoDvdiEma* e, int i, double
     return e->prev;
 }
 
-extern "C" __global__
-void dvdiqqe_neo_batch_f64(const double* __restrict__ open,
-                           const double* __restrict__ close,
-                           const double* __restrict__ volume,
-                           int series_len,
-                           const int* __restrict__ periods,
-                           int n_combos,
-                           int first_valid,
-                           double* __restrict__ out)
+/* One exact arithmetic authority for the canonical four-output route and the
+ * preserved dvdi-primary ABI. Null destinations suppress materialization only;
+ * all scalar state still advances in the canonical order. */
+__device__ __forceinline__
+static void dvdiqqe_row_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ close,
+    const double* __restrict__ volume,
+    int len,
+    int period,
+    int smoothing_period,
+    double fast_multiplier,
+    double slow_multiplier,
+    bool use_tick_only,
+    bool dynamic_center,
+    double tick_size,
+    int first_valid,
+    double* __restrict__ out_dvdi,
+    double* __restrict__ out_fast_tl,
+    double* __restrict__ out_slow_tl,
+    double* __restrict__ out_center_line)
 {
-    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (combo >= n_combos) return;
-
-    const int len = series_len;
-    double* __restrict__ o = out + (size_t)combo * (size_t)len;
-    const int period = periods[combo];
-
-    const int smoothing = NEO_DVDIQQE_SMOOTHING;
-    const double tick = NEO_DVDIQQE_TICK;
+    for (int i = 0; i < len; ++i) {
+        if (out_dvdi != nullptr) out_dvdi[i] = NEO_F64_NAN;
+        if (out_fast_tl != nullptr) out_fast_tl[i] = NEO_F64_NAN;
+        if (out_slow_tl != nullptr) out_slow_tl[i] = NEO_F64_NAN;
+        if (out_center_line != nullptr) out_center_line[i] = NEO_F64_NAN;
+    }
 
     /* dvdiqqe_prepare:388-425 */
     if (len <= 0 || period <= 0 || period > len ||
+        smoothing_period <= 0 || smoothing_period > len ||
+        !isfinite(fast_multiplier) || fast_multiplier <= 0.0 ||
+        !isfinite(slow_multiplier) || slow_multiplier <= 0.0 ||
+        !isfinite(tick_size) || tick_size <= 0.0 ||
         first_valid < 0 || first_valid >= len ||
         (len - first_valid) < period) {
-        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
         return;
     }
 
-    const int wper = (period * 2) - 1;
-    const int warmup = first_valid + wper;
+    const long long wper_wide = ((long long)period * 2LL) - 1LL;
+    if (wper_wide <= 0LL || wper_wide > 0x7fffffffLL) return;
+    const int wper = (int)wper_wide;
+    const long long warmup = (long long)first_valid + wper_wide;
 
     double pvi_prev = 0.0, nvi_prev = 0.0;
     double prev_vol = 0.0, prev_close = 0.0;
-    double tickrng_prev = tick;
+    double tickrng_prev = tick_size;
+    double prev_dvdi = NEO_F64_NAN;
+    double fast_tl = NEO_F64_NAN;
+    double slow_tl = NEO_F64_NAN;
+    double center_sum = 0.0;
+    double center_count = 0.0;
 
-    NeoDvdiEma ema_p, ema_n, ema_pd, ema_nd;
+    NeoDvdiEma ema_p, ema_n, ema_pd, ema_nd, ema_range, ema_smooth_range;
     neo_dvdi_ema_init(&ema_p,  period);
     neo_dvdi_ema_init(&ema_n,  period);
-    neo_dvdi_ema_init(&ema_pd, smoothing);
-    neo_dvdi_ema_init(&ema_nd, smoothing);
+    neo_dvdi_ema_init(&ema_pd, smoothing_period);
+    neo_dvdi_ema_init(&ema_nd, smoothing_period);
+    neo_dvdi_ema_init(&ema_range, wper);
+    neo_dvdi_ema_init(&ema_smooth_range, wper);
 
     for (int i = 0; i < len; ++i) {
         const double oi = open[i];
@@ -600,11 +622,11 @@ void dvdiqqe_neo_batch_f64(const double* __restrict__ open,
 
         /* :492-507 */
         const double rng = ci - oi;
-        const double tickrng = (fabs(rng) < tick) ? tickrng_prev : rng;
-        const double tick_vol = fmax(fabs(tickrng) / tick, 0.0);
+        const double tickrng = (fabs(rng) < tick_size) ? tickrng_prev : rng;
+        const double tick_vol = fmax(fabs(tickrng) / tick_size, 0.0);
 
         const double vv = volume[i];
-        const double sel_vol = isfinite(vv) ? vv : tick_vol;
+        const double sel_vol = use_tick_only ? tick_vol : (isfinite(vv) ? vv : tick_vol);
 
         const double d_close = ci - prev_close;
         if (sel_vol > prev_vol) pvi_prev += d_close;
@@ -623,15 +645,129 @@ void dvdiqqe_neo_batch_f64(const double* __restrict__ open,
         const double dp = pvi_i - ep;
         const double dn = nvi_i - en;
 
-        /* :544-557 — EMA(smoothing) of each difference. */
+        /* :544-557 — EMA(smoothing_period) of each difference. */
         const double pd = neo_dvdi_ema_step(&ema_pd, i, dp, len);
         const double nd = neo_dvdi_ema_step(&ema_nd, i, dn, len);
 
-        /* :560-565 */
-        o[i] = pd - nd;
-    }
+        /* :560-576 — raw DVDI, absolute change, then the two range EMAs. */
+        const double dvdi = pd - nd;
+        const double range = (i == 0) ? NEO_F64_NAN : fabs(dvdi - prev_dvdi);
+        const double avg_range = neo_dvdi_ema_step(&ema_range, i, range, len);
+        const double smooth_range =
+            neo_dvdi_ema_step(&ema_smooth_range, i, avg_range, len);
+        prev_dvdi = dvdi;
 
-    /* :578-582 — the warm-up blank happens AFTER the whole series is built. */
-    const int cut = (warmup < len) ? warmup : len;
-    for (int i = 0; i < cut; ++i) o[i] = NEO_F64_NAN;
+        if ((long long)i < warmup) continue;
+
+        if ((long long)i == warmup) {
+            fast_tl = dvdi;
+            slow_tl = dvdi;
+        } else {
+            const double fast_range = smooth_range * fast_multiplier;
+            const double slow_range = smooth_range * slow_multiplier;
+            if (dvdi > fast_tl) {
+                const double next = dvdi - fast_range;
+                fast_tl = (next < fast_tl) ? fast_tl : next;
+            } else {
+                const double next = dvdi + fast_range;
+                fast_tl = (next > fast_tl) ? fast_tl : next;
+            }
+            if (dvdi > slow_tl) {
+                const double next = dvdi - slow_range;
+                slow_tl = (next < slow_tl) ? slow_tl : next;
+            } else {
+                const double next = dvdi + slow_range;
+                slow_tl = (next > slow_tl) ? slow_tl : next;
+            }
+        }
+
+        double center_line;
+        if (dynamic_center) {
+            if (isfinite(dvdi)) {
+                center_sum += dvdi;
+                center_count += 1.0;
+            }
+            center_line = (center_count > 0.0) ? (center_sum / center_count) : NEO_F64_NAN;
+        } else {
+            center_line = 0.0;
+        }
+
+        if (out_dvdi != nullptr) out_dvdi[i] = dvdi;
+        if (out_fast_tl != nullptr) out_fast_tl[i] = fast_tl;
+        if (out_slow_tl != nullptr) out_slow_tl[i] = slow_tl;
+        if (out_center_line != nullptr) out_center_line[i] = center_line;
+    }
+}
+
+extern "C" __global__
+void dvdiqqe_all_outputs_f64(
+    const double* __restrict__ open,
+    const double* __restrict__ close,
+    const double* __restrict__ volume,
+    int series_len,
+    const int* __restrict__ periods,
+    const int* __restrict__ smoothing_periods,
+    const double* __restrict__ fast_multipliers,
+    const double* __restrict__ slow_multipliers,
+    const int* __restrict__ use_tick_only_flags,
+    const int* __restrict__ dynamic_center_flags,
+    const double* __restrict__ tick_sizes,
+    int n_combos,
+    int first_valid,
+    double* __restrict__ out_dvdi,
+    double* __restrict__ out_fast_tl,
+    double* __restrict__ out_slow_tl,
+    double* __restrict__ out_center_line)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || series_len <= 0) return;
+    const size_t base = (size_t)combo * (size_t)series_len;
+    dvdiqqe_row_f64(
+        open,
+        close,
+        volume,
+        series_len,
+        periods[combo],
+        smoothing_periods[combo],
+        fast_multipliers[combo],
+        slow_multipliers[combo],
+        use_tick_only_flags[combo] != 0,
+        dynamic_center_flags[combo] != 0,
+        tick_sizes[combo],
+        first_valid,
+        out_dvdi + base,
+        out_fast_tl + base,
+        out_slow_tl + base,
+        out_center_line + base);
+}
+
+extern "C" __global__
+void dvdiqqe_neo_batch_f64(const double* __restrict__ open,
+                           const double* __restrict__ close,
+                           const double* __restrict__ volume,
+                           int series_len,
+                           const int* __restrict__ periods,
+                           int n_combos,
+                           int first_valid,
+                           double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos || series_len <= 0) return;
+    dvdiqqe_row_f64(
+        open,
+        close,
+        volume,
+        series_len,
+        periods[combo],
+        NEO_DVDIQQE_SMOOTHING,
+        NEO_DVDIQQE_FAST,
+        NEO_DVDIQQE_SLOW,
+        false,
+        true,
+        NEO_DVDIQQE_TICK,
+        first_valid,
+        out + (size_t)combo * (size_t)series_len,
+        nullptr,
+        nullptr,
+        nullptr);
 }

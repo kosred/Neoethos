@@ -131,7 +131,9 @@ struct SpotsResponse {
 /// - Flutter has community packages (`http`'s
 ///   `Client.send` + line-decode) that consume SSE without
 ///   extra dependencies.
-pub async fn stream(State(_state): State<AppApiState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+pub async fn stream(
+    State(_state): State<AppApiState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let receiver = subscribe();
     let stream = BroadcastStream::new(receiver).filter_map(|res| async move {
         let tick = res.ok()?;

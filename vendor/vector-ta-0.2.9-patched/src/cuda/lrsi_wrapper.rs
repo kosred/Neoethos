@@ -1,14 +1,14 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
+use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::cuda::moving_averages::alma_wrapper::{BatchKernelPolicy, ManySeriesKernelPolicy};
 use crate::cuda::moving_averages::alma_wrapper::{BatchKernelSelected, ManySeriesKernelSelected};
-use crate::cuda::moving_averages::DeviceArrayF32;
 use crate::indicators::lrsi::{LrsiBatchRange, LrsiParams};
 use cust::context::Context;
 use cust::device::{Device, DeviceAttribute};
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::ffi::c_void;
@@ -85,11 +85,6 @@ impl CudaLrsi {
         let sm_count = device.get_attribute(DeviceAttribute::MultiprocessorCount)? as u32;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/lrsi_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("lrsi_kernel")?;
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
@@ -699,13 +694,15 @@ pub mod benches {
     }
 
     pub fn bench_profiles() -> Vec<CudaBenchScenario> {
-        vec![CudaBenchScenario::new(
-            "lrsi",
-            "batch_dev",
-            "lrsi_cuda_batch_dev",
-            "1m_x_250",
-            prep_batch,
-        )
-        .with_inner_iters(4)]
+        vec![
+            CudaBenchScenario::new(
+                "lrsi",
+                "batch_dev",
+                "lrsi_cuda_batch_dev",
+                "1m_x_250",
+                prep_batch,
+            )
+            .with_inner_iters(4),
+        ]
     }
 }

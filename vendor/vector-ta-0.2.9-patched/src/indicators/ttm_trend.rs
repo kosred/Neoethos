@@ -1,6 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -8,8 +6,6 @@ use crate::utilities::helpers::{
 };
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::memory::DeviceBuffer;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::error::Error;
@@ -1043,238 +1039,17 @@ unsafe fn ttm_trend_row_avx512_long(
     ttm_trend_row_scalar(source, close, first, period, out)
 }
 
-#[cfg(feature = "python")]
-pub fn register_ttm_trend_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(ttm_trend_py, m)?)?;
-    m.add_function(wrap_pyfunction!(ttm_trend_batch_py, m)?)?;
-    m.add_class::<TtmTrendStreamPy>()?;
-    #[cfg(all(feature = "python", feature = "cuda"))]
-    {
-        m.add_class::<TtmTrendDeviceArrayF32Py>()?;
-        m.add_function(wrap_pyfunction!(ttm_trend_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(
-            ttm_trend_cuda_many_series_one_param_dev_py,
-            m
-        )?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::cuda_available;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::moving_averages::DeviceArrayF32;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::ttm_trend_wrapper::CudaTtmTrend;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use cust::context::Context;
-#[cfg(all(feature = "python", feature = "cuda"))]
-use std::sync::Arc;
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyclass(module = "vector_ta", name = "TtmTrendDeviceArrayF32", unsendable)]
-pub struct TtmTrendDeviceArrayF32Py {
-    pub(crate) inner: DeviceArrayF32,
-    pub(crate) _ctx: Arc<Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pymethods]
-impl TtmTrendDeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new(py);
-        let itemsize = std::mem::size_of::<f32>();
-        d.set_item("shape", (self.inner.rows, self.inner.cols))?;
-        d.set_item("typestr", "<f4")?;
-        d.set_item("strides", (self.inner.cols * itemsize, itemsize))?;
-        d.set_item("data", (self.inner.device_ptr() as usize, false))?;
-
-        d.set_item("version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: Python<'py>,
-        stream: Option<PyObject>,
-        max_version: Option<PyObject>,
-        dl_device: Option<PyObject>,
-        copy: Option<PyObject>,
-    ) -> PyResult<PyObject> {
-        if let Some(ref s_obj) = stream {
-            if let Ok(s) = s_obj.extract::<usize>(py) {
-                if s == 0 {
-                    return Err(PyValueError::new_err(
-                        "__dlpack__ stream=0 is invalid for CUDA",
-                    ));
-                }
-            }
-        }
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(PyValueError::new_err(
-                            "dl_device mismatch; cross-device copy not supported for TtmTrendDeviceArrayF32",
-                        ));
-                    }
-                }
-            }
-        }
-
-        if let Some(ref c_obj) = copy {
-            if let Ok(true) = c_obj.extract::<bool>(py) {
-                return Err(PyValueError::new_err(
-                    "copy=True not supported for TtmTrendDeviceArrayF32",
-                ));
-            }
-        }
-
-        let dummy =
-            DeviceBuffer::from_slice(&[]).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let inner = std::mem::replace(
-            &mut self.inner,
-            DeviceArrayF32 {
-                buf: dummy,
-                rows: 0,
-                cols: 0,
-            },
-        );
-
-        let rows = inner.rows;
-        let cols = inner.cols;
-        let buf = inner.buf;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-impl TtmTrendDeviceArrayF32Py {
-    pub fn new_from_rust(inner: DeviceArrayF32, ctx_guard: Arc<Context>, device_id: u32) -> Self {
-        Self {
-            inner,
-            _ctx: ctx_guard,
-            device_id,
-        }
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ttm_trend_cuda_batch_dev")]
-#[pyo3(signature = (source_f32, close_f32, period_range, device_id=0))]
-pub fn ttm_trend_cuda_batch_dev_py(
-    py: Python<'_>,
-    source_f32: PyReadonlyArray1<'_, f32>,
-    close_f32: PyReadonlyArray1<'_, f32>,
-    period_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<TtmTrendDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let src = source_f32.as_slice()?;
-    let cls = close_f32.as_slice()?;
-    let sweep = TtmTrendBatchRange {
-        period: period_range,
-    };
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaTtmTrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .ttm_trend_batch_dev(src, cls, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(TtmTrendDeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ttm_trend_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (source_tm_f32, close_tm_f32, cols, rows, period, device_id=0))]
-pub fn ttm_trend_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    source_tm_f32: PyReadonlyArray1<'_, f32>,
-    close_tm_f32: PyReadonlyArray1<'_, f32>,
-    cols: usize,
-    rows: usize,
-    period: usize,
-    device_id: usize,
-) -> PyResult<TtmTrendDeviceArrayF32Py> {
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let src_tm = source_tm_f32.as_slice()?;
-    let cls_tm = close_tm_f32.as_slice()?;
-    let (inner, ctx, dev_id) = py.allow_threads(|| {
-        let cuda =
-            CudaTtmTrend::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let ctx = cuda.context_arc();
-        let dev_id = cuda.device_id();
-        let arr = cuda
-            .ttm_trend_many_series_one_param_time_major_dev(src_tm, cls_tm, cols, rows, period)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((arr, ctx, dev_id))
-    })?;
-    Ok(TtmTrendDeviceArrayF32Py::new_from_rust(inner, ctx, dev_id))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_trend_output_into_js(
-    source: &[f64],
-    close: &[f64],
-    period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ttm_trend_js(source, close, period)?;
-    crate::write_wasm_f64_output("ttm_trend_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_trend_batch_output_into_js(
-    source: &[f64],
-    close: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ttm_trend_batch_js(source, close, config)?;
-    crate::write_wasm_selected_object_f64_outputs("ttm_trend_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
 
     #[test]
     fn test_ttm_trend_into_matches_api() -> Result<(), Box<dyn Error>> {
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let source = source_type(&candles, "hl2");
         let close = source_type(&candles, "close");
         let input = TtmTrendInput::from_slices(source, close, TtmTrendParams::default());
@@ -1282,12 +1057,7 @@ mod tests {
         let baseline = ttm_trend(&input)?.values;
 
         let mut out = vec![0.0f64; close.len()];
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
         ttm_trend_into(&input, &mut out)?;
-        #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-        {
-            ttm_trend_into_slice_f64(&mut out, &input, Kernel::Auto)?;
-        }
 
         let (_s, _c, p, first, _k) = ttm_prepare(&input, Kernel::Auto)?;
         let warmup_end = first + p - 1;
@@ -1321,8 +1091,8 @@ mod tests {
 
     fn check_ttm_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let default_params = TtmTrendParams { period: None };
         let input = TtmTrendInput::from_candles(&candles, "hl2", default_params);
         let output = ttm_trend_with_kernel(&input, kernel)?;
@@ -1332,8 +1102,8 @@ mod tests {
 
     fn check_ttm_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let close = source_type(&candles, "close");
         let params = TtmTrendParams { period: Some(5) };
         let input = TtmTrendInput::from_candles(&candles, "hl2", params);
@@ -1396,8 +1166,8 @@ mod tests {
 
     fn check_ttm_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
         let src = source_type(&candles, "hl2");
         let close = source_type(&candles, "close");
         let period = 5;
@@ -1427,8 +1197,8 @@ mod tests {
     fn check_ttm_trend_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let src = source_type(&candles, "hl2");
         let close = source_type(&candles, "close");
 
@@ -1534,8 +1304,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let src = source_type(&c, "hl2");
         let close = source_type(&c, "close");
         let output = TtmTrendBatchBuilder::new()
@@ -1556,8 +1326,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let src = source_type(&c, "hl2");
         let close = source_type(&c, "close");
 
@@ -1880,129 +1650,6 @@ mod tests {
     generate_all_ttm_tests!(check_ttm_trend_property);
 }
 
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ttm_trend")]
-#[pyo3(signature = (source, close, period, kernel=None))]
-pub fn ttm_trend_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let s = source.as_slice()?;
-    let c = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let params = TtmTrendParams {
-        period: Some(period),
-    };
-    let input = TtmTrendInput::from_slices(s, c, params);
-
-    let len = s.len().min(c.len());
-    let out = unsafe { PyArray1::<f64>::new(py, [len], false) };
-    let dst = unsafe { out.as_slice_mut()? };
-
-    py.allow_threads(|| {
-        let (ss, cc, p, first, chosen) = ttm_prepare(&input, kern).map_err(|e| e.to_string())?;
-        for v in &mut dst[..first + p - 1] {
-            *v = f64::NAN;
-        }
-        ttm_numeric_compute_into(ss, cc, p, first, dst);
-        Ok::<(), String>(())
-    })
-    .map_err(|e: String| PyValueError::new_err(e))?;
-
-    Ok(out)
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "TtmTrendStream")]
-pub struct TtmTrendStreamPy {
-    stream: TtmTrendStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl TtmTrendStreamPy {
-    #[new]
-    fn new(period: usize) -> PyResult<Self> {
-        let params = TtmTrendParams {
-            period: Some(period),
-        };
-        let stream =
-            TtmTrendStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(TtmTrendStreamPy { stream })
-    }
-
-    fn update(&mut self, source_val: f64, close_val: f64) -> Option<bool> {
-        self.stream.update(source_val, close_val)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ttm_trend_batch")]
-#[pyo3(signature = (source, close, period_range, kernel=None))]
-pub fn ttm_trend_batch_py<'py>(
-    py: Python<'py>,
-    source: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let s = source.as_slice()?;
-    let c = close.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-    let sweep = TtmTrendBatchRange {
-        period: period_range,
-    };
-
-    let (vals_f64, combos, rows, cols) = py
-        .allow_threads(|| {
-            let k = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match k {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => k,
-            };
-            ttm_batch_inner_f64(s, c, &sweep, simd, true).map_err(|e| e.to_string())
-        })
-        .map_err(|e: String| PyValueError::new_err(e))?;
-
-    let dict = PyDict::new(py);
-
-    let arr = unsafe { PyArray1::<f64>::from_vec(py, vals_f64) }.reshape((rows, cols))?;
-    dict.set_item("values", arr)?;
-    dict.set_item(
-        "periods",
-        combos
-            .iter()
-            .map(|p| p.period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
 #[inline]
 pub fn ttm_trend_into_slice_f64(
     dst: &mut [f64],
@@ -2012,7 +1659,6 @@ pub fn ttm_trend_into_slice_f64(
     ttm_numeric_into_slice(dst, input, kern)
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ttm_trend_into(input: &TtmTrendInput, out: &mut [f64]) -> Result<(), TtmTrendError> {
     ttm_trend_into_slice_f64(out, input, Kernel::Auto)
@@ -2045,132 +1691,4 @@ pub fn ttm_trend_into_slice(
         _ => unreachable!(),
     }
     Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_trend_js(source: &[f64], close: &[f64], period: usize) -> Result<Vec<f64>, JsValue> {
-    let input = TtmTrendInput::from_slices(
-        source,
-        close,
-        TtmTrendParams {
-            period: Some(period),
-        },
-    );
-    let (s, c, p, first, _) =
-        ttm_prepare(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut out = alloc_with_nan_prefix(s.len().min(c.len()), first + p - 1);
-    ttm_numeric_compute_into(s, c, p, first, &mut out);
-    Ok(out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_trend_into(
-    source_ptr: *const f64,
-    close_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    period: usize,
-) -> Result<(), JsValue> {
-    if source_ptr.is_null() || close_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer"));
-    }
-    unsafe {
-        let s = std::slice::from_raw_parts(source_ptr, len);
-        let c = std::slice::from_raw_parts(close_ptr, len);
-        let input = TtmTrendInput::from_slices(
-            s,
-            c,
-            TtmTrendParams {
-                period: Some(period),
-            },
-        );
-        let (ss, cc, p, first, _) =
-            ttm_prepare(&input, Kernel::Auto).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let out = std::slice::from_raw_parts_mut(out_ptr, ss.len().min(cc.len()));
-        for v in &mut out[..first + p - 1] {
-            *v = f64::NAN;
-        }
-        ttm_numeric_compute_into(ss, cc, p, first, out);
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_trend_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ttm_trend_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TtmTrendBatchConfig {
-    pub period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct TtmTrendBatchJsOutput {
-    pub values: Vec<f64>,
-    pub periods: Vec<usize>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ttm_trend_batch)]
-pub fn ttm_trend_batch_js(
-    source: &[f64],
-    close: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: TtmTrendBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    if config.period_range.0 == 0 {
-        return Err(JsValue::from_str("Invalid period: period must be > 0"));
-    }
-    if config.period_range.1 < config.period_range.0 {
-        return Err(JsValue::from_str(
-            "Invalid period range: end must be >= start",
-        ));
-    }
-
-    let sweep = TtmTrendBatchRange {
-        period: config.period_range,
-    };
-    let kernel = detect_best_batch_kernel();
-    let simd = match kernel {
-        Kernel::Avx512Batch => Kernel::Avx512,
-        Kernel::Avx2Batch => Kernel::Avx2,
-        Kernel::ScalarBatch => Kernel::Scalar,
-        _ => kernel,
-    };
-
-    let (values, combos, rows, cols) = ttm_batch_inner_f64(source, close, &sweep, simd, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let output = TtmTrendBatchJsOutput {
-        values,
-        periods: combos.iter().map(|p| p.period.unwrap()).collect(),
-        rows,
-        cols,
-    };
-
-    serde_wasm_bindgen::to_value(&output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }

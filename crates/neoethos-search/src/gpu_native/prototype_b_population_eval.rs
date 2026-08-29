@@ -21,27 +21,27 @@
 //! engine computes it.
 
 use anyhow::{Context, Result, bail};
-use ndarray::ArrayView2;
 
 // `NeoPopulationEvent` is deliberately not imported. It was here only so the
 // deleted event budget could take its size, and the population lane touches no
 // event record anywhere else — the type stays alive for the diagnostic readback
 // contract, which is a different lane.
-use neoethos_gpu_contracts::device::ScenarioDescriptor;
+use neoethos_gpu_contracts::device::{GeneDescriptor, ScenarioDescriptor};
 
-use crate::eval::{BacktestSettings, SmcRow};
-use crate::gpu_native::prototype_a::{PrototypeADatasetUpload, PrototypeAGeneUpload};
+use crate::eval::SmcRow;
+use crate::gpu_native::prototype_a::PrototypeAGeneUpload;
+use crate::gpu_native::prototype_population_oracle::population_settings_for_settings;
 use crate::gpu_native::scenario;
-use crate::gpu_native::prototype_b_engine::PrototypeBPopulationInputs;
-use crate::gpu_native::prototype_population_oracle::population_settings_for_dataset;
-use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
 
-use neoethos_gpu_cuda::{
-    CudaPopulationError, PopulationDatasetView, PopulationGeneView, PopulationSession,
-};
+use neoethos_gpu_cuda::{CudaPopulationError, PopulationGeneView, PopulationResidencyCountersV1};
 
 /// Metric row shape shared with the CPU and CubeCL lanes.
 const ZERO_METRICS: [f64; 11] = [0.0; 11];
+
+struct NativePopulationBatchV1 {
+    rows: Vec<[f64; 11]>,
+    counters: PopulationResidencyCountersV1,
+}
 
 /// Is a CUDA device present and the native population engine usable?
 pub(crate) fn prototype_b_available() -> bool {
@@ -65,13 +65,6 @@ pub(crate) fn prototype_b_available() -> bool {
 /// 25 250 items ran on the CPU after 30 s of wasted attempts.
 ///
 /// Deciding the size up front costs one query and removes the failure entirely.
-/// The batch to use when free memory cannot be read and nothing has worked yet.
-///
-/// At ~0.6 MB per candidate this is around 600 MB — small enough for any
-/// discrete card, large enough to keep the reduce busy. It is a floor for a
-/// blind moment, not a target.
-const CONSERVATIVE_BATCH: usize = 1_024;
-
 /// Sustained device throughput, in scenario-bars per second.
 ///
 /// Measured 2026-08 on an RTX 3090 at populations 16 384 and 131 072: 843-966 M
@@ -154,7 +147,10 @@ enum Sizing {
     /// `cudaMemGetInfo` did not answer. Size conservatively and carry on.
     Unreadable,
     /// The card answered and it has no usable room. Not a batching problem.
-    NoRoom { dataset_bytes: u64, budget_bytes: u64 },
+    NoRoom {
+        dataset_bytes: u64,
+        budget_bytes: u64,
+    },
 }
 
 fn candidates_that_fit(
@@ -166,39 +162,6 @@ fn candidates_that_fit(
     match neoethos_gpu_cuda::device_free_memory_bytes(device) {
         Some(free) => candidates_for_free_memory(free, bars, feature_count, month_capacity),
         None => Sizing::Unreadable,
-    }
-}
-
-/// The largest candidate count worth putting in ONE submission to this engine,
-/// for callers that pick their own chunk size before calling the evaluator.
-///
-/// This is a BATCHING number, never a search number: genes are independent, so
-/// any chunking of a population produces bit-identical per-gene metrics — the
-/// only thing a caller changes by consulting this is how many launches the work
-/// takes. The quality screen used a constant 256 here, which ran the card at
-/// ~42 M candidate-bars/s where a launch sized to this ceiling sustains
-/// 843-966 M (measured 2026-08, RTX 3090, populations 16 384 / 131 072).
-///
-/// `None` means "no card, or its free memory cannot be read" — the caller keeps
-/// whatever conservative constant it had, and nothing about the run changes.
-/// The evaluator below still re-checks and splits on its own, so a stale answer
-/// here costs one split, never an OOM.
-///
-/// Since the walk stopped materialising per-scenario signal columns, this is
-/// bounded by [`TARGET_LAUNCH_SECONDS`] as often as by VRAM — a launch is kept
-/// short enough to be observed, not merely small enough to fit.
-pub(crate) fn submission_ceiling(device: usize, bars: usize, feature_count: usize) -> Option<usize> {
-    if !prototype_b_available() {
-        return None;
-    }
-    match candidates_that_fit(
-        device,
-        bars,
-        feature_count,
-        crate::eval::current_backtest_runtime_overrides().month_capacity,
-    ) {
-        Sizing::Fits(fits) => Some(fits),
-        Sizing::Unreadable | Sizing::NoRoom { .. } => None,
     }
 }
 
@@ -224,6 +187,19 @@ pub(crate) fn submission_ceiling(device: usize, bars: usize, feature_count: usiz
 /// The launch takes the SMALLER. Peak memory therefore stays a function of the
 /// hardware alone — the time term can only ever lower the count, never raise it
 /// past what the card was measured to hold.
+fn prototype_b_dataset_peak_bytes(bars: usize, feature_count: usize) -> u64 {
+    let bars = bars as u64;
+    let indicator_elements = bars.saturating_mul(feature_count as u64);
+    let indicator_bytes = indicator_elements.saturating_mul(std::mem::size_of::<f64>() as u64);
+    let fixed_per_bar = (3 * std::mem::size_of::<f64>()
+        + 3 * std::mem::size_of::<i64>()
+        + std::mem::size_of::<f64>()
+        + std::mem::size_of::<u8>()
+        + 11 * std::mem::size_of::<i8>()) as u64;
+    bars.saturating_mul(fixed_per_bar)
+        .saturating_add(indicator_bytes)
+}
+
 fn candidates_for_free_memory(
     free: u64,
     bars: usize,
@@ -233,34 +209,35 @@ fn candidates_for_free_memory(
     // Leave three tenths for context, fragmentation and the allocator's own
     // bookkeeping.
     let budget = (free / 10) * 7;
-    // The dataset is charged TWICE for the indicator matrix on purpose. The
-    // device uploads it feature-major into a staging buffer and transposes it
-    // into the permanent bar-major one, so both exist for the duration of one
-    // kernel at upload. Budgeting for the peak is what keeps that transient
-    // from being the allocation that fails.
-    let indicators = bars as u64 * feature_count as u64 * 4;
-    // Every bars-scaled array `upload_dataset` allocates, named so the next one
+    // The sealed parent owns exactly one feature-major indicator matrix. The V1
+    // native walk consumes it directly, so neither a staging transpose nor a
+    // second resident indicator copy belongs in this production budget.
+    // Every bars-scaled array `upload_parent_dataset_v1` allocates, named so the next one
     // added has an obvious place to go:
     //   close + high + low                    3 x f64
     //   months + days + timestamps            3 x i64
     //   adaptive_base_pips                    1 x f64   (WAS MISSING)
     //   gap_flags                             1 x u8    (WAS MISSING)
     //   smc_rows                             11 x i8
-    //   indicators, twice (staging+permanent)
-    let dataset = bars as u64 * (3 * 8 + 3 * 8 + 8 + 1 + 11) + 2 * indicators;
+    //   indicators, once (immutable feature-major parent)
+    let dataset = prototype_b_dataset_peak_bytes(bars, feature_count);
     // The card answered and the DATASET alone does not fit. That is not a
-    // batching problem: no work list, however small, makes a 5.4 GB indicator
-    // matrix smaller. Saying so here is what stops the caller from sizing a
-    // launch out of a stale number and then discovering it by failing.
+    // batching problem: no work list, however small, makes a 10.8 GB f64
+    // indicator matrix (21.6 GB at the transpose peak) smaller. Saying so here
+    // is what stops the caller from sizing a launch out of a stale number and
+    // then discovering it by failing.
     if dataset.saturating_add(64 * 1024 * 1024) >= budget {
-        return Sizing::NoRoom { dataset_bytes: dataset, budget_bytes: budget };
+        return Sizing::NoRoom {
+            dataset_bytes: dataset,
+            budget_bytes: budget,
+        };
     }
     // The 64 MiB is the reserve for allocator fragmentation, the context, and
     // the GENE arrays — which are not bars-scaled and not scenario-scaled:
-    // `population * 51 B + (population + 1) * 4 B + terms * 8 B`. The largest
-    // gene array any lane uploads is the quality screen's 131 072 clones, which
-    // is ~7 MB of that reserve; a work list is scenarios, and those are charged
-    // per scenario below.
+    // `population * 59 B + (population + 1) * 4 B + terms * 12 B + 88 B`.
+    // The largest gene array any lane uploads is the quality screen's 131 072
+    // clones; the fixed per-gene portion is ~7.4 MiB before its CSR terms and
+    // stays inside this reserve. A work list is scenarios, charged below.
     let room = budget
         .saturating_sub(dataset)
         .saturating_sub(64 * 1024 * 1024);
@@ -275,7 +252,8 @@ fn candidates_for_free_memory(
     // override with no upper bound — so hardcoding the default made peak device
     // memory a function of a user parameter, in the one function that exists to
     // stop exactly that.
-    let outcome = std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationOutcome>() as u64;
+    let outcome =
+        std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationOutcome>() as u64;
     let metric_row =
         std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationMetricRow>() as u64;
     // 8 (base id) + 8 (scenario id) + 8 (rng counter) + 8 (window offset)
@@ -289,7 +267,10 @@ fn candidates_for_free_memory(
     // Below this the card cannot do useful work and the CPU lane is the honest
     // answer.
     if fits < 16 {
-        return Sizing::NoRoom { dataset_bytes: dataset, budget_bytes: budget };
+        return Sizing::NoRoom {
+            dataset_bytes: dataset,
+            budget_bytes: budget,
+        };
     }
     Sizing::Fits(fits.min(candidates_for_target_launch(bars)) as usize)
 }
@@ -318,320 +299,6 @@ fn candidates_for_free_memory(
 /// What still bounds device memory is [`candidates_for_free_memory`], which
 /// counts only allocations that exist. This constant just satisfies the ABI's
 /// "must be non-zero" check; the device stores it nowhere and reads it never.
-const VESTIGIAL_SESSION_MAX_EVENTS: usize = 1;
-
-
-// ── Resident session ─────────────────────────────────────────────────────────
-//
-// Measured on an RTX 2080 Ti, 2026-07-28: building a session and re-uploading
-// the dataset on every call cost 2.7 M candidate-bars/s at 4 096 bars against
-// 49.5 M for the same kernel driven by a session that stays alive — an 18x loss,
-// falling to 23 % at 200 000 bars because the overhead is per call rather than
-// per bar. That shape is exactly wrong here: the Monte-Carlo quality screen
-// calls this evaluator once per surviving candidate (7 793 in a real AUDUSD H4
-// run) and the GA calls it every generation.
-//
-// The native session refuses a second `upload_dataset`, so reuse means keeping
-// the session alive while the dataset is unchanged and rebuilding it when it is
-// not. Genes and scenarios carry no such restriction and are re-uploaded every
-// call, which is correct — they are what actually varies.
-
-/// Cheap identity for an uploaded dataset: length plus a strided sample.
-///
-/// Same approach the CubeCL resident cache uses, for the same reason — hashing
-/// every byte of a 200 000-bar dataset on every call would reintroduce exactly
-/// the per-call cost this cache exists to remove. Floats are hashed by their
-/// bit pattern, so two datasets that differ only in a NaN payload are still
-/// treated as different.
-fn sample_hash<T, F>(values: &[T], to_bits: F, hasher: &mut impl std::hash::Hasher)
-where
-    F: Fn(&T) -> u64,
-{
-    use std::hash::Hash;
-    values.len().hash(hasher);
-    if values.is_empty() {
-        return;
-    }
-    const SAMPLES: usize = 256;
-    if values.len() <= SAMPLES {
-        for value in values {
-            to_bits(value).hash(hasher);
-        }
-    } else {
-        let stride = values.len() / SAMPLES;
-        for index in 0..SAMPLES {
-            to_bits(&values[index * stride]).hash(hasher);
-        }
-        to_bits(&values[values.len() - 1]).hash(hasher);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dataset_key(
-    close: &[f64],
-    high: &[f64],
-    low: &[f64],
-    indicators: &ArrayView2<'_, f32>,
-    feature_count: usize,
-    months: &[i64],
-    days: &[i64],
-    timestamps: &[i64],
-    smc_data: &[SmcRow],
-    settings: &BacktestSettings,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for slice in [close, high, low] {
-        sample_hash(slice, |v| v.to_bits(), &mut hasher);
-    }
-    // Indicators, by INDEXING, exactly as `sample_hash` does it.
-    //
-    // This walked the whole matrix — `indicators.iter().enumerate()` with an
-    // `i % stride` test per element — to keep 256 of them. On EURUSD M5 that is
-    // 843 456 bars x 64 features = 53 981 184 elements iterated and 53 981 184
-    // remainders computed, on EVERY launch, to select 256 values. The sibling
-    // `sample_hash` twenty lines up already did the obvious thing: compute the
-    // stride, then index. There was no reason for the two to differ.
-    //
-    // `ArrayView2` indexing is O(1) whatever the layout, so nothing is given up
-    // by not iterating: a non-contiguous view is addressed by its strides just
-    // as a contiguous one is. The sampled positions are the same ones the
-    // modulo walk selected (0, stride, 2*stride, ...) plus the final element,
-    // which `sample_hash` has always included and this had not. The key is
-    // process-local and never persisted, so the absolute value is free to
-    // change; what matters is that it still separates two different matrices,
-    // and one more sample can only help.
-    let flat = indicators.len();
-    flat.hash(&mut hasher);
-    if flat > 0 {
-        const SAMPLES: usize = 256;
-        let stride = (flat / SAMPLES).max(1);
-        let rows = indicators.nrows();
-        let cols = indicators.ncols();
-        let mut index = 0usize;
-        while index < flat {
-            // Logical row-major order over the view, matching what `iter()`
-            // yields for a standard C-ordered `ArrayView2`.
-            let value = indicators[(index / cols.max(1), index % cols.max(1))];
-            value.to_bits().hash(&mut hasher);
-            index += stride;
-        }
-        // The last element is cheap and pins a change in the tail, which a
-        // stride that divides the length would otherwise never visit.
-        indicators[(rows - 1, cols - 1)].to_bits().hash(&mut hasher);
-    }
-    feature_count.hash(&mut hasher);
-    for slice in [months, days, timestamps] {
-        sample_hash(slice, |v| *v as u64, &mut hasher);
-    }
-    // SMC flags are -1/0/+1, and `-1i8 as u64` is 18 446 744 073 709 551 615:
-    // two of them overflow the sum. Release wrapped it silently and every parity
-    // run passed; a debug build panics, which is how it surfaced — after the 18
-    // parity tests had been reported green three times from release runs.
-    //
-    // Summing also threw position away — [1, -1] and [-1, 1] hashed the same.
-    // Folding fixes both. `wrapping_*` is the intent here, not an oversight:
-    // this is a hash and mixing is what it is for.
-    sample_hash(
-        smc_data,
-        |row| {
-            row.iter().fold(0u64, |acc, v| {
-                acc.wrapping_mul(31).wrapping_add(*v as i64 as u64)
-            })
-        },
-        &mut hasher,
-    );
-    settings_key(settings, &mut hasher);
-    hasher.finish()
-}
-
-/// Hash the settings that identify a resident session, field by field.
-///
-/// This was `format!("{settings:?}").hash(..)`. `BacktestSettings` carries
-/// `adaptive_base_pips: Option<Arc<[f64]>>` — 843 456 f64 on EURUSD M5 — and
-/// `Debug` renders every one of them, so each launch built a ~17 MB `String`
-/// and then SipHashed all of it, purely to decide whether the dataset already
-/// on the card was the same one. That is the single most expensive line in a
-/// lane whose entire purpose is to avoid re-uploading data.
-///
-/// It was also wrong in the other direction. `Debug` folds in `sl_pips` and
-/// `tp_pips`, which do not travel to the device at all — they are per-gene, in
-/// the `stop_pips` / `target_pips` arrays, and `NeoPopulationSettings` has no
-/// field for either. The chunk loop takes them from the FIRST GENE of the chunk
-/// (`discovery.rs`), so two chunks over the same bars produced two different
-/// keys, and 16 bytes of computationally dead scalar destroyed a 261 MiB
-/// resident dataset and rebuilt it.
-///
-/// The destructure is EXHAUSTIVE on purpose, and that is the point of this
-/// function rather than a hand-written field list: add a field to
-/// `BacktestSettings` and this stops compiling. A field silently left out of a
-/// cache key is not a missing feature, it is a wrong cache HIT — the run
-/// continues, on the card, against the wrong data, with nothing to show for it.
-fn settings_key(settings: &BacktestSettings, hasher: &mut impl std::hash::Hasher) {
-    use std::hash::Hash;
-    let BacktestSettings {
-        // ── Deliberately NOT hashed ──────────────────────────────────────────
-        //
-        // These two are per-GENE, not per-dataset. They reach the device in the
-        // `stop_pips` / `target_pips` arrays uploaded with the genes on every
-        // call, and `NeoPopulationSettings` has no field for either — the DTO
-        // the device settings are built from (`SnapshotSettingsDto`) drops them
-        // outright. Nothing that is resident depends on them, so including them
-        // could only ever cause a spurious rebuild, and it did.
-        sl_pips: _,
-        tp_pips: _,
-
-        // ── Everything else, by bits ─────────────────────────────────────────
-        //
-        // All of these DO reach the device, either in the resident
-        // `adaptive_base_pips` upload or in the `NeoPopulationSettings` struct
-        // that is stored on the resident session and replayed on every
-        // `evaluate`. Keeping them here is what makes that stored copy safe:
-        // change any one of them and the key changes, the session is rebuilt,
-        // and the stored settings are rebuilt with it. Drop one from this list
-        // and the run would keep using the previous spread, commission or hold
-        // limit while reporting the new one.
-        max_hold_bars,
-        min_hold_bars,
-        max_trades_per_day,
-        gap_threshold_ms,
-        trailing_enabled,
-        trailing_atr_multiplier,
-        trailing_be_trigger_r,
-        trailing_min_lock_pips,
-        pip_value,
-        spread_pips,
-        commission_per_trade,
-        pip_value_per_lot,
-        kill_zones_enabled,
-        session_spread_profile,
-        swap_long_pips_per_day,
-        swap_short_pips_per_day,
-        pnl_conversion_fee_rate,
-        risk_based_sizing,
-        risk_per_trade_min,
-        risk_per_trade_max,
-        high_quality_confidence,
-        adaptive_base_pips,
-        adaptive_vol_mult,
-        adaptive_rr,
-    } = settings;
-
-    max_hold_bars.hash(hasher);
-    min_hold_bars.hash(hasher);
-    max_trades_per_day.hash(hasher);
-    gap_threshold_ms.hash(hasher);
-    trailing_enabled.hash(hasher);
-    // Floats by bit pattern, never by value: `f64` is not `Hash`, and `-0.0 ==
-    // 0.0` while `NaN != NaN`, so a value comparison would both merge distinct
-    // settings and refuse to recognise identical ones.
-    trailing_atr_multiplier.to_bits().hash(hasher);
-    trailing_be_trigger_r.to_bits().hash(hasher);
-    trailing_min_lock_pips.to_bits().hash(hasher);
-    pip_value.to_bits().hash(hasher);
-    spread_pips.to_bits().hash(hasher);
-    commission_per_trade.to_bits().hash(hasher);
-    pip_value_per_lot.to_bits().hash(hasher);
-    kill_zones_enabled.hash(hasher);
-    match session_spread_profile {
-        // The discriminant is hashed separately from the buckets so a profile
-        // whose three values happen to equal the flat `spread_pips` is still a
-        // different session from no profile at all.
-        Some(profile) => {
-            1u8.hash(hasher);
-            profile.asian_pips.to_bits().hash(hasher);
-            profile.overlap_pips.to_bits().hash(hasher);
-            profile.late_ny_pips.to_bits().hash(hasher);
-        }
-        None => 0u8.hash(hasher),
-    }
-    swap_long_pips_per_day.to_bits().hash(hasher);
-    swap_short_pips_per_day.to_bits().hash(hasher);
-    pnl_conversion_fee_rate.to_bits().hash(hasher);
-    risk_based_sizing.hash(hasher);
-    risk_per_trade_min.to_bits().hash(hasher);
-    risk_per_trade_max.to_bits().hash(hasher);
-    high_quality_confidence.to_bits().hash(hasher);
-    // The one series in here, and the reason settings are in the key at all:
-    // `adaptive_base_pips` is uploaded WITH the dataset, so two runs over
-    // identical bars but different adaptive stops are different datasets on the
-    // device. Sampled the same way as close/high/low — length plus a strided
-    // sample — never by `Debug`, which is what made this line cost 17 MB.
-    match adaptive_base_pips {
-        Some(base) => {
-            1u8.hash(hasher);
-            sample_hash(base, |v| v.to_bits(), hasher);
-        }
-        None => 0u8.hash(hasher),
-    }
-    adaptive_vol_mult.to_bits().hash(hasher);
-    adaptive_rr.to_bits().hash(hasher);
-}
-
-struct ResidentSession {
-    session: PopulationSession,
-    key: u64,
-    device: i32,
-    /// The SCENARIO COUNT the device workspace was actually allocated for.
-    ///
-    /// The outcome array is sized `scenarios * MAX_TRADES_PER_CANDIDATE` when
-    /// the workspace is built, and the kernel indexes it by the CURRENT
-    /// scenario count — which `upload_scenarios` overwrites on every call.
-    /// Reusing a session for a longer work list therefore writes past its end,
-    /// into whatever the allocator placed next. (There used to be two more
-    /// arrays with the same hazard, `signal_values` and `signal_confidences`,
-    /// sized `population * bars`; the walk now synthesises the signal in
-    /// registers and they do not exist.)
-    ///
-    /// This counted GENES until the scenario became the unit of work, and the
-    /// two are no longer the same number: a quality-screen launch is 174 genes
-    /// and 17 574 scenarios, so a gene-count guard would have approved a reuse
-    /// that overruns the workspace by a factor of a hundred.
-    ///
-    /// Nothing stopped that at all before either guard existed. The reuse test
-    /// was `capacity >= capacity` on the old event budget, and that budget
-    /// SUBTRACTED `population * bars * 5`, so a larger population asked for LESS
-    /// capacity and passed more easily — the check was not merely silent about
-    /// size, it was inverted with respect to it. A session built for 256 was
-    /// reused for 25 600. The phantom budget is gone; this field is what
-    /// replaced it, and it is the ONLY thing standing between a reused session
-    /// and that write.
-    ///
-    /// It records what the DEVICE workspace holds, not what the last call
-    /// asked for. The native side grows the workspace instead of matching it
-    /// exactly (`workspace_scenarios < scenario_count`), so a shorter work list
-    /// reuses a larger workspace and this value must not be lowered to follow
-    /// it — lowering it would be harmless for safety but would force a rebuild
-    /// the device no longer performs, and the two sides would disagree about
-    /// what is resident.
-    workspace_scenarios: usize,
-    /// The host-side dataset, staged once and kept.
-    ///
-    /// Building it copies every bar of close/high/low and the whole
-    /// feature-major indicator matrix — for M3 that is ~1.75 M bars against 64
-    /// features. Rebuilding that per call, while the device copy sat resident
-    /// and unchanged, was pure waste: the bars do not change between
-    /// generations, only the genes do. It stays in RAM, ready.
-    dataset: PrototypeADatasetUpload,
-    smc_rows: Vec<i8>,
-    native_settings: neoethos_gpu_contracts::device::NeoPopulationSettings,
-}
-
-/// The session holds a raw device handle, which is why it is not `Send` by
-/// itself. Sending it between threads is sound here for a specific reason:
-/// every native entry point begins with `cudaSetDevice(session->device)`, so a
-/// call from a different thread binds the right device before touching
-/// anything, and all access is serialized by the mutex below. Without that
-/// per-entry binding this would be unsound.
-struct SendResident(ResidentSession);
-unsafe impl Send for SendResident {}
-
-fn resident_slot() -> &'static std::sync::Mutex<Option<SendResident>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<SendResident>>> =
-        std::sync::OnceLock::new();
-    SLOT.get_or_init(|| std::sync::Mutex::new(None))
-}
-
 /// What a learned launch size is a fact ABOUT.
 ///
 /// A fit is measured in scenarios, and the room available for scenarios is
@@ -661,8 +328,7 @@ struct LimitKey {
 /// So the size that worked is remembered and used as the starting point — for
 /// the shape it was learned on, and no other. An absent entry means "not yet
 /// learned": the first call tries the whole work list, as it should.
-fn learned_batch_limits()
--> &'static std::sync::Mutex<std::collections::HashMap<LimitKey, usize>> {
+fn learned_batch_limits() -> &'static std::sync::Mutex<std::collections::HashMap<LimitKey, usize>> {
     static LIMITS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<LimitKey, usize>>,
     > = std::sync::OnceLock::new();
@@ -739,40 +405,111 @@ impl std::error::Error for NotAWorkListSizeProblem {}
 /// that would silently become a free-trading backtest.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_evaluate_population_b(
-    close: &[f64],
-    high: &[f64],
-    low: &[f64],
-    indicators: ArrayView2<'_, f32>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1,
     gene_offsets: &[i32],
     gene_indices: &[i32],
-    gene_weights: &[f32],
-    long_thr: &[f32],
-    short_thr: &[f32],
-    month_idx: &[i64],
-    day_idx: &[i64],
-    timestamps: &[i64],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
     sl_pips: &[f64],
     tp_pips: &[f64],
     stop_vol_mult: &[f64],
-    smc_data: &[SmcRow],
     gene_smc_flags: &[SmcRow],
-    gate_threshold: f32,
-    smc_weights: &[f32; 11],
-    settings: &BacktestSettings,
-    device_override: Option<usize>,
+    gate_threshold: f64,
+    smc_weights: &[f64; 11],
 ) -> Result<Vec<[f64; 11]>> {
+    evidence
+        .validate_population_layout(evidence.row_count(), evidence.feature_count())
+        .map_err(anyhow::Error::new)?;
+    let expected = long_thr.len();
+    let rows = require_exact_native_population_rows_v1(
+        evaluate_population_b_raw_v1(
+            evidence,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            sl_pips,
+            tp_pips,
+            stop_vol_mult,
+            gene_smc_flags,
+            gate_threshold,
+            smc_weights,
+        ),
+        expected,
+    )?;
+    if expected > 0 {
+        evidence.record_successful_native_population_v1(
+            expected,
+            rows.rows.len(),
+            rows.counters,
+        )?;
+        evidence
+            .record_successful_population(
+                crate::engine_identity::PopulationEvalEngine::CudaNativeF64,
+                expected,
+                rows.rows.len(),
+            )
+            .map_err(anyhow::Error::new)?;
+    }
+    Ok(rows.rows)
+}
+
+fn require_exact_native_population_rows_v1(
+    outcome: Result<NativePopulationBatchV1>,
+    expected: usize,
+) -> Result<NativePopulationBatchV1> {
+    let rows = outcome?;
+    if rows.rows.len() != expected {
+        bail!(
+            "prototype B returned {} metric rows; expected {expected}",
+            rows.rows.len()
+        );
+    }
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_population_b_raw_v1(
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f64,
+    smc_weights: &[f64; 11],
+) -> Result<NativePopulationBatchV1> {
     let n_genes = long_thr.len();
-    let bars = close.len();
+    let bars = evidence.row_count();
     if n_genes == 0 || bars == 0 {
-        return Ok(vec![ZERO_METRICS; n_genes]);
+        return Ok(NativePopulationBatchV1 {
+            rows: vec![ZERO_METRICS; n_genes],
+            counters: PopulationResidencyCountersV1::default(),
+        });
     }
     let scenarios: Vec<ScenarioDescriptor> = (0..n_genes as u64)
         .map(|candidate| scenario::base_scenario(candidate, candidate, bars))
         .collect();
-    try_evaluate_scenarios_b(
-        close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
-        short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
-        gene_smc_flags, gate_threshold, smc_weights, settings, device_override, &scenarios,
+    evaluate_scenarios_b_raw_v1(
+        evidence,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        gene_smc_flags,
+        gate_threshold,
+        smc_weights,
+        &scenarios,
     )
 }
 
@@ -804,34 +541,83 @@ pub(crate) fn try_evaluate_population_b(
 /// correct work list whatever it contains.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_evaluate_scenarios_b(
-    close: &[f64],
-    high: &[f64],
-    low: &[f64],
-    indicators: ArrayView2<'_, f32>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1,
     gene_offsets: &[i32],
     gene_indices: &[i32],
-    gene_weights: &[f32],
-    long_thr: &[f32],
-    short_thr: &[f32],
-    month_idx: &[i64],
-    day_idx: &[i64],
-    timestamps: &[i64],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
     sl_pips: &[f64],
     tp_pips: &[f64],
     stop_vol_mult: &[f64],
-    smc_data: &[SmcRow],
     gene_smc_flags: &[SmcRow],
-    gate_threshold: f32,
-    smc_weights: &[f32; 11],
-    settings: &BacktestSettings,
-    device_override: Option<usize>,
+    gate_threshold: f64,
+    smc_weights: &[f64; 11],
     scenarios: &[ScenarioDescriptor],
 ) -> Result<Vec<[f64; 11]>> {
+    evidence
+        .validate_population_layout(evidence.row_count(), evidence.feature_count())
+        .map_err(anyhow::Error::new)?;
+    let expected = scenarios.len();
+    let rows = require_exact_native_population_rows_v1(
+        evaluate_scenarios_b_raw_v1(
+            evidence,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            sl_pips,
+            tp_pips,
+            stop_vol_mult,
+            gene_smc_flags,
+            gate_threshold,
+            smc_weights,
+            scenarios,
+        ),
+        expected,
+    )?;
+    if expected > 0 {
+        evidence.record_successful_native_population_v1(
+            expected,
+            rows.rows.len(),
+            rows.counters,
+        )?;
+        evidence
+            .record_successful_population(
+                crate::engine_identity::PopulationEvalEngine::CudaNativeF64,
+                expected,
+                rows.rows.len(),
+            )
+            .map_err(anyhow::Error::new)?;
+    }
+    Ok(rows.rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_scenarios_b_raw_v1(
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
+    sl_pips: &[f64],
+    tp_pips: &[f64],
+    stop_vol_mult: &[f64],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f64,
+    smc_weights: &[f64; 11],
+    scenarios: &[ScenarioDescriptor],
+) -> Result<NativePopulationBatchV1> {
     let n_genes = long_thr.len();
     // What the launch is sized by, from here down.
     let n_scenarios = scenarios.len();
     if n_scenarios == 0 {
-        return Ok(Vec::new());
+        return Ok(NativePopulationBatchV1 {
+            rows: Vec::new(),
+            counters: PopulationResidencyCountersV1::default(),
+        });
     }
     // Refused here, before anything is uploaded, because the device cannot
     // detect either fault: a gene index past the end of the population is an
@@ -839,15 +625,22 @@ pub(crate) fn try_evaluate_scenarios_b(
     // metric row, and a window past the end of the series is an out-of-bounds
     // read of prices. The native side checks again — two independent guards,
     // like the workspace-population pair — but this one can name the index.
-    if let Err(detail) = scenario::validate_scenarios(scenarios, n_genes, close.len()) {
+    if let Err(detail) = scenario::validate_scenarios(scenarios, n_genes, evidence.row_count()) {
         bail!("prototype B scenario list: {detail}");
     }
 
+    let selected_ordinal = evidence
+        .require_exact_cuda_device_ordinal_v1()?
+        .selected_ordinal();
+    let device = usize::try_from(selected_ordinal).map_err(|_| {
+        anyhow::anyhow!("sealed CUDA ordinal {selected_ordinal} does not fit this process")
+    })?;
+
     // Everything the launch size is a fact about, in one key.
     let limit_key = LimitKey {
-        device: device_override.unwrap_or(0),
-        bars: close.len(),
-        feature_count: indicators.nrows(),
+        device,
+        bars: evidence.row_count(),
+        feature_count: evidence.feature_count(),
         month_capacity: crate::eval::current_backtest_runtime_overrides().month_capacity,
     };
     // Start at the size already known to fit THIS shape rather than
@@ -872,37 +665,25 @@ pub(crate) fn try_evaluate_scenarios_b(
         // batch that fixes it, so say so and let the caller's own policy
         // decide: with NEOETHOS_REQUIRE_GPU set that is a loud failure, and
         // without it the CPU lane is the honest answer.
-        Sizing::NoRoom { dataset_bytes, budget_bytes } => {
+        Sizing::NoRoom {
+            dataset_bytes,
+            budget_bytes,
+        } => {
             bail!(
                 "prototype B: this device has no room for the dataset — it needs \
                  {dataset_bytes} B (close/high/low, months/days/timestamps, the adaptive stop \
-                 base, gap flags, SMC rows and the indicator matrix twice for the bar-major \
-                 transpose) against a {budget_bytes} B budget of free VRAM. {n_scenarios} \
+                 base, gap flags, SMC rows and one immutable feature-major indicator matrix) \
+                 against a {budget_bytes} B budget of free VRAM. {n_scenarios} \
                  scenarios over {} bars x {} features. Splitting the work list cannot help: \
                  the dataset is the same size whatever the launch asks for.",
                 limit_key.bars,
                 limit_key.feature_count
             );
         }
-        // Not knowing how much room there is is a reason to ask for less, not
-        // for everything. This read `unwrap_or(usize::MAX)` — unknown meant
-        // unlimited — and a measured run launched 24 700 candidates against a
-        // card that holds ~16 300, died with a stream synchronization failure,
-        // and left the CUDA context unusable: the 27 evaluations after it could
-        // not even read free memory, so 31 859 items went to the CPU from one
-        // bad guess. It then read `last_known_fit()`, which is the same mistake
-        // with a better disguise — the last SUCCESSFUL large batch is exactly
-        // the wrong guess to make when the card has stopped answering.
-        Sizing::Unreadable => {
-            tracing::warn!(
-                target: "neoethos_search::eval",
-                n_genes,
-                n_scenarios,
-                fallback = CONSERVATIVE_BATCH,
-                "cannot read free device memory — sizing the batch conservatively"
-            );
-            CONSERVATIVE_BATCH
-        }
+        Sizing::Unreadable => bail!(
+            "prototype B could not read free memory on sealed CUDA ordinal {selected_ordinal}; \
+             a runtime/device probe fault cannot authorize a guessed batch or CPU substitution"
+        ),
     };
     if fits < n_scenarios {
         tracing::info!(
@@ -916,17 +697,38 @@ pub(crate) fn try_evaluate_scenarios_b(
     let learned = learned.min(fits);
     if n_scenarios > learned && n_scenarios > 1 {
         return split_and_evaluate(
-            close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
-            short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
-            gene_smc_flags, gate_threshold, smc_weights, settings, device_override, scenarios,
+            evidence,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            sl_pips,
+            tp_pips,
+            stop_vol_mult,
+            gene_smc_flags,
+            gate_threshold,
+            smc_weights,
+            scenarios,
             learned,
         );
     }
 
     let attempt = evaluate_population_b_batch(
-        close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
-        short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
-        gene_smc_flags, gate_threshold, smc_weights, settings, device_override, scenarios,
+        evidence,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        gene_smc_flags,
+        gate_threshold,
+        smc_weights,
+        device,
+        scenarios,
     );
     let Err(error) = attempt else {
         // This size fits; keep it as the starting point for the next call over
@@ -956,9 +758,19 @@ pub(crate) fn try_evaluate_scenarios_b(
          remembering the limit so later launches start there"
     );
     return split_and_evaluate(
-        close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
-        short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
-        gene_smc_flags, gate_threshold, smc_weights, settings, device_override, scenarios,
+        evidence,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        gene_smc_flags,
+        gate_threshold,
+        smc_weights,
+        scenarios,
         n_scenarios / 2,
     );
 }
@@ -1020,6 +832,22 @@ mod capacity_detection_tests {
             Sizing::Fits(fits) => fits,
             other => panic!("expected a fit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sealed_parent_sizes_one_f64_indicator_matrix_without_transpose_staging() {
+        const BARS: usize = 37;
+        const FEATURES: usize = 13;
+        let fixed_per_bar = 3 * std::mem::size_of::<f64>()
+            + 3 * std::mem::size_of::<i64>()
+            + std::mem::size_of::<f64>()
+            + std::mem::size_of::<u8>()
+            + 11 * std::mem::size_of::<i8>();
+        let expected = BARS * fixed_per_bar + BARS * FEATURES * std::mem::size_of::<f64>();
+        assert_eq!(
+            prototype_b_dataset_peak_bytes(BARS, FEATURES),
+            expected as u64
+        );
     }
 
     /// What fusion bought, stated as a number rather than as a claim.
@@ -1127,9 +955,10 @@ mod capacity_detection_tests {
     /// What replaced it was `workspace_scenarios >= n_scenarios` in the HOST
     /// reuse predicate, and that over-corrected. `workspace_scenarios` is
     /// written only at session creation, so the first LARGER launch tore the
-    /// session down and re-uploaded the entire dataset — up to 10.8 GB of
-    /// traffic — in order to grow a 594 B/scenario workspace that the device
-    /// grows by itself. The guard that matters is the device's
+    /// session down and re-uploaded the entire dataset — more than 10 GB of H2D
+    /// traffic plus a same-sized transient transpose allocation — in order to
+    /// grow a 594 B/scenario workspace that the device grows by itself. The
+    /// guard that matters is the device's
     /// (`workspace_scenarios < scenario_count`), and it is exact.
     #[test]
     fn a_workspace_is_reusable_downward_and_grown_upward() {
@@ -1165,30 +994,10 @@ mod capacity_detection_tests {
             }
             record = host_record_after(record, requested);
         }
-        assert_eq!(reallocations, 1, "the workspace grows once and is then reused");
-    }
-
-    /// A blind moment must not approve everything.
-    ///
-    /// The unreadable-memory branch used to yield `usize::MAX`. That single
-    /// default launched 24 700 candidates at a card holding ~16 300, which
-    /// failed mid-stream and left the CUDA context unusable for the rest of the
-    /// run. Whatever it yields, it has to be a batch the smallest sensible card
-    /// could host.
-    #[test]
-    fn the_blind_batch_is_small_enough_for_any_card() {
-        // No `bars * 5` term: the per-scenario signal and confidence columns
-        // that made the blind batch depend on the series length are gone, so
-        // this is now a flat 593 768 B per candidate whatever the dataset.
-        let per_candidate =
-            neoethos_gpu_cuda::MAX_TRADES_PER_CANDIDATE * 72 + 2 * MONTHS as u64 * 8 + 104 + 56;
-        let blind = CONSERVATIVE_BATCH as u64 * per_candidate;
-        assert!(
-            blind < 2 * 1024 * 1024 * 1024,
-            "a blind batch wants {} MiB, which is not safe on a small card",
-            blind / (1024 * 1024)
+        assert_eq!(
+            reallocations, 1,
+            "the workspace grows once and is then reused"
         );
-        assert!(CONSERVATIVE_BATCH >= 256, "and it still has to keep the card busy");
     }
 
     /// Peak memory must follow the hardware, never the request.
@@ -1218,9 +1027,9 @@ mod capacity_detection_tests {
         ));
 
         // The worked shape: a 12 GB card asked for EURUSD M1 at 257 features.
-        // The indicator matrix alone is 5.4 GB and it is charged twice for the
-        // bar-major transpose, so the DATASET does not fit — and no work list,
-        // however small, makes a dataset smaller.
+        // The f64 indicator matrix alone is 10.8 GB and it is charged twice for
+        // the bar-major transpose, so the DATASET does not fit — and no work
+        // list, however small, makes a dataset smaller.
         assert!(matches!(
             candidates_for_free_memory(12 * 1024 * 1024 * 1024, 5_270_000, 257, MONTHS),
             Sizing::NoRoom { .. }
@@ -1262,8 +1071,18 @@ mod capacity_detection_tests {
     /// other dataset's launches for the life of the process.
     #[test]
     fn a_learned_limit_belongs_to_one_shape() {
-        let m5 = LimitKey { device: 0, bars: 843_456, feature_count: 64, month_capacity: 240 };
-        let m1 = LimitKey { device: 0, bars: 5_270_000, feature_count: 257, month_capacity: 240 };
+        let m5 = LimitKey {
+            device: 0,
+            bars: 843_456,
+            feature_count: 64,
+            month_capacity: 240,
+        };
+        let m1 = LimitKey {
+            device: 0,
+            bars: 5_270_000,
+            feature_count: 257,
+            month_capacity: 240,
+        };
         learn_batch_success(m5, 26_777);
         assert_eq!(learned_batch_limit(m5), 26_777);
         assert_eq!(
@@ -1286,10 +1105,9 @@ mod capacity_detection_tests {
     /// first failure may already have left unusable.
     #[test]
     fn a_dataset_allocation_failure_is_never_split() {
-        let workspace: Result<()> =
-            Err(native_error(neoethos_gpu_cuda::STATUS_ALLOCATION_FAILED))
-                .map_err(anyhow::Error::new)
-                .context("prototype B evaluate");
+        let workspace: Result<()> = Err(native_error(neoethos_gpu_cuda::STATUS_ALLOCATION_FAILED))
+            .map_err(anyhow::Error::new)
+            .context("prototype B evaluate");
         assert!(
             is_capacity_exhaustion(&workspace.expect_err("constructed as an error")),
             "a workspace exhaustion IS worth retrying smaller"
@@ -1306,8 +1124,14 @@ mod capacity_detection_tests {
         );
         // And the reason still reaches the log.
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("prototype B dataset upload"), "{rendered}");
-        assert!(rendered.contains("does not depend on the work list size"), "{rendered}");
+        assert!(
+            rendered.contains("prototype B dataset upload"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("does not depend on the work list size"),
+            "{rendered}"
+        );
     }
 
     /// Built exactly as the engine builds it, so the test exercises the real
@@ -1352,137 +1176,55 @@ mod capacity_detection_tests {
         assert!(!is_capacity_exhaustion(&error));
     }
 
-    fn key_of(settings: &BacktestSettings) -> u64 {
-        use std::hash::Hasher;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        settings_key(settings, &mut hasher);
-        hasher.finish()
-    }
-
-    /// `BacktestSettings::default()` leaves `pip_value`, `spread_pips`,
-    /// `commission_per_trade` and `pip_value_per_lot` as NaN sentinels — a
-    /// deliberate trap so a caller that never binds a real symbol is caught by
-    /// the NaN-fitness guard. That makes the default useless as a hashing
-    /// baseline: `NaN + 0.3` is NaN with the same bit pattern, so a test built
-    /// on it would report "the key ignores spread" no matter what the key did.
-    /// Fill the cost fields with real numbers first.
-    fn priced_settings() -> BacktestSettings {
-        let mut settings = BacktestSettings::default();
-        settings.pip_value = 0.0001;
-        settings.spread_pips = 1.2;
-        settings.commission_per_trade = 3.5;
-        settings.pip_value_per_lot = 10.0;
-        settings
-    }
-
-    /// The key must separate exactly the settings the device can see.
-    ///
-    /// Both directions are failures, and they fail differently. A field that
-    /// reaches `NeoPopulationSettings` but not the key is a WRONG CACHE HIT:
-    /// the resident session keeps last chunk's spread or commission and the run
-    /// continues on the card, quietly pricing trades with the wrong numbers. A
-    /// field that reaches the key but not the device is pure waste: it tears
-    /// down a 261 MiB resident dataset and re-uploads it to change nothing.
-    ///
-    /// `sl_pips` and `tp_pips` were the second kind. They are per-gene — they
-    /// travel in `stop_pips` / `target_pips`, re-uploaded every call — and the
-    /// chunk loop takes them from the first gene of the chunk, so every chunk
-    /// over the same bars rebuilt the dataset over 16 dead bytes.
     #[test]
-    fn the_key_separates_settings_that_reach_the_device() {
-        let base = priced_settings();
-        let baseline = key_of(&base);
-
-        // Per-gene, invisible to `NeoPopulationSettings`: must NOT rebuild.
-        let mut per_gene = base.clone();
-        per_gene.sl_pips = base.sl_pips + 17.5;
-        per_gene.tp_pips = base.tp_pips + 42.25;
-        assert_eq!(
-            key_of(&per_gene),
-            baseline,
-            "sl_pips/tp_pips are per-gene and have no field in NeoPopulationSettings — \
-             changing them must not destroy the resident dataset"
-        );
-
-        // Everything that does reach the device: must rebuild.
-        let mut spread = base.clone();
-        spread.spread_pips = base.spread_pips + 0.3;
-        assert_ne!(key_of(&spread), baseline, "spread reaches the kernel");
-
-        let mut commission = base.clone();
-        commission.commission_per_trade = base.commission_per_trade + 1.0;
-        assert_ne!(key_of(&commission), baseline, "commission reaches the kernel");
-
-        let mut hold = base.clone();
-        hold.max_hold_bars = base.max_hold_bars + 1;
-        assert_ne!(key_of(&hold), baseline, "max_hold_bars reaches the kernel");
-
-        // `trailing_min_lock_pips` HAS a field in `NeoPopulationSettings`
-        // (`population_settings_for_dataset` writes it), so it belongs in the
-        // key. Note for whoever chases a trailing-stop parity gap: the value
-        // the device receives is currently NOT this one. `SnapshotSettingsDto`
-        // has no field for it, and `to_settings()` rebuilds from
-        // `BacktestSettings::default()`, so the round trip through the DTO
-        // silently substitutes the default. That is a separate defect in the
-        // DTO, not in this key — the key is what must change if the setting
-        // changes, and fixing the DTO must not require touching this line.
-        let mut trailing = base.clone();
-        trailing.trailing_min_lock_pips = base.trailing_min_lock_pips + 1.0;
-        assert_ne!(
-            key_of(&trailing),
-            baseline,
-            "trailing_min_lock_pips has a field in NeoPopulationSettings"
-        );
-
-        // The session profile is a distinct session from a flat spread even
-        // when its buckets all equal that flat value.
-        let mut profile = base.clone();
-        profile.session_spread_profile = Some(crate::eval::SessionSpreadProfile {
-            asian_pips: base.spread_pips,
-            overlap_pips: base.spread_pips,
-            late_ny_pips: base.spread_pips,
-        });
-        assert_ne!(
-            key_of(&profile),
-            baseline,
-            "a profile whose buckets equal the flat spread is still a different session"
-        );
+    fn resident_reuse_is_owned_by_the_run_scoped_sealed_native_boundary() {
+        let source = include_str!("prototype_b_population_eval.rs");
+        let production = &source[source
+            .find("fn evaluate_population_b_batch(")
+            .expect("native population adapter boundary")..];
+        assert!(production.contains("bind_exact_native_population_view_v1"));
+        assert!(!production.contains("fn resident_slot()"));
+        assert!(!production.contains("static RESIDENT"));
+        assert!(!production.contains("sample_hash"));
+        assert!(!production.contains("dataset_key"));
     }
 
-    /// `adaptive_base_pips` is uploaded WITH the dataset, so it is the one
-    /// settings field whose change genuinely is a different device dataset.
-    ///
-    /// It is also the field that made the old key cost 17 MB: `Debug` rendered
-    /// all 843 456 values into a `String` on every launch just to compare them.
-    /// Sampled hashing has to keep separating them.
     #[test]
-    fn the_adaptive_base_series_is_part_of_the_dataset_identity() {
-        use std::sync::Arc;
-        let base = priced_settings();
+    fn prototype_b_f64_adapter_contract_has_no_cubecl_diversion() {
+        let source = include_str!("../cubecl_eval.rs").to_ascii_lowercase();
+        for forbidden in [
+            "prototype_b",
+            "prototype b",
+            "prototype-b",
+            "gpu-b-adapter",
+            "try_evaluate_population_b",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "CubeCL must remain a separate engine; found stale diversion token {forbidden}"
+            );
+        }
+    }
 
-        let mut none = base.clone();
-        none.adaptive_base_pips = None;
+    #[test]
+    fn prototype_b_f64_adapter_contract_real_parity_is_fail_loud() {
+        let source = include_str!("../eval.rs");
+        let start = source
+            .find("fn gpu_matches_cpu_with_a_trailing_stop()")
+            .expect("real Prototype B parity test must exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("fn uniform_buckets_are_a_scalar_by_another_name()")
+            .expect("next parity test must delimit the real trailing-stop test");
+        let parity_test = &rest[..end];
 
-        let mut flat = base.clone();
-        flat.adaptive_base_pips = Some(Arc::from(vec![10.0f64; 4_096].as_slice()));
-
-        let mut shifted = base.clone();
-        let mut values = vec![10.0f64; 4_096];
-        // Move a sampled position: with 4 096 values and 256 samples the stride
-        // is 16, so index 2 048 is one of them.
-        values[2_048] = 11.0;
-        shifted.adaptive_base_pips = Some(Arc::from(values.as_slice()));
-
-        let mut longer = base.clone();
-        longer.adaptive_base_pips = Some(Arc::from(vec![10.0f64; 8_192].as_slice()));
-
-        assert_ne!(key_of(&none), key_of(&flat), "absent is not the same as flat");
-        assert_ne!(key_of(&flat), key_of(&shifted), "a changed stop distance is a different dataset");
-        assert_ne!(key_of(&flat), key_of(&longer), "a different length is a different dataset");
-        assert_eq!(
-            key_of(&flat),
-            key_of(&flat.clone()),
-            "and identical series must still hit the resident session"
+        assert!(
+            !parity_test.contains("skipping trailing parity"),
+            "a device error must fail the paid real-device parity test, never report a skip"
+        );
+        assert!(
+            parity_test.contains("Prototype B real-device parity failed"),
+            "the parity test must surface a device failure with an explicit fail-loud diagnostic"
         );
     }
 }
@@ -1497,30 +1239,21 @@ mod capacity_detection_tests {
 /// whatever it contains. The class of bug is gone rather than guarded.
 #[allow(clippy::too_many_arguments)]
 fn split_and_evaluate(
-    close: &[f64],
-    high: &[f64],
-    low: &[f64],
-    indicators: ArrayView2<'_, f32>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1,
     gene_offsets: &[i32],
     gene_indices: &[i32],
-    gene_weights: &[f32],
-    long_thr: &[f32],
-    short_thr: &[f32],
-    month_idx: &[i64],
-    day_idx: &[i64],
-    timestamps: &[i64],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
     sl_pips: &[f64],
     tp_pips: &[f64],
     stop_vol_mult: &[f64],
-    smc_data: &[SmcRow],
     gene_smc_flags: &[SmcRow],
-    gate_threshold: f32,
-    smc_weights: &[f32; 11],
-    settings: &BacktestSettings,
-    device_override: Option<usize>,
+    gate_threshold: f64,
+    smc_weights: &[f64; 11],
     scenarios: &[ScenarioDescriptor],
     head_len: usize,
-) -> Result<Vec<[f64; 11]>> {
+) -> Result<NativePopulationBatchV1> {
     // Everything launched below this point is a split leaf. Without it the
     // telemetry sees only the outer entry: a `calls=7` line covered an unknown
     // number of real launches, and "unknown" is what let the recursive split be
@@ -1542,52 +1275,62 @@ fn split_and_evaluate(
     // slicing the genes would invalidate every index in the work list. Uploading
     // the whole gene array twice costs a few megabytes; slicing it wrongly costs
     // a run that reports numbers from the wrong strategies.
-    let mut head = try_evaluate_scenarios_b(
-        close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
-        short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
-        gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
+    let mut head = evaluate_scenarios_b_raw_v1(
+        evidence,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        gene_smc_flags,
+        gate_threshold,
+        smc_weights,
         &scenarios[..cut],
     )?;
-    let tail = try_evaluate_scenarios_b(
-        close, high, low, indicators, gene_offsets, gene_indices, gene_weights, long_thr,
-        short_thr, month_idx, day_idx, timestamps, sl_pips, tp_pips, stop_vol_mult, smc_data,
-        gene_smc_flags, gate_threshold, smc_weights, settings, device_override,
+    let tail = evaluate_scenarios_b_raw_v1(
+        evidence,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        sl_pips,
+        tp_pips,
+        stop_vol_mult,
+        gene_smc_flags,
+        gate_threshold,
+        smc_weights,
         &scenarios[cut..],
     )?;
-    head.extend(tail);
+    head.rows.extend(tail.rows);
+    head.counters = tail.counters;
     Ok(head)
 }
 
 /// Evaluate a population on Prototype B.
 ///
-/// Mirrors `cubecl_eval::try_evaluate_population_cuda` argument for argument so
-/// the two are interchangeable at the call site, and returns the same
-/// `[f64; 11]` rows in candidate order.
+/// This is the canonical f64 native-CUDA adapter. CubeCL remains a separate
+/// engine and never diverts into this path.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_population_b_batch(
-    close: &[f64],
-    high: &[f64],
-    low: &[f64],
-    indicators: ArrayView2<'_, f32>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1,
     gene_offsets: &[i32],
     gene_indices: &[i32],
-    gene_weights: &[f32],
-    long_thr: &[f32],
-    short_thr: &[f32],
-    month_idx: &[i64],
-    day_idx: &[i64],
-    timestamps: &[i64],
+    gene_weights: &[f64],
+    long_thr: &[f64],
+    short_thr: &[f64],
     sl_pips: &[f64],
     tp_pips: &[f64],
     stop_vol_mult: &[f64],
-    smc_data: &[SmcRow],
     gene_smc_flags: &[SmcRow],
-    gate_threshold: f32,
-    smc_weights: &[f32; 11],
-    settings: &BacktestSettings,
-    device_override: Option<usize>,
+    gate_threshold: f64,
+    smc_weights: &[f64; 11],
+    device: usize,
     scenarios: &[ScenarioDescriptor],
-) -> Result<Vec<[f64; 11]>> {
+) -> Result<NativePopulationBatchV1> {
     // Host prep starts here, not at the first upload.
     //
     // Everything between this line and the submission below is the card
@@ -1599,9 +1342,12 @@ fn evaluate_population_b_batch(
     let host_prep_started = std::time::Instant::now();
     let n_genes = long_thr.len();
     let n_scenarios = scenarios.len();
-    let bars = close.len();
+    let bars = evidence.row_count();
     if n_genes == 0 || bars == 0 || n_scenarios == 0 {
-        return Ok(vec![ZERO_METRICS; n_scenarios]);
+        return Ok(NativePopulationBatchV1 {
+            rows: vec![ZERO_METRICS; n_scenarios],
+            counters: PopulationResidencyCountersV1::default(),
+        });
     }
     // Same optional-contract handling as the CubeCL lane: an empty
     // `stop_vol_mult` means "no adaptive stops", and every downstream slice
@@ -1609,187 +1355,11 @@ fn evaluate_population_b_batch(
     let stop_vol_fallback = crate::eval::normalized_stop_vol_mult(stop_vol_mult, n_genes);
     let stop_vol_mult = stop_vol_fallback.as_deref().unwrap_or(stop_vol_mult);
 
-    // And the same contract for timestamps: the CPU reference treats an empty
-    // slice as "no timestamps" (session spread profile off, gap detection off,
-    // entry/exit stamps zero — `use_timestamps` in `fast_evaluate_strategy_core`),
-    // and the CPCV gathered-fold lane passes exactly that. The device dataset has
-    // no empty-slice notion — `PopulationDatasetView::validate` demands one stamp
-    // per bar — so zeros go up instead. That is bit-identical, not approximate:
-    // the kernel's `timestamp_ms <= 0` guard resolves spread to the scalar, the
-    // gap kernel's `current > previous` never fires on equal stamps, and the
-    // trade stamps come back 0 exactly as the CPU's disabled path writes them.
-    // Before this shim every production CPCV fold eval was refused at upload and
-    // silently recomputed on the CPU — the card never saw the CPCV gate at all.
-    let timestamps_fallback: Option<Vec<i64>> =
-        if timestamps.is_empty() { Some(vec![0; bars]) } else { None };
-    let timestamps = timestamps_fallback.as_deref().unwrap_or(timestamps);
-
-    // Identity is decided from the caller's slices, before anything is copied,
-    // so a repeat call over the same bars costs a sampled hash instead of a
-    // full rebuild of the dataset.
-    let feature_count = indicators.nrows();
-    let key = dataset_key(
-        close,
-        high,
-        low,
-        &indicators,
-        feature_count,
-        month_idx,
-        day_idx,
-        timestamps,
-        smc_data,
-        settings,
-    );
-    let device = device_override.unwrap_or(0) as i32;
-
-    // Hold the slot for the whole evaluation. That serializes device access the
-    // way the CubeCL launch lock does, which is deliberate: the quality screen
-    // calls this from a rayon `par_iter`, and one session per worker thread
-    // would multiply VRAM by the thread count.
-    let mut slot = resident_slot()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    // Three terms, and each one is load-bearing.
-    //
-    // There was a fourth, `capacity >= capacity`, comparing the event budget
-    // the session was created with against the one this call computed. It
-    // guarded a buffer that is never allocated, and because that budget
-    // subtracted `population * bars * 5` it moved every time the population
-    // did — so a session was torn down and rebuilt over an imaginary number.
-    // It is gone.
-    //
-    // What is NOT gone is the size term. That is the one this predicate exists
-    // for: the device workspace is sized at allocation and every kernel indexes
-    // it by the current SCENARIO COUNT, so handing a reused session a LONGER
-    // work list writes past the end of the outcome array — into `monthly_pnls`,
-    // which is what sharpe and consistency are computed from, with `sanitize()`
-    // turning the consequence into a plausible 0.0. The native side refuses that
-    // too (`workspace_scenarios < scenario_count` re-allocates), so this is the
-    // outer of two independent guards, not the only one.
-    // THE SIZE TERM IS NOT IN THIS PREDICATE, and that is deliberate.
-    //
-    // It was: `workspace_scenarios >= n_scenarios`. `workspace_scenarios` is
-    // only ever written at session CREATION, so the first launch LARGER than
-    // the one the session was built for tore the whole session down — a fresh
-    // `PopulationSession::create`, a full `upload_dataset` (up to 10.8 GB of
-    // traffic at M1/F=257 counting the bar-major transpose) and a full rebuild
-    // of the host staging copy — to grow a workspace that costs 594 B per
-    // scenario and that the DEVICE grows for free: `upload`-side, cu:2165 reads
-    // `session->workspace_scenarios < scenario_count` and re-allocates the
-    // workspace alone, leaving the dataset resident.
-    //
-    // So the host guard was not a second safety net at all. It could not stop
-    // an overrun the device does not already stop — the device decides the
-    // allocation — and what it actually did was convert a free workspace growth
-    // into the "go back to the card and it is empty" dead time. The GA lane and
-    // the validation tail share one resident slot and their launch sizes
-    // alternate, so this fired constantly.
-    //
-    // `workspace_scenarios` stays, as a RECORD of what the device allocated,
-    // raised after each successful evaluate (below). It is what the telemetry
-    // and the tests read; it is no longer a rebuild trigger.
-    let reusable = slot
-        .as_ref()
-        .is_some_and(|r| r.0.key == key && r.0.device == device);
-
-    // Counted, not just taken: a rebuild frees and re-allocates the whole
-    // workspace, and every `cudaFree` is an implicit device-wide sync. A run
-    // that rebuilds on every launch and one that never rebuilds produced the
-    // same output, and the difference is the largest single cost in the lane.
-    let session_rebuilt = !reusable;
-
-    if !reusable {
-        // Drop the old session before building the new one so the two never
-        // hold device memory at the same time.
-        *slot = None;
-
-        let indicators_flat: Vec<f32> = match indicators.as_slice() {
-            Some(flat) => flat.to_vec(),
-            None => indicators.iter().copied().collect(),
-        };
-        let dataset = PrototypeADatasetUpload {
-            close: close.to_vec(),
-            high: high.to_vec(),
-            low: low.to_vec(),
-            indicators: indicators_flat,
-            feature_count,
-            months: month_idx.to_vec(),
-            days: day_idx.to_vec(),
-            timestamps: timestamps.to_vec(),
-            smc_data: smc_data.to_vec(),
-            settings: SnapshotSettingsDto::from_settings(settings),
-        };
-        let native_settings = population_settings_for_dataset(&dataset)
-            .map_err(anyhow::Error::new)
+    let native_device = i32::try_from(device)
+        .map_err(|_| anyhow::anyhow!("sealed CUDA ordinal {device} does not fit the native ABI"))?;
+    let native_settings = population_settings_for_settings(evidence.settings())
+        .map_err(anyhow::Error::new)
         .context("prototype B settings")?;
-        let smc_rows: Vec<i8> = dataset.smc_data.iter().flatten().copied().collect();
-        let adaptive_base = dataset.settings.to_settings().adaptive_base_pips.clone();
-
-        let mut session = PopulationSession::create(device, VESTIGIAL_SESSION_MAX_EVENTS)
-            .map_err(anyhow::Error::new)
-        .context("prototype B session")?;
-        session
-            .upload_dataset(PopulationDatasetView {
-                close: &dataset.close,
-                high: &dataset.high,
-                low: &dataset.low,
-                indicators: &dataset.indicators,
-                feature_count: dataset.feature_count,
-                months: &dataset.months,
-                days: &dataset.days,
-                timestamps: &dataset.timestamps,
-                smc_rows: &smc_rows,
-                adaptive_base_pips: adaptive_base.as_deref(),
-            })
-            .map_err(anyhow::Error::new)
-            .context(NotAWorkListSizeProblem("the dataset upload"))
-        .context("prototype B dataset upload")?;
-
-        *slot = Some(SendResident(ResidentSession {
-            session,
-            key,
-            device,
-            workspace_scenarios: n_scenarios,
-            dataset,
-            smc_rows,
-            native_settings,
-        }));
-    }
-
-    let resident = &mut slot
-        .as_mut()
-        .expect("resident session was just installed")
-        .0;
-    // The device settings come from the RESIDENT copy, built when the session
-    // was, and this is only sound because the key covers them.
-    //
-    // The question the key rewrite raises: `dataset_key` no longer hashes
-    // `sl_pips` and `tp_pips`, so could a settings change now slip past the
-    // predicate and leave this copy stale — the run charging last chunk's
-    // spread while reporting this chunk's? There were two ways to close that:
-    // keep every scalar in the key, or rebuild `native_settings` on every call
-    // and store nothing.
-    //
-    // Keeping them in the key is the choice, for a reason specific to the two
-    // fields that were dropped: they cannot reach here. `native_settings` is
-    // built by `population_settings_for_dataset`, which reads
-    // `SnapshotSettingsDto` — and that DTO has no `sl_pips` or `tp_pips` field
-    // at all. Per-gene stops travel in the `stop_pips` / `target_pips` arrays,
-    // re-uploaded with the genes on every call, and `NeoPopulationSettings` has
-    // nowhere to put them. So the two excluded fields are provably invisible to
-    // this struct, while `settings_key` hashes every other field of
-    // `BacktestSettings` by an EXHAUSTIVE destructure that stops compiling when
-    // a field is added. Any scalar that can change what the device charges
-    // changes the key, rebuilds the session, and rebuilds this copy with it.
-    //
-    // The alternative — refresh per call — would also be correct, and it would
-    // additionally stop a spread change from tearing down a 261 MiB resident
-    // dataset. It is not taken here because it would leave the key and the
-    // stored settings free to disagree, and a compiler-enforced destructure in
-    // one place is a stronger guarantee than a rebuild that a future edit can
-    // quietly skip. See `the_key_separates_settings_that_reach_the_device`.
-    let native_settings = resident.native_settings;
 
     // Genes and scenarios are what actually change between calls, so they are
     // the only things rebuilt and re-uploaded.
@@ -1807,28 +1377,34 @@ fn evaluate_population_b_batch(
         smc_weights: *smc_weights,
         gate_threshold,
     };
-    let inputs = PrototypeBPopulationInputs::from_uploads(&resident.dataset, &genes)
-        .map_err(anyhow::Error::new)
-        .context("prototype B")?;
-    let session = &mut resident.session;
-
-    session
-        .upload_genes(PopulationGeneView {
-            descriptors: &inputs.descriptors,
-            offsets: &genes.offsets,
-            indices: &genes.indices,
-            weights: &genes.weights,
-            stop_pips: &genes.stop_pips,
-            target_pips: &genes.target_pips,
-            stop_vol_multipliers: &genes.stop_vol_multipliers,
-            smc_flags: &inputs.smc_flags,
-            smc_weights: &genes.smc_weights,
-            gate_threshold: genes.gate_threshold,
-            smc_gate_disabled: crate::genetic::smc_gate_disabled(),
+    let descriptors = genes
+        .candidate_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, candidate_id)| {
+            let start = genes.offsets[index] as u32;
+            let end = genes.offsets[index + 1] as u32;
+            GeneDescriptor {
+                candidate_id,
+                term_offset: start,
+                term_count: end.saturating_sub(start),
+                long_threshold: genes.long_thresholds[index],
+                short_threshold: genes.short_thresholds[index],
+                stop_ticks: 0,
+                target_ticks: 0,
+                stop_vol_multiplier: genes.stop_vol_multipliers[index],
+                flags: 0,
+                reserved: 0,
+            }
         })
-        .map_err(anyhow::Error::new)
-        .context(NotAWorkListSizeProblem("the gene upload"))
-        .context("prototype B gene upload")?;
+        .collect::<Vec<_>>();
+    let smc_flags = genes
+        .smc_flags
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
 
     // The work list, as the caller built it.
     //
@@ -1847,42 +1423,65 @@ fn evaluate_population_b_batch(
     // `scenario::base_scenario` / `cost_scenario` / `perturb_scenario` is how
     // that becomes a free-trading backtest, which is why there is no third
     // construction site.
-    session
-        .upload_scenarios(scenarios)
-        .map_err(anyhow::Error::new)
-        .context("prototype B scenario upload")?;
+    let ((rows, counters, host_prep, device_elapsed, adapter_counters), residency_counters) =
+        evidence.bind_exact_native_population_view_v1(native_device, |session| {
+            session
+                .upload_genes(PopulationGeneView {
+                    descriptors: &descriptors,
+                    offsets: &genes.offsets,
+                    indices: &genes.indices,
+                    weights: &genes.weights,
+                    stop_pips: &genes.stop_pips,
+                    target_pips: &genes.target_pips,
+                    stop_vol_multipliers: &genes.stop_vol_multipliers,
+                    smc_flags: &smc_flags,
+                    smc_weights: &genes.smc_weights,
+                    gate_threshold: genes.gate_threshold,
+                    smc_gate_disabled: crate::genetic::smc_gate_disabled(),
+                })
+                .map_err(anyhow::Error::new)
+                .context(NotAWorkListSizeProblem("the gene upload"))
+                .context("prototype B gene upload")?;
+            session
+                .upload_scenarios(scenarios)
+                .map_err(anyhow::Error::new)
+                .context("prototype B scenario upload")?;
 
-    // The host/device boundary. Everything above was prep; everything from here
-    // to the readback is the only part of the call the card is in.
-    let host_prep = host_prep_started.elapsed();
-    let device_started = std::time::Instant::now();
-
-    // The engine counts its own submissions and synchronizations (the native
-    // side increments them at each kernel launch and each stream sync) and
-    // returns them here. The host read them into `_counters` and dropped them
-    // on the next line, so the one authoritative answer to "how many kernels
-    // did this launch actually submit, and how many times did it stop the
-    // stream" was produced by the device, handed to the host, and thrown away
-    // — every launch, for the whole life of this lane.
-    let (event_id, counters) = session
-        .evaluate(&native_settings)
-        .map_err(anyhow::Error::new)
-        .context("prototype B evaluate")?;
-    session
-        .wait(event_id)
-        .map_err(anyhow::Error::new)
-        .context("prototype B wait")?;
-    let rows = session
-        .read_metrics()
-        .map_err(anyhow::Error::new)
-        .context("prototype B readback")?;
-    let device_elapsed = device_started.elapsed();
-
-    // The device grew its workspace if it needed to (cu:2165 re-allocates when
-    // `workspace_scenarios < scenario_count`), so the host record follows it
-    // upward and never downward: a shorter work list reuses a larger workspace,
-    // and the two sides must not disagree about what is resident.
-    resident.workspace_scenarios = resident.workspace_scenarios.max(n_scenarios);
+            // The parent upload/view bind and all changing input staging are
+            // included in host prep. The device interval still includes the
+            // full population-metric D2H readback; P1-E must eliminate that
+            // intermediate transfer before this can be final-only evidence.
+            let host_prep = host_prep_started.elapsed();
+            let device_started = std::time::Instant::now();
+            let (event_id, counters) = session
+                .evaluate(&native_settings)
+                .map_err(anyhow::Error::new)
+                .context("prototype B evaluate")?;
+            session
+                .wait(event_id)
+                .map_err(anyhow::Error::new)
+                .context("prototype B wait")?;
+            let rows = session
+                .read_metrics()
+                .map_err(anyhow::Error::new)
+                .context("prototype B readback")?;
+            let adapter_counters = session
+                .read_residency_counters_v1()
+                .map_err(anyhow::Error::new)
+                .context("prototype B residency counter readback")?;
+            Ok((
+                rows,
+                counters,
+                host_prep,
+                device_started.elapsed(),
+                adapter_counters,
+            ))
+        })?;
+    if adapter_counters != residency_counters {
+        bail!("native population residency counters changed without an intervening operation");
+    }
+    let session_rebuilt = residency_counters.parent_upload_count() == 1
+        && residency_counters.view_binding_count() == 1;
 
     crate::eval_telemetry::record_launch(
         crate::eval_telemetry::current_lane(),
@@ -1910,7 +1509,10 @@ fn evaluate_population_b_batch(
     // always zero: the kernel never fills that field, it only stores the total
     // on the session after `wait`. Slot 8 of a metric row is the same fact per
     // candidate, already read back.
-    let trade_counts = rows.iter().map(|row| row.values[8]).filter(|count| count.is_finite());
+    let trade_counts = rows
+        .iter()
+        .map(|row| row.values[8])
+        .filter(|count| count.is_finite());
     let (peak, total) = trade_counts.fold((0.0f64, 0.0f64), |(peak, total), count| {
         (peak.max(count), total + count)
     });
@@ -2013,5 +1615,8 @@ fn evaluate_population_b_batch(
         }
         out[index] = row.values;
     }
-    Ok(out)
+    Ok(NativePopulationBatchV1 {
+        rows: out,
+        counters: residency_counters,
+    })
 }

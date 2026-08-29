@@ -226,12 +226,11 @@ extern "C" __global__ void bollinger_bands_many_series_one_param_f32(
  *   `bollinger_bands_compute_into`(:313)— matype "sma" takes the classic path
  *   `bb_row_scalar_classic_sma`  (:582) — the rolling mean/variance recurrence
  *
- * WHICH BAND THIS EMITS. `compute_bollinger_batch` (cpu_batch.rs:5514) maps
- * output_id "value" -> `upper_band`. The f64 lane carries ONE matrix per
- * indicator, so this kernel emits the UPPER band, which is what a caller
- * asking for `bollinger_bands` with no output_id gets from the CPU. Emitting
- * `middle` would be the more "natural" choice and would silently disagree
- * with the reference.
+ * WHICH BAND THE PRIMARY EMITS. The registered primary output is UPPER. The
+ * preserved `bollinger_bands_neo_batch_f64` ABI therefore still writes only
+ * UPPER, while `bollinger_bands_production_f64` calls the same exact row
+ * authority and writes the canonical UPPER/MIDDLE/LOWER feature tuple in one
+ * launch. No primary buffer is relabelled as a different named output.
  *
  * PARAMETERS: the swept int is `period` (CPU default 20). `devup`/`devdn` are
  * held at 2.0, `matype` at "sma" and `devtype` at 0 — the cpu_batch defaults
@@ -269,36 +268,35 @@ extern "C" __global__ void bollinger_bands_many_series_one_param_f32(
 #define NEO_BB_DEVUP 2.0
 #define NEO_BB_DEVDN 2.0
 
-extern "C" __global__
-void bollinger_bands_neo_batch_f64(const double* __restrict__ data,
-                                   int series_len,
-                                   const int* __restrict__ periods,
-                                   int n_combos,
-                                   int first_valid,
-                                   double* __restrict__ out)
+__device__ __forceinline__
+void neo_bollinger_bands_row_f64(const double* __restrict__ data,
+                                 int len,
+                                 int period,
+                                 double devup,
+                                 double devdn,
+                                 int first_valid,
+                                 double* __restrict__ out_upper,
+                                 double* __restrict__ out_middle,
+                                 double* __restrict__ out_lower)
 {
-    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (combo >= n_combos) return;
-
-    const int len = series_len;
-    double* __restrict__ o = out + (size_t)combo * (size_t)len;
-    const int period = periods[combo];
-
     if (len <= 0 || period <= 0 || period > len ||
         first_valid < 0 || first_valid >= len ||
         (len - first_valid) < period) {
-        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        for (int i = 0; i < len; ++i) {
+            if (out_upper != nullptr) out_upper[i] = NEO_F64_NAN;
+            if (out_middle != nullptr) out_middle[i] = NEO_F64_NAN;
+            if (out_lower != nullptr) out_lower[i] = NEO_F64_NAN;
+        }
         return;
     }
 
     const int warm = first_valid + period - 1;
-    for (int i = 0; i < len && i < warm; ++i) o[i] = NEO_F64_NAN;
+    for (int i = 0; i < len && i < warm; ++i) {
+        if (out_upper != nullptr) out_upper[i] = NEO_F64_NAN;
+        if (out_middle != nullptr) out_middle[i] = NEO_F64_NAN;
+        if (out_lower != nullptr) out_lower[i] = NEO_F64_NAN;
+    }
     if (warm >= len) return;
-
-    const double devup = NEO_BB_DEVUP;
-    const double devdn = NEO_BB_DEVDN;
-    (void)devdn;  // the lower band is not this matrix; kept so the constant
-                  // pair reads as the CPU's pair rather than half of it.
 
     const double inv_n = 1.0 / (double)period;
 
@@ -316,7 +314,9 @@ void bollinger_bands_neo_batch_f64(const double* __restrict__ data,
     const double var0 = (sum_sq * inv_n) - (mean * mean);
     const double std0 = sqrt(fmax(var0, 0.0));
 
-    o[warm] = mean + devup * std0;
+    if (out_upper != nullptr) out_upper[warm] = mean + devup * std0;
+    if (out_middle != nullptr) out_middle[warm] = mean;
+    if (out_lower != nullptr) out_lower[warm] = mean - devdn * std0;
 
     for (int i = warm + 1; i < len; ++i) {
         const double nv = data[i];
@@ -329,6 +329,60 @@ void bollinger_bands_neo_batch_f64(const double* __restrict__ data,
         const double var = (sum_sq * inv_n) - (m * m);
         const double sd = sqrt(fmax(var, 0.0));
 
-        o[i] = m + devup * sd;
+        if (out_upper != nullptr) out_upper[i] = m + devup * sd;
+        if (out_middle != nullptr) out_middle[i] = m;
+        if (out_lower != nullptr) out_lower[i] = m - devdn * sd;
     }
+}
+
+extern "C" __global__
+void bollinger_bands_neo_batch_f64(const double* __restrict__ data,
+                                   int series_len,
+                                   const int* __restrict__ periods,
+                                   int n_combos,
+                                   int first_valid,
+                                   double* __restrict__ out)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    double* __restrict__ out_upper = out + (size_t)combo * (size_t)len;
+    neo_bollinger_bands_row_f64(data,
+                                len,
+                                periods[combo],
+                                NEO_BB_DEVUP,
+                                NEO_BB_DEVDN,
+                                first_valid,
+                                out_upper,
+                                nullptr,
+                                nullptr);
+}
+
+extern "C" __global__
+void bollinger_bands_production_f64(const double* __restrict__ data,
+                                    int series_len,
+                                    const int* __restrict__ periods,
+                                    const double* __restrict__ devups,
+                                    const double* __restrict__ devdns,
+                                    int n_combos,
+                                    int first_valid,
+                                    double* __restrict__ out_upper,
+                                    double* __restrict__ out_middle,
+                                    double* __restrict__ out_lower)
+{
+    const int combo = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (combo >= n_combos) return;
+
+    const int len = series_len;
+    const size_t row_offset = (size_t)combo * (size_t)len;
+    neo_bollinger_bands_row_f64(data,
+                                len,
+                                periods[combo],
+                                devups[combo],
+                                devdns[combo],
+                                first_valid,
+                                out_upper + row_offset,
+                                out_middle + row_offset,
+                                out_lower + row_offset);
 }

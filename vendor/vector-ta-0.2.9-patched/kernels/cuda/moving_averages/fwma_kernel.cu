@@ -180,42 +180,294 @@ void fwma_many_series_one_param_f32(const float* __restrict__ prices_tm,
 
 
 // ---------------------------------------------------------------------------
-// f64 lane.
+// Strict f64 lane.
 //
-// CPU reference: `moving_averages/fwma.rs::fwma_scalar` (l.560), weights built
-// at `fwma.rs:331-341`:
-//     fib[0] = fib[1] = 1.0 ; fib[i] = fib[i-1] + fib[i-2]  for i in 2..period
-//     fib_sum = fib.iter().sum()          <- ASCENDING, left-associated
-//     fib[i] /= fib_sum                   <- a DIVIDE per weight, not a
-//                                            multiply by a reciprocal
-//     for i in (first + period - 1)..len:
-//         window = data[i+1-period ..= i]              (index 0 = OLDEST bar)
-//         sum accumulated in GROUPS OF FOUR:
-//             sum += d0*w0 + d1*w1 + d2*w2 + d3*w3
-//         then the remainder ONE AT A TIME: sum += d*w
-//         out[i] = sum
+// Semantic identity:
+// fwma-f64-v2-p254-u192-fib-pow2-dd-fma-window-recovery
 //
-// NO FMA. The CPU writes `d*w` and then `+`, so each tap is two roundings; an
-// `fma(d, w, sum)` would be one and a different number. The group of four is a
-// left-associated 4-term product sum added to `sum` in a SINGLE add — not four
-// adds — so the grouping is reproduced literally.
-//
-// The normalised weight table is built once per thread into a fixed local
-// array, which is why the compiled kernel carries a period bound and the host
-// refuses an oversized period by name.
-//
-// f32 -> f64 audit: pointers/locals widened; `0.0f`/`1.0f` widened;
-// `__int_as_float` NaN x3 -> the f64 quiet-NaN bit pattern; no fast-math
-// intrinsic survives; no epsilon (`fib_sum == 0.0` is an exact test on the CPU
-// and stays exact); no min/max chain.
+// The Fibonacci integers are generated exactly in three 64-bit limbs.  The
+// p<=254 bound keeps F_254 and its exact denominator within 192 bits.  Each
+// finite window is globally power-of-two scaled, then accumulated oldest to
+// newest with the same DD / TwoSum / FMA-product-tail schedule as the host.
+// Nonfinite or uncertifiable scale/quotient underflow fails closed to the
+// canonical quiet NaN.  Compile this lane with FTZ disabled and precise div.
 // ---------------------------------------------------------------------------
 
 #ifndef FWMA_MAX_PERIOD_F64
-#define FWMA_MAX_PERIOD_F64 512
+#define FWMA_MAX_PERIOD_F64 254
 #endif
+
+struct fwma_dd_f64_v2 {
+    double hi;
+    double lo;
+};
+
+struct fwma_u192_f64_v2 {
+    unsigned long long lo;
+    unsigned long long mid;
+    unsigned long long hi;
+};
 
 static __device__ __forceinline__ double fwma_qnan_f64() {
     return __longlong_as_double(0x7ff8000000000000ULL);
+}
+
+static __device__ __forceinline__ double fwma_canonical_zero_f64_v2(
+    double value)
+{
+    return value == 0.0 ? 0.0 : value;
+}
+
+static __device__ __forceinline__ fwma_dd_f64_v2 fwma_two_sum_f64_v2(
+    double a,
+    double b)
+{
+    const double hi = __dadd_rn(a, b);
+    const double b_virtual = __dsub_rn(hi, a);
+    const double lo = __dadd_rn(
+        __dsub_rn(a, __dsub_rn(hi, b_virtual)),
+        __dsub_rn(b, b_virtual));
+    return {hi, lo};
+}
+
+static __device__ __forceinline__ fwma_dd_f64_v2 fwma_dd_add_f64_v2(
+    fwma_dd_f64_v2 a,
+    fwma_dd_f64_v2 b)
+{
+    const fwma_dd_f64_v2 high = fwma_two_sum_f64_v2(a.hi, b.hi);
+    const fwma_dd_f64_v2 low = fwma_two_sum_f64_v2(a.lo, b.lo);
+    const fwma_dd_f64_v2 middle = fwma_two_sum_f64_v2(high.lo, low.hi);
+    const fwma_dd_f64_v2 normalized =
+        fwma_two_sum_f64_v2(high.hi, middle.hi);
+    const double tail = __dadd_rn(
+        __dadd_rn(normalized.lo, middle.lo),
+        low.lo);
+    return fwma_two_sum_f64_v2(normalized.hi, tail);
+}
+
+static __device__ __forceinline__ fwma_dd_f64_v2 fwma_dd_sub_f64_v2(
+    fwma_dd_f64_v2 a,
+    fwma_dd_f64_v2 b)
+{
+    b.hi = -b.hi;
+    b.lo = -b.lo;
+    return fwma_dd_add_f64_v2(a, b);
+}
+
+static __device__ __forceinline__ fwma_dd_f64_v2 fwma_dd_mul_f64_v2(
+    double value,
+    fwma_dd_f64_v2 weight)
+{
+    const double product = __dmul_rn(value, weight.hi);
+    const double product_tail = __fma_rn(value, weight.hi, -product);
+    return fwma_two_sum_f64_v2(
+        product,
+        __fma_rn(value, weight.lo, product_tail));
+}
+
+static __device__ __forceinline__ fwma_dd_f64_v2 fwma_dd_mul_scalar_f64_v2(
+    fwma_dd_f64_v2 value,
+    double scalar)
+{
+    const double product = __dmul_rn(value.hi, scalar);
+    const double product_tail = __fma_rn(value.hi, scalar, -product);
+    return fwma_two_sum_f64_v2(
+        product,
+        __fma_rn(value.lo, scalar, product_tail));
+}
+
+static __device__ __forceinline__ bool fwma_u192_add_f64_v2(
+    fwma_u192_f64_v2 a,
+    fwma_u192_f64_v2 b,
+    fwma_u192_f64_v2* out)
+{
+    const unsigned long long lo = a.lo + b.lo;
+    const bool carry0 = lo < a.lo;
+    const unsigned long long mid0 = a.mid + b.mid;
+    const bool carry1 = mid0 < a.mid;
+    const unsigned long long mid =
+        mid0 + static_cast<unsigned long long>(carry0);
+    const bool carry2 = mid < mid0;
+    const unsigned long long hi0 = a.hi + b.hi;
+    const bool carry3 = hi0 < a.hi;
+    const unsigned long long hi =
+        hi0 + static_cast<unsigned long long>(carry1 || carry2);
+    const bool carry4 = hi < hi0;
+    out->lo = lo;
+    out->mid = mid;
+    out->hi = hi;
+    return !(carry3 || carry4);
+}
+
+static __device__ __forceinline__ unsigned int fwma_u192_chunk_f64_v2(
+    fwma_u192_f64_v2 value,
+    int index)
+{
+    if (index == 0) return static_cast<unsigned int>(value.lo);
+    if (index == 1) return static_cast<unsigned int>(value.lo >> 32);
+    if (index == 2) return static_cast<unsigned int>(value.mid);
+    if (index == 3) return static_cast<unsigned int>(value.mid >> 32);
+    if (index == 4) return static_cast<unsigned int>(value.hi);
+    return static_cast<unsigned int>(value.hi >> 32);
+}
+
+static __device__ __forceinline__ fwma_dd_f64_v2 fwma_u192_to_dd_f64_v2(
+    fwma_u192_f64_v2 value)
+{
+    fwma_dd_f64_v2 result = {0.0, 0.0};
+    for (int index = 5; index >= 0; --index) {
+        result.hi = __dmul_rn(result.hi, 4294967296.0);
+        result.lo = __dmul_rn(result.lo, 4294967296.0);
+        const fwma_dd_f64_v2 chunk = {
+            __uint2double_rn(fwma_u192_chunk_f64_v2(value, index)),
+            0.0};
+        result = fwma_dd_add_f64_v2(result, chunk);
+    }
+    return result;
+}
+
+static __device__ __forceinline__ bool fwma_build_weights_f64_v2(
+    int period,
+    fwma_dd_f64_v2* weights,
+    fwma_dd_f64_v2* denominator_dd)
+{
+    const fwma_u192_f64_v2 zero = {0ULL, 0ULL, 0ULL};
+    const fwma_u192_f64_v2 one = {1ULL, 0ULL, 0ULL};
+    fwma_u192_f64_v2 previous = one;
+    fwma_u192_f64_v2 current = one;
+    fwma_u192_f64_v2 denominator = zero;
+    for (int index = 0; index < period; ++index) {
+        fwma_u192_f64_v2 weight = one;
+        if (index >= 2) {
+            if (!fwma_u192_add_f64_v2(previous, current, &weight)) return false;
+            previous = current;
+            current = weight;
+        }
+        if (!fwma_u192_add_f64_v2(denominator, weight, &denominator)) return false;
+        weights[index] = fwma_u192_to_dd_f64_v2(weight);
+    }
+    *denominator_dd = fwma_u192_to_dd_f64_v2(denominator);
+    return true;
+}
+
+static __device__ __forceinline__ bool fwma_unbiased_exponent_f64_v2(
+    double value,
+    int* exponent_out)
+{
+    const unsigned long long bits =
+        static_cast<unsigned long long>(__double_as_longlong(value))
+        & 0x7fffffffffffffffULL;
+    if (bits == 0ULL) return false;
+    const int exponent = static_cast<int>((bits >> 52) & 0x7ffULL);
+    if (exponent != 0) {
+        *exponent_out = exponent - 1023;
+    } else {
+        const unsigned long long fraction = bits & 0x000fffffffffffffULL;
+        const int highest = 63 - __clzll(fraction);
+        *exponent_out = highest - 1074;
+    }
+    return true;
+}
+
+static __device__ __forceinline__ double fwma_pow2_f64_v2(int exponent) {
+    return __longlong_as_double(
+        static_cast<unsigned long long>(exponent + 1023) << 52);
+}
+
+static __device__ __forceinline__ bool fwma_scale_pow2_checked_f64_v2(
+    double value,
+    int exponent,
+    double* result_out)
+{
+    while (exponent != 0) {
+        const int step =
+            exponent > 512 ? 512 : (exponent < -512 ? -512 : exponent);
+        const double scaled = __dmul_rn(value, fwma_pow2_f64_v2(step));
+        if (!isfinite(scaled) || (scaled == 0.0 && value != 0.0)) return false;
+        value = scaled;
+        exponent -= step;
+    }
+    *result_out = value;
+    return true;
+}
+
+static __device__ __forceinline__ bool fwma_compensated_quotient_f64_v2(
+    fwma_dd_f64_v2 numerator,
+    fwma_dd_f64_v2 denominator,
+    double* result_out)
+{
+    if (denominator.hi == 0.0
+        || !isfinite(denominator.hi)
+        || !isfinite(numerator.hi)) return false;
+    const double q0 = __ddiv_rn(numerator.hi, denominator.hi);
+    if (!isfinite(q0)) return false;
+    const fwma_dd_f64_v2 residual0 = fwma_dd_sub_f64_v2(
+        numerator,
+        fwma_dd_mul_scalar_f64_v2(denominator, q0));
+    const double q1 = __ddiv_rn(residual0.hi, denominator.hi);
+    const fwma_dd_f64_v2 residual1 = fwma_dd_sub_f64_v2(
+        residual0,
+        fwma_dd_mul_scalar_f64_v2(denominator, q1));
+    const double q2 = __ddiv_rn(residual1.hi, denominator.hi);
+    const fwma_dd_f64_v2 quotient = fwma_dd_add_f64_v2(
+        fwma_two_sum_f64_v2(q0, q1),
+        fwma_dd_f64_v2{q2, 0.0});
+    const double result = __dadd_rn(quotient.hi, quotient.lo);
+    if (!isfinite(result)
+        || (result == 0.0
+            && (numerator.hi != 0.0 || numerator.lo != 0.0))) return false;
+    *result_out = fwma_canonical_zero_f64_v2(result);
+    return true;
+}
+
+static __device__ __forceinline__ bool fwma_window_authority_f64_v2(
+    const double* prices,
+    int start,
+    int period,
+    const fwma_dd_f64_v2* weights,
+    fwma_dd_f64_v2 denominator,
+    double* result_out)
+{
+    if (period == 1) {
+        const double value = prices[start];
+        if (!isfinite(value)) return false;
+        *result_out = fwma_canonical_zero_f64_v2(value);
+        return true;
+    }
+
+    bool any_nonzero = false;
+    int maximum_exponent = -1075;
+    for (int index = 0; index < period; ++index) {
+        const double value = prices[start + index];
+        if (!isfinite(value)) return false;
+        int exponent = 0;
+        if (fwma_unbiased_exponent_f64_v2(value, &exponent)) {
+            any_nonzero = true;
+            if (exponent > maximum_exponent) maximum_exponent = exponent;
+        }
+    }
+    if (!any_nonzero) {
+        *result_out = 0.0;
+        return true;
+    }
+
+    fwma_dd_f64_v2 numerator = {0.0, 0.0};
+    for (int index = 0; index < period; ++index) {
+        double scaled = 0.0;
+        if (!fwma_scale_pow2_checked_f64_v2(
+                prices[start + index], -maximum_exponent, &scaled)) return false;
+        numerator = fwma_dd_add_f64_v2(
+            numerator,
+            fwma_dd_mul_f64_v2(scaled, weights[index]));
+    }
+    double scaled_result = 0.0;
+    if (!fwma_compensated_quotient_f64_v2(
+            numerator, denominator, &scaled_result)) return false;
+    double result = 0.0;
+    if (!fwma_scale_pow2_checked_f64_v2(
+            scaled_result, maximum_exponent, &result)) return false;
+    *result_out = fwma_canonical_zero_f64_v2(result);
+    return true;
 }
 
 extern "C" __global__
@@ -226,54 +478,56 @@ void fwma_batch_f64(const double* __restrict__ prices,
                     int first_valid,
                     double* __restrict__ out)
 {
-    const int combo = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ fwma_dd_f64_v2 weights[FWMA_MAX_PERIOD_F64];
+    __shared__ fwma_dd_f64_v2 denominator;
+    __shared__ int shared_period;
+    __shared__ int shared_warm;
+    __shared__ int shared_success;
+
+    const int combo = blockIdx.y;
+    if (threadIdx.x == 0) {
+        shared_period = 0;
+        shared_warm = 0;
+        shared_success = 0;
+        denominator = {0.0, 0.0};
+        if (combo < n_combos && n > 0) {
+            const int period = periods[combo];
+            const long long warm_ll =
+                static_cast<long long>(first_valid)
+                + static_cast<long long>(period)
+                - 1LL;
+            if (period > 0
+                && period <= FWMA_MAX_PERIOD_F64
+                && first_valid >= 0
+                && warm_ll >= 0
+                && warm_ll < n
+                && fwma_build_weights_f64_v2(period, weights, &denominator)) {
+                shared_period = period;
+                shared_warm = static_cast<int>(warm_ll);
+                shared_success = 1;
+            }
+        }
+    }
+    __syncthreads();
+
     if (combo >= n_combos || n <= 0) return;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= n) return;
 
-    const double nan_d = fwma_qnan_f64();
-    double* __restrict__ row = out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+    double* __restrict__ row =
+        out + static_cast<size_t>(combo) * static_cast<size_t>(n);
+    row[index] = fwma_qnan_f64();
+    if (!shared_success || index < shared_warm) return;
 
-    const int period = periods[combo];
-    const long long warm_ll =
-        static_cast<long long>(first_valid) + static_cast<long long>(period) - 1;
-    if (period <= 0 || period > FWMA_MAX_PERIOD_F64 || warm_ll >= n) {
-        for (int t = 0; t < n; ++t) row[t] = nan_d;
-        return;
-    }
-    const int warm = static_cast<int>(warm_ll);
-
-    double fib[FWMA_MAX_PERIOD_F64];
-    for (int k = 0; k < period; ++k) {
-        fib[k] = (k < 2) ? 1.0 : (fib[k - 1] + fib[k - 2]);
-    }
-    double fib_sum = 0.0;
-    for (int k = 0; k < period; ++k) fib_sum += fib[k];
-    if (fib_sum == 0.0) {
-        for (int t = 0; t < n; ++t) row[t] = nan_d;
-        return;
-    }
-    for (int k = 0; k < period; ++k) fib[k] /= fib_sum;
-
-    for (int t = 0; t < warm; ++t) row[t] = nan_d;
-
-    const int p4 = period & ~3;
-
-    for (int i = warm; i < n; ++i) {
-        const int start = i + 1 - period;
-        double sum = 0.0;
-
-        int k = 0;
-        while (k < p4) {
-            sum += prices[start + k + 0] * fib[k + 0]
-                 + prices[start + k + 1] * fib[k + 1]
-                 + prices[start + k + 2] * fib[k + 2]
-                 + prices[start + k + 3] * fib[k + 3];
-            k += 4;
-        }
-        while (k < period) {
-            sum += prices[start + k] * fib[k];
-            ++k;
-        }
-
-        row[i] = sum;
+    const int start = index + 1 - shared_period;
+    double value = 0.0;
+    if (fwma_window_authority_f64_v2(
+            prices,
+            start,
+            shared_period,
+            weights,
+            denominator,
+            &value)) {
+        row[index] = value;
     }
 }

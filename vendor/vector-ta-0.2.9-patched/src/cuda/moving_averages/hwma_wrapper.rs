@@ -1,18 +1,18 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 use crate::indicators::moving_averages::hwma::{HwmaBatchRange, HwmaParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, GridSize};
-use cust::memory::{mem_get_info, DeviceBuffer, LockedBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{DeviceBuffer, LockedBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::env;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -23,7 +23,9 @@ pub enum CudaHwmaError {
     InvalidInput(String),
     #[error("Invalid policy: {0}")]
     InvalidPolicy(&'static str),
-    #[error("Out of memory on device (required={required} bytes, free={free} bytes, headroom={headroom} bytes)")]
+    #[error(
+        "Out of memory on device (required={required} bytes, free={free} bytes, headroom={headroom} bytes)"
+    )]
     OutOfMemory {
         required: usize,
         free: usize,
@@ -100,12 +102,6 @@ impl CudaHwma {
         let context = Context::new(device)?;
         let context = Arc::new(context);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/hwma_kernel.ptx"));
-
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("hwma_kernel")?;
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 

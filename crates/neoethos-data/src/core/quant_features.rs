@@ -3,14 +3,19 @@
 /// Institutional-grade statistical features for regime detection,
 /// market microstructure analysis, and alpha generation.
 use super::super::Ohlcv;
-use super::timestamps::{infer_timestamp_unit, timestamp_to_millis};
+use super::features::{FeatureCellValidity, FeatureColumnF64};
+use super::timestamps::{
+    infer_timestamp_unit, timestamp_to_millis, validate_canonical_millisecond_timestamps,
+};
+use anyhow::{Result, ensure};
+use std::collections::HashMap;
 
 /// Bars per trading day, derived from the actual timestamp spacing (audit
 /// D04). The "previous day / previous week" levels used a hardcoded 24 / 120
 /// bars — correct ONLY on H1 (24×H1 = 1 day). On M1 that "day" was 24
 /// minutes, on M5 two hours, on D1 twenty-four days — so the feature meant
 /// something different on every timeframe. Deriving the count from the median
-/// bar period (unit-agnostic, like the resample/alignment fixes) makes
+/// bar period (unit-agnostic, like the alignment fixes) makes
 /// "previous day" actually one day on ANY timeframe. Falls back to 24 (the
 /// old H1 assumption) only when timestamps are missing/degenerate.
 fn bars_per_day(ohlcv: &Ohlcv, n: usize) -> usize {
@@ -25,7 +30,11 @@ fn bars_per_day(ohlcv: &Ohlcv, n: usize) -> usize {
         return FALLBACK_H1_BARS_PER_DAY;
     };
     // Median positive spacing = the bar period, in native units.
-    let mut steps: Vec<i64> = ts.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0).collect();
+    let mut steps: Vec<i64> = ts
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|d| *d > 0)
+        .collect();
     if steps.is_empty() {
         return FALLBACK_H1_BARS_PER_DAY;
     }
@@ -64,6 +73,10 @@ pub fn compute_quant_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
 
     let mut cols: Vec<(String, Vec<f64>)> = Vec::new();
 
+    // Canonical raw close input for stateful price models. Keeping it in the
+    // shared plan avoids adapter-specific OHLC aliases and hidden reloads.
+    cols.push(("quant_close".to_string(), close.clone()));
+
     // ==========================================
     // 1. Returns at multiple horizons
     // ==========================================
@@ -87,6 +100,18 @@ pub fn compute_quant_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         }
     }
     cols.push(("quant_log_return".to_string(), log_ret.clone()));
+
+    // Instantaneous log range used by the HMM regime model. Keep this in the
+    // shared feature plan so training and inference consume exactly one
+    // validity-aware implementation rather than recomputing OHLC privately.
+    let mut log_volatility = vec![0.0; n];
+    for i in 0..n {
+        let range = high[i] - low[i];
+        if range > 1e-10 {
+            log_volatility[i] = range.ln();
+        }
+    }
+    cols.push(("quant_log_volatility".to_string(), log_volatility));
 
     // ==========================================
     // 3. Realized Volatility (multiple windows)
@@ -787,13 +812,489 @@ pub fn compute_quant_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
     cols
 }
 
+fn quant_validity_mut<'a>(
+    validity_by_name: &'a mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+) -> Result<&'a mut Vec<FeatureCellValidity>> {
+    validity_by_name
+        .get_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("missing quantitative validity plan for `{name}`"))
+}
+
+fn quant_mark_after_warmup(
+    validity_by_name: &mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+    warmup: usize,
+) -> Result<()> {
+    let validity = quant_validity_mut(validity_by_name, name)?;
+    validity.fill(FeatureCellValidity::Valid);
+    let warmup = warmup.min(validity.len());
+    validity[..warmup].fill(FeatureCellValidity::Warmup);
+    Ok(())
+}
+
+fn quant_mark_all(
+    validity_by_name: &mut HashMap<String, Vec<FeatureCellValidity>>,
+    name: &str,
+    reason: FeatureCellValidity,
+) -> Result<()> {
+    quant_validity_mut(validity_by_name, name)?.fill(reason);
+    Ok(())
+}
+
+/// Explicit-validity f64 quantitative lane used by the atomic Tasks 5B-9
+/// migration.
+///
+/// The legacy value producer remains temporarily so value parity can be
+/// measured while the shared `FeatureFrame` is migrated. This boundary
+/// replays every formula's information requirements and never exposes its
+/// numeric warmup/default sentinels as observations. Outputs whose current
+/// formula silently assumes a bar annualization, broker trading session, or
+/// timeframe are marked missing until that typed contract reaches the
+/// producer; guessing those semantics would make a fast but false feature.
+pub fn compute_quant_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureColumnF64>> {
+    const EPS: f64 = 1e-12;
+
+    let n = ohlcv.len();
+    ensure!(n > 0, "quantitative features require at least one OHLC row");
+    ensure!(
+        ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
+        "quantitative OHLC lengths do not match close length {n}"
+    );
+    for row in 0..n {
+        let open = ohlcv.open[row];
+        let high = ohlcv.high[row];
+        let low = ohlcv.low[row];
+        let close = ohlcv.close[row];
+        ensure!(
+            open.is_finite() && high.is_finite() && low.is_finite() && close.is_finite(),
+            "quantitative OHLC row {row} contains a non-finite price"
+        );
+        ensure!(
+            open > 0.0 && high > 0.0 && low > 0.0 && close > 0.0,
+            "quantitative OHLC row {row} contains a non-positive price"
+        );
+        ensure!(
+            low <= open.min(close) && high >= open.max(close),
+            "quantitative OHLC row {row} violates low <= open/close <= high"
+        );
+    }
+
+    if let Some(timestamps) = ohlcv.timestamp.as_deref() {
+        ensure!(
+            timestamps.len() == n,
+            "quantitative timestamp length {} does not match OHLC length {n}",
+            timestamps.len()
+        );
+        validate_canonical_millisecond_timestamps(timestamps)?;
+    }
+
+    let volume = if let Some(volume) = ohlcv.volume.as_deref() {
+        ensure!(
+            volume.len() == n,
+            "quantitative volume length {} does not match OHLC length {n}",
+            volume.len()
+        );
+        if let Some((row, value)) = volume
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            anyhow::bail!("quantitative volume row {row} is invalid: {value}");
+        }
+        Some(volume)
+    } else {
+        None
+    };
+
+    // The legacy function conditionally omits volume-derived columns. Supply
+    // zeroes only to enumerate the stable schema; every such payload is
+    // replaced with canonical NaN below when real volume is absent.
+    let mut value_input = ohlcv.clone();
+    if volume.is_none() {
+        value_input.volume = Some(vec![0.0; n]);
+    }
+    let legacy = compute_quant_feature_columns(&value_input);
+    let mut validity_by_name: HashMap<String, Vec<FeatureCellValidity>> = legacy
+        .iter()
+        .map(|(name, _)| (name.clone(), vec![FeatureCellValidity::ComputeFailure; n]))
+        .collect();
+
+    let mut log_returns = vec![0.0; n];
+    for row in 1..n {
+        log_returns[row] = (ohlcv.close[row] / ohlcv.close[row - 1]).ln();
+    }
+
+    quant_mark_after_warmup(&mut validity_by_name, "quant_close", 0)?;
+    for lag in [1_usize, 2, 3, 5, 8, 13, 21] {
+        quant_mark_after_warmup(&mut validity_by_name, &format!("quant_return_{lag}"), lag)?;
+    }
+    quant_mark_after_warmup(&mut validity_by_name, "quant_log_return", 1)?;
+    quant_mark_after_warmup(&mut validity_by_name, "quant_log_volatility", 0)?;
+    for row in 0..n {
+        if ohlcv.high[row] - ohlcv.low[row] <= EPS {
+            quant_validity_mut(&mut validity_by_name, "quant_log_volatility")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    // The existing values multiply every bar-frequency estimate by sqrt(252),
+    // even when the source is intraday. Without the typed timeframe and
+    // annualization convention these are not comparable observations.
+    for name in [
+        "quant_realized_vol_5",
+        "quant_realized_vol_10",
+        "quant_realized_vol_20",
+        "quant_realized_vol_50",
+        "quant_gk_vol_10",
+        "quant_gk_vol_20",
+        "quant_parkinson_vol_10",
+        "quant_parkinson_vol_20",
+    ] {
+        quant_mark_all(
+            &mut validity_by_name,
+            name,
+            FeatureCellValidity::MissingInput,
+        )?;
+    }
+
+    quant_mark_after_warmup(&mut validity_by_name, "quant_vol_ratio", 20)?;
+    for row in 20..n {
+        let long_sq: f64 = log_returns[(row - 19)..=row]
+            .iter()
+            .map(|value| value * value)
+            .sum();
+        if long_sq <= EPS {
+            quant_validity_mut(&mut validity_by_name, "quant_vol_ratio")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    quant_mark_after_warmup(&mut validity_by_name, "quant_hurst_100", 100)?;
+    for row in 100..n {
+        let slice = &log_returns[(row - 99)..=row];
+        let mean = slice.iter().sum::<f64>() / 100.0;
+        let mut running = 0.0;
+        let mut minimum = f64::INFINITY;
+        let mut maximum = f64::NEG_INFINITY;
+        for value in slice {
+            running += value - mean;
+            minimum = minimum.min(running);
+            maximum = maximum.max(running);
+        }
+        let variance = slice
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / 99.0;
+        if variance.sqrt() <= EPS || maximum - minimum <= EPS {
+            quant_validity_mut(&mut validity_by_name, "quant_hurst_100")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    for lag in [1_usize, 5, 10] {
+        let name = format!("quant_autocorr_{lag}");
+        quant_mark_after_warmup(&mut validity_by_name, &name, 50 + lag)?;
+        for row in (50 + lag)..n {
+            let slice = &log_returns[(row - 49)..=row];
+            let mean = slice.iter().sum::<f64>() / 50.0;
+            let denominator: f64 = (lag..50).map(|offset| (slice[offset] - mean).powi(2)).sum();
+            if denominator <= EPS {
+                quant_validity_mut(&mut validity_by_name, &name)?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    }
+
+    for window in [10_usize, 20] {
+        let name = format!("quant_efficiency_ratio_{window}");
+        quant_mark_after_warmup(&mut validity_by_name, &name, window)?;
+        for row in window..n {
+            let volatility: f64 = ((row - window + 1)..=row)
+                .map(|index| (ohlcv.close[index] - ohlcv.close[index - 1]).abs())
+                .sum();
+            if volatility <= EPS {
+                quant_validity_mut(&mut validity_by_name, &name)?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    }
+
+    for name in ["quant_skewness_30", "quant_kurtosis_30"] {
+        quant_mark_after_warmup(&mut validity_by_name, name, 30)?;
+    }
+    for row in 30..n {
+        let slice = &log_returns[(row - 29)..=row];
+        let mean = slice.iter().sum::<f64>() / 30.0;
+        let variance = slice
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / 30.0;
+        if variance.sqrt() <= EPS {
+            for name in ["quant_skewness_30", "quant_kurtosis_30"] {
+                quant_validity_mut(&mut validity_by_name, name)?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    }
+
+    if let Some(volume) = volume {
+        quant_mark_after_warmup(&mut validity_by_name, "quant_kyle_lambda", 20)?;
+        for row in 20..n {
+            let denominator: f64 = ((row - 19)..=row)
+                .map(|index| {
+                    let delta = ohlcv.close[index] - ohlcv.close[index - 1];
+                    let direction = if delta > 0.0 {
+                        1.0
+                    } else if delta < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    (direction * volume[index]).powi(2)
+                })
+                .sum();
+            if denominator <= EPS {
+                quant_validity_mut(&mut validity_by_name, "quant_kyle_lambda")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+
+        quant_mark_after_warmup(&mut validity_by_name, "quant_vpin", 500)?;
+        for row in 500..n {
+            let total_volume: f64 = volume[(row - 500)..row].iter().sum();
+            if total_volume <= EPS {
+                quant_validity_mut(&mut validity_by_name, "quant_vpin")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+
+        quant_mark_after_warmup(&mut validity_by_name, "quant_amihud_illiquidity", 20)?;
+        for row in 20..n {
+            if volume[(row - 19)..=row].iter().all(|value| *value <= EPS) {
+                quant_validity_mut(&mut validity_by_name, "quant_amihud_illiquidity")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    } else {
+        for name in [
+            "quant_kyle_lambda",
+            "quant_vpin",
+            "quant_amihud_illiquidity",
+        ] {
+            quant_mark_all(
+                &mut validity_by_name,
+                name,
+                FeatureCellValidity::MissingInput,
+            )?;
+        }
+    }
+
+    quant_mark_after_warmup(&mut validity_by_name, "quant_roll_spread", 21)?;
+    for name in ["quant_consec_up", "quant_consec_down"] {
+        quant_mark_after_warmup(&mut validity_by_name, name, 1)?;
+    }
+    for name in ["quant_inside_bar", "quant_outside_bar"] {
+        quant_mark_after_warmup(&mut validity_by_name, name, 1)?;
+    }
+    for name in [
+        "quant_body_ratio",
+        "quant_upper_shadow",
+        "quant_lower_shadow",
+    ] {
+        quant_mark_after_warmup(&mut validity_by_name, name, 0)?;
+    }
+    for row in 0..n {
+        if ohlcv.high[row] - ohlcv.low[row] <= EPS {
+            for name in [
+                "quant_body_ratio",
+                "quant_upper_shadow",
+                "quant_lower_shadow",
+            ] {
+                quant_validity_mut(&mut validity_by_name, name)?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    }
+
+    // These columns currently infer a rolling "day" or pretend the last N
+    // bars are an opening range. Ohlcv does not carry the broker-session and
+    // source-timeframe contract required to make those identities true.
+    for name in [
+        "quant_prev_day_h_dist",
+        "quant_prev_day_l_dist",
+        "quant_prev_week_h_dist",
+        "quant_prev_week_l_dist",
+        "quant_orb_4",
+        "quant_orb_8",
+        "quant_orb_12",
+        "quant_pivot_dist",
+        "quant_r1_dist",
+        "quant_r2_dist",
+        "quant_s1_dist",
+        "quant_s2_dist",
+        "quant_cam_r3_dist",
+        "quant_cam_s3_dist",
+    ] {
+        quant_mark_all(
+            &mut validity_by_name,
+            name,
+            FeatureCellValidity::MissingInput,
+        )?;
+    }
+
+    quant_mark_after_warmup(&mut validity_by_name, "quant_amd_phase", 20)?;
+    for row in 20..n {
+        let average_range: f64 = ((row - 20)..row)
+            .map(|index| ohlcv.high[index] - ohlcv.low[index])
+            .sum::<f64>()
+            / 20.0;
+        if average_range <= EPS {
+            quant_validity_mut(&mut validity_by_name, "quant_amd_phase")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+    quant_mark_after_warmup(&mut validity_by_name, "quant_wyckoff", 30)?;
+
+    if volume.is_some() {
+        quant_mark_after_warmup(&mut validity_by_name, "quant_engulfing_vol", 1)?;
+    } else {
+        quant_mark_all(
+            &mut validity_by_name,
+            "quant_engulfing_vol",
+            FeatureCellValidity::MissingInput,
+        )?;
+    }
+
+    for window in [20_usize, 50] {
+        let name = format!("quant_zscore_{window}");
+        quant_mark_after_warmup(&mut validity_by_name, &name, window)?;
+        for row in window..n {
+            let slice = &ohlcv.close[(row - window)..row];
+            let mean = slice.iter().sum::<f64>() / window as f64;
+            let variance = slice
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / (window as f64 - 1.0);
+            if variance.sqrt() <= EPS {
+                quant_validity_mut(&mut validity_by_name, &name)?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    }
+
+    quant_mark_after_warmup(&mut validity_by_name, "quant_fractal_dim", 30)?;
+    for row in 30..n {
+        let slice = &ohlcv.close[(row - 30)..=row];
+        let minimum = slice.iter().copied().fold(f64::INFINITY, f64::min);
+        let maximum = slice.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if maximum - minimum <= EPS {
+            quant_validity_mut(&mut validity_by_name, "quant_fractal_dim")?[row] =
+                FeatureCellValidity::ZeroDenominator;
+        }
+    }
+
+    if let Some(volume) = volume {
+        for window in [10_usize, 20, 50] {
+            let name = format!("quant_rvol_{window}");
+            quant_mark_after_warmup(&mut validity_by_name, &name, window)?;
+            for row in window..n {
+                let average = volume[(row - window)..row].iter().sum::<f64>() / window as f64;
+                if average <= EPS {
+                    quant_validity_mut(&mut validity_by_name, &name)?[row] =
+                        FeatureCellValidity::ZeroDenominator;
+                }
+            }
+        }
+
+        quant_mark_after_warmup(&mut validity_by_name, "quant_delta_volume", 0)?;
+        let mut delta_validity = vec![FeatureCellValidity::Valid; n];
+        let mut cumulative_delta = vec![0.0; n];
+        let mut cumulative = 0.0;
+        for row in 0..n {
+            let range = ohlcv.high[row] - ohlcv.low[row];
+            if range <= EPS {
+                delta_validity[row] = FeatureCellValidity::ZeroDenominator;
+                quant_validity_mut(&mut validity_by_name, "quant_delta_volume")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            } else {
+                let buy_fraction = (ohlcv.close[row] - ohlcv.low[row]) / range;
+                cumulative += volume[row] * (2.0 * buy_fraction - 1.0);
+            }
+            cumulative_delta[row] = cumulative;
+        }
+
+        quant_mark_after_warmup(&mut validity_by_name, "quant_cum_delta_zscore", 50)?;
+        for row in 50..n {
+            if delta_validity[..=row]
+                .iter()
+                .any(|validity| !validity.is_valid())
+            {
+                quant_validity_mut(&mut validity_by_name, "quant_cum_delta_zscore")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+                continue;
+            }
+            let slice = &cumulative_delta[(row - 50)..row];
+            let mean = slice.iter().sum::<f64>() / 50.0;
+            let variance = slice
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / 49.0;
+            if variance.sqrt() <= EPS {
+                quant_validity_mut(&mut validity_by_name, "quant_cum_delta_zscore")?[row] =
+                    FeatureCellValidity::ZeroDenominator;
+            }
+        }
+    } else {
+        for name in [
+            "quant_rvol_10",
+            "quant_rvol_20",
+            "quant_rvol_50",
+            "quant_delta_volume",
+            "quant_cum_delta_zscore",
+        ] {
+            quant_mark_all(
+                &mut validity_by_name,
+                name,
+                FeatureCellValidity::MissingInput,
+            )?;
+        }
+    }
+
+    if let Some((name, row)) = validity_by_name.iter().find_map(|(name, validity)| {
+        validity
+            .iter()
+            .position(|reason| *reason == FeatureCellValidity::ComputeFailure)
+            .map(|row| (name.clone(), row))
+    }) {
+        anyhow::bail!("unclassified quantitative validity for `{name}` row {row}");
+    }
+
+    legacy
+        .into_iter()
+        .map(|(name, values)| {
+            let validity = validity_by_name
+                .remove(&name)
+                .ok_or_else(|| anyhow::anyhow!("missing quantitative validity for `{name}`"))?;
+            FeatureColumnF64::new(name, values, validity)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod d04_tests {
     use super::*;
     use crate::Ohlcv;
 
     fn ohlcv_with_step(step_ms: i64, n: usize) -> Ohlcv {
-        let ts: Vec<i64> = (0..n as i64).map(|i| 1_700_000_000_000 + i * step_ms).collect();
+        let ts: Vec<i64> = (0..n as i64)
+            .map(|i| 1_700_000_000_000 + i * step_ms)
+            .collect();
         Ohlcv {
             timestamp: Some(ts),
             open: vec![1.0; n],
@@ -844,7 +1345,11 @@ mod d04_tests {
     fn bars_per_day_falls_back_without_timestamps() {
         let mut o = ohlcv_with_step(300_000, 100);
         o.timestamp = None;
-        assert_eq!(bars_per_day(&o, 100), 24, "no timestamps → legacy H1 assumption");
+        assert_eq!(
+            bars_per_day(&o, 100),
+            24,
+            "no timestamps → legacy H1 assumption"
+        );
     }
 
     #[test]

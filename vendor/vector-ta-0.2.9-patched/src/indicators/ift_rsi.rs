@@ -1,24 +1,6 @@
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::PyDict;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::indicators::rsi::{rsi, RsiError, RsiInput, RsiParams};
-use crate::indicators::wma::{wma, WmaError, WmaInput, WmaParams};
-use crate::utilities::data_loader::{source_type, Candles};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::DeviceArrayF32Py;
+use crate::indicators::rsi::{RsiError, RsiInput, RsiParams, rsi};
+use crate::indicators::wma::{WmaError, WmaInput, WmaParams, wma};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -69,10 +51,6 @@ pub struct IftRsiOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct IftRsiParams {
     pub rsi_period: Option<usize>,
     pub wma_period: Option<usize>,
@@ -199,7 +177,9 @@ pub enum IftRsiError {
     EmptyData,
     #[error("ift_rsi: All values are NaN.")]
     AllValuesNaN,
-    #[error("ift_rsi: Invalid RSI period {rsi_period} or WMA period {wma_period}, data length = {data_len}.")]
+    #[error(
+        "ift_rsi: Invalid RSI period {rsi_period} or WMA period {wma_period}, data length = {data_len}."
+    )]
     InvalidPeriod {
         rsi_period: usize,
         wma_period: usize,
@@ -286,7 +266,6 @@ pub fn ift_rsi_with_kernel(
     Ok(IftRsiOutput { values: out })
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn ift_rsi_into(input: &IftRsiInput, out: &mut [f64]) -> Result<(), IftRsiError> {
     let data: &[f64] = input.as_ref();
@@ -1508,43 +1487,16 @@ pub unsafe fn ift_rsi_scalar_classic(
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ift_rsi_output_into_js(
-    data: &[f64],
-    rsi_period: usize,
-    wma_period: usize,
-    out: &js_sys::Float64Array,
-) -> Result<usize, JsValue> {
-    let values = ift_rsi_js(data, rsi_period, wma_period)?;
-    crate::write_wasm_f64_output("ift_rsi_output_into_js", &values, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ift_rsi_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = ift_rsi_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "ift_rsi_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     fn check_ift_rsi_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = IftRsiParams {
             rsi_period: None,
             wma_period: None,
@@ -1587,8 +1539,8 @@ mod tests {
 
     fn check_ift_rsi_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = IftRsiInput::from_candles(&candles, "close", IftRsiParams::default());
         let result = ift_rsi_with_kernel(&input, kernel)?;
 
@@ -1620,8 +1572,8 @@ mod tests {
         kernel: Kernel,
     ) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = IftRsiInput::with_default_candles(&candles);
         let output = ift_rsi_with_kernel(&input, kernel)?;
         assert_eq!(output.values.len(), candles.close.len());
@@ -1687,8 +1639,8 @@ mod tests {
 
     fn check_ift_rsi_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = IftRsiParams {
             rsi_period: Some(5),
             wma_period: Some(9),
@@ -1707,8 +1659,8 @@ mod tests {
 
     fn check_ift_rsi_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = IftRsiInput::from_candles(
             &candles,
             "close",
@@ -1736,8 +1688,8 @@ mod tests {
     fn check_ift_rsi_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             IftRsiParams::default(),
@@ -2099,8 +2051,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = IftRsiBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2114,8 +2066,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             (2, 10, 2, 2, 10, 2),
@@ -2226,371 +2178,4 @@ mod tests {
     }
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ift_rsi")]
-#[pyo3(signature = (data, rsi_period, wma_period, kernel=None))]
-pub fn ift_rsi_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    rsi_period: usize,
-    wma_period: usize,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let params = IftRsiParams {
-        rsi_period: Some(rsi_period),
-        wma_period: Some(wma_period),
-    };
-    let input = IftRsiInput::from_slice(slice_in, params);
-
-    let result_vec: Vec<f64> = py
-        .allow_threads(|| ift_rsi_with_kernel(&input, kern).map(|o| o.values))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    Ok(result_vec.into_pyarray(py))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "IftRsiStream")]
-pub struct IftRsiStreamPy {
-    stream: IftRsiStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl IftRsiStreamPy {
-    #[new]
-    fn new(rsi_period: usize, wma_period: usize) -> PyResult<Self> {
-        let params = IftRsiParams {
-            rsi_period: Some(rsi_period),
-            wma_period: Some(wma_period),
-        };
-        let stream =
-            IftRsiStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(IftRsiStreamPy { stream })
-    }
-
-    fn update(&mut self, value: f64) -> Option<f64> {
-        self.stream.update(value)
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "ift_rsi_batch")]
-#[pyo3(signature = (data, rsi_period_range, wma_period_range, kernel=None))]
-pub fn ift_rsi_batch_py<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray1<'py, f64>,
-    rsi_period_range: (usize, usize, usize),
-    wma_period_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    use numpy::{IntoPyArray, PyArray1, PyArrayMethods};
-    use pyo3::types::PyDict;
-
-    let slice_in = data.as_slice()?;
-    let kern = validate_kernel(kernel, true)?;
-
-    let sweep = IftRsiBatchRange {
-        rsi_period: rsi_period_range,
-        wma_period: wma_period_range,
-    };
-
-    let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let rows = combos.len();
-    let cols = slice_in.len();
-
-    let out_arr = unsafe { PyArray1::<f64>::new(py, [rows * cols], false) };
-    let slice_out = unsafe { out_arr.as_slice_mut()? };
-
-    let combos = py
-        .allow_threads(|| {
-            let kernel = match kern {
-                Kernel::Auto => detect_best_batch_kernel(),
-                k => k,
-            };
-            let simd = match kernel {
-                Kernel::Avx512Batch => Kernel::Avx512,
-                Kernel::Avx2Batch => Kernel::Avx2,
-                Kernel::ScalarBatch => Kernel::Scalar,
-                _ => unreachable!(),
-            };
-            ift_rsi_batch_inner_into(slice_in, &sweep, simd, true, slice_out)
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("values", out_arr.reshape((rows, cols))?)?;
-    dict.set_item(
-        "rsi_periods",
-        combos
-            .iter()
-            .map(|p| p.rsi_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "wma_periods",
-        combos
-            .iter()
-            .map(|p| p.wma_period.unwrap() as u64)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ift_rsi_cuda_batch_dev")]
-#[pyo3(signature = (data_f32, rsi_range, wma_range, device_id=0))]
-pub fn ift_rsi_cuda_batch_dev_py(
-    py: Python<'_>,
-    data_f32: numpy::PyReadonlyArray1<'_, f32>,
-    rsi_range: (usize, usize, usize),
-    wma_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::CudaIftRsi;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let slice_in: &[f32] = data_f32.as_slice()?;
-    let sweep = IftRsiBatchRange {
-        rsi_period: rsi_range,
-        wma_period: wma_range,
-    };
-    let (inner, dev_id, ctx) = py.allow_threads(|| {
-        let cuda = CudaIftRsi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let ctx = cuda.context_arc();
-        let (dev, _combos) = cuda
-            .ift_rsi_batch_dev(slice_in, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.synchronize()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((dev, dev_id, ctx))
-    })?;
-    let handle = DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    };
-    Ok(handle)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "ift_rsi_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, rsi_period, wma_period, device_id=0))]
-pub fn ift_rsi_cuda_many_series_one_param_dev_py(
-    py: Python<'_>,
-    data_tm_f32: numpy::PyReadonlyArray2<'_, f32>,
-    rsi_period: usize,
-    wma_period: usize,
-    device_id: usize,
-) -> PyResult<DeviceArrayF32Py> {
-    use crate::cuda::cuda_available;
-    use crate::cuda::oscillators::CudaIftRsi;
-    use numpy::PyUntypedArrayMethods;
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-    let flat_in: &[f32] = data_tm_f32.as_slice()?;
-    let rows = data_tm_f32.shape()[0];
-    let cols = data_tm_f32.shape()[1];
-    let params = IftRsiParams {
-        rsi_period: Some(rsi_period),
-        wma_period: Some(wma_period),
-    };
-    let (inner, dev_id, ctx) = py.allow_threads(|| {
-        let cuda = CudaIftRsi::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let dev_id = cuda.device_id();
-        let ctx = cuda.context_arc();
-        let dev = cuda
-            .ift_rsi_many_series_one_param_time_major_dev(flat_in, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        cuda.synchronize()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, PyErr>((dev, dev_id, ctx))
-    })?;
-    let handle = DeviceArrayF32Py {
-        inner,
-        _ctx: Some(ctx),
-        device_id: Some(dev_id),
-    };
-    Ok(handle)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ift_rsi_js(data: &[f64], rsi_period: usize, wma_period: usize) -> Result<Vec<f64>, JsValue> {
-    let params = IftRsiParams {
-        rsi_period: Some(rsi_period),
-        wma_period: Some(wma_period),
-    };
-    let input = IftRsiInput::from_slice(data, params);
-
-    let mut output = vec![0.0; data.len()];
-
-    let kernel = Kernel::Scalar;
-
-    ift_rsi_into_slice(&mut output, &input, kernel)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(output)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ift_rsi_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    rsi_period: usize,
-    wma_period: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to ift_rsi_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let params = IftRsiParams {
-            rsi_period: Some(rsi_period),
-            wma_period: Some(wma_period),
-        };
-        let input = IftRsiInput::from_slice(data, params);
-
-        let kernel = Kernel::Scalar;
-
-        if in_ptr == out_ptr as *const f64 {
-            let mut temp = vec![0.0; len];
-            ift_rsi_into_slice(&mut temp, &input, kernel)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            out.copy_from_slice(&temp);
-        } else {
-            let out = std::slice::from_raw_parts_mut(out_ptr, len);
-            ift_rsi_into_slice(out, &input, kernel)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ift_rsi_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ift_rsi_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct IftRsiBatchConfig {
-    pub rsi_period_range: (usize, usize, usize),
-    pub wma_period_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct IftRsiBatchJsOutput {
-    pub values: Vec<f64>,
-    pub combos: Vec<IftRsiParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = ift_rsi_batch)]
-pub fn ift_rsi_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: IftRsiBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-
-    let sweep = IftRsiBatchRange {
-        rsi_period: config.rsi_period_range,
-        wma_period: config.wma_period_range,
-    };
-
-    #[cfg(target_arch = "wasm32")]
-    let kernel = detect_best_kernel();
-    #[cfg(not(target_arch = "wasm32"))]
-    let kernel = Kernel::Scalar;
-
-    let output = ift_rsi_batch_inner(data, &sweep, kernel, false)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let js_output = IftRsiBatchJsOutput {
-        values: output.values,
-        combos: output.combos,
-        rows: output.rows,
-        cols: output.cols,
-    };
-
-    serde_wasm_bindgen::to_value(&js_output)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn ift_rsi_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    rsi_start: usize,
-    rsi_end: usize,
-    rsi_step: usize,
-    wma_start: usize,
-    wma_end: usize,
-    wma_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str(
-            "null pointer passed to ift_rsi_batch_into",
-        ));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-        let sweep = IftRsiBatchRange {
-            rsi_period: (rsi_start, rsi_end, rsi_step),
-            wma_period: (wma_start, wma_end, wma_step),
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let out = std::slice::from_raw_parts_mut(out_ptr, rows * cols);
-
-        #[cfg(target_arch = "wasm32")]
-        let kernel = detect_best_kernel();
-        #[cfg(not(target_arch = "wasm32"))]
-        let kernel = Kernel::Scalar;
-
-        ift_rsi_batch_inner_into(data, &sweep, kernel, false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
 }

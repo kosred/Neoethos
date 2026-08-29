@@ -10,7 +10,7 @@
 //!
 //! **That number is VOID.** It was produced by the pre-2026-08-09 f32
 //! `pearson_correlation`, which returned exactly `0.0` whenever its denominator
-//! was non-finite, meeting `core::features::align_features_by_ns`, which
+//! was invalid, meeting `core::features::align_feature_columns_by_ms`, which
 //! initialises every aligned higher-timeframe cell to `NaN` by construction.
 //! One NaN anywhere in a column made the whole column score exactly `0.0`, the
 //! stable sort broke the resulting mass tie by original column index, and base
@@ -220,7 +220,11 @@ fn rolling_atr_f64(ohlcv: &Ohlcv, period: usize) -> Vec<f64> {
     for i in 0..n {
         let hi = ohlcv.high[i];
         let lo = ohlcv.low[i];
-        let prev_close = if i > 0 { ohlcv.close[i - 1] } else { ohlcv.close[i] };
+        let prev_close = if i > 0 {
+            ohlcv.close[i - 1]
+        } else {
+            ohlcv.close[i]
+        };
         if !hi.is_finite() || !lo.is_finite() || !prev_close.is_finite() {
             tr[i] = f64::NAN;
             continue;
@@ -358,7 +362,11 @@ fn first_passage_labels(ohlcv: &Ohlcv, cost_px: f64) -> (Vec<f32>, Vec<f32>, Lab
 /// `discovery::prefilter_fit_windows` with CPCV, verbatim.
 fn cpcv_fit_windows(n_rows: usize) -> (Vec<Vec<usize>>, usize) {
     let (n_splits, n_test_groups, embargo_pct, purge_pct, max_rows) = CPCV;
-    let capped = if max_rows > 0 { max_rows.min(n_rows) } else { n_rows };
+    let capped = if max_rows > 0 {
+        max_rows.min(n_rows)
+    } else {
+        n_rows
+    };
     let offset = n_rows.saturating_sub(capped);
     let cv = neoethos_search::validation::CombinatorialPurgedCV::new(
         n_splits,
@@ -694,7 +702,7 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
     let root = store_root();
 
     // Pin the runtime switch rather than inherit it. See NORMALIZE_FEATURES.
-    neoethos_data::install_data_runtime_overrides(NORMALIZE_FEATURES, false);
+    neoethos_data::install_data_runtime_overrides(NORMALIZE_FEATURES);
 
     println!("\n╔══════════════════════════════════════════════════════════════════════════╗");
     println!("║  HIGHER-TIMEFRAME PREFILTER LANE — MEASURED ON REAL BARS                 ║");
@@ -804,8 +812,13 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
 
     // ── labels ──────────────────────────────────────────────────────────────
     let cost_px = SPREAD_PIPS.max(0.0) * PIP;
-    let atr_pips =
-        neoethos_search::stop_target::median_atr_pips(&ohlcv.high, &ohlcv.low, &ohlcv.close, PIP, 14);
+    let atr_pips = neoethos_search::stop_target::median_atr_pips(
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+        PIP,
+        14,
+    );
     let t1 = std::time::Instant::now();
     let (long_labels, short_labels, lc) = first_passage_labels(&ohlcv, cost_px);
     println!(
@@ -869,7 +882,15 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
         .map(|col_idx| {
             let name = &names[col_idx];
             let is_regime = name.starts_with("regime_");
-            let col: Vec<f32> = features.feature_column(col_idx).iter().copied().collect();
+            // The f32 copy exists only to measure the retired correlation
+            // implementation. Production/shared feature storage stays f64.
+            let col: Vec<f32> = features
+                .feature_column(col_idx)
+                .expect("feature projection succeeds")
+                .values
+                .iter()
+                .map(|&value| value as f32)
+                .collect();
 
             let mut used_total = 0u64;
             let mut skipped_total = 0u64;
@@ -916,7 +937,11 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
                 used_min = used_min.min(ol.used as u64);
 
                 // Worst fold, best direction — the shipped rule.
-                let mut a: Option<f64> = if ol.is_rankable() { Some(ol.abs()) } else { None };
+                let mut a: Option<f64> = if ol.is_rankable() {
+                    Some(ol.abs())
+                } else {
+                    None
+                };
                 if os.is_rankable() {
                     let s = os.abs();
                     a = Some(a.map_or(s, |l: f64| l.max(s)));
@@ -937,7 +962,11 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
                 runs_min = runs_min.min(rxl.len() as u64);
                 let rl = pearson_pairwise(&rxl, &ryl);
                 let rs = pearson_pairwise(&rxs, &rys);
-                let mut r: Option<f64> = if rl.is_rankable() { Some(rl.abs()) } else { None };
+                let mut r: Option<f64> = if rl.is_rankable() {
+                    Some(rl.abs())
+                } else {
+                    None
+                };
                 if rs.is_rankable() {
                     let s = rs.abs();
                     r = Some(r.map_or(s, |l: f64| l.max(s)));
@@ -978,7 +1007,11 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
 
             Row {
                 legacy_prefix: ColumnScore {
-                    score: if is_regime { f64::INFINITY } else { legacy_prefix_score },
+                    score: if is_regime {
+                        f64::INFINITY
+                    } else {
+                        legacy_prefix_score
+                    },
                     // The legacy function had no rankability concept at all:
                     // every column competed, including the ones it scored 0.0.
                     rankable: true,
@@ -994,7 +1027,11 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
                     rankable: is_regime || o.is_rankable(),
                 },
                 legacy_cpcv: ColumnScore {
-                    score: if is_regime { f64::INFINITY } else { legacy_worst },
+                    score: if is_regime {
+                        f64::INFINITY
+                    } else {
+                        legacy_worst
+                    },
                     rankable: true,
                 },
                 new_cpcv: ColumnScore {
@@ -1027,20 +1064,35 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
     for (tf, idxs) in &by_tf {
         let cols = idxs.len() as f64;
         let used: f64 = idxs.iter().map(|i| rows[*i].used_total as f64).sum::<f64>() / cols / nw;
-        let skipped: f64 =
-            idxs.iter().map(|i| rows[*i].skipped_total as f64).sum::<f64>() / cols / nw;
-        let offered: f64 =
-            idxs.iter().map(|i| rows[*i].offered_total as f64).sum::<f64>() / cols / nw;
+        let skipped: f64 = idxs
+            .iter()
+            .map(|i| rows[*i].skipped_total as f64)
+            .sum::<f64>()
+            / cols
+            / nw;
+        let offered: f64 = idxs
+            .iter()
+            .map(|i| rows[*i].offered_total as f64)
+            .sum::<f64>()
+            / cols
+            / nw;
         let used_min = idxs.iter().map(|i| rows[*i].used_min).min().unwrap_or(0);
-        let prefix_used: f64 =
-            idxs.iter().map(|i| rows[*i].prefix_used as f64).sum::<f64>() / cols;
+        let prefix_used: f64 = idxs
+            .iter()
+            .map(|i| rows[*i].prefix_used as f64)
+            .sum::<f64>()
+            / cols;
         println!(
             "{:<6} {:>7} {:>14.0} {:>14.0} {:>8.2}% {:>16} {:>13.0}",
             tf,
             idxs.len(),
             used,
             skipped,
-            if offered > 0.0 { 100.0 * used / offered } else { 0.0 },
+            if offered > 0.0 {
+                100.0 * used / offered
+            } else {
+                0.0
+            },
             used_min,
             prefix_used
         );
@@ -1125,7 +1177,16 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
             match quantiles(vals) {
                 Some(q) => println!(
                     "{:<6} {:>6} {:>7} {:>9.6} {:>9.6} {:>9.6} {:>9.6} {:>9.6} {:>9.6} {:>9.6}",
-                    tf, idxs.len(), unrank, q.min, q.p10, q.p25, q.p50, q.p75, q.p90, q.max
+                    tf,
+                    idxs.len(),
+                    unrank,
+                    q.min,
+                    q.p10,
+                    q.p25,
+                    q.p50,
+                    q.p75,
+                    q.p90,
+                    q.max
                 ),
                 None => println!(
                     "{:<6} {:>6} {:>7}   (no rankable columns)",
@@ -1167,7 +1228,10 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
         }
         let mut median_rank: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         for (tf, idxs) in &by_tf {
-            let mut r: Vec<usize> = idxs.iter().filter_map(|i| rank_of.get(i).copied()).collect();
+            let mut r: Vec<usize> = idxs
+                .iter()
+                .filter_map(|i| rank_of.get(i).copied())
+                .collect();
             if r.is_empty() {
                 continue;
             }
@@ -1297,7 +1361,10 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
     );
     let t_lanes: [(&str, bool); 2] = [
         ("t from r_dense (what the prefilter ranks on)", false),
-        ("t from r_runs  (attenuation removed: one point per observation)", true),
+        (
+            "t from r_runs  (attenuation removed: one point per observation)",
+            true,
+        ),
     ];
     for (label, use_runs) in t_lanes {
         println!("-- {label} --");
@@ -1405,7 +1472,7 @@ fn measure_the_higher_timeframe_lane_on_real_bars() {
             zeros, offered_non_regime,
             "the legacy correlation scored {zeros} of {offered_non_regime} {tf} columns exactly \
              0.0. The void number requires ALL of them. Either the alignment no longer emits NaN \
-             (check align_features_by_ns), or normalize_features is no longer being honoured \
+             (check align_feature_columns_by_ms), or normalize_features is no longer being honoured \
              (this test pins it to {NORMALIZE_FEATURES}). Whichever it is, the historical figure \
              now has a DIFFERENT explanation than the one on record, and \
              docs/higher-timeframe-lane-2026-08-09.md must be re-written before anyone acts on it."

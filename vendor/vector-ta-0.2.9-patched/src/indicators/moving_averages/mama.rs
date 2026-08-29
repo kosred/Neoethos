@@ -1,4 +1,4 @@
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
@@ -15,8 +15,6 @@ use std::error::Error;
 use std::f64::consts::PI;
 use std::mem::MaybeUninit;
 use thiserror::Error;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
 pub enum MamaData<'a> {
@@ -34,10 +32,6 @@ pub struct MamaOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
 pub struct MamaParams {
     pub fast_limit: Option<f64>,
     pub slow_limit: Option<f64>,
@@ -386,7 +380,6 @@ pub fn mama_compute_into(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn mama_into(
     input: &MamaInput,
@@ -1975,48 +1968,18 @@ pub unsafe fn mama_row_avx512(
     mama_avx512_inplace(data, fast_limit, slow_limit, out_mama, out_fama);
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mama_output_into_js(
-    data: &[f64],
-    fast_limit: f64,
-    slow_limit: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = mama_js(data, fast_limit, slow_limit)?;
-    crate::write_wasm_object_f64_outputs("mama_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mama_batch_output_into_js(
-    data: &[f64],
-    fast_start: f64,
-    fast_end: f64,
-    fast_step: f64,
-    slow_start: f64,
-    slow_end: f64,
-    slow_step: f64,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = mama_batch_js(
-        data, fast_start, fast_end, fast_step, slow_start, slow_end, slow_step,
-    )?;
-    crate::write_wasm_selected_object_f64_outputs("mama_batch_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skip_if_unsupported;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use paste::paste;
     use proptest::prelude::*;
 
     fn check_mama_partial_params(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let default_params = MamaParams {
             fast_limit: None,
             slow_limit: None,
@@ -2030,8 +1993,8 @@ mod tests {
 
     fn check_mama_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MamaInput::from_candles(&candles, "close", MamaParams::default());
         let result = mama_with_kernel(&input, kernel)?;
         assert_eq!(result.mama_values.len(), candles.close.len());
@@ -2041,8 +2004,8 @@ mod tests {
 
     fn check_mama_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let input = MamaInput::with_default_candles(&candles);
         match input.data {
             MamaData::Candles { source, .. } => assert_eq!(source, "close"),
@@ -2083,8 +2046,8 @@ mod tests {
 
     fn check_mama_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let first_params = MamaParams::default();
         let first_input = MamaInput::from_candles(&candles, "close", first_params);
         let first_result = mama_with_kernel(&first_input, kernel)?;
@@ -2107,8 +2070,8 @@ mod tests {
 
     fn check_mama_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
         let params = MamaParams::default();
         let input = MamaInput::from_candles(&candles, "close", params);
         let result = mama_with_kernel(&input, kernel)?;
@@ -2153,8 +2116,8 @@ mod tests {
     fn check_mama_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_cases = vec![
             MamaParams::default(),
@@ -2513,8 +2476,8 @@ mod tests {
 
     fn check_batch_default_row(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let output = MamaBatchBuilder::new()
             .kernel(kernel)
             .apply_candles(&c, "close")?;
@@ -2549,8 +2512,8 @@ mod tests {
     fn check_batch_no_poison(test: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
 
         let test_configs = vec![
             ((0.2, 0.4, 0.1), (0.02, 0.04, 0.01)),
@@ -2658,13 +2621,8 @@ mod tests {
         let mut out_fama = vec![0.0; n];
         #[allow(unused_variables)]
         {
-            #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
             {
                 super::mama_into(&input, &mut out_mama, &mut out_fama)?;
-            }
-            #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-            {
-                super::mama_into_slice(&mut out_mama, &mut out_fama, &input, Kernel::Auto)?;
             }
         }
 
@@ -2695,855 +2653,4 @@ mod tests {
 
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_no_poison);
-}
-
-#[cfg(feature = "python")]
-mod python_bindings {
-    use super::*;
-    #[cfg(feature = "cuda")]
-    use crate::cuda::cuda_available;
-    #[cfg(feature = "cuda")]
-    use crate::cuda::moving_averages::{CudaMama, DeviceMamaPair};
-    use crate::utilities::kernel_validation::validate_kernel;
-    #[cfg(feature = "cuda")]
-    use cust::context::Context;
-    #[cfg(feature = "cuda")]
-    use cust::memory::DeviceBuffer;
-    #[cfg(feature = "cuda")]
-    use numpy::PyReadonlyArray2;
-    use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1};
-    use pyo3::exceptions::PyValueError;
-    use pyo3::prelude::*;
-    use pyo3::types::PyDictMethods;
-    #[cfg(feature = "cuda")]
-    use std::os::raw::c_void;
-    #[cfg(feature = "cuda")]
-    use std::sync::Arc;
-
-    use pyo3::types::PyDict;
-    use pyo3::{pyclass, pymethods};
-    use std::collections::HashMap;
-
-    #[pyfunction]
-    #[pyo3(name = "mama")]
-    #[pyo3(signature = (data, fast_limit, slow_limit, kernel=None))]
-    pub fn mama_py<'py>(
-        py: Python<'py>,
-        data: PyReadonlyArray1<'py, f64>,
-        fast_limit: f64,
-        slow_limit: f64,
-        kernel: Option<&str>,
-    ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-        let slice_in = data.as_slice()?;
-        let params = MamaParams {
-            fast_limit: Some(fast_limit),
-            slow_limit: Some(slow_limit),
-        };
-        let input = MamaInput::from_slice(slice_in, params);
-        let kern = validate_kernel(kernel, false)?;
-
-        let len = slice_in.len();
-
-        let out_m = unsafe { PyArray1::<f64>::new(py, [len], false) };
-        let out_f = unsafe { PyArray1::<f64>::new(py, [len], false) };
-        let sm = unsafe { out_m.as_slice_mut()? };
-        let sf = unsafe { out_f.as_slice_mut()? };
-
-        py.allow_threads(|| mama_into_slice(sm, sf, &input, kern))
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        Ok((out_m, out_f))
-    }
-
-    #[pyfunction]
-    #[pyo3(name = "mama_batch")]
-    #[pyo3(signature = (data, fast_limit_range, slow_limit_range, kernel=None))]
-    pub fn mama_batch_py<'py>(
-        py: Python<'py>,
-        data: PyReadonlyArray1<'py, f64>,
-        fast_limit_range: (f64, f64, f64),
-        slow_limit_range: (f64, f64, f64),
-        kernel: Option<&str>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let slice_in = data.as_slice()?;
-        let sweep = MamaBatchRange {
-            fast_limit: fast_limit_range,
-            slow_limit: slow_limit_range,
-        };
-
-        let combos = expand_grid(&sweep).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let rows = combos.len();
-        let cols = slice_in.len();
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| PyValueError::new_err("rows*cols overflow"))?;
-
-        let mama_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-        let fama_arr = unsafe { PyArray1::<f64>::new(py, [total], false) };
-        let mama_slice = unsafe { mama_arr.as_slice_mut()? };
-        let fama_slice = unsafe { fama_arr.as_slice_mut()? };
-
-        let kern = validate_kernel(kernel, true)?;
-
-        let combos = py
-            .allow_threads(|| -> Result<Vec<MamaParams>, MamaError> {
-                let simd = match kern {
-                    Kernel::Auto | Kernel::ScalarBatch => Kernel::Scalar,
-                    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                    Kernel::Avx512Batch => Kernel::Avx512,
-                    #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
-                    Kernel::Avx2Batch => Kernel::Avx2,
-
-                    _ => Kernel::Scalar,
-                };
-
-                mama_batch_inner_into(slice_in, &sweep, simd, true, mama_slice, fama_slice)
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        let dict = PyDict::new(py);
-        dict.set_item("mama", mama_arr.reshape((rows, cols))?)?;
-        dict.set_item("fama", fama_arr.reshape((rows, cols))?)?;
-        dict.set_item(
-            "fast_limits",
-            combos
-                .iter()
-                .map(|p| p.fast_limit.unwrap_or(0.5))
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-        dict.set_item(
-            "slow_limits",
-            combos
-                .iter()
-                .map(|p| p.slow_limit.unwrap_or(0.05))
-                .collect::<Vec<_>>()
-                .into_pyarray(py),
-        )?;
-
-        Ok(dict)
-    }
-
-    #[cfg(feature = "cuda")]
-    #[pyfunction(name = "mama_cuda_batch_dev")]
-    #[pyo3(signature = (data_f32, fast_limit_range, slow_limit_range, device_id=0))]
-    pub fn mama_cuda_batch_dev_py(
-        py: Python<'_>,
-        data_f32: PyReadonlyArray1<'_, f32>,
-        fast_limit_range: (f64, f64, f64),
-        slow_limit_range: (f64, f64, f64),
-        device_id: usize,
-    ) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-        if !cuda_available() {
-            return Err(PyValueError::new_err("CUDA not available"));
-        }
-
-        let slice_in = data_f32.as_slice()?;
-        let sweep = MamaBatchRange {
-            fast_limit: fast_limit_range,
-            slow_limit: slow_limit_range,
-        };
-
-        let (pair, ctx, dev_id) = py.allow_threads(|| {
-            let cuda =
-                CudaMama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let ctx = cuda.context_arc();
-            let dev_id = cuda.device_id();
-            let pair = cuda
-                .mama_batch_dev(slice_in, &sweep)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok::<_, PyErr>((pair, ctx, dev_id))
-        })?;
-
-        let DeviceMamaPair { mama, fama } = pair;
-        Ok((
-            DeviceArrayF32Py {
-                buf: Some(mama.buf),
-                rows: mama.rows,
-                cols: mama.cols,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-            DeviceArrayF32Py {
-                buf: Some(fama.buf),
-                rows: fama.rows,
-                cols: fama.cols,
-                _ctx: ctx,
-                device_id: dev_id,
-            },
-        ))
-    }
-
-    #[cfg(feature = "cuda")]
-    #[pyfunction(name = "mama_cuda_many_series_one_param_dev")]
-    #[pyo3(signature = (data_tm_f32, fast_limit, slow_limit, device_id=0))]
-    pub fn mama_cuda_many_series_one_param_dev_py(
-        py: Python<'_>,
-        data_tm_f32: PyReadonlyArray2<'_, f32>,
-        fast_limit: f64,
-        slow_limit: f64,
-        device_id: usize,
-    ) -> PyResult<(DeviceArrayF32Py, DeviceArrayF32Py)> {
-        use numpy::PyUntypedArrayMethods;
-
-        if !cuda_available() {
-            return Err(PyValueError::new_err("CUDA not available"));
-        }
-
-        let shape = data_tm_f32.shape();
-        if shape.len() != 2 {
-            return Err(PyValueError::new_err("expected 2D array"));
-        }
-        let rows = shape[0];
-        let cols = shape[1];
-        let flat = data_tm_f32.as_slice()?;
-
-        let fast = fast_limit as f32;
-        let slow = slow_limit as f32;
-
-        let (pair, ctx, dev_id) = py.allow_threads(|| {
-            let cuda =
-                CudaMama::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let ctx = cuda.context_arc();
-            let dev_id = cuda.device_id();
-            let pair = cuda
-                .mama_many_series_one_param_time_major_dev(flat, cols, rows, fast, slow)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok::<_, PyErr>((pair, ctx, dev_id))
-        })?;
-
-        let DeviceMamaPair { mama, fama } = pair;
-        Ok((
-            DeviceArrayF32Py {
-                buf: Some(mama.buf),
-                rows: mama.rows,
-                cols: mama.cols,
-                _ctx: ctx.clone(),
-                device_id: dev_id,
-            },
-            DeviceArrayF32Py {
-                buf: Some(fama.buf),
-                rows: fama.rows,
-                cols: fama.cols,
-                _ctx: ctx,
-                device_id: dev_id,
-            },
-        ))
-    }
-
-    #[pyclass]
-    #[pyo3(name = "MamaStream")]
-    pub struct MamaStreamPy {
-        inner: MamaStream,
-    }
-
-    #[pymethods]
-    impl MamaStreamPy {
-        #[new]
-        pub fn new(fast_limit: f64, slow_limit: f64) -> PyResult<Self> {
-            let params = MamaParams {
-                fast_limit: Some(fast_limit),
-                slow_limit: Some(slow_limit),
-            };
-            let stream =
-                MamaStream::try_new(params).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok(Self { inner: stream })
-        }
-
-        pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-            self.inner.update(value)
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-pub use python_bindings::{mama_batch_py, mama_py, MamaStreamPy};
-#[cfg(all(feature = "python", feature = "cuda"))]
-pub use python_bindings::{mama_cuda_batch_dev_py, mama_cuda_many_series_one_param_dev_py};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MamaResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "mama")]
-pub fn mama_js(data: &[f64], fast_limit: f64, slow_limit: f64) -> Result<JsValue, JsValue> {
-    let params = MamaParams {
-        fast_limit: Some(fast_limit),
-        slow_limit: Some(slow_limit),
-    };
-    let input = MamaInput::from_slice(data, params);
-
-    let mut mama = vec![0.0; data.len()];
-    let mut fama = vec![0.0; data.len()];
-    mama_into_slice(&mut mama, &mut fama, &input, detect_best_kernel())
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut values = mama;
-    values.extend_from_slice(&fama);
-
-    let out = MamaResult {
-        values,
-        rows: 2,
-        cols: data.len(),
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "mama_into")]
-pub fn mama_into(
-    in_ptr: *const f64,
-    out_m_ptr: *mut f64,
-    out_f_ptr: *mut f64,
-    len: usize,
-    fast_limit: f64,
-    slow_limit: f64,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || out_m_ptr.is_null() || out_f_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to mama_into"));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(in_ptr, len);
-        let out_m = core::slice::from_raw_parts_mut(out_m_ptr, len);
-        let out_f = core::slice::from_raw_parts_mut(out_f_ptr, len);
-        let params = MamaParams {
-            fast_limit: Some(fast_limit),
-            slow_limit: Some(slow_limit),
-        };
-        let input = MamaInput::from_slice(data, params);
-        mama_into_slice(out_m, out_f, &input, detect_best_kernel())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct MamaBatchJsOutput {
-    pub mama: Vec<f64>,
-    pub fama: Vec<f64>,
-    pub combos: Vec<MamaParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "mama_batch")]
-pub fn mama_batch_js(
-    data: &[f64],
-    fast_start: f64,
-    fast_end: f64,
-    fast_step: f64,
-    slow_start: f64,
-    slow_end: f64,
-    slow_step: f64,
-) -> Result<JsValue, JsValue> {
-    let sweep = MamaBatchRange {
-        fast_limit: (fast_start, fast_end, fast_step),
-        slow_limit: (slow_start, slow_end, slow_step),
-    };
-    let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let rows = combos.len();
-    let cols = data.len();
-    let total = rows
-        .checked_mul(cols)
-        .ok_or(JsValue::from_str("rows*cols overflow"))?;
-
-    let mut mama_values = vec![0.0; total];
-    let mut fama_values = vec![0.0; total];
-
-    let kern = detect_best_kernel();
-    mama_batch_inner_into(
-        data,
-        &sweep,
-        kern,
-        false,
-        &mut mama_values,
-        &mut fama_values,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let out = MamaBatchJsOutput {
-        mama: mama_values,
-        fama: fama_values,
-        combos,
-        rows,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&out)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mama_batch_metadata_js(
-    fast_limit_start: f64,
-    fast_limit_end: f64,
-    fast_limit_step: f64,
-    slow_limit_start: f64,
-    slow_limit_end: f64,
-    slow_limit_step: f64,
-) -> Vec<f64> {
-    let range = MamaBatchRange {
-        fast_limit: (fast_limit_start, fast_limit_end, fast_limit_step),
-        slow_limit: (slow_limit_start, slow_limit_end, slow_limit_step),
-    };
-
-    let combos = expand_grid(&range).unwrap_or_else(|_| Vec::new());
-    let mut metadata = Vec::with_capacity(combos.len() * 2);
-
-    for combo in combos {
-        metadata.push(combo.fast_limit.unwrap_or(0.5));
-        metadata.push(combo.slow_limit.unwrap_or(0.05));
-    }
-
-    metadata
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mama_batch_rows_cols_js(
-    fast_limit_start: f64,
-    fast_limit_end: f64,
-    fast_limit_step: f64,
-    slow_limit_start: f64,
-    slow_limit_end: f64,
-    slow_limit_step: f64,
-    data_len: usize,
-) -> Vec<usize> {
-    let range = MamaBatchRange {
-        fast_limit: (fast_limit_start, fast_limit_end, fast_limit_step),
-        slow_limit: (slow_limit_start, slow_limit_end, slow_limit_step),
-    };
-
-    let combos = expand_grid(&range).unwrap_or_else(|_| Vec::new());
-    vec![combos.len(), data_len]
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mama_alloc(len: usize) -> *mut f64 {
-    let mut vec = Vec::<f64>::with_capacity(len);
-    let ptr = vec.as_mut_ptr();
-    std::mem::forget(vec);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mama_free(ptr: *mut f64, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, 0, len);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn mama_batch_into(
-    in_ptr: *const f64,
-    out_mama_ptr: *mut f64,
-    out_fama_ptr: *mut f64,
-    len: usize,
-    fast_limit_start: f64,
-    fast_limit_end: f64,
-    fast_limit_step: f64,
-    slow_limit_start: f64,
-    slow_limit_end: f64,
-    slow_limit_step: f64,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_mama_ptr.is_null() || out_fama_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to mama_batch_into"));
-    }
-
-    unsafe {
-        let data = std::slice::from_raw_parts(in_ptr, len);
-
-        let range = MamaBatchRange {
-            fast_limit: (fast_limit_start, fast_limit_end, fast_limit_step),
-            slow_limit: (slow_limit_start, slow_limit_end, slow_limit_step),
-        };
-
-        let batch_output = mama_batch_with_kernel(data, &range, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let rows = batch_output.combos.len();
-        let cols = len;
-        let total_elements = rows * cols;
-
-        let out_mama = std::slice::from_raw_parts_mut(out_mama_ptr, total_elements);
-        out_mama.copy_from_slice(&batch_output.mama_values);
-
-        let out_fama = std::slice::from_raw_parts_mut(out_fama_ptr, total_elements);
-        out_fama.copy_from_slice(&batch_output.fama_values);
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyo3::pyclass(module = "vector_ta", unsendable)]
-pub struct DeviceArrayF32Py {
-    pub(crate) buf: Option<cust::memory::DeviceBuffer<f32>>,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) _ctx: std::sync::Arc<cust::context::Context>,
-    pub(crate) device_id: u32,
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyo3::pymethods]
-impl DeviceArrayF32Py {
-    #[getter]
-    fn __cuda_array_interface__<'py>(
-        &self,
-        py: pyo3::Python<'py>,
-    ) -> pyo3::PyResult<pyo3::prelude::Bound<'py, pyo3::types::PyDict>> {
-        let d = pyo3::types::PyDict::new(py);
-        pyo3::types::PyDictMethods::set_item(&d, "shape", (self.rows, self.cols))?;
-        pyo3::types::PyDictMethods::set_item(&d, "typestr", "<f4")?;
-        pyo3::types::PyDictMethods::set_item(
-            &d,
-            "strides",
-            (
-                self.cols * std::mem::size_of::<f32>(),
-                std::mem::size_of::<f32>(),
-            ),
-        )?;
-        let ptr = self
-            .buf
-            .as_ref()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("buffer already exported via __dlpack__")
-            })?
-            .as_device_ptr()
-            .as_raw() as usize;
-        pyo3::types::PyDictMethods::set_item(&d, "data", (ptr, false))?;
-        pyo3::types::PyDictMethods::set_item(&d, "version", 3)?;
-        Ok(d)
-    }
-
-    fn __dlpack_device__(&self) -> (i32, i32) {
-        (2, self.device_id as i32)
-    }
-
-    #[cfg(feature = "mama_legacy_dlpack")]
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack_legacy__<'py>(
-        &mut self,
-        py: pyo3::Python<'py>,
-        stream: Option<&pyo3::types::PyAny>,
-        max_version: Option<&pyo3::types::PyAny>,
-        dl_device: Option<&pyo3::types::PyAny>,
-        copy: Option<&pyo3::types::PyAny>,
-    ) -> pyo3::PyResult<pyo3::PyObject> {
-        use std::os::raw::c_char;
-
-        let buf = self.buf.take().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("__dlpack__ may only be called once")
-        })?;
-
-        #[repr(C)]
-        struct DLDevice {
-            device_type: i32,
-            device_id: i32,
-        }
-        #[repr(C)]
-        struct DLDataType {
-            code: u8,
-            bits: u8,
-            lanes: u16,
-        }
-        #[repr(C)]
-        struct DLTensor {
-            data: *mut std::ffi::c_void,
-            device: DLDevice,
-            ndim: i32,
-            dtype: DLDataType,
-            shape: *mut i64,
-            strides: *mut i64,
-            byte_offset: u64,
-        }
-        #[repr(C)]
-        struct DLManagedTensor {
-            dl_tensor: DLTensor,
-            manager_ctx: *mut std::ffi::c_void,
-            deleter: Option<extern "C" fn(*mut DLManagedTensor)>,
-        }
-        #[repr(C)]
-        struct DLVersion {
-            major: i32,
-            minor: i32,
-        }
-        #[repr(C)]
-        struct DLManagedTensorVersioned {
-            dl_managed_tensor: DLManagedTensor,
-            version: DLVersion,
-        }
-
-        struct HolderLegacy {
-            managed: DLManagedTensor,
-            shape: [i64; 2],
-            strides: [i64; 2],
-            buf: cust::memory::DeviceBuffer<f32>,
-            retained: cust::sys::CUcontext,
-            device_id: i32,
-        }
-        struct HolderV1 {
-            managed: DLManagedTensorVersioned,
-            shape: [i64; 2],
-            strides: [i64; 2],
-            buf: cust::memory::DeviceBuffer<f32>,
-            retained: cust::sys::CUcontext,
-            device_id: i32,
-        }
-
-        unsafe extern "C" fn deleter_legacy(p: *mut DLManagedTensor) {
-            if p.is_null() {
-                return;
-            }
-            let holder = (*p).manager_ctx as *mut HolderLegacy;
-            if !holder.is_null() {
-                let ctx = (*holder).retained;
-                if !ctx.is_null() {
-                    let _ = cust::sys::cuCtxPushCurrent(ctx);
-                    let dev = (*holder).device_id;
-                    drop(Box::from_raw(holder));
-                    let mut _out: cust::sys::CUcontext = std::ptr::null_mut();
-                    let _ = cust::sys::cuCtxPopCurrent(&mut _out);
-                    let _ = cust::sys::cuDevicePrimaryCtxRelease(dev);
-                }
-            }
-            drop(Box::from_raw(p));
-        }
-        unsafe extern "C" fn deleter_v1(p: *mut DLManagedTensorVersioned) {
-            if p.is_null() {
-                return;
-            }
-            let holder = (*p).dl_managed_tensor.manager_ctx as *mut HolderV1;
-            if !holder.is_null() {
-                let ctx = (*holder).retained;
-                if !ctx.is_null() {
-                    let _ = cust::sys::cuCtxPushCurrent(ctx);
-                    let dev = (*holder).device_id;
-                    drop(Box::from_raw(holder));
-                    let mut _out: cust::sys::CUcontext = std::ptr::null_mut();
-                    let _ = cust::sys::cuCtxPopCurrent(&mut _out);
-                    let _ = cust::sys::cuDevicePrimaryCtxRelease(dev);
-                }
-            }
-            drop(Box::from_raw(p));
-        }
-
-        unsafe extern "C" fn cap_destructor_legacy(capsule: *mut pyo3::ffi::PyObject) {
-            let name = b"dltensor\0";
-            let ptr = pyo3::ffi::PyCapsule_GetPointer(capsule, name.as_ptr() as *const c_char)
-                as *mut DLManagedTensor;
-            if !ptr.is_null() {
-                if let Some(del) = (*ptr).deleter {
-                    del(ptr);
-                }
-                let used = b"used_dltensor\0";
-                pyo3::ffi::PyCapsule_SetName(capsule, used.as_ptr() as *const _);
-            }
-        }
-        unsafe extern "C" fn cap_destructor_v1(capsule: *mut pyo3::ffi::PyObject) {
-            let name = b"dltensor_versioned\0";
-            let ptr = pyo3::ffi::PyCapsule_GetPointer(capsule, name.as_ptr() as *const c_char)
-                as *mut DLManagedTensorVersioned;
-            if !ptr.is_null() {
-                let mt = &mut (*ptr).dl_managed_tensor;
-                if let Some(del) = mt.deleter {
-                    del(mt);
-                }
-                let used = b"used_dltensor_versioned\0";
-                pyo3::ffi::PyCapsule_SetName(capsule, used.as_ptr() as *const _);
-            }
-        }
-
-        let alloc_dev = self.device_id as i32;
-        let mut retained: cust::sys::CUcontext = std::ptr::null_mut();
-        unsafe {
-            let _ = cust::sys::cuDevicePrimaryCtxRetain(&mut retained, alloc_dev);
-        }
-
-        let rows = self.rows as i64;
-        let cols = self.cols as i64;
-        let data_ptr: *mut std::ffi::c_void = if self.rows == 0 || self.cols == 0 {
-            std::ptr::null_mut()
-        } else {
-            buf.as_device_ptr().as_raw() as *mut std::ffi::c_void
-        };
-
-        let want_v1 = if let Some(v) = max_version {
-            v.getattr("__iter")
-                .ok()
-                .and_then(|_| v.extract::<(i32, i32)>().ok())
-                .map(|(maj, _)| maj >= 1)
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
-        if want_v1 {
-            let mut holder = Box::new(HolderV1 {
-                managed: DLManagedTensorVersioned {
-                    dl_managed_tensor: DLManagedTensor {
-                        dl_tensor: DLTensor {
-                            data: data_ptr,
-                            device: DLDevice {
-                                device_type: 2,
-                                device_id: alloc_dev,
-                            },
-                            ndim: 2,
-                            dtype: DLDataType {
-                                code: 2,
-                                bits: 32,
-                                lanes: 1,
-                            },
-                            shape: std::ptr::null_mut(),
-                            strides: std::ptr::null_mut(),
-                            byte_offset: 0,
-                        },
-                        manager_ctx: std::ptr::null_mut(),
-                        deleter: Some(|mt| {
-                            if !mt.is_null() {
-                                let outer = (mt as *mut u8)
-                                    .offset(-(std::mem::size_of::<DLVersion>() as isize))
-                                    as *mut DLManagedTensorVersioned;
-                                deleter_v1(outer);
-                            }
-                        }),
-                    },
-                    version: DLVersion { major: 1, minor: 0 },
-                },
-                shape: [rows, cols],
-                strides: [cols, 1],
-                buf,
-                retained,
-                device_id: alloc_dev,
-            });
-            holder.managed.dl_managed_tensor.dl_tensor.shape = holder.shape.as_mut_ptr();
-            holder.managed.dl_managed_tensor.dl_tensor.strides = holder.strides.as_mut_ptr();
-            holder.managed.dl_managed_tensor.manager_ctx =
-                &mut *holder as *mut HolderV1 as *mut std::ffi::c_void;
-            let mt_ptr: *mut DLManagedTensorVersioned = &mut holder.managed;
-            let _leak = Box::into_raw(holder);
-            let name = b"dltensor_versioned\0";
-            let cap = unsafe {
-                pyo3::ffi::PyCapsule_New(
-                    mt_ptr as *mut std::ffi::c_void,
-                    name.as_ptr() as *const c_char,
-                    Some(cap_destructor_v1),
-                )
-            };
-            if cap.is_null() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "failed to create DLPack capsule",
-                ));
-            }
-            Ok(unsafe { pyo3::PyObject::from_owned_ptr(py, cap) })
-        } else {
-            let mut holder = Box::new(HolderLegacy {
-                managed: DLManagedTensor {
-                    dl_tensor: DLTensor {
-                        data: data_ptr,
-                        device: DLDevice {
-                            device_type: 2,
-                            device_id: alloc_dev,
-                        },
-                        ndim: 2,
-                        dtype: DLDataType {
-                            code: 2,
-                            bits: 32,
-                            lanes: 1,
-                        },
-                        shape: std::ptr::null_mut(),
-                        strides: std::ptr::null_mut(),
-                        byte_offset: 0,
-                    },
-                    manager_ctx: std::ptr::null_mut(),
-                    deleter: Some(deleter_legacy),
-                },
-                shape: [rows, cols],
-                strides: [cols, 1],
-                buf,
-                retained,
-                device_id: alloc_dev,
-            });
-            holder.managed.dl_tensor.shape = holder.shape.as_mut_ptr();
-            holder.managed.dl_tensor.strides = holder.strides.as_mut_ptr();
-            holder.managed.manager_ctx = &mut *holder as *mut HolderLegacy as *mut std::ffi::c_void;
-            let mt_ptr: *mut DLManagedTensor = &mut holder.managed;
-            let _leak = Box::into_raw(holder);
-            let name = b"dltensor\0";
-            let cap = unsafe {
-                pyo3::ffi::PyCapsule_New(
-                    mt_ptr as *mut std::ffi::c_void,
-                    name.as_ptr() as *const c_char,
-                    Some(cap_destructor_legacy),
-                )
-            };
-            if cap.is_null() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "failed to create DLPack capsule",
-                ));
-            }
-            Ok(unsafe { pyo3::PyObject::from_owned_ptr(py, cap) })
-        }
-    }
-
-    #[pyo3(signature=(stream=None, max_version=None, dl_device=None, copy=None))]
-    fn __dlpack__<'py>(
-        &mut self,
-        py: pyo3::Python<'py>,
-        stream: Option<pyo3::PyObject>,
-        max_version: Option<pyo3::PyObject>,
-        dl_device: Option<pyo3::PyObject>,
-        copy: Option<pyo3::PyObject>,
-    ) -> pyo3::PyResult<pyo3::PyObject> {
-        use crate::utilities::dlpack_cuda::export_f32_cuda_dlpack_2d;
-
-        let (kdl, alloc_dev) = self.__dlpack_device__();
-        if let Some(dev_obj) = dl_device.as_ref() {
-            if let Ok((dev_ty, dev_id)) = dev_obj.extract::<(i32, i32)>(py) {
-                if dev_ty != kdl || dev_id != alloc_dev {
-                    let wants_copy = copy
-                        .as_ref()
-                        .and_then(|c| c.extract::<bool>(py).ok())
-                        .unwrap_or(false);
-                    if wants_copy {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "device copy not implemented for __dlpack__",
-                        ));
-                    } else {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "dl_device mismatch for __dlpack__",
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = stream;
-
-        let buf = self.buf.take().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("__dlpack__ may only be called once")
-        })?;
-
-        let rows = self.rows;
-        let cols = self.cols;
-
-        let max_version_bound = max_version.map(|obj| obj.into_bound(py));
-
-        export_f32_cuda_dlpack_2d(py, buf, rows, cols, alloc_dev, max_version_bound)
-    }
 }

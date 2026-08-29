@@ -286,11 +286,9 @@ extern "C" __global__ void donchian_many_series_one_param_f32(
 //
 // CPU reference: `donchian_scalar` (src/indicators/donchian.rs:425).
 //
-// OUTPUT: `upper`, which is `OUTPUTS_BOLLINGER[0]` (registry.rs:1054 ->
-// [OUTPUT_UPPER, OUTPUT_MIDDLE, OUTPUT_LOWER]). The f64 lane carries one
-// matrix per indicator; middle is `(upper - lower).mul_add(0.5, lower)` and
-// lower is the window min, both one launch away once the lane grows an output
-// selector.
+// OUTPUTS: canonical `[upper, middle, lower]`. The preserved generic primary
+// ABI still returns `upper`; production enters the full three-output ABI so a
+// family tuple is launched once. Both entry points call one exact row authority.
 //
 // FIRST VALID IS NOT THE COMMON RULE. donchian.rs:183-188 scans high and low
 // INDEPENDENTLY and takes `h.max(l)` -- the same construction `adx` uses over
@@ -316,11 +314,10 @@ extern "C" __global__ void donchian_many_series_one_param_f32(
 // PARALLEL OVER (combo, bar), not one thread per column: donchian carries no
 // state across bars -- every output is a fresh max/min over its own window --
 // so `F64Kernel::is_sequential` is false for it and the launcher uses the
-// (bars x rows) grid. The window scan is the CPU's naive `for k in 0..period`
-// (:481-495), which is what makes it bit-identical; the CPU's block-max
-// reformulation for period > 32 computes the SAME max by a different route
-// and is an optimisation this shape does not need, because the work is spread
-// over bars instead of over one thread.
+// (bars x rows) grid. For period <= 32 the row scans forward exactly like the
+// CPU. For period > 32 it reconstructs the CPU's reverse suffix, forward
+// prefix, and suffix-vs-prefix selection order. Equal signed zeroes make that
+// order observable, so a simpler full-window scan is not exact-bit authority.
 //
 // f32 -> f64 audit: the f32 lane above uses `fmaxf` x2, `fminf` x2 and
 // `__int_as_float` x2. Below there is no f32-suffixed function and no
@@ -337,6 +334,114 @@ static __device__ __forceinline__ double donchian_qnan_f64() {
     return __longlong_as_double(0x7ff8000000000000ULL);
 }
 
+static __device__ __forceinline__
+void donchian_row_f64(const double* __restrict__ high,
+                      const double* __restrict__ low,
+                      int n,
+                      int period,
+                      int first_valid,
+                      int i,
+                      double* upper,
+                      double* middle,
+                      double* lower)
+{
+    const double nan_d = donchian_qnan_f64();
+    if (period <= 0 || period > n || first_valid < 0) {
+        *upper = nan_d;
+        *middle = nan_d;
+        *lower = nan_d;
+        return;
+    }
+
+    const int warmup = first_valid + period - 1;
+    if (i < warmup) {
+        *upper = nan_d;
+        *middle = nan_d;
+        *lower = nan_d;
+        return;
+    }
+
+    if (period == 1) {
+        const double h = high[i];
+        const double l = low[i];
+        if (isnan(h) || isnan(l)) {
+            *upper = nan_d;
+            *middle = nan_d;
+            *lower = nan_d;
+        } else {
+            *upper = h;
+            *middle = fma(h - l, 0.5, l);
+            *lower = l;
+        }
+        return;
+    }
+
+    const int start = i + 1 - period;
+    double maxv = -INFINITY;
+    double minv = INFINITY;
+
+    if (period <= 32) {
+        bool has_nan = false;
+        for (int k = 0; k < period; ++k) {
+            const double h = high[start + k];
+            const double l = low[start + k];
+            if (isnan(h) || isnan(l)) {
+                has_nan = true;
+                break;
+            }
+            if (h > maxv) maxv = h;
+            if (l < minv) minv = l;
+        }
+        if (has_nan) {
+            *upper = nan_d;
+            *middle = nan_d;
+            *lower = nan_d;
+            return;
+        }
+    } else {
+        bool all_valid = true;
+        for (int k = 0; k < period; ++k) {
+            const double h = high[start + k];
+            const double l = low[start + k];
+            const bool ok = isfinite(h) && isfinite(l);
+            if (!ok) all_valid = false;
+        }
+        if (!all_valid) {
+            *upper = nan_d;
+            *middle = nan_d;
+            *lower = nan_d;
+            return;
+        }
+
+        const int suffix_end = min(((start / period) + 1) * period - 1, n - 1);
+        double suffix_max = high[suffix_end];
+        double suffix_min = low[suffix_end];
+        for (int k = suffix_end - 1; k >= start; --k) {
+            const double h = high[k];
+            const double l = low[k];
+            if (h > suffix_max) suffix_max = h;
+            if (l < suffix_min) suffix_min = l;
+        }
+
+        const int prefix_start = (i / period) * period;
+        double prefix_max = high[prefix_start];
+        double prefix_min = low[prefix_start];
+        for (int k = prefix_start + 1; k <= i; ++k) {
+            const double h = high[k];
+            const double l = low[k];
+            if (h > prefix_max) prefix_max = h;
+            if (l < prefix_min) prefix_min = l;
+        }
+
+        maxv = suffix_max > prefix_max ? suffix_max : prefix_max;
+        minv = suffix_min < prefix_min ? suffix_min : prefix_min;
+    }
+
+    *upper = maxv;
+    *middle = fma(maxv - minv, 0.5, minv);
+    *lower = minv;
+}
+
 extern "C" __global__
 void donchian_batch_f64(const double* __restrict__ high,
                         const double* __restrict__ low,
@@ -351,49 +456,37 @@ void donchian_batch_f64(const double* __restrict__ high,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    const double nan_d = donchian_qnan_f64();
     double* __restrict__ row = out + static_cast<size_t>(r) * static_cast<size_t>(n);
+    double upper;
+    double middle;
+    double lower;
+    donchian_row_f64(high, low, n, periods[r], first_valid, i, &upper, &middle, &lower);
+    row[i] = upper;
+}
 
-    const int period = periods[r];
-    if (period <= 0 || period > n || first_valid < 0) { row[i] = nan_d; return; }
+extern "C" __global__
+void donchian_all_outputs_batch_f64(const double* __restrict__ high,
+                                    const double* __restrict__ low,
+                                    int n,
+                                    const int* __restrict__ periods,
+                                    int n_combos,
+                                    int first_valid,
+                                    double* __restrict__ upper_out,
+                                    double* __restrict__ middle_out,
+                                    double* __restrict__ lower_out)
+{
+    const int r = blockIdx.y;
+    if (r >= n_combos) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
 
-    const int warmup = first_valid + period - 1;      // :443
-    if (i < warmup) { row[i] = nan_d; return; }
-
-    if (period == 1) {                                 // :445-468
-        const double h = high[i];
-        const double l = low[i];
-        row[i] = (isnan(h) || isnan(l)) ? nan_d : h;
-        return;
-    }
-
-    const int start = i + 1 - period;
-
-    if (period <= 32) {                                // :470-506
-        double maxv = -INFINITY;
-        bool has_nan = false;
-        for (int k = 0; k < period; ++k) {
-            const double h = high[start + k];
-            const double l = low[start + k];
-            if (isnan(h) || isnan(l)) { has_nan = true; break; }
-            if (h > maxv) maxv = h;
-        }
-        row[i] = has_nan ? nan_d : maxv;
-        return;
-    }
-
-    // :509-548 -- validity is `is_finite`, and an invalid bar contributes
-    // -INFINITY to the max, then the whole window is voided by the valid
-    // prefix-sum check. Both halves reproduced.
-    double acc_max = -INFINITY;
-    bool all_valid = true;
-    for (int k = 0; k < period; ++k) {
-        const double h = high[start + k];
-        const double l = low[start + k];
-        const bool ok = isfinite(h) && isfinite(l);
-        if (!ok) { all_valid = false; }
-        const double hv = ok ? h : -INFINITY;
-        if (hv > acc_max) acc_max = hv;
-    }
-    row[i] = all_valid ? acc_max : nan_d;
+    const size_t offset = static_cast<size_t>(r) * static_cast<size_t>(n) +
+                          static_cast<size_t>(i);
+    double upper;
+    double middle;
+    double lower;
+    donchian_row_f64(high, low, n, periods[r], first_valid, i, &upper, &middle, &lower);
+    upper_out[offset] = upper;
+    middle_out[offset] = middle;
+    lower_out[offset] = lower;
 }

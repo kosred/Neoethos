@@ -26,6 +26,245 @@ fn sample_ohlcv() -> Ohlcv {
     neoethos_data::test_fixtures::ctrader_sample_ohlcv()
 }
 
+fn sample_run_input<'a>(
+    features: &'a FeatureFrame,
+    ohlcv: &'a Ohlcv,
+) -> CanonicalSearchRunInputV2<'a> {
+    let anchor = features.provenance().bindings()[0]
+        .dataset_identity()
+        .clone();
+    let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(&anchor, features)
+        .expect("canonical search test receipt");
+    CanonicalSearchRunInputV2::new_for_test_values(receipt, features, ohlcv)
+        .expect("receipt-bound canonical search test input")
+}
+
+fn sample_search_input_receipt() -> CanonicalSearchInputReceiptV2 {
+    let features = sample_feature_frame();
+    let anchor = features.provenance().bindings()[0]
+        .dataset_identity()
+        .clone();
+    CanonicalSearchInputReceiptV2::from_feature_frame(&anchor, &features)
+        .expect("canonical search test receipt")
+}
+
+fn sample_discovery_selection_scope() -> CanonicalSearchArtifactScopeV2 {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    CanonicalSearchArtifactScopeV2::from_run_input(
+        CanonicalSearchWindowRoleV1::DiscoveryInput,
+        &input,
+    )
+    .expect("canonical full discovery test scope")
+}
+
+fn sample_split_search_scopes() -> (
+    CanonicalSearchInputReceiptV2,
+    CanonicalSearchArtifactScopeV2,
+    CanonicalSearchArtifactScopeV2,
+) {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let windows = CanonicalDiscoveryRunInputs::with_holdout(&input)
+        .expect("canonical fixture must produce exact 80/20 scopes");
+    let selection_scope = windows.selection().scope().clone();
+    let holdout_scope = windows
+        .holdout()
+        .expect("canonical fixture must contain a holdout")
+        .scope()
+        .clone();
+    (input.receipt().clone(), selection_scope, holdout_scope)
+}
+
+fn sample_split_search_values() -> (
+    CanonicalSearchInputReceiptV2,
+    CanonicalSearchArtifactScopeV2,
+    CanonicalSearchArtifactScopeV2,
+    FeatureFrame,
+    Ohlcv,
+) {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let windows = CanonicalDiscoveryRunInputs::with_holdout(&input)
+        .expect("canonical fixture must produce exact 80/20 values");
+    let selection_scope = windows.selection().scope().clone();
+    let holdout = windows
+        .holdout()
+        .expect("canonical fixture must contain holdout values");
+    (
+        input.receipt().clone(),
+        selection_scope,
+        holdout.scope().clone(),
+        holdout.features().clone(),
+        holdout.ohlcv().clone(),
+    )
+}
+
+#[test]
+fn holdout_split_stores_exact_contiguous_80_20_scopes_and_values() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let timestamps = ohlcv
+        .timestamp
+        .as_deref()
+        .expect("canonical fixture timestamps");
+
+    assert_eq!(input.ohlcv().len(), 100, "fixture must remain 100 rows");
+
+    let windows = CanonicalDiscoveryRunInputs::with_holdout(&input)
+        .expect("100 rows must produce an exact 80/20 split");
+    let selection = windows.selection();
+    let holdout = windows
+        .holdout()
+        .expect("split discovery input must store holdout evidence");
+    let selection_window = selection.scope().evaluated_window();
+    let holdout_window = holdout.scope().evaluated_window();
+
+    assert_eq!(
+        selection_window.role(),
+        CanonicalSearchWindowRoleV1::InSample
+    );
+    assert_eq!(
+        (selection_window.row_start(), selection_window.row_end()),
+        (0, 80)
+    );
+    assert_eq!(selection_window.timestamp_start_ms(), timestamps[0]);
+    assert_eq!(selection_window.timestamp_end_ms(), timestamps[79]);
+    assert_eq!(holdout_window.role(), CanonicalSearchWindowRoleV1::Holdout);
+    assert_eq!(
+        (holdout_window.row_start(), holdout_window.row_end()),
+        (80, 100)
+    );
+    assert_eq!(holdout_window.timestamp_start_ms(), timestamps[80]);
+    assert_eq!(holdout_window.timestamp_end_ms(), timestamps[99]);
+
+    assert_eq!(selection.scope().receipt(), input.receipt());
+    assert_eq!(holdout.scope().receipt(), input.receipt());
+    assert_eq!(selection.features().timestamps, features.timestamps[0..80]);
+    assert_eq!(
+        selection.ohlcv().timestamp.as_deref(),
+        Some(&timestamps[0..80])
+    );
+    assert_eq!(holdout.features().timestamps, features.timestamps[80..100]);
+    assert_eq!(
+        holdout.ohlcv().timestamp.as_deref(),
+        Some(&timestamps[80..100])
+    );
+}
+
+#[test]
+fn holdout_free_input_stores_exact_full_discovery_scope() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let timestamps = ohlcv
+        .timestamp
+        .as_deref()
+        .expect("canonical fixture timestamps");
+
+    let windows = CanonicalDiscoveryRunInputs::entire(&input)
+        .expect("validated canonical input must produce a full discovery scope");
+    let selection = windows.selection();
+    let window = selection.scope().evaluated_window();
+
+    assert!(windows.holdout().is_none());
+    assert_eq!(window.role(), CanonicalSearchWindowRoleV1::DiscoveryInput);
+    assert_eq!((window.row_start(), window.row_end()), (0, 100));
+    assert_eq!(window.timestamp_start_ms(), timestamps[0]);
+    assert_eq!(window.timestamp_end_ms(), timestamps[99]);
+    assert_eq!(selection.scope().receipt(), input.receipt());
+    assert_eq!(selection.features().timestamps, features.timestamps);
+    assert_eq!(selection.ohlcv().timestamp.as_deref(), Some(timestamps));
+}
+
+#[test]
+fn holdout_scope_pair_refuses_swapped_roles() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let wrong_selection = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::Holdout,
+        &input,
+        0..80,
+    )
+    .expect("valid range");
+    let wrong_holdout = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::InSample,
+        &input,
+        80..100,
+    )
+    .expect("valid range");
+
+    let error = validate_discovery_scope_pair(&input, &wrong_selection, Some(&wrong_holdout))
+        .expect_err("swapped selection/holdout roles must be refused");
+
+    assert!(
+        error.to_string().contains("role"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn holdout_scope_pair_refuses_gap_and_overlap() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let holdout = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::Holdout,
+        &input,
+        80..100,
+    )
+    .expect("valid holdout range");
+
+    for (name, selection_range) in [("gap", 0..79), ("overlap", 0..81)] {
+        let selection = CanonicalSearchArtifactScopeV2::from_run_input_range(
+            CanonicalSearchWindowRoleV1::InSample,
+            &input,
+            selection_range,
+        )
+        .expect("valid selection range");
+        let error = validate_discovery_scope_pair(&input, &selection, Some(&holdout))
+            .expect_err("non-contiguous selection/holdout scopes must be refused");
+        assert!(
+            error.to_string().contains("contiguous"),
+            "{name} produced unexpected error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn holdout_constructor_refuses_empty_or_too_short_windows() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+
+    let empty_selection = CanonicalDiscoveryRunInputs::with_holdout_at(&input, 0)
+        .expect_err("empty in-sample window must be refused");
+    assert!(
+        empty_selection.to_string().contains("empty"),
+        "unexpected error: {empty_selection:#}"
+    );
+
+    let too_short = CanonicalDiscoveryRunInputs::with_holdout_at(&input, 63)
+        .expect_err("fewer than 64 in-sample rows must be refused");
+    assert!(
+        too_short.to_string().contains("at least 64"),
+        "unexpected error: {too_short:#}"
+    );
+
+    let empty_holdout = CanonicalDiscoveryRunInputs::with_holdout_at(&input, 100)
+        .expect_err("missing holdout suffix must be refused");
+    assert!(
+        empty_holdout.to_string().contains("holdout")
+            && empty_holdout.to_string().contains("empty"),
+        "unexpected error: {empty_holdout:#}"
+    );
+}
+
 fn profitable_gene(strategy_id: &str) -> Gene {
     Gene {
         strategy_id: strategy_id.to_string(),
@@ -55,6 +294,10 @@ fn temp_path(name: &str) -> std::path::PathBuf {
 #[test]
 fn empty_portfolio_is_an_explicit_error() {
     let result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: vec![Gene::default()],
@@ -68,7 +311,7 @@ fn empty_portfolio_is_an_explicit_error() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
 
     let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -84,6 +327,10 @@ fn empty_portfolio_is_an_explicit_error() {
 #[test]
 fn non_empty_portfolio_is_accepted() {
     let result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: vec![Gene::default()],
         candidates: vec![Gene::default()],
@@ -97,7 +344,7 @@ fn non_empty_portfolio_is_accepted() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
 
     ensure_non_empty_portfolio(&result, "EURUSD M1").expect("expected non-empty portfolio to pass");
@@ -111,25 +358,8 @@ fn candidate_truncation_honors_small_explicit_limits() {
     assert_eq!(candidate_truncation_limit(5, 0), 0);
 }
 
-// F-303 (2026-05-28): test asserts `portfolio.len() == 1` from a
-// 100-bar EURUSD M1 synthetic fixture + 2 hand-crafted `profitable_gene`
-// candidates. After the recent quality-gate additions (MC perturbation,
-// spread sensitivity, regime robustness) the 100-bar fixture is too
-// small for any candidate to survive ALL downstream gates — both
-// candidates end up filtered to 0 portfolio.
-//
-// Two options to fix:
-//   1. Grow the fixture to ~2000+ bars so MC/sensitivity/regime have
-//      enough sample to evaluate (large diff to test-fixtures crate).
-//   2. Stub the new gates to no-op when the input is < N bars (would
-//      hide real regressions on real-data discovery runs).
-//
-// Neither is in scope for the F-303 test-suite cleanup. Mark
-// `#[ignore]` with this note so `cargo test` is clean while a
-// follow-up can grow the fixture properly.
 #[test]
-#[ignore = "F-303: fixture-too-small for current quality gates; needs ≥2000-bar fixture (separate task)"]
-fn finalize_candidates_with_progress_emits_filter_and_portfolio_milestones() {
+fn finalize_candidates_emits_selection_milestones_before_broker_truth_refusal() {
     let features = sample_feature_frame();
     let ohlcv = sample_ohlcv();
     let config = DiscoveryConfig {
@@ -150,37 +380,79 @@ fn finalize_candidates_with_progress_emits_filter_and_portfolio_milestones() {
         },
         ..DiscoveryConfig::default()
     };
-    let candidates = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
+    // `profitable_gene` is also a compact artifact fixture and intentionally
+    // uses broad +/-0.5 thresholds. The canonical EURUSD sample's first
+    // feature is `close_minus_open`, whose real magnitude is much smaller, so
+    // those artifact-only thresholds produce no signals at all. Pin this
+    // finalization test to two otherwise-identical genes that actually cross
+    // the canonical feature around zero; their identical signals then exercise
+    // the intended correlation-pruning milestone.
+    let mut alpha_1 = profitable_gene("alpha-1");
+    alpha_1.long_threshold = 0.0;
+    alpha_1.short_threshold = 0.0;
+    let mut alpha_2 = profitable_gene("alpha-2");
+    alpha_2.long_threshold = 0.0;
+    alpha_2.short_threshold = 0.0;
+    let candidates = vec![alpha_1, alpha_2];
+    let signal_config = config.evaluation_config_with_smc_gate(ohlcv.close.last().copied(), 0.75);
+    let candidate_signals = candidates
+        .iter()
+        .map(|gene| {
+            signals_for_gene_full(&features, &ohlcv, gene, &signal_config)
+                .expect("milestone fixture signal synthesis")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        candidate_signals
+            .iter()
+            .all(|signals| signals.iter().any(|signal| *signal != 0)),
+        "milestone genes must reach the min-trades screen"
+    );
+    assert_eq!(
+        candidate_signals[0], candidate_signals[1],
+        "the second milestone gene must be rejected by correlation"
+    );
     let mut progress_events = Vec::new();
+    let input = sample_run_input(&features, &ohlcv);
+    let selection_scope = CanonicalSearchArtifactScopeV2::from_run_input(
+        CanonicalSearchWindowRoleV1::DiscoveryInput,
+        &input,
+    )
+    .expect("canonical full discovery test scope");
+    let strict_device_admission = crate::acquire_strict_discovery_device_admission_v1()
+        .expect("real strict device admission for milestone fixture");
+    let population_execution_run =
+        crate::population_execution_evidence_v1::begin_exact_population_execution_run_v1(
+            strict_device_admission,
+            &selection_scope,
+            &features,
+            &ohlcv,
+        )
+        .expect("seal milestone fixture population evidence");
 
     let mut funnel = crate::funnel_profile::FunnelProfile::new("EURUSD", "M1");
-    let result = finalize_candidates_with_progress(
+    let error = finalize_candidates_with_progress(
         candidates,
         &features,
         &ohlcv,
+        input.receipt(),
+        &selection_scope,
+        None,
+        "fnv64:0123456789abcdef",
         &config,
         0.75,
         features.names.clone(),
+        &population_execution_run,
         &mut funnel,
         |event| progress_events.push(event),
     )
-    .expect("candidate finalization should succeed");
-
-    assert_eq!(result.candidates.len(), 2);
-    assert_eq!(result.portfolio.len(), 1);
-    assert_eq!(
-        result.canonical_backtest_artifacts.len(),
-        result.portfolio.len()
+    .expect_err("financial validation must require exact broker evidence");
+    assert!(
+        error
+            .to_string()
+            .contains(neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1),
+        "unexpected finalization error: {error:#}"
     );
-    assert_eq!(
-        result.walkforward_validation_artifacts.len(),
-        result.portfolio.len()
-    );
-    assert_eq!(
-        result.validation_gates.canonical_backtest_artifacts,
-        result.portfolio.len()
-    );
-    assert!(result.validation_gates.temporal_contract_hash.is_some());
     assert!(progress_events.iter().any(|event| matches!(
         event,
         DiscoveryProgress::CandidatesRanked { candidate_count, truncated_to }
@@ -196,16 +468,21 @@ fn finalize_candidates_with_progress_emits_filter_and_portfolio_milestones() {
         DiscoveryProgress::PortfolioSelected { portfolio_size, rejected_by_correlation, target_portfolio }
             if *portfolio_size == 1 && *rejected_by_correlation == 1 && *target_portfolio == 2
     )));
-    assert!(progress_events.iter().any(|event| matches!(
-        event,
-        DiscoveryProgress::Completed { candidate_count, filtered_count, portfolio_size }
-            if *candidate_count == 2 && *filtered_count == 2 && *portfolio_size == 1
-    )));
+    assert!(
+        !progress_events
+            .iter()
+            .any(|event| matches!(event, DiscoveryProgress::Completed { .. })),
+        "broker-truth refusal must not emit a successful completion milestone"
+    );
 }
 
 #[test]
 fn portfolio_export_requires_validation_gates() {
     let result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
@@ -219,7 +496,7 @@ fn portfolio_export_requires_validation_gates() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
     let path = temp_path("portfolio-gates");
 
@@ -236,6 +513,10 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
     // portfolio that cleared the window but NOT walkforward+CPCV (the exact
     // shape of the AUDUSD 20-straight-losses incident) must never export.
     let mut result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
@@ -249,7 +530,7 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
     result.validation_gates.prop_firm_window_passed = true;
     result.validation_gates.prop_firm_window_count = 50;
@@ -360,8 +641,23 @@ fn auto_tune_n_windows_scales_with_history() {
 }
 
 #[test]
-fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
+fn holdout_portfolio_export_uses_effective_names_and_stored_selection_scope() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let windows = CanonicalDiscoveryRunInputs::with_holdout(&input)
+        .expect("canonical fixture must produce exact holdout scopes");
+    let selection_scope = windows.selection().scope().clone();
+    let holdout_scope = windows
+        .holdout()
+        .expect("split must contain holdout scope")
+        .scope()
+        .clone();
     let mut result = DiscoveryResult {
+        search_input_receipt: input.receipt().clone(),
+        selection_scope: selection_scope.clone(),
+        holdout_scope: Some(holdout_scope.clone()),
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
@@ -375,7 +671,7 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -385,6 +681,47 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
         .expect("portfolio export should pass once validation gates are true");
     let exported = std::fs::read_to_string(&path).expect("portfolio export should exist");
     assert!(exported.contains("filtered_signal"));
+    let envelope: CanonicalSearchArtifactEnvelopeV2<Vec<serde_json::Value>> =
+        CanonicalSearchArtifactEnvelopeV2::from_json_bytes(exported.as_bytes())
+            .expect("portfolio export must be a strict receipt-bound envelope");
+    assert_eq!(envelope.artifact_kind(), "neoethos.search-portfolio.v1");
+    assert_eq!(envelope.search_config_hash(), result.search_config_hash);
+    assert_eq!(
+        result
+            .selection_scope()
+            .expect("valid stored selection scope"),
+        &selection_scope
+    );
+    assert_eq!(
+        result.holdout_scope().expect("valid stored holdout scope"),
+        Some(&holdout_scope)
+    );
+    assert_eq!(
+        envelope.scope(),
+        result
+            .selection_scope()
+            .expect("valid stored selection scope")
+    );
+    assert_eq!(
+        envelope.scope().evaluated_window().role(),
+        CanonicalSearchWindowRoleV1::InSample
+    );
+    envelope
+        .scope()
+        .validate_against_receipt(&result.search_input_receipt)
+        .expect("portfolio envelope must retain the exact discovery receipt");
+
+    let mut swapped = result.clone();
+    swapped.selection_scope = holdout_scope;
+    swapped.holdout_scope = Some(selection_scope);
+    let invalid_path = temp_path("portfolio-export-swapped-holdout-scopes");
+    let error = save_portfolio_json(&invalid_path, &swapped)
+        .expect_err("writer must refuse public literals with swapped stored scope roles");
+    assert!(
+        error.to_string().contains("role"),
+        "unexpected swapped-scope error: {error:#}"
+    );
+    assert!(!invalid_path.exists());
 
     let _ = std::fs::remove_file(path);
 }
@@ -392,6 +729,10 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
 #[test]
 fn discovery_profile_exports_validation_gate_status() {
     let mut result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: vec![profitable_gene("alpha-1")],
@@ -405,7 +746,7 @@ fn discovery_profile_exports_validation_gate_status() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -432,15 +773,14 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("forex-discovery-{name}-{unique}"))
 }
 
-fn sample_temporal_contract() -> TemporalFeatureContract {
-    discovery_temporal_contract(&DiscoveryConfig::default(), &["signal".to_string()])
-        .expect("temporal contract for default discovery config")
-}
-
-fn sample_canonical_backtest_artifact(strategy_hash: &str) -> CanonicalBacktestArtifactFile {
-    let contract = sample_temporal_contract();
-    let scope = CanonicalBacktestScope::new("dataset", "evaluation", strategy_hash, &contract);
-    CanonicalBacktestArtifactFile::new(scope, BacktestMetrics::from_metric_array([0.0; 11]))
+fn sample_canonical_backtest_artifact(gene: &Gene) -> CanonicalBacktestArtifactFile {
+    CanonicalBacktestArtifactFile::new(
+        sample_discovery_selection_scope(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        gene,
+        BacktestMetrics::from_metric_array([0.0; 11]),
+    )
+    .expect("strict canonical fixture")
 }
 
 fn sample_walkforward_summary() -> WalkforwardSummary {
@@ -460,36 +800,891 @@ fn sample_walkforward_summary() -> WalkforwardSummary {
     }
 }
 
-fn sample_walkforward_validation_artifact(
-    strategy_hash: &str,
-) -> WalkforwardValidationArtifactFile {
-    let contract = sample_temporal_contract();
-    let scope =
-        WalkforwardValidationScope::for_strategy("dataset", "evaluation", strategy_hash, &contract);
-    WalkforwardValidationArtifactFile::new(scope, sample_walkforward_summary())
+const STRICT_VALIDATION_SEARCH_CONFIG_HASH: &str = "fnv64:0123456789abcdef";
+
+fn strict_forward_test_summary(
+    net_profit: f64,
+    trade_count: usize,
+) -> crate::validation::ForwardTestSummary {
+    let mut metrics = [0.0_f64; 11];
+    metrics[0] = net_profit;
+    metrics[8] = trade_count as f64;
+    crate::validation::ForwardTestSummary {
+        bars: 20,
+        metrics: BacktestMetrics::from_metric_array(metrics),
+        span_days: 1.0,
+    }
+}
+
+fn strict_prop_firm_summary(
+    all_rules_passed: bool,
+) -> crate::validation::PropFirmRiskValidationSummary {
+    crate::validation::PropFirmRiskValidationSummary {
+        rules: PropFirmRiskRules::default(),
+        trades_observed: 1,
+        trading_days_observed: 1,
+        max_daily_loss_pct_observed: 0.0,
+        max_overall_drawdown_pct_observed: 0.0,
+        largest_profit_share_observed: 0.0,
+        max_trades_per_day_observed: 1,
+        net_return_pct: 0.01,
+        daily_loss_breach: false,
+        overall_drawdown_breach: false,
+        consistency_violation: false,
+        trade_limit_violation: false,
+        min_trading_days_ok: true,
+        profit_target_met: true,
+        all_rules_passed,
+    }
+}
+
+#[test]
+fn validation_v2_envelopes_bind_selection_holdout_config_and_exact_gene() {
+    let (_receipt, selection_scope, holdout_scope) = sample_split_search_scopes();
+    let gene = profitable_gene("strict-alpha");
+
+    let canonical = CanonicalBacktestArtifactFile::new(
+        selection_scope.clone(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &gene,
+        BacktestMetrics::from_metric_array([0.0; 11]),
+    )
+    .expect("canonical v2 envelope");
+    let walkforward = WalkforwardValidationArtifactFile::new(
+        selection_scope.clone(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &gene,
+        sample_walkforward_summary(),
+    )
+    .expect("walkforward v2 envelope");
+    let forward = ForwardTestValidationArtifactFile::new(
+        holdout_scope.clone(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &gene,
+        strict_forward_test_summary(5.0, 1),
+    )
+    .expect("forward-test v2 envelope");
+    let prop = PropFirmRiskValidationArtifactFile::new(
+        holdout_scope.clone(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &gene,
+        strict_prop_firm_summary(true),
+    )
+    .expect("prop-firm v2 envelope");
+
+    for artifact in [canonical.scope(), walkforward.scope()] {
+        assert_eq!(artifact, &selection_scope);
+    }
+    for artifact in [forward.scope(), prop.scope()] {
+        assert_eq!(artifact, &holdout_scope);
+    }
+    for config_hash in [
+        canonical.search_config_hash(),
+        walkforward.search_config_hash(),
+        forward.search_config_hash(),
+        prop.search_config_hash(),
+    ] {
+        assert_eq!(config_hash, STRICT_VALIDATION_SEARCH_CONFIG_HASH);
+    }
+
+    let expected_gene_hash = crate::artifact_io::stable_json_hash(&gene).expect("exact gene hash");
+    for identity in [
+        canonical.strategy_identity(),
+        walkforward.strategy_identity(),
+        forward.strategy_identity(),
+        prop.strategy_identity(),
+    ] {
+        assert_eq!(identity.strategy_id(), gene.strategy_id);
+        assert_eq!(identity.exact_gene_hash(), expected_gene_hash);
+    }
+
+    canonical
+        .validate_against(
+            &selection_scope,
+            STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+            &gene,
+        )
+        .expect("canonical exact authority must validate");
+    walkforward
+        .validate_against(
+            &selection_scope,
+            STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+            &gene,
+        )
+        .expect("walkforward exact authority must validate");
+    forward
+        .validate_against(&holdout_scope, STRICT_VALIDATION_SEARCH_CONFIG_HASH, &gene)
+        .expect("forward-test exact authority must validate");
+    prop.validate_against(&holdout_scope, STRICT_VALIDATION_SEARCH_CONFIG_HASH, &gene)
+        .expect("prop-firm exact authority must validate");
+}
+
+#[test]
+fn validation_v2_refuses_role_config_and_strategy_substitution() {
+    let (_receipt, selection_scope, holdout_scope) = sample_split_search_scopes();
+    let gene = profitable_gene("strict-alpha");
+    let other_gene = profitable_gene("strict-beta");
+    let artifact = CanonicalBacktestArtifactFile::new(
+        selection_scope.clone(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &gene,
+        BacktestMetrics::from_metric_array([0.0; 11]),
+    )
+    .expect("canonical v2 envelope");
+
+    assert!(
+        CanonicalBacktestArtifactFile::new(
+            holdout_scope.clone(),
+            STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+            &gene,
+            BacktestMetrics::from_metric_array([0.0; 11]),
+        )
+        .is_err(),
+        "canonical evidence must never accept a holdout role"
+    );
+    assert!(
+        ForwardTestValidationArtifactFile::new(
+            selection_scope.clone(),
+            STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+            &gene,
+            strict_forward_test_summary(5.0, 1),
+        )
+        .is_err(),
+        "forward evidence must never accept a selection role"
+    );
+    assert!(
+        artifact
+            .validate_against(&holdout_scope, STRICT_VALIDATION_SEARCH_CONFIG_HASH, &gene,)
+            .is_err(),
+        "scope substitution must fail"
+    );
+    assert!(
+        artifact
+            .validate_against(&selection_scope, "fnv64:fedcba9876543210", &gene)
+            .is_err(),
+        "search-config substitution must fail"
+    );
+    assert!(
+        artifact
+            .validate_against(
+                &selection_scope,
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                &other_gene,
+            )
+            .is_err(),
+        "strategy substitution must fail"
+    );
+}
+
+#[test]
+fn validation_v2_wire_rejects_unknown_fields_and_legacy_weak_scope() {
+    let (_receipt, selection_scope, _holdout_scope) = sample_split_search_scopes();
+    let gene = profitable_gene("strict-alpha");
+    let artifact = CanonicalBacktestArtifactFile::new(
+        selection_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &gene,
+        BacktestMetrics::from_metric_array([0.0; 11]),
+    )
+    .expect("canonical v2 envelope");
+    let bytes = artifact.to_json_bytes().expect("strict v2 bytes");
+    let text = std::str::from_utf8(&bytes).expect("JSON must be UTF-8");
+    assert!(text.contains("search_config_hash"));
+    assert!(text.contains("exact_gene_hash"));
+    assert!(!text.contains("dataset_hash"));
+    assert!(!text.contains("evaluation_config_hash"));
+    assert!(!text.contains("temporal_scope"));
+
+    let mut unknown_outer: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parse v2 envelope fixture");
+    unknown_outer["legacy_dataset_hash"] = serde_json::json!("weak");
+    let unknown_outer = serde_json::to_vec(&unknown_outer).expect("serialize unknown outer");
+    assert!(CanonicalBacktestArtifactFile::from_json_bytes(&unknown_outer).is_err());
+
+    let mut unknown_payload: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parse v2 envelope fixture");
+    unknown_payload["payload"]["legacy_eval_hash"] = serde_json::json!("weak");
+    let unknown_payload = serde_json::to_vec(&unknown_payload).expect("serialize unknown payload");
+    assert!(CanonicalBacktestArtifactFile::from_json_bytes(&unknown_payload).is_err());
+
+    let legacy = serde_json::json!({
+        "artifact_kind": "canonical_strategy_backtest_artifact",
+        "artifact_schema_version": 1,
+        "scope": {
+            "dataset_hash": "weak-dataset",
+            "evaluation_config_hash": "weak-config",
+            "strategy_hash": "weak-strategy",
+            "temporal_scope": {
+                "temporal_contract_hash": "t",
+                "timestamp_policy_hash": "ts",
+                "feature_availability_policy_hash": "fa",
+                "label_policy_hash": "lp"
+            }
+        },
+        "metrics": BacktestMetrics::from_metric_array([0.0; 11])
+    });
+    let error = CanonicalBacktestArtifactFile::from_json_bytes(
+        &serde_json::to_vec(&legacy).expect("serialize legacy fixture"),
+    )
+    .expect_err("legacy weak v1 must fail closed");
+    let message = error.to_string();
+    assert!(message.contains("legacy") || message.contains("version 1"));
+    assert!(
+        message.contains("regenerate"),
+        "unexpected error: {message}"
+    );
+}
+
+fn strict_split_validation_result(portfolio: Vec<Gene>) -> DiscoveryResult {
+    let (receipt, selection_scope, holdout_scope) = sample_split_search_scopes();
+    let canonical_backtest_artifacts = portfolio
+        .iter()
+        .map(|gene| {
+            CanonicalBacktestArtifactFile::new(
+                selection_scope.clone(),
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                gene,
+                BacktestMetrics::from_metric_array([0.0; 11]),
+            )
+            .expect("canonical v2 fixture")
+        })
+        .collect();
+    let walkforward_validation_artifacts = portfolio
+        .iter()
+        .map(|gene| {
+            WalkforwardValidationArtifactFile::new(
+                selection_scope.clone(),
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                gene,
+                sample_walkforward_summary(),
+            )
+            .expect("walkforward v2 fixture")
+        })
+        .collect();
+    let forward_test_validation_artifacts = portfolio
+        .iter()
+        .map(|gene| {
+            ForwardTestValidationArtifactFile::new(
+                holdout_scope.clone(),
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                gene,
+                strict_forward_test_summary(5.0, 1),
+            )
+            .expect("forward-test v2 fixture")
+        })
+        .collect();
+    let prop_firm_validation_artifacts = portfolio
+        .iter()
+        .map(|gene| {
+            PropFirmRiskValidationArtifactFile::new(
+                holdout_scope.clone(),
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                gene,
+                strict_prop_firm_summary(true),
+            )
+            .expect("prop-firm v2 fixture")
+        })
+        .collect();
+    let mut validation_gates = DiscoveryValidationGates::pending();
+    validation_gates.walkforward_passed = true;
+    validation_gates.cpcv_passed = true;
+    DiscoveryResult {
+        search_input_receipt: receipt,
+        selection_scope,
+        holdout_scope: Some(holdout_scope),
+        search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_owned(),
+        cost_band_by_strategy: Vec::new(),
+        portfolio,
+        candidates: Vec::new(),
+        quality_metrics: Vec::new(),
+        logged_trades: Vec::new(),
+        effective_feature_names: vec!["signal".to_owned()],
+        validation_gates,
+        canonical_backtest_artifacts,
+        walkforward_validation_artifacts,
+        forward_test_validation_artifacts,
+        prop_firm_validation_artifacts,
+        funnel_profile: None,
+        effective_smc_gate_threshold: f64::NAN,
+    }
+}
+
+fn snapshot_tree_bytes(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        let mut entries = std::fs::read_dir(dir)
+            .expect("snapshot directory must be readable")
+            .map(|entry| entry.expect("snapshot entry must be readable"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).expect("snapshot entry metadata must be readable");
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "an authoritative snapshot must never contain a symlink: {}",
+                path.display()
+            );
+            if metadata.is_dir() {
+                visit(root, &path, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(root)
+                        .expect("snapshot entry must remain below root")
+                        .to_path_buf(),
+                    std::fs::read(&path).expect("snapshot member bytes must be readable"),
+                );
+            }
+        }
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[test]
+fn validation_snapshot_commits_strict_content_addressed_generation_and_reuses_it_byte_for_byte() {
+    let root = temp_dir("strict-validation-snapshot-idempotent");
+    let alpha = profitable_gene("strict-alpha");
+    let beta = profitable_gene("strict-beta");
+    let result = strict_split_validation_result(vec![beta.clone(), alpha.clone()]);
+
+    let first = crate::save_discovery_validation_snapshot(&root, &result)
+        .expect("the complete result must commit one strict snapshot");
+    assert!(
+        first.generation_id().starts_with("fnv64-"),
+        "the immutable generation leaf must be content-addressed"
+    );
+    let current_path = root.join("CURRENT.json");
+    let current_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&current_path).expect("CURRENT must be committed last"),
+    )
+    .expect("CURRENT must be strict JSON");
+    let current = current_json
+        .as_object()
+        .expect("CURRENT must be one small object");
+    assert_eq!(
+        current
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["generation_id", "manifest_hash", "schema_version"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "CURRENT may select a generation but must not duplicate manifest authority"
+    );
+
+    let loaded = crate::load_discovery_validation_snapshot(&root)
+        .expect("the committed snapshot must validate on read");
+    loaded
+        .validate_against(&result)
+        .expect("reader must revalidate exact scopes/config/genes/evidence");
+    assert_eq!(loaded.pointer(), &first);
+    assert_eq!(loaded.manifest().scope(), result.selection_scope().unwrap());
+    assert_eq!(
+        loaded.manifest().search_config_hash(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH
+    );
+    assert_eq!(
+        loaded.manifest().payload().holdout_scope(),
+        result.holdout_scope().unwrap().unwrap()
+    );
+    let strategies = loaded.manifest().payload().strategies();
+    assert_eq!(strategies.len(), 2);
+    let strategy_hashes = strategies
+        .iter()
+        .map(|entry| entry.strategy_identity().exact_gene_hash())
+        .collect::<Vec<_>>();
+    assert!(strategy_hashes.windows(2).all(|pair| pair[0] < pair[1]));
+    for entry in strategies {
+        entry
+            .strategy_identity()
+            .validate_against(entry.gene())
+            .expect("the manifest must carry each exact full gene");
+        assert_eq!(entry.members().len(), 4, "one exact member per kind");
+    }
+
+    let manifest_path = loaded.generation_dir().join("manifest.json");
+    let manifest_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path).expect("generation manifest must exist"),
+    )
+    .expect("generation manifest must be JSON");
+    assert!(
+        manifest_json
+            .get("payload")
+            .and_then(|payload| payload.get("manifest_hash"))
+            .is_none(),
+        "the manifest hash must live only in CURRENT and cannot hash itself"
+    );
+    assert_eq!(
+        crate::artifact_io::stable_json_hash(&manifest_json).expect("manifest hash"),
+        first.manifest_hash()
+    );
+
+    let before = snapshot_tree_bytes(&root);
+    let second = crate::save_discovery_validation_snapshot(&root, &result)
+        .expect("an exact existing immutable generation must be verified and reused");
+    assert_eq!(second, first);
+    assert_eq!(
+        snapshot_tree_bytes(&root),
+        before,
+        "idempotent reuse is byte exact"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn validation_snapshot_new_current_has_no_stale_members_from_the_previous_generation() {
+    let root = temp_dir("strict-validation-snapshot-replacement");
+    let alpha = profitable_gene("strict-alpha");
+    let beta = profitable_gene("strict-beta");
+    let first_result = strict_split_validation_result(vec![alpha.clone(), beta]);
+    let second_result = strict_split_validation_result(vec![alpha]);
+
+    let first =
+        crate::save_discovery_validation_snapshot(&root, &first_result).expect("first generation");
+    let second = crate::save_discovery_validation_snapshot(&root, &second_result)
+        .expect("replacement generation");
+    assert_ne!(first.generation_id(), second.generation_id());
+    assert!(
+        root.join("generations")
+            .join(first.generation_id())
+            .is_dir(),
+        "old immutable generations may remain for audit but are not current"
+    );
+
+    let loaded = crate::load_discovery_validation_snapshot(&root)
+        .expect("CURRENT must select only the replacement generation");
+    assert_eq!(loaded.pointer(), &second);
+    loaded
+        .validate_against(&second_result)
+        .expect("replacement must validate exactly");
+    assert_eq!(loaded.manifest().payload().strategies().len(), 1);
+    assert_eq!(
+        loaded.manifest().payload().all_members().len(),
+        5,
+        "four per-strategy artifacts plus one promotion summary"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn validation_snapshot_failures_before_current_swap_preserve_previous_authority() {
+    let root = temp_dir("strict-validation-snapshot-fault");
+    let original_result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
+    let replacement_result = strict_split_validation_result(vec![profitable_gene("strict-beta")]);
+    let original = crate::save_discovery_validation_snapshot(&root, &original_result)
+        .expect("original generation");
+    let current_path = root.join("CURRENT.json");
+    let current_before = std::fs::read(&current_path).expect("original CURRENT");
+
+    for fault in [
+        crate::validation_snapshot::ValidationSnapshotTestFault::AfterFirstMemberWrite,
+        crate::validation_snapshot::ValidationSnapshotTestFault::BeforeCurrentSwap,
+    ] {
+        let error = crate::validation_snapshot::save_discovery_validation_snapshot_with_test_fault(
+            &root,
+            &replacement_result,
+            fault,
+        )
+        .expect_err("an injected staging/commit fault must fail loudly");
+        assert!(error.to_string().contains("injected"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&current_path).expect("CURRENT must remain readable"),
+            current_before,
+            "CURRENT is swapped last and must remain byte-identical on failure"
+        );
+        let loaded = crate::load_discovery_validation_snapshot(&root)
+            .expect("the previous generation must remain authoritative");
+        assert_eq!(loaded.pointer(), &original);
+        loaded.validate_against(&original_result).unwrap();
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn validation_snapshot_existing_content_address_is_verified_never_overwritten() {
+    let root = temp_dir("strict-validation-snapshot-no-overwrite");
+    let old_result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
+    let current_result = strict_split_validation_result(vec![profitable_gene("strict-beta")]);
+
+    let old_ref =
+        crate::save_discovery_validation_snapshot(&root, &old_result).expect("old generation");
+    let old_loaded = crate::load_discovery_validation_snapshot(&root).unwrap();
+    let relative_member = old_loaded.manifest().payload().strategies()[0].members()[0]
+        .relative_path()
+        .to_path_buf();
+    let current_ref = crate::save_discovery_validation_snapshot(&root, &current_result)
+        .expect("current generation");
+    let tampered_path = root
+        .join("generations")
+        .join(old_ref.generation_id())
+        .join(relative_member);
+    let mut tampered_bytes = std::fs::read(&tampered_path).unwrap();
+    tampered_bytes.extend_from_slice(b" ");
+    std::fs::write(&tampered_path, &tampered_bytes).unwrap();
+
+    let error = crate::save_discovery_validation_snapshot(&root, &old_result)
+        .expect_err("an existing content address with different bytes must refuse");
+    assert!(
+        error.to_string().contains("existing immutable generation"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read(&tampered_path).unwrap(),
+        tampered_bytes,
+        "the writer must never repair by overwriting an immutable generation"
+    );
+    let loaded = crate::load_discovery_validation_snapshot(&root)
+        .expect("failed reuse must leave the prior CURRENT authoritative");
+    assert_eq!(loaded.pointer(), &current_ref);
+    loaded.validate_against(&current_result).unwrap();
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn validation_snapshot_reader_rejects_extra_members_unknown_current_fields_and_unsafe_paths() {
+    for unsafe_path in [
+        std::path::Path::new("../escape.json"),
+        std::path::Path::new("nested/../../escape.json"),
+        std::path::Path::new("."),
+        std::path::Path::new(""),
+        std::path::Path::new("/absolute.json"),
+        std::path::Path::new(r"C:\\absolute.json"),
+    ] {
+        assert!(
+            crate::validation_snapshot::validate_snapshot_relative_path(unsafe_path).is_err(),
+            "unsafe snapshot path must refuse: {}",
+            unsafe_path.display()
+        );
+    }
+    crate::validation_snapshot::validate_snapshot_relative_path(std::path::Path::new(
+        "canonical/fnv64-0123456789abcdef.json",
+    ))
+    .expect("normal safe relative member path");
+
+    let extra_root = temp_dir("strict-validation-snapshot-extra-member");
+    let result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
+    crate::save_discovery_validation_snapshot(&extra_root, &result).unwrap();
+    let loaded = crate::load_discovery_validation_snapshot(&extra_root).unwrap();
+    std::fs::write(loaded.generation_dir().join("unexpected.json"), b"{}\n").unwrap();
+    let extra_error = crate::load_discovery_validation_snapshot(&extra_root)
+        .expect_err("unlisted generation members must fail closed");
+    assert!(extra_error.to_string().contains("extra"), "{extra_error:#}");
+
+    let missing_root = temp_dir("strict-validation-snapshot-missing-member");
+    crate::save_discovery_validation_snapshot(&missing_root, &result).unwrap();
+    let loaded = crate::load_discovery_validation_snapshot(&missing_root).unwrap();
+    let missing_member = loaded.manifest().payload().strategies()[0].members()[0]
+        .relative_path()
+        .to_path_buf();
+    std::fs::remove_file(loaded.generation_dir().join(missing_member)).unwrap();
+    let missing_error = crate::load_discovery_validation_snapshot(&missing_root)
+        .expect_err("a missing listed generation member must fail closed");
+    assert!(
+        missing_error.to_string().contains("missing"),
+        "{missing_error:#}"
+    );
+
+    let pointer_root = temp_dir("strict-validation-snapshot-current-unknown");
+    crate::save_discovery_validation_snapshot(&pointer_root, &result).unwrap();
+    let current_path = pointer_root.join("CURRENT.json");
+    let mut current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&current_path).unwrap()).unwrap();
+    current
+        .as_object_mut()
+        .unwrap()
+        .insert("legacy_fallback".to_owned(), serde_json::Value::Bool(true));
+    std::fs::write(&current_path, serde_json::to_vec_pretty(&current).unwrap()).unwrap();
+    let pointer_error = crate::load_discovery_validation_snapshot(&pointer_root)
+        .expect_err("CURRENT must deny unknown fields");
+    assert!(
+        pointer_error.to_string().contains("unknown field"),
+        "{pointer_error:#}"
+    );
+
+    let _ = std::fs::remove_dir_all(extra_root);
+    let _ = std::fs::remove_dir_all(missing_root);
+    let _ = std::fs::remove_dir_all(pointer_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn validation_snapshot_member_resolution_refuses_symlink_traversal() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir("strict-validation-snapshot-symlink");
+    let generation = root.join("generation");
+    std::fs::create_dir_all(&generation).unwrap();
+    let outside = root.join("outside.json");
+    std::fs::write(&outside, b"{}\n").unwrap();
+    symlink(&outside, generation.join("member.json")).unwrap();
+
+    let error = crate::validation_snapshot::resolve_snapshot_member_without_symlinks(
+        &generation,
+        std::path::Path::new("member.json"),
+    )
+    .expect_err("snapshot members may not traverse a symlink");
+    assert!(error.to_string().contains("symlink"), "{error:#}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn orchestration_and_cli_publish_only_complete_snapshots_including_every_streaming_batch() {
+    let orchestration = include_str!("orchestration.rs");
+    assert_eq!(
+        orchestration
+            .match_indices("save_discovery_validation_snapshot(")
+            .count(),
+        1,
+        "batch orchestration must have one canonical snapshot writer"
+    );
+    for superseded in [
+        "save_canonical_backtest_artifacts(",
+        "save_walkforward_validation_artifacts(",
+        "save_forward_test_validation_artifacts(",
+        "save_prop_firm_validation_artifacts(",
+        "save_promotion_summary_json(",
+    ] {
+        assert!(
+            !orchestration.contains(superseded),
+            "orchestration must not publish parallel authority via {superseded}"
+        );
+    }
+
+    let cli = include_str!("../../neoethos-cli/src/main.rs");
+    let streaming_loop = cli
+        .find("for (cursor, batch_result) in &extra")
+        .expect("streaming extra-batch loop");
+    let run_level_publication = cli[streaming_loop..]
+        .find("StreamingRunPortfolio {")
+        .map(|offset| streaming_loop + offset)
+        .expect("run-level streaming publication");
+    let streaming_persistence = &cli[streaming_loop..run_level_publication];
+    assert!(
+        streaming_persistence.contains("save_discovery_validation_snapshot"),
+        "every extra surviving batch needs its own strict snapshot before run-level publication"
+    );
+    assert!(
+        cli.contains("StreamingPromotionAuthorityV1::PerBatchLocalOnly"),
+        "canonical index remapping changes exact gene hashes, so the run artifact must name the batch-local-only authority boundary"
+    );
+    assert!(
+        cli.match_indices("save_discovery_validation_snapshot")
+            .count()
+            >= 2,
+        "CLI must snapshot both the primary and every extra result"
+    );
+}
+
+#[test]
+fn validation_set_refuses_extra_strategy_before_hash_pass_or_write() {
+    let alpha = profitable_gene("strict-alpha");
+    let beta = profitable_gene("strict-beta");
+    let mut result = strict_split_validation_result(vec![alpha]);
+    result.canonical_backtest_artifacts.push(
+        CanonicalBacktestArtifactFile::new(
+            result.selection_scope().expect("selection scope").clone(),
+            STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+            &beta,
+            BacktestMetrics::from_metric_array([0.0; 11]),
+        )
+        .expect("extra canonical fixture"),
+    );
+
+    let hash_error = discovery_per_kind_evidence_hashes(&result)
+        .expect_err("hashing must validate exact final-strategy coverage first");
+    assert!(hash_error.to_string().contains("extra"), "{hash_error:#}");
+
+    let evidence_error = live_validation_evidence_from_discovery(&result)
+        .expect_err("pass/fail aggregation must validate exact bindings first");
+    assert!(
+        evidence_error.to_string().contains("extra"),
+        "{evidence_error:#}"
+    );
+
+    let dir = temp_dir("strict-extra-strategy");
+    let write_error = save_canonical_backtest_artifacts(&dir, &result)
+        .expect_err("writer must validate the whole set before writing");
+    assert!(write_error.to_string().contains("extra"), "{write_error:#}");
+    assert!(
+        !dir.exists(),
+        "invalid evidence must create no output directory"
+    );
+}
+
+#[test]
+fn validation_hashes_are_independent_of_parallel_artifact_completion_order() {
+    let alpha = profitable_gene("strict-alpha");
+    let beta = profitable_gene("strict-beta");
+    let ordered = strict_split_validation_result(vec![alpha, beta]);
+    let mut reversed = ordered.clone();
+    reversed.canonical_backtest_artifacts.reverse();
+    reversed.walkforward_validation_artifacts.reverse();
+    reversed.forward_test_validation_artifacts.reverse();
+    reversed.prop_firm_validation_artifacts.reverse();
+
+    let ordered_hashes =
+        discovery_per_kind_evidence_hashes(&ordered).expect("ordered exact evidence hashes");
+    let reversed_hashes =
+        discovery_per_kind_evidence_hashes(&reversed).expect("reversed exact evidence hashes");
+    assert_eq!(ordered_hashes, reversed_hashes);
+}
+
+#[test]
+fn final_portfolio_prunes_selection_artifacts_by_exact_strategy_identity() {
+    let alpha = profitable_gene("strict-alpha");
+    let beta = profitable_gene("strict-beta");
+    let result = strict_split_validation_result(vec![alpha.clone(), beta]);
+    let mut canonical = result.canonical_backtest_artifacts;
+    let mut walkforward = result.walkforward_validation_artifacts;
+
+    retain_selection_validation_artifacts_for_final_portfolio(
+        std::slice::from_ref(&alpha),
+        &mut canonical,
+        &mut walkforward,
+    )
+    .expect("selection artifacts must prune to the final portfolio");
+
+    assert_eq!(canonical.len(), 1);
+    assert_eq!(walkforward.len(), 1);
+    assert_eq!(
+        canonical[0].strategy_identity().strategy_id(),
+        alpha.strategy_id
+    );
+    assert_eq!(
+        walkforward[0].strategy_identity().strategy_id(),
+        alpha.strategy_id
+    );
+}
+
+#[test]
+fn complete_promotion_evidence_requires_one_artifact_per_kind_and_strategy() {
+    let alpha = profitable_gene("strict-alpha");
+    let mut result = strict_split_validation_result(vec![alpha]);
+    result.prop_firm_validation_artifacts.clear();
+
+    let error = result
+        .validate_complete_promotion_evidence()
+        .expect_err("missing prop evidence must fail closed for promotion");
+    assert!(error.to_string().contains("prop_firm"), "{error:#}");
+    assert!(error.to_string().contains("missing"), "{error:#}");
+}
+
+#[test]
+fn promotion_summary_v3_binds_exact_composite_scopes_and_validated_hashes() {
+    let alpha = profitable_gene("strict-alpha");
+    let result = strict_split_validation_result(vec![alpha.clone()]);
+    let expected_hashes =
+        discovery_per_kind_evidence_hashes(&result).expect("validated evidence hashes");
+    let path = temp_path("strict-promotion-summary-v3");
+
+    save_promotion_summary_json(&path, &result).expect("strict composite promotion summary");
+    let bytes = std::fs::read(&path).expect("read promotion summary v3");
+    let envelope =
+        CanonicalSearchArtifactEnvelopeV2::<PromotionSummaryAuthorityPayloadV3>::from_json_bytes(
+            &bytes,
+        )
+        .expect("strict promotion-summary v3 envelope");
+    envelope
+        .validate_against(
+            PROMOTION_SUMMARY_ARTIFACT_KIND_V3,
+            STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+            &result.search_input_receipt,
+            result
+                .selection_scope()
+                .expect("selection scope")
+                .evaluated_window(),
+        )
+        .expect("outer promotion authority must bind exact selection scope");
+    assert_eq!(
+        envelope.payload().holdout_scope(),
+        result
+            .holdout_scope()
+            .expect("valid result scopes")
+            .expect("promotion requires holdout")
+    );
+    assert_eq!(
+        envelope.payload().validation_evidence_hashes(),
+        &expected_hashes
+    );
+    assert_eq!(envelope.payload().strategy_evidence().len(), 1);
+    assert_eq!(
+        envelope.payload().strategy_evidence()[0]
+            .strategy_identity()
+            .strategy_id(),
+        alpha.strategy_id
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn promotion_summary_v3_validates_everything_before_creating_a_file() {
+    let alpha = profitable_gene("strict-alpha");
+    let mut result = strict_split_validation_result(vec![alpha]);
+    result.forward_test_validation_artifacts.clear();
+    let path = temp_path("strict-promotion-summary-missing-forward");
+
+    let error = save_promotion_summary_json(&path, &result)
+        .expect_err("incomplete composite evidence must fail closed");
+    assert!(error.to_string().contains("forward_test"), "{error:#}");
+    assert!(
+        !path.exists(),
+        "invalid promotion authority must not be written"
+    );
+}
+
+fn sample_walkforward_validation_artifact(gene: &Gene) -> WalkforwardValidationArtifactFile {
+    WalkforwardValidationArtifactFile::new(
+        sample_discovery_selection_scope(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        gene,
+        sample_walkforward_summary(),
+    )
+    .expect("strict walk-forward fixture")
 }
 
 #[test]
 fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("canonical-backtests");
+    let alpha_1 = profitable_gene("alpha-1");
+    let alpha_2 = profitable_gene("alpha-2");
     let result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
-        portfolio: vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")],
+        portfolio: vec![alpha_1.clone(), alpha_2.clone()],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
         logged_trades: Vec::new(),
         effective_feature_names: vec!["signal".to_string()],
         validation_gates: DiscoveryValidationGates::pending(),
         canonical_backtest_artifacts: vec![
-            sample_canonical_backtest_artifact("fnv64:0123456789abcdef"),
-            sample_canonical_backtest_artifact("fnv64:fedcba9876543210"),
+            sample_canonical_backtest_artifact(&alpha_1),
+            sample_canonical_backtest_artifact(&alpha_2),
         ],
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
 
     let written = save_canonical_backtest_artifacts(&dir, &result)
@@ -513,23 +1708,26 @@ fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
 #[test]
 fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("walkforward-validations");
+    let alpha = profitable_gene("alpha-1");
     let result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
-        portfolio: vec![profitable_gene("alpha-1")],
+        portfolio: vec![alpha.clone()],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
         logged_trades: Vec::new(),
         effective_feature_names: vec!["signal".to_string()],
         validation_gates: DiscoveryValidationGates::pending(),
         canonical_backtest_artifacts: Vec::new(),
-        walkforward_validation_artifacts: vec![sample_walkforward_validation_artifact(
-            "fnv64:0011223344556677",
-        )],
+        walkforward_validation_artifacts: vec![sample_walkforward_validation_artifact(&alpha)],
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
 
     let written = save_walkforward_validation_artifacts(&dir, &result)
@@ -551,6 +1749,10 @@ fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
 fn save_canonical_backtest_artifacts_skips_when_empty() {
     let dir = temp_dir("canonical-backtests-empty");
     let result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
@@ -564,7 +1766,7 @@ fn save_canonical_backtest_artifacts_skips_when_empty() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
 
     let written = save_canonical_backtest_artifacts(&dir, &result)
@@ -650,6 +1852,10 @@ fn discovery_profile_exports_runtime_override_resolution() {
         min_history_years: 0,
     };
     let result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: vec![profitable_gene("alpha-1")],
         candidates: Vec::new(),
@@ -663,7 +1869,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
 
     let profile = build_discovery_profile(&config, &result);
@@ -686,7 +1892,7 @@ fn timeframe_group_classifies_multitimeframe_prefixes() {
     assert_eq!(timeframe_group("rsi_14"), None);
     assert_eq!(timeframe_group("macd_signal"), None);
     assert_eq!(timeframe_group("ema_20"), None);
-    assert_eq!(timeframe_group("regime_trend_strength"), None);
+    assert_eq!(timeframe_group("regime_wilder_adx_14_v3"), None);
     // Uppercase base heads that are NOT timeframe labels must not match.
     assert_eq!(timeframe_group("MA_20"), None); // letters then non-digit
     assert_eq!(timeframe_group("MACD_x"), None); // 4 chars, too long
@@ -706,8 +1912,9 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
         let dir = if (i - 1) % 2 == 0 { 1.0 } else { -1.0 };
         close[i] = close[i - 1] * (1.0 + 0.01 * dir);
     }
+    let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(n);
     let ohlcv = Ohlcv {
-        timestamp: Some((0..n as i64).collect()),
+        timestamp: Some(timestamps.clone()),
         open: close.clone(),
         high: close.clone(),
         low: close.clone(),
@@ -726,17 +1933,16 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
     // base_* track the alternating return sign (high |corr|); H*_* are slowly
     // rising near-constant columns (~0 |corr| vs the zero-mean alternation).
     let data = ndarray::Array2::from_shape_fn((n, names.len()), |(i, j)| {
-        let sign = if i % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        let sign = if i % 2 == 0 { 1.0f64 } else { -1.0f64 };
         match j {
             0 | 1 | 2 => sign,
-            _ => 1000.0 + (i as f32) * 0.001,
+            _ => 1000.0 + (i as f64) * 0.001,
         }
     });
-    let frame = FeatureFrame {
-        timestamps: (0..n as i64).collect(),
-        names,
-        data: neoethos_data::FeatureData::InMemory(data),
-    };
+    let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+        timestamps, names, data,
+    )
+    .expect("valid f64 quota fixture");
 
     // This fixture's bars are a pure ±1% alternation with no intrabar range, so
     // nothing ever reaches a 2-ATR barrier and the first-passage label is
@@ -759,7 +1965,8 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
     };
 
     // Legacy (no quota): top-3 by |corr| are the 3 base columns; no HTF.
-    let (legacy, _) = prefilter_features(&frame, &ohlcv, &spec(3, 0));
+    let (legacy, _) =
+        prefilter_features(&frame, &ohlcv, &spec(3, 0)).expect("legacy prefilter succeeds");
     assert!(
         !legacy.names.iter().any(|n| timeframe_group(n).is_some()),
         "legacy prefilter should keep only base features, got {:?}",
@@ -767,7 +1974,8 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
     );
 
     // With quota: each present higher-TF group gets at least 1 representative.
-    let (quota, _) = prefilter_features(&frame, &ohlcv, &spec(3, 1));
+    let (quota, _) =
+        prefilter_features(&frame, &ohlcv, &spec(3, 1)).expect("quota prefilter succeeds");
     assert!(
         quota.names.iter().any(|n| n.starts_with("H1_")),
         "quota prefilter must keep an H1_ feature, got {:?}",
@@ -807,8 +2015,9 @@ fn first_passage_labels_decide_on_a_trending_series_and_are_fully_counted() {
         high.push(c + 0.0004);
         low.push(c - 0.0004);
     }
+    let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(n);
     let ohlcv = Ohlcv {
-        timestamp: Some((0..n as i64).collect()),
+        timestamp: Some(timestamps.clone()),
         open: close.clone(),
         high,
         low,
@@ -966,12 +2175,13 @@ fn prefilter_refits_inside_cpcv_folds_and_falls_back_to_a_single_prefix() {
 #[test]
 fn a_nan_prefixed_column_is_ranked_on_its_finite_rows_not_scored_zero() {
     let n = 800usize;
+    let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(n);
     let mut close = Vec::with_capacity(n);
     for i in 0..n {
         close.push(1.1000 + (i as f64) * 0.00005 + 0.0002 * ((i as f64) * 0.3).sin());
     }
     let ohlcv = Ohlcv {
-        timestamp: Some((0..n as i64).collect()),
+        timestamp: Some(timestamps.clone()),
         open: close.clone(),
         high: close.iter().map(|c| c + 0.0004).collect(),
         low: close.iter().map(|c| c - 0.0004).collect(),
@@ -1006,20 +2216,19 @@ fn a_nan_prefixed_column_is_ranked_on_its_finite_rows_not_scored_zero() {
     let data = ndarray::Array2::from_shape_fn((n, 2), |(i, j)| match j {
         0 => {
             if i < 60 {
-                f32::NAN
+                f64::NAN
             } else {
                 labels.long[i]
             }
         }
-        _ => ((i % 7) as f32) - 3.0,
+        _ => ((i % 7) as f64) - 3.0,
     });
-    let frame = FeatureFrame {
-        timestamps: (0..n as i64).collect(),
-        names,
-        data: neoethos_data::FeatureData::InMemory(data),
-    };
+    let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+        timestamps, names, data,
+    )
+    .expect("valid f64 non-finite fixture");
 
-    let (kept, census) = prefilter_features(&frame, &ohlcv, &spec);
+    let (kept, census) = prefilter_features(&frame, &ohlcv, &spec).expect("prefilter succeeds");
     assert!(
         !census.label_fell_back_to_forward_return,
         "the fixture must exercise the first-passage target, not the fallback ({census:?})"
@@ -1039,11 +2248,17 @@ fn a_nan_prefixed_column_is_ranked_on_its_finite_rows_not_scored_zero() {
 #[test]
 fn compute_discovery_forward_test_artifacts_returns_empty_for_empty_portfolio() {
     let config = DiscoveryConfig::default();
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
-    let artifacts =
-        compute_discovery_forward_test_artifacts(&[], &features.names, &features, &ohlcv, &config)
-            .expect("empty portfolio should produce zero artifacts");
+    let (_, _, holdout_scope, features, ohlcv) = sample_split_search_values();
+    let artifacts = compute_discovery_forward_test_artifacts(
+        &[],
+        &features.names,
+        &features,
+        &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &config,
+    )
+    .expect("empty portfolio should produce zero artifacts");
     assert!(artifacts.is_empty());
 }
 
@@ -1051,13 +2266,15 @@ fn compute_discovery_forward_test_artifacts_returns_empty_for_empty_portfolio() 
 fn compute_discovery_forward_test_artifacts_rejects_tails_missing_features() {
     let config = DiscoveryConfig::default();
     let portfolio = vec![profitable_gene("alpha-1")];
-    let mut tail_features = sample_feature_frame();
+    let (_, _, holdout_scope, mut tail_features, tail_ohlcv) = sample_split_search_values();
     tail_features.names = vec!["unrelated_feature".to_string()];
     let err = compute_discovery_forward_test_artifacts(
         &portfolio,
         &["signal".to_string()],
         &tail_features,
-        &sample_ohlcv(),
+        &tail_ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
         &config,
     )
     .expect_err("tail without the effective feature must be rejected");
@@ -1069,24 +2286,22 @@ fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy()
     let mut config = DiscoveryConfig::default();
     config.runtime_overrides.prefilter_top_k = 0;
     let portfolio = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
+    let (_, _, holdout_scope, features, ohlcv) = sample_split_search_values();
     let artifacts = compute_discovery_forward_test_artifacts(
         &portfolio,
         &features.names,
         &features,
         &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
         &config,
     )
     .expect("forward-test artifacts should build for in-band tail");
     assert_eq!(artifacts.len(), portfolio.len());
     for artifact in &artifacts {
-        assert_eq!(
-            artifact.artifact_kind,
-            crate::validation::FORWARD_TEST_VALIDATION_ARTIFACT_KIND
-        );
-        assert!(artifact.summary.bars > 0);
-        assert!(!artifact.scope.strategy_hash.is_empty());
+        assert!(artifact.summary().bars > 0);
+        assert!(!artifact.strategy_identity().exact_gene_hash().is_empty());
+        assert_eq!(artifact.scope(), &holdout_scope);
     }
 }
 
@@ -1095,18 +2310,23 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("forward-test-validations");
     let config = DiscoveryConfig::default();
     let portfolio = vec![profitable_gene("alpha-1")];
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
+    let (receipt, selection_scope, holdout_scope, features, ohlcv) = sample_split_search_values();
     let artifacts = compute_discovery_forward_test_artifacts(
         &portfolio,
         &features.names,
         &features,
         &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
         &config,
     )
     .expect("forward-test artifacts should build");
 
     let result = DiscoveryResult {
+        search_input_receipt: receipt,
+        selection_scope,
+        holdout_scope: Some(holdout_scope),
+        search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio,
         candidates: Vec::new(),
@@ -1120,7 +2340,7 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
 
     let written = save_forward_test_validation_artifacts(&dir, &result)
@@ -1141,17 +2361,20 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
 #[test]
 fn discovery_profile_exports_forward_test_artifact_count() {
     let config = DiscoveryConfig::default();
-    let temporal = discovery_temporal_contract(&config, &["signal".to_string()])
-        .expect("temporal contract for default discovery config");
-    let scope = ForwardTestValidationScope::new("dataset", "eval", "strategy", &temporal);
+    let (receipt, selection_scope, holdout_scope) = sample_split_search_scopes();
+    let gene = profitable_gene("alpha-1");
     let summary = crate::validation::ForwardTestSummary {
-        bars: 5,
+        bars: 20,
         metrics: BacktestMetrics::from_metric_array([0.0; 11]),
         span_days: 0.0,
     };
     let mut result = DiscoveryResult {
+        search_input_receipt: receipt,
+        selection_scope,
+        holdout_scope: Some(holdout_scope.clone()),
+        search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
-        portfolio: vec![profitable_gene("alpha-1")],
+        portfolio: vec![gene.clone()],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
         logged_trades: Vec::new(),
@@ -1159,13 +2382,19 @@ fn discovery_profile_exports_forward_test_artifact_count() {
         validation_gates: DiscoveryValidationGates::pending(),
         canonical_backtest_artifacts: Vec::new(),
         walkforward_validation_artifacts: Vec::new(),
-        forward_test_validation_artifacts: vec![ForwardTestValidationArtifactFile::new(
-            scope, summary,
-        )],
+        forward_test_validation_artifacts: vec![
+            ForwardTestValidationArtifactFile::new(
+                holdout_scope,
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                &gene,
+                summary,
+            )
+            .expect("strict forward-test fixture"),
+        ],
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
     result.validation_gates.walkforward_passed = true;
     result.validation_gates.cpcv_passed = true;
@@ -1175,23 +2404,26 @@ fn discovery_profile_exports_forward_test_artifact_count() {
 }
 
 fn forward_test_artifact_with_metrics(
-    strategy_hash: &str,
+    gene: &Gene,
+    holdout_scope: &CanonicalSearchArtifactScopeV2,
     net_profit: f64,
     trade_count: usize,
 ) -> ForwardTestValidationArtifactFile {
-    let config = DiscoveryConfig::default();
-    let temporal = discovery_temporal_contract(&config, &["signal".to_string()])
-        .expect("temporal contract for default discovery config");
-    let scope = ForwardTestValidationScope::new("dataset", "eval", strategy_hash, &temporal);
     let mut metrics_array = [0.0_f64; 11];
     metrics_array[0] = net_profit; // net_profit
     metrics_array[8] = trade_count as f64; // trade_count
     let summary = crate::validation::ForwardTestSummary {
-        bars: 5,
+        bars: 20,
         metrics: BacktestMetrics::from_metric_array(metrics_array),
         span_days: 0.0,
     };
-    ForwardTestValidationArtifactFile::new(scope, summary)
+    ForwardTestValidationArtifactFile::new(
+        holdout_scope.clone(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        gene,
+        summary,
+    )
+    .expect("strict forward-test fixture")
 }
 
 fn empty_discovery_result_with_gates(
@@ -1202,6 +2434,10 @@ fn empty_discovery_result_with_gates(
     gates.walkforward_passed = walkforward_passed;
     gates.cpcv_passed = cpcv_passed;
     DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
@@ -1215,123 +2451,117 @@ fn empty_discovery_result_with_gates(
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     }
 }
 
 #[test]
 fn evidence_bridge_mirrors_discovery_validation_gates_with_no_forward_test_artifacts() {
     let result = empty_discovery_result_with_gates(true, true);
-    let evidence = live_validation_evidence_from_discovery(&result);
-    assert!(evidence.walkforward_passed);
-    assert!(evidence.cpcv_passed);
-    assert_eq!(evidence.forward_test_passed, None);
-    assert_eq!(evidence.prop_firm_passed, None);
-    assert!(evidence.live_sim_runtime_model_hash.is_none());
+    let error = live_validation_evidence_from_discovery(&result)
+        .expect_err("live evidence must reject a missing final portfolio/evidence set");
+    assert!(error.to_string().contains("missing"), "{error:#}");
 }
 
 #[test]
 fn evidence_bridge_marks_forward_test_passed_when_every_artifact_is_profitable() {
-    let mut result = empty_discovery_result_with_gates(true, true);
-    result.forward_test_validation_artifacts = vec![
-        forward_test_artifact_with_metrics("fnv64:abc", 25.0, 3),
-        forward_test_artifact_with_metrics("fnv64:def", 10.0, 1),
-    ];
-    let evidence = live_validation_evidence_from_discovery(&result);
+    let result = strict_split_validation_result(vec![
+        profitable_gene("strict-alpha"),
+        profitable_gene("strict-beta"),
+    ]);
+    let evidence = live_validation_evidence_from_discovery(&result)
+        .expect("complete exact evidence must aggregate");
     assert_eq!(evidence.forward_test_passed, Some(true));
 }
 
 #[test]
 fn evidence_bridge_marks_forward_test_failed_when_any_artifact_is_unprofitable() {
-    let mut result = empty_discovery_result_with_gates(true, true);
-    result.forward_test_validation_artifacts = vec![
-        forward_test_artifact_with_metrics("fnv64:abc", 25.0, 3),
-        forward_test_artifact_with_metrics("fnv64:def", -10.0, 2),
-    ];
-    let evidence = live_validation_evidence_from_discovery(&result);
+    let alpha = profitable_gene("strict-alpha");
+    let beta = profitable_gene("strict-beta");
+    let mut result = strict_split_validation_result(vec![alpha, beta.clone()]);
+    let holdout_scope = result
+        .holdout_scope
+        .as_ref()
+        .expect("holdout scope")
+        .clone();
+    result.forward_test_validation_artifacts[1] =
+        forward_test_artifact_with_metrics(&beta, &holdout_scope, -10.0, 2);
+    let evidence = live_validation_evidence_from_discovery(&result)
+        .expect("complete exact evidence must aggregate");
     assert_eq!(evidence.forward_test_passed, Some(false));
 }
 
 #[test]
 fn evidence_bridge_marks_forward_test_failed_when_artifact_has_zero_trades() {
-    let mut result = empty_discovery_result_with_gates(true, true);
-    result.forward_test_validation_artifacts =
-        vec![forward_test_artifact_with_metrics("fnv64:abc", 5.0, 0)];
-    let evidence = live_validation_evidence_from_discovery(&result);
+    let alpha = profitable_gene("strict-alpha");
+    let mut result = strict_split_validation_result(vec![alpha.clone()]);
+    let holdout_scope = result
+        .holdout_scope
+        .as_ref()
+        .expect("holdout scope")
+        .clone();
+    result.forward_test_validation_artifacts[0] =
+        forward_test_artifact_with_metrics(&alpha, &holdout_scope, 5.0, 0);
+    let evidence = live_validation_evidence_from_discovery(&result)
+        .expect("complete exact evidence must aggregate");
     assert_eq!(evidence.forward_test_passed, Some(false));
 }
 
 #[test]
 fn evidence_bridge_propagates_failed_walkforward_and_cpcv() {
-    let result = empty_discovery_result_with_gates(false, false);
-    let evidence = live_validation_evidence_from_discovery(&result);
+    let mut result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
+    result.validation_gates.walkforward_passed = false;
+    result.validation_gates.cpcv_passed = false;
+    let evidence = live_validation_evidence_from_discovery(&result)
+        .expect("complete exact evidence must aggregate");
     assert!(!evidence.walkforward_passed);
     assert!(!evidence.cpcv_passed);
 }
 
-fn prop_firm_artifact_with_pass_flag(
-    strategy_hash: &str,
-    all_rules_passed: bool,
-) -> PropFirmRiskValidationArtifactFile {
-    let config = DiscoveryConfig::default();
-    let temporal = discovery_temporal_contract(&config, &["signal".to_string()])
-        .expect("temporal contract for default discovery config");
-    let rules = PropFirmRiskRules::default();
-    let scope =
-        PropFirmRiskValidationScope::new("dataset", "eval", strategy_hash, &rules, &temporal)
-            .expect("scope construction should succeed");
-    let summary = crate::validation::PropFirmRiskValidationSummary {
-        rules,
-        trades_observed: 0,
-        trading_days_observed: 0,
-        max_daily_loss_pct_observed: 0.0,
-        max_overall_drawdown_pct_observed: 0.0,
-        largest_profit_share_observed: 0.0,
-        max_trades_per_day_observed: 0,
-        net_return_pct: 0.0,
-        daily_loss_breach: false,
-        overall_drawdown_breach: false,
-        consistency_violation: false,
-        trade_limit_violation: false,
-        min_trading_days_ok: true,
-        profit_target_met: true,
-        all_rules_passed,
-    };
-    PropFirmRiskValidationArtifactFile::new(scope, summary)
-}
-
 #[test]
 fn evidence_bridge_marks_prop_firm_passed_when_every_artifact_passes() {
-    let mut result = empty_discovery_result_with_gates(true, true);
-    result.prop_firm_validation_artifacts = vec![
-        prop_firm_artifact_with_pass_flag("fnv64:abc", true),
-        prop_firm_artifact_with_pass_flag("fnv64:def", true),
-    ];
-    let evidence = live_validation_evidence_from_discovery(&result);
+    let result = strict_split_validation_result(vec![
+        profitable_gene("strict-alpha"),
+        profitable_gene("strict-beta"),
+    ]);
+    let evidence = live_validation_evidence_from_discovery(&result)
+        .expect("complete exact evidence must aggregate");
     assert_eq!(evidence.prop_firm_passed, Some(true));
 }
 
 #[test]
 fn evidence_bridge_marks_prop_firm_failed_when_any_artifact_fails() {
-    let mut result = empty_discovery_result_with_gates(true, true);
-    result.prop_firm_validation_artifacts = vec![
-        prop_firm_artifact_with_pass_flag("fnv64:abc", true),
-        prop_firm_artifact_with_pass_flag("fnv64:def", false),
-    ];
-    let evidence = live_validation_evidence_from_discovery(&result);
+    let alpha = profitable_gene("strict-alpha");
+    let beta = profitable_gene("strict-beta");
+    let mut result = strict_split_validation_result(vec![alpha, beta.clone()]);
+    let holdout_scope = result
+        .holdout_scope
+        .as_ref()
+        .expect("holdout scope")
+        .clone();
+    result.prop_firm_validation_artifacts[1] = PropFirmRiskValidationArtifactFile::new(
+        holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &beta,
+        strict_prop_firm_summary(false),
+    )
+    .expect("strict failing prop-firm fixture");
+    let evidence = live_validation_evidence_from_discovery(&result)
+        .expect("complete exact evidence must aggregate");
     assert_eq!(evidence.prop_firm_passed, Some(false));
 }
 
 #[test]
 fn compute_discovery_prop_firm_artifacts_returns_empty_for_empty_portfolio() {
     let config = DiscoveryConfig::default();
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
+    let (_, _, holdout_scope, features, ohlcv) = sample_split_search_values();
     let artifacts = compute_discovery_prop_firm_artifacts(
         &[],
         &features.names,
         &features,
         &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
         &config,
         PropFirmRiskRules::default(),
     )
@@ -1343,13 +2573,15 @@ fn compute_discovery_prop_firm_artifacts_returns_empty_for_empty_portfolio() {
 fn compute_discovery_prop_firm_artifacts_rejects_tails_missing_features() {
     let config = DiscoveryConfig::default();
     let portfolio = vec![profitable_gene("alpha-1")];
-    let mut tail_features = sample_feature_frame();
+    let (_, _, holdout_scope, mut tail_features, tail_ohlcv) = sample_split_search_values();
     tail_features.names = vec!["unrelated_feature".to_string()];
     let err = compute_discovery_prop_firm_artifacts(
         &portfolio,
         &["signal".to_string()],
         &tail_features,
-        &sample_ohlcv(),
+        &tail_ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
         &config,
         PropFirmRiskRules::default(),
     )
@@ -1362,33 +2594,44 @@ fn compute_discovery_prop_firm_artifacts_produces_one_artifact_per_strategy() {
     let mut config = DiscoveryConfig::default();
     config.runtime_overrides.prefilter_top_k = 0;
     let portfolio = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
+    let (_, _, holdout_scope, features, ohlcv) = sample_split_search_values();
     let artifacts = compute_discovery_prop_firm_artifacts(
         &portfolio,
         &features.names,
         &features,
         &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
         &config,
         PropFirmRiskRules::default(),
     )
     .expect("prop-firm artifacts should build");
     assert_eq!(artifacts.len(), portfolio.len());
     for artifact in &artifacts {
-        assert_eq!(
-            artifact.artifact_kind,
-            crate::validation::PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND
-        );
-        assert!(!artifact.scope.strategy_hash.is_empty());
+        assert!(!artifact.strategy_identity().exact_gene_hash().is_empty());
+        assert_eq!(artifact.scope(), &holdout_scope);
     }
 }
 
 #[test]
 fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("prop-firm-validations");
+    let (receipt, selection_scope, holdout_scope) = sample_split_search_scopes();
+    let alpha = profitable_gene("alpha-1");
+    let artifact = PropFirmRiskValidationArtifactFile::new(
+        holdout_scope.clone(),
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &alpha,
+        strict_prop_firm_summary(true),
+    )
+    .expect("strict prop-firm fixture");
     let result = DiscoveryResult {
+        search_input_receipt: receipt,
+        selection_scope,
+        holdout_scope: Some(holdout_scope),
+        search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
-        portfolio: vec![profitable_gene("alpha-1")],
+        portfolio: vec![alpha],
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
         logged_trades: Vec::new(),
@@ -1397,10 +2640,10 @@ fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
         canonical_backtest_artifacts: Vec::new(),
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
-        prop_firm_validation_artifacts: vec![prop_firm_artifact_with_pass_flag("fnv64:abc", true)],
+        prop_firm_validation_artifacts: vec![artifact],
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
 
     let written = save_prop_firm_validation_artifacts(&dir, &result)
@@ -1424,29 +2667,78 @@ fn populated_discovery_result(
     forward_test_count: usize,
     prop_firm_count: usize,
 ) -> DiscoveryResult {
+    let (receipt, selection_scope, holdout_scope) = sample_split_search_scopes();
+    let strategy_count = canonical_count
+        .max(walkforward_count)
+        .max(forward_test_count)
+        .max(prop_firm_count)
+        .max(1);
+    let portfolio = (0..strategy_count)
+        .map(|idx| profitable_gene(&format!("strict-{idx}")))
+        .collect::<Vec<_>>();
+    let canonical_backtest_artifacts = portfolio
+        .iter()
+        .take(canonical_count)
+        .map(|gene| {
+            CanonicalBacktestArtifactFile::new(
+                selection_scope.clone(),
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                gene,
+                BacktestMetrics::from_metric_array([0.0; 11]),
+            )
+            .expect("strict canonical fixture")
+        })
+        .collect();
+    let walkforward_validation_artifacts = portfolio
+        .iter()
+        .take(walkforward_count)
+        .map(|gene| {
+            WalkforwardValidationArtifactFile::new(
+                selection_scope.clone(),
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                gene,
+                sample_walkforward_summary(),
+            )
+            .expect("strict walk-forward fixture")
+        })
+        .collect();
+    let forward_test_validation_artifacts = portfolio
+        .iter()
+        .take(forward_test_count)
+        .map(|gene| forward_test_artifact_with_metrics(gene, &holdout_scope, 1.0, 1))
+        .collect();
+    let prop_firm_validation_artifacts = portfolio
+        .iter()
+        .take(prop_firm_count)
+        .map(|gene| {
+            PropFirmRiskValidationArtifactFile::new(
+                holdout_scope.clone(),
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                gene,
+                strict_prop_firm_summary(true),
+            )
+            .expect("strict prop-firm fixture")
+        })
+        .collect();
     DiscoveryResult {
+        search_input_receipt: receipt,
+        selection_scope,
+        holdout_scope: Some(holdout_scope),
+        search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
-        portfolio: vec![profitable_gene("alpha-1")],
+        portfolio,
         candidates: Vec::new(),
         quality_metrics: Vec::new(),
         logged_trades: Vec::new(),
         effective_feature_names: vec!["signal".to_string()],
         validation_gates: DiscoveryValidationGates::pending(),
-        canonical_backtest_artifacts: (0..canonical_count)
-            .map(|idx| sample_canonical_backtest_artifact(&format!("canonical-{idx}")))
-            .collect(),
-        walkforward_validation_artifacts: (0..walkforward_count)
-            .map(|idx| sample_walkforward_validation_artifact(&format!("walkforward-{idx}")))
-            .collect(),
-        forward_test_validation_artifacts: (0..forward_test_count)
-            .map(|idx| forward_test_artifact_with_metrics(&format!("forward-{idx}"), 1.0, 1))
-            .collect(),
-        prop_firm_validation_artifacts: (0..prop_firm_count)
-            .map(|idx| prop_firm_artifact_with_pass_flag(&format!("prop-{idx}"), true))
-            .collect(),
+        canonical_backtest_artifacts,
+        walkforward_validation_artifacts,
+        forward_test_validation_artifacts,
+        prop_firm_validation_artifacts,
         funnel_profile: None,
 
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     }
 }
 
@@ -1526,7 +2818,7 @@ fn all_producer_kinds_present_ignores_live_sim() {
 #[test]
 fn full_validation_chain_with_complete_producer_evidence_passes_lossy_manifest() {
     // Build a result with all four producer-side artifact kinds populated.
-    let result = populated_discovery_result(2, 1, 1, 2);
+    let result = populated_discovery_result(2, 2, 2, 2);
 
     // 1. Per-kind hashes know which kinds are present.
     let hashes = discovery_per_kind_evidence_hashes(&result)
@@ -1557,7 +2849,8 @@ fn full_validation_chain_with_complete_producer_evidence_passes_lossy_manifest()
     let mut result_for_evidence = result.clone();
     result_for_evidence.validation_gates.walkforward_passed = true;
     result_for_evidence.validation_gates.cpcv_passed = true;
-    let evidence = live_validation_evidence_from_discovery(&result_for_evidence);
+    let evidence = live_validation_evidence_from_discovery(&result_for_evidence)
+        .expect("complete exact producer evidence must aggregate");
     assert!(evidence.walkforward_passed);
     assert!(evidence.cpcv_passed);
     assert_eq!(evidence.forward_test_passed, Some(true));
@@ -1570,7 +2863,7 @@ fn full_validation_chain_with_complete_producer_evidence_passes_lossy_manifest()
     // vector directly (not from validation_gates), so it should
     // reflect the constructed fixture.
     assert_eq!(profile.prop_firm_validation_artifacts_observed, 2);
-    assert_eq!(profile.forward_test_validation_artifacts_observed, 1);
+    assert_eq!(profile.forward_test_validation_artifacts_observed, 2);
     assert!(!profile.validation_evidence_complete); // live-sim still missing
     assert!(
         profile
@@ -1603,33 +2896,56 @@ fn discovery_run_profile_records_typed_determinism_policy() {
     }
 }
 
-/// A run that cannot name its own arithmetic is not evidence.
-///
-/// The four population engines disagree — the CubeCL f32 lane is 54 % off the
-/// canonical CPU at 200 000 bars and takes 129-430 more trades — so two runs
-/// that used different engines ranked different strategies. Until this field
-/// existed nothing in the artifacts said which one had run, which is exactly
-/// how the f32/f64 confusion survived being measured twice.
+/// A legacy profile cannot mint engine evidence from process-global state.
 #[test]
-fn discovery_run_profile_names_the_engines_that_evaluated_the_population() {
-    crate::engine_identity::record_population_engine(
-        crate::engine_identity::PopulationEvalEngine::Cpu,
-    );
+fn discovery_run_profile_leaves_engine_identity_empty_without_a_run_receipt() {
     let profile = build_discovery_profile(
         &DiscoveryConfig::default(),
         &populated_discovery_result(0, 0, 0, 0),
     );
-    assert!(
-        profile
-            .population_eval_engines
-            .contains(&crate::engine_identity::PopulationEvalEngine::Cpu),
-        "the profile must carry the engine that evaluated the population: {:?}",
-        profile.population_eval_engines
-    );
-    // And it has to survive serialisation, because the profile is read from
-    // disk long after the process that produced it is gone.
+    assert!(profile.population_eval_engines.is_empty());
     let json = serde_json::to_string(&profile).unwrap();
-    assert!(json.contains("cpu_f64_canonical"), "{json}");
+    assert!(json.contains("\"population_eval_engines\":[]"), "{json}");
+}
+
+#[test]
+fn discovery_run_profile_persists_the_full_run_scoped_execution_receipt_v2() {
+    let mut result = populated_discovery_result(0, 0, 0, 0);
+    let run = crate::population_engine_run_receipt_v1::begin_population_engine_run_v1(
+        &result.selection_scope,
+    )
+    .unwrap();
+    run.record_successful_population(crate::engine_identity::PopulationEvalEngine::Cpu, 3, 3)
+        .unwrap();
+    let engine_receipt_v1 = run.finish().unwrap();
+    let receipt_v2 =
+        crate::population_execution_run_receipt_v2::seal_exact_population_execution_run_receipt_v2(
+            engine_receipt_v1.clone(),
+            None,
+        )
+        .unwrap();
+    result
+        .funnel_profile
+        .as_mut()
+        .unwrap()
+        .attach_population_execution_run_receipt_v2(receipt_v2.clone())
+        .unwrap();
+
+    let profile = build_discovery_profile(&DiscoveryConfig::default(), &result);
+    assert_eq!(
+        profile.population_eval_engines,
+        vec![crate::engine_identity::PopulationEvalEngine::Cpu]
+    );
+    assert_eq!(
+        profile.population_execution_run_receipt_v2.as_ref(),
+        Some(&receipt_v2)
+    );
+    let json = serde_json::to_string(&profile).unwrap();
+    assert!(json.contains(receipt_v2.identity_sha256()), "{json}");
+    assert!(
+        json.contains(engine_receipt_v1.canonical_scope_identity_sha256()),
+        "{json}"
+    );
 }
 
 #[test]
@@ -1706,7 +3022,8 @@ fn run_discovery_cycle_bails_on_empty_evaluation_symbol() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_symbol = String::new();
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("empty symbol must bail");
+    let input = sample_run_input(&features, &ohlcv);
+    let err = run_discovery_cycle(&input, &cfg).expect_err("empty symbol must bail");
     assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
@@ -1716,8 +3033,8 @@ fn run_discovery_cycle_bails_on_empty_account_currency() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_account_currency = String::new();
-    let err =
-        run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("empty account_currency must bail");
+    let input = sample_run_input(&features, &ohlcv);
+    let err = run_discovery_cycle(&input, &cfg).expect_err("empty account_currency must bail");
     assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
@@ -1727,7 +3044,8 @@ fn run_discovery_cycle_bails_on_nan_spread() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_spread_pips = f64::NAN;
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("NaN spread must bail");
+    let input = sample_run_input(&features, &ohlcv);
+    let err = run_discovery_cycle(&input, &cfg).expect_err("NaN spread must bail");
     assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
@@ -1737,7 +3055,8 @@ fn run_discovery_cycle_bails_on_nan_commission() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_commission_per_trade = f64::NAN;
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg).expect_err("NaN commission must bail");
+    let input = sample_run_input(&features, &ohlcv);
+    let err = run_discovery_cycle(&input, &cfg).expect_err("NaN commission must bail");
     assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
@@ -1747,8 +3066,8 @@ fn run_discovery_cycle_bails_on_whitespace_only_currency() {
     let ohlcv = sample_ohlcv();
     let mut cfg = valid_discovery_config();
     cfg.evaluation_account_currency = "   ".to_string();
-    let err = run_discovery_cycle(&features, &ohlcv, &cfg)
-        .expect_err("whitespace-only currency must bail");
+    let input = sample_run_input(&features, &ohlcv);
+    let err = run_discovery_cycle(&input, &cfg).expect_err("whitespace-only currency must bail");
     assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
@@ -1776,9 +3095,14 @@ fn from_settings_propagates_account_currency() {
 fn min_trades_per_month_scale_intra_day_unchanged() {
     // Intra-day TFs keep operator's value at 1.0× — plenty of bars,
     // 15 trades/month is fine.
-    assert_eq!(min_trades_per_month_scale_for_tf("M1"), 1.0);
-    assert_eq!(min_trades_per_month_scale_for_tf("M5"), 1.0);
-    assert_eq!(min_trades_per_month_scale_for_tf("M15"), 1.0);
+    for timeframe in ["M1", "M2", "M3", "M4", "M5", "M10", "M15"] {
+        assert_eq!(min_trades_per_month_scale_for_tf(timeframe), 1.0);
+    }
+    assert_eq!(
+        min_trades_per_month_scale_for_tf("H12"),
+        1.0,
+        "H12 preserves the old conservative fallback until policy review"
+    );
 }
 
 #[test]
@@ -1827,6 +3151,22 @@ fn min_trades_per_month_scale_unknown_tf_is_conservative() {
     assert_eq!(min_trades_per_month_scale_for_tf(""), 1.0);
     assert_eq!(min_trades_per_month_scale_for_tf("H2"), 1.0); // non-canonical
     assert_eq!(min_trades_per_month_scale_for_tf("XYZ"), 1.0);
+}
+
+#[test]
+fn annual_bar_estimate_covers_every_official_timeframe_without_private_aliases() {
+    use neoethos_core::CanonicalTimeframe as T;
+
+    for timeframe in T::ALL {
+        assert!(
+            approx_bars_per_year(timeframe.as_str()) > 0,
+            "official timeframe {timeframe} has no annual estimate"
+        );
+    }
+    assert_eq!(approx_bars_per_year("M2"), 220 * 24 * 30);
+    assert_eq!(approx_bars_per_year("M4"), 220 * 24 * 15);
+    assert_eq!(approx_bars_per_year("M10"), 220 * 24 * 6);
+    assert_eq!(approx_bars_per_year("H2"), 0);
 }
 
 #[test]
@@ -1943,18 +3283,18 @@ fn empty_portfolio_diagnosis_falls_back_when_no_bottleneck_set() {
 /// the naive O(n²) way (rescan the slice for every element). The shipping
 /// `spearman_corr_i8` computes the same quantity from a 256-bucket
 /// histogram in O(n); these two must agree exactly.
-fn spearman_corr_i8_naive(a: &[i8], b: &[i8]) -> f64 {
-    let n = a.len().min(b.len());
-    if n < 2 {
-        return 0.0;
+fn spearman_corr_i8_naive(a: &[i8], b: &[i8]) -> Option<f64> {
+    if a.len() != b.len() || a.len() < 2 {
+        return None;
     }
+    let n = a.len();
     let rank_of = |vals: &[i8], v: i8| -> f64 {
-        let count = vals[..n].iter().filter(|&&x| x == v).count() as f64;
-        let before = vals[..n].iter().filter(|&&x| x < v).count() as f64;
+        let count = vals.iter().filter(|&&x| x == v).count() as f64;
+        let before = vals.iter().filter(|&&x| x < v).count() as f64;
         before + (count + 1.0) / 2.0
     };
-    let ranks_a: Vec<f64> = a[..n].iter().map(|&v| rank_of(&a[..n], v)).collect();
-    let ranks_b: Vec<f64> = b[..n].iter().map(|&v| rank_of(&b[..n], v)).collect();
+    let ranks_a: Vec<f64> = a.iter().map(|&v| rank_of(a, v)).collect();
+    let ranks_b: Vec<f64> = b.iter().map(|&v| rank_of(b, v)).collect();
     let mean_a: f64 = ranks_a.iter().sum::<f64>() / n as f64;
     let mean_b: f64 = ranks_b.iter().sum::<f64>() / n as f64;
     let (mut num, mut denom_a, mut denom_b) = (0.0_f64, 0.0_f64, 0.0_f64);
@@ -1965,16 +3305,17 @@ fn spearman_corr_i8_naive(a: &[i8], b: &[i8]) -> f64 {
         denom_a += da * da;
         denom_b += db * db;
     }
-    if denom_a <= 1e-12 || denom_b <= 1e-12 {
-        return 0.0;
+    if denom_a == 0.0 || denom_b == 0.0 {
+        return None;
     }
-    num / (denom_a.sqrt() * denom_b.sqrt())
+    let correlation = num / (denom_a.sqrt() * denom_b.sqrt());
+    correlation.is_finite().then_some(correlation)
 }
 
 #[test]
 fn spearman_histogram_matches_the_naive_rank_scan() {
     // Deterministic pseudo-random trit signals (the real shape: -1/0/+1),
-    // plus the degenerate and perfectly-(anti)correlated edge cases.
+    // plus perfectly-(anti)correlated and full-i8-range edge cases.
     let mut state = 0x2545_F491_4F6C_DD1D_u64;
     let mut next = || {
         state ^= state << 13;
@@ -1995,20 +3336,65 @@ fn spearman_histogram_matches_the_naive_rank_scan() {
         ("independent", &a, &b),
         ("self", &a, &a),
         ("inverted", &a, &inverted),
-        ("constant", &a, &constant),
         ("wide range", &wide_a, &wide_b),
     ] {
-        let fast = spearman_corr_i8(x, y);
-        let naive = spearman_corr_i8_naive(x, y);
+        let fast = spearman_corr_i8(x, y).expect("defined production Spearman");
+        let naive = spearman_corr_i8_naive(x, y).expect("defined naive Spearman");
         assert!(
             (fast - naive).abs() < 1e-12,
             "{label}: fast={fast} naive={naive}"
         );
     }
     // Sanity anchors on top of the equivalence check.
-    assert!((spearman_corr_i8(&a, &a) - 1.0).abs() < 1e-12);
-    assert!((spearman_corr_i8(&a, &inverted) + 1.0).abs() < 1e-12);
-    assert_eq!(spearman_corr_i8(&a, &constant), 0.0);
+    assert!((spearman_corr_i8(&a, &a).unwrap() - 1.0).abs() < 1e-12);
+    assert!((spearman_corr_i8(&a, &inverted).unwrap() + 1.0).abs() < 1e-12);
+    assert_eq!(
+        spearman_corr_i8(&a, &constant),
+        Err(CorrelationUndefinedV1::ConstantInput)
+    );
+
+    // SciPy's published tie fixture anchors average-rank semantics rather than
+    // relying on the pre-existing CPU implementation as the authority.
+    let tied_a = [1_i8, 2, 3, 4, 5];
+    let tied_b = [5_i8, 6, 7, 8, 7];
+    assert!((spearman_corr_i8(&tied_a, &tied_b).unwrap() - 0.820_782_681_668_123_3).abs() < 1e-15);
+}
+
+#[test]
+fn portfolio_correlation_gate_rejects_undefined_inputs_and_threshold_equality() {
+    let defined = [-1_i8, 0, 1, -1, 0, 1];
+    let constant = [0_i8; 6];
+    assert_eq!(
+        pearson_corr_i8(&defined, &constant),
+        Err(CorrelationUndefinedV1::ConstantInput)
+    );
+    assert_eq!(
+        pearson_corr_i8(&defined, &defined[..5]),
+        Err(CorrelationUndefinedV1::LengthMismatch)
+    );
+    assert_eq!(
+        spearman_corr_i8(&defined[..1], &defined[..1]),
+        Err(CorrelationUndefinedV1::InsufficientPairedObservations)
+    );
+    assert_eq!(
+        pairwise_portfolio_correlation_decision_v1(&defined, &defined, 1.0),
+        PortfolioCorrelationDecisionV1::RejectThreshold
+    );
+    assert_eq!(
+        pairwise_portfolio_correlation_decision_v1(&defined, &constant, 0.9),
+        PortfolioCorrelationDecisionV1::RejectUndefined(CorrelationUndefinedV1::ConstantInput)
+    );
+    assert!(!portfolio_signal_is_correlation_rankable_v1(&constant));
+
+    let near_constant_sum_squares = (0.5 * SCIPY_NEAR_CONSTANT_RELATIVE_NORM_V1).powi(2);
+    assert_eq!(
+        classify_centered_correlation_input_v1(1.0, near_constant_sum_squares),
+        Err(CorrelationUndefinedV1::NearConstantInput)
+    );
+    assert_eq!(
+        finish_correlation_v1(f64::NAN, 1.0, 1.0),
+        Err(CorrelationUndefinedV1::NonFiniteResult)
+    );
 }
 
 /// The operator's risk band must reach the BACKTEST, not just live sizing.
@@ -2701,8 +4087,9 @@ fn duplicate_knobs_resolve_to_the_documented_winner() {
         "system.account_currency wins; a wrong currency silently rescales every result"
     );
     assert!(
-        (cfg.evaluation_spread_pips - 1.5).abs() < 1e-9,
-        "risk.backtest_spread_pips + risk.slippage_pips wins (expected 1.5, got {}); \
+        (cfg.evaluation_spread_pips - 1.75).abs() < 1e-9,
+        "risk.backtest_spread_pips + two risk.slippage_pips fill assumptions wins \
+         (expected 1.75, got {}); \
          models.eval_runtime.spread_pips is what the Settings screen calls \
          cost.spread_pips and it must not bind in discovery",
         cfg.evaluation_spread_pips
@@ -2985,7 +4372,8 @@ fn signal_count_screen_matches_screening_each_candidate_alone() {
     let expected: Vec<(usize, Gene, Vec<i8>)> = candidates
         .iter()
         .filter_map(|(idx, gene)| {
-            let sig = signals_for_gene_full(&features, &ohlcv, gene, &eval_config);
+            let sig = signals_for_gene_full(&features, &ohlcv, gene, &eval_config)
+                .expect("valid test signal inputs");
             let firing = sig.iter().filter(|v| **v != 0).count();
             (firing >= min_trades).then(|| (*idx, gene.clone(), sig))
         })
@@ -2994,6 +4382,7 @@ fn signal_count_screen_matches_screening_each_candidate_alone() {
         .iter()
         .filter(|(_, gene)| {
             signals_for_gene_full(&features, &ohlcv, gene, &eval_config)
+                .expect("valid test signal inputs")
                 .iter()
                 .any(|v| *v != 0)
         })
@@ -3010,7 +4399,8 @@ fn signal_count_screen_matches_screening_each_candidate_alone() {
     assert!(expected_nonzero > 0 && expected_nonzero < candidates.len());
 
     let (survivors, nonzero) =
-        screen_candidates_by_signal_count(&features, &ohlcv, candidates, &eval_config, min_trades);
+        screen_candidates_by_signal_count(&features, &ohlcv, candidates, &eval_config, min_trades)
+            .expect("candidate screen succeeds");
     assert_eq!(nonzero, expected_nonzero, "'fired at all' count");
     assert_eq!(survivors.len(), expected.len(), "survivor count");
     for (got, want) in survivors.iter().zip(expected.iter()) {
@@ -3378,8 +4768,9 @@ fn walkforward_export_defaults_are_not_a_hand_copy_that_can_drift() {
 // `DiscoveryRunProfile` (with a JSON pointer this test VERIFIES resolves), or
 // it is explicitly declared diagnostic-only with a written justification.
 // A new knob that skips the profile fails this test with instructions.
-// NEOETHOS_GPU_F64 (chose the GPU kernel precision, absent from the profile)
-// is the proven failure mode this ratchet exists to prevent.
+// NEOETHOS_GPU_F64 (once chose the GPU kernel precision without authority) is
+// the proven failure mode this ratchet exists to prevent. It is now retired:
+// CubeCL search arithmetic is unconditionally f64.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// How a discovered env knob is accounted for.
@@ -3830,7 +5221,7 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
         ),
         (
             "NEOETHOS_GPU_F64",
-            Profile("/execution/gpu/gpu_f64_backtest"),
+            DiagnosticOnly("retired and ignored; CubeCL search arithmetic is unconditionally f64"),
         ),
         (
             "NEOETHOS_GPU_FUSED_EVAL",
@@ -3839,6 +5230,12 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
         (
             "NEOETHOS_REQUIRE_GPU",
             Profile("/execution/gpu/require_gpu_env"),
+        ),
+        (
+            "NEOETHOS_RUN_CUDA_SEARCH_TESTS",
+            DiagnosticOnly(
+                "compiled only into real-device test gates; it cannot alter a production search",
+            ),
         ),
         (
             "NEOETHOS_BOT_SEARCH_VRAM_LOG",
@@ -3898,6 +5295,10 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
     //    empty result. Field EXISTENCE is what is asserted (a null value
     //    resolves fine), so the fixture's emptiness does not weaken the test.
     let empty_result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
@@ -3910,7 +5311,7 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
     let profile = build_discovery_profile(&DiscoveryConfig::default(), &empty_result);
     let json = serde_json::to_value(&profile).expect("run profile must serialize");
@@ -3976,6 +5377,10 @@ fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
         ("H1".to_string(), 50),
     ]);
     let result = DiscoveryResult {
+        search_input_receipt: sample_search_input_receipt(),
+        selection_scope: sample_discovery_selection_scope(),
+        holdout_scope: None,
+        search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
         portfolio: Vec::new(),
         candidates: Vec::new(),
@@ -3988,7 +5393,7 @@ fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
         forward_test_validation_artifacts: Vec::new(),
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
-        effective_smc_gate_threshold: f32::NAN,
+        effective_smc_gate_threshold: f64::NAN,
     };
     let mut a = build_discovery_profile(&config, &result);
     let mut b = build_discovery_profile(&config, &result);
@@ -4381,13 +5786,20 @@ fn the_kill_zone_switch_reaches_the_discovery_backtest() {
          exactly the defect this test exists for"
     );
 
-    // And the two runs must be TELLABLE APART afterwards: the value is part of
-    // the backtest policy hash, so artifacts produced under either setting
-    // cannot be confused for one another.
-    let hash_on = crate::discovery::discovery_backtest_policy_hash(&on, &gene, &template(&on))
-        .expect("policy hash (on)");
-    let hash_off = crate::discovery::discovery_backtest_policy_hash(&off, &gene, &template(&off))
-        .expect("policy hash (off)");
+    // And the two runs must be TELLABLE APART afterwards through the one
+    // canonical search-config authority every validation envelope carries.
+    let hash_on = crate::run_identity::config_hash_for(
+        &on,
+        on.evaluation_config(None).pip_value_per_lot,
+        false,
+    )
+    .expect("search config hash (on)");
+    let hash_off = crate::run_identity::config_hash_for(
+        &off,
+        off.evaluation_config(None).pip_value_per_lot,
+        false,
+    )
+    .expect("search config hash (off)");
     assert_ne!(
         hash_on, hash_off,
         "two runs under opposite weekend policies must not hash identically"

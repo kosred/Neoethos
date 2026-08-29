@@ -53,7 +53,10 @@ pub fn publish_elites(elites: Vec<Gene>) {
 
 /// Mesh → wire: drain the elites to gossip to peers.
 pub fn take_outgoing() -> Vec<Gene> {
-    OUTGOING.lock().map(|mut o| std::mem::take(&mut *o)).unwrap_or_default()
+    OUTGOING
+        .lock()
+        .map(|mut o| std::mem::take(&mut *o))
+        .unwrap_or_default()
 }
 
 /// Mesh → buffer: a peer's elites arrived; queue them for the GA (capped).
@@ -69,5 +72,8 @@ pub fn push_incoming(genes: Vec<Gene>) {
 
 /// GA ← buffer: drain migrants to fold into the next generation.
 pub fn take_incoming() -> Vec<Gene> {
-    INCOMING.lock().map(|mut i| std::mem::take(&mut *i)).unwrap_or_default()
+    INCOMING
+        .lock()
+        .map(|mut i| std::mem::take(&mut *i))
+        .unwrap_or_default()
 }

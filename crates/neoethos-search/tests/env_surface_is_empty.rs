@@ -26,14 +26,12 @@ use std::path::{Path, PathBuf};
 /// Reads that are allowed to remain, each because it CANNOT change what a run
 /// computes. `(path suffix, why)` — the path is matched with `ends_with` on a
 /// forward-slash-normalised relative path.
-const ALLOWED: &[(&str, &str)] = &[
-    (
-        "src/execution_profile.rs",
-        "RECORDER + the retired-env reporter. `raw_env` writes ambient values into the run \
+const ALLOWED: &[(&str, &str)] = &[(
+    "src/execution_profile.rs",
+    "RECORDER + the retired-env reporter. `raw_env` writes ambient values into the run \
          profile and nothing branches on the result; `report_retired_env_vars` exists \
          precisely to shout that a retired name is set and ignored.",
-    ),
-];
+)];
 
 fn is_env_read(line: &str) -> bool {
     let trimmed = line.trim_start();
@@ -46,6 +44,60 @@ fn is_env_read(line: &str) -> bool {
         None => trimmed,
     };
     code.contains("env::var(") || code.contains("env::var_os(") || code.contains("env::vars(")
+}
+
+fn retired_env_alias(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") || trimmed.starts_with('*') {
+        return None;
+    }
+    let code = match trimmed.find("//") {
+        Some(i) => &trimmed[..i],
+        None => trimmed,
+    };
+    let tokens: Vec<&str> = code
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    if tokens
+        .iter()
+        .any(|token| token.starts_with("install_") && token.ends_with("_from_env"))
+    {
+        return Some("retired install_*_from_env alias");
+    }
+    if tokens
+        .windows(2)
+        .any(|pair| pair == ["SmcSearchConfig", "from_env"])
+    {
+        return Some("retired SmcSearchConfig::from_env alias");
+    }
+    if tokens
+        .windows(2)
+        .any(|pair| pair == ["SeenSignatureMemory", "from_env"])
+    {
+        return Some("retired SeenSignatureMemory::from_env alias");
+    }
+    if tokens.windows(2).any(|pair| pair == ["fn", "from_env"]) {
+        return Some("retired from_env constructor definition");
+    }
+    None
+}
+
+#[test]
+fn retired_env_alias_detector_covers_definitions_reexports_and_calls() {
+    for forbidden in [
+        "pub fn install_smc_search_config_from_env() {}",
+        "pub use smc::install_smc_search_config_from_env;",
+        "pub fn from_env() -> Self { Self::current() }",
+        "let cfg = SmcSearchConfig :: from_env();",
+        "let seen = SeenSignatureMemory::from_env();",
+    ] {
+        assert!(
+            retired_env_alias(forbidden).is_some(),
+            "detector missed forbidden production surface: {forbidden}"
+        );
+    }
 }
 
 /// Line indices (0-based) that sit inside a `#[cfg(test)]` item.
@@ -143,7 +195,11 @@ fn no_production_env_reads_in_neoethos_search() {
         // Whole-file test modules. This crate declares them at the parent with
         // `#[cfg(all(test, ..))] mod device_tests;`, so the file itself carries
         // no marker to find — the convention is the name.
-        let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let name = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if name == "tests.rs" || name.ends_with("_tests.rs") {
             continue;
         }
@@ -191,4 +247,58 @@ fn the_allowlist_stays_small() {
             "allowlist entry {path} has no real justification: {why:?}"
         );
     }
+}
+
+/// Once the typed settings/runtime-override boundary replaced the legacy env
+/// surface, keeping compatibility aliases became actively unsafe: each
+/// `install_*_from_env` shim installed DEFAULTS into a `OnceLock`, so an early
+/// call could permanently win over the real settings. Keep definitions,
+/// re-exports, and calls out of production source instead of preserving dead
+/// spellings indefinitely.
+#[test]
+fn no_retired_env_aliases_in_production_search_surface() {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = crate_root.join("src");
+    let mut files = Vec::new();
+    rust_sources(&src, &mut files);
+    assert!(
+        !files.is_empty(),
+        "found no .rs files under {} — the ratchet is not scanning anything",
+        src.display()
+    );
+
+    let mut offences = Vec::new();
+    for file in &files {
+        let name = file.file_name().unwrap_or_default().to_string_lossy();
+        if name == "tests.rs" || name.ends_with("_tests.rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let skip = cfg_test_lines(&text);
+        let rel = file
+            .strip_prefix(&crate_root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (idx, line) in text.lines().enumerate() {
+            if skip.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(reason) = retired_env_alias(line) {
+                offences.push(format!("{rel}:{}: {reason}: {}", idx + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offences.is_empty(),
+        "retired env aliases remain on the production search surface ({} site(s)).\n\n{}\n\n\
+         Delete the alias definition/re-export/call. Production callers must use the typed \
+         `current()` or runtime-override boundary; no DEFAULT installer may initialize a \
+         `OnceLock` before settings.",
+        offences.len(),
+        offences.join("\n")
+    );
 }

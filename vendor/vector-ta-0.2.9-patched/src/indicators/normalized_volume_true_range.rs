@@ -1,24 +1,6 @@
-#[cfg(feature = "python")]
-use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyList};
-#[cfg(feature = "python")]
-use pyo3::wrap_pyfunction;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
 use crate::utilities::data_loader::Candles;
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{detect_best_batch_kernel, make_uninit_matrix};
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::mem::ManuallyDrop;
@@ -31,11 +13,6 @@ const MIN_LENGTH: usize = 2;
 const MIN_OUTLIER_RANGE: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "snake_case")
-)]
 pub enum NormalizedVolumeTrueRangeStyle {
     Body,
     Hl,
@@ -98,10 +75,6 @@ pub struct NormalizedVolumeTrueRangeOutput {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct NormalizedVolumeTrueRangeParams {
     pub true_range_style: Option<NormalizedVolumeTrueRangeStyle>,
     pub outlier_range: Option<f64>,
@@ -298,11 +271,11 @@ pub enum NormalizedVolumeTrueRangeError {
     InvalidOutlierRange { outlier_range: f64 },
     #[error("normalized_volume_true_range: invalid atr_length: {atr_length}. Expected >= 2.")]
     InvalidAtrLength { atr_length: usize },
-    #[error(
-        "normalized_volume_true_range: invalid volume_length: {volume_length}. Expected >= 2."
-    )]
+    #[error("normalized_volume_true_range: invalid volume_length: {volume_length}. Expected >= 2.")]
     InvalidVolumeLength { volume_length: usize },
-    #[error("normalized_volume_true_range: inconsistent slice lengths: open={open_len}, high={high_len}, low={low_len}, close={close_len}, volume={volume_len}")]
+    #[error(
+        "normalized_volume_true_range: inconsistent slice lengths: open={open_len}, high={high_len}, low={low_len}, close={close_len}, volume={volume_len}"
+    )]
     InconsistentSliceLengths {
         open_len: usize,
         high_len: usize,
@@ -314,15 +287,21 @@ pub enum NormalizedVolumeTrueRangeError {
         "normalized_volume_true_range: output length mismatch: expected = {expected}, got = {got}"
     )]
     OutputLengthMismatch { expected: usize, got: usize },
-    #[error("normalized_volume_true_range: invalid outlier range sweep: start={start}, end={end}, step={step}")]
+    #[error(
+        "normalized_volume_true_range: invalid outlier range sweep: start={start}, end={end}, step={step}"
+    )]
     InvalidOutlierRangeSweep { start: f64, end: f64, step: f64 },
-    #[error("normalized_volume_true_range: invalid atr length sweep: start={start}, end={end}, step={step}")]
+    #[error(
+        "normalized_volume_true_range: invalid atr length sweep: start={start}, end={end}, step={step}"
+    )]
     InvalidAtrLengthSweep {
         start: usize,
         end: usize,
         step: usize,
     },
-    #[error("normalized_volume_true_range: invalid volume length sweep: start={start}, end={end}, step={step}")]
+    #[error(
+        "normalized_volume_true_range: invalid volume length sweep: start={start}, end={end}, step={step}"
+    )]
     InvalidVolumeLengthSweep {
         start: usize,
         end: usize,
@@ -845,7 +824,6 @@ pub fn normalized_volume_true_range_into_slice(
     )
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 #[inline]
 pub fn normalized_volume_true_range_into(
     input: &NormalizedVolumeTrueRangeInput<'_>,
@@ -1451,730 +1429,10 @@ fn normalized_volume_true_range_batch_inner(
     })
 }
 
-#[cfg(feature = "python")]
-fn parse_style_py(style: Option<&str>) -> PyResult<Option<NormalizedVolumeTrueRangeStyle>> {
-    match style {
-        Some(value) => value
-            .parse::<NormalizedVolumeTrueRangeStyle>()
-            .map(Some)
-            .map_err(PyValueError::new_err),
-        None => Ok(None),
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "normalized_volume_true_range")]
-#[pyo3(signature = (open, high, low, close, volume, true_range_style=None, outlier_range=None, atr_length=None, volume_length=None, *, kernel=None))]
-pub fn normalized_volume_true_range_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    true_range_style: Option<&str>,
-    outlier_range: Option<f64>,
-    atr_length: Option<usize>,
-    volume_length: Option<usize>,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
-    let kernel = validate_kernel(kernel, false)?;
-    let style = parse_style_py(true_range_style)?;
-    let input = NormalizedVolumeTrueRangeInput::from_slices(
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        volume.as_slice()?,
-        NormalizedVolumeTrueRangeParams {
-            true_range_style: style,
-            outlier_range,
-            atr_length,
-            volume_length,
-        },
-    );
-    let out = py
-        .allow_threads(|| normalized_volume_true_range_with_kernel(&input, kernel))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.normalized_volume.into_pyarray(py),
-        out.normalized_true_range.into_pyarray(py),
-        out.baseline.into_pyarray(py),
-        out.atr.into_pyarray(py),
-        out.average_volume.into_pyarray(py),
-    ))
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "NormalizedVolumeTrueRangeStream")]
-pub struct NormalizedVolumeTrueRangeStreamPy {
-    inner: NormalizedVolumeTrueRangeStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl NormalizedVolumeTrueRangeStreamPy {
-    #[new]
-    #[pyo3(signature = (true_range_style=None, outlier_range=None, atr_length=None, volume_length=None))]
-    pub fn new(
-        true_range_style: Option<&str>,
-        outlier_range: Option<f64>,
-        atr_length: Option<usize>,
-        volume_length: Option<usize>,
-    ) -> PyResult<Self> {
-        let inner = NormalizedVolumeTrueRangeStream::try_new(NormalizedVolumeTrueRangeParams {
-            true_range_style: parse_style_py(true_range_style)?,
-            outlier_range,
-            atr_length,
-            volume_length,
-        })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner })
-    }
-
-    pub fn update(
-        &mut self,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: f64,
-    ) -> Option<(f64, f64, f64, f64, f64)> {
-        self.inner.update(open, high, low, close, volume)
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "normalized_volume_true_range_batch")]
-#[pyo3(signature = (open, high, low, close, volume, outlier_range_range=None, atr_length_range=None, volume_length_range=None, true_range_style=None, *, kernel=None))]
-pub fn normalized_volume_true_range_batch_py<'py>(
-    py: Python<'py>,
-    open: PyReadonlyArray1<'py, f64>,
-    high: PyReadonlyArray1<'py, f64>,
-    low: PyReadonlyArray1<'py, f64>,
-    close: PyReadonlyArray1<'py, f64>,
-    volume: PyReadonlyArray1<'py, f64>,
-    outlier_range_range: Option<(f64, f64, f64)>,
-    atr_length_range: Option<(usize, usize, usize)>,
-    volume_length_range: Option<(usize, usize, usize)>,
-    true_range_style: Option<&str>,
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let kernel = validate_kernel(kernel, true)?;
-    let style = parse_style_py(true_range_style)?;
-    let out = normalized_volume_true_range_batch_with_kernel(
-        open.as_slice()?,
-        high.as_slice()?,
-        low.as_slice()?,
-        close.as_slice()?,
-        volume.as_slice()?,
-        &NormalizedVolumeTrueRangeBatchRange {
-            outlier_range: outlier_range_range.unwrap_or((
-                DEFAULT_OUTLIER_RANGE,
-                DEFAULT_OUTLIER_RANGE,
-                0.0,
-            )),
-            atr_length: atr_length_range.unwrap_or((DEFAULT_ATR_LENGTH, DEFAULT_ATR_LENGTH, 0)),
-            volume_length: volume_length_range.unwrap_or((
-                DEFAULT_VOLUME_LENGTH,
-                DEFAULT_VOLUME_LENGTH,
-                0,
-            )),
-            true_range_style: style,
-        },
-        kernel,
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "normalized_volume",
-        out.normalized_volume
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "normalized_true_range",
-        out.normalized_true_range
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "baseline",
-        out.baseline
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "atr",
-        out.atr.into_pyarray(py).reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "average_volume",
-        out.average_volume
-            .into_pyarray(py)
-            .reshape((out.rows, out.cols))?,
-    )?;
-    dict.set_item(
-        "outlier_ranges",
-        out.combos
-            .iter()
-            .map(|combo| combo.outlier_range.unwrap_or(DEFAULT_OUTLIER_RANGE))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "atr_lengths",
-        out.combos
-            .iter()
-            .map(|combo| combo.atr_length.unwrap_or(DEFAULT_ATR_LENGTH))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "volume_lengths",
-        out.combos
-            .iter()
-            .map(|combo| combo.volume_length.unwrap_or(DEFAULT_VOLUME_LENGTH))
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "true_range_styles",
-        PyList::new(
-            py,
-            out.combos
-                .iter()
-                .map(|combo| combo.true_range_style.unwrap_or_default().as_str()),
-        )?,
-    )?;
-    dict.set_item("rows", out.rows)?;
-    dict.set_item("cols", out.cols)?;
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_normalized_volume_true_range_module(
-    m: &Bound<'_, pyo3::types::PyModule>,
-) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(normalized_volume_true_range_py, m)?)?;
-    m.add_function(wrap_pyfunction!(normalized_volume_true_range_batch_py, m)?)?;
-    m.add_class::<NormalizedVolumeTrueRangeStreamPy>()?;
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-fn parse_style_js(
-    style: Option<String>,
-) -> Result<Option<NormalizedVolumeTrueRangeStyle>, JsValue> {
-    match style {
-        Some(value) => value
-            .parse::<NormalizedVolumeTrueRangeStyle>()
-            .map(Some)
-            .map_err(|e| JsValue::from_str(&e)),
-        None => Ok(None),
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct NormalizedVolumeTrueRangeJsOutput {
-    normalized_volume: Vec<f64>,
-    normalized_true_range: Vec<f64>,
-    baseline: Vec<f64>,
-    atr: Vec<f64>,
-    average_volume: Vec<f64>,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-struct NormalizedVolumeTrueRangeStreamJsOutput {
-    normalized_volume: f64,
-    normalized_true_range: f64,
-    baseline: f64,
-    atr: f64,
-    average_volume: f64,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NormalizedVolumeTrueRangeBatchConfig {
-    pub true_range_style: Option<String>,
-    pub outlier_range_range: (f64, f64, f64),
-    pub atr_length_range: (usize, usize, usize),
-    pub volume_length_range: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct NormalizedVolumeTrueRangeBatchJsOutput {
-    pub normalized_volume: Vec<f64>,
-    pub normalized_true_range: Vec<f64>,
-    pub baseline: Vec<f64>,
-    pub atr: Vec<f64>,
-    pub average_volume: Vec<f64>,
-    pub combos: Vec<NormalizedVolumeTrueRangeParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = normalized_volume_true_range_js)]
-pub fn normalized_volume_true_range_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    true_range_style: Option<String>,
-    outlier_range: Option<f64>,
-    atr_length: Option<usize>,
-    volume_length: Option<usize>,
-) -> Result<JsValue, JsValue> {
-    let input = NormalizedVolumeTrueRangeInput::from_slices(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        NormalizedVolumeTrueRangeParams {
-            true_range_style: parse_style_js(true_range_style)?,
-            outlier_range,
-            atr_length,
-            volume_length,
-        },
-    );
-    let out =
-        normalized_volume_true_range(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&NormalizedVolumeTrueRangeJsOutput {
-        normalized_volume: out.normalized_volume,
-        normalized_true_range: out.normalized_true_range,
-        baseline: out.baseline,
-        atr: out.atr,
-        average_volume: out.average_volume,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = normalized_volume_true_range_batch)]
-pub fn normalized_volume_true_range_batch_unified_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-) -> Result<JsValue, JsValue> {
-    let config: NormalizedVolumeTrueRangeBatchConfig =
-        serde_wasm_bindgen::from_value(config).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let out = normalized_volume_true_range_batch_with_kernel(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        &NormalizedVolumeTrueRangeBatchRange {
-            true_range_style: parse_style_js(config.true_range_style)?,
-            outlier_range: config.outlier_range_range,
-            atr_length: config.atr_length_range,
-            volume_length: config.volume_length_range,
-        },
-        Kernel::Auto,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    serde_wasm_bindgen::to_value(&NormalizedVolumeTrueRangeBatchJsOutput {
-        normalized_volume: out.normalized_volume,
-        normalized_true_range: out.normalized_true_range,
-        baseline: out.baseline,
-        atr: out.atr,
-        average_volume: out.average_volume,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    })
-    .map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = normalized_volume_true_range_alloc)]
-pub fn normalized_volume_true_range_alloc(len: usize) -> *mut f64 {
-    let mut values = vec![0.0; len];
-    let ptr = values.as_mut_ptr();
-    std::mem::forget(values);
-    ptr
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = normalized_volume_true_range_free)]
-pub fn normalized_volume_true_range_free(ptr: *mut f64, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Vec::from_raw_parts(ptr, 0, len));
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = normalized_volume_true_range_into)]
-pub fn normalized_volume_true_range_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    normalized_volume_ptr: *mut f64,
-    normalized_true_range_ptr: *mut f64,
-    baseline_ptr: *mut f64,
-    atr_ptr: *mut f64,
-    average_volume_ptr: *mut f64,
-    len: usize,
-    true_range_style: Option<String>,
-    outlier_range: Option<f64>,
-    atr_length: Option<usize>,
-    volume_length: Option<usize>,
-) -> Result<(), JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || normalized_volume_ptr.is_null()
-        || normalized_true_range_ptr.is_null()
-        || baseline_ptr.is_null()
-        || atr_ptr.is_null()
-        || average_volume_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to normalized_volume_true_range_into",
-        ));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let input = NormalizedVolumeTrueRangeInput::from_slices(
-            open,
-            high,
-            low,
-            close,
-            volume,
-            NormalizedVolumeTrueRangeParams {
-                true_range_style: parse_style_js(true_range_style)?,
-                outlier_range,
-                atr_length,
-                volume_length,
-            },
-        );
-
-        let input_alias = [
-            normalized_volume_ptr as *const f64,
-            normalized_true_range_ptr as *const f64,
-            baseline_ptr as *const f64,
-            atr_ptr as *const f64,
-            average_volume_ptr as *const f64,
-        ]
-        .iter()
-        .any(|&ptr| {
-            ptr == open_ptr
-                || ptr == high_ptr
-                || ptr == low_ptr
-                || ptr == close_ptr
-                || ptr == volume_ptr
-        });
-        let output_alias = normalized_volume_ptr == normalized_true_range_ptr
-            || normalized_volume_ptr == baseline_ptr
-            || normalized_volume_ptr == atr_ptr
-            || normalized_volume_ptr == average_volume_ptr
-            || normalized_true_range_ptr == baseline_ptr
-            || normalized_true_range_ptr == atr_ptr
-            || normalized_true_range_ptr == average_volume_ptr
-            || baseline_ptr == atr_ptr
-            || baseline_ptr == average_volume_ptr
-            || atr_ptr == average_volume_ptr;
-
-        if input_alias || output_alias {
-            let mut normalized_volume = vec![0.0; len];
-            let mut normalized_true_range = vec![0.0; len];
-            let mut baseline = vec![0.0; len];
-            let mut atr = vec![0.0; len];
-            let mut average_volume = vec![0.0; len];
-            normalized_volume_true_range_into_slice(
-                &mut normalized_volume,
-                &mut normalized_true_range,
-                &mut baseline,
-                &mut atr,
-                &mut average_volume,
-                &input,
-                Kernel::Auto,
-            )
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            std::slice::from_raw_parts_mut(normalized_volume_ptr, len)
-                .copy_from_slice(&normalized_volume);
-            std::slice::from_raw_parts_mut(normalized_true_range_ptr, len)
-                .copy_from_slice(&normalized_true_range);
-            std::slice::from_raw_parts_mut(baseline_ptr, len).copy_from_slice(&baseline);
-            std::slice::from_raw_parts_mut(atr_ptr, len).copy_from_slice(&atr);
-            std::slice::from_raw_parts_mut(average_volume_ptr, len)
-                .copy_from_slice(&average_volume);
-            return Ok(());
-        }
-
-        normalized_volume_true_range_into_slice(
-            std::slice::from_raw_parts_mut(normalized_volume_ptr, len),
-            std::slice::from_raw_parts_mut(normalized_true_range_ptr, len),
-            std::slice::from_raw_parts_mut(baseline_ptr, len),
-            std::slice::from_raw_parts_mut(atr_ptr, len),
-            std::slice::from_raw_parts_mut(average_volume_ptr, len),
-            &input,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = normalized_volume_true_range_batch_into)]
-pub fn normalized_volume_true_range_batch_into(
-    open_ptr: *const f64,
-    high_ptr: *const f64,
-    low_ptr: *const f64,
-    close_ptr: *const f64,
-    volume_ptr: *const f64,
-    normalized_volume_ptr: *mut f64,
-    normalized_true_range_ptr: *mut f64,
-    baseline_ptr: *mut f64,
-    atr_ptr: *mut f64,
-    average_volume_ptr: *mut f64,
-    len: usize,
-    outlier_range_start: f64,
-    outlier_range_end: f64,
-    outlier_range_step: f64,
-    atr_length_start: usize,
-    atr_length_end: usize,
-    atr_length_step: usize,
-    volume_length_start: usize,
-    volume_length_end: usize,
-    volume_length_step: usize,
-    true_range_style: Option<String>,
-) -> Result<usize, JsValue> {
-    if open_ptr.is_null()
-        || high_ptr.is_null()
-        || low_ptr.is_null()
-        || close_ptr.is_null()
-        || volume_ptr.is_null()
-        || normalized_volume_ptr.is_null()
-        || normalized_true_range_ptr.is_null()
-        || baseline_ptr.is_null()
-        || atr_ptr.is_null()
-        || average_volume_ptr.is_null()
-    {
-        return Err(JsValue::from_str(
-            "null pointer passed to normalized_volume_true_range_batch_into",
-        ));
-    }
-
-    unsafe {
-        let open = std::slice::from_raw_parts(open_ptr, len);
-        let high = std::slice::from_raw_parts(high_ptr, len);
-        let low = std::slice::from_raw_parts(low_ptr, len);
-        let close = std::slice::from_raw_parts(close_ptr, len);
-        let volume = std::slice::from_raw_parts(volume_ptr, len);
-        let sweep = NormalizedVolumeTrueRangeBatchRange {
-            true_range_style: parse_style_js(true_range_style)?,
-            outlier_range: (outlier_range_start, outlier_range_end, outlier_range_step),
-            atr_length: (atr_length_start, atr_length_end, atr_length_step),
-            volume_length: (volume_length_start, volume_length_end, volume_length_step),
-        };
-        let combos = expand_grid_normalized_volume_true_range(&sweep)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let total = rows
-            .checked_mul(len)
-            .ok_or_else(|| JsValue::from_str("rows*cols overflow"))?;
-
-        let input_alias = [
-            normalized_volume_ptr as *const f64,
-            normalized_true_range_ptr as *const f64,
-            baseline_ptr as *const f64,
-            atr_ptr as *const f64,
-            average_volume_ptr as *const f64,
-        ]
-        .iter()
-        .any(|&ptr| {
-            ptr == open_ptr
-                || ptr == high_ptr
-                || ptr == low_ptr
-                || ptr == close_ptr
-                || ptr == volume_ptr
-        });
-        let output_alias = normalized_volume_ptr == normalized_true_range_ptr
-            || normalized_volume_ptr == baseline_ptr
-            || normalized_volume_ptr == atr_ptr
-            || normalized_volume_ptr == average_volume_ptr
-            || normalized_true_range_ptr == baseline_ptr
-            || normalized_true_range_ptr == atr_ptr
-            || normalized_true_range_ptr == average_volume_ptr
-            || baseline_ptr == atr_ptr
-            || baseline_ptr == average_volume_ptr
-            || atr_ptr == average_volume_ptr;
-
-        let out = normalized_volume_true_range_batch_with_kernel(
-            open,
-            high,
-            low,
-            close,
-            volume,
-            &sweep,
-            Kernel::Auto,
-        )
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        if input_alias || output_alias {
-            std::slice::from_raw_parts_mut(normalized_volume_ptr, total)
-                .copy_from_slice(&out.normalized_volume);
-            std::slice::from_raw_parts_mut(normalized_true_range_ptr, total)
-                .copy_from_slice(&out.normalized_true_range);
-            std::slice::from_raw_parts_mut(baseline_ptr, total).copy_from_slice(&out.baseline);
-            std::slice::from_raw_parts_mut(atr_ptr, total).copy_from_slice(&out.atr);
-            std::slice::from_raw_parts_mut(average_volume_ptr, total)
-                .copy_from_slice(&out.average_volume);
-            return Ok(rows);
-        }
-
-        std::slice::from_raw_parts_mut(normalized_volume_ptr, total)
-            .copy_from_slice(&out.normalized_volume);
-        std::slice::from_raw_parts_mut(normalized_true_range_ptr, total)
-            .copy_from_slice(&out.normalized_true_range);
-        std::slice::from_raw_parts_mut(baseline_ptr, total).copy_from_slice(&out.baseline);
-        std::slice::from_raw_parts_mut(atr_ptr, total).copy_from_slice(&out.atr);
-        std::slice::from_raw_parts_mut(average_volume_ptr, total)
-            .copy_from_slice(&out.average_volume);
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub struct NormalizedVolumeTrueRangeStreamWasm {
-    inner: NormalizedVolumeTrueRangeStream,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-impl NormalizedVolumeTrueRangeStreamWasm {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        true_range_style: Option<String>,
-        outlier_range: Option<f64>,
-        atr_length: Option<usize>,
-        volume_length: Option<usize>,
-    ) -> Result<NormalizedVolumeTrueRangeStreamWasm, JsValue> {
-        Ok(Self {
-            inner: NormalizedVolumeTrueRangeStream::try_new(NormalizedVolumeTrueRangeParams {
-                true_range_style: parse_style_js(true_range_style)?,
-                outlier_range,
-                atr_length,
-                volume_length,
-            })
-            .map_err(|e| JsValue::from_str(&e.to_string()))?,
-        })
-    }
-
-    pub fn update(
-        &mut self,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: f64,
-    ) -> Result<JsValue, JsValue> {
-        match self.inner.update(open, high, low, close, volume) {
-            Some((normalized_volume, normalized_true_range, baseline, atr, average_volume)) => {
-                serde_wasm_bindgen::to_value(&NormalizedVolumeTrueRangeStreamJsOutput {
-                    normalized_volume,
-                    normalized_true_range,
-                    baseline,
-                    atr,
-                    average_volume,
-                })
-                .map_err(|e| JsValue::from_str(&e.to_string()))
-            }
-            None => Ok(JsValue::NULL),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn normalized_volume_true_range_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    true_range_style: Option<String>,
-    outlier_range: Option<f64>,
-    atr_length: Option<usize>,
-    volume_length: Option<usize>,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = normalized_volume_true_range_js(
-        open,
-        high,
-        low,
-        close,
-        volume,
-        true_range_style,
-        outlier_range,
-        atr_length,
-        volume_length,
-    )?;
-    crate::write_wasm_object_f64_outputs("normalized_volume_true_range_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn normalized_volume_true_range_batch_unified_output_into_js(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value =
-        normalized_volume_true_range_batch_unified_js(open, high, low, close, volume, config)?;
-    crate::write_wasm_selected_object_f64_outputs(
-        "normalized_volume_true_range_batch_unified_output_into_js",
-        &value,
-        out,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
     use std::error::Error;
 
     fn naive_reference(
@@ -2356,28 +1614,31 @@ mod tests {
 
     #[test]
     fn normalized_volume_true_range_fixture_has_values() -> Result<(), Box<dyn Error>> {
-        let candles = read_candles_from_csv("src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv")?;
+        let candles = read_candles_from_vortex("src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex")?;
         let out = normalized_volume_true_range(
             &NormalizedVolumeTrueRangeInput::with_default_candles(&candles),
         )?;
         assert_eq!(out.normalized_volume.len(), candles.close.len());
-        assert!(out
-            .normalized_volume
-            .iter()
-            .skip(32)
-            .any(|value| value.is_finite()));
-        assert!(out
-            .normalized_true_range
-            .iter()
-            .skip(32)
-            .any(|value| value.is_finite()));
+        assert!(
+            out.normalized_volume
+                .iter()
+                .skip(32)
+                .any(|value| value.is_finite())
+        );
+        assert!(
+            out.normalized_true_range
+                .iter()
+                .skip(32)
+                .any(|value| value.is_finite())
+        );
         assert!(out.baseline.iter().skip(32).any(|value| value.is_finite()));
         assert!(out.atr.iter().skip(32).any(|value| value.is_finite()));
-        assert!(out
-            .average_volume
-            .iter()
-            .skip(32)
-            .any(|value| value.is_finite()));
+        assert!(
+            out.average_volume
+                .iter()
+                .skip(32)
+                .any(|value| value.is_finite())
+        );
         Ok(())
     }
 }

@@ -35,9 +35,9 @@ use axum::response::{IntoResponse, Response};
 
 use neoethos_core::Settings;
 
-use crate::app_services::live_trading::{LiveTradingStatus, StartRequest};
 use super::errors::actionable_error;
 use super::state::AppApiState;
+use crate::app_services::live_trading::{LiveTradingStatus, StartRequest};
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
@@ -221,7 +221,9 @@ pub async fn start_live(
 
     let mut slot = match state.live_trading.lock() {
         Ok(g) => g,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response();
+        }
     };
     // Keep only still-running engines so the registry reflects reality.
     slot.retain(|h| h.is_running());
@@ -259,9 +261,7 @@ pub async fn start_live(
                 started.push(path);
                 slot.push(handle);
             }
-            Err(e) => {
-                failed.push(serde_json::json!({"portfolio": path, "error": e.to_string()}))
-            }
+            Err(e) => failed.push(serde_json::json!({"portfolio": path, "error": e.to_string()})),
         }
     }
 
@@ -376,7 +376,9 @@ pub struct ParityQuery {
 /// features) — fix BEFORE trusting live results.
 pub async fn parity(Query(q): Query<ParityQuery>) -> Response {
     let portfolio = q.portfolio;
-    let window = q.window.unwrap_or(crate::app_services::live_trading::default_warmup_bars());
+    let window = q
+        .window
+        .unwrap_or(crate::app_services::live_trading::default_warmup_bars());
     let reference = q.reference.unwrap_or(3000);
     let result = tokio::task::spawn_blocking(move || {
         crate::app_services::live_parity::run_live_parity_check(&portfolio, window, reference)
@@ -402,7 +404,9 @@ pub async fn parity(Query(q): Query<ParityQuery>) -> Response {
 pub async fn stop_live(State(state): State<AppApiState>) -> Response {
     let mut slot = match state.live_trading.lock() {
         Ok(g) => g,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response();
+        }
     };
     let count = slot.len();
     for handle in slot.iter() {
@@ -460,7 +464,9 @@ pub async fn gate(Query(q): Query<GateQuery>) -> Response {
 pub async fn live_status(State(state): State<AppApiState>) -> Response {
     let mut slot = match state.live_trading.lock() {
         Ok(g) => g,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response();
+        }
     };
     slot.retain(|h| h.is_running());
     Json(live_overview(&slot)).into_response()

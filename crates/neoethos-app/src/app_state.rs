@@ -1,9 +1,11 @@
+pub use crate::app_services::execution_admission::platform_import_auxiliary_slot_limit;
 use crate::app_services::execution_admission::{
     AdmissionError, ExecutionAdmissionClient, ExecutionAdmissionCoordinator,
+    ExecutionAdmissionSnapshot,
 };
 use neoethos_core::Settings;
 use neoethos_core::execution::BudgetedCpuExecutor;
-use neoethos_core::execution_budget::{CpuPermitBroker, WorkerLimit};
+use neoethos_core::execution_budget::{AuxiliarySlotLimit, CpuPermitBroker, WorkerLimit};
 use std::path::PathBuf;
 
 /// Process-lifetime owner of async CPU admission and the lease-bound Rayon
@@ -18,10 +20,25 @@ impl AppExecutionState {
         broker: CpuPermitBroker,
         max_cached_worker_threads: WorkerLimit,
     ) -> std::io::Result<Self> {
+        Self::new_with_auxiliary_slots(
+            broker,
+            max_cached_worker_threads,
+            platform_import_auxiliary_slot_limit(),
+        )
+    }
+
+    pub fn new_with_auxiliary_slots(
+        broker: CpuPermitBroker,
+        max_cached_worker_threads: WorkerLimit,
+        auxiliary_slots: AuxiliarySlotLimit,
+    ) -> std::io::Result<Self> {
         let executor =
             BudgetedCpuExecutor::new_for_broker(broker.clone(), max_cached_worker_threads);
         Ok(Self {
-            coordinator: Some(ExecutionAdmissionCoordinator::start(broker)?),
+            coordinator: Some(ExecutionAdmissionCoordinator::start_with_auxiliary_slots(
+                broker,
+                auxiliary_slots,
+            )?),
             executor,
         })
     }
@@ -35,6 +52,13 @@ impl AppExecutionState {
 
     pub fn executor(&self) -> &BudgetedCpuExecutor {
         &self.executor
+    }
+
+    pub fn admission_snapshot(&self) -> ExecutionAdmissionSnapshot {
+        self.coordinator
+            .as_ref()
+            .expect("app execution state owns its coordinator until shutdown")
+            .admission_snapshot()
     }
 
     pub fn shutdown(mut self) -> Result<(), AdmissionError> {

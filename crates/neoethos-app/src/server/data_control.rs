@@ -3,15 +3,26 @@
 //!
 //!   GET  /broker/symbols           — what this account can trade
 //!   POST /data/fetch               — download bars + persist to disk
+//!   GET  /data/fetch/status        — exact active run id + phase
+//!   POST /data/fetch/stop          — cancel one exact capturing run id
 //!
-//! Both share the `broker_api` helper module so the route bodies
-//! are thin wrappers around `spawn_blocking`.
+//! Both share the `broker_api` helper module. CPU-bound route work first
+//! enters the process admission coordinator, then transfers that exact lease
+//! into the blocking lifetime; `spawn_blocking` is only the async/runtime
+//! boundary and never grants capacity by itself.
 
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use neoethos_broker_history::{
+    BrokerHistoryConflict, HistoricalFetchCancelResult, HistoricalFetchStartFailure,
+    begin_process_historical_capture, cancel_process_historical_capture,
+    is_historical_capture_cancelled, process_historical_capture_status,
+};
 use neoethos_core::Settings;
+use neoethos_data::ExactDatasetGenerationConflict;
+use neoethos_data::core::dataset_manifest::PublicationConflict;
 
 use crate::app_services::broker_api::{
     download_history_blocking, fetch_broker_accounts_blocking,
@@ -20,6 +31,7 @@ use crate::app_services::broker_api::{
     fetch_broker_symbols_blocking, fetch_broker_version_blocking,
 };
 use crate::app_services::ctrader_errors::translate_anyhow;
+use crate::app_services::ctrader_messages::CTraderBlockedPayloadError;
 
 use super::errors::internal_panic;
 use super::state::AppApiState;
@@ -30,6 +42,37 @@ use super::state::AppApiState;
 /// "errorCode=CH_ACCESS_TOKEN_INVALID" gibberish.
 fn broker_gateway_error(err: anyhow::Error) -> Response {
     let raw = err.to_string();
+    let retry_after_seconds = err
+        .downcast_ref::<CTraderBlockedPayloadError>()
+        .map(CTraderBlockedPayloadError::retry_after_seconds)
+        .or_else(|| {
+            err.downcast_ref::<
+                neoethos_broker_history::ctrader_messages::CTraderBlockedPayloadError,
+            >()
+            .map(
+                neoethos_broker_history::ctrader_messages::CTraderBlockedPayloadError::retry_after_seconds,
+            )
+        });
+    if let Some(retry_after_seconds) = retry_after_seconds {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "cTrader temporarily blocked this historical payload type; the batch was stopped without retry.",
+                "detail": raw,
+                "code": "BLOCKED_PAYLOAD_TYPE",
+                "retryAfterSeconds": retry_after_seconds,
+            })),
+        )
+            .into_response();
+        if let Some(seconds) = retry_after_seconds
+            && let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string())
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        return response;
+    }
     if let Some(t) = translate_anyhow(&err) {
         let body = serde_json::json!({
             "error": t.message,
@@ -44,6 +87,52 @@ fn broker_gateway_error(err: anyhow::Error) -> Response {
         "detail": raw,
     });
     (StatusCode::BAD_GATEWAY, Json(body)).into_response()
+}
+
+fn cancelled_fetch_response(run_id: u64) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "broker historical fetch was cancelled",
+            "code": "FETCH_CANCELLED",
+            "outcome": "cancelled",
+            "runId": run_id,
+        })),
+    )
+        .into_response()
+}
+
+fn broker_fetch_error(err: anyhow::Error, run_id: u64) -> Response {
+    if is_historical_capture_cancelled(err.as_ref()) {
+        return cancelled_fetch_response(run_id);
+    }
+
+    let conflict_code = if err
+        .downcast_ref::<ExactDatasetGenerationConflict>()
+        .is_some()
+    {
+        Some("STALE_DATASET_RECEIPT")
+    } else if err.downcast_ref::<PublicationConflict>().is_some() {
+        Some("DATASET_PUBLICATION_CONFLICT")
+    } else {
+        err.downcast_ref::<BrokerHistoryConflict>()
+            .map(BrokerHistoryConflict::response_code)
+    };
+    if let Some(conflict_code) = conflict_code {
+        let detail = err.to_string();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "broker dataset selection conflicts with current canonical state",
+                "detail": detail,
+                "code": conflict_code,
+                "runId": run_id,
+            })),
+        )
+            .into_response();
+    }
+
+    broker_gateway_error(err)
 }
 
 // ─── GET /broker/timeframes ───────────────────────────────────────────────
@@ -214,6 +303,8 @@ pub struct FetchBody {
     /// Unix-millis exclusive upper bound. `None` → now.
     #[serde(rename = "toMs")]
     pub to_ms: Option<i64>,
+    /// Exact refresh receipt from `/data/bootstrap`; `None` is CREATE-only.
+    pub dataset_selection: Option<neoethos_data::SelectedDatasetGenerationV1>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -227,6 +318,63 @@ pub struct FetchOutcomeDto {
     /// Unix-millis of the oldest bar returned (serialized `oldestMs`); null when
     /// 0 bars. UI uses it to show actual history depth + warn on shallow data.
     pub oldest_ms: Option<i64>,
+    pub dataset_identity: String,
+    pub generation: String,
+    pub durable_commit_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchStatusDto {
+    pub active: bool,
+    pub run_id: Option<u64>,
+    pub phase: Option<&'static str>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StopFetchBody {
+    pub run_id: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome")]
+enum StopFetchOutcomeDto {
+    #[serde(rename = "cancelled")]
+    Cancelled {
+        #[serde(rename = "runId")]
+        run_id: u64,
+    },
+    #[serde(rename = "publication_in_progress")]
+    PublicationInProgress {
+        #[serde(rename = "runId")]
+        run_id: u64,
+    },
+    #[serde(rename = "stale_run")]
+    StaleRun {
+        #[serde(rename = "requestedRunId")]
+        requested_run_id: u64,
+        #[serde(rename = "activeRunId")]
+        active_run_id: u64,
+    },
+    #[serde(rename = "no_active_fetch")]
+    NoActiveFetch,
+}
+
+fn cancelled_before_broker_execution(run_id: u64) -> Response {
+    cancelled_fetch_response(run_id)
+}
+
+/// Current CPU demand of the broker-history pipeline. The network fetch,
+/// validation and canonical publication are serial today, so reserving the
+/// process-wide N-2 limit would strand capacity without creating parallel
+/// work. Keep this typed hook at the route boundary so a future proven bounded
+/// parallel publisher can raise its declared demand without bypassing shared
+/// admission.
+fn broker_fetch_cpu_demand() -> neoethos_core::execution_budget::CpuPermitRequest {
+    let width = neoethos_core::execution_budget::WorkerLimit::new(1)
+        .expect("one broker-fetch worker is a valid positive CPU demand");
+    neoethos_core::execution_budget::CpuPermitRequest::local(width)
 }
 
 pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>) -> Response {
@@ -246,23 +394,108 @@ pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>
     }
 
     let from_ms = body.from_ms;
+    let dataset_selection = body.dataset_selection;
+    let active_fetch = match begin_process_historical_capture() {
+        Ok(active_fetch) => active_fetch,
+        Err(HistoricalFetchStartFailure::AlreadyActive { active_run_id }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "a broker historical fetch is already active",
+                    "activeRunId": active_run_id,
+                })),
+            )
+                .into_response();
+        }
+        Err(HistoricalFetchStartFailure::RunIdOverflow) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "broker historical fetch id space is exhausted",
+                })),
+            )
+                .into_response();
+        }
+        Err(HistoricalFetchStartFailure::Cancelled { run_id }) => {
+            return cancelled_before_broker_execution(run_id);
+        }
+    };
+    let run_id = active_fetch.run_id();
+    let Some(execution) = state.execution_state() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "broker fetch unavailable: process CPU admission was not installed before AppApiState",
+            })),
+        )
+            .into_response();
+    };
+    let pending_admission = match execution
+        .admission_client()
+        .submit(broker_fetch_cpu_demand())
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "broker fetch admission failed",
+                    "detail": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut pending_wait = Box::pin(pending_admission.wait());
+    let admitted = loop {
+        tokio::select! {
+            result = &mut pending_wait => match result {
+                Ok(admitted) => break admitted,
+                Err(error) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": "broker fetch admission failed",
+                            "detail": error.to_string(),
+                        })),
+                    )
+                        .into_response();
+                }
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                if active_fetch.is_cancelled() {
+                    return cancelled_before_broker_execution(run_id);
+                }
+            }
+        }
+    };
+    drop(pending_wait);
+    if active_fetch.is_cancelled() {
+        return cancelled_before_broker_execution(run_id);
+    }
+
     // F-553/F-576 closure (2026-05-25): config path threaded from CLI.
     let config_path = state.config_path().to_path_buf();
+    let executor = execution.executor().clone();
     let result = tokio::task::spawn_blocking(move || {
-        let settings = Settings::from_yaml(&config_path)
-            .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
-        download_history_blocking(
-            &symbol,
-            &timeframe,
-            from_ms,
-            to_ms,
-            &settings.system.data_dir,
-        )
+        admitted.execute(&executor, move || {
+            let settings = Settings::from_yaml(&config_path)
+                .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
+            download_history_blocking(
+                &symbol,
+                &timeframe,
+                from_ms,
+                to_ms,
+                &settings.system.data_dir,
+                dataset_selection.as_ref(),
+                &active_fetch,
+            )
+        })
     })
     .await;
 
     match result {
-        Ok(Ok(outcome)) => {
+        Ok(Ok(Ok(outcome))) => {
             // **2026-05-25 — chart-cache invalidation**: the Vortex
             // file for this (symbol, *) was just rewritten by the
             // `download_history_blocking` path. Drop any cached
@@ -277,11 +510,69 @@ pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>
                 has_more: outcome.has_more,
                 written_path: outcome.written_path.display().to_string(),
                 oldest_ms: outcome.oldest_ms,
+                dataset_identity: outcome.dataset_identity,
+                generation: outcome.generation,
+                durable_commit_id: outcome.durable_commit_id,
             })
             .into_response()
         }
-        Ok(Err(err)) => broker_gateway_error(err),
+        Ok(Ok(Err(err))) => broker_fetch_error(err, run_id),
+        Ok(Err(error)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "broker fetch CPU execution failed",
+                "detail": error.to_string(),
+            })),
+        )
+            .into_response(),
         Err(join_err) => internal_panic("Downloading market data", join_err),
+    }
+}
+
+pub async fn fetch_status() -> Json<FetchStatusDto> {
+    let status = process_historical_capture_status();
+    Json(match status {
+        Some(status) => FetchStatusDto {
+            active: true,
+            run_id: Some(status.run_id),
+            phase: Some(status.phase),
+        },
+        None => FetchStatusDto {
+            active: false,
+            run_id: None,
+            phase: None,
+        },
+    })
+}
+
+pub async fn stop_fetch(Json(body): Json<StopFetchBody>) -> Response {
+    match cancel_process_historical_capture(body.run_id) {
+        HistoricalFetchCancelResult::Cancelled { run_id } => (
+            StatusCode::ACCEPTED,
+            Json(StopFetchOutcomeDto::Cancelled { run_id }),
+        )
+            .into_response(),
+        HistoricalFetchCancelResult::PublicationInProgress { run_id } => (
+            StatusCode::CONFLICT,
+            Json(StopFetchOutcomeDto::PublicationInProgress { run_id }),
+        )
+            .into_response(),
+        HistoricalFetchCancelResult::StaleRun {
+            requested_run_id,
+            active_run_id,
+        } => (
+            StatusCode::CONFLICT,
+            Json(StopFetchOutcomeDto::StaleRun {
+                requested_run_id,
+                active_run_id,
+            }),
+        )
+            .into_response(),
+        HistoricalFetchCancelResult::NoActiveFetch => (
+            StatusCode::CONFLICT,
+            Json(StopFetchOutcomeDto::NoActiveFetch),
+        )
+            .into_response(),
     }
 }
 
@@ -289,19 +580,20 @@ pub async fn fetch(State(state): State<AppApiState>, Json(body): Json<FetchBody>
 
 /// Request body for `POST /data/import` (#192).
 ///
-/// `source_path` is the absolute path to the file the user wants to
-/// ingest. `symbol`/`timeframe` decide where the converted Vortex file
-/// lands on disk (`data/symbol=<sym>/timeframe=<tf>/data.vortex`). The
-/// source format is auto-detected from the file extension by the data
-/// layer's `DataFormat::from_extension`, so we don't ask the user to
-/// pick "CSV vs Parquet" — they just give us a file.
+/// This adapter carries every provenance choice explicitly. The source
+/// extension may help the desktop pre-fill `source_format`, but the server
+/// never guesses the route or timestamp meaning from the filename/bytes.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ImportBody {
     #[serde(rename = "sourcePath")]
     pub source_path: String,
+    pub source_format: neoethos_data::core::import_provenance::ImportSourceFormat,
+    pub source_namespace: String,
     pub symbol: String,
     pub timeframe: String,
+    pub bar_timestamp_convention: String,
+    pub expected_generation: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -310,84 +602,72 @@ pub struct ImportOutcomeDto {
     pub symbol: String,
     pub timeframe: String,
     pub source_format: String,
+    pub dataset_identity: String,
     pub written_path: String,
+    pub row_count: u64,
+    pub generation: String,
+    pub durable_commit_id: String,
+    pub source_sha256: String,
 }
 
-/// `POST /data/import` — convert a user-provided CSV/Parquet/Arrow/
-/// JSON/JSONL/TSV file into the canonical Vortex layout under
-/// `data_dir/symbol=<S>/timeframe=<T>/data.vortex`.
-///
-/// This is the "I have my own data, don't make me re-download from
-/// the broker" workflow. The data layer's `convert_to_vortex` does
-/// the actual schema validation + write; we just route requests at
-/// it and return a tidy DTO.
+/// `POST /data/import` — explicitly import one user-provided source into an
+/// immutable, verified canonical Vortex generation. Admission atomically
+/// reserves the full import CPU plan and one SourceSeal slot before any source
+/// byte is opened. Runtime consumers only reopen the published Vortex path.
 pub async fn import_file(
     State(state): State<AppApiState>,
     Json(body): Json<ImportBody>,
 ) -> Response {
-    let symbol = body.symbol.trim().to_uppercase();
-    let timeframe = body.timeframe.trim().to_uppercase();
-    let source_path = body.source_path.trim().to_string();
-
-    if symbol.is_empty() || timeframe.is_empty() || source_path.is_empty() {
+    let parsed = match ParsedImportBody::try_from(body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return super::errors::actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Import request is invalid. Declare the exact source format, external source namespace, canonical cTrader timeframe, and timestamp meaning. Only explicitly evidenced bar-open timestamps can become canonical data.",
+                &error,
+            );
+        }
+    };
+    let Some(execution) = state.execution_state() else {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "sourcePath, symbol, and timeframe must all be non-empty",
+                "error": "import unavailable: process CPU admission was not installed before AppApiState",
             })),
         )
             .into_response();
-    }
-
-    // F-553/F-576 closure (2026-05-25): config path threaded from CLI.
-    let config_path = state.config_path().to_path_buf();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<ImportOutcomeDto> {
-        let settings = Settings::from_yaml(&config_path)
-            .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
-        let source = std::path::Path::new(&source_path);
-        if !source.exists() {
-            anyhow::bail!("source file not found: {}", source.display());
+    };
+    let snapshot = execution.admission_snapshot();
+    let admitted = match execution
+        .admission_client()
+        .admit_import(neoethos_core::execution_budget::CpuPermitRequest::local(
+            snapshot.cpu.installed_limit,
+        ))
+        .await
+    {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "import admission failed",
+                    "detail": error.to_string(),
+                })),
+            )
+                .into_response();
         }
-        // Auto-detect format from extension (CSV/TSV/Parquet/JSON/
-        // JSONL/Arrow/IPC/Feather). Anything else returns an `Err`.
-        let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let format =
-            neoethos_data::core::discover::DataFormat::from_extension(ext).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unsupported extension on {} — \
-                     supported: csv, tsv, parquet, json, jsonl, arrow, ipc, feather",
-                    source.display()
-                )
-            })?;
-        let destination = neoethos_data::symbol_timeframe_vortex_path(
-            &settings.system.data_dir,
-            &symbol,
-            &timeframe,
-        );
-        let hint = neoethos_data::core::to_vortex::IngestionSchema {
-            optional: vec!["volume".to_string()],
-            timeframe_hint: Some(timeframe.clone()),
-        };
-        let written = neoethos_data::core::to_vortex::convert_to_vortex(
-            source,
-            format,
-            &destination,
-            Some(&hint),
-        )?;
-        Ok(ImportOutcomeDto {
-            symbol: symbol.clone(),
-            timeframe: timeframe.clone(),
-            source_format: format!("{format:?}"),
-            written_path: written.display().to_string(),
+    };
+
+    let config_path = state.config_path().to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        admitted.execute(move |_cpu_lease, source_seal_slot| {
+            run_admitted_import(&config_path, parsed, source_seal_slot)
         })
     })
     .await;
 
     match result {
         Ok(Ok(dto)) => {
-            // **2026-05-25 — chart-cache invalidation**: import_file
-            // rewrites the Vortex for (symbol, *). Same reasoning as
-            // the `fetch` handler — drop the now-stale chart cache.
             super::chart_cache::clear_symbol(&dto.symbol);
             Json(dto).into_response()
         }
@@ -395,13 +675,114 @@ pub async fn import_file(
             let friendly_err = anyhow::anyhow!("{err}");
             super::errors::actionable_error(
                 StatusCode::BAD_REQUEST,
-                "File import failed. Supported formats: CSV, TSV, Parquet, JSON, JSONL, Arrow. \
-                 Check the path is correct and the file isn't open elsewhere.",
+                "File import failed before a canonical generation could be acknowledged. Check the declared format/schema, bar-open timestamp contract, source stability, disk limits, and expectedGeneration.",
                 &friendly_err,
             )
         }
         Err(join_err) => internal_panic("Importing the file", join_err),
     }
+}
+
+struct ParsedImportBody {
+    source_path: std::path::PathBuf,
+    source_format: neoethos_data::core::import_provenance::ImportSourceFormat,
+    identity: neoethos_data::CanonicalDatasetIdentity,
+    expected_generation: Option<String>,
+}
+
+impl TryFrom<ImportBody> for ParsedImportBody {
+    type Error = anyhow::Error;
+
+    fn try_from(body: ImportBody) -> anyhow::Result<Self> {
+        let source_path = std::path::PathBuf::from(body.source_path.trim());
+        if source_path.as_os_str().is_empty() || !source_path.is_absolute() {
+            anyhow::bail!("sourcePath must be a non-empty absolute path");
+        }
+        let source_namespace = body.source_namespace.trim();
+        let symbol = body.symbol.trim();
+        if source_namespace.is_empty() || symbol.is_empty() {
+            anyhow::bail!("sourceNamespace and symbol must be non-empty");
+        }
+        let timeframe = body
+            .timeframe
+            .trim()
+            .parse::<neoethos_data::CanonicalTimeframe>()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let convention = body
+            .bar_timestamp_convention
+            .trim()
+            .parse::<neoethos_data::BarTimestampConvention>()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !convention.is_canonical_bar_open() {
+            anyhow::bail!(
+                "barTimestampConvention={} cannot become canonical; only bar_open is accepted",
+                convention
+            );
+        }
+        let expected_generation = match body.expected_generation {
+            Some(generation) => {
+                let generation = generation.trim().to_owned();
+                if generation.is_empty() {
+                    anyhow::bail!("expectedGeneration cannot be an empty string");
+                }
+                Some(generation)
+            }
+            None => None,
+        };
+        let identity = neoethos_data::CanonicalDatasetIdentity::external(
+            source_namespace,
+            symbol,
+            timeframe,
+            convention,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Self {
+            source_path,
+            source_format: body.source_format,
+            identity,
+            expected_generation,
+        })
+    }
+}
+
+fn run_admitted_import(
+    config_path: &std::path::Path,
+    parsed: ParsedImportBody,
+    source_seal_slot: &neoethos_core::execution_budget::AuxiliarySlotLease,
+) -> anyhow::Result<ImportOutcomeDto> {
+    let settings = Settings::from_yaml(config_path)
+        .map_err(|error| anyhow::anyhow!("{} not loadable: {error}", config_path.display()))?;
+    let limits = neoethos_data::core::import_limits::ImportLimits::default();
+    let imported = neoethos_data::core::import_service::import_path_to_vortex(
+        neoethos_data::core::import_service::ImportRequest {
+            source_path: &parsed.source_path,
+            configured_root: &settings.system.data_dir,
+            identity: &parsed.identity,
+            declared_format: parsed.source_format,
+            expected_generation: parsed.expected_generation.as_deref(),
+            limits: &limits,
+            auxiliary_slot: source_seal_slot,
+        },
+    )?;
+    let manifest = imported.manifest();
+    let provenance = imported.provenance();
+    if provenance.dataset_identity() != &parsed.identity
+        || provenance.selected_format() != parsed.source_format
+        || provenance.detected_format() != parsed.source_format
+    {
+        anyhow::bail!("reopened canonical import provenance disagrees with the request");
+    }
+    Ok(ImportOutcomeDto {
+        symbol: parsed.identity.symbol_name().to_owned(),
+        timeframe: parsed.identity.timeframe().to_string(),
+        source_format: parsed.source_format.as_str().to_owned(),
+        dataset_identity: parsed.identity.to_path_component(),
+        written_path: manifest.generation_path().display().to_string(),
+        row_count: imported.row_count(),
+        generation: imported.generation().to_owned(),
+        durable_commit_id: imported.durable_commit_id().to_owned(),
+        source_sha256: hex::encode(provenance.source_sha256()),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

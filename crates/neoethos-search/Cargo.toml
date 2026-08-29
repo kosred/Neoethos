@@ -19,8 +19,8 @@ cubecl = { version = "0.10.0", optional = true }
 # 0.10.0 the cubecl umbrella resolves (Cargo.lock) so there is one copy in the graph.
 # Optional + gated to `gpu` so the non-GPU build never pulls it.
 cubecl-runtime = { version = "0.10.0", optional = true }
+cubecl-common = { version = "0.10.0", optional = true }
 ndarray = { version = "0.17.2", features = ["rayon"] }
-half = { version = "2.5", optional = true, default-features = true, features = ["alloc", "num-traits"] }
 itertools = "0.14.0"
 rand = "0.9.2"
 # AREA 2 / Stage A (2026-06-09): deterministic ChaCha8 RNG for the GPU-batched
@@ -32,6 +32,7 @@ rand_chacha = "0.9.0"
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2.workspace = true
 statrs = "0.18.0"
 # Filesystem free-space probe for `trial_returns.rs`. The per-trial return
 # matrix is capped by a SHARE OF ACTUAL DISK HEADROOM rather than by a constant,
@@ -41,6 +42,8 @@ statrs = "0.18.0"
 sysinfo = "0.39.6"
 tracing = "0.1.42"  # aligned with workspace.dependencies (2026-05-26)
 neoethos-data = { path = "../neoethos-data" }
+neoethos-dataset-contracts.workspace = true
+neoethos-broker-truth = { path = "../neoethos-broker-truth" }
 neoethos-core = { path = "../neoethos-core" }
 neoethos-gpu-contracts = { path = "../neoethos-gpu-contracts" }
 neoethos-gpu-cuda = { path = "../neoethos-gpu-cuda", optional = true }
@@ -71,7 +74,7 @@ nvtx = []
 # been single-device. Multi-GPU is unbuilt work, not a feature to be
 # rediscovered — the claim is deleted rather than softened so nobody plans
 # against it again.
-gpu = ["dep:cubecl", "dep:half", "dep:cubecl-runtime"]
+gpu = ["dep:cubecl", "dep:cubecl-runtime", "dep:cubecl-common"]
 # #205: vendor-aware aliases so the top-level binary can pick a backend
 # without knowing the internals. The `cubecl_eval.rs` GA kernels are generic
 # over `R: Runtime`, so each alias just selects the cubecl runtime:
@@ -85,6 +88,7 @@ gpu-cuda = [
     "gpu-b-native",
     "cubecl/cuda",
     "neoethos-core/gpu-cuda",
+    "neoethos-data/gpu-cuda",
 ]
 # Prototype B is a native-CUDA engine: it links the `neoethos-gpu-cuda` C ABI
 # and needs neither CubeCL nor libtorch. This feature exists on its own so a

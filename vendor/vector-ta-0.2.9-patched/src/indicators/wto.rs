@@ -1,25 +1,9 @@
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::cuda::{cuda_available, CudaWto, CudaWtoBatchResult, DeviceArrayF32Triplet};
-#[cfg(all(feature = "python", feature = "cuda"))]
-use crate::utilities::dlpack_cuda::{make_device_array_py, DeviceArrayF32Py};
-#[cfg(feature = "python")]
-use pyo3::exceptions::PyValueError;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-use wasm_bindgen::prelude::*;
-
-use crate::utilities::data_loader::{source_type, Candles};
+use crate::utilities::data_loader::{Candles, source_type};
 use crate::utilities::enums::Kernel;
 use crate::utilities::helpers::{
     alloc_with_nan_prefix, detect_best_batch_kernel, detect_best_kernel, init_matrix_prefixes,
     make_uninit_matrix,
 };
-#[cfg(feature = "python")]
-use crate::utilities::kernel_validation::validate_kernel;
 use aligned_vec::{AVec, CACHELINE_ALIGN};
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]
@@ -35,10 +19,10 @@ use std::mem::MaybeUninit;
 use thiserror::Error;
 
 use crate::indicators::moving_averages::ema::{
-    ema_into_slice, ema_with_kernel, EmaInput, EmaParams,
+    EmaInput, EmaParams, ema_into_slice, ema_with_kernel,
 };
 use crate::indicators::moving_averages::sma::{
-    sma_into_slice, sma_with_kernel, SmaInput, SmaParams,
+    SmaInput, SmaParams, sma_into_slice, sma_with_kernel,
 };
 
 #[derive(Debug, Clone)]
@@ -65,10 +49,6 @@ pub enum WtoOutputField {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", feature = "wasm"),
-    derive(Serialize, Deserialize)
-)]
 pub struct WtoParams {
     pub channel_length: Option<usize>,
     pub average_length: Option<usize>,
@@ -315,7 +295,6 @@ pub fn wto_into_slices(
     Ok(())
 }
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
 pub fn wto_into(
     input: &WtoInput,
     wt1_out: &mut [f64],
@@ -1185,290 +1164,6 @@ unsafe fn wto_avx512(
     }
 
     Ok(())
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "wto")]
-#[pyo3(signature = (close, channel_length, average_length, kernel=None))]
-pub fn wto_py<'py>(
-    py: Python<'py>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    channel_length: usize,
-    average_length: usize,
-    kernel: Option<&str>,
-) -> PyResult<(
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-    Bound<'py, numpy::PyArray1<f64>>,
-)> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-
-    let slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-    let p = WtoParams {
-        channel_length: Some(channel_length),
-        average_length: Some(average_length),
-    };
-    let inp = WtoInput::from_slice(slice, p);
-    let out = py
-        .allow_threads(|| wto_with_kernel(&inp, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        out.wavetrend1.into_pyarray(py),
-        out.wavetrend2.into_pyarray(py),
-        out.histogram.into_pyarray(py),
-    ))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "wto_js")]
-pub fn wto_js(
-    close: &[f64],
-    channel_length: usize,
-    average_length: usize,
-) -> Result<js_sys::Object, JsValue> {
-    let params = WtoParams {
-        channel_length: Some(channel_length),
-        average_length: Some(average_length),
-    };
-    let input = WtoInput::from_slice(close, params);
-
-    let output = wto(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let result = js_sys::Object::new();
-
-    let wt1_array = js_sys::Float64Array::new_with_length(output.wavetrend1.len() as u32);
-    wt1_array.copy_from(&output.wavetrend1);
-    js_sys::Reflect::set(&result, &JsValue::from_str("wavetrend1"), &wt1_array)?;
-
-    let wt2_array = js_sys::Float64Array::new_with_length(output.wavetrend2.len() as u32);
-    wt2_array.copy_from(&output.wavetrend2);
-    js_sys::Reflect::set(&result, &JsValue::from_str("wavetrend2"), &wt2_array)?;
-
-    let hist_array = js_sys::Float64Array::new_with_length(output.histogram.len() as u32);
-    hist_array.copy_from(&output.histogram);
-    js_sys::Reflect::set(&result, &JsValue::from_str("histogram"), &hist_array)?;
-
-    Ok(result)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wto_alloc(len: usize) -> *mut f64 {
-    let mut v = Vec::<f64>::with_capacity(len);
-    let p = v.as_mut_ptr();
-    core::mem::forget(v);
-    p
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wto_free(ptr: *mut f64, len: usize) {
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, len);
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wto_into(
-    in_ptr: *const f64,
-    wt1_ptr: *mut f64,
-    wt2_ptr: *mut f64,
-    hist_ptr: *mut f64,
-    len: usize,
-    channel_length: usize,
-    average_length: usize,
-) -> Result<(), JsValue> {
-    if in_ptr.is_null() || wt1_ptr.is_null() || wt2_ptr.is_null() || hist_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to wto_into"));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(in_ptr, len);
-        let wt1 = core::slice::from_raw_parts_mut(wt1_ptr, len);
-        let wt2 = core::slice::from_raw_parts_mut(wt2_ptr, len);
-        let hist = core::slice::from_raw_parts_mut(hist_ptr, len);
-
-        let p = WtoParams {
-            channel_length: Some(channel_length),
-            average_length: Some(average_length),
-        };
-        let inp = WtoInput::from_slice(data, p);
-
-        wto_into_slices(wt1, wt2, hist, &inp, Kernel::Auto)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WtoResult {
-    pub values: Vec<f64>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "wto_unified")]
-pub fn wto_unified_js(
-    close: &[f64],
-    channel_length: usize,
-    average_length: usize,
-) -> Result<JsValue, JsValue> {
-    let params = WtoParams {
-        channel_length: Some(channel_length),
-        average_length: Some(average_length),
-    };
-    let input = WtoInput::from_slice(close, params);
-    let out = wto(&input).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let cols = close.len();
-    let cap = 3usize
-        .checked_mul(cols)
-        .ok_or_else(|| JsValue::from_str("overflow in wto_unified_js allocation"))?;
-    let mut values = Vec::with_capacity(cap);
-    values.extend_from_slice(&out.wavetrend1);
-    values.extend_from_slice(&out.wavetrend2);
-    values.extend_from_slice(&out.histogram);
-
-    let res = WtoResult {
-        values,
-        rows: 3,
-        cols,
-    };
-    serde_wasm_bindgen::to_value(&res)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WtoBatchConfig {
-    pub channel: (usize, usize, usize),
-    pub average: (usize, usize, usize),
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[derive(Serialize, Deserialize)]
-pub struct WtoBatchJsOutput {
-    pub wavetrend1: Vec<f64>,
-    pub wavetrend2: Vec<f64>,
-    pub histogram: Vec<f64>,
-    pub combos: Vec<WtoParams>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wto_batch_into(
-    in_ptr: *const f64,
-    out_ptr: *mut f64,
-    len: usize,
-    ch_start: usize,
-    ch_end: usize,
-    ch_step: usize,
-    av_start: usize,
-    av_end: usize,
-    av_step: usize,
-) -> Result<usize, JsValue> {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return Err(JsValue::from_str("null pointer passed to wto_batch_into"));
-    }
-    if len == 0 {
-        return Err(JsValue::from_str(&WtoError::EmptyInputData.to_string()));
-    }
-    if in_ptr == out_ptr {
-        return Err(JsValue::from_str(
-            "wto_batch_into: in_ptr and out_ptr must not alias",
-        ));
-    }
-    unsafe {
-        let data = core::slice::from_raw_parts(in_ptr, len);
-        let first = data
-            .iter()
-            .position(|x| !x.is_nan())
-            .ok_or_else(|| JsValue::from_str(&WtoError::AllValuesNaN.to_string()))?;
-        let sweep = WtoBatchRange {
-            channel: (ch_start, ch_end, ch_step),
-            average: (av_start, av_end, av_step),
-        };
-        let combos = expand_grid(&sweep).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let rows = combos.len();
-        let cols = len;
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| JsValue::from_str("rows * cols overflow in wto_batch_into"))?;
-
-        let out_mu = core::slice::from_raw_parts_mut(out_ptr as *mut MaybeUninit<f64>, total);
-        let mut warms: Vec<usize> = Vec::with_capacity(rows);
-        for p in combos.iter() {
-            let channel_length = p.channel_length.unwrap_or(10);
-            let average_length = p.average_length.unwrap_or(21);
-
-            if channel_length == 0 || channel_length > cols {
-                return Err(JsValue::from_str(
-                    &WtoError::InvalidPeriod {
-                        period: channel_length,
-                        data_len: cols,
-                    }
-                    .to_string(),
-                ));
-            }
-            if average_length == 0 || average_length > cols {
-                return Err(JsValue::from_str(
-                    &WtoError::InvalidPeriod {
-                        period: average_length,
-                        data_len: cols,
-                    }
-                    .to_string(),
-                ));
-            }
-
-            let valid = cols.saturating_sub(first);
-            if valid < channel_length {
-                return Err(JsValue::from_str(
-                    &WtoError::NotEnoughValidData {
-                        needed: channel_length,
-                        valid,
-                    }
-                    .to_string(),
-                ));
-            }
-
-            let ci_start = first + channel_length - 1;
-            warms.push(ci_start);
-        }
-        init_matrix_prefixes(out_mu, cols, &warms);
-
-        let out = core::slice::from_raw_parts_mut(out_ptr, total);
-        wto_fill_wt1_grouped(data, &combos, first, detect_best_kernel(), false, out)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(rows)
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen(js_name = "wto_batch")]
-pub fn wto_batch_unified_js(data: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let cfg: WtoBatchConfig = serde_wasm_bindgen::from_value(config)
-        .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-    let sweep = WtoBatchRange {
-        channel: cfg.channel,
-        average: cfg.average,
-    };
-    let out = wto_batch_all_outputs_with_kernel(data, &sweep, Kernel::ScalarBatch)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let js = WtoBatchJsOutput {
-        wavetrend1: out.wt1,
-        wavetrend2: out.wt2,
-        histogram: out.hist,
-        combos: out.combos,
-        rows: out.rows,
-        cols: out.cols,
-    };
-    serde_wasm_bindgen::to_value(&js)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }
 
 #[derive(Debug, Clone)]
@@ -2563,249 +2258,10 @@ impl WtoStream {
     }
 }
 
-#[cfg(feature = "python")]
-#[pyclass(name = "WtoStream")]
-pub struct WtoStreamPy {
-    inner: WtoStream,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl WtoStreamPy {
-    #[new]
-    fn new(channel_length: usize, average_length: usize) -> PyResult<Self> {
-        let p = WtoParams {
-            channel_length: Some(channel_length),
-            average_length: Some(average_length),
-        };
-        Ok(Self {
-            inner: WtoStream::try_new(p).map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
-    }
-
-    pub fn update(&mut self, value: f64) -> Option<(f64, f64, f64)> {
-        self.inner.update(value)
-    }
-
-    pub fn last(&self) -> Option<(f64, f64, f64)> {
-        self.inner.last()
-    }
-
-    pub fn reset(&mut self) {
-        self.inner.reset()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyfunction(name = "wto_batch")]
-#[pyo3(signature = (close, channel_range, average_range, kernel=None))]
-pub fn wto_batch_py<'py>(
-    py: Python<'py>,
-    close: numpy::PyReadonlyArray1<'py, f64>,
-    channel_range: (usize, usize, usize),
-    average_range: (usize, usize, usize),
-    kernel: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::{IntoPyArray, PyArrayMethods};
-    let slice = close.as_slice()?;
-    let kern = validate_kernel(kernel, false)?;
-
-    let sweep = WtoBatchRange {
-        channel: channel_range,
-        average: average_range,
-    };
-    let out = py
-        .allow_threads(|| wto_batch_all_outputs_with_kernel(slice, &sweep, kern))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = pyo3::types::PyDict::new(py);
-
-    let wt1_arr = unsafe { numpy::PyArray1::<f64>::new(py, [out.rows * out.cols], false) };
-    unsafe { wt1_arr.as_slice_mut()? }.copy_from_slice(&out.wt1);
-    dict.set_item("wt1", wt1_arr.reshape((out.rows, out.cols))?)?;
-
-    let wt2_arr = unsafe { numpy::PyArray1::<f64>::new(py, [out.rows * out.cols], false) };
-    unsafe { wt2_arr.as_slice_mut()? }.copy_from_slice(&out.wt2);
-    dict.set_item("wt2", wt2_arr.reshape((out.rows, out.cols))?)?;
-
-    let hist_arr = unsafe { numpy::PyArray1::<f64>::new(py, [out.rows * out.cols], false) };
-    unsafe { hist_arr.as_slice_mut()? }.copy_from_slice(&out.hist);
-    dict.set_item("hist", hist_arr.reshape((out.rows, out.cols))?)?;
-
-    dict.set_item(
-        "channel_lengths",
-        out.combos
-            .iter()
-            .map(|p| p.channel_length.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    dict.set_item(
-        "average_lengths",
-        out.combos
-            .iter()
-            .map(|p| p.average_length.unwrap())
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wto_cuda_batch_dev")]
-#[pyo3(signature = (close_f32, channel_range, average_range, device_id=0))]
-pub fn wto_cuda_batch_dev_py<'py>(
-    py: Python<'py>,
-    close_f32: numpy::PyReadonlyArray1<'py, f32>,
-    channel_range: (usize, usize, usize),
-    average_range: (usize, usize, usize),
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::IntoPyArray;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let slice = close_f32.as_slice()?;
-    let sweep = WtoBatchRange {
-        channel: channel_range,
-        average: average_range,
-    };
-
-    let (CudaWtoBatchResult { outputs, combos }, dev_id) = py.allow_threads(|| {
-        let cuda = CudaWto::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let res = cuda
-            .wto_batch_dev(slice, &sweep)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((res, cuda.device_id()))
-    })?;
-    let DeviceArrayF32Triplet { wt1, wt2, hist } = outputs;
-
-    let dict = pyo3::types::PyDict::new(py);
-    let wt1_py = make_device_array_py(dev_id as usize, wt1)?;
-    let wt2_py = make_device_array_py(dev_id as usize, wt2)?;
-    let hist_py = make_device_array_py(dev_id as usize, hist)?;
-    dict.set_item("wt1", Py::new(py, wt1_py)?)?;
-    dict.set_item("wt2", Py::new(py, wt2_py)?)?;
-    dict.set_item("hist", Py::new(py, hist_py)?)?;
-
-    let channel_vec: Vec<usize> = combos.iter().map(|p| p.channel_length.unwrap()).collect();
-    let average_vec: Vec<usize> = combos.iter().map(|p| p.average_length.unwrap()).collect();
-
-    dict.set_item("channel_lengths", channel_vec.into_pyarray(py))?;
-    dict.set_item("average_lengths", average_vec.into_pyarray(py))?;
-    dict.set_item("rows", combos.len())?;
-    dict.set_item("cols", slice.len())?;
-
-    Ok(dict)
-}
-
-#[cfg(all(feature = "python", feature = "cuda"))]
-#[pyfunction(name = "wto_cuda_many_series_one_param_dev")]
-#[pyo3(signature = (data_tm_f32, channel_length, average_length, device_id=0))]
-pub fn wto_cuda_many_series_one_param_dev_py<'py>(
-    py: Python<'py>,
-    data_tm_f32: numpy::PyReadonlyArray2<'py, f32>,
-    channel_length: usize,
-    average_length: usize,
-    device_id: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use numpy::PyUntypedArrayMethods;
-
-    if !cuda_available() {
-        return Err(PyValueError::new_err("CUDA not available"));
-    }
-
-    let shape = data_tm_f32.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err("expected 2D array"));
-    }
-    let rows = shape[0];
-    let cols = shape[1];
-    let flat = data_tm_f32.as_slice()?;
-
-    let params = WtoParams {
-        channel_length: Some(channel_length),
-        average_length: Some(average_length),
-    };
-
-    let (DeviceArrayF32Triplet { wt1, wt2, hist }, dev_id) = py.allow_threads(|| {
-        let cuda = CudaWto::new(device_id).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let res = cuda
-            .wto_many_series_one_param_time_major_dev(flat, cols, rows, &params)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok::<_, pyo3::PyErr>((res, cuda.device_id()))
-    })?;
-
-    let dict = pyo3::types::PyDict::new(py);
-    let wt1_py = make_device_array_py(dev_id as usize, wt1)?;
-    let wt2_py = make_device_array_py(dev_id as usize, wt2)?;
-    let hist_py = make_device_array_py(dev_id as usize, hist)?;
-    dict.set_item("wt1", Py::new(py, wt1_py)?)?;
-    dict.set_item("wt2", Py::new(py, wt2_py)?)?;
-    dict.set_item("hist", Py::new(py, hist_py)?)?;
-    dict.set_item("rows", rows)?;
-    dict.set_item("cols", cols)?;
-    dict.set_item("channel_length", channel_length)?;
-    dict.set_item("average_length", average_length)?;
-
-    Ok(dict)
-}
-
-#[cfg(feature = "python")]
-pub fn register_wto_module(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(wto_py, m)?)?;
-    m.add_function(wrap_pyfunction!(wto_batch_py, m)?)?;
-    m.add_class::<WtoStreamPy>()?;
-    #[cfg(feature = "cuda")]
-    {
-        m.add_function(wrap_pyfunction!(wto_cuda_batch_dev_py, m)?)?;
-        m.add_function(wrap_pyfunction!(wto_cuda_many_series_one_param_dev_py, m)?)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wto_output_into_js(
-    close: &[f64],
-    channel_length: usize,
-    average_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let result = wto_js(close, channel_length, average_length)?;
-    let value = JsValue::from(result);
-    crate::write_wasm_object_f64_outputs("wto_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wto_batch_unified_output_into_js(
-    data: &[f64],
-    config: JsValue,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = wto_batch_unified_js(data, config)?;
-    crate::write_wasm_selected_object_f64_outputs("wto_batch_unified_output_into_js", &value, out)
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-#[wasm_bindgen]
-pub fn wto_unified_output_into_js(
-    close: &[f64],
-    channel_length: usize,
-    average_length: usize,
-    out: &js_sys::Object,
-) -> Result<usize, JsValue> {
-    let value = wto_unified_js(close, channel_length, average_length)?;
-    crate::write_wasm_object_f64_outputs("wto_unified_output_into_js", &value, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utilities::data_loader::read_candles_from_csv;
+    use crate::utilities::data_loader::read_candles_from_vortex;
 
     macro_rules! skip_if_unsupported {
         ($kernel:expr, $test_name:expr) => {
@@ -2822,8 +2278,8 @@ mod tests {
 
     fn check_wto_accuracy(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = WtoInput::from_candles(&candles, "close", WtoParams::default());
         let result = wto_with_kernel(&input, kernel)?;
@@ -2920,8 +2376,8 @@ mod tests {
     fn check_wto_default_candles(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = WtoInput::with_default_candles(&candles);
         match input.data {
@@ -3018,8 +2474,8 @@ mod tests {
     fn check_wto_reinput(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let first_params = WtoParams::default();
         let first_input = WtoInput::from_candles(&candles, "close", first_params);
@@ -3039,8 +2495,8 @@ mod tests {
     fn check_wto_nan_handling(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let input = WtoInput::from_candles(&candles, "close", WtoParams::default());
         let res = wto_with_kernel(&input, kernel)?;
@@ -3062,8 +2518,8 @@ mod tests {
     fn check_wto_streaming(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let params = WtoParams::default();
         let input = WtoInput::from_candles(&candles, "close", params.clone());
@@ -3091,8 +2547,8 @@ mod tests {
     fn check_wto_no_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let test_params = vec![
             WtoParams {
@@ -3143,8 +2599,8 @@ mod tests {
     fn check_wto_no_poison_all(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let c = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let c = read_candles_from_vortex(file)?;
         let input = WtoInput::with_default_candles(&c);
         let out = wto_with_kernel(&input, kernel)?;
 
@@ -3170,8 +2626,8 @@ mod tests {
     fn check_batch_poison(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file)?;
+        let file = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file)?;
 
         let output = WtoBatchBuilder::new()
             .channel_range(5, 15, 5)
@@ -3293,8 +2749,8 @@ mod tests {
     fn check_batch_default_row(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = WtoBatchBuilder::new()
             .kernel(kernel)
@@ -3310,8 +2766,8 @@ mod tests {
     fn check_batch_sweep(test_name: &str, kernel: Kernel) -> Result<(), Box<dyn Error>> {
         skip_if_unsupported!(kernel, test_name);
 
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path)?;
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path)?;
 
         let output = WtoBatchBuilder::new()
             .kernel(kernel)
@@ -3355,11 +2811,10 @@ mod tests {
     gen_batch_tests!(check_batch_default_row);
     gen_batch_tests!(check_batch_sweep);
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm")))]
     #[test]
     fn test_wto_into_matches_api() {
-        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.csv";
-        let candles = read_candles_from_csv(file_path).expect("failed to load candles");
+        let file_path = "src/data/2018-09-01-2024-Bitfinex_Spot-4h.vortex";
+        let candles = read_candles_from_vortex(file_path).expect("failed to load candles");
 
         let input = WtoInput::with_default_candles(&candles);
 

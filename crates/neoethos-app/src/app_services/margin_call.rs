@@ -428,7 +428,10 @@ pub fn poll_once() -> anyhow::Result<MarginStatus> {
         return Ok(status);
     }
 
-    match (status.margin_level_pct, status.thresholds.tightest_threshold_pct()) {
+    match (
+        status.margin_level_pct,
+        status.thresholds.tightest_threshold_pct(),
+    ) {
         (Some(level), Some(threshold)) => {
             tracing::debug!(
                 target: "neoethos_app::margin_call",

@@ -1,8 +1,9 @@
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cuda-build-native")]
 
 use super::alma_wrapper::DeviceArrayF32;
 
 use super::{BatchKernelPolicy, ManySeriesKernelPolicy};
+use crate::cuda::CudaDeviceSliceF32Ref;
 use crate::cuda::moving_averages::{
     CudaEma, CudaKama, CudaNama, CudaSma, CudaVpwma, CudaVwma, CudaWilders, CudaZlema,
 };
@@ -10,21 +11,20 @@ use crate::cuda::moving_averages::{
     CudaMaData, CudaMaDeviceDataRef, CudaMaSelector, CudaMaSelectorError,
 };
 use crate::cuda::runtime::CudaSession;
-use crate::cuda::CudaDeviceSliceF32Ref;
 use crate::indicators::ott::{OttBatchRange, OttParams};
 use cust::context::Context;
 use cust::device::Device;
 use cust::function::{BlockSize, Function, GridSize};
-use cust::memory::{mem_get_info, AsyncCopyDestination, DeviceBuffer};
-use cust::module::{Module, ModuleJitOption, OptLevel};
+use cust::memory::{AsyncCopyDestination, DeviceBuffer, mem_get_info};
+use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use thiserror::Error;
 
 fn ott_batch_var_block_x() -> u32 {
@@ -211,11 +211,6 @@ impl CudaOtt {
         let device = Device::get_device(device_id as u32)?;
         let context = Arc::new(Context::new(device)?);
 
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/ott_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("ott_kernel")?;
 
         let stream = Arc::new(Stream::new(StreamFlags::NON_BLOCKING, None)?);
@@ -235,11 +230,6 @@ impl CudaOtt {
     }
 
     pub fn from_session(session: Arc<CudaSession>) -> Result<Self, CudaOttError> {
-        let ptx: &str = include_str!(concat!(env!("OUT_DIR"), "/ott_kernel.ptx"));
-        let jit_opts = &[
-            ModuleJitOption::DetermineTargetFromContext,
-            ModuleJitOption::OptLevel(OptLevel::O2),
-        ];
         let module = crate::load_cuda_embedded_module!("ott_kernel")?;
 
         Ok(Self {

@@ -32,10 +32,10 @@ use std::sync::OnceLock;
 /// signal-generation issues without recompiling.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SmcGateOverrides {
-    pub start: f32,
-    pub end: f32,
-    pub curve: f32,
-    pub stagnation_step: f32,
+    pub start: f64,
+    pub end: f64,
+    pub curve: f64,
+    pub stagnation_step: f64,
     pub disable_gate: bool,
 }
 
@@ -52,7 +52,7 @@ impl Default for SmcGateOverrides {
 }
 
 impl SmcGateOverrides {
-    fn resolved_curve(&self) -> f32 {
+    fn resolved_curve(&self) -> f64 {
         if self.curve.is_finite() && self.curve >= 0.1 {
             self.curve
         } else {
@@ -60,7 +60,7 @@ impl SmcGateOverrides {
         }
     }
 
-    fn resolved_stagnation_step(&self) -> f32 {
+    fn resolved_stagnation_step(&self) -> f64 {
         if self.stagnation_step.is_finite() && self.stagnation_step >= 0.0 {
             self.stagnation_step
         } else {
@@ -213,7 +213,6 @@ impl GeneticSearchRuntimeOverrides {
     // on a shell nothing recorded. All of them are typed on
     // `models.search_runtime` and installed by
     // `install_genetic_search_runtime_overrides_from_settings`.
-
 
     /// Config-driven constructor — the operator sets these knobs in the
     /// single `Settings` (config / UI / TUI), never the environment.
@@ -447,18 +446,18 @@ impl CostProfileRuntimeOverrides {
 /// fallback used by `EvaluationConfig::default`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SmcWeightRuntimeOverrides {
-    pub gate_threshold: f32,
-    pub w_ob: f32,
-    pub w_fvg: f32,
-    pub w_liq: f32,
-    pub w_mtf: f32,
-    pub w_premium: f32,
-    pub w_inducement: f32,
-    pub w_bos: f32,
-    pub w_choch: f32,
-    pub w_eqh: f32,
-    pub w_eql: f32,
-    pub w_displacement: f32,
+    pub gate_threshold: f64,
+    pub w_ob: f64,
+    pub w_fvg: f64,
+    pub w_liq: f64,
+    pub w_mtf: f64,
+    pub w_premium: f64,
+    pub w_inducement: f64,
+    pub w_bos: f64,
+    pub w_choch: f64,
+    pub w_eqh: f64,
+    pub w_eql: f64,
+    pub w_displacement: f64,
 }
 
 impl Default for SmcWeightRuntimeOverrides {
@@ -709,7 +708,10 @@ pub fn install_gene_stop_bounds_overrides_from_settings(s: &neoethos_core::Setti
 /// The installed band multiples, or the deterministic defaults when nothing was
 /// installed (the `neoethos-models` GA and every test fixture land here).
 pub fn current_gene_stop_bounds_overrides() -> GeneStopBoundsOverrides {
-    GENE_STOP_BOUNDS_OVERRIDES.get().copied().unwrap_or_default()
+    GENE_STOP_BOUNDS_OVERRIDES
+        .get()
+        .copied()
+        .unwrap_or_default()
 }
 
 static STRATEGY_EVALUATION_RUNTIME_OVERRIDES: OnceLock<StrategyEvaluationRuntimeOverrides> =
@@ -722,19 +724,6 @@ pub fn install_strategy_evaluation_runtime_overrides(
     overrides: StrategyEvaluationRuntimeOverrides,
 ) -> Result<(), StrategyEvaluationRuntimeOverrides> {
     STRATEGY_EVALUATION_RUNTIME_OVERRIDES.set(overrides)
-}
-
-/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
-/// Kept only because `genetic/mod.rs` and `lib.rs` re-export it.
-pub fn install_strategy_evaluation_runtime_overrides_from_env() {
-    tracing::error!(
-        target: "neoethos_search::retired_env",
-        "install_strategy_evaluation_runtime_overrides_from_env() is RETIRED and installs \
-         typed DEFAULTS — the cost-profile and SMC-weight env layer no longer exists. Call \
-         install_strategy_evaluation_runtime_overrides_from_settings(&settings)."
-    );
-    let _ = STRATEGY_EVALUATION_RUNTIME_OVERRIDES
-        .set(StrategyEvaluationRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the strategy-evaluation knobs from the
@@ -769,24 +758,6 @@ pub fn install_genetic_search_runtime_overrides(
     overrides: GeneticSearchRuntimeOverrides,
 ) -> Result<(), GeneticSearchRuntimeOverrides> {
     GENETIC_SEARCH_RUNTIME_OVERRIDES.set(overrides)
-}
-
-/// RETIRED 2026-08-10 — installs the typed defaults and reads no environment.
-/// Kept only because `genetic/mod.rs` and `lib.rs` re-export it.
-///
-/// This one matters most: the struct it installs carries the RNG SEED and the
-/// selection policy, so installing defaults over an operator's config would
-/// change which genes the run creates. It says so rather than doing it
-/// quietly.
-pub fn install_genetic_search_runtime_overrides_from_env() {
-    tracing::error!(
-        target: "neoethos_search::retired_env",
-        "install_genetic_search_runtime_overrides_from_env() is RETIRED and installs typed \
-         DEFAULTS (including the RNG seed and selection policy) — the NEOETHOS_BOT_* search \
-         env layer no longer exists. Call \
-         install_genetic_search_runtime_overrides_from_settings(&settings)."
-    );
-    let _ = GENETIC_SEARCH_RUNTIME_OVERRIDES.set(GeneticSearchRuntimeOverrides::default());
 }
 
 /// Config-driven install — reads the genetic-search knobs from the single
@@ -840,13 +811,17 @@ mod tests {
         // off the full (cloned) struct would — it only skips the allocation.
         assert_eq!(
             smc_gate_disabled(),
-            current_genetic_search_runtime_overrides().smc_gate.disable_gate,
+            current_genetic_search_runtime_overrides()
+                .smc_gate
+                .disable_gate,
         );
         // And with nothing installed it falls back to the default, same as the
         // full path's `unwrap_or_default`.
         assert_eq!(
             smc_gate_disabled(),
-            GeneticSearchRuntimeOverrides::default().smc_gate.disable_gate,
+            GeneticSearchRuntimeOverrides::default()
+                .smc_gate
+                .disable_gate,
         );
     }
 
@@ -1044,7 +1019,7 @@ mod tests {
                 start: 0.8,
                 end: 0.2,
                 curve: 0.0,
-                stagnation_step: f32::NAN,
+                stagnation_step: f64::NAN,
                 disable_gate: false,
             },
             ..GeneticSearchRuntimeOverrides::default()

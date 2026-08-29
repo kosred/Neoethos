@@ -534,31 +534,20 @@ extern "C" __global__ void frama_many_series_one_param_f32(
 /* ===========================================================================
  * S4 f64 LANE — frama (fractal adaptive moving average)
  * ---------------------------------------------------------------------------
- * CPU oracle: src/indicators/moving_averages/frama.rs
- *   `frama_prepare`      (:253) — first_valid over the TRIPLE, the win parity
- *                                 fix-up, and every Err branch
- *   `frama_compute_into` (:320) — the seed, `mean(close[first .. first+win])`
- *   `frama_small_scan`   (:648) — the fractal-dimension scan and the EMA step
- *
- * The four `frama_small_scan_const::<10|14|20|32>` specialisations and
- * `frama_scalar_deque` (win > 32) are the SAME arithmetic: a const generic and
- * a monotonic deque change how the window max/min is found, not what it is —
- * max/min are exact — and the alpha/EMA lines are byte-identical in all three.
- * One kernel therefore serves every win, and no special case is written.
+ * CPU authority: src/indicators/moving_averages/frama.rs
+ * `frama-f64-v3-finite-hlc-segment-reset-even-window-stable-fma-v2`.
+ * Every non-finite H/L/C row resets the seed, `d_prev`, previous output, and
+ * extrema ownership. Each following maximal finite segment is a fresh FRAMA
+ * run and emits only after `win` consecutive finite rows.
  *
  * WHAT THE f32 KERNEL ABOVE GETS WRONG, AND IS FIXED HERE
  *
  *  1. `__int_as_float(0x7f...)` is an f32 NaN bit pattern; here the prefix is
  *     `__longlong_as_double(0x7ff8...)`.
- *  2. `f64::MIN` / `f64::MAX` seeds. The CPU seeds max with `f64::MIN` —
- *     -1.797e308, the most negative FINITE double — NOT -infinity. `-DBL_MAX`
- *     is the f64 spelling. An f32 kernel that seeded with `-FLT_MAX` is an
- *     epsilon-class constant sized for the wrong type; this is the same bug
- *     in its largest form.
- *  3. `fmaxf`/`fminf` x1 each -> `fmax`/`fmin`. These MUST stay max/min and
- *     not become comparison chains: the CPU uses `f64::max`, which returns the
- *     NON-NaN operand, so one NaN bar inside the window is absorbed rather
- *     than poisoning `d_prev` for the rest of the series.
+ *  2. The f64 lane carries extrema indices in four monotonic half-window
+ *     deques, so it needs no type-sized extrema sentinels at all.
+ *  3. `fmaxf`/`fminf` x1 each -> `fmax`/`fmin`. Non-finite values never reach
+ *     the extrema scan under the v3 segment contract.
  *  4. `.clamp(0.1, 1.0)` IS NOT `fmin(fmax(x, 0.1), 1.0)`. Rust's `f64::clamp`
  *     is `if self < min {min} else if self > max {max} else {self}`, so a NaN
  *     PASSES THROUGH. `fmax`/`fmin` would replace it with a bound. Both clamps
@@ -569,10 +558,14 @@ extern "C" __global__ void frama_many_series_one_param_f32(
  *     sub-ulp divergence sources between CUDA's libdevice and the host libm;
  *     declared, not discovered.
  *
- * `w_ln`, `sc_floor` and the parity fix-up `if (win & 1) win += 1` are hoisted
- * exactly where the CPU hoists them. `d_prev` seeds at 1.0 and CARRIES across
- * bars, and `out[i]` reads `out[i-1]`: two carried scalars, so one thread per
- * column walking ascending, never a scan.
+ * Each update computes from `[i-win, i-half)` and `[i-half, i)` before it
+ * expires `i-win`, moves `i-half` from right to left, and pushes `i` right.
+ * Capacity 513 represents every index in a 512-row half without making a full
+ * ring alias the empty `head == tail` state. `w_ln`, `sc_floor` and the parity
+ * fix-up are hoisted exactly where the CPU hoists them. `d_prev` seeds at 1.0
+ * at every finite segment boundary. One thread owns one column and walks rows
+ * ascending. Requests whose evenized window exceeds 1024 fail closed in the
+ * host and are rejected here again as kernel defense in depth.
  *
  * PARAMETERS: the swept int is `window` (CPU default 10). `sc` and `fc` are
  * held at the CPU batch defaults 300 and 1 (frama.rs:114,118) because the
@@ -586,6 +579,85 @@ extern "C" __global__ void frama_many_series_one_param_f32(
 
 #define NEO_FRAMA_SC_DEFAULT 300
 #define NEO_FRAMA_FC_DEFAULT 1
+#define NEO_FRAMA_MAX_WINDOW 1024
+#define NEO_FRAMA_HALF_DEQUE_CAPACITY 513
+
+struct NeoFramaDequeF64V3 {
+    int* storage;
+    int head;
+    int tail;
+};
+
+__device__ __forceinline__ NeoFramaDequeF64V3 neo_frama_make_deque_f64_v3(
+    int* storage)
+{
+    NeoFramaDequeF64V3 deque = {storage, 0, 0};
+    return deque;
+}
+
+__device__ __forceinline__ bool neo_frama_empty_f64_v3(
+    const NeoFramaDequeF64V3* deque)
+{
+    return deque->head == deque->tail;
+}
+
+__device__ __forceinline__ void neo_frama_clear_f64_v3(
+    NeoFramaDequeF64V3* deque)
+{
+    deque->head = 0;
+    deque->tail = 0;
+}
+
+__device__ __forceinline__ int neo_frama_front_f64_v3(
+    const NeoFramaDequeF64V3* deque)
+{
+    return deque->storage[deque->head];
+}
+
+__device__ __forceinline__ void neo_frama_expire_f64_v3(
+    NeoFramaDequeF64V3* deque, int idx_out)
+{
+    if (!neo_frama_empty_f64_v3(deque) &&
+        neo_frama_front_f64_v3(deque) == idx_out) {
+        deque->head = (deque->head + 1) % NEO_FRAMA_HALF_DEQUE_CAPACITY;
+    }
+}
+
+__device__ __forceinline__ void neo_frama_push_max_f64_v3(
+    NeoFramaDequeF64V3* deque, int idx, const double* __restrict__ values)
+{
+    while (!neo_frama_empty_f64_v3(deque)) {
+        const int last =
+            (deque->tail + NEO_FRAMA_HALF_DEQUE_CAPACITY - 1) %
+            NEO_FRAMA_HALF_DEQUE_CAPACITY;
+        if (values[deque->storage[last]] >= values[idx]) break;
+        deque->tail = last;
+    }
+    deque->storage[deque->tail] = idx;
+    deque->tail =
+        (deque->tail + 1) % NEO_FRAMA_HALF_DEQUE_CAPACITY;
+}
+
+__device__ __forceinline__ void neo_frama_push_min_f64_v3(
+    NeoFramaDequeF64V3* deque, int idx, const double* __restrict__ values)
+{
+    while (!neo_frama_empty_f64_v3(deque)) {
+        const int last =
+            (deque->tail + NEO_FRAMA_HALF_DEQUE_CAPACITY - 1) %
+            NEO_FRAMA_HALF_DEQUE_CAPACITY;
+        if (values[deque->storage[last]] <= values[idx]) break;
+        deque->tail = last;
+    }
+    deque->storage[deque->tail] = idx;
+    deque->tail =
+        (deque->tail + 1) % NEO_FRAMA_HALF_DEQUE_CAPACITY;
+}
+
+__device__ __forceinline__ double neo_frama_stable_update_f64_v2(
+    double close, double previous, double alpha)
+{
+    return __fma_rn(alpha, __dsub_rn(close, previous), previous);
+}
 
 extern "C" __global__
 void frama_neo_batch_f64(const double* __restrict__ high,
@@ -607,24 +679,28 @@ void frama_neo_batch_f64(const double* __restrict__ high,
     const int sc = NEO_FRAMA_SC_DEFAULT;
     const int fc = NEO_FRAMA_FC_DEFAULT;
 
-    int win = window;
-    if (win & 1) win += 1;
-
     if (len <= 0 || window <= 0 || window > len ||
-        first_valid < 0 || first_valid >= len ||
-        (len - first_valid) < win) {
+        window > NEO_FRAMA_MAX_WINDOW) {
         for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
         return;
     }
+    const int win = window + (window & 1);
+    if (win > NEO_FRAMA_MAX_WINDOW) {
+        for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
+        return;
+    }
+    (void)first_valid;
 
-    const int warm = first_valid + win - 1;
-    for (int i = 0; i < len && i < warm; ++i) o[i] = NEO_F64_NAN;
+    for (int i = 0; i < len; ++i) o[i] = NEO_F64_NAN;
 
-    // frama.rs:337 — plain ascending sum of `win` closes, then one divide.
-    double seed = 0.0;
-    for (int j = first_valid; j < first_valid + win; ++j) seed += close[j];
-    seed = seed / (double)win;
-    o[warm] = seed;
+    int left_max_storage[NEO_FRAMA_HALF_DEQUE_CAPACITY];
+    int left_min_storage[NEO_FRAMA_HALF_DEQUE_CAPACITY];
+    int right_max_storage[NEO_FRAMA_HALF_DEQUE_CAPACITY];
+    int right_min_storage[NEO_FRAMA_HALF_DEQUE_CAPACITY];
+    NeoFramaDequeF64V3 left_max = neo_frama_make_deque_f64_v3(left_max_storage);
+    NeoFramaDequeF64V3 left_min = neo_frama_make_deque_f64_v3(left_min_storage);
+    NeoFramaDequeF64V3 right_max = neo_frama_make_deque_f64_v3(right_max_storage);
+    NeoFramaDequeF64V3 right_min = neo_frama_make_deque_f64_v3(right_min_storage);
 
     const int half = win >> 1;
     const double win_f = (double)win;
@@ -632,39 +708,47 @@ void frama_neo_batch_f64(const double* __restrict__ high,
     const double w_ln = log(2.0 / ((double)sc + 1.0));
     const double sc_floor = 2.0 / ((double)sc + 1.0);
     const double LN_2 = 0.693147180559945309417232121458176568;
-    const double DBL_MIN_FINITE = -1.7976931348623157e308;  // f64::MIN
-    const double DBL_MAX_FINITE =  1.7976931348623157e308;  // f64::MAX
 
+    int finite_run = 0;
+    double seed = 0.0;
     double d_prev = 1.0;
+    double previous = NEO_F64_NAN;
 
-    for (int i = first_valid + win; i < len; ++i) {
-        const int seg_start = i - win;
-        const int mid = seg_start + half;
-
-        double max1 = DBL_MIN_FINITE, min1 = DBL_MAX_FINITE;
-        double max2 = DBL_MIN_FINITE, min2 = DBL_MAX_FINITE;
-
-        int j = seg_start;
-        while (j + 1 < mid) {
-            max2 = fmax(max2, fmax(high[j], high[j + 1]));
-            min2 = fmin(min2, fmin(low[j],  low[j + 1]));
-            j += 2;
-        }
-        if (j < mid) {
-            max2 = fmax(max2, high[j]);
-            min2 = fmin(min2, low[j]);
+    for (int i = 0; i < len; ++i) {
+        if (!isfinite(high[i]) || !isfinite(low[i]) || !isfinite(close[i])) {
+            finite_run = 0;
+            seed = 0.0;
+            d_prev = 1.0;
+            previous = NEO_F64_NAN;
+            neo_frama_clear_f64_v3(&left_max);
+            neo_frama_clear_f64_v3(&left_min);
+            neo_frama_clear_f64_v3(&right_max);
+            neo_frama_clear_f64_v3(&right_min);
+            o[i] = NEO_F64_NAN;
+            continue;
         }
 
-        j = mid;
-        while (j + 1 < i) {
-            max1 = fmax(max1, fmax(high[j], high[j + 1]));
-            min1 = fmin(min1, fmin(low[j],  low[j + 1]));
-            j += 2;
+        if (finite_run < win) {
+            seed += close[i];
+            if (finite_run < half) {
+                neo_frama_push_max_f64_v3(&left_max, i, high);
+                neo_frama_push_min_f64_v3(&left_min, i, low);
+            } else {
+                neo_frama_push_max_f64_v3(&right_max, i, high);
+                neo_frama_push_min_f64_v3(&right_min, i, low);
+            }
+            finite_run += 1;
+            if (finite_run == win) {
+                previous = seed / (double)win;
+                o[i] = previous;
+            }
+            continue;
         }
-        if (j < i) {
-            max1 = fmax(max1, high[j]);
-            min1 = fmin(min1, low[j]);
-        }
+
+        const double max1 = high[neo_frama_front_f64_v3(&right_max)];
+        const double min1 = low[neo_frama_front_f64_v3(&right_min)];
+        const double max2 = high[neo_frama_front_f64_v3(&left_max)];
+        const double min2 = low[neo_frama_front_f64_v3(&left_min)];
 
         const double max3 = fmax(max1, max2);
         const double min3 = fmin(min1, min2);
@@ -692,8 +776,18 @@ void frama_neo_batch_f64(const double* __restrict__ high,
         double alpha = 2.0 / (new_n + 1.0);
         if (alpha < sc_floor) alpha = sc_floor; else if (alpha > 1.0) alpha = 1.0;
 
-        // frama.rs:724 — ONE fused rounding on the close term, a plain product
-        // on the carry term. Not `alpha*c + (1-alpha)*prev`.
-        o[i] = fma(close[i], alpha, (1.0 - alpha) * o[i - 1]);
+        previous = neo_frama_stable_update_f64_v2(close[i], previous, alpha);
+        o[i] = previous;
+
+        const int idx_out = i - win;
+        const int crossing = i - half;
+        neo_frama_expire_f64_v3(&left_max, idx_out);
+        neo_frama_expire_f64_v3(&left_min, idx_out);
+        neo_frama_expire_f64_v3(&right_max, crossing);
+        neo_frama_expire_f64_v3(&right_min, crossing);
+        neo_frama_push_max_f64_v3(&left_max, crossing, high);
+        neo_frama_push_min_f64_v3(&left_min, crossing, low);
+        neo_frama_push_max_f64_v3(&right_max, i, high);
+        neo_frama_push_min_f64_v3(&right_min, i, low);
     }
 }

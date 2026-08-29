@@ -2,10 +2,28 @@
 // directly — it calls these, so the command surface is one auditable file.
 import { invoke } from "@tauri-apps/api/core";
 
-import { amendProtectionBody, dataImportBody, promoteStrategyBody } from "./apiContracts";
-import type { DataFetchBody } from "./apiContracts";
+import {
+  amendProtectionBody,
+  dataFetchStopOutcomeFromPayload,
+  dataImportBody,
+  promoteStrategyBody,
+  stopDataFetchFollowingActiveRun,
+  type DatasetInventoryEntry,
+  type DatasetInventorySkipped,
+  type DiscoveryStartBody,
+  type DataFetchBody,
+  type DataFetchOutcome,
+  type DataFetchStatus,
+  type DataFetchStopOutcome,
+  type DataImportBody,
+  type DataImportOutcome,
+  type DataImportSourceFormat,
+  type SymbolCoverage,
+} from "./apiContracts";
+import type { EngineRunState } from "./discoveryQueueState";
 
 export { dataFetchBody } from "./apiContracts";
+export type { SymbolCoverage } from "./apiContracts";
 
 // ── In-process backend (full neoethos-app axum API over loopback) ─────────────
 // The Tauri shell runs the whole backend in-process and tells us the port via
@@ -16,10 +34,38 @@ export async function apiBaseUrl(): Promise<string> {
   _apiBase = await invoke<string>("api_base");
   return _apiBase;
 }
+
+export class ApiResponseError extends Error {
+  readonly status: number;
+  readonly statusText: string;
+  readonly payload: unknown;
+
+  constructor(
+    status: number,
+    statusText: string,
+    payload: unknown,
+    detail: string,
+  ) {
+    super(`${status} ${statusText}${detail ? ` — ${detail}` : ""}`);
+    this.name = "ApiResponseError";
+    this.status = status;
+    this.statusText = statusText;
+    this.payload = payload;
+  }
+}
+
 async function _check(r: Response): Promise<Response> {
   if (!r.ok) {
     const detail = await r.text().catch(() => "");
-    throw new Error(`${r.status} ${r.statusText}${detail ? ` — ${detail}` : ""}`);
+    let payload: unknown = null;
+    if (detail) {
+      try {
+        payload = JSON.parse(detail);
+      } catch {
+        payload = null;
+      }
+    }
+    throw new ApiResponseError(r.status, r.statusText, payload, detail);
   }
   return r;
 }
@@ -170,7 +216,6 @@ export type ReauthResult = {
 export const appInfo = () => invoke<AppInfo>("app_info");
 /** Native OS file picker for data import; returns the chosen path or null. */
 export const pickDataFile = () => invoke<string | null>("pick_data_file");
-export type SymbolCoverage = { symbol: string; bars: number; firstMs: number; lastMs: number; years: number };
 /** Per-symbol local-history coverage (years + bars) for the given base TF. */
 export const dataCoverage = (symbols: string[], timeframe: string) =>
   invoke<SymbolCoverage[]>("data_coverage", { symbols, timeframe });
@@ -254,8 +299,8 @@ export const saveBrokerCredentials = (b: {
 // ── Engines: Discovery + Training ─────────────────────────────────────────
 export type EngineCounter = { name: string; value: number };
 export type EnginesStatus = {
-  discovery: string;
-  training: string;
+  discovery: EngineRunState;
+  training: EngineRunState;
   autoTrader?: string;
   auto_trader?: string;
   discoverySummary?: string;
@@ -283,7 +328,7 @@ export type StartJob = {
   portfolio_size?: number;
 };
 export const enginesStatus = () => apiGet<EnginesStatus>("/engines/status");
-export const discoveryStart = (b: StartJob) => apiPost("/engines/discovery/start", b);
+export const discoveryStart = (b: DiscoveryStartBody) => apiPost("/engines/discovery/start", b);
 export const discoveryStop = () => apiPost("/engines/discovery/stop");
 export const trainingStart = (b: StartJob) => apiPost("/engines/training/start", b);
 export const trainingStop = () => apiPost("/engines/training/stop");
@@ -477,11 +522,32 @@ export type DataBootstrap = {
   dataDir: string;
   dataDirExists: boolean;
   symbols: string[];
-  fileCount: number;
+  datasetCount: number;
   lastTouchedUnixMs: number | null;
+  datasets: DatasetInventoryEntry[];
+  skipped: DatasetInventorySkipped[];
 };
 export const dataBootstrap = () => apiGet<DataBootstrap>("/data/bootstrap");
-export const dataFetch = (body: DataFetchBody) => apiPost("/data/fetch", body);
+export const dataFetch = (body: DataFetchBody) =>
+  apiPost<DataFetchOutcome>("/data/fetch", body);
+export const dataFetchStatus = () => apiGet<DataFetchStatus>("/data/fetch/status");
+export const stopDataFetch = (runId: number) =>
+  apiPost<DataFetchStopOutcome>("/data/fetch/stop", { runId });
+
+async function requestDataFetchStopOutcome(runId: number): Promise<DataFetchStopOutcome> {
+  try {
+    return await stopDataFetch(runId);
+  } catch (error) {
+    const outcome = error instanceof ApiResponseError
+      ? dataFetchStopOutcomeFromPayload(error.payload)
+      : null;
+    if (outcome) return outcome;
+    throw error;
+  }
+}
+
+export const stopActiveDataFetch = (runId: number) =>
+  stopDataFetchFollowingActiveRun(runId, requestDataFetchStopOutcome);
 
 // ── Market Watch / watchlist ──────────────────────────────────────────────
 export const getWatchlist = () => apiGet<any>("/watchlist");
@@ -621,8 +687,27 @@ export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");
 export const settingsRaw = () => apiGet<any>("/settings/raw");
 export const saveSettingsRaw = (yaml: string) => apiPost("/settings/raw", { yaml });
 export const diagnosticsReport = () => apiPost<any>("/diagnostics/report", {});
-export const dataImport = (sourcePath: string, symbol: string, timeframe: string) =>
-  apiPost<any>("/data/import", dataImportBody(sourcePath, symbol, timeframe));
+export const dataImport = (
+  sourcePath: string,
+  sourceFormat: DataImportSourceFormat,
+  sourceNamespace: string,
+  symbol: string,
+  timeframe: string,
+  barTimestampConvention: DataImportBody["barTimestampConvention"],
+  expectedGeneration: string | null = null,
+) =>
+  apiPost<DataImportOutcome>(
+    "/data/import",
+    dataImportBody(
+      sourcePath,
+      sourceFormat,
+      sourceNamespace,
+      symbol,
+      timeframe,
+      barTimestampConvention,
+      expectedGeneration,
+    ),
+  );
 
 // ── Storage transparency (where every file lives) ─────────────────────────
 export type StorageEntry = {

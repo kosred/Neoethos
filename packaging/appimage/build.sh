@@ -49,13 +49,33 @@ if [[ -z "${NEOETHOS_VERSION:-}" ]]; then
 fi
 echo "[appimage] version = ${NEOETHOS_VERSION}"
 
-# ── Step 1: cargo build --release -p neoethos-app ────────────────────────────
-echo "[appimage] step 1/4 — cargo build --release -p neoethos-app"
-cargo build --release -p neoethos-app
+# ── Step 1: build the private payload and baseline launcher separately ───────
+echo "[appimage] step 1a/4 — build private x86-64 v3 payload"
+CARGO_TARGET_DIR=target/x86-64-v3-payload RUSTFLAGS='-C target-cpu=x86-64-v3' \
+    cargo build --release -p neoethos-app
 
-# ── Step 2: stage the binary inside the AppDir ───────────────────────────────
-echo "[appimage] step 2/4 — staging binary into AppDir"
-install -Dm755 "${REPO_ROOT}/target/release/neoethos-app" "${APPDIR}/usr/bin/neoethos-app"
+echo "[appimage] step 1b/4 — build baseline public launcher"
+CARGO_TARGET_DIR=target/x86-64-baseline-launcher RUSTFLAGS='-C target-cpu=x86-64' \
+    cargo build --release -p neoethos-x86-64-v3-launcher
+
+# ── Step 2: stage the launch pair inside the AppDir ──────────────────────────
+echo "[appimage] step 2/4 — staging baseline launcher and private payload"
+PAYLOAD_RELEASE="${REPO_ROOT}/target/x86-64-v3-payload/release"
+install -Dm755 \
+    "${REPO_ROOT}/target/x86-64-baseline-launcher/release/neoethos-x86-64-v3-launcher" \
+    "${APPDIR}/usr/bin/neoethos-app"
+install -Dm755 \
+    "${REPO_ROOT}/target/x86-64-v3-payload/release/neoethos-app" \
+    "${APPDIR}/usr/bin/neoethos-app.x86-64-v3"
+for library in libcatboostmodel.so libxgboost.so; do
+    test -s "${PAYLOAD_RELEASE}/${library}" || {
+        echo "[appimage] ERROR: selected native runtime is missing or empty: ${PAYLOAD_RELEASE}/${library}" >&2
+        exit 1
+    }
+    install -Dm755 \
+        "${PAYLOAD_RELEASE}/${library}" \
+        "${APPDIR}/usr/bin/${library}"
+done
 
 # Stage runtime assets per installer_infrastructure_spec.md §8.
 install -Dm644 "${REPO_ROOT}/assets/symbol_metadata/defaults.json" "${APPDIR}/usr/share/neoethos/symbol_metadata/defaults.json"

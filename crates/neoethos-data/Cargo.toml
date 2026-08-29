@@ -4,23 +4,32 @@ version = "0.5.6"
 edition.workspace = true
 license.workspace = true
 # Refuses exactly one build configuration — `gpu-cuda` together with
-# CUDA_FAST_MATH — and records nothing. It deliberately does NOT resolve a CUDA
-# arch: vector-ta already exports what it compiled
-# (`module_loader::{COMPILED_ARCHS, COMPILED_PTX_ARCH}`), and probing the build
-# host for a second answer both broke card-less CUDA builds and printed the
-# wrong number in the arch-mismatch diagnostic. See build.rs's header.
+# CUDA_FAST_MATH — and records nothing. vector-ta is the sole authority for
+# exact native architectures through `module_loader::{COMPILED_ARCHS,
+# COMPILED_ARCH_SOURCE}`; this crate never derives a second answer.
 build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.100"
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-ipc.workspace = true
+parquet.workspace = true
+thrift.workspace = true
+flatbuffers.workspace = true
+vortex-flatbuffers.workspace = true
 chrono = "0.4"
 neoethos-core = { path = "../neoethos-core" }
+neoethos-dataset-contracts.workspace = true
+neoethos-feature-contracts.workspace = true
+neoethos-gpu-contracts = { path = "../neoethos-gpu-contracts", optional = true }
+neoethos-gpu-cuda = { path = "../neoethos-gpu-cuda", optional = true }
 csv = "1.3"
-polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "timezones", "parquet", "ipc"] }
 ndarray = { version = "0.17.2", features = ["rayon"] }
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tracing = "0.1"
 # Pin aligned 2026-05-26 with workspace `[patch.crates-io]` which redirects
 # this dep to `vendor/vector-ta-0.2.9-patched/`. The previous `0.2.4` pin was
@@ -33,20 +42,16 @@ tracing = "0.1"
 # Without it `Kernel::Auto` falls back to the SCALAR baseline — i.e. the whole
 # feature build runs on SSE2-class scalar code instead of AVX2/AVX512. This is
 # the single biggest CPU win for `hpc_ta::compute_classic_ta_columns` and needs
-# no GPU. (vector-ta's separate `cuda`/`cuda-build-ptx` GPU path is wired
-# separately once `hpc_ta` dispatches to `vector_ta::cuda::*` — task #22.)
+# no GPU. The separate native CUDA path is enabled only by `gpu-cuda` below.
 vector-ta = { version = "0.2.9", features = ["nightly-avx"] }
 # STAY ON 0.2.9 — decided 2026-08-09 against the 0.3.1 API diff, not by habit.
 #   * A mechanical diff of every `pub fn|struct|enum|trait` across
 #     `src/indicators`, `src/cuda` and `src/utilities` between 0.2.9 and 0.3.1
-#     yields an EMPTY removed-set AND an EMPTY added-set. The only source
-#     changes are pyo3 0.25 -> 0.29 renames (`allow_threads` -> `detach`,
-#     `PyObject` -> `Py<PyAny>`) behind the optional `python` feature, which we
-#     do not enable. So the upgrade buys us exactly nothing in Rust.
-#   * Nothing changes GPU-side either: 0.3.1 ships the SAME 329 `.cu` kernels,
-#     the SAME 329 prebuilt PTX files (all still `.target sm_89`), the same 258
-#     wrappers, the same `cust = "0.3.2"`, and an IDENTICAL `[features]` table.
-#     In particular it does NOT fix the compute_89 trap.
+#     yields an EMPTY removed-set AND an EMPTY added-set for NeoEthos's Rust
+#     API. The upgrade therefore buys no Rust production capability.
+#   * The GPU lane is a reviewed vendored replacement with exact native cubin
+#     generation and loading. An upstream crate comparison is not authority for
+#     its artifact or runtime semantics.
 #   * And it does not carry the fix we vendored for: the `warm prefix exceeds
 #     row width` assert is still at `src/utilities/helpers.rs:159` in 0.3.1
 #     (verified against the extracted 0.3.1 crate source). Upgrading means
@@ -56,6 +61,7 @@ vector-ta = { version = "0.2.9", features = ["nightly-avx"] }
 # device lane — that, not a version number, is what would make the GPU
 # indicator path parity-capable.
 memmap2 = "0.9.5"
+libc = "0.2.189"
 # Rust CUDA Driver-API bindings — SAME 0.3.2 vector-ta itself depends on, so
 # the graph unifies on one copy and `cust::Context::new` retains the DEVICE
 # PRIMARY context, i.e. our handle and every vector-ta wrapper share one
@@ -75,49 +81,29 @@ vortex-io = "0.67.0"
 vortex-layout = "0.67.0"
 vortex-session = "0.67.0"
 
-# Task #22 — GPU (CUDA) feature build. `gpu-cuda` ADDITIVELY turns on
-# vector-ta's `cuda-build-ptx` sub-feature, which (a) compiles the CUDA
-# indicator-kernel PTX at build time via nvcc AND (b) transitively enables
-# vector-ta's `cuda` feature (`cuda-build-ptx = ["cuda"]` in
-# vendor/vector-ta-0.2.9-patched/Cargo.toml), which is what gates the runtime
-# API we call: the `vector_ta::cuda::*` module (CudaRuntime, cuda_available)
-# and `vector_ta::indicators::dispatch::compute_cuda_device` + its
-# `IndicatorCuda*` request/output types (all `#[cfg(feature = "cuda")]` in the
-# vendor crate). So enabling `cuda-build-ptx` alone brings BOTH the PTX build
-# and the host-side `cuda` API into scope — no separate `vector-ta/cuda` line
-# needed.
-#
-# This does NOT change the default build: with `gpu-cuda` OFF the `vector-ta`
-# dep above stays exactly `["nightly-avx"]` and every GPU code path in
-# `hpc_ta.rs` is `#[cfg(feature = "gpu-cuda")]`-gated, so the non-GPU object
-# code is byte-identical. Built ONLY on a machine with the CUDA toolkit (the
-# A6000 VPS) — `cargo check --features gpu-cuda` fails on a non-CUDA host
-# because vector-ta's build.rs needs nvcc to emit the kernel PTX.
-#
-# THE ARCH TRAP — read this before enabling the feature.
-#
-# `cuda-build-ptx` (rather than plain `cuda`) is the deliberate choice: the
-# `cuda` feature stages vector-ta's PREBUILT PTX, and all 329 shipped files
-# carry a literal `.target sm_89` (Ada / RTX 4090). PTX is FORWARD-compatible
-# only, so none of them JIT down onto the sm_86 of an RTX 3090 — the module
-# simply fails to load, per indicator, at first use.
-#
-# `cuda-build-ptx` compiles the kernels with nvcc instead, and
-# `vendor/vector-ta-0.2.9-patched/build.rs` was patched (2026-08-09) to DERIVE
-# the target arch from the card that is actually present rather than defaulting
-# to a hardcoded `compute_89`. On the rented 3090:
-#
-#   CUDA_ARCH=sm_86 CUDA_FAST_MATH=0 cargo build -p neoethos-data --features gpu-cuda
-#
-# `CUDA_FAST_MATH=0` is not optional if any parity claim is to be made:
-# vector-ta's build.rs passes `--use_fast_math` by default, which turns on
-# flush-to-zero and approximate div/sqrt/rcp in every kernel.
-#
-# This does NOT change the default build: with `gpu-cuda` OFF the `vector-ta`
-# dep above stays exactly `["nightly-avx"]`, `cust` is not resolved, `build.rs`
-# emits the "none" sentinel, and every GPU code path is cfg-gated away, so the
-# non-GPU object code is byte-identical. The feature can only be COMPILED on a
-# machine with the CUDA toolkit — `cust_raw`'s build script panics without one.
-[features]
-gpu-cuda = ["dep:cust", "vector-ta/cuda-build-ptx"]
+[dev-dependencies]
+ctor = "0.4.3"
+tempfile = "3.27"
 
+# `gpu-cuda` enables vector-ta's reviewed native CUDA build and Rust CUDA API.
+# The build emits one exact `.cubin` per kernel and requested/visible `sm_X`,
+# validates every artifact with `cuobjdump`, and generates the exact runtime
+# registry. No alternate artifact, driver compilation, approximate
+# architecture selection, or CPU substitution path exists.
+#
+# `CUDA_ARCHS` may name one or more explicit exact targets; otherwise vector-ta
+# derives every visible GPU architecture. nvcc and cuobjdump are required.
+# `CUDA_FAST_MATH` must remain unset or `0` for parity.
+# The default feature set remains CPU-only and never resolves `cust`.
+[features]
+gpu-cuda = [
+    "dep:cust",
+    "dep:neoethos-gpu-contracts",
+    "dep:neoethos-gpu-cuda",
+    "neoethos-gpu-cuda/cuda",
+    "vector-ta/cuda-build-native",
+]
+gpu-cuda-device-fixtures = [
+    "gpu-cuda",
+    "neoethos-gpu-cuda/cuda-device-fixtures",
+]
